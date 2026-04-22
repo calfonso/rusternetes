@@ -34,6 +34,15 @@ print_success() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Detect container runtime (podman or docker)
+if command -v podman &> /dev/null; then
+    CONTAINER_CMD="podman"
+elif command -v docker &> /dev/null; then
+    CONTAINER_CMD="docker"
+else
+    CONTAINER_CMD="docker" # Default to docker for compatibility
+fi
+
 # Check if kubectl is available
 KUBECTL=""
 if [ -f "$PROJECT_ROOT/target/release/kubectl" ]; then
@@ -82,9 +91,9 @@ fi
 # Step 3: Delete existing CoreDNS resources to ensure fresh creation with proper service account token
 print_step "Cleaning up existing CoreDNS resources (if any)..."
 # Remove CoreDNS container
-docker rm -f $(docker ps -a --filter "name=coredns" --format "{{.ID}}") 2>/dev/null && echo "  Deleted CoreDNS container" || echo "  No CoreDNS container to delete"
+$CONTAINER_CMD rm -f $($CONTAINER_CMD ps -a --filter "name=coredns" --format "{{.ID}}") 2>/dev/null && echo "  Deleted CoreDNS container" || echo "  No CoreDNS container to delete"
 # Remove CoreDNS pod from etcd
-docker exec rusternetes-etcd etcdctl del /registry/pods/kube-system/coredns 2>/dev/null && echo "  Deleted CoreDNS pod from etcd" || echo "  No CoreDNS pod in etcd"
+$CONTAINER_CMD exec rusternetes-etcd etcdctl del /registry/pods/kube-system/coredns 2>/dev/null && echo "  Deleted CoreDNS pod from etcd" || echo "  No CoreDNS pod in etcd"
 
 # Step 4: Apply bootstrap cluster resources
 print_step "Applying bootstrap resources (namespaces, services, CoreDNS)..."
