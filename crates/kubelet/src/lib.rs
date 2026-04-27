@@ -1,5 +1,6 @@
 pub mod cni;
 pub mod config;
+pub mod container_runtime;
 pub mod eviction;
 pub mod kubelet;
 pub mod runtime;

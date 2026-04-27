@@ -3644,6 +3644,7 @@ name = "rusternetes-kubelet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.7.9",
  "bollard",
  "chrono",
@@ -3661,6 +3662,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tonic 0.12.3",
  "tracing",

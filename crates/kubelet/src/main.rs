@@ -1,5 +1,6 @@
 mod cni;
 mod config;
+mod container_runtime;
 mod eviction;
 mod kubelet;
 mod runtime;

@@ -21,6 +21,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::cni::CniRuntime;
+use crate::container_runtime::{self, ContainerRuntime as ContainerRuntimeTrait, RuntimeType};
 
 /// Wrapper for pre-encoded protobuf bytes (gRPC health check request).
 #[derive(Clone, Debug, Default)]
@@ -84,7 +85,8 @@ struct ProbeState {
 
 /// ContainerRuntime manages containers using Docker/Podman with CNI networking
 pub struct ContainerRuntime {
-    docker: Docker,
+    runtime: Box<dyn ContainerRuntimeTrait>,
+    docker: Docker, // Keep for now during transition - some bollard-specific code remains
     storage: Option<Arc<rusternetes_storage::StorageBackend>>,
     volumes_base_path: String,
     cluster_dns: String,
@@ -162,6 +164,20 @@ impl ContainerRuntime {
         network: String,
         kubernetes_service_host: String,
     ) -> Result<Self> {
+        // Auto-detect runtime or use environment variable
+        let runtime_type = std::env::var("CONTAINER_RUNTIME")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "docker" | "podman" => Some(RuntimeType::Docker),
+                "apple" | "container" => Some(RuntimeType::AppleContainer),
+                _ => None,
+            })
+            .unwrap_or_else(RuntimeType::auto_detect);
+
+        info!("Selected container runtime: {:?}", runtime_type);
+
+        let runtime = container_runtime::create_runtime(runtime_type)
+            .context("Failed to create container runtime")?;
         let docker = Docker::connect_with_local_defaults()?;
 
         info!("Using volumes base path: {}", volumes_base_path);
@@ -192,6 +208,7 @@ impl ContainerRuntime {
         let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
 
         Ok(Self {
+            runtime,
             docker,
             storage: None,
             volumes_base_path,
@@ -426,13 +443,13 @@ impl ContainerRuntime {
 
     /// Check if an image exists locally
     async fn check_image_exists(&self, image: &str) -> bool {
-        match self.docker.inspect_image(image).await {
-            Ok(_) => {
+        match self.runtime.inspect_image(image).await {
+            Ok(Some(_)) => {
                 debug!("Image {} exists locally", image);
                 true
             }
-            Err(e) => {
-                debug!("Image {} not found locally: {}", image, e);
+            Ok(None) | Err(_) => {
+                debug!("Image {} not found locally", image);
                 false
             }
         }
@@ -460,40 +477,11 @@ impl ContainerRuntime {
 
     /// Pull image with retry logic
     async fn pull_image_with_retry(&self, image: &str) -> Result<()> {
-        let options = CreateImageOptions {
-            from_image: image,
-            ..Default::default()
-        };
-
-        let mut stream = self.docker.create_image(Some(options), None, None);
-        let mut last_error = None;
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(info) => {
-                    if let Some(status) = &info.status {
-                        debug!("Image pull: {}", status);
-                    }
-                    if let Some(progress) = &info.progress {
-                        debug!("Image pull progress: {}", progress);
-                    }
-                    if let Some(error) = info.error {
-                        last_error = Some(error.clone());
-                        error!("Image pull error: {}", error);
-                    }
-                }
-                Err(e) => {
-                    last_error = Some(format!("{}", e));
-                    error!("Image pull stream error: {}", e);
-                }
-            }
-        }
-
-        // Check if there was an error
-        if let Some(err) = last_error {
-            return Err(anyhow::anyhow!("Image pull failed: {}", err));
-        }
-
+        info!("Pulling image: {}", image);
+        self.runtime.pull_image(image)
+            .await
+            .context("Failed to pull image")?;
+        info!("Successfully pulled image: {}", image);
         Ok(())
     }
 

@@ -281,8 +281,9 @@ impl ContainerRuntime for AppleContainerRuntime {
         args.push(&config.image);
 
         // Add command and entrypoint
+        let ep_str;
         if let Some(ref entrypoint) = config.entrypoint {
-            let ep_str = entrypoint.join(" ");
+            ep_str = entrypoint.join(" ");
             args.push("--entrypoint");
             args.push(&ep_str);
         }
@@ -500,9 +501,10 @@ impl ContainerRuntime for AppleContainerRuntime {
             args.push("--follow");
         }
 
+        let tail_str;
         if let Some(n) = tail {
             args.push("--tail");
-            let tail_str = n.to_string();
+            tail_str = n.to_string();
             args.push(&tail_str);
         }
 
@@ -520,18 +522,24 @@ impl ContainerRuntime for AppleContainerRuntime {
             .take()
             .ok_or_else(|| RuntimeError::Generic("No stdout".to_string()))?;
 
-        let stream = BufReader::new(stdout).lines();
+        let lines = BufReader::new(stdout).lines();
 
-        use futures::stream::StreamExt;
-        let mapped = stream.map(|line| {
-            line.map(|l| LogEntry {
-                stream: LogStreamType::Stdout,
-                data: l.into_bytes(),
-            })
-            .map_err(|e| RuntimeError::Io(e))
+        use futures::stream::{unfold, StreamExt};
+        let stream = unfold(lines, |mut lines| async move {
+            match lines.next_line().await {
+                Ok(Some(line)) => Some((
+                    Ok(LogEntry {
+                        stream: LogStreamType::Stdout,
+                        data: line.into_bytes(),
+                    }),
+                    lines,
+                )),
+                Ok(None) => None,
+                Err(e) => Some((Err(RuntimeError::Io(e)), lines)),
+            }
         });
 
-        Ok(Box::pin(mapped))
+        Ok(Box::pin(stream))
     }
 
     async fn download_from_container(
@@ -539,7 +547,8 @@ impl ContainerRuntime for AppleContainerRuntime {
         container: &str,
         path: &str,
     ) -> Result<Vec<u8>, RuntimeError> {
-        let args = vec!["container", "cp", &format!("{}:{}", container, path), "-"];
+        let container_path = format!("{}:{}", container, path);
+        let args = vec!["container", "cp", &container_path, "-"];
         let output = TokioCommand::new(&self.container_bin)
             .args(&args)
             .output()

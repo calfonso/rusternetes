@@ -3,7 +3,7 @@
 use super::*;
 use async_trait::async_trait;
 use bollard::Docker;
-use bollard::image::{CreateImageOptions, InspectImageOptions};
+use bollard::image::CreateImageOptions;
 use bollard::container::{
     CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, StopContainerOptions,
@@ -183,13 +183,13 @@ impl ContainerRuntime for DockerRuntime {
         let mut filter_map = HashMap::new();
 
         if let Some(names) = filters.name {
-            filter_map.insert("name", names);
+            filter_map.insert("name".to_string(), names);
         }
         if let Some(labels) = filters.label {
-            filter_map.insert("label", labels);
+            filter_map.insert("label".to_string(), labels);
         }
         if let Some(status) = filters.status {
-            filter_map.insert("status", status);
+            filter_map.insert("status".to_string(), status);
         }
 
         let options = ListContainersOptions {
@@ -332,7 +332,7 @@ impl ContainerRuntime for DockerRuntime {
                 name: v.name,
                 driver: v.driver,
                 mountpoint: v.mountpoint,
-                labels: v.labels.unwrap_or_default(),
+                labels: v.labels,
             })
             .collect())
     }
@@ -352,7 +352,7 @@ fn convert_container_info(info: ContainerInspectResponse) -> ContainerInfo {
         running: s.running.unwrap_or(false),
         paused: s.paused.unwrap_or(false),
         restarting: s.restarting.unwrap_or(false),
-        status: s.status.unwrap_or_default().to_string(),
+        status: s.status.map(|st| format!("{:?}", st)).unwrap_or_else(|| "unknown".to_string()),
         exit_code: s.exit_code.map(|c| c as i32),
         started_at: s.started_at,
         finished_at: s.finished_at,
