@@ -139,7 +139,7 @@ impl ContainerRuntime for AppleContainerRuntime {
         name: &str,
         config: ContainerConfig,
     ) -> Result<String, RuntimeError> {
-        let mut args = vec!["container", "create", "--name", name];
+        let mut args = vec!["create", "--name", name];
 
         // Add hostname
         if let Some(ref hostname) = config.hostname {
@@ -298,20 +298,20 @@ impl ContainerRuntime for AppleContainerRuntime {
     }
 
     async fn start_container(&self, id: &str) -> Result<(), RuntimeError> {
-        self.run_command_async(&["container", "start", id])
+        self.run_command_async(&["start", id])
             .await
             .map(|_| ())
     }
 
     async fn stop_container(&self, id: &str, timeout: u64) -> Result<(), RuntimeError> {
         let timeout_str = timeout.to_string();
-        self.run_command_async(&["container", "stop", "--time", &timeout_str, id])
+        self.run_command_async(&["stop", "--time", &timeout_str, id])
             .await
             .map(|_| ())
     }
 
     async fn remove_container(&self, id: &str, force: bool) -> Result<(), RuntimeError> {
-        let mut args = vec!["container", "rm"];
+        let mut args = vec!["rm"];
         if force {
             args.push("--force");
         }
@@ -320,7 +320,7 @@ impl ContainerRuntime for AppleContainerRuntime {
     }
 
     async fn inspect_container(&self, name: &str) -> Result<Option<ContainerInfo>, RuntimeError> {
-        match self.run_json_command(&["container", "inspect", name]) {
+        match self.run_json_command(&["inspect", name]) {
             Ok(json) => {
                 let arr = json
                     .as_array()
@@ -389,7 +389,7 @@ impl ContainerRuntime for AppleContainerRuntime {
         &self,
         filters: ContainerFilters,
     ) -> Result<Vec<ContainerSummary>, RuntimeError> {
-        let mut args = vec!["container", "ls", "--format=json"];
+        let mut args = vec!["ls", "--format=json"];
 
         if filters.all {
             args.push("--all");
@@ -464,7 +464,7 @@ impl ContainerRuntime for AppleContainerRuntime {
         let cmd = parts[1];
         let cmd_parts: Vec<&str> = cmd.split_whitespace().collect();
 
-        let mut args = vec!["container", "exec", container];
+        let mut args = vec!["exec", container];
         args.extend(&cmd_parts);
 
         let output = TokioCommand::new(&self.container_bin)
@@ -495,7 +495,7 @@ impl ContainerRuntime for AppleContainerRuntime {
         follow: bool,
         tail: Option<usize>,
     ) -> Result<LogStream, RuntimeError> {
-        let mut args = vec!["container", "logs"];
+        let mut args = vec!["logs"];
 
         if follow {
             args.push("--follow");
@@ -548,7 +548,7 @@ impl ContainerRuntime for AppleContainerRuntime {
         path: &str,
     ) -> Result<Vec<u8>, RuntimeError> {
         let container_path = format!("{}:{}", container, path);
-        let args = vec!["container", "cp", &container_path, "-"];
+        let args = vec!["cp", &container_path, "-"];
         let output = TokioCommand::new(&self.container_bin)
             .args(&args)
             .output()
