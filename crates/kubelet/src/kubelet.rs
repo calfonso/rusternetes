@@ -938,7 +938,23 @@ impl Kubelet {
     ) -> Result<()> {
         debug!("Checking for orphaned containers");
 
-        // Reuse the pod list already fetched by sync_loop to avoid a redundant etcd round-trip
+        // Reuse the pod list already fetched by sync_loop to avoid a redundant etcd round-trip.
+        // Pods in terminal phase (Succeeded/Failed) with deletionTimestamp are effectively
+        // deleted — their containers should be cleaned up. Since the kubelet no longer
+        // deletes pods from storage (K8s rule), we must treat these as orphans.
+        let terminal_pod_names: std::collections::HashSet<String> = all_existing_pods
+            .iter()
+            .filter(|p| {
+                let is_terminal = p.status.as_ref()
+                    .and_then(|s| s.phase.as_ref())
+                    .map(|phase| matches!(phase, Phase::Succeeded | Phase::Failed))
+                    .unwrap_or(false);
+                let has_deletion = p.metadata.deletion_timestamp.is_some();
+                is_terminal && has_deletion
+            })
+            .map(|p| p.metadata.name.clone())
+            .collect();
+
         let existing_pod_names: std::collections::HashSet<String> = all_existing_pods
             .iter()
             .map(|p| p.metadata.name.clone())
@@ -960,8 +976,10 @@ impl Kubelet {
         // Only kill a container if its pod name is not found in the COMPLETE pod list
         // (all namespaces, all nodes).
         for running_pod_name in &running_pods {
-            if existing_pod_names.contains(running_pod_name) {
-                continue; // Pod exists in etcd — not an orphan
+            if existing_pod_names.contains(running_pod_name)
+                && !terminal_pod_names.contains(running_pod_name)
+            {
+                continue; // Pod exists in etcd and is not terminal — not an orphan
             }
             // Fast path: if this pod was explicitly deleted (via watch event),
             // skip the grace period and clean up immediately.
@@ -992,9 +1010,21 @@ impl Kubelet {
             // Re-check etcd before cleanup — a new pod with the same name may have
             // been created since we fetched the pod list at the start of sync_loop.
             // Without this check, we'd delete volumes that the new pod needs.
+            // A pod that exists but is terminal+deleted is still an orphan.
             let still_orphaned = {
                 let fresh_pods: Vec<Pod> = self.storage.list("/registry/pods/").await.unwrap_or_default();
-                !fresh_pods.iter().any(|p| p.metadata.name == *running_pod_name)
+                let matching = fresh_pods.iter().find(|p| p.metadata.name == *running_pod_name);
+                match matching {
+                    None => true, // Pod gone from storage — orphan
+                    Some(p) => {
+                        // Pod exists but is terminal+deleted — treat as orphan
+                        let is_terminal = p.status.as_ref()
+                            .and_then(|s| s.phase.as_ref())
+                            .map(|phase| matches!(phase, Phase::Succeeded | Phase::Failed))
+                            .unwrap_or(false);
+                        is_terminal && p.metadata.deletion_timestamp.is_some()
+                    }
+                }
             };
             if !still_orphaned {
                 debug!("Pod {} was recreated in etcd — skipping cleanup", running_pod_name);
