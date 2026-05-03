@@ -395,7 +395,8 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                         obj.iter().find_map(|item| {
                             item.as_object()
                                 .and_then(|o| o.get("$deleteFromPrimitiveList"))
-                                .and_then(|v| v.as_array()).cloned()
+                                .and_then(|v| v.as_array())
+                                .cloned()
                         })
                     } else {
                         None
@@ -471,7 +472,11 @@ fn strategic_merge_arrays(original: &[Value], patch: &[Value]) -> Result<Vec<Val
         // See: apimachinery/pkg/util/strategicpatch/patch.go normalizeElementOrder
         let patch_names: Vec<String> = patch
             .iter()
-            .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            .filter_map(|v| {
+                v.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
 
         let mut final_array = Vec::new();

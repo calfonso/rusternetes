@@ -1252,10 +1252,7 @@ pub async fn execute(
 fn print_pods(pods: &[Pod], no_headers: bool, show_labels: bool) {
     if !no_headers {
         if show_labels {
-            println!(
-                "{:<30} {:<15} {:<15} LABELS",
-                "NAME", "STATUS", "NODE"
-            );
+            println!("{:<30} {:<15} {:<15} LABELS", "NAME", "STATUS", "NODE");
         } else {
             println!("{:<30} {:<15} {:<15}", "NAME", "STATUS", "NODE");
         }
@@ -1289,19 +1286,13 @@ fn print_pods(pods: &[Pod], no_headers: bool, show_labels: bool) {
 fn print_services(services: &[Service], no_headers: bool, show_labels: bool) {
     if !no_headers {
         if show_labels {
-            println!(
-                "{:<30} {:<20} {:<10} LABELS",
-                "NAME", "CLUSTER-IP", "PORTS"
-            );
+            println!("{:<30} {:<20} {:<10} LABELS", "NAME", "CLUSTER-IP", "PORTS");
         } else {
             println!("{:<30} {:<20} {:<10}", "NAME", "CLUSTER-IP", "PORTS");
         }
     }
     for service in services {
-        let cluster_ip = service
-            .spec
-            .cluster_ip.as_deref()
-            .unwrap_or("<none>");
+        let cluster_ip = service.spec.cluster_ip.as_deref().unwrap_or("<none>");
         let ports = service
             .spec
             .ports
@@ -1557,11 +1548,7 @@ fn print_cronjobs(cronjobs: &[CronJob], no_headers: bool, _show_labels: bool) {
     for cronjob in cronjobs {
         let schedule = &cronjob.spec.schedule;
         let suspend = cronjob.spec.suspend.unwrap_or(false);
-        let active = cronjob
-            .status
-            .as_ref()
-            .map(|s| s.active.len())
-            .unwrap_or(0);
+        let active = cronjob.status.as_ref().map(|s| s.active.len()).unwrap_or(0);
         let last_schedule = cronjob
             .status
             .as_ref()

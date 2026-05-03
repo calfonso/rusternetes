@@ -157,7 +157,12 @@ impl SchemaValidator {
                         format!("{}.{}", path, key)
                     };
                     let mut dummy = Vec::new();
-                    Self::validate_with_path_skip_unknown(prop_schema, value, &new_path, &mut dummy)?;
+                    Self::validate_with_path_skip_unknown(
+                        prop_schema,
+                        value,
+                        &new_path,
+                        &mut dummy,
+                    )?;
                 }
                 // Unknown fields are silently ignored (they'll be pruned)
             }

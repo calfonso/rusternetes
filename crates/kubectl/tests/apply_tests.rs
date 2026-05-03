@@ -5,7 +5,6 @@
 mod tests {
     use rusternetes_common::resources::*;
     use serde::Deserialize;
-    
 
     #[test]
     fn test_apply_pod_yaml_parsing() {

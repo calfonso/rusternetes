@@ -34,7 +34,10 @@ pub async fn handle_ws_exec(
     let docker = DOCKER_CLIENT.get_or_init(|| {
         Docker::connect_with_local_defaults().expect("Failed to connect to container runtime")
     });
-    info!("WS exec: using container runtime client for {}", container_id);
+    info!(
+        "WS exec: using container runtime client for {}",
+        container_id
+    );
 
     let exec_config = CreateExecOptions {
         cmd: Some(command.iter().map(|s| s.as_str()).collect()),
@@ -166,7 +169,10 @@ pub async fn handle_ws_exec(
         .ok()
         .and_then(|info| info.exit_code)
         .unwrap_or(0);
-    info!("WS exec: command finished for {} with exit_code={}", container_id, exit_code);
+    info!(
+        "WS exec: command finished for {} with exit_code={}",
+        container_id, exit_code
+    );
 
     let is_v1 = V1_PROTOCOL_FLAG.load(std::sync::atomic::Ordering::Relaxed);
     if !is_v1 || exit_code != 0 {
@@ -339,9 +345,10 @@ pub async fn handle_portforward_websocket(mut socket: WebSocket, pod: Pod, ports
             }
             Err(e) => {
                 let _ = socket
-                    .send(Message::Text(
-                        format!("Failed to connect to {}: {}", target, e),
-                    ))
+                    .send(Message::Text(format!(
+                        "Failed to connect to {}: {}",
+                        target, e
+                    )))
                     .await;
             }
         }

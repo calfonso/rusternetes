@@ -575,7 +575,8 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
     // K8s checks ALL resources (cpu, memory, AND extended resources like fakecpu).
     let mut used_cpu = 0i64;
     let mut used_memory = 0i64;
-    let mut used_extended: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut used_extended: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     let node_name = &node.metadata.name;
     for existing_pod in all_pods {
         let scheduled_on_this_node = existing_pod

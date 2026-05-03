@@ -3,7 +3,7 @@ use futures::StreamExt;
 use rusternetes_common::resources::workloads::{Job, JobCondition, JobStatus};
 use rusternetes_common::resources::{Pod, PodStatus};
 use rusternetes_common::types::{OwnerReference, Phase};
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,6 @@ impl<S: Storage + 'static> JobController<S> {
         info!("Starting JobController (watch-based)");
         let retry_interval = Duration::from_secs(5);
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -42,7 +41,10 @@ impl<S: Storage + 'static> JobController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -52,7 +54,10 @@ impl<S: Storage + 'static> JobController<S> {
             let mut pod_watch = match self.storage.watch(&pod_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish pod watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -109,13 +114,16 @@ impl<S: Storage + 'static> JobController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("jobs", Some(ns), name);
             match self.storage.get::<Job>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile(&mut resource).await {
+                    match self.reconcile(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -137,9 +145,9 @@ impl<S: Storage + 'static> JobController<S> {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("jobs/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("jobs/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -172,9 +180,15 @@ impl<S: Storage + 'static> JobController<S> {
             }
             Err(_) => {
                 // Pod deleted — enqueue all Jobs in this namespace
-                if let Ok(items) = self.storage.list::<Job>(&build_prefix("jobs", Some(ns))).await {
+                if let Ok(items) = self
+                    .storage
+                    .list::<Job>(&build_prefix("jobs", Some(ns)))
+                    .await
+                {
                     for job in &items {
-                        queue.add(format!("jobs/{}/{}", ns, job.metadata.name)).await;
+                        queue
+                            .add(format!("jobs/{}/{}", ns, job.metadata.name))
+                            .await;
                     }
                 }
             }
@@ -223,10 +237,9 @@ impl<S: Storage + 'static> JobController<S> {
                     let terminating = all_pods
                         .iter()
                         .filter(|p| {
-                            let owned =
-                                p.metadata.owner_references.as_ref().is_some_and(|refs| {
-                                    refs.iter().any(|r| r.uid == *job_uid && r.kind == "Job")
-                                });
+                            let owned = p.metadata.owner_references.as_ref().is_some_and(|refs| {
+                                refs.iter().any(|r| r.uid == *job_uid && r.kind == "Job")
+                            });
                             let is_terminating = p.metadata.deletion_timestamp.is_some()
                                 && !matches!(
                                     p.status.as_ref().and_then(|s| s.phase.as_ref()),
@@ -240,7 +253,9 @@ impl<S: Storage + 'static> JobController<S> {
                         let key = build_key("jobs", Some(namespace), name);
                         // Re-read for fresh resourceVersion to avoid CAS conflict
                         if let Ok(mut fresh_job) = self.storage.get::<Job>(&key).await {
-                            if fresh_job.status.as_ref().and_then(|s| s.terminating) != Some(terminating) {
+                            if fresh_job.status.as_ref().and_then(|s| s.terminating)
+                                != Some(terminating)
+                            {
                                 if let Some(ref mut s) = fresh_job.status {
                                     s.terminating = Some(terminating);
                                 }
@@ -326,8 +341,7 @@ impl<S: Storage + 'static> JobController<S> {
         for pod in &job_pods {
             if let Some(sel) = selector {
                 let labels = pod.metadata.labels.as_ref();
-                let matches =
-                    labels.is_some_and(|l| sel.iter().all(|(k, v)| l.get(k) == Some(v)));
+                let matches = labels.is_some_and(|l| sel.iter().all(|(k, v)| l.get(k) == Some(v)));
                 if !matches {
                     // Pod no longer matches selector — release it by removing ownerReference
                     // Use CAS retry to handle concurrent updates
@@ -1038,7 +1052,10 @@ impl<S: Storage + 'static> JobController<S> {
             }
 
             // Calculate how many new pods to create using fresh counts
-            let pods_needed = std::cmp::min(parallelism - fresh_active, completions - fresh_succeeded - fresh_active);
+            let pods_needed = std::cmp::min(
+                parallelism - fresh_active,
+                completions - fresh_succeeded - fresh_active,
+            );
 
             if pods_needed > 0 {
                 // For Indexed mode, find which indexes still need pods
@@ -1087,8 +1104,13 @@ impl<S: Storage + 'static> JobController<S> {
                         }
                         Err(e) => {
                             let err_str = format!("{}", e);
-                            if err_str.contains("already exists") || err_str.contains("AlreadyExists") {
-                                debug!("Pod already exists for Job {}/{}, skipping", namespace, name);
+                            if err_str.contains("already exists")
+                                || err_str.contains("AlreadyExists")
+                            {
+                                debug!(
+                                    "Pod already exists for Job {}/{}, skipping",
+                                    namespace, name
+                                );
                             } else {
                                 return Err(e);
                             }
@@ -1139,8 +1161,11 @@ impl<S: Storage + 'static> JobController<S> {
             let already_complete = existing_conditions
                 .as_ref()
                 .map(|c| {
-                    c.iter()
-                        .any(|cond| (cond.condition_type == "Complete" || cond.condition_type == "SuccessCriteriaMet") && cond.status == "True")
+                    c.iter().any(|cond| {
+                        (cond.condition_type == "Complete"
+                            || cond.condition_type == "SuccessCriteriaMet")
+                            && cond.status == "True"
+                    })
                 })
                 .unwrap_or(false);
 

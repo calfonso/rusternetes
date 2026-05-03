@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
 use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -24,7 +24,6 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         use futures::StreamExt;
 
         info!("Starting ResourceQuota controller");
-
 
         let queue = WorkQueue::new();
 
@@ -84,19 +83,20 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("resourcequotas", Some(ns), name);
             match self.storage.get::<ResourceQuota>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_quota(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_quota(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -107,13 +107,17 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<ResourceQuota>("/registry/resourcequotas/").await {
+        match self
+            .storage
+            .list::<ResourceQuota>("/registry/resourcequotas/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("resourcequotas/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("resourcequotas/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -343,18 +347,19 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                             .as_ref()
                             .and_then(|s| s.priority_class_name.as_deref())
                             .unwrap_or("");
-                        let matches =
-                            match req.operator.as_str() {
-                                "In" => req.values.as_ref().is_some_and(|v| {
-                                    v.iter().any(|val| val == pod_priority_class)
-                                }),
-                                "NotIn" => req.values.as_ref().is_none_or(|v| {
-                                    !v.iter().any(|val| val == pod_priority_class)
-                                }),
-                                "Exists" => !pod_priority_class.is_empty(),
-                                "DoesNotExist" => pod_priority_class.is_empty(),
-                                _ => true,
-                            };
+                        let matches = match req.operator.as_str() {
+                            "In" => req
+                                .values
+                                .as_ref()
+                                .is_some_and(|v| v.iter().any(|val| val == pod_priority_class)),
+                            "NotIn" => req
+                                .values
+                                .as_ref()
+                                .is_none_or(|v| !v.iter().any(|val| val == pod_priority_class)),
+                            "Exists" => !pod_priority_class.is_empty(),
+                            "DoesNotExist" => pod_priority_class.is_empty(),
+                            _ => true,
+                        };
                         if !matches {
                             return false;
                         }

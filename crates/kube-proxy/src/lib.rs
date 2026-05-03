@@ -18,14 +18,19 @@ pub struct KubeProxyConfig {
 /// This is the main entry point for embedding kube-proxy in the all-in-one binary.
 /// It runs the iptables sync loop until cancelled.
 pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyhow::Result<()> {
-    info!("Starting Rusternetes Kube-proxy for node: {}", config.node_name);
+    info!(
+        "Starting Rusternetes Kube-proxy for node: {}",
+        config.node_name
+    );
 
     if let Err(e) = check_iptables() {
         warn!("iptables check failed: {}. Some features may not work.", e);
         warn!("Kube-proxy requires iptables to be installed and accessible.");
     }
 
-    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(Arc::clone(&storage))?));
+    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(Arc::clone(
+        &storage,
+    ))?));
 
     info!("Kube-proxy initialized successfully");
     info!("Syncing services every {} seconds", config.sync_interval);

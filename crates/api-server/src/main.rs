@@ -33,7 +33,7 @@ use rusternetes_common::auth::TokenManager;
 use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::tls::TlsConfig;
-use rusternetes_storage::{StorageBackend, StorageConfig, Storage};
+use rusternetes_storage::{Storage, StorageBackend, StorageConfig};
 use state::ApiServerState;
 use std::sync::Arc;
 use tracing::debug;
@@ -127,7 +127,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir.clone() }
+            StorageConfig::Sqlite {
+                path: args.data_dir.clone(),
+            }
         }
         _ => {
             let etcd_endpoints: Vec<String> = args
@@ -136,7 +138,9 @@ async fn main() -> Result<()> {
                 .map(|s| s.trim().to_string())
                 .collect();
             info!("Connecting to etcd: {:?}", etcd_endpoints);
-            StorageConfig::Etcd { endpoints: etcd_endpoints }
+            StorageConfig::Etcd {
+                endpoints: etcd_endpoints,
+            }
         }
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
@@ -354,7 +358,8 @@ async fn main() -> Result<()> {
         {
             let builder = server.http_builder();
             // Set timer first — required for HTTP/2 keepalive to function
-            builder.http2()
+            builder
+                .http2()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .initial_stream_window_size(256 * 1024) // 256KB per stream (K8s: 256KB)
                 .initial_connection_window_size(256 * 1024 * 100) // 25MB total (K8s: 256KB * 100)

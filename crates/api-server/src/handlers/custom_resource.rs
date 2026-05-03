@@ -202,7 +202,6 @@ pub async fn create_custom_resource(
     // Run admission webhooks (mutating + validating) for custom resources
     // K8s runs webhooks for ALL resource types including CRDs
     {
-        
         let gvk = rusternetes_common::admission::GroupVersionKind {
             group: group.clone(),
             version: version.clone(),
@@ -251,7 +250,8 @@ pub async fn create_custom_resource(
                 None,
                 &user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(rusternetes_common::Error::Forbidden(format!(
                 "admission webhook denied the request: {}",
                 reason
@@ -412,14 +412,13 @@ pub async fn update_custom_resource(
 
     // Strict field validation: reject unknown top-level fields for CRDs
     let is_strict = params.get("fieldValidation").map(|v| v.as_str()) == Some("Strict");
-    if is_strict
-        && !cr.extra.is_empty() {
-            let unknown: Vec<&String> = cr.extra.keys().collect();
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "strict decoding error: unknown field \"{}\"",
-                unknown[0]
-            )));
-        }
+    if is_strict && !cr.extra.is_empty() {
+        let unknown: Vec<&String> = cr.extra.keys().collect();
+        return Err(rusternetes_common::Error::InvalidResource(format!(
+            "strict decoding error: unknown field \"{}\"",
+            unknown[0]
+        )));
+    }
     crate::handlers::validation::validate_strict_fields(&params, &body, &cr)?;
 
     // Find the CRD for this resource type
@@ -521,7 +520,8 @@ pub async fn update_custom_resource(
                 None,
                 &user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
@@ -1018,7 +1018,6 @@ pub async fn delete_custom_resource(
     // K8s runs validating admission (including webhooks) before deletion.
     // Mutating webhooks are NOT called on DELETE in K8s — only validating.
     {
-        
         let kind = crd.spec.names.kind.clone();
         let gvk = rusternetes_common::admission::GroupVersionKind {
             group: group.clone(),
@@ -1050,7 +1049,8 @@ pub async fn delete_custom_resource(
                 cr_value,
                 &user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(rusternetes_common::Error::Forbidden(format!(
                 "admission webhook denied the request: {}",
                 reason
@@ -1138,11 +1138,7 @@ fn apply_schema_defaults(crd: &CustomResourceDefinition, version: &str, cr: &mut
 /// K8s removes fields not in the schema unless x-kubernetes-preserve-unknown-fields is set.
 /// This runs AFTER webhook mutation so webhook-added fields not in the schema are removed.
 /// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning
-fn prune_custom_resource(
-    crd: &CustomResourceDefinition,
-    version: &str,
-    cr: &mut CustomResource,
-) {
+fn prune_custom_resource(crd: &CustomResourceDefinition, version: &str, cr: &mut CustomResource) {
     let crd_version = match crd.spec.versions.iter().find(|v| v.name == version) {
         Some(v) => v,
         None => return,
@@ -1205,7 +1201,8 @@ fn prune_custom_resource(
                             if !allowed_keys.contains(&k) {
                                 tracing::debug!(
                                     "Pruning unknown field '{}.{}' from CR",
-                                    field_name, k
+                                    field_name,
+                                    k
                                 );
                                 obj.remove(&k);
                             }

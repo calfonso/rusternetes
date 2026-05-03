@@ -764,10 +764,9 @@ pub async fn patch_crd(
                 state.storage.get::<serde_json::Value>(&key).await.ok();
 
             // Parse desired resource
-            let desired_json: serde_json::Value =
-                serde_json::from_slice(&body).map_err(|e| {
-                    rusternetes_common::Error::InvalidResource(format!("Invalid resource: {}", e))
-                })?;
+            let desired_json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!("Invalid resource: {}", e))
+            })?;
 
             let force = params
                 .get("force")
@@ -850,9 +849,8 @@ pub async fn patch_crd(
     let current_json: serde_json::Value = state.storage.get(&key).await?;
 
     // Parse patch document
-    let patch_json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e))
-    })?;
+    let patch_json: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e)))?;
 
     // Apply patch to raw JSON
     let mut patched_json = crate::patch::apply_patch(&current_json, &patch_json, patch_type)
@@ -883,12 +881,9 @@ pub async fn patch_crd(
 
     // Validate that the patched JSON can still be parsed as a CRD (catch structural errors)
     // but do NOT use the typed struct for storage — store the raw JSON directly.
-    let _validate: CustomResourceDefinition =
-        serde_json::from_value(patched_json.clone()).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Patched CRD is not valid: {}",
-                e
-            ))
+    let _validate: CustomResourceDefinition = serde_json::from_value(patched_json.clone())
+        .map_err(|e| {
+            rusternetes_common::Error::InvalidResource(format!("Patched CRD is not valid: {}", e))
         })?;
 
     // Check if this is a dry-run request

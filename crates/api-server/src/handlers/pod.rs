@@ -1085,7 +1085,10 @@ pub async fn list_all_pods(
         continue_token,
     };
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Apply pagination
     let paginated = match rusternetes_common::paginate(pods, pagination_params, &resource_version) {

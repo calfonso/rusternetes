@@ -6,9 +6,7 @@
 //! "should complete a service status lifecycle" where the watcher must see
 //! the DELETED event after a service is deleted.
 
-use rusternetes_api_server::handlers::watch::{
-    build_delete_fallback_json, extract_rv_from_json,
-};
+use rusternetes_api_server::handlers::watch::{build_delete_fallback_json, extract_rv_from_json};
 
 /// Test that extract_rv_from_json extracts resourceVersion from valid JSON.
 #[test]
@@ -33,7 +31,8 @@ fn test_extract_rv_from_json_without_rv() {
 /// Test that build_delete_fallback_json constructs valid DELETE event from raw JSON.
 #[test]
 fn test_build_delete_fallback_from_valid_json() {
-    let prev_value = r#"{"metadata":{"name":"my-svc","namespace":"default","resourceVersion":"10"},"spec":{}}"#;
+    let prev_value =
+        r#"{"metadata":{"name":"my-svc","namespace":"default","resourceVersion":"10"},"spec":{}}"#;
     let key = "/registry/services/default/my-svc";
 
     let json = build_delete_fallback_json(key, prev_value).unwrap();
@@ -121,10 +120,7 @@ fn test_build_delete_fallback_minimal_metadata() {
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed["type"].as_str(), Some("DELETED"));
-    assert_eq!(
-        parsed["object"]["metadata"]["name"].as_str(),
-        Some("svc")
-    );
+    assert_eq!(parsed["object"]["metadata"]["name"].as_str(), Some("svc"));
     assert_eq!(
         parsed["object"]["metadata"]["resourceVersion"].as_str(),
         Some("100")

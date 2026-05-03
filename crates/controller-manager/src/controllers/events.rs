@@ -137,7 +137,7 @@ impl<S: Storage + 'static> EventsController<S> {
                 Some(Phase::Pending) => {
                     // Check if pod is scheduled
                     if let Some(spec) = &pod.spec {
-                        if spec.node_name.is_some() {
+                        if spec.node_name.as_deref().is_some_and(|n| !n.is_empty()) {
                             self.create_event_if_new(
                                 namespace,
                                 &pod_ref,

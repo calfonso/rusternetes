@@ -3,7 +3,7 @@ use rusternetes_common::resources::{
     Deployment, Pod, RecommendedContainerResources, RecommendedPodResources, ReplicaSet,
     StatefulSet, VerticalPodAutoscaler, VerticalPodAutoscalerStatus,
 };
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -103,19 +103,24 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("verticalpodautoscalers", Some(ns), name);
-            match self.storage.get::<VerticalPodAutoscaler>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_vpa(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<VerticalPodAutoscaler>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_vpa(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -126,13 +131,17 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<VerticalPodAutoscaler>("/registry/verticalpodautoscalers/").await {
+        match self
+            .storage
+            .list::<VerticalPodAutoscaler>("/registry/verticalpodautoscalers/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("verticalpodautoscalers/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("verticalpodautoscalers/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }

@@ -1,8 +1,6 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use rusternetes_common::{
-    resources::{
-        LimitRange, Pod, ResourceQuota, ServiceAccount, Volume, VolumeMount,
-    },
+    resources::{LimitRange, Pod, ResourceQuota, ServiceAccount, Volume, VolumeMount},
     types::ResourceRequirements,
 };
 use rusternetes_storage::Storage;
@@ -333,9 +331,12 @@ pub async fn check_resource_quota<S: Storage>(
         // K8s treats any quota key starting with "requests." that isn't
         // cpu/memory/ephemeral-storage as an extended resource.
         for (key, limit_str) in &hard {
-            if key.starts_with("requests.") && !matches!(key.as_str(),
-                "requests.cpu" | "requests.memory" | "requests.ephemeral-storage"
-            ) {
+            if key.starts_with("requests.")
+                && !matches!(
+                    key.as_str(),
+                    "requests.cpu" | "requests.memory" | "requests.ephemeral-storage"
+                )
+            {
                 // Extended resource name is the part after "requests."
                 let ext_name = &key["requests.".len()..];
                 let limit: i64 = limit_str.parse().unwrap_or(i64::MAX);
@@ -346,13 +347,20 @@ pub async fn check_resource_quota<S: Storage>(
                     .unwrap_or(0);
                 // Get this pod's request for the resource
                 let pod_request: i64 = pod
-                    .spec.as_ref()
-                    .map(|s| s.containers.iter()
-                        .filter_map(|c| c.resources.as_ref()
-                            .and_then(|r| r.requests.as_ref())
-                            .and_then(|reqs| reqs.get(ext_name))
-                            .and_then(|v| v.parse::<i64>().ok()))
-                        .sum::<i64>())
+                    .spec
+                    .as_ref()
+                    .map(|s| {
+                        s.containers
+                            .iter()
+                            .filter_map(|c| {
+                                c.resources
+                                    .as_ref()
+                                    .and_then(|r| r.requests.as_ref())
+                                    .and_then(|reqs| reqs.get(ext_name))
+                                    .and_then(|v| v.parse::<i64>().ok())
+                            })
+                            .sum::<i64>()
+                    })
                     .unwrap_or(0);
                 if pod_request > 0 && current + pod_request > limit {
                     exceeded.push(format!(

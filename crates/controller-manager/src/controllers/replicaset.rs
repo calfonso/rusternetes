@@ -1,9 +1,9 @@
+use futures::StreamExt;
 use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicaSet, ReplicaSetStatus},
     types::{ObjectMeta, Phase},
 };
-use futures::StreamExt;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -25,7 +25,6 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         info!("ReplicaSet controller started (watch-based)");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -44,7 +43,10 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
@@ -54,7 +56,10 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             let mut pod_watch = match self.storage.watch(&pod_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish pod watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
@@ -111,19 +116,20 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("replicasets", Some(ns), name);
             match self.storage.get::<ReplicaSet>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_replicaset(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_replicaset(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -134,13 +140,17 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<ReplicaSet>("/registry/replicasets/").await {
+        match self
+            .storage
+            .list::<ReplicaSet>("/registry/replicasets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("replicasets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("replicasets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -152,7 +162,11 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
     /// When a pod changes, check its ownerReferences for a ReplicaSet owner
     /// and enqueue that ReplicaSet for reconciliation.
-    async fn enqueue_owner_replicaset(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+    async fn enqueue_owner_replicaset(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
         let pod_key = extract_key(event);
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -166,16 +180,24 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 if let Some(refs) = &pod.metadata.owner_references {
                     for owner_ref in refs {
                         if owner_ref.kind == "ReplicaSet" {
-                            queue.add(format!("replicasets/{}/{}", ns, owner_ref.name)).await;
+                            queue
+                                .add(format!("replicasets/{}/{}", ns, owner_ref.name))
+                                .await;
                         }
                     }
                 }
             }
             Err(_) => {
                 // Pod deleted — enqueue all ReplicaSets in this namespace
-                if let Ok(items) = self.storage.list::<ReplicaSet>(&build_prefix("replicasets", Some(ns))).await {
+                if let Ok(items) = self
+                    .storage
+                    .list::<ReplicaSet>(&build_prefix("replicasets", Some(ns)))
+                    .await
+                {
                     for rs in &items {
-                        queue.add(format!("replicasets/{}/{}", ns, rs.metadata.name)).await;
+                        queue
+                            .add(format!("replicasets/{}/{}", ns, rs.metadata.name))
+                            .await;
                     }
                 }
             }

@@ -191,8 +191,6 @@ impl Storage for MemoryStorage {
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
-        
-
         let mut rx = self.watch_tx.subscribe();
         let prefix = prefix.to_string();
 

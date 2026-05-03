@@ -5,7 +5,7 @@ use rusternetes_common::resources::endpointslice::{
 };
 use rusternetes_common::resources::{EndpointSlice, Endpoints, Pod, Service};
 use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -38,7 +38,6 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     /// and enqueue them for reconciliation.
     /// When an endpoint changes, we enqueue it for mirroring (services without selectors).
     pub async fn run(self: Arc<Self>) -> Result<()> {
-
         let queue = WorkQueue::new();
         // Separate queue for endpoints mirroring
         let mirror_queue = WorkQueue::new();
@@ -157,7 +156,11 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
 
     /// When a pod changes, find services in the same namespace whose selector
     /// matches the pod and enqueue them for reconciliation.
-    async fn enqueue_services_for_pod(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+    async fn enqueue_services_for_pod(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
         let pod_key = extract_key(event);
         // Parse pod key: "pods/{namespace}/{name}"
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
@@ -171,13 +174,19 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         let pod: Option<Pod> = self.storage.get(&storage_key).await.ok();
 
         // List services in this namespace and find matches
-        if let Ok(services) = self.storage.list::<Service>(&build_prefix("services", Some(ns))).await {
+        if let Ok(services) = self
+            .storage
+            .list::<Service>(&build_prefix("services", Some(ns)))
+            .await
+        {
             match pod {
                 Some(ref pod) => {
                     for svc in &services {
                         if let Some(ref selector) = svc.spec.selector {
                             if Self::labels_match(selector, &pod.metadata.labels) {
-                                queue.add(format!("services/{}/{}", ns, svc.metadata.name)).await;
+                                queue
+                                    .add(format!("services/{}/{}", ns, svc.metadata.name))
+                                    .await;
                             }
                         }
                     }
@@ -186,7 +195,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     // Pod was deleted -- enqueue all services in this namespace
                     // since we don't know which ones matched
                     for svc in &services {
-                        queue.add(format!("services/{}/{}", ns, svc.metadata.name)).await;
+                        queue
+                            .add(format!("services/{}/{}", ns, svc.metadata.name))
+                            .await;
                     }
                 }
             }
@@ -194,7 +205,10 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     }
 
     /// Check if all selector key-value pairs exist in the pod's labels.
-    fn labels_match(selector: &std::collections::HashMap<String, String>, labels: &Option<std::collections::HashMap<String, String>>) -> bool {
+    fn labels_match(
+        selector: &std::collections::HashMap<String, String>,
+        labels: &Option<std::collections::HashMap<String, String>>,
+    ) -> bool {
         let labels = match labels {
             Some(l) => l,
             None => return selector.is_empty(),
@@ -208,19 +222,20 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("services", Some(ns), name);
             match self.storage.get::<Service>(&storage_key).await {
-                Ok(service) => {
-                    match self.reconcile_service(&service).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            tracing::error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(service) => match self.reconcile_service(&service).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        tracing::error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     queue.forget(&key).await;
                 }
@@ -237,7 +252,10 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             match self.mirror_endpoint(ns, name).await {
                 Ok(()) => queue.forget(&key).await,
@@ -265,18 +283,27 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 let existing_slices: Vec<EndpointSlice> =
                     self.storage.list(&es_prefix).await.unwrap_or_default();
                 for slice in &existing_slices {
-                    let managed = slice.metadata.labels.as_ref()
+                    let managed = slice
+                        .metadata
+                        .labels
+                        .as_ref()
                         .and_then(|l| l.get("endpointslice.kubernetes.io/managed-by"))
                         .map(|m| m == "endpointslice-mirroring-controller.k8s.io")
                         .unwrap_or(false);
-                    let owned = slice.metadata.labels.as_ref()
+                    let owned = slice
+                        .metadata
+                        .labels
+                        .as_ref()
                         .and_then(|l| l.get("kubernetes.io/service-name"))
                         .map(|n| n == name)
                         .unwrap_or(false);
                     if managed && owned {
                         let slice_key = build_key("endpointslices", Some(ns), &slice.metadata.name);
                         let _ = self.storage.delete(&slice_key).await;
-                        debug!("Deleted mirrored EndpointSlice {}/{} (source Endpoints deleted)", ns, slice.metadata.name);
+                        debug!(
+                            "Deleted mirrored EndpointSlice {}/{} (source Endpoints deleted)",
+                            ns, slice.metadata.name
+                        );
                     }
                 }
                 return Ok(());
@@ -295,7 +322,10 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         // If so, the main endpointslice controller handles it, skip mirroring.
         let svc_key = build_key("services", Some(ns), name);
         if let Ok(svc) = self.storage.get::<Service>(&svc_key).await {
-            let has_selector = svc.spec.selector.as_ref()
+            let has_selector = svc
+                .spec
+                .selector
+                .as_ref()
                 .map(|sel| !sel.is_empty())
                 .unwrap_or(false);
             if has_selector {
@@ -359,7 +389,10 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                             debug!("Updated mirrored EndpointSlice {}/{}", ns, slice_name);
                         }
                         Err(e) => {
-                            debug!("Failed to update mirrored EndpointSlice {}/{}: {}", ns, slice_name, e);
+                            debug!(
+                                "Failed to update mirrored EndpointSlice {}/{}: {}",
+                                ns, slice_name, e
+                            );
                         }
                     }
                 }
@@ -371,7 +404,10 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                             info!("Created mirrored EndpointSlice {}/{}", ns, slice_name);
                         }
                         Err(e) => {
-                            debug!("Failed to create mirrored EndpointSlice {}/{}: {}", ns, slice_name, e);
+                            debug!(
+                                "Failed to create mirrored EndpointSlice {}/{}: {}",
+                                ns, slice_name, e
+                            );
                         }
                     }
                 }
@@ -602,8 +638,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             None => return Ok(()), // nil selector = skip (headless without selector)
         };
 
-        debug!(
-            "Reconciling endpointslices for service {}/{}",
+        // Log at INFO so we can confirm the controller reconciles after pod changes
+        info!(
+            "Reconciling endpointslices for service {}/{} (matching_pods will follow)",
             namespace, service_name
         );
 
@@ -632,6 +669,14 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     && pod.metadata.deletion_timestamp.is_none()
             })
             .collect();
+
+        info!(
+            "EndpointSlice reconcile {}/{}: {} matching pods (from {} total in namespace)",
+            namespace,
+            service_name,
+            matching_pods.len(),
+            all_pods.len()
+        );
 
         // Group pods by their resolved port mapping.
         // Each group gets its own EndpointSlice with only the ports those pods serve.
@@ -769,9 +814,11 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     slice.metadata.resource_version = existing.metadata.resource_version;
                     match self.storage.update(&slice_key, &slice).await {
                         Ok(_) => {
-                            debug!(
-                                "Updated endpointslice {}/{} for service",
-                                namespace, slice_name
+                            info!(
+                                "Updated endpointslice {}/{} for service ({} endpoints)",
+                                namespace,
+                                slice_name,
+                                slice.endpoints.len()
                             );
                         }
                         Err(e) => return Err(e.into()),
@@ -1041,6 +1088,114 @@ mod tests {
         assert!(
             storage.get::<EndpointSlice>(&key2).await.is_err(),
             "controller-managed orphan EndpointSlice should be deleted"
+        );
+    }
+
+    /// Regression test: when a service is created before its pods, the
+    /// EndpointSlice is initially empty. When pods become ready, the
+    /// EndpointSlice must be UPDATED with the pod's IP and ready=true.
+    /// Bug: the controller created empty slices but never updated them,
+    /// causing kube-proxy to never generate DNAT rules for the service.
+    #[tokio::test]
+    async fn test_endpointslice_updates_when_pod_becomes_ready() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointSliceController::new(Arc::clone(&storage));
+
+        // 1. Create a service with one port (port 80, no targetPort)
+        let service = Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("endpoint-test2").with_namespace("test-ns"),
+            spec: ServiceSpec {
+                ports: vec![ServicePort {
+                    name: None,
+                    port: 80,
+                    target_port: None,
+                    protocol: Some("TCP".to_string()),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                selector: Some(HashMap::from([("app".to_string(), "test".to_string())])),
+                ..Default::default()
+            },
+            status: None,
+        };
+        let svc_key = build_key("services", Some("test-ns"), "endpoint-test2");
+        storage.create(&svc_key, &service).await.unwrap();
+
+        // 2. Reconcile with no pods — should create empty EndpointSlice
+        controller.reconcile_service(&service).await.unwrap();
+
+        let es_key = build_key("endpointslices", Some("test-ns"), "endpoint-test2");
+        let es = storage.get::<EndpointSlice>(&es_key).await.unwrap();
+        assert!(
+            es.endpoints.is_empty(),
+            "EndpointSlice should be empty when no pods exist"
+        );
+        assert!(
+            !es.ports.is_empty(),
+            "EndpointSlice should have ports from the service"
+        );
+
+        // 3. Create a matching pod with IP and Ready condition
+        let pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("pod1")
+                .with_namespace("test-ns")
+                .with_labels(HashMap::from([("app".to_string(), "test".to_string())])),
+            spec: Some(rusternetes_common::resources::PodSpec {
+                containers: vec![rusternetes_common::resources::Container {
+                    name: "agnhost".to_string(),
+                    ports: Some(vec![ContainerPort {
+                        container_port: 80,
+                        name: None,
+                        protocol: None,
+                        host_port: None,
+                        host_ip: None,
+                    }]),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(rusternetes_common::resources::PodStatus {
+                phase: Some(rusternetes_common::types::Phase::Running),
+                pod_ip: Some("10.89.0.22".to_string()),
+                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: None,
+                    message: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
+        };
+        let pod_key = build_key("pods", Some("test-ns"), "pod1");
+        storage.create(&pod_key, &pod).await.unwrap();
+
+        // 4. Reconcile again — EndpointSlice MUST be updated with the pod
+        controller.reconcile_service(&service).await.unwrap();
+
+        let es_updated = storage.get::<EndpointSlice>(&es_key).await.unwrap();
+        assert_eq!(
+            es_updated.endpoints.len(),
+            1,
+            "EndpointSlice must have 1 endpoint after pod becomes ready"
+        );
+        assert_eq!(es_updated.endpoints[0].addresses, vec!["10.89.0.22"]);
+        assert_eq!(
+            es_updated.endpoints[0]
+                .conditions
+                .as_ref()
+                .and_then(|c| c.ready),
+            Some(true),
+            "Endpoint must be marked ready"
         );
     }
 }

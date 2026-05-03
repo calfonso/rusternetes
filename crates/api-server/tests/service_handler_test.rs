@@ -644,9 +644,8 @@ async fn test_service_create_initializes_status() {
     assert!(json.get("loadBalancer").is_some());
     let lb = json.get("loadBalancer").unwrap();
     // ingress is skipped when empty due to skip_serializing_if
-    assert!(
-        lb.get("ingress")
-            .and_then(|v| v.as_array())
-            .is_none_or(|a| a.is_empty())
-    );
+    assert!(lb
+        .get("ingress")
+        .and_then(|v| v.as_array())
+        .is_none_or(|a| a.is_empty()));
 }

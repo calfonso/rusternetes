@@ -90,8 +90,7 @@ mod tests {
 
         let mut url_path = format!("/api/v1/namespaces/{}/pods/{}/attach", namespace, pod_name);
 
-        let query_params = ["stdout=true".to_string(),
-            "stderr=true".to_string()];
+        let query_params = ["stdout=true".to_string(), "stderr=true".to_string()];
 
         if !query_params.is_empty() {
             url_path.push('?');
@@ -111,9 +110,11 @@ mod tests {
 
         let mut url_path = format!("/api/v1/namespaces/{}/pods/{}/attach", namespace, pod_name);
 
-        let query_params = ["stdout=true".to_string(),
+        let query_params = [
+            "stdout=true".to_string(),
             "stderr=true".to_string(),
-            "stdin=true".to_string()];
+            "stdin=true".to_string(),
+        ];
         // tty is false, so not added
 
         url_path.push('?');

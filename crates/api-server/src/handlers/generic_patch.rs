@@ -306,7 +306,8 @@ where
                 Some(current_json),
                 &user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(rusternetes_common::Error::Forbidden(format!(
                 "admission webhook denied the request: {}",
                 reason
@@ -337,8 +338,9 @@ where
                 .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
             let re_patched = apply_patch(&fresh_json, &patch_json, patch_type_for_retry)
                 .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
-            let re_patched_resource: T = serde_json::from_value(re_patched)
-                .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e)))?;
+            let re_patched_resource: T = serde_json::from_value(re_patched).map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
+            })?;
             let updated = state.storage.update(&key, &re_patched_resource).await?;
             Ok(Json(updated))
         }

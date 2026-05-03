@@ -78,7 +78,6 @@ fn generate_uid() -> String {
     String::new()
 }
 
-
 impl ObjectMeta {
     pub fn new(name: impl Into<String>) -> Self {
         Self {

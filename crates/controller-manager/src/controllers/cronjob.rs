@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::workloads::{CronJob, CronJobStatus, Job};
 use rusternetes_common::types::OwnerReference;
-use rusternetes_storage::{Storage, WorkQueue, extract_key, build_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -24,7 +24,6 @@ impl<S: Storage + 'static> CronJobController<S> {
         // watch events — a cron trigger is time-based, not change-based.
         let resync_secs = 10;
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -43,7 +42,10 @@ impl<S: Storage + 'static> CronJobController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -86,13 +88,16 @@ impl<S: Storage + 'static> CronJobController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("cronjobs", Some(ns), name);
             match self.storage.get::<CronJob>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile(&mut resource).await {
+                    match self.reconcile(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -114,9 +119,9 @@ impl<S: Storage + 'static> CronJobController<S> {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("cronjobs/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("cronjobs/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -200,7 +205,8 @@ impl<S: Storage + 'static> CronJobController<S> {
 
         let concurrency_policy = cronjob
             .spec
-            .concurrency_policy.as_deref()
+            .concurrency_policy
+            .as_deref()
             .unwrap_or("Allow");
 
         match concurrency_policy {

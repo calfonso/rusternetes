@@ -97,9 +97,10 @@ pub async fn create_validating_webhook(
                     // an additional validation step — genuinely invalid syntax
                     // will fail at execution even with no variables.
                     let test_ctx = cel::Context::default();
-                    let exec_result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| program.execute(&test_ctx)),
-                    );
+                    let exec_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            program.execute(&test_ctx)
+                        }));
                     match exec_result {
                         Ok(Ok(_)) => {} // Valid expression
                         Ok(Err(e)) => {
@@ -397,9 +398,10 @@ pub async fn create_mutating_webhook(
                     // The cel crate's parser accepts some invalid expressions.
                     // Try executing with empty context as validation.
                     let test_ctx = cel::Context::default();
-                    let exec_result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| program.execute(&test_ctx)),
-                    );
+                    let exec_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            program.execute(&test_ctx)
+                        }));
                     match exec_result {
                         Ok(Ok(_)) => {}
                         Ok(Err(e)) => {

@@ -75,7 +75,6 @@ pub async fn create(
 
     // Run admission webhooks (mutating + validating)
     {
-        
         let gvr = rusternetes_common::admission::GroupVersionResource {
             group: "".to_string(),
             version: "v1".to_string(),
@@ -128,7 +127,8 @@ pub async fn create(
                 None,
                 &user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(rusternetes_common::Error::Forbidden(format!(
                 "admission webhook denied the request: {}",
                 reason
@@ -228,7 +228,6 @@ pub async fn update(
 
     // Run admission webhooks (mutating + validating) for UPDATE
     {
-        
         let gvr = rusternetes_common::admission::GroupVersionResource {
             group: "".to_string(),
             version: "v1".to_string(),
@@ -280,7 +279,8 @@ pub async fn update(
                 None,
                 &user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(rusternetes_common::Error::Forbidden(format!(
                 "admission webhook denied the request: {}",
                 reason

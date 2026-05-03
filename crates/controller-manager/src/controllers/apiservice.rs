@@ -126,7 +126,10 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("EndpointSlice watch failed for apiservice controller: {}", e);
+                    error!(
+                        "EndpointSlice watch failed for apiservice controller: {}",
+                        e
+                    );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -225,8 +228,13 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             Some(n) => n.to_string(),
             None => {
                 // Local APIService (no service backing) — always available
-                self.update_condition(name, "True", "Local", "Local APIService is always available")
-                    .await?;
+                self.update_condition(
+                    name,
+                    "True",
+                    "Local",
+                    "Local APIService is always available",
+                )
+                .await?;
                 return Ok(());
             }
         };

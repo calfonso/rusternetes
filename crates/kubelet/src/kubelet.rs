@@ -8,7 +8,7 @@ use rusternetes_common::{
     },
     types::Phase,
 };
-use rusternetes_storage::{build_key, build_prefix, StorageBackend, Storage, WatchEvent};
+use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend, WatchEvent};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -112,6 +112,22 @@ impl Kubelet {
         // reconciliation at startup to ensure no stale containers remain.
         self.startup_cleanup().await;
 
+        // Container GC — runs every 60 seconds to remove dead containers.
+        // K8s ref: pkg/kubelet/kubelet.go — ContainerGCPeriod = 1 minute
+        {
+            let gc_self = Arc::clone(self);
+            tokio::spawn(async move {
+                // Wait before first GC run to let startup_cleanup finish
+                // and pods populate in etcd
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let mut gc_timer = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    gc_timer.tick().await;
+                    gc_self.container_gc().await;
+                }
+            });
+        }
+
         // Channel for watch events to trigger immediate pod syncs
         let (watch_tx, mut watch_rx) = mpsc::channel::<String>(256);
 
@@ -153,9 +169,16 @@ impl Kubelet {
                                             pod.pointer("/spec/nodeName").and_then(|v| v.as_str());
                                         if assigned_node == Some(&node_name) {
                                             // Cache the pod spec so orphan cleanup can run preStop hooks
-                                            if let Some(pod_name) = pod.pointer("/metadata/name").and_then(|v| v.as_str()) {
-                                                let cached_pod = serde_json::from_value::<Pod>(pod.clone()).ok();
-                                                recently_deleted_clone.lock().unwrap().insert(pod_name.to_string(), cached_pod);
+                                            if let Some(pod_name) = pod
+                                                .pointer("/metadata/name")
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                let cached_pod =
+                                                    serde_json::from_value::<Pod>(pod.clone()).ok();
+                                                recently_deleted_clone
+                                                    .lock()
+                                                    .unwrap()
+                                                    .insert(pod_name.to_string(), cached_pod);
                                             }
                                             let _ = watch_tx_clone.try_send(key);
                                         }
@@ -575,7 +598,9 @@ impl Kubelet {
                 for condition in conditions.iter_mut() {
                     if condition.condition_type == "Ready" {
                         let now = chrono::Utc::now();
-                        let last = condition.last_heartbeat_time.unwrap_or(now - chrono::Duration::seconds(60));
+                        let last = condition
+                            .last_heartbeat_time
+                            .unwrap_or(now - chrono::Duration::seconds(60));
                         let stale = (now - last).num_seconds() > 10;
                         if stale {
                             condition.last_heartbeat_time = Some(now);
@@ -629,8 +654,7 @@ impl Kubelet {
                         for taint in &no_execute_taints {
                             let tolerated = tolerations.is_some_and(|tols| {
                                 tols.iter().any(|t| {
-                                    let key_match =
-                                        t.key.as_deref().is_none_or(|k| k == taint.key);
+                                    let key_match = t.key.as_deref().is_none_or(|k| k == taint.key);
                                     let effect_match =
                                         t.effect.as_deref().is_none_or(|e| e == taint.effect);
                                     let op = t.operator.as_deref().unwrap_or("Equal");
@@ -772,8 +796,10 @@ impl Kubelet {
 
         // Clean up workers for pods that are no longer assigned to this node
         {
-            let worker_names: Vec<String> = self.pod_workers.lock().unwrap().keys().cloned().collect();
-            let pod_names: HashSet<&str> = node_pods.iter().map(|p| p.metadata.name.as_str()).collect();
+            let worker_names: Vec<String> =
+                self.pod_workers.lock().unwrap().keys().cloned().collect();
+            let pod_names: HashSet<&str> =
+                node_pods.iter().map(|p| p.metadata.name.as_str()).collect();
             for name in worker_names {
                 if !pod_names.contains(name.as_str()) {
                     // Pod no longer exists — remove worker (it will shut down on next recv)
@@ -788,7 +814,11 @@ impl Kubelet {
         for pod in &node_pods {
             let pod = pod.clone();
             let kubelet = Arc::clone(self);
-            let timeout_secs = if pod.metadata.deletion_timestamp.is_some() { 90u64 } else { 30u64 };
+            let timeout_secs = if pod.metadata.deletion_timestamp.is_some() {
+                90u64
+            } else {
+                30u64
+            };
             tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
@@ -879,10 +909,8 @@ impl Kubelet {
             }
         };
 
-        let existing_pod_names: std::collections::HashSet<String> = all_pods
-            .iter()
-            .map(|p| p.metadata.name.clone())
-            .collect();
+        let existing_pod_names: std::collections::HashSet<String> =
+            all_pods.iter().map(|p| p.metadata.name.clone()).collect();
 
         // Get all containers from Docker (including exited) so orphan cleanup
         // can remove stopped containers from deleted pods
@@ -905,7 +933,10 @@ impl Kubelet {
             return;
         }
 
-        info!("Startup cleanup: found {} stale containers, removing", orphans.len());
+        info!(
+            "Startup cleanup: found {} stale containers, removing",
+            orphans.len()
+        );
 
         // Clean up in parallel (up to 10 concurrent) for fast startup
         let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
@@ -939,22 +970,10 @@ impl Kubelet {
         debug!("Checking for orphaned containers");
 
         // Reuse the pod list already fetched by sync_loop to avoid a redundant etcd round-trip.
-        // Pods in terminal phase (Succeeded/Failed) with deletionTimestamp are effectively
-        // deleted — their containers should be cleaned up. Since the kubelet no longer
-        // deletes pods from storage (K8s rule), we must treat these as orphans.
-        let terminal_pod_names: std::collections::HashSet<String> = all_existing_pods
-            .iter()
-            .filter(|p| {
-                let is_terminal = p.status.as_ref()
-                    .and_then(|s| s.phase.as_ref())
-                    .map(|phase| matches!(phase, Phase::Succeeded | Phase::Failed))
-                    .unwrap_or(false);
-                let has_deletion = p.metadata.deletion_timestamp.is_some();
-                is_terminal && has_deletion
-            })
-            .map(|p| p.metadata.name.clone())
-            .collect();
-
+        // NOTE: Terminal+deleted pod container cleanup is handled by the container GC
+        // (container_gc method), which runs independently every 60 seconds and removes
+        // exited containers. This orphan cleanup only handles containers whose pods
+        // have been fully removed from etcd.
         let existing_pod_names: std::collections::HashSet<String> = all_existing_pods
             .iter()
             .map(|p| p.metadata.name.clone())
@@ -970,21 +989,39 @@ impl Kubelet {
             running_pods.len()
         );
 
-        // Check for orphaned pods (running in container runtime but not in etcd).
-        // IMPORTANT: In a shared Docker daemon (Docker Desktop), ALL kubelets see
-        // ALL containers. We must not kill containers belonging to other nodes' pods.
-        // Only kill a container if its pod name is not found in the COMPLETE pod list
-        // (all namespaces, all nodes).
+        // Check for orphaned pods — running in the container runtime but not
+        // tracked by any pod worker or found in etcd.
+        // K8s ref: pkg/kubelet/kubelet_pods.go:1270 — kills orphaned runtime
+        // pods not in workingPods with a 1-second grace period.
+        //
+        // IMPORTANT: In a shared Docker daemon, ALL kubelets see ALL containers.
+        // We must not kill containers belonging to other nodes' pods.
+        let known_pod_names: std::collections::HashSet<String> = {
+            let states = self.pod_states.lock().unwrap();
+            states.keys().cloned().collect()
+        };
         for running_pod_name in &running_pods {
-            if existing_pod_names.contains(running_pod_name)
-                && !terminal_pod_names.contains(running_pod_name)
-            {
-                continue; // Pod exists in etcd and is not terminal — not an orphan
+            if existing_pod_names.contains(running_pod_name) {
+                continue; // Pod exists in etcd — not an orphan
+            }
+            if known_pod_names.contains(running_pod_name) {
+                continue; // Pod worker is still tracking this pod
             }
             // Fast path: if this pod was explicitly deleted (via watch event),
             // skip the grace period and clean up immediately.
-            let cached_pod = self.recently_deleted.lock().unwrap().get(running_pod_name).cloned().flatten();
-            let is_recently_deleted = cached_pod.is_some() || self.recently_deleted.lock().unwrap().contains_key(running_pod_name);
+            let cached_pod = self
+                .recently_deleted
+                .lock()
+                .unwrap()
+                .get(running_pod_name)
+                .cloned()
+                .flatten();
+            let is_recently_deleted = cached_pod.is_some()
+                || self
+                    .recently_deleted
+                    .lock()
+                    .unwrap()
+                    .contains_key(running_pod_name);
             if !is_recently_deleted {
                 // Check container age — don't kill containers younger than 30s
                 let container_age = self
@@ -1001,7 +1038,10 @@ impl Kubelet {
                 }
             } else {
                 // Remove from tracker — we're about to clean it up
-                self.recently_deleted.lock().unwrap().remove(running_pod_name.as_str());
+                self.recently_deleted
+                    .lock()
+                    .unwrap()
+                    .remove(running_pod_name.as_str());
                 info!(
                     "Fast-path cleanup for explicitly deleted pod {} — skipping grace period",
                     running_pod_name
@@ -1010,24 +1050,21 @@ impl Kubelet {
             // Re-check etcd before cleanup — a new pod with the same name may have
             // been created since we fetched the pod list at the start of sync_loop.
             // Without this check, we'd delete volumes that the new pod needs.
-            // A pod that exists but is terminal+deleted is still an orphan.
             let still_orphaned = {
-                let fresh_pods: Vec<Pod> = self.storage.list("/registry/pods/").await.unwrap_or_default();
-                let matching = fresh_pods.iter().find(|p| p.metadata.name == *running_pod_name);
-                match matching {
-                    None => true, // Pod gone from storage — orphan
-                    Some(p) => {
-                        // Pod exists but is terminal+deleted — treat as orphan
-                        let is_terminal = p.status.as_ref()
-                            .and_then(|s| s.phase.as_ref())
-                            .map(|phase| matches!(phase, Phase::Succeeded | Phase::Failed))
-                            .unwrap_or(false);
-                        is_terminal && p.metadata.deletion_timestamp.is_some()
-                    }
-                }
+                let fresh_pods: Vec<Pod> = self
+                    .storage
+                    .list("/registry/pods/")
+                    .await
+                    .unwrap_or_default();
+                !fresh_pods
+                    .iter()
+                    .any(|p| p.metadata.name == *running_pod_name)
             };
             if !still_orphaned {
-                debug!("Pod {} was recreated in etcd — skipping cleanup", running_pod_name);
+                debug!(
+                    "Pod {} was recreated in etcd — skipping cleanup",
+                    running_pod_name
+                );
                 continue;
             }
 
@@ -1035,66 +1072,73 @@ impl Kubelet {
                 "Found orphaned pod {} - not in etcd, stopping and removing containers",
                 running_pod_name
             );
-            // If we have a cached pod spec, use stop_pod_for to run preStop hooks.
-            // Otherwise fall back to direct stop_and_remove_pod.
+            // Stop orphaned containers. K8s HandlePodCleanups kills orphaned
+            // runtime pods with a 1-second grace period. Container removal is
+            // left to the container GC.
+            // K8s ref: pkg/kubelet/kubelet_pods.go:1280
             if let Some(ref pod) = cached_pod {
-                let has_lifecycle = pod.spec.as_ref().map(|s| {
-                    s.containers.iter().any(|c| c.lifecycle.as_ref().map(|l| l.pre_stop.is_some()).unwrap_or(false))
-                }).unwrap_or(false);
-                if has_lifecycle {
-                    let grace = pod.spec.as_ref()
-                        .and_then(|s| s.termination_grace_period_seconds)
-                        .unwrap_or(30);
-                    info!("Running preStop hooks for deleted pod {} (grace {}s)", running_pod_name, grace);
-                    if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
-                        warn!("preStop hooks failed for pod {}: {}", running_pod_name, e);
-                    }
+                // If we have a cached pod spec, run preStop hooks
+                let grace = pod
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.termination_grace_period_seconds)
+                    .unwrap_or(1); // K8s uses 1s for orphans
+                if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
+                    warn!("Failed to stop orphaned pod {}: {}", running_pod_name, e);
                 }
-                // Clean up remaining containers and volumes
-                if let Err(e) = self.runtime.stop_and_remove_pod(running_pod_name).await {
-                    warn!("Failed to clean up pod {}: {}", running_pod_name, e);
+            } else {
+                // No cached spec — stop with 1s grace, no preStop hooks
+                if let Err(e) = self
+                    .runtime
+                    .stop_pod_with_grace_period(running_pod_name, 1)
+                    .await
+                {
+                    warn!("Failed to stop orphaned pod {}: {}", running_pod_name, e);
                 }
-            } else if let Err(e) = self.runtime.stop_and_remove_pod(running_pod_name).await {
-                warn!(
-                    "Failed to clean up orphaned pod {}: {}",
-                    running_pod_name, e
-                );
             }
         }
 
-        // Clean up stale "Created" containers that were never started (prevents Docker OOM)
-        if let Ok(stale) = self.runtime.list_stale_created_containers().await {
-            for container_id in stale {
-                debug!("Removing stale created container: {}", container_id);
-                let _ = self.runtime.remove_container(&container_id).await;
-            }
-        }
-
-        // Clean up EXITED containers whose pods no longer exist in etcd.
-        // When conformance tests delete namespaces, the pods are removed from etcd
-        // but Docker containers remain in "exited" state. The orphan cleanup only
-        // handles RUNNING containers. This handles EXITED ones.
-        if let Ok(exited_pods) = self.runtime.list_exited_pods().await {
-            for exited_pod_name in &exited_pods {
-                if !existing_pod_names.contains(exited_pod_name) {
-                    // Pod not in etcd — check container age before removing
-                    let age = self
-                        .runtime
-                        .get_container_age(exited_pod_name)
-                        .await
-                        .unwrap_or(std::time::Duration::from_secs(0));
-                    if age > std::time::Duration::from_secs(300) {
-                        debug!(
-                            "Removing exited orphan containers for pod {}",
-                            exited_pod_name
-                        );
-                        let _ = self.runtime.stop_and_remove_pod(exited_pod_name).await;
-                    }
-                }
-            }
-        }
+        // Stale "created" containers and exited orphan containers are handled
+        // by the container GC (garbage_collect_containers), which runs independently
+        // every 60 seconds. K8s ref: pkg/kubelet/kuberuntime/kuberuntime_gc.go
 
         Ok(())
+    }
+
+    /// Container garbage collector — runs independently every 60 seconds.
+    /// Matches K8s kuberuntime_gc.go behavior:
+    /// 1. For deleted pods (not in etcd): remove ALL dead containers
+    /// 2. For existing pods: keep at most 1 dead container per pod (for log access)
+    /// 3. Remove orphaned pause containers (sandboxes) with no running app containers
+    /// 4. Remove stale "created" containers that were never started
+    ///
+    /// K8s ref: pkg/kubelet/kuberuntime/kuberuntime_gc.go — GarbageCollect
+    async fn container_gc(&self) {
+        // Get pod names from etcd to distinguish deleted vs existing pods
+        // K8s ref: evictContainers checks allSourcesReady
+        let existing_pods: HashSet<String> = self
+            .storage
+            .list::<Pod>("/registry/pods/")
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.metadata.name.clone())
+            .collect();
+
+        match self
+            .runtime
+            .garbage_collect_containers(&existing_pods)
+            .await
+        {
+            Ok(removed) => {
+                if removed > 0 {
+                    info!("Container GC: removed {} dead/stale containers", removed);
+                }
+            }
+            Err(e) => {
+                error!("Container GC failed: {}", e);
+            }
+        }
     }
 
     /// Ensure a per-pod worker task exists for the given pod.
@@ -1138,7 +1182,8 @@ impl Kubelet {
                 let signaled = tokio::time::timeout(
                     Duration::from_secs(5), // periodic fallback re-sync
                     rx.recv(),
-                ).await;
+                )
+                .await;
 
                 // If channel closed, pod worker is being removed
                 if matches!(signaled, Ok(None)) {
@@ -1177,11 +1222,17 @@ impl Kubelet {
                         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
                         //   grace_period can be up to terminationGracePeriodSeconds (default 30s)
                         //   plus preStop hook execution time.
-                        let timeout_secs = if pod.metadata.deletion_timestamp.is_some() { 120u64 } else { 30u64 };
+                        let timeout_secs = if pod.metadata.deletion_timestamp.is_some() {
+                            120u64
+                        } else {
+                            30u64
+                        };
                         match tokio::time::timeout(
                             Duration::from_secs(timeout_secs),
                             kubelet.sync_pod(&pod),
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
                                 let err_str = e.to_string();
@@ -1222,7 +1273,10 @@ impl Kubelet {
         {
             let mut locks = self.pod_sync_locks.lock().unwrap();
             if locks.contains(pod_uid) {
-                debug!("Skipping sync for pod {}/{} — already syncing", namespace, pod_name);
+                debug!(
+                    "Skipping sync for pod {}/{} — already syncing",
+                    namespace, pod_name
+                );
                 return Ok(());
             }
             locks.insert(pod_uid.clone());
@@ -1247,27 +1301,69 @@ impl Kubelet {
         // Pod worker state machine dispatch.
         // K8s ref: pkg/kubelet/pod_workers.go — podWorkerLoop
         //
-        // Transition triggers:
-        // - deletionTimestamp set → TerminatingPod (API delete, controller delete)
-        // - eviction → TerminatingPod (handled by eviction manager separately)
-        // - Container creation errors → stay in SyncPod (retry)
-        let current_state = { self.pod_states.lock().unwrap().get(pod_uid).cloned() };
+        // State transitions:
+        // - SyncPod (default): normal operation — create/update containers
+        // - TerminatingPod: pod is being stopped — stop containers, run preStop hooks
+        //   Triggered by: deletionTimestamp set, phase Succeeded/Failed, eviction
+        // - TerminatedPod: all containers stopped — update status, clean volumes
+        //   Container REMOVAL is NOT done here — it's handled by the container GC.
+        //
+        // K8s ref: pkg/kubelet/pod_workers.go:110-117
+        let current_state = {
+            self.pod_states
+                .lock()
+                .unwrap()
+                .get(pod_uid)
+                .cloned()
+                .unwrap_or(PodWorkerState::SyncPod)
+        };
 
-        // Transition to TerminatingPod when deletionTimestamp is set
-        if pod.metadata.deletion_timestamp.is_some()
-            && !matches!(current_state, Some(PodWorkerState::TerminatedPod))
-        {
+        // Determine if we need to transition to TerminatingPod.
+        // Triggers:
+        // 1. deletionTimestamp set (API delete, controller delete)
+        // 2. Pod phase is terminal (Succeeded/Failed) AND restartPolicy prevents
+        //    restart. With restartPolicy=Always, the kubelet restarts containers
+        //    instead of terminating — the pod stays in SyncPod state.
+        //    K8s ref: pkg/kubelet/pod_workers.go — completeSync checks isTerminal
+        //    which is only true when the pod is finished (all containers exited
+        //    and restartPolicy doesn't allow restart).
+        let is_terminal_phase = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_ref())
+            .map(|p| matches!(p, Phase::Succeeded | Phase::Failed))
+            .unwrap_or(false);
+        let restart_policy = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.restart_policy.as_deref())
+            .unwrap_or("Always");
+        let terminal_and_done = is_terminal_phase && restart_policy != "Always";
+        let needs_terminating = (pod.metadata.deletion_timestamp.is_some() || terminal_and_done)
+            && matches!(current_state, PodWorkerState::SyncPod);
+
+        if needs_terminating {
             self.pod_states
                 .lock()
                 .unwrap()
                 .insert(pod_uid.clone(), PodWorkerState::TerminatingPod);
+            // Fall through to TerminatingPod handling below
         }
 
-        // Handle TerminatedPod: update status but do NOT delete from storage.
-        // In real K8s, the kubelet never deletes pods from the API server.
-        // Pod lifecycle is managed by namespace deletion, GC, or Job TTL.
-        // Deleting here breaks tests that need to observe terminal pod status.
-        if matches!(current_state, Some(PodWorkerState::TerminatedPod)) {
+        // Re-read state after potential transition
+        let current_state = {
+            self.pod_states
+                .lock()
+                .unwrap()
+                .get(pod_uid)
+                .cloned()
+                .unwrap_or(PodWorkerState::SyncPod)
+        };
+
+        // === TerminatedPod: update status, clean up resources ===
+        // K8s ref: pkg/kubelet/kubelet.go:2467 — SyncTerminatedPod
+        // Container removal is NOT done here — left to the container GC.
+        if matches!(current_state, PodWorkerState::TerminatedPod) {
             let key = build_key("pods", Some(namespace), pod_name);
             let has_finalizers = pod
                 .metadata
@@ -1289,7 +1385,9 @@ impl Kubelet {
                         // Succeeded, all init containers must have completed.
                         if let Some(ref mut ics) = status.init_container_statuses {
                             for ic in ics.iter_mut() {
-                                if let Some(ContainerState::Terminated { exit_code, .. }) = &ic.state {
+                                if let Some(ContainerState::Terminated { exit_code, .. }) =
+                                    &ic.state
+                                {
                                     if *exit_code == 0 {
                                         ic.ready = true;
                                         ic.started = Some(true);
@@ -1337,19 +1435,21 @@ impl Kubelet {
                     let _ = self.storage.update(&key, &p).await;
                 }
             }
+            // Volumes are cleaned by stop_pod_for during TerminatingPod.
+            // Remove pod worker state — K8s HandlePodCleanups removes finished workers
             self.pod_states.lock().unwrap().remove(pod_uid);
             return Ok(());
         }
 
-        // Check if the pod is marked for deletion (deletionTimestamp set by API server)
-        if pod.metadata.deletion_timestamp.is_some() {
+        // === TerminatingPod: stop containers, transition to TerminatedPod ===
+        // K8s ref: pkg/kubelet/kubelet.go:2398 — SyncTerminatingPod
+        // Stops all containers (with preStop hooks), does NOT remove them.
+        // Container removal is handled by the container GC.
+        if matches!(current_state, PodWorkerState::TerminatingPod) {
             info!(
-                "Pod {}/{} is marked for deletion, stopping gracefully",
+                "Pod {}/{} terminating — stopping containers",
                 namespace, pod_name
             );
-            // Use deletionGracePeriodSeconds (set by the API server's DELETE handler)
-            // when available, falling back to spec.terminationGracePeriodSeconds.
-            // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:849
             let grace_period = pod
                 .metadata
                 .deletion_grace_period_seconds
@@ -1361,115 +1461,39 @@ impl Kubelet {
                 .unwrap_or(30);
 
             // Stop the pod containers, executing preStop lifecycle hooks.
-            // We must stop before deleting from storage to prevent the orphan
-            // cleanup from killing containers without running preStop hooks.
-            // Always call stop_pod_for — it checks each container's state internally.
-            // Skipping via is_pod_running() can race and miss preStop hooks when
-            // containers are transitioning states.
+            // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:849
             if let Err(e) = self.runtime.stop_pod_for(pod, grace_period).await {
                 warn!("Error stopping pod {}/{}: {}", namespace, pod_name, e);
             }
 
-            // Remove stopped containers to prevent accumulation of exited containers.
-            // During conformance tests, hundreds of pods are created and deleted,
-            // and leftover exited containers waste Docker daemon resources.
-            if let Err(e) = self.runtime.stop_and_remove_pod(pod_name).await {
-                debug!(
-                    "Error removing containers for pod {}/{}: {}",
-                    namespace, pod_name, e
-                );
-            }
+            // Transition to TerminatedPod — containers are stopped.
+            self.pod_states
+                .lock()
+                .unwrap()
+                .insert(pod_uid.clone(), PodWorkerState::TerminatedPod);
 
-            // Delete the pod from storage ONLY if it has no finalizers.
-            // K8s keeps pods with finalizers in storage (with deletionTimestamp)
-            // until the finalizer is removed by the owner/controller.
+            // Update pod status to terminal phase.
+            // K8s kubelet NEVER deletes pods from the API server.
             let key = build_key("pods", Some(namespace), pod_name);
-            let has_finalizers = pod
-                .metadata
-                .finalizers
-                .as_ref()
-                .map(|f| !f.is_empty())
-                .unwrap_or(false);
-            if has_finalizers {
-                debug!(
-                    "Pod {}/{} has finalizers, keeping in storage with deletionTimestamp",
-                    namespace, pod_name
-                );
-                // Update status to show pod is terminated but not deleted.
-                // IMPORTANT: Preserve existing conditions (like DisruptionTarget
-                // set by scheduler preemption). K8s doesn't overwrite conditions
-                // when terminating — only updates phase and container statuses.
-                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                    if let Some(ref mut status) = p.status {
-                        // Only change phase if it wasn't already set to Failed
-                        // (e.g., by preemption). Failed takes precedence over Succeeded.
-                        if status.phase != Some(Phase::Failed) {
-                            status.phase = Some(Phase::Succeeded);
-                        }
-                        // Refresh init container statuses — they may have been
-                        // last written while the containers were still running.
-                        // Now that the pod is Succeeded, all init containers
-                        // must have completed successfully (ready=true).
-                        if let Some(ref mut ics) = status.init_container_statuses {
-                            for ic in ics.iter_mut() {
-                                if let Some(ContainerState::Terminated { exit_code, .. }) = &ic.state {
-                                    if *exit_code == 0 {
-                                        ic.ready = true;
-                                        ic.started = Some(true);
-                                    }
-                                } else {
-                                    // Init container state not Terminated but pod succeeded —
-                                    // Docker removed the container. Mark as completed.
-                                    ic.state = Some(ContainerState::Terminated {
-                                        exit_code: 0,
-                                        reason: Some("Completed".to_string()),
-                                        message: None,
-                                        started_at: None,
-                                        finished_at: None,
-                                        container_id: None,
-                                        signal: None,
-                                    });
-                                    ic.ready = true;
-                                    ic.started = Some(true);
-                                }
-                            }
-                        }
+            if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                if let Some(ref mut status) = p.status {
+                    if status.phase != Some(Phase::Failed) {
+                        status.phase = Some(Phase::Succeeded);
                     }
-                    // Refresh container statuses outside the mutable borrow
-                    let fresh_statuses = self.runtime.get_container_statuses(&p).await.ok();
-                    if let Some(ref mut status) = p.status {
-                        if let Some(cs) = fresh_statuses {
-                            status.container_statuses = Some(cs);
-                        }
-                    }
-                    let _ = self.storage.update(&key, &p).await;
+                    Self::fixup_init_container_ready(status);
                 }
-            } else {
-                // K8s kubelet NEVER deletes pods from the API server.
-                // It updates status to terminal phase and lets the API server GC
-                // handle actual deletion. Deleting here breaks tests that need to
-                // observe terminal pod status after deletion.
-                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                    if let Some(ref mut status) = p.status {
-                        if status.phase != Some(Phase::Failed) {
-                            status.phase = Some(Phase::Succeeded);
-                        }
-                        Self::fixup_init_container_ready(status);
+                let fresh_statuses = self.runtime.get_container_statuses(&p).await.ok();
+                if let Some(ref mut status) = p.status {
+                    if let Some(cs) = fresh_statuses {
+                        status.container_statuses = Some(cs);
                     }
-                    // Refresh container statuses
-                    let fresh_statuses = self.runtime.get_container_statuses(&p).await.ok();
-                    if let Some(ref mut status) = p.status {
-                        if let Some(cs) = fresh_statuses {
-                            status.container_statuses = Some(cs);
-                        }
-                    }
-                    let _ = self.storage.update(&key, &p).await;
                 }
-                debug!(
-                    "Pod {}/{} marked terminal (not deleted from storage)",
-                    namespace, pod_name
-                );
+                let _ = self.storage.update(&key, &p).await;
             }
+            debug!(
+                "Pod {}/{} terminated (containers stopped, left for GC)",
+                namespace, pod_name
+            );
             return Ok(());
         }
 
@@ -1572,7 +1596,11 @@ impl Kubelet {
                 if !pod_host_ports.is_empty() {
                     // Get all pods on this node
                     let all_pods_prefix = build_prefix("pods", None);
-                    let all_pods: Vec<Pod> = self.storage.list(&all_pods_prefix).await.unwrap_or_default();
+                    let all_pods: Vec<Pod> = self
+                        .storage
+                        .list(&all_pods_prefix)
+                        .await
+                        .unwrap_or_default();
                     let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
                     let active_on_node: Vec<&Pod> = all_pods
                         .iter()
@@ -1581,7 +1609,8 @@ impl Kubelet {
                             let same_pod = p.metadata.name == pod.metadata.name
                                 && p.metadata.namespace.as_deref().unwrap_or("default") == pod_ns;
                             !same_pod
-                                && p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(&self.node_name)
+                                && p.spec.as_ref().and_then(|s| s.node_name.as_deref())
+                                    == Some(&self.node_name)
                                 && !matches!(
                                     p.status.as_ref().and_then(|s| s.phase.as_ref()),
                                     Some(Phase::Failed) | Some(Phase::Succeeded)
@@ -1615,11 +1644,19 @@ impl Kubelet {
                                                         "Pod {}/{} rejected: hostPort {}/{} conflicts with pod {}",
                                                         namespace, pod_name, port, proto, existing.metadata.name
                                                     );
-                                                    let key = build_key("pods", Some(namespace), pod_name);
-                                                    if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                                                    let key = build_key(
+                                                        "pods",
+                                                        Some(namespace),
+                                                        pod_name,
+                                                    );
+                                                    if let Ok(mut p) =
+                                                        self.storage.get::<Pod>(&key).await
+                                                    {
                                                         if let Some(ref mut status) = p.status {
                                                             status.phase = Some(Phase::Failed);
-                                                            status.reason = Some("HostPortConflict".to_string());
+                                                            status.reason = Some(
+                                                                "HostPortConflict".to_string(),
+                                                            );
                                                             status.message = Some(format!(
                                                                 "Pod was rejected: host port {} is already in use",
                                                                 port
@@ -1877,19 +1914,26 @@ impl Kubelet {
 
                             if let Err(e) = self.storage.update(&key, &new_pod).await {
                                 // Retry with fresh read on conflict (K8s pattern)
-                                if e.to_string().contains("Conflict") || e.to_string().contains("mismatch") {
+                                if e.to_string().contains("Conflict")
+                                    || e.to_string().contains("mismatch")
+                                {
                                     if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
                                         let mut retry_pod = fresh_pod;
                                         if let Some(ref mut status) = retry_pod.status {
                                             status.phase = Some(Phase::Running);
-                                            status.message = Some("All containers ready".to_string());
+                                            status.message =
+                                                Some("All containers ready".to_string());
                                         }
-                                        if let Err(e2) = self.storage.update(&key, &retry_pod).await {
+                                        if let Err(e2) = self.storage.update(&key, &retry_pod).await
+                                        {
                                             warn!("Failed to update pod {}/{} status to Running after retry: {}", namespace, pod_name, e2);
                                         }
                                     }
                                 } else {
-                                    warn!("Failed to update pod {}/{} status to Running: {}", namespace, pod_name, e);
+                                    warn!(
+                                        "Failed to update pod {}/{} status to Running: {}",
+                                        namespace, pod_name, e
+                                    );
                                 }
                             }
                         }
@@ -2326,8 +2370,7 @@ impl Kubelet {
                                         let millicores = crate::runtime::parse_cpu_quantity(cpu);
                                         if millicores > 0 {
                                             // K8s formula: shares = max(2, (millicores * 1024) / 1000)
-                                            cpu_shares =
-                                                Some(((millicores * 1024) / 1000).max(2));
+                                            cpu_shares = Some(((millicores * 1024) / 1000).max(2));
                                             needs_update = true;
                                         }
                                     }
@@ -2344,9 +2387,8 @@ impl Kubelet {
                                             needs_update = true;
                                             // Also set shares from limits if no requests
                                             if cpu_shares.is_none() {
-                                                cpu_shares = Some(
-                                                    ((millicores * 1024) / 1000).max(2),
-                                                );
+                                                cpu_shares =
+                                                    Some(((millicores * 1024) / 1000).max(2));
                                             }
                                         }
                                     }
@@ -2443,14 +2485,18 @@ impl Kubelet {
                                 container.name, namespace, pod_name
                             );
                             let empty_binds = std::collections::HashMap::new();
-                            if let Err(e) = self.runtime.start_container(
-                                pod,
-                                container,
-                                &empty_binds,
-                                None, // netns — pod already has networking via pause
-                                None, // hosts file
-                                pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()),
-                            ).await {
+                            if let Err(e) = self
+                                .runtime
+                                .start_container(
+                                    pod,
+                                    container,
+                                    &empty_binds,
+                                    None, // netns — pod already has networking via pause
+                                    None, // hosts file
+                                    pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()),
+                                )
+                                .await
+                            {
                                 warn!(
                                     "Failed to create missing container {} for pod {}/{}: {}",
                                     container.name, namespace, pod_name, e
@@ -2546,7 +2592,8 @@ impl Kubelet {
                                             Some("Pod completed successfully".to_string());
                                         status.container_statuses = Some(container_statuses);
                                         if init_container_statuses.is_some() {
-                                            status.init_container_statuses = init_container_statuses;
+                                            status.init_container_statuses =
+                                                init_container_statuses;
                                         }
                                         status.conditions = Some(Self::succeeded_pod_conditions());
                                     }
@@ -2614,9 +2661,7 @@ impl Kubelet {
                                             cs.restart_count = prev + 1;
                                             cs.last_state = cs.state.take();
                                             cs.state = Some(ContainerState::Waiting {
-                                                reason: Some(
-                                                    "CrashLoopBackOff".to_string(),
-                                                ),
+                                                reason: Some("CrashLoopBackOff".to_string()),
                                                 message: Some(
                                                     "Back-off restarting failed container"
                                                         .to_string(),
@@ -2644,7 +2689,9 @@ impl Kubelet {
                                     // Only update restart_count and last_state, keep current state
                                     if let Some(ref mut cs_list) = status.container_statuses {
                                         for cs in cs_list.iter_mut() {
-                                            if let Some(updated) = updated_statuses.iter().find(|u| u.name == cs.name) {
+                                            if let Some(updated) =
+                                                updated_statuses.iter().find(|u| u.name == cs.name)
+                                            {
                                                 cs.restart_count = updated.restart_count;
                                                 cs.last_state = updated.last_state.clone();
                                             }
@@ -2658,7 +2705,8 @@ impl Kubelet {
                                 // on successful exit (code 0).
                                 // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — backOff
                                 if has_failed_container {
-                                    let max_restart_count = prev_counts.values().copied().max().unwrap_or(0);
+                                    let max_restart_count =
+                                        prev_counts.values().copied().max().unwrap_or(0);
                                     if max_restart_count > 1 {
                                         let backoff_secs = std::cmp::min(
                                             10u64 * 2u64.pow((max_restart_count - 2).min(8)),
@@ -2762,7 +2810,9 @@ impl Kubelet {
                                 // merged with stale data, resetting the incremented restart count.
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
-                                    if let Ok(fresh_statuses) = self.runtime.get_container_statuses(&fresh_pod).await {
+                                    if let Ok(fresh_statuses) =
+                                        self.runtime.get_container_statuses(&fresh_pod).await
+                                    {
                                         let mut p = fresh_pod;
                                         if let Some(ref mut s) = p.status {
                                             s.container_statuses = Some(fresh_statuses);
@@ -3024,7 +3074,11 @@ impl Kubelet {
                         // restart_count/last_state set during the restart path
                         // above are preserved (the original `pod` variable is stale).
                         let readiness_pod_key = build_key("pods", Some(namespace), pod_name);
-                        let readiness_pod = self.storage.get::<Pod>(&readiness_pod_key).await.unwrap_or_else(|_| pod.clone());
+                        let readiness_pod = self
+                            .storage
+                            .get::<Pod>(&readiness_pod_key)
+                            .await
+                            .unwrap_or_else(|_| pod.clone());
                         if let Ok(container_statuses) =
                             self.runtime.get_container_statuses(&readiness_pod).await
                         {
@@ -3132,7 +3186,8 @@ impl Kubelet {
                                             Some("Pod completed successfully".to_string());
                                         status.container_statuses = Some(container_statuses);
                                         if init_container_statuses.is_some() {
-                                            status.init_container_statuses = init_container_statuses;
+                                            status.init_container_statuses =
+                                                init_container_statuses;
                                         }
                                         status.conditions = Some(Self::succeeded_pod_conditions());
                                     }
@@ -3180,14 +3235,14 @@ impl Kubelet {
                             // Skip update if status hasn't changed — avoids unnecessary
                             // resourceVersion bumps that cause CAS conflicts for kubectl replace.
                             // K8s kubelet uses status manager to diff before writing.
-                            let old_status_json = serde_json::to_value(
-                                pod.status.as_ref(),
-                            ).ok();
-                            let new_status_json = serde_json::to_value(
-                                new_pod.status.as_ref(),
-                            ).ok();
+                            let old_status_json = serde_json::to_value(pod.status.as_ref()).ok();
+                            let new_status_json =
+                                serde_json::to_value(new_pod.status.as_ref()).ok();
                             if old_status_json == new_status_json {
-                                debug!("Pod {}/{} status unchanged, skipping update", namespace, pod_name);
+                                debug!(
+                                    "Pod {}/{} status unchanged, skipping update",
+                                    namespace, pod_name
+                                );
                                 return Ok(());
                             }
 
@@ -3446,15 +3501,14 @@ impl Kubelet {
                 }
             }
             Phase::Succeeded | Phase::Failed => {
-                if is_running {
-                    info!("Stopping completed pod: {}/{}", namespace, pod_name);
-                    let grace = pod
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.termination_grace_period_seconds)
-                        .unwrap_or(30);
-                    self.runtime.stop_pod_for(pod, grace).await?;
-                }
+                // Terminal phase is handled by the state machine above
+                // (SyncPod → TerminatingPod → TerminatedPod).
+                // This branch should not be reached for pods in SyncPod state
+                // because needs_terminating transitions them first.
+                debug!(
+                    "Pod {}/{} reached terminal phase handler in SyncPod (should not happen)",
+                    namespace, pod_name
+                );
             }
             _ => {
                 debug!(
@@ -3721,8 +3775,8 @@ impl Kubelet {
             let limits = resources.limits.as_ref();
             let requests = resources.requests.as_ref();
 
-            let has_any = limits.is_some_and(|l| !l.is_empty())
-                || requests.is_some_and(|r| !r.is_empty());
+            let has_any =
+                limits.is_some_and(|l| !l.is_empty()) || requests.is_some_and(|r| !r.is_empty());
 
             if has_any {
                 none_have_any = false;

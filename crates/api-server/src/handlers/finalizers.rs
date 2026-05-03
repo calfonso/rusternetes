@@ -90,10 +90,7 @@ where
 
     // If already marked for deletion, handle as before
     if metadata.deletion_timestamp.is_some() {
-        let has_finalizers = metadata
-            .finalizers
-            .as_ref()
-            .is_some_and(|f| !f.is_empty());
+        let has_finalizers = metadata.finalizers.as_ref().is_some_and(|f| !f.is_empty());
 
         if has_finalizers {
             debug!(
@@ -841,10 +838,7 @@ mod tests {
         let marked_again = handle_delete_with_finalizers(&storage, key, &updated_pod)
             .await
             .unwrap();
-        assert!(
-            marked_again,
-            "Resource should still be marked for deletion"
-        );
+        assert!(marked_again, "Resource should still be marked for deletion");
 
         storage.delete(key).await.unwrap();
     }
@@ -871,10 +865,7 @@ mod tests {
         let deleted = handle_delete_with_finalizers(&storage, key, &updated_pod)
             .await
             .unwrap();
-        assert!(
-            !deleted,
-            "Resource without finalizers should be deleted"
-        );
+        assert!(!deleted, "Resource without finalizers should be deleted");
 
         let result = storage.get::<Pod>(key).await;
         assert!(result.is_err(), "Resource should be deleted from storage");

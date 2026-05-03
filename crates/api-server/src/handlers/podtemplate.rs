@@ -249,7 +249,10 @@ pub async fn list_podtemplates(
         limit,
         continue_token,
     };
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     let paginated =
         match rusternetes_common::paginate(podtemplates, pagination_params, &resource_version) {
@@ -344,7 +347,10 @@ pub async fn list_all_podtemplates(
         limit,
         continue_token,
     };
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     let paginated =
         match rusternetes_common::paginate(podtemplates, pagination_params, &resource_version) {

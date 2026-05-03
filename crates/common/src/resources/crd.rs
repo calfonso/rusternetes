@@ -708,10 +708,7 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         feeling.enum_,
-                        Some(vec![
-                            serde_json::json!("Great"),
-                            serde_json::json!("Down")
-                        ]),
+                        Some(vec![serde_json::json!("Great"), serde_json::json!("Down")]),
                         "enum values should survive deserialization"
                     );
                 }
@@ -733,4 +730,3 @@ mod tests {
         );
     }
 }
-

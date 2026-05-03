@@ -8,7 +8,7 @@
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use rusternetes_common::resources::workloads::Job;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error, info, warn};
@@ -93,19 +93,20 @@ impl<S: Storage + 'static> TTLController<S> {
             let (ns, name) = match parts.len() {
                 3 => (Some(parts[1]), parts[2]),
                 2 => (None, parts[1]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("jobs", ns, name);
             match self.storage.get::<Job>(&storage_key).await {
-                Ok(job) => {
-                    match self.check_job_ttl(&job).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("TTL check failed for {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(job) => match self.check_job_ttl(&job).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("TTL check failed for {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     queue.forget(&key).await;
                 }

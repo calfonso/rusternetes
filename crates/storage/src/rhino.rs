@@ -82,9 +82,7 @@ impl Storage for RhinoStorage {
         let json = {
             let mut raw = Self::serialize(value)?;
             if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if v.get("metadata").is_none()
-                    || v.get("metadata").is_some_and(|m| m.is_null())
-                {
+                if v.get("metadata").is_none() || v.get("metadata").is_some_and(|m| m.is_null()) {
                     v["metadata"] = serde_json::json!({});
                 }
                 if let Some(metadata) = v.get_mut("metadata") {
@@ -97,14 +95,16 @@ impl Storage for RhinoStorage {
             raw
         };
 
-        let mod_revision = self
-            .backend
-            .create(key, json.as_bytes(), 0)
-            .await
-            .map_err(|e| match e {
-                rhino::backend::BackendError::KeyExists => Error::AlreadyExists(key.to_string()),
-                other => Error::Storage(format!("Failed to create resource: {}", other)),
-            })?;
+        let mod_revision =
+            self.backend
+                .create(key, json.as_bytes(), 0)
+                .await
+                .map_err(|e| match e {
+                    rhino::backend::BackendError::KeyExists => {
+                        Error::AlreadyExists(key.to_string())
+                    }
+                    other => Error::Storage(format!("Failed to create resource: {}", other)),
+                })?;
 
         debug!("Created resource at key: {}", key);
 
@@ -149,8 +149,7 @@ impl Storage for RhinoStorage {
         );
 
         if let Some(incoming_rv) = incoming_rv.as_deref() {
-            let expected_mod_revision =
-                concurrency::resource_version_to_mod_revision(incoming_rv)?;
+            let expected_mod_revision = concurrency::resource_version_to_mod_revision(incoming_rv)?;
 
             let (rev, prev_kv, succeeded) = self
                 .backend
@@ -186,8 +185,7 @@ impl Storage for RhinoStorage {
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
 
-            let existing_kv =
-                existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
+            let existing_kv = existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
             let (new_rev, _prev_kv, succeeded) = self
                 .backend
@@ -197,14 +195,12 @@ impl Storage for RhinoStorage {
 
             if !succeeded {
                 // Concurrent modification — retry once by re-reading
-                let (_rev, latest_kv) = self
-                    .backend
-                    .get(key, "", 1, 0, false)
-                    .await
-                    .map_err(|e| Error::Storage(format!("Failed to re-read resource: {}", e)))?;
+                let (_rev, latest_kv) =
+                    self.backend.get(key, "", 1, 0, false).await.map_err(|e| {
+                        Error::Storage(format!("Failed to re-read resource: {}", e))
+                    })?;
 
-                let latest_kv =
-                    latest_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
+                let latest_kv = latest_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
                 let (new_rev, _prev_kv, succeeded) = self
                     .backend
@@ -238,8 +234,7 @@ impl Storage for RhinoStorage {
             .await
             .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
 
-        let existing_kv =
-            existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
+        let existing_kv = existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
         let (_new_rev, _prev_kv, succeeded) = self
             .backend

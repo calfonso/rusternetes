@@ -7,7 +7,7 @@ use rusternetes_common::resources::{
     VolumeSnapshotStatus,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -27,7 +27,6 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
 
         info!("Starting Volume Snapshot Controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -35,7 +34,6 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -85,13 +83,21 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("volumesnapshots", Some(ns), name);
             match self.storage.get::<VolumeSnapshot>(&storage_key).await {
                 Ok(snapshot) => {
                     // Only process snapshots that don't have a bound content yet
-                    if snapshot.status.as_ref().and_then(|s| s.bound_volume_snapshot_content_name.as_ref()).is_none() {
+                    if snapshot
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.bound_volume_snapshot_content_name.as_ref())
+                        .is_none()
+                    {
                         if let Err(e) = self.create_snapshot(&snapshot).await {
                             error!("Failed to create snapshot for {}: {}", key, e);
                             queue.requeue_rate_limited(key.clone()).await;
@@ -113,7 +119,11 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<VolumeSnapshot>("/registry/volumesnapshots/").await {
+        match self
+            .storage
+            .list::<VolumeSnapshot>("/registry/volumesnapshots/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let ns = item.metadata.namespace.as_deref().unwrap_or("");

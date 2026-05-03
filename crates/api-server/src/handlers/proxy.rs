@@ -293,16 +293,17 @@ pub async fn proxy_service(
     if endpoint_ip.is_none() {
         let ep_key =
             rusternetes_storage::build_key("endpoints", Some(&namespace), actual_service_name);
-        if let Ok(endpoints) =
-            state.storage.get::<rusternetes_common::resources::Endpoints>(&ep_key).await
+        if let Ok(endpoints) = state
+            .storage
+            .get::<rusternetes_common::resources::Endpoints>(&ep_key)
+            .await
         {
             for subset in &endpoints.subsets {
                 // Also extract the port from the endpoint subset
                 if let Some(ports) = &subset.ports {
                     if let Some(ep_port) = if !port_id.is_empty() {
                         ports.iter().find(|p| {
-                            p.name.as_deref() == Some(port_id)
-                                || p.port.to_string() == port_id
+                            p.name.as_deref() == Some(port_id) || p.port.to_string() == port_id
                         })
                     } else {
                         ports.first()
@@ -341,10 +342,7 @@ pub async fn proxy_service(
             "Service proxy: no endpoints found for {}/{}, falling back to ClusterIP {}",
             namespace, actual_service_name, cluster_ip
         );
-        format!(
-            "{}://{}:{}/{}",
-            url_scheme, cluster_ip, service_port, path
-        )
+        format!("{}://{}:{}/{}", url_scheme, cluster_ip, service_port, path)
     };
 
     // Forward the request
@@ -468,10 +466,7 @@ pub async fn proxy_pod(
     let target_url = format!("{}://{}:{}/{}", url_scheme, pod_ip, port, path);
 
     // Forward the request with URL rewriting for HTML responses
-    let proxy_base = format!(
-        "/api/v1/namespaces/{}/pods/{}/proxy",
-        namespace, pod_name
-    );
+    let proxy_base = format!("/api/v1/namespaces/{}/pods/{}/proxy", namespace, pod_name);
     proxy_request_with_rewrite(target_url, method, headers, params, body, Some(proxy_base)).await
 }
 
@@ -572,10 +567,7 @@ async fn proxy_request_with_rewrite(
         }
 
         // Build the request
-        let req_method: reqwest::Method = method
-            .as_str()
-            .parse()
-            .unwrap_or(reqwest::Method::GET);
+        let req_method: reqwest::Method = method.as_str().parse().unwrap_or(reqwest::Method::GET);
         let mut request = client
             .request(req_method, &full_url)
             .body(body_bytes.to_vec());
@@ -599,7 +591,8 @@ async fn proxy_request_with_rewrite(
                 // Remove Content-Length if we might rewrite the body (HTML responses),
                 // since rewriting changes the body length.
                 let might_rewrite = proxy_base_path.is_some()
-                    && response.headers()
+                    && response
+                        .headers()
                         .get("content-type")
                         .and_then(|v| v.to_str().ok())
                         .map(|ct| ct.contains("text/html"))
@@ -654,14 +647,9 @@ async fn proxy_request_with_rewrite(
                 };
 
                 // Build final response
-                return axum_response
-                    .body(final_body)
-                    .map_err(|e| {
-                        rusternetes_common::Error::Internal(format!(
-                            "Failed to build response: {}",
-                            e
-                        ))
-                    });
+                return axum_response.body(final_body).map_err(|e| {
+                    rusternetes_common::Error::Internal(format!("Failed to build response: {}", e))
+                });
             }
             Err(e) => {
                 last_error = e.to_string();
@@ -681,10 +669,7 @@ async fn proxy_request_with_rewrite(
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
                         .header("Content-Type", "text/plain")
-                        .body(Body::from(format!(
-                            "error trying to reach backend: {}",
-                            e
-                        )))
+                        .body(Body::from(format!("error trying to reach backend: {}", e)))
                         .unwrap());
                 }
                 // Connection error — retry

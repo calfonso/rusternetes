@@ -1,10 +1,10 @@
 use chrono::Utc;
+use futures::StreamExt;
 use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicationController, ReplicationControllerCondition},
     types::{ObjectMeta, OwnerReference, Phase},
 };
-use futures::StreamExt;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -25,7 +25,6 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         info!("ReplicationController controller started (watch-based)");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -44,7 +43,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
@@ -86,19 +88,24 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("replicationcontrollers", Some(ns), name);
-            match self.storage.get::<ReplicationController>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_rc(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<ReplicationController>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_rc(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -109,13 +116,17 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<ReplicationController>("/registry/replicationcontrollers/").await {
+        match self
+            .storage
+            .list::<ReplicationController>("/registry/replicationcontrollers/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("replicationcontrollers/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("replicationcontrollers/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -184,7 +195,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                             });
                         let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
                         if let Err(e) = self.storage.update(&pod_key, &updated_pod).await {
-                            debug!("Failed to orphan pod {}: {} — will retry", pod.metadata.name, e);
+                            debug!(
+                                "Failed to orphan pod {}: {} — will retry",
+                                pod.metadata.name, e
+                            );
                             all_orphaned = false;
                         }
                     }

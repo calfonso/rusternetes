@@ -126,15 +126,24 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Storage: SQLite at {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir }
+            StorageConfig::Sqlite {
+                path: args.data_dir,
+            }
         }
         "etcd" => {
-            let endpoints: Vec<String> = args.etcd_servers.split(',').map(|s| s.trim().to_string()).collect();
+            let endpoints: Vec<String> = args
+                .etcd_servers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
             info!("Storage: etcd at {:?}", endpoints);
             StorageConfig::Etcd { endpoints }
         }
         other => {
-            anyhow::bail!("Unknown storage backend: {}. Use 'sqlite' or 'etcd'.", other);
+            anyhow::bail!(
+                "Unknown storage backend: {}. Use 'sqlite' or 'etcd'.",
+                other
+            );
         }
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);

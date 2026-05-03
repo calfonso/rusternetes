@@ -159,7 +159,6 @@ async fn test_metrics_registry_initialization() {
 
     // Verify metrics can be recorded (this is a smoke test)
     let _metrics_with_api = result.unwrap();
-
 }
 
 #[tokio::test]
@@ -334,7 +333,6 @@ async fn test_component_startup_order() {
     // 4. Metrics can initialize independently
     let metrics = MetricsRegistry::new().with_api_server_metrics();
     assert!(metrics.is_ok(), "Metrics should initialize");
-
 }
 
 #[tokio::test]

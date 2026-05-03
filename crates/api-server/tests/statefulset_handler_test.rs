@@ -3,8 +3,7 @@
 //! Tests all CRUD operations, edge cases, and error handling for statefulsets
 
 use rusternetes_common::resources::{
-    Container, PodSpec, PodTemplateSpec,
-    StatefulSet, StatefulSetSpec, StatefulSetStatus,
+    Container, PodSpec, PodTemplateSpec, StatefulSet, StatefulSetSpec, StatefulSetStatus,
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};

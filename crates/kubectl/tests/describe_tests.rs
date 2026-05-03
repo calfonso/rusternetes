@@ -309,9 +309,9 @@ mod tests {
 
         assert!(should_show_annotation("description"));
         assert!(should_show_annotation("owner"));
-        assert!(
-            !should_show_annotation("kubectl.kubernetes.io/last-applied-configuration")
-        );
+        assert!(!should_show_annotation(
+            "kubectl.kubernetes.io/last-applied-configuration"
+        ));
         assert!(!should_show_annotation("kubernetes.io/created-by"));
     }
 

@@ -2851,14 +2851,22 @@ impl ProtoRegistry {
                     } else {
                         // Skip unknown fields
                         match wire_type {
-                            WIRE_VARINT => { let _ = read_varint(data, pos).map(|(_, p)| pos = p); }
-                            WIRE_64BIT => { pos += 8; }
+                            WIRE_VARINT => {
+                                let _ = read_varint(data, pos).map(|(_, p)| pos = p);
+                            }
+                            WIRE_64BIT => {
+                                pos += 8;
+                            }
                             WIRE_LENGTH_DELIMITED => {
                                 if let Some((len, new_pos)) = read_varint(data, pos) {
                                     pos = new_pos + len as usize;
-                                } else { break; }
+                                } else {
+                                    break;
+                                }
                             }
-                            WIRE_32BIT => { pos += 4; }
+                            WIRE_32BIT => {
+                                pos += 4;
+                            }
                             _ => break,
                         }
                     }

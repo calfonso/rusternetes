@@ -33,9 +33,7 @@ fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// Dynamically includes CRD group/version paths so kubectl can discover
 /// CRD schemas via the OpenAPI v3 discovery mechanism.
-pub async fn get_openapi_spec(
-    State(state): State<Arc<ApiServerState>>,
-) -> Response {
+pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Response {
     // Return the root document that lists all available OpenAPI paths
     // In real K8s, this returns {"paths": {"/apis/apps/v1": {...}, ...}}
     let mut paths = serde_json::Map::new();
@@ -184,12 +182,7 @@ pub async fn get_openapi_spec_path(
                 // Build definition key matching K8s ToRESTFriendlyName format:
                 // group/version/kind -> reverse group domain parts, join with dots
                 let group_parts: Vec<&str> = group.rsplitn(10, '.').collect();
-                let def_key = format!(
-                    "{}.{}.{}",
-                    group_parts.to_vec().join("."),
-                    ver,
-                    kind
-                );
+                let def_key = format!("{}.{}.{}", group_parts.to_vec().join("."), ver, kind);
 
                 // Build the schema from CRD validation
                 let crd_preserves = crd
@@ -197,13 +190,42 @@ pub async fn get_openapi_spec_path(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                let schema_value = if let Some(schema_val) = version.pointer("/schema/openAPIV3Schema") {
-                    let schema_preserves = schema_val
-                        .get("x-kubernetes-preserve-unknown-fields")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                let schema_value =
+                    if let Some(schema_val) = version.pointer("/schema/openAPIV3Schema") {
+                        let schema_preserves = schema_val
+                            .get("x-kubernetes-preserve-unknown-fields")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
 
-                    if crd_preserves || schema_preserves {
+                        if crd_preserves || schema_preserves {
+                            let mut def = serde_json::json!({
+                                "type": "object",
+                                "x-kubernetes-group-version-kind": [{
+                                    "group": group,
+                                    "kind": kind,
+                                    "version": ver,
+                                }],
+                            });
+                            add_standard_crd_properties(&mut def);
+                            def
+                        } else {
+                            let mut cleaned = schema_val.clone();
+                            strip_false_extensions(&mut cleaned);
+                            if let Some(obj) = cleaned.as_object_mut() {
+                                obj.insert(
+                                    "x-kubernetes-group-version-kind".to_string(),
+                                    serde_json::json!([{
+                                        "group": group,
+                                        "kind": kind,
+                                        "version": ver,
+                                    }]),
+                                );
+                            }
+                            add_standard_crd_properties(&mut cleaned);
+                            cleaned
+                        }
+                    } else {
+                        // No schema — CRD without validation, treat as preserveUnknownFields
                         let mut def = serde_json::json!({
                             "type": "object",
                             "x-kubernetes-group-version-kind": [{
@@ -214,35 +236,7 @@ pub async fn get_openapi_spec_path(
                         });
                         add_standard_crd_properties(&mut def);
                         def
-                    } else {
-                        let mut cleaned = schema_val.clone();
-                        strip_false_extensions(&mut cleaned);
-                        if let Some(obj) = cleaned.as_object_mut() {
-                            obj.insert(
-                                "x-kubernetes-group-version-kind".to_string(),
-                                serde_json::json!([{
-                                    "group": group,
-                                    "kind": kind,
-                                    "version": ver,
-                                }]),
-                            );
-                        }
-                        add_standard_crd_properties(&mut cleaned);
-                        cleaned
-                    }
-                } else {
-                    // No schema — CRD without validation, treat as preserveUnknownFields
-                    let mut def = serde_json::json!({
-                        "type": "object",
-                        "x-kubernetes-group-version-kind": [{
-                            "group": group,
-                            "kind": kind,
-                            "version": ver,
-                        }],
-                    });
-                    add_standard_crd_properties(&mut def);
-                    def
-                };
+                    };
 
                 // Insert into components/schemas
                 if let Some(schemas) = spec_json
@@ -295,23 +289,21 @@ pub async fn get_openapi_spec_path(
                                 "/apis/{}/{}/namespaces/{{namespace}}/{}/{{name}}",
                                 group, ver, plural
                             );
-                            paths.entry(list_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
-                            paths.entry(item_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
+                            paths
+                                .entry(list_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
+                            paths
+                                .entry(item_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
                         } else {
-                            let list_path =
-                                format!("/apis/{}/{}/{}", group, ver, plural);
-                            let item_path =
-                                format!("/apis/{}/{}/{}/{{name}}", group, ver, plural);
-                            paths.entry(list_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
-                            paths.entry(item_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
+                            let list_path = format!("/apis/{}/{}/{}", group, ver, plural);
+                            let item_path = format!("/apis/{}/{}/{}/{{name}}", group, ver, plural);
+                            paths
+                                .entry(list_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
+                            paths
+                                .entry(item_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
                         }
                     }
                 }
@@ -426,12 +418,7 @@ pub async fn get_swagger_spec(
 
                 // Build definition key like "io.example.stable.v1.CronTab"
                 let group_parts: Vec<&str> = group.rsplitn(10, '.').collect();
-                let def_key = format!(
-                    "{}.{}.{}",
-                    group_parts.to_vec().join("."),
-                    ver,
-                    kind
-                );
+                let def_key = format!("{}.{}.{}", group_parts.to_vec().join("."), ver, kind);
 
                 // Add schema from CRD validation.
                 // K8s ref: controller/openapi/builder/builder.go:392-407
@@ -537,6 +524,49 @@ pub async fn get_swagger_spec(
         }
     }
 
+    // Add standard K8s definitions referenced by CRD schemas.
+    // CRD schemas use $ref to io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+    // so it must exist in the definitions section.
+    // K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
+    definitions.insert(
+        "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta".to_string(),
+        serde_json::json!({
+            "description": "ObjectMeta is metadata that all persisted resources must have, which includes all objects users must create.",
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Name must be unique within a namespace." },
+                "namespace": { "type": "string", "description": "Namespace defines the space within which each name must be unique." },
+                "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Map of string keys and values that can be used to organize and categorize objects." },
+                "annotations": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Annotations is an unstructured key value map stored with a resource." },
+                "uid": { "type": "string", "description": "UID is the unique in time and space value for this object." },
+                "resourceVersion": { "type": "string", "description": "An opaque value that represents the internal version of this object." },
+                "generation": { "type": "integer", "format": "int64", "description": "A sequence number representing a specific generation of the desired state." },
+                "creationTimestamp": { "type": "string", "format": "date-time", "description": "CreationTimestamp is a timestamp representing the server time when this object was created." },
+                "deletionTimestamp": { "type": "string", "format": "date-time", "description": "DeletionTimestamp is RFC 3339 date and time at which this resource will be deleted." },
+                "deletionGracePeriodSeconds": { "type": "integer", "format": "int64", "description": "Number of seconds allowed for this object to gracefully terminate." },
+                "ownerReferences": { "type": "array", "items": { "$ref": "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference" } },
+                "finalizers": { "type": "array", "items": { "type": "string" } },
+                "managedFields": { "type": "array", "items": { "type": "object" } }
+            }
+        }),
+    );
+    definitions.insert(
+        "io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference".to_string(),
+        serde_json::json!({
+            "description": "OwnerReference contains enough information to let you identify an owning object.",
+            "type": "object",
+            "required": ["apiVersion", "kind", "name", "uid"],
+            "properties": {
+                "apiVersion": { "type": "string" },
+                "kind": { "type": "string" },
+                "name": { "type": "string" },
+                "uid": { "type": "string" },
+                "controller": { "type": "boolean" },
+                "blockOwnerDeletion": { "type": "boolean" }
+            }
+        }),
+    );
+
     let spec = serde_json::json!({
         "swagger": "2.0",
         "info": {
@@ -564,8 +594,8 @@ pub async fn get_swagger_spec(
     // Cache the protobuf conversion to avoid regenerating on every request.
     // The swagger spec changes when CRDs are created/deleted. We use a simple
     // hash of the JSON bytes to detect changes.
-    use std::sync::OnceLock;
     use std::sync::Mutex;
+    use std::sync::OnceLock;
     static PROTO_CACHE: OnceLock<Mutex<(u64, Vec<u8>)>> = OnceLock::new();
     let cache = PROTO_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
 
@@ -609,7 +639,10 @@ pub async fn get_swagger_spec(
                     .unwrap();
             }
             Err(e) => {
-                info!("Failed to convert swagger to protobuf: {}, falling back to JSON", e);
+                info!(
+                    "Failed to convert swagger to protobuf: {}, falling back to JSON",
+                    e
+                );
                 // Fall through to JSON response
             }
         }
@@ -728,10 +761,15 @@ fn strip_false_extensions(value: &mut serde_json::Value) {
         // JSONSchemaProps fields like maxLength, minLength, maxItems, etc. use
         // pointer types (*int64) in Go with omitempty — zero means "not set".
         let zero_int_fields = [
-            "maximum", "minimum", "multipleOf",
-            "maxLength", "minLength",
-            "maxItems", "minItems",
-            "maxProperties", "minProperties",
+            "maximum",
+            "minimum",
+            "multipleOf",
+            "maxLength",
+            "minLength",
+            "maxItems",
+            "minItems",
+            "maxProperties",
+            "minProperties",
         ];
         for key in &zero_int_fields {
             if let Some(serde_json::Value::Number(n)) = obj.get(*key) {
@@ -751,10 +789,58 @@ fn strip_false_extensions(value: &mut serde_json::Value) {
             }
         }
 
-        // Empty "properties" object should be omitted
-        if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
-            if props.is_empty() {
-                obj.remove("properties");
+        // Empty objects should be omitted (Go omitempty on maps/structs)
+        let empty_obj_fields = [
+            "properties",
+            "additionalProperties",
+            "definitions",
+            "patternProperties",
+            "dependencies",
+            "externalDocs",
+        ];
+        for key in &empty_obj_fields {
+            if let Some(serde_json::Value::Object(m)) = obj.get(*key) {
+                if m.is_empty() {
+                    obj.remove(*key);
+                }
+            }
+        }
+
+        // Remove "additionalProperties": false — Go omitempty treats
+        // the zero-value JSONSchemaPropsOrBool as omitted.
+        // K8s only includes additionalProperties when it's explicitly
+        // set to a non-default value.
+        if obj.get("additionalProperties") == Some(&serde_json::Value::Bool(false)) {
+            obj.remove("additionalProperties");
+        }
+
+        // Remove "default" when it's null — Go omits nil *JSON fields
+        if obj.get("default") == Some(&serde_json::Value::Null) {
+            obj.remove("default");
+        }
+
+        // Remove "example" when it's null
+        if obj.get("example") == Some(&serde_json::Value::Null) {
+            obj.remove("example");
+        }
+
+        // Remove "x-kubernetes-list-type" and "x-kubernetes-map-type" when empty
+        for key in [
+            "x-kubernetes-list-type",
+            "x-kubernetes-map-type",
+            "x-kubernetes-list-map-keys",
+        ] {
+            match obj.get(key) {
+                Some(serde_json::Value::String(s)) if s.is_empty() => {
+                    obj.remove(key);
+                }
+                Some(serde_json::Value::Array(a)) if a.is_empty() => {
+                    obj.remove(key);
+                }
+                Some(serde_json::Value::Null) => {
+                    obj.remove(key);
+                }
+                _ => {}
             }
         }
 
@@ -1073,10 +1159,79 @@ mod tests {
             obj.remove("x-kubernetes-group-version-kind");
         }
 
-        assert_eq!(cleaned, original_schema,
+        assert_eq!(
+            cleaned,
+            original_schema,
             "Schema should match after roundtrip.\nExpected:\n{}\n\nActual:\n{}",
             serde_json::to_string_pretty(&original_schema).unwrap(),
             serde_json::to_string_pretty(&cleaned).unwrap()
         );
+    }
+
+    /// K8s CRD schemas reference io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+    /// via $ref. kubectl validates CRs against the OpenAPI spec before sending
+    /// them to the API server. If ObjectMeta is missing from definitions,
+    /// kubectl fails with "unknown model in reference".
+    /// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
+    #[test]
+    fn test_strip_empty_objects_and_arrays() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+            "default": null,
+            "example": null,
+            "required": [],
+            "enum": [],
+            "x-kubernetes-list-type": "",
+            "x-kubernetes-map-type": "",
+            "x-kubernetes-list-map-keys": [],
+            "definitions": {},
+            "allOf": [],
+        });
+        strip_false_extensions(&mut schema);
+
+        // All empty/null/false values should be stripped (Go omitempty)
+        let obj = schema.as_object().unwrap();
+        assert!(
+            !obj.contains_key("properties"),
+            "empty properties should be stripped"
+        );
+        assert!(
+            !obj.contains_key("additionalProperties"),
+            "false additionalProperties should be stripped"
+        );
+        assert!(
+            !obj.contains_key("default"),
+            "null default should be stripped"
+        );
+        assert!(
+            !obj.contains_key("example"),
+            "null example should be stripped"
+        );
+        assert!(
+            !obj.contains_key("required"),
+            "empty required should be stripped"
+        );
+        assert!(!obj.contains_key("enum"), "empty enum should be stripped");
+        assert!(
+            !obj.contains_key("x-kubernetes-list-type"),
+            "empty x-kubernetes-list-type should be stripped"
+        );
+        assert!(
+            !obj.contains_key("x-kubernetes-map-type"),
+            "empty x-kubernetes-map-type should be stripped"
+        );
+        assert!(
+            !obj.contains_key("x-kubernetes-list-map-keys"),
+            "empty x-kubernetes-list-map-keys should be stripped"
+        );
+        assert!(
+            !obj.contains_key("definitions"),
+            "empty definitions should be stripped"
+        );
+        assert!(!obj.contains_key("allOf"), "empty allOf should be stripped");
+        // type: "object" should be kept (non-empty)
+        assert!(obj.contains_key("type"), "non-empty type should be kept");
     }
 }

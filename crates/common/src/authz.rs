@@ -544,9 +544,10 @@ impl Authorizer for NodeAuthorizer {
 
         // Allow nodes to read certain cluster-wide resources
         if matches!(attrs.verb.as_str(), "get" | "list" | "watch")
-            && self.is_node_allowed_resource(attrs) {
-                return Ok(Decision::Allow);
-            }
+            && self.is_node_allowed_resource(attrs)
+        {
+            return Ok(Decision::Allow);
+        }
 
         // Allow nodes to access node-related API groups
         // (authentication, authorization, certificates, coordination)

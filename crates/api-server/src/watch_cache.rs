@@ -149,9 +149,7 @@ impl WatchCache {
                                     '_,
                                     HashMap<String, VecDeque<CachedWatchEvent>>,
                                 > = history_ref.write().await;
-                                let buf = hist
-                                    .entry(prefix_owned.clone())
-                                    .or_default();
+                                let buf = hist.entry(prefix_owned.clone()).or_default();
                                 buf.push_back(cached.clone());
                                 while buf.len() > HISTORY_CAPACITY {
                                     buf.pop_front();

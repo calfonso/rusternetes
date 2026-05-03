@@ -40,7 +40,12 @@ pub async fn get_node_metrics(
 
     // Read metrics from storage (written by the kubelet)
     let metrics_key = format!("/registry/metrics.k8s.io/nodes/{}", name);
-    match state.storage.as_ref().get::<NodeMetrics>(&metrics_key).await {
+    match state
+        .storage
+        .as_ref()
+        .get::<NodeMetrics>(&metrics_key)
+        .await
+    {
         Ok(metrics) => Ok(Json(metrics)),
         Err(_) => {
             // No metrics yet — return zeros

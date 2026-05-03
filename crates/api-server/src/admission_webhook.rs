@@ -649,7 +649,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             if let Some(ref old) = old_object {
                                 let _ = ctx.add_json_variable("oldObject", old);
                             } else {
-                                let _ = ctx.add_json_variable("oldObject", &serde_json::Value::Null);
+                                let _ =
+                                    ctx.add_json_variable("oldObject", &serde_json::Value::Null);
                             }
                             let request_val = serde_json::json!({
                                 "operation": op_str,
@@ -719,19 +720,18 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     // K8s splits resource/subresource in the admission review request.
                     // e.g. GVR "pods/attach" becomes resource="pods", subResource="attach".
                     // The webhook server expects this split format.
-                    let (wire_gvr, sub_resource) =
-                        if let Some(idx) = gvr.resource.find('/') {
-                            (
-                                GroupVersionResource {
-                                    group: gvr.group.clone(),
-                                    version: gvr.version.clone(),
-                                    resource: gvr.resource[..idx].to_string(),
-                                },
-                                Some(gvr.resource[idx + 1..].to_string()),
-                            )
-                        } else {
-                            (gvr.clone(), None)
-                        };
+                    let (wire_gvr, sub_resource) = if let Some(idx) = gvr.resource.find('/') {
+                        (
+                            GroupVersionResource {
+                                group: gvr.group.clone(),
+                                version: gvr.version.clone(),
+                                resource: gvr.resource[..idx].to_string(),
+                            },
+                            Some(gvr.resource[idx + 1..].to_string()),
+                        )
+                    } else {
+                        (gvr.clone(), None)
+                    };
 
                     let request = AdmissionReviewRequest {
                         uid: uuid::Uuid::new_v4().to_string(),
@@ -1009,7 +1009,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             if let Some(ref old) = old_object {
                                 let _ = ctx.add_json_variable("oldObject", old);
                             } else {
-                                let _ = ctx.add_json_variable("oldObject", &serde_json::Value::Null);
+                                let _ =
+                                    ctx.add_json_variable("oldObject", &serde_json::Value::Null);
                             }
                             let request_val = serde_json::json!({
                                 "operation": op_str,
@@ -1072,19 +1073,18 @@ impl<S: Storage> AdmissionWebhookManager<S> {
 
                     // Build admission request with potentially mutated object.
                     // K8s splits resource/subresource in the admission review request.
-                    let (wire_gvr, sub_resource) =
-                        if let Some(idx) = gvr.resource.find('/') {
-                            (
-                                GroupVersionResource {
-                                    group: gvr.group.clone(),
-                                    version: gvr.version.clone(),
-                                    resource: gvr.resource[..idx].to_string(),
-                                },
-                                Some(gvr.resource[idx + 1..].to_string()),
-                            )
-                        } else {
-                            (gvr.clone(), None)
-                        };
+                    let (wire_gvr, sub_resource) = if let Some(idx) = gvr.resource.find('/') {
+                        (
+                            GroupVersionResource {
+                                group: gvr.group.clone(),
+                                version: gvr.version.clone(),
+                                resource: gvr.resource[..idx].to_string(),
+                            },
+                            Some(gvr.resource[idx + 1..].to_string()),
+                        )
+                    } else {
+                        (gvr.clone(), None)
+                    };
 
                     let request = AdmissionReviewRequest {
                         uid: uuid::Uuid::new_v4().to_string(),
@@ -1674,10 +1674,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 .and_then(|s| s.get("variables"))
                 .and_then(|v| v.as_array())
             {
-                let mut var_map: std::collections::HashMap<
-                    cel::objects::Key,
-                    cel::objects::Value,
-                > = std::collections::HashMap::new();
+                let mut var_map: std::collections::HashMap<cel::objects::Key, cel::objects::Value> =
+                    std::collections::HashMap::new();
                 for var_def in vars {
                     let var_name = var_def.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let var_expr = var_def
@@ -1767,9 +1765,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                         .get("validationActions")
                                         .and_then(|a| a.as_array())
                                 });
-                            let has_deny = actions.is_none_or(|acts| {
-                                acts.iter().any(|a| a.as_str() == Some("Deny"))
-                            });
+                            let has_deny = actions
+                                .is_none_or(|acts| acts.iter().any(|a| a.as_str() == Some("Deny")));
                             if has_deny {
                                 // Use messageExpression (CEL) if present, otherwise static message
                                 let message = if let Some(msg_expr) =

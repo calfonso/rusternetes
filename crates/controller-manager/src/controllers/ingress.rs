@@ -3,7 +3,7 @@ use rusternetes_common::resources::{
     ingress::{HTTPIngressPath, IngressBackend, IngressRule, IngressSpec, IngressTLS},
     Ingress, Service,
 };
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -30,7 +30,6 @@ impl<S: Storage + 'static> IngressController<S> {
         use futures::StreamExt;
 
         info!("Starting Ingress controller");
-
 
         let queue = WorkQueue::new();
 
@@ -90,19 +89,20 @@ impl<S: Storage + 'static> IngressController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("ingresses", Some(ns), name);
             match self.storage.get::<Ingress>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_ingress(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_ingress(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -117,9 +117,9 @@ impl<S: Storage + 'static> IngressController<S> {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("ingresses/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("ingresses/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }

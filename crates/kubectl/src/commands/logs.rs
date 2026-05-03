@@ -156,9 +156,11 @@ mod tests {
         let ns = "prod";
         let pod = "web";
         let mut url = format!("/api/v1/namespaces/{}/pods/{}/log", ns, pod);
-        let params = ["container=nginx".to_string(),
+        let params = [
+            "container=nginx".to_string(),
             "follow=true".to_string(),
-            format!("tailLines={}", 100)];
+            format!("tailLines={}", 100),
+        ];
         url.push('?');
         url.push_str(&params.join("&"));
 
@@ -218,8 +220,7 @@ mod tests {
         let ns = "default";
         let pod = "app";
         let mut url = format!("/api/v1/namespaces/{}/pods/{}/log", ns, pod);
-        let params = ["timestamps=true".to_string(),
-            "previous=true".to_string()];
+        let params = ["timestamps=true".to_string(), "previous=true".to_string()];
         url.push('?');
         url.push_str(&params.join("&"));
         assert_eq!(
@@ -264,12 +265,14 @@ mod tests {
         let ns = "prod";
         let pod = "web";
         let mut url = format!("/api/v1/namespaces/{}/pods/{}/log", ns, pod);
-        let params = ["container=app".to_string(),
+        let params = [
+            "container=app".to_string(),
             "follow=true".to_string(),
             "tailLines=50".to_string(),
             "timestamps=true".to_string(),
             "sinceTime=2024-01-01T00:00:00Z".to_string(),
-            "previous=true".to_string()];
+            "previous=true".to_string(),
+        ];
         url.push('?');
         url.push_str(&params.join("&"));
         assert!(url.contains("container=app"));

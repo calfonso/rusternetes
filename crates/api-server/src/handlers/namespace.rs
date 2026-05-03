@@ -159,23 +159,41 @@ pub async fn create(
                 kind: "ConfigMap".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta::new("extension-apiserver-authentication")
-                .with_namespace("kube-system".to_string()),
+            metadata: rusternetes_common::types::ObjectMeta::new(
+                "extension-apiserver-authentication",
+            )
+            .with_namespace("kube-system".to_string()),
             data: Some(std::collections::HashMap::from([
                 ("client-ca-file".to_string(), ca_cert_for_auth.clone()),
                 ("requestheader-client-ca-file".to_string(), ca_cert_for_auth),
-                ("requestheader-username-headers".to_string(), "[\"x-remote-user\"]".to_string()),
-                ("requestheader-group-headers".to_string(), "[\"x-remote-group\"]".to_string()),
-                ("requestheader-extra-headers-prefix".to_string(), "[\"x-remote-extra-\"]".to_string()),
+                (
+                    "requestheader-username-headers".to_string(),
+                    "[\"x-remote-user\"]".to_string(),
+                ),
+                (
+                    "requestheader-group-headers".to_string(),
+                    "[\"x-remote-group\"]".to_string(),
+                ),
+                (
+                    "requestheader-extra-headers-prefix".to_string(),
+                    "[\"x-remote-extra-\"]".to_string(),
+                ),
                 ("requestheader-allowed-names".to_string(), "[]".to_string()),
             ])),
             binary_data: None,
             immutable: None,
         };
-        let auth_cm_key = build_key("configmaps", Some("kube-system"), "extension-apiserver-authentication");
+        let auth_cm_key = build_key(
+            "configmaps",
+            Some("kube-system"),
+            "extension-apiserver-authentication",
+        );
         match state.storage.create(&auth_cm_key, &auth_cm).await {
             Ok(_) => info!("Created extension-apiserver-authentication ConfigMap in kube-system"),
-            Err(e) => debug!("extension-apiserver-authentication already exists or error: {}", e),
+            Err(e) => debug!(
+                "extension-apiserver-authentication already exists or error: {}",
+                e
+            ),
         }
 
         // Create the Role that allows extension API servers to read this ConfigMap
@@ -193,10 +211,17 @@ pub async fn create(
                 "verbs": ["get", "list", "watch"]
             }]
         });
-        let role_key = build_key("roles", Some("kube-system"), "extension-apiserver-authentication-reader");
+        let role_key = build_key(
+            "roles",
+            Some("kube-system"),
+            "extension-apiserver-authentication-reader",
+        );
         match state.storage.create(&role_key, &reader_role).await {
             Ok(_) => info!("Created extension-apiserver-authentication-reader Role"),
-            Err(e) => debug!("extension-apiserver-authentication-reader already exists or error: {}", e),
+            Err(e) => debug!(
+                "extension-apiserver-authentication-reader already exists or error: {}",
+                e
+            ),
         }
     }
 

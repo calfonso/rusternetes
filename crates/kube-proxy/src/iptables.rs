@@ -28,10 +28,7 @@ fn detect_iptables_cmd() -> &'static str {
 /// Works with both Docker (172.18.0.0/16 on br-xxx) and Podman (10.89.0.0/24 on podman1).
 /// Returns (interface_name, cidr) if found.
 fn detect_bridge_network() -> Option<(String, String)> {
-    let output = Command::new("ip")
-        .args(["route", "show"])
-        .output()
-        .ok()?;
+    let output = Command::new("ip").args(["route", "show"]).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Look for routes that match known container bridge patterns.
@@ -170,7 +167,10 @@ impl IptablesManager {
         ] {
             if std::path::Path::new(sysctl).exists() {
                 if let Err(e) = std::fs::write(sysctl, "1") {
-                    warn!("Failed to enable {}: {} (NodePort from pods may not work)", sysctl, e);
+                    warn!(
+                        "Failed to enable {}: {} (NodePort from pods may not work)",
+                        sysctl, e
+                    );
                 } else {
                     info!("Enabled {}", sysctl);
                 }
@@ -264,7 +264,10 @@ impl IptablesManager {
                     .output()
                     .context("Failed to add hairpin MASQUERADE rule")?;
                 if output.status.success() {
-                    info!("Added hairpin MASQUERADE rule for {} on container bridge", cidr);
+                    info!(
+                        "Added hairpin MASQUERADE rule for {} on container bridge",
+                        cidr
+                    );
                 } else {
                     warn!(
                         "Failed to add hairpin MASQUERADE: {}",
@@ -1741,7 +1744,6 @@ impl Drop for IptablesManager {
 
 #[cfg(test)]
 mod tests {
-    
 
     #[test]
     fn test_probability_calculation_uniform() {

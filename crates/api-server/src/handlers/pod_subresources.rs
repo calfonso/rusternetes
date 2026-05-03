@@ -351,10 +351,7 @@ fn generate_pod_logs(
         .unwrap_or_else(|| "Unknown".to_string());
 
     // Generate log entries
-    let base_time = pod
-        .metadata
-        .creation_timestamp
-        .unwrap_or_else(Utc::now);
+    let base_time = pod.metadata.creation_timestamp.unwrap_or_else(Utc::now);
 
     let mut log_lines = vec![
         format!(
@@ -530,7 +527,8 @@ pub async fn exec(
                 None,
                 &webhook_user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(Error::Forbidden(format!(
                 "admission webhook denied the request: {}",
                 reason
@@ -818,7 +816,8 @@ pub async fn attach(
                 None,
                 &webhook_user_info,
             )
-            .await? {
+            .await?
+        {
             return Err(Error::Forbidden(format!(
                 "admission webhook denied the request: {}",
                 reason
@@ -1172,14 +1171,14 @@ pub async fn create_eviction(
             let disrupted_pods = updated_pdb
                 .status
                 .get_or_insert(rusternetes_common::resources::PodDisruptionBudgetStatus {
-                        current_healthy: 0,
-                        desired_healthy: 0,
-                        disruptions_allowed: 0,
-                        expected_pods: 0,
-                        observed_generation: None,
-                        conditions: None,
-                        disrupted_pods: None,
-                    })
+                    current_healthy: 0,
+                    desired_healthy: 0,
+                    disruptions_allowed: 0,
+                    expected_pods: 0,
+                    observed_generation: None,
+                    conditions: None,
+                    disrupted_pods: None,
+                })
                 .disrupted_pods
                 .get_or_insert_with(std::collections::HashMap::new);
             disrupted_pods.insert(name.clone(), chrono::Utc::now());

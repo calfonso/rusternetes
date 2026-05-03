@@ -1252,7 +1252,11 @@ pub fn build_delete_fallback_json(key: &str, prev_value: &str) -> Option<String>
     // Key format: /registry/{type}/{ns}/{name} or /registry/{type}/{name}
     let parts: Vec<&str> = key.split('/').collect();
     let name = parts.last().unwrap_or(&"");
-    let ns = if parts.len() >= 5 { parts[parts.len() - 2] } else { "" };
+    let ns = if parts.len() >= 5 {
+        parts[parts.len() - 2]
+    } else {
+        ""
+    };
     let k8s_event = serde_json::json!({
         "type": "DELETED",
         "object": {
@@ -1269,7 +1273,11 @@ pub fn build_delete_fallback_json(key: &str, prev_value: &str) -> Option<String>
 pub fn extract_rv_from_json(json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
-        .and_then(|v| v.pointer("/metadata/resourceVersion").and_then(|rv| rv.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.pointer("/metadata/resourceVersion")
+                .and_then(|rv| rv.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 /// Derive the Kind and apiVersion from resource_type and api_group

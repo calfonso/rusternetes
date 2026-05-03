@@ -911,13 +911,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::openapi::get_openapi_spec_path),
         )
         .route("/swagger.json", get(handlers::openapi::get_swagger_spec))
-        .layer(axum_middleware::map_response(|mut response: Response| async move {
-            response.headers_mut().insert(
-                axum::http::header::CACHE_CONTROL,
-                "no-cache, private".parse().unwrap(),
-            );
-            response
-        }));
+        .layer(axum_middleware::map_response(
+            |mut response: Response| async move {
+                response.headers_mut().insert(
+                    axum::http::header::CACHE_CONTROL,
+                    "no-cache, private".parse().unwrap(),
+                );
+                response
+            },
+        ));
 
     let public_routes = public_routes.merge(discovery_routes);
 
@@ -2490,9 +2492,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     // Combine routes and add shared state.
     // K8s (Go) treats /path and /path/ identically. Axum doesn't, so we
     // normalize URIs by stripping trailing slashes before routing.
-    let mut app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes);
+    let mut app = Router::new().merge(public_routes).merge(protected_routes);
 
     // Serve the console SPA at /console/ when a console directory is configured.
     if let Some(dir) = console_dir {
@@ -2503,26 +2503,26 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     }
 
     app.layer(axum_middleware::map_request(
-            |mut req: axum::extract::Request| async move {
-                let path = req.uri().path();
-                // Strip trailing slash for non-root paths (but not /console/ paths,
-                // which are handled by ServeDir and need trailing slashes intact)
-                if path.len() > 1 && path.ends_with('/') && !path.starts_with("/console") {
-                    let new_path = path.trim_end_matches('/');
-                    if let Ok(new_uri) = axum::http::Uri::builder()
-                        .path_and_query(if let Some(q) = req.uri().query() {
-                            format!("{}?{}", new_path, q)
-                        } else {
-                            new_path.to_string()
-                        })
-                        .build()
-                    {
-                        *req.uri_mut() = new_uri;
-                    }
+        |mut req: axum::extract::Request| async move {
+            let path = req.uri().path();
+            // Strip trailing slash for non-root paths (but not /console/ paths,
+            // which are handled by ServeDir and need trailing slashes intact)
+            if path.len() > 1 && path.ends_with('/') && !path.starts_with("/console") {
+                let new_path = path.trim_end_matches('/');
+                if let Ok(new_uri) = axum::http::Uri::builder()
+                    .path_and_query(if let Some(q) = req.uri().query() {
+                        format!("{}?{}", new_path, q)
+                    } else {
+                        new_path.to_string()
+                    })
+                    .build()
+                {
+                    *req.uri_mut() = new_uri;
                 }
-                req
-            },
-        ))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+            }
+            req
+        },
+    ))
+    .layer(TraceLayer::new_for_http())
+    .with_state(state)
 }

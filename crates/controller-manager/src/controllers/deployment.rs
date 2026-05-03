@@ -1,12 +1,12 @@
 use chrono::Utc;
+use futures::StreamExt;
 use rusternetes_common::{
     resources::{
         Deployment, DeploymentCondition, DeploymentStatus, Pod, ReplicaSet, ReplicaSetSpec,
     },
     types::{ObjectMeta, TypeMeta},
 };
-use futures::StreamExt;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -51,7 +51,6 @@ impl<S: Storage + 'static> DeploymentController<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         info!("Deployment controller started (watch-based)");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -70,7 +69,10 @@ impl<S: Storage + 'static> DeploymentController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
@@ -80,7 +82,10 @@ impl<S: Storage + 'static> DeploymentController<S> {
             let mut rs_watch = match self.storage.watch(&rs_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish replicaset watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish replicaset watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
@@ -137,19 +142,20 @@ impl<S: Storage + 'static> DeploymentController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("deployments", Some(ns), name);
             match self.storage.get::<Deployment>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_deployment(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_deployment(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -160,13 +166,17 @@ impl<S: Storage + 'static> DeploymentController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<Deployment>("/registry/deployments/").await {
+        match self
+            .storage
+            .list::<Deployment>("/registry/deployments/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("deployments/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("deployments/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -178,7 +188,11 @@ impl<S: Storage + 'static> DeploymentController<S> {
 
     /// When a ReplicaSet changes, check its ownerReferences for a Deployment owner
     /// and enqueue that Deployment for reconciliation.
-    async fn enqueue_owner_deployment(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+    async fn enqueue_owner_deployment(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
         let rs_key = extract_key(event);
         let parts: Vec<&str> = rs_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -192,16 +206,24 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 if let Some(refs) = &rs.metadata.owner_references {
                     for owner_ref in refs {
                         if owner_ref.kind == "Deployment" {
-                            queue.add(format!("deployments/{}/{}", ns, owner_ref.name)).await;
+                            queue
+                                .add(format!("deployments/{}/{}", ns, owner_ref.name))
+                                .await;
                         }
                     }
                 }
             }
             Err(_) => {
                 // ReplicaSet deleted — enqueue all Deployments in this namespace
-                if let Ok(items) = self.storage.list::<Deployment>(&build_prefix("deployments", Some(ns))).await {
+                if let Ok(items) = self
+                    .storage
+                    .list::<Deployment>(&build_prefix("deployments", Some(ns)))
+                    .await
+                {
                     for d in &items {
-                        queue.add(format!("deployments/{}/{}", ns, d.metadata.name)).await;
+                        queue
+                            .add(format!("deployments/{}/{}", ns, d.metadata.name))
+                            .await;
                     }
                 }
             }
@@ -589,7 +611,8 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 // Update desired-replicas annotation on all active RSes after scaling
                 for rs in owned_replicasets.iter() {
                     if rs.spec.replicas > 0 {
-                        self.set_desired_replicas_annotation(rs, desired_replicas, namespace).await;
+                        self.set_desired_replicas_annotation(rs, desired_replicas, namespace)
+                            .await;
                     }
                 }
 
@@ -612,7 +635,8 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     "Scaling active ReplicaSet {}/{} from {} to {} (no old RSes)",
                     namespace, active_name, active_replicas, desired_replicas
                 );
-                self.update_replicaset_replicas(active, desired_replicas).await?;
+                self.update_replicaset_replicas(active, desired_replicas)
+                    .await?;
                 return self.update_deployment_status(deployment).await;
             }
 
@@ -646,7 +670,8 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 // currentPodCount = sum of all RS replicas (spec, not status)
                 // scaleUpCount = maxTotalPods - currentPodCount
                 // scaleUpCount = min(scaleUpCount, desired - newRS.Replicas)
-                let current_pod_count: i32 = owned_replicasets.iter().map(|rs| rs.spec.replicas).sum();
+                let current_pod_count: i32 =
+                    owned_replicasets.iter().map(|rs| rs.spec.replicas).sum();
                 let scale_up_count = (max_total - current_pod_count).max(0);
                 let scale_up_count = scale_up_count.min(desired_replicas - active_replicas);
                 let new_active_replicas = active_replicas + scale_up_count;
@@ -674,25 +699,32 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 //
                 // Count available replicas from all RSes (status-based, matching K8s).
                 // Fall back to counting pods directly if RS status is not yet populated.
-                let _all_available: i32 = owned_replicasets.iter().map(|rs| {
-                    if let Some(status) = &rs.status {
-                        status.available_replicas
-                    } else {
-                        // Fall back to pod count
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(
-                                self.count_available_pods_for_rs(&rs.metadata.name, namespace)
-                            )
-                        })
-                    }
-                }).sum();
+                let _all_available: i32 = owned_replicasets
+                    .iter()
+                    .map(|rs| {
+                        if let Some(status) = &rs.status {
+                            status.available_replicas
+                        } else {
+                            // Fall back to pod count
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(
+                                    self.count_available_pods_for_rs(&rs.metadata.name, namespace),
+                                )
+                            })
+                        }
+                    })
+                    .sum();
 
                 // New RS unavailable count = newRS.Spec.Replicas - newRS.Status.AvailableReplicas
-                let new_rs_available = if let Some(new_rs) = owned_replicasets.iter().find(|rs| rs.metadata.name == active_name) {
+                let new_rs_available = if let Some(new_rs) = owned_replicasets
+                    .iter()
+                    .find(|rs| rs.metadata.name == active_name)
+                {
                     if let Some(status) = &new_rs.status {
                         status.available_replicas
                     } else {
-                        self.count_available_pods_for_rs(&active_name, namespace).await
+                        self.count_available_pods_for_rs(&active_name, namespace)
+                            .await
                     }
                 } else {
                     0
@@ -700,13 +732,16 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 let new_rs_unavailable = (new_active_replicas - new_rs_available).max(0);
 
                 // allPodsCount uses the updated count after scaling up
-                let all_pods_count: i32 = owned_replicasets.iter().map(|rs| {
-                    if rs.metadata.name == active_name {
-                        new_active_replicas // Use the just-scaled-up count
-                    } else {
-                        rs.spec.replicas
-                    }
-                }).sum();
+                let all_pods_count: i32 = owned_replicasets
+                    .iter()
+                    .map(|rs| {
+                        if rs.metadata.name == active_name {
+                            new_active_replicas // Use the just-scaled-up count
+                        } else {
+                            rs.spec.replicas
+                        }
+                    })
+                    .sum();
 
                 let max_scaled_down = (all_pods_count - min_available - new_rs_unavailable).max(0);
                 let scale_down_by = max_scaled_down.min(old_rs_total);
@@ -885,7 +920,11 @@ impl<S: Storage + 'static> DeploymentController<S> {
         // After a rollout completes, delete old RSes (replicas=0) that exceed the history limit.
         // Re-fetch owned RSes since they may have changed during reconcile.
         let cleanup_rs_prefix = build_prefix("replicasets", Some(namespace));
-        let cleanup_all_rs: Vec<ReplicaSet> = self.storage.list(&cleanup_rs_prefix).await.unwrap_or_default();
+        let cleanup_all_rs: Vec<ReplicaSet> = self
+            .storage
+            .list(&cleanup_rs_prefix)
+            .await
+            .unwrap_or_default();
         let cleanup_owned: Vec<ReplicaSet> = cleanup_all_rs
             .into_iter()
             .filter(|rs| self.is_owned_by_deployment(rs, deployment))
@@ -999,10 +1038,19 @@ impl<S: Storage + 'static> DeploymentController<S> {
                         }
                     }
                     // Remove null/empty optional fields
-                    for field in &["nodeName", "nodeSelector", "hostname", "subdomain",
-                                   "priority", "runtimeClassName", "overhead",
-                                   "serviceAccountName", "serviceAccount",
-                                   "automountServiceAccountToken", "preemptionPolicy"] {
+                    for field in &[
+                        "nodeName",
+                        "nodeSelector",
+                        "hostname",
+                        "subdomain",
+                        "priority",
+                        "runtimeClassName",
+                        "overhead",
+                        "serviceAccountName",
+                        "serviceAccount",
+                        "automountServiceAccountToken",
+                        "preemptionPolicy",
+                    ] {
                         if let Some(v) = obj.get(*field) {
                             if v.is_null() || v == &serde_json::json!("") {
                                 obj.remove(*field);
@@ -1014,10 +1062,14 @@ impl<S: Storage + 'static> DeploymentController<S> {
                         if let Some(containers) = obj.get_mut(*key).and_then(|c| c.as_array_mut()) {
                             for container in containers.iter_mut() {
                                 if let Some(cobj) = container.as_object_mut() {
-                                    if cobj.get("terminationMessagePath") == Some(&serde_json::json!("/dev/termination-log")) {
+                                    if cobj.get("terminationMessagePath")
+                                        == Some(&serde_json::json!("/dev/termination-log"))
+                                    {
                                         cobj.remove("terminationMessagePath");
                                     }
-                                    if cobj.get("terminationMessagePolicy") == Some(&serde_json::json!("File")) {
+                                    if cobj.get("terminationMessagePolicy")
+                                        == Some(&serde_json::json!("File"))
+                                    {
                                         cobj.remove("terminationMessagePolicy");
                                     }
                                     // ImagePullPolicy depends on tag — just remove it
@@ -1415,12 +1467,18 @@ impl<S: Storage + 'static> DeploymentController<S> {
         };
 
         // Build status conditions — merge with existing, preserving unknown types
-        let mut conditions = deployment.status.as_ref()
+        let mut conditions = deployment
+            .status
+            .as_ref()
             .and_then(|s| s.conditions.clone())
             .unwrap_or_default();
 
         // Remove only the types we manage, then add our computed ones
-        conditions.retain(|c| c.condition_type != "Available" && c.condition_type != "Progressing" && c.condition_type != "ReplicaFailure");
+        conditions.retain(|c| {
+            c.condition_type != "Available"
+                && c.condition_type != "Progressing"
+                && c.condition_type != "ReplicaFailure"
+        });
 
         // Available condition
         if available_replicas >= desired_replicas {

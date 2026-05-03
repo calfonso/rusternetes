@@ -6,7 +6,7 @@ use rusternetes_common::resources::{
     HorizontalPodAutoscalerStatus, MetricSpec, MetricStatus, MetricValueStatus, ReplicaSet,
     StatefulSet,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -24,7 +24,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         info!("Starting HorizontalPodAutoscaler controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -32,7 +31,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -82,19 +80,24 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("horizontalpodautoscalers", Some(ns), name);
-            match self.storage.get::<HorizontalPodAutoscaler>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_hpa(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<HorizontalPodAutoscaler>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_hpa(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -105,13 +108,17 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<HorizontalPodAutoscaler>("/registry/horizontalpodautoscalers/").await {
+        match self
+            .storage
+            .list::<HorizontalPodAutoscaler>("/registry/horizontalpodautoscalers/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("horizontalpodautoscalers/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("horizontalpodautoscalers/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -479,24 +486,26 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         let mut updated_hpa = hpa.clone();
 
         // Build metric status (simplified for now)
-        let current_metrics = hpa.spec.metrics.as_ref().map(|specs| specs
-                    .iter()
-                    .map(|spec| MetricStatus {
-                        metric_type: spec.metric_type.clone(),
-                        resource: spec.resource.as_ref().map(|r| ResourceMetricStatus {
-                            name: r.name.clone(),
-                            current: MetricValueStatus {
-                                value: None,
-                                average_value: None,
-                                average_utilization: Some(85), // Mock current utilization
-                            },
-                        }),
-                        pods: None,
-                        object: None,
-                        external: None,
-                        container_resource: None,
-                    })
-                    .collect());
+        let current_metrics = hpa.spec.metrics.as_ref().map(|specs| {
+            specs
+                .iter()
+                .map(|spec| MetricStatus {
+                    metric_type: spec.metric_type.clone(),
+                    resource: spec.resource.as_ref().map(|r| ResourceMetricStatus {
+                        name: r.name.clone(),
+                        current: MetricValueStatus {
+                            value: None,
+                            average_value: None,
+                            average_utilization: Some(85), // Mock current utilization
+                        },
+                    }),
+                    pods: None,
+                    object: None,
+                    external: None,
+                    container_resource: None,
+                })
+                .collect()
+        });
 
         // Build conditions
         let now = Utc::now();

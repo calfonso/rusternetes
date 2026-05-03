@@ -252,7 +252,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             if let Err(e) = self.extract_metadata(&value) {
                 debug!(
                     "GC: Failed to extract metadata from {} resource: {} (key hint: {:?})",
-                    resource_type, e,
+                    resource_type,
+                    e,
                     value.pointer("/metadata/name").and_then(|v| v.as_str())
                 );
             }
@@ -331,10 +332,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // orphan) or background cascade will handle them properly.
         // K8s GC uses informer caches where a resource is "existing" until the
         // DELETE event fires (i.e., it's removed from etcd).
-        let existing_uids: HashSet<_> = resources
-            .iter()
-            .map(|r| r.metadata.uid.as_str())
-            .collect();
+        let existing_uids: HashSet<_> = resources.iter().map(|r| r.metadata.uid.as_str()).collect();
         let mut orphans = Vec::new();
 
         for resource in resources {
@@ -351,7 +349,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     debug!(
                         "GC: orphan {} — ownerRef UIDs {:?} not in existing_uids ({} entries)",
                         resource.key,
-                        owner_refs.iter().map(|r| r.uid.as_str()).collect::<Vec<_>>(),
+                        owner_refs
+                            .iter()
+                            .map(|r| r.uid.as_str())
+                            .collect::<Vec<_>>(),
                         existing_uids.len(),
                     );
                     orphans.push(resource.clone());
@@ -399,7 +400,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             let plural = kind_to_plural(&owner_ref.kind);
             if plural.is_empty() {
                 // Unknown kind — be conservative, don't delete
-                debug!("GC: {} has owner of unknown kind '{}', skipping", orphan.key, owner_ref.kind);
+                debug!(
+                    "GC: {} has owner of unknown kind '{}', skipping",
+                    orphan.key, owner_ref.kind
+                );
                 return Ok(());
             }
             let owner_key = if let Some(ns) = namespace {
@@ -412,7 +416,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             match self.storage.get::<Value>(&owner_key).await {
                 Ok(owner_value) => {
                     // Owner exists — verify UID matches
-                    if let Some(uid) = owner_value.pointer("/metadata/uid").and_then(|u| u.as_str()) {
+                    if let Some(uid) = owner_value
+                        .pointer("/metadata/uid")
+                        .and_then(|u| u.as_str())
+                    {
                         if uid == owner_ref.uid {
                             // Owner with matching UID exists — NOT an orphan
                             debug!(
@@ -563,9 +570,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         let dependents: Vec<_> = all_resources
             .iter()
             .filter(|r| {
-                r.metadata.owner_references.as_ref().is_some_and(|refs| {
-                    refs.iter().any(|oref| oref.uid == *resource_uid)
-                })
+                r.metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|refs| refs.iter().any(|oref| oref.uid == *resource_uid))
             })
             .collect();
 
@@ -656,9 +664,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         let dependents: Vec<_> = all_resources
             .iter()
             .filter(|r| {
-                r.metadata.owner_references.as_ref().is_some_and(|refs| {
-                    refs.iter().any(|oref| oref.uid == *resource_uid)
-                })
+                r.metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|refs| refs.iter().any(|oref| oref.uid == *resource_uid))
             })
             .collect();
 

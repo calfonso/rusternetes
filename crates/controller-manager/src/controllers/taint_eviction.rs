@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -21,7 +21,6 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
     /// Watch-based run loop. Watches nodes as primary resource.
     /// Falls back to periodic resync every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -29,7 +28,6 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -79,15 +77,13 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
             let name = key.strip_prefix("nodes/").unwrap_or(&key);
             let storage_key = build_key("nodes", None, name);
             match self.storage.get::<Node>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_node(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_node(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -220,7 +216,9 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
                             condition_type: "DisruptionTarget".to_string(),
                             status: "True".to_string(),
                             reason: Some("DeletionByTaintManager".to_string()),
-                            message: Some("Taint manager: deleting due to NoExecute taint".to_string()),
+                            message: Some(
+                                "Taint manager: deleting due to NoExecute taint".to_string(),
+                            ),
                             last_transition_time: Some(Utc::now()),
                             observed_generation: None,
                         };
@@ -284,9 +282,10 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
     ) -> bool {
         // Empty key with Exists operator matches all taints
         if toleration.key.as_ref().is_none_or(|k| k.is_empty())
-            && toleration.operator.as_deref() == Some("Exists") {
-                return true;
-            }
+            && toleration.operator.as_deref() == Some("Exists")
+        {
+            return true;
+        }
 
         // Key must match
         let key_matches = toleration.key.as_ref() == Some(&taint.key);

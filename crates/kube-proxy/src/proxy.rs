@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rusternetes_common::resources::{EndpointSlice, Endpoints, Service, ServiceType};
-use rusternetes_storage::{StorageBackend, Storage};
+use rusternetes_storage::{Storage, StorageBackend};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -192,7 +192,11 @@ impl KubeProxy {
         // See: pkg/proxy/iptables/proxier.go:1495 — RestoreAll with NoFlushTables
         //
         // Build all rules in memory, then apply atomically.
-        info!("Kube-proxy sync: {} services, {} endpoint entries", services.len(), endpointslice_map.len());
+        info!(
+            "Kube-proxy sync: {} services, {} endpoint entries",
+            services.len(),
+            endpointslice_map.len()
+        );
         let nat_rules = self
             .iptables
             .build_nat_rules(&services, &endpointslice_map)

@@ -2,7 +2,7 @@ use rusternetes_common::resources::{
     IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetStatus,
 };
 use rusternetes_common::types::LabelSelector;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -19,7 +19,6 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         use futures::StreamExt;
 
         info!("Starting PodDisruptionBudget controller");
-
 
         let queue = WorkQueue::new();
 
@@ -77,19 +76,20 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("poddisruptionbudgets", Some(ns), name);
             match self.storage.get::<PodDisruptionBudget>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_pdb(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_pdb(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -100,13 +100,17 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<PodDisruptionBudget>("/registry/poddisruptionbudgets/").await {
+        match self
+            .storage
+            .list::<PodDisruptionBudget>("/registry/poddisruptionbudgets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("poddisruptionbudgets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("poddisruptionbudgets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }

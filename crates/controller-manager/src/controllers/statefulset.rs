@@ -4,7 +4,7 @@ use rusternetes_common::resources::{
     PersistentVolumeClaim, Pod, PodStatus, StatefulSet, StatefulSetStatus,
 };
 use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -22,7 +22,6 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting StatefulSetController (watch-based)");
         let retry_interval = Duration::from_secs(5);
-
 
         let queue = WorkQueue::new();
 
@@ -42,7 +41,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -52,7 +54,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             let mut pod_watch = match self.storage.watch(&pod_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish pod watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -109,13 +114,16 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("statefulsets", Some(ns), name);
             match self.storage.get::<StatefulSet>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile(&mut resource).await {
+                    match self.reconcile(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -133,13 +141,17 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<StatefulSet>("/registry/statefulsets/").await {
+        match self
+            .storage
+            .list::<StatefulSet>("/registry/statefulsets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("statefulsets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("statefulsets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -151,7 +163,11 @@ impl<S: Storage + 'static> StatefulSetController<S> {
 
     /// When a pod changes, check its ownerReferences for a StatefulSet owner
     /// and enqueue that StatefulSet for reconciliation.
-    async fn enqueue_owner_statefulset(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+    async fn enqueue_owner_statefulset(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
         let pod_key = extract_key(event);
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -165,16 +181,24 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 if let Some(refs) = &pod.metadata.owner_references {
                     for owner_ref in refs {
                         if owner_ref.kind == "StatefulSet" {
-                            queue.add(format!("statefulsets/{}/{}", ns, owner_ref.name)).await;
+                            queue
+                                .add(format!("statefulsets/{}/{}", ns, owner_ref.name))
+                                .await;
                         }
                     }
                 }
             }
             Err(_) => {
                 // Pod deleted — enqueue all StatefulSets in this namespace
-                if let Ok(items) = self.storage.list::<StatefulSet>(&build_prefix("statefulsets", Some(ns))).await {
+                if let Ok(items) = self
+                    .storage
+                    .list::<StatefulSet>(&build_prefix("statefulsets", Some(ns)))
+                    .await
+                {
                     for ss in &items {
-                        queue.add(format!("statefulsets/{}/{}", ns, ss.metadata.name)).await;
+                        queue
+                            .add(format!("statefulsets/{}/{}", ns, ss.metadata.name))
+                            .await;
                     }
                 }
             }
@@ -787,7 +811,9 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         // doesn't manage any condition types itself, so keep ALL existing conditions.
         // This prevents overwriting conditions set via PUT /status (e.g. "StatusUpdate"
         // condition from conformance tests).
-        let existing_conditions = statefulset.status.as_ref()
+        let existing_conditions = statefulset
+            .status
+            .as_ref()
             .and_then(|s| s.conditions.clone());
 
         // Update status with accurate counts

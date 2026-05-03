@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use rusternetes_common::resources::{
     CustomResourceDefinition, CustomResourceDefinitionCondition, CustomResourceDefinitionStatus,
 };
-use rusternetes_storage::{Storage, WorkQueue, extract_key, build_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -86,18 +86,22 @@ impl<S: Storage + 'static> CRDController<S> {
     }
     async fn worker(&self, queue: WorkQueue) {
         while let Some(key) = queue.get().await {
-            let name = key.strip_prefix("customresourcedefinitions/").unwrap_or(&key);
+            let name = key
+                .strip_prefix("customresourcedefinitions/")
+                .unwrap_or(&key);
             let storage_key = build_key("customresourcedefinitions", None, name);
-            match self.storage.get::<CustomResourceDefinition>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_crd(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<CustomResourceDefinition>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_crd(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -108,7 +112,11 @@ impl<S: Storage + 'static> CRDController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<CustomResourceDefinition>("/registry/customresourcedefinitions/").await {
+        match self
+            .storage
+            .list::<CustomResourceDefinition>("/registry/customresourcedefinitions/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = format!("customresourcedefinitions/{}", item.metadata.name);
@@ -116,7 +124,10 @@ impl<S: Storage + 'static> CRDController<S> {
                 }
             }
             Err(e) => {
-                error!("Failed to list customresourcedefinitions for enqueue: {}", e);
+                error!(
+                    "Failed to list customresourcedefinitions for enqueue: {}",
+                    e
+                );
             }
         }
     }
@@ -209,11 +220,8 @@ impl<S: Storage + 'static> CRDController<S> {
                 crd.spec.group, version.name, crd.spec.names.plural
             );
 
-            let crs: Vec<serde_json::Value> = self
-                .storage
-                .list(&cr_prefix)
-                .await
-                .unwrap_or_default();
+            let crs: Vec<serde_json::Value> =
+                self.storage.list(&cr_prefix).await.unwrap_or_default();
 
             for cr in &crs {
                 let cr_name = cr
@@ -238,10 +246,7 @@ impl<S: Storage + 'static> CRDController<S> {
                 };
 
                 if let Err(e) = self.storage.delete(&cr_key).await {
-                    warn!(
-                        "Failed to delete CR {} for CRD {}: {}",
-                        cr_key, crd_name, e
-                    );
+                    warn!("Failed to delete CR {} for CRD {}: {}", cr_key, crd_name, e);
                 } else {
                     debug!("Deleted CR {} for CRD {}", cr_key, crd_name);
                 }
@@ -253,7 +258,10 @@ impl<S: Storage + 'static> CRDController<S> {
         match self.storage.get::<serde_json::Value>(&crd_key).await {
             Ok(mut crd_value) => {
                 // Remove the finalizer
-                if let Some(meta) = crd_value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                if let Some(meta) = crd_value
+                    .get_mut("metadata")
+                    .and_then(|m| m.as_object_mut())
+                {
                     if let Some(fins) = meta.get_mut("finalizers").and_then(|f| f.as_array_mut()) {
                         fins.retain(|f| f.as_str() != Some(cleanup_finalizer));
                         if fins.is_empty() {
@@ -271,10 +279,16 @@ impl<S: Storage + 'static> CRDController<S> {
                 if has_finalizers {
                     // Other finalizers remain — just update to remove ours
                     if let Err(e) = self.storage.update(&crd_key, &crd_value).await {
-                        error!("Failed to update CRD {} after removing finalizer: {}", crd_name, e);
+                        error!(
+                            "Failed to update CRD {} after removing finalizer: {}",
+                            crd_name, e
+                        );
                         return Err(anyhow!("Failed to update CRD: {}", e));
                     }
-                    info!("Removed cleanup finalizer from CRD {}, other finalizers remain", crd_name);
+                    info!(
+                        "Removed cleanup finalizer from CRD {}, other finalizers remain",
+                        crd_name
+                    );
                 } else {
                     // No finalizers left — delete the CRD
                     if let Err(e) = self.storage.delete(&crd_key).await {

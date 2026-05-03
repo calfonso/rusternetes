@@ -6,7 +6,7 @@ use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
 use rusternetes_common::types::{OwnerReference, Phase};
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -57,7 +57,6 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         info!("Starting DaemonSetController (watch-based)");
         let retry_interval = Duration::from_secs(5);
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -81,7 +80,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let ds_watch = match self.storage.watch(ds_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish daemonset watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish daemonset watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -89,7 +91,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let node_watch = match self.storage.watch(node_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish node watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish node watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -97,7 +102,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let pod_watch = match self.storage.watch(pod_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish pod watch for DS controller: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish pod watch for DS controller: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -172,7 +180,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     }
 
     /// When a pod changes, find its owning DaemonSet and enqueue it for reconciliation.
-    async fn enqueue_ds_for_pod_event(&self, event: &rusternetes_storage::WatchEvent, queue: &WorkQueue) {
+    async fn enqueue_ds_for_pod_event(
+        &self,
+        event: &rusternetes_storage::WatchEvent,
+        queue: &WorkQueue,
+    ) {
         let json_str = match event {
             rusternetes_storage::WatchEvent::Added(_, v)
             | rusternetes_storage::WatchEvent::Modified(_, v)
@@ -194,10 +206,16 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// When a node changes, enqueue ALL daemonsets since any DS might need
     /// to create/delete a pod on the changed node.
     async fn enqueue_all_for_node_change(&self, queue: &WorkQueue) {
-        if let Ok(daemonsets) = self.storage.list::<DaemonSet>("/registry/daemonsets/").await {
+        if let Ok(daemonsets) = self
+            .storage
+            .list::<DaemonSet>("/registry/daemonsets/")
+            .await
+        {
             for ds in &daemonsets {
                 let ns = ds.metadata.namespace.as_deref().unwrap_or("");
-                queue.add(format!("daemonsets/{}/{}", ns, ds.metadata.name)).await;
+                queue
+                    .add(format!("daemonsets/{}/{}", ns, ds.metadata.name))
+                    .await;
             }
         }
     }
@@ -206,13 +224,16 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("daemonsets", Some(ns), name);
             match self.storage.get::<DaemonSet>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile(&mut resource).await {
+                    match self.reconcile(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -230,13 +251,17 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<DaemonSet>("/registry/daemonsets/").await {
+        match self
+            .storage
+            .list::<DaemonSet>("/registry/daemonsets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("daemonsets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("daemonsets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -655,7 +680,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 if let Ok(()) = self.storage.delete(&pod_key).await {
                     info!(
                         "Rolling update: deleted unavailable old pod {} on node {} (budget {}/{})",
-                        pod_name, node_name, deleted_count + 1, allowed_deletions
+                        pod_name,
+                        node_name,
+                        deleted_count + 1,
+                        allowed_deletions
                     );
                     deleted_count += 1;
                 }
@@ -671,8 +699,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 if let Ok(()) = self.storage.delete(&pod_key).await {
                     info!(
                         "Rolling update: deleted old pod {} on node {} (hash != {}, budget {}/{})",
-                        pod_name, node_name, template_hash,
-                        deleted_count + 1, allowed_deletions
+                        pod_name,
+                        node_name,
+                        template_hash,
+                        deleted_count + 1,
+                        allowed_deletions
                     );
                     deleted_count += 1;
                 }
@@ -760,8 +791,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             .count() as i32;
 
         // Preserve existing conditions from current status (merge pattern)
-        let existing_conditions = daemonset.status.as_ref()
-            .and_then(|s| s.conditions.clone());
+        let existing_conditions = daemonset.status.as_ref().and_then(|s| s.conditions.clone());
 
         let new_status = Some(DaemonSetStatus {
             desired_number_scheduled,
@@ -806,7 +836,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                             updated_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
                             let pod_key = build_key("pods", Some(ns), &pod.metadata.name);
                             let _ = self.storage.update(&pod_key, &updated_pod).await;
-                            info!("Marked pod {} for deletion (DaemonSet {} being deleted)", pod.metadata.name, ds_name);
+                            info!(
+                                "Marked pod {} for deletion (DaemonSet {} being deleted)",
+                                pod.metadata.name, ds_name
+                            );
                         }
                     }
                 }
@@ -859,11 +892,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 })
                 .collect()
         };
-        let pod_name = format!(
-            "{}-{}",
-            daemonset_name,
-            suffix
-        );
+        let pod_name = format!("{}-{}", daemonset_name, suffix);
 
         // Create pod from template
         let template = &daemonset.spec.template;
@@ -1185,13 +1214,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 }
                 serde_json::Value::Object(cleaned)
             }
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(
-                    arr.iter()
-                        .map(|v| Self::strip_go_omitempty_zeros(v))
-                        .collect(),
-                )
-            }
+            serde_json::Value::Array(arr) => serde_json::Value::Array(
+                arr.iter()
+                    .map(|v| Self::strip_go_omitempty_zeros(v))
+                    .collect(),
+            ),
             other => other.clone(),
         }
     }
@@ -1201,9 +1228,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         match value {
             serde_json::Value::Null => true,
             serde_json::Value::Bool(b) => !b,
-            serde_json::Value::Number(n) => {
-                n.as_f64().map(|f| f == 0.0).unwrap_or(false)
-            }
+            serde_json::Value::Number(n) => n.as_f64().map(|f| f == 0.0).unwrap_or(false),
             serde_json::Value::String(s) => s.is_empty(),
             serde_json::Value::Array(arr) => arr.is_empty(),
             serde_json::Value::Object(map) => map.is_empty(),

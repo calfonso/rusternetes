@@ -103,7 +103,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir.clone() }
+            StorageConfig::Sqlite {
+                path: args.data_dir.clone(),
+            }
         }
         _ => {
             let etcd_endpoints: Vec<String> = args
@@ -112,7 +114,9 @@ async fn main() -> Result<()> {
                 .map(|s| s.trim().to_string())
                 .collect();
             info!("Connecting to etcd: {:?}", etcd_endpoints);
-            StorageConfig::Etcd { endpoints: etcd_endpoints }
+            StorageConfig::Etcd {
+                endpoints: etcd_endpoints,
+            }
         }
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);

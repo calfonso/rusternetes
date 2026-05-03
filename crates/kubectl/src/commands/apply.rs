@@ -175,7 +175,10 @@ pub fn collect_files(inputs: &[String], recursive: bool) -> Result<Vec<String>> 
 
 /// Return true if the file extension indicates a Kubernetes manifest.
 fn is_manifest_file(path: &Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()), Some("yaml") | Some("yml") | Some("json"))
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yaml") | Some("yml") | Some("json")
+    )
 }
 
 // ---------------------------------------------------------------------------

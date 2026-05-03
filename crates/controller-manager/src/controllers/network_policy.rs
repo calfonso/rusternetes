@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rusternetes_common::resources::{NetworkPolicy, Pod};
-use rusternetes_storage::{Storage, WorkQueue, extract_key, build_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -29,7 +29,6 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
 
         info!("Starting NetworkPolicy controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -37,7 +36,6 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -87,19 +85,20 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("networkpolicies", Some(ns), name);
             match self.storage.get::<NetworkPolicy>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_policy(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_policy(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -110,13 +109,17 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<NetworkPolicy>("/registry/networkpolicies/").await {
+        match self
+            .storage
+            .list::<NetworkPolicy>("/registry/networkpolicies/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("networkpolicies/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("networkpolicies/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }

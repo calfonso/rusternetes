@@ -166,10 +166,7 @@ async fn test_cr_data_does_not_contain_empty_name_field() {
 
     let ds = make_daemonset("rev-ds", "default");
     storage
-        .create(
-            &build_key("daemonsets", Some("default"), "rev-ds"),
-            &ds,
-        )
+        .create(&build_key("daemonsets", Some("default"), "rev-ds"), &ds)
         .await
         .unwrap();
 
@@ -180,7 +177,10 @@ async fn test_cr_data_does_not_contain_empty_name_field() {
         .list("/registry/controllerrevisions/default/")
         .await
         .unwrap();
-    assert!(!revisions.is_empty(), "Should have created a ControllerRevision");
+    assert!(
+        !revisions.is_empty(),
+        "Should have created a ControllerRevision"
+    );
 
     let cr = &revisions[0];
     let data = cr.data.as_ref().unwrap();
@@ -208,10 +208,7 @@ async fn test_cr_data_does_not_contain_empty_uid_field() {
 
     let ds = make_daemonset("uid-ds", "default");
     storage
-        .create(
-            &build_key("daemonsets", Some("default"), "uid-ds"),
-            &ds,
-        )
+        .create(&build_key("daemonsets", Some("default"), "uid-ds"), &ds)
         .await
         .unwrap();
 
@@ -248,10 +245,7 @@ async fn test_cr_data_is_deterministic_across_reconciles() {
 
     let ds = make_daemonset("det-ds", "default");
     storage
-        .create(
-            &build_key("daemonsets", Some("default"), "det-ds"),
-            &ds,
-        )
+        .create(&build_key("daemonsets", Some("default"), "det-ds"), &ds)
         .await
         .unwrap();
 
@@ -266,8 +260,7 @@ async fn test_cr_data_is_deterministic_across_reconciles() {
 
     // Build fresh patch data from the same template
     let fresh_patch =
-        DaemonSetController::<MemoryStorage>::build_patch_data(&ds.spec.template)
-            .unwrap();
+        DaemonSetController::<MemoryStorage>::build_patch_data(&ds.spec.template).unwrap();
     let cr_data_2 = serde_json::to_string(&fresh_patch).unwrap();
 
     assert_eq!(
@@ -289,10 +282,7 @@ async fn test_cr_data_has_patch_replace_marker() {
 
     let ds = make_daemonset("patch-ds", "default");
     storage
-        .create(
-            &build_key("daemonsets", Some("default"), "patch-ds"),
-            &ds,
-        )
+        .create(&build_key("daemonsets", Some("default"), "patch-ds"), &ds)
         .await
         .unwrap();
 
@@ -331,10 +321,7 @@ async fn test_cr_data_keys_sorted_alphabetically() {
 
     let ds = make_daemonset("sort-ds", "default");
     storage
-        .create(
-            &build_key("daemonsets", Some("default"), "sort-ds"),
-            &ds,
-        )
+        .create(&build_key("daemonsets", Some("default"), "sort-ds"), &ds)
         .await
         .unwrap();
 
@@ -377,10 +364,7 @@ async fn test_failed_pod_is_deleted_and_replacement_has_different_name() {
 
     let ds = make_daemonset("fail-ds", "default");
     storage
-        .create(
-            &build_key("daemonsets", Some("default"), "fail-ds"),
-            &ds,
-        )
+        .create(&build_key("daemonsets", Some("default"), "fail-ds"), &ds)
         .await
         .unwrap();
 
@@ -472,10 +456,7 @@ async fn test_succeeded_pod_is_deleted() {
 
     let ds = make_daemonset("succ-ds", "default");
     storage
-        .create(
-            &build_key("daemonsets", Some("default"), "succ-ds"),
-            &ds,
-        )
+        .create(&build_key("daemonsets", Some("default"), "succ-ds"), &ds)
         .await
         .unwrap();
 
@@ -519,8 +500,5 @@ async fn test_succeeded_pod_is_deleted() {
 
     // Original should be gone
     let result: Result<Pod, _> = storage.get(&pod_key).await;
-    assert!(
-        result.is_err(),
-        "Succeeded pod should be deleted"
-    );
+    assert!(result.is_err(), "Succeeded pod should be deleted");
 }

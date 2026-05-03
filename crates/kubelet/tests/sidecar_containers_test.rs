@@ -337,10 +337,7 @@ fn test_multiple_sidecars_with_init_containers() {
     // Next 3 are sidecars
     for (i, container) in init_containers.iter().skip(2).enumerate().take(3) {
         assert_eq!(container.name, format!("sidecar-{}", i));
-        assert_eq!(
-            container.restart_policy,
-            Some("Always".to_string())
-        );
+        assert_eq!(container.restart_policy, Some("Always".to_string()));
     }
 
     // Should have 2 main containers
@@ -400,10 +397,7 @@ fn test_only_sidecars_no_regular_init() {
 
     for (i, container) in init_containers.iter().enumerate().take(2) {
         assert_eq!(container.name, format!("sidecar-{}", i));
-        assert_eq!(
-            container.restart_policy,
-            Some("Always".to_string())
-        );
+        assert_eq!(container.restart_policy, Some("Always".to_string()));
     }
 }
 
