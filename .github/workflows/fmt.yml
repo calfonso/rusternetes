@@ -1,0 +1,23 @@
+name: Check formatting
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  fmt:
+    name: Verify formatting with cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup component add --toolchain stable rustfmt
+          rustup default stable
+
+      - name: Validate formatting
+        run: cargo fmt --all -- --check
