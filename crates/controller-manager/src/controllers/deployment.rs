@@ -555,7 +555,11 @@ impl<S: Storage + 'static> DeploymentController<S> {
             let replicas_to_add = allowed_size - all_rs_replicas;
 
             if replicas_to_add != 0 {
-                // Distribute proportionally across all active RSes
+                // K8s proportional scaling formula (deployment_util.go:getReplicaSetFraction):
+                //   newSize = rs.Replicas * (newMaxTotal / oldMaxTotal)
+                //   fraction = round(newSize) - rs.Replicas
+                // where oldMaxTotal comes from the RS "max-replicas" annotation.
+                // K8s ref: pkg/controller/deployment/util/deployment_util.go
                 let mut added = 0i32;
                 let mut updates: Vec<(String, i32)> = Vec::new();
 
@@ -563,23 +567,28 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     if rs.spec.replicas == 0 {
                         continue;
                     }
-                    let fraction = if all_rs_replicas > 0 {
-                        let f = (replicas_to_add as f64) * (rs.spec.replicas as f64)
-                            / (all_rs_replicas as f64);
-                        if replicas_to_add > 0 {
-                            f.ceil() as i32 // Round up when scaling up
-                        } else {
-                            f.floor() as i32 // Round down when scaling down
-                        }
+                    // Read oldMaxTotal from RS annotation (set during previous scale)
+                    let old_max = rs
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|a| a.get("deployment.kubernetes.io/max-replicas"))
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .unwrap_or(all_rs_replicas); // fallback if no annotation
+
+                    let fraction = if old_max > 0 {
+                        let new_size =
+                            (rs.spec.replicas as f64) * (allowed_size as f64) / (old_max as f64);
+                        new_size.round() as i32 - rs.spec.replicas
                     } else {
                         0
                     };
 
                     let allowed = replicas_to_add - added;
                     let proportion = if replicas_to_add > 0 {
-                        fraction.min(allowed)
+                        fraction.min(allowed).max(0)
                     } else {
-                        fraction.max(allowed)
+                        fraction.max(allowed).min(0)
                     };
 
                     let new_replicas = (rs.spec.replicas + proportion).max(0);
@@ -589,7 +598,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     added += proportion;
                 }
 
-                // Apply leftover to first RS
+                // Apply leftover to first RS (K8s assigns leftover to largest/newest)
                 if !updates.is_empty() && replicas_to_add != added {
                     let leftover = replicas_to_add - added;
                     updates[0].1 = (updates[0].1 + leftover).max(0);
@@ -608,11 +617,17 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     }
                 }
 
-                // Update desired-replicas annotation on all active RSes after scaling
+                // Update desired-replicas annotation on all active RSes after scaling.
+                // K8s SetReplicasAnnotations sets max-replicas = desired + maxSurge.
                 for rs in owned_replicasets.iter() {
                     if rs.spec.replicas > 0 {
-                        self.set_desired_replicas_annotation(rs, desired_replicas, namespace)
-                            .await;
+                        self.set_desired_replicas_annotation(
+                            rs,
+                            desired_replicas,
+                            max_surge,
+                            namespace,
+                        )
+                        .await;
                     }
                 }
 
@@ -1315,6 +1330,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         &self,
         rs: &ReplicaSet,
         desired: i32,
+        max_surge: i32,
         namespace: &str,
     ) {
         let key = build_key("replicasets", Some(namespace), &rs.metadata.name);
@@ -1324,8 +1340,8 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 .annotations
                 .get_or_insert_with(std::collections::HashMap::new);
             let desired_str = desired.to_string();
-            // K8s: maxSurge defaults to 25% of desired, rounded up, minimum 1
-            let max_surge = std::cmp::max((desired as f64 * 0.25).ceil() as i32, 1);
+            // K8s: max-replicas = desired + maxSurge (from deployment strategy)
+            // K8s ref: pkg/controller/deployment/util/deployment_util.go — SetReplicasAnnotations
             let max_replicas_str = (desired + max_surge).to_string();
             let mut changed = false;
             if annotations.get("deployment.kubernetes.io/desired-replicas") != Some(&desired_str) {
