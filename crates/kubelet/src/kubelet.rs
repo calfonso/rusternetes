@@ -1919,10 +1919,23 @@ impl Kubelet {
                                 {
                                     if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
                                         let mut retry_pod = fresh_pod;
+                                        // Re-fetch ALL statuses for the retry — stale
+                                        // init_container_statuses from an intermediate
+                                        // write may have ready=false for completed inits.
+                                        // K8s prober_manager.UpdatePodStatus always sets
+                                        // ready=true for terminated init containers.
+                                        let fresh_init_statuses =
+                                            self.runtime.get_init_container_statuses(pod).await;
+                                        let fresh_container_statuses =
+                                            self.runtime.get_container_statuses(pod).await.ok();
                                         if let Some(ref mut status) = retry_pod.status {
                                             status.phase = Some(Phase::Running);
                                             status.message =
                                                 Some("All containers ready".to_string());
+                                            status.init_container_statuses = fresh_init_statuses;
+                                            if let Some(cs) = fresh_container_statuses {
+                                                status.container_statuses = Some(cs);
+                                            }
                                         }
                                         if let Err(e2) = self.storage.update(&key, &retry_pod).await
                                         {
@@ -3213,8 +3226,16 @@ impl Kubelet {
                                 .get_ephemeral_container_statuses(&new_pod)
                                 .await;
 
+                            // Refresh init container statuses — K8s prober_manager
+                            // sets ready=true for terminated init containers on every
+                            // status sync. Without this, stale ready=false from an
+                            // intermediate write persists indefinitely.
+                            let init_container_statuses =
+                                self.runtime.get_init_container_statuses(&new_pod).await;
+
                             if let Some(ref mut status) = new_pod.status {
                                 status.container_statuses = Some(container_statuses);
+                                status.init_container_statuses = init_container_statuses;
                                 status.ephemeral_container_statuses = ephemeral_container_statuses;
                                 status.observed_generation = new_pod.metadata.generation;
                                 // Update pod IP if we got one and it's different
