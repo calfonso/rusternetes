@@ -159,12 +159,13 @@ where
     // Extract parameters
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
     let send_initial_events = params.send_initial_events.unwrap_or(false);
-    // Watch timeout: use client-requested timeout, capped at 5 minutes.
-    // K8s default is ~30 minutes but lingering watches from completed tests
-    // consume HTTP/2 streams. 5 minutes balances test needs (some watches
-    // need 300s) with stream recycling. client-go RetryWatcher auto-reconnects.
+    // Watch timeout: honor client-requested timeout, capped at 10 minutes.
+    // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
+    // request 350-572s timeouts. Capping below the client's request causes
+    // "context canceled" errors when the server closes the watch early.
+    // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go
     let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(300).min(300),
+        params.timeout_seconds.unwrap_or(600).min(600),
     ));
     let label_selector = params.label_selector.clone();
     let field_selector = params.field_selector.clone();
@@ -646,12 +647,13 @@ where
     // Extract parameters
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
     let send_initial_events = params.send_initial_events.unwrap_or(false);
-    // Watch timeout: use client-requested timeout, capped at 5 minutes.
-    // K8s default is ~30 minutes but lingering watches from completed tests
-    // consume HTTP/2 streams. 5 minutes balances test needs (some watches
-    // need 300s) with stream recycling. client-go RetryWatcher auto-reconnects.
+    // Watch timeout: honor client-requested timeout, capped at 10 minutes.
+    // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
+    // request 350-572s timeouts. Capping below the client's request causes
+    // "context canceled" errors when the server closes the watch early.
+    // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go
     let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(300).min(300),
+        params.timeout_seconds.unwrap_or(600).min(600),
     ));
     let label_selector = params.label_selector.clone();
     let field_selector = params.field_selector.clone();
