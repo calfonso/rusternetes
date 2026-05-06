@@ -818,9 +818,9 @@ impl Kubelet {
             let pod = pod.clone();
             let kubelet = Arc::clone(self);
             let timeout_secs = if pod.metadata.deletion_timestamp.is_some() {
-                90u64
+                120u64
             } else {
-                30u64
+                120u64
             };
             tokio::spawn(async move {
                 let result = tokio::time::timeout(
@@ -1225,10 +1225,14 @@ impl Kubelet {
                         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
                         //   grace_period can be up to terminationGracePeriodSeconds (default 30s)
                         //   plus preStop hook execution time.
+                        // K8s pod workers don't have a per-sync timeout — they
+                        // run until complete. We use a generous timeout to avoid
+                        // killing sync_pod before readiness probes can execute.
+                        // 30s was too short for multi-container pods with probes.
                         let timeout_secs = if pod.metadata.deletion_timestamp.is_some() {
                             120u64
                         } else {
-                            30u64
+                            120u64
                         };
                         match tokio::time::timeout(
                             Duration::from_secs(timeout_secs),
