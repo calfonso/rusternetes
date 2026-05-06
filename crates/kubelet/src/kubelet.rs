@@ -632,8 +632,11 @@ impl Kubelet {
             }
         }
 
-        // Check for NoExecute taints and evict pods that don't tolerate them
-        if let Some(ref spec) = node.spec {
+        // Check for NoExecute taints and evict pods that don't tolerate them.
+        // Re-read the node to get the freshest taint state — a test may have
+        // removed taints between the initial read and this check.
+        let fresh_node: Node = self.storage.get(&key).await.unwrap_or(node.clone());
+        if let Some(ref spec) = fresh_node.spec {
             if let Some(ref taints) = spec.taints {
                 let no_execute_taints: Vec<_> =
                     taints.iter().filter(|t| t.effect == "NoExecute").collect();
