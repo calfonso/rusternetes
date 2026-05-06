@@ -1206,8 +1206,19 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 for (key, val) in map {
                     // Recursively clean nested values first
                     let cleaned_val = Self::strip_go_omitempty_zeros(val);
-                    // Skip zero-value fields (Go's omitempty behavior)
-                    if Self::is_go_zero_value(&cleaned_val) {
+                    // Skip zero-value fields (Go's omitempty behavior).
+                    // Exception: Go keeps empty structs that come from non-nil
+                    // pointers (e.g., securityContext: {} from &SecurityContext{}).
+                    // These are NOT dropped by omitempty because the pointer is
+                    // non-nil even though the struct is empty.
+                    // K8s ref: api/core/v1/types.go — SecurityContext is *SecurityContext
+                    let is_preserved_empty_struct = cleaned_val.is_object()
+                        && cleaned_val.as_object().unwrap().is_empty()
+                        && matches!(
+                            key.as_str(),
+                            "securityContext" | "resources" | "capabilities"
+                        );
+                    if !is_preserved_empty_struct && Self::is_go_zero_value(&cleaned_val) {
                         continue;
                     }
                     cleaned.insert(key.clone(), cleaned_val);
