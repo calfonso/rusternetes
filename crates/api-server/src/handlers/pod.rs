@@ -774,6 +774,20 @@ pub async fn update(
         }
     }
 
+    // Check ResourceQuota on update — K8s enforces quota when pod resources change.
+    // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
+    match crate::admission::check_resource_quota(&state.storage, &namespace, &pod).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(rusternetes_common::Error::Forbidden(
+                "exceeded quota".to_string(),
+            ));
+        }
+        Err(e) => {
+            warn!("Error checking ResourceQuota on pod update: {}", e);
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(

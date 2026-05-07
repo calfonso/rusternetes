@@ -2396,8 +2396,10 @@ impl ContainerRuntime {
                         );
                         None
                     } else {
-                        // Required secret not found — abort pod start so kubelet
-                        // retries on next reconciliation (when the secret exists).
+                        // Required secret not found — return error so the kubelet
+                        // retries on next sync. K8s leaves the pod in Pending with
+                        // ContainerCreating and retries until the secret exists.
+                        // K8s ref: pkg/kubelet/kubelet_pods.go — makeVolumes
                         return Err(anyhow::anyhow!(
                             "Secret {} not found in namespace {}: {}",
                             secret_name,

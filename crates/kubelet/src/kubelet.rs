@@ -817,11 +817,7 @@ impl Kubelet {
         for pod in &node_pods {
             let pod = pod.clone();
             let kubelet = Arc::clone(self);
-            let timeout_secs = if pod.metadata.deletion_timestamp.is_some() {
-                120u64
-            } else {
-                120u64
-            };
+            let timeout_secs = 120u64;
             tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
@@ -1226,14 +1222,9 @@ impl Kubelet {
                         //   grace_period can be up to terminationGracePeriodSeconds (default 30s)
                         //   plus preStop hook execution time.
                         // K8s pod workers don't have a per-sync timeout — they
-                        // run until complete. We use a generous timeout to avoid
-                        // killing sync_pod before readiness probes can execute.
-                        // 30s was too short for multi-container pods with probes.
-                        let timeout_secs = if pod.metadata.deletion_timestamp.is_some() {
-                            120u64
-                        } else {
-                            120u64
-                        };
+                        // K8s pod workers don't have a per-sync timeout.
+                        // 120s is generous enough for container startup + probes.
+                        let timeout_secs = 120u64;
                         match tokio::time::timeout(
                             Duration::from_secs(timeout_secs),
                             kubelet.sync_pod(&pod),
@@ -1959,6 +1950,65 @@ impl Kubelet {
                         }
                         Err(e) => {
                             let err_msg = e.to_string();
+
+                            // K8s retries volume mounting when secrets/configmaps
+                            // aren't available yet. The pod stays Pending with
+                            // containers in Waiting{ContainerCreating} state.
+                            // syncPod returns early without creating any containers.
+                            // The pod worker retries on the next sync cycle.
+                            // K8s ref: pkg/kubelet/kubelet.go:2204 — WaitForAttachAndMount
+                            //          pkg/kubelet/kubelet_pods.go:2496 — defaultWaitingState
+                            if err_msg.contains("not found in namespace")
+                                && (err_msg.contains("Secret") || err_msg.contains("ConfigMap"))
+                            {
+                                warn!(
+                                    "Pod {}/{} waiting for volume (will retry): {}",
+                                    namespace, pod_name, err_msg
+                                );
+                                let key = build_key("pods", Some(namespace), pod_name);
+                                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                                    // Set container statuses to Waiting{ContainerCreating}
+                                    let container_statuses: Vec<ContainerStatus> = p
+                                        .spec
+                                        .as_ref()
+                                        .map(|s| {
+                                            s.containers
+                                                .iter()
+                                                .map(|c| ContainerStatus {
+                                                    name: c.name.clone(),
+                                                    ready: false,
+                                                    restart_count: 0,
+                                                    state: Some(ContainerState::Waiting {
+                                                        reason: Some(
+                                                            "ContainerCreating".to_string(),
+                                                        ),
+                                                        message: None,
+                                                    }),
+                                                    last_state: None,
+                                                    image: Some(c.image.clone()),
+                                                    image_id: None,
+                                                    container_id: None,
+                                                    started: Some(false),
+                                                    allocated_resources: None,
+                                                    allocated_resources_status: None,
+                                                    resources: None,
+                                                    user: None,
+                                                    volume_mounts: None,
+                                                    stop_signal: None,
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    if let Some(ref mut status) = p.status {
+                                        status.phase = Some(Phase::Pending);
+                                        status.container_statuses = Some(container_statuses);
+                                        status.conditions = Some(Self::not_ready_pod_conditions());
+                                    }
+                                    let _ = self.storage.update(&key, &p).await;
+                                }
+                                return Ok(());
+                            }
+
                             error!(
                                 "Failed to start pod {}/{}: {}",
                                 namespace, pod_name, err_msg

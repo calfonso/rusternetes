@@ -587,21 +587,19 @@ async fn proxy_request_with_rewrite(
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 );
 
-                // Copy response headers.
-                // Remove Content-Length if we might rewrite the body (HTML responses),
-                // since rewriting changes the body length.
-                let might_rewrite = proxy_base_path.is_some()
-                    && response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|ct| ct.contains("text/html"))
-                        .unwrap_or(false);
+                // Copy response headers, skipping Content-Length (recalculated from body).
                 for (name, value) in response.headers().iter() {
                     let name_str = name.as_str();
                     if !is_hop_by_hop_header(name_str) {
-                        if might_rewrite && name_str == "content-length" {
-                            continue; // Skip — body length will change
+                        // Always skip upstream Content-Length. reqwest may
+                        // decompress the body (gzip/deflate), making the
+                        // upstream length wrong. Let Axum set it from the
+                        // actual body bytes.
+                        // K8s ref: httputil.ReverseProxy copies Content-Length
+                        // but Go's net/http handles the body streaming directly.
+                        // We buffer the body, so we must recalculate.
+                        if name_str == "content-length" {
+                            continue;
                         }
                         axum_response = axum_response.header(name_str, value);
                     }

@@ -896,9 +896,21 @@ impl<S: Storage + 'static> JobController<S> {
                 }
             }
 
+            // For indexed jobs, succeeded = number of unique succeeded indexes,
+            // not the total succeeded pod count.
+            // K8s ref: pkg/controller/job/job_controller.go — status.Succeeded = succeededIndexes.total()
+            let succeeded_count = if is_indexed {
+                completed_indexes
+                    .as_ref()
+                    .map(|ci| parse_index_ranges(ci).len() as i32)
+                    .unwrap_or(0)
+            } else {
+                succeeded
+            };
+
             job.status = Some(JobStatus {
                 active: Some(0),
-                succeeded: Some(succeeded),
+                succeeded: Some(succeeded_count),
                 failed: Some(failed),
                 conditions: Some(vec![
                     JobCondition {
