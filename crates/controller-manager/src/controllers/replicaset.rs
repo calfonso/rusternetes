@@ -644,12 +644,19 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         let mut metadata = ObjectMeta::new(&pod_name);
         metadata.namespace = Some(namespace.to_string());
+        // Use template labels when present, otherwise fall back to selector
+        // matchLabels so created pods can be matched by the controller on the
+        // next reconcile. Per K8s validation, template labels must be a
+        // superset of the selector — but a defensive fallback prevents
+        // runaway pod creation if a malformed RS arrives with no template
+        // labels.
         metadata.labels = replicaset
             .spec
             .template
             .metadata
             .as_ref()
-            .and_then(|m| m.labels.clone());
+            .and_then(|m| m.labels.clone())
+            .or_else(|| replicaset.spec.selector.match_labels.clone());
 
         // Set owner reference so pods are garbage collected when ReplicaSet is deleted
         metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
@@ -883,5 +890,48 @@ mod tests {
         let refs = pod.metadata.owner_references.as_ref().unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "other-rs");
+    }
+
+    #[tokio::test]
+    async fn test_rs_creates_pods_with_selector_labels_when_template_has_none() {
+        // Regression: a ReplicaSet whose template has no labels would create
+        // pods with no labels, so the controller's matches_selector check
+        // failed for its own pods, causing infinite pod creation. Fall back
+        // to selector matchLabels when template labels are absent.
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+
+        let labels = make_labels(&[("app", "myapp")]);
+
+        // Build an RS where the pod template has no labels at all.
+        let mut rs = make_replicaset("no-template-labels-rs", labels.clone(), 2);
+        rs.spec.template.metadata = None;
+        let rs_key = build_key("replicasets", Some("default"), "no-template-labels-rs");
+        storage.create(&rs_key, &rs).await.unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        // Two pods should be created with selector labels applied so the
+        // controller matches them on the next reconcile.
+        let pods_prefix = build_prefix("pods", Some("default"));
+        let pods: Vec<Pod> = storage.list(&pods_prefix).await.unwrap();
+        assert_eq!(pods.len(), 2, "RS should create exactly 2 pods");
+        for pod in &pods {
+            let pod_labels = pod
+                .metadata
+                .labels
+                .as_ref()
+                .expect("Pod must inherit selector labels");
+            assert_eq!(pod_labels.get("app"), Some(&"myapp".to_string()));
+        }
+
+        // Second reconcile must not create more pods (matching works).
+        controller.reconcile_all().await.unwrap();
+        let pods: Vec<Pod> = storage.list(&pods_prefix).await.unwrap();
+        assert_eq!(
+            pods.len(),
+            2,
+            "second reconcile must match existing pods, not create more"
+        );
     }
 }

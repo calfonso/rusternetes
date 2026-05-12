@@ -37,7 +37,12 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             // Initial full reconciliation
             self.enqueue_all(&queue).await;
 
-            // Watch for changes
+            // Watch for changes to ReplicationControllers AND Pods.
+            // Pod watch is required for low-latency status updates: when a pod
+            // transitions Pending -> Running or its Ready condition flips, the
+            // RC must reconcile immediately so status.readyReplicas reflects
+            // reality. Otherwise conformance tests (e.g. "should serve a basic
+            // image") time out waiting on the periodic resync.
             let prefix = build_prefix("replicationcontrollers", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
@@ -52,8 +57,21 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 }
             };
 
-            // Periodic full resync as safety net (every 30s)
-            let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
+            let pod_prefix = build_prefix("pods", None);
+            let mut pod_watch = match self.storage.watch(&pod_prefix).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
+                    tokio::time::sleep(self.interval).await;
+                    continue;
+                }
+            };
+
+            // Periodic full resync as safety net
+            let mut resync = tokio::time::interval(std::time::Duration::from_secs(5));
             resync.tick().await; // consume first immediate tick
 
             let mut watch_broken = false;
@@ -75,12 +93,74 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                             }
                         }
                     }
+                    event = pod_watch.next() => {
+                        match event {
+                            Some(Ok(ev)) => {
+                                self.enqueue_owner_rc(&queue, &ev).await;
+                            }
+                            Some(Err(e)) => {
+                                warn!("Pod watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                warn!("Pod watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
+                    }
                     _ = resync.tick() => {
                         self.enqueue_all(&queue).await;
                     }
                 }
             }
             // Watch broke — loop back to re-establish
+        }
+    }
+
+    /// When a pod changes, check its ownerReferences for a ReplicationController
+    /// owner and enqueue that RC for reconciliation.
+    async fn enqueue_owner_rc(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+        let pod_key = extract_key(event);
+        let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
+        let ns = match parts.get(1) {
+            Some(ns) => *ns,
+            None => return,
+        };
+
+        let storage_key = format!("/registry/{}", pod_key);
+        match self.storage.get::<Pod>(&storage_key).await {
+            Ok(pod) => {
+                if let Some(refs) = &pod.metadata.owner_references {
+                    for owner_ref in refs {
+                        if owner_ref.kind == "ReplicationController" {
+                            queue
+                                .add(format!("replicationcontrollers/{}/{}", ns, owner_ref.name))
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Pod deleted — enqueue all RCs in this namespace so they
+                // notice the missing replica and create a replacement.
+                if let Ok(items) = self
+                    .storage
+                    .list::<ReplicationController>(&build_prefix(
+                        "replicationcontrollers",
+                        Some(ns),
+                    ))
+                    .await
+                {
+                    for rc in &items {
+                        queue
+                            .add(format!(
+                                "replicationcontrollers/{}/{}",
+                                ns, rc.metadata.name
+                            ))
+                            .await;
+                    }
+                }
+            }
         }
     }
     async fn worker(&self, queue: WorkQueue) {
