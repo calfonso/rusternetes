@@ -16,9 +16,9 @@ use rusternetes_common::{
         GroupVersionResource, Operation, PatchOp, PatchOperation, UserInfo,
     },
     resources::{
-        FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, Rule,
-        RuleWithOperations, SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration,
-        WebhookClientConfig,
+        FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType,
+        ReinvocationPolicy, Rule, RuleWithOperations, SideEffectClass, ValidatingWebhook,
+        ValidatingWebhookConfiguration, WebhookClientConfig,
     },
     types::ObjectMeta,
 };
@@ -185,6 +185,121 @@ async fn start_mock_mutating_server(
 
     let url = format!("http://{}", addr);
     (url, shutdown_tx)
+}
+
+/// Start a mock validating webhook server that sleeps longer than the request
+/// timeout. Used to verify timeoutSeconds enforcement.
+async fn start_mock_slow_validating_server(
+    delay: std::time::Duration,
+) -> (String, oneshot::Sender<()>) {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let route =
+        warp::post()
+            .and(warp::body::json())
+            .and_then(move |review: AdmissionReview| async move {
+                tokio::time::sleep(delay).await;
+                let response = if let Some(request) = review.request {
+                    AdmissionReviewResponse::allow(request.uid)
+                } else {
+                    AdmissionReviewResponse {
+                        uid: "unknown".to_string(),
+                        allowed: true,
+                        status: None,
+                        patch: None,
+                        patch_type: None,
+                        audit_annotations: None,
+                        warnings: None,
+                    }
+                };
+                let response_review = AdmissionReview {
+                    api_version: "admission.k8s.io/v1".to_string(),
+                    kind: "AdmissionReview".to_string(),
+                    request: None,
+                    response: Some(response),
+                };
+                Ok::<_, warp::Rejection>(warp::reply::json(&response_review))
+            });
+
+    let (addr, server) =
+        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+            shutdown_rx.await.ok();
+        });
+
+    tokio::spawn(server);
+
+    let url = format!("http://{}", addr);
+    (url, shutdown_tx)
+}
+
+/// Start a mock mutating webhook server whose label value reflects the call
+/// count. Used to verify reinvocation: the second invocation returns a
+/// different value than the first.
+async fn start_mock_counting_mutating_server(
+    label_key: String,
+) -> (
+    String,
+    oneshot::Sender<()>,
+    Arc<std::sync::atomic::AtomicU32>,
+) {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter_clone = counter.clone();
+
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(move |review: AdmissionReview| {
+            let call = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let label_value = format!("call-{}", call);
+            let response = if let Some(request) = review.request {
+                let patch = vec![PatchOperation {
+                    op: PatchOp::Add,
+                    path: format!("/metadata/labels/{}", label_key),
+                    value: Some(json!(label_value)),
+                    from: None,
+                }];
+                use base64::Engine;
+                let patch_json = serde_json::to_string(&patch).unwrap();
+                let patch_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(patch_json.as_bytes());
+                AdmissionReviewResponse {
+                    uid: request.uid,
+                    allowed: true,
+                    status: None,
+                    patch: Some(patch_base64),
+                    patch_type: Some("JSONPatch".to_string()),
+                    audit_annotations: None,
+                    warnings: None,
+                }
+            } else {
+                AdmissionReviewResponse {
+                    uid: "unknown".to_string(),
+                    allowed: true,
+                    status: None,
+                    patch: None,
+                    patch_type: None,
+                    audit_annotations: None,
+                    warnings: None,
+                }
+            };
+            let response_review = AdmissionReview {
+                api_version: "admission.k8s.io/v1".to_string(),
+                kind: "AdmissionReview".to_string(),
+                request: None,
+                response: Some(response),
+            };
+            warp::reply::json(&response_review)
+        });
+
+    let (addr, server) =
+        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+            shutdown_rx.await.ok();
+        });
+
+    tokio::spawn(server);
+
+    let url = format!("http://{}", addr);
+    (url, shutdown_tx, counter)
 }
 
 // ===== Webhook Client Tests =====
@@ -711,4 +826,508 @@ async fn test_webhook_manager_denial_stops_request() {
             panic!("Unexpected response type");
         }
     }
+}
+
+// ===== Timeout & Reinvocation Tests =====
+
+/// A webhook that sleeps longer than `timeoutSeconds` must be aborted at the
+/// deadline. With FailurePolicy=Fail the request fails.
+#[tokio::test]
+async fn test_webhook_timeout_fail_policy_aborts_at_deadline() {
+    // Server sleeps 5s, webhook timeout is 1s.
+    let (url, _shutdown) =
+        start_mock_slow_validating_server(std::time::Duration::from_secs(5)).await;
+
+    let client = AdmissionWebhookClient::new();
+    let webhook = ValidatingWebhook {
+        name: "slow-validator".to_string(),
+        client_config: WebhookClientConfig {
+            url: Some(url),
+            service: None,
+            ca_bundle: None,
+        },
+        rules: vec![],
+        failure_policy: Some(FailurePolicy::Fail),
+        match_policy: None,
+        namespace_selector: None,
+        object_selector: None,
+        side_effects: SideEffectClass::None,
+        timeout_seconds: Some(1),
+        admission_review_versions: vec!["v1".to_string()],
+        match_conditions: None,
+    };
+
+    let request = AdmissionReviewRequest {
+        uid: "timeout-uid".to_string(),
+        kind: GroupVersionKind {
+            group: "".to_string(),
+            version: "v1".to_string(),
+            kind: "Pod".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "".to_string(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+        },
+        sub_resource: None,
+        request_kind: None,
+        request_resource: None,
+        request_sub_resource: None,
+        name: "slow-pod".to_string(),
+        namespace: Some("default".to_string()),
+        operation: Operation::Create,
+        user_info: UserInfo {
+            username: "admin".to_string(),
+            uid: "admin-uid".to_string(),
+            groups: vec!["system:masters".to_string()],
+        },
+        object: Some(json!({"metadata": {"name": "slow-pod"}})),
+        old_object: None,
+        dry_run: None,
+        options: None,
+    };
+
+    let start = std::time::Instant::now();
+    let result = client.call_validating_webhook(&webhook, &request).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "Expected timeout error with FailurePolicy=Fail, got {:?}",
+        result
+    );
+    // Total call time must be bounded near the 1s timeout, not the 5s sleep.
+    // Allow 3s slack for CI flakiness while still proving the deadline aborted.
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "Webhook call exceeded deadline: {:?}",
+        elapsed
+    );
+    let msg = format!("{}", result.unwrap_err()).to_lowercase();
+    assert!(
+        msg.contains("deadline") || msg.contains("timeout") || msg.contains("timed out"),
+        "Expected deadline/timeout message, got: {}",
+        msg
+    );
+}
+
+/// With FailurePolicy=Ignore, a slow webhook must not block the request once
+/// the deadline elapses.
+#[tokio::test]
+async fn test_webhook_timeout_ignore_policy_allows_request() {
+    let (url, _shutdown) =
+        start_mock_slow_validating_server(std::time::Duration::from_secs(5)).await;
+
+    let client = AdmissionWebhookClient::new();
+    let webhook = ValidatingWebhook {
+        name: "slow-validator-ignore".to_string(),
+        client_config: WebhookClientConfig {
+            url: Some(url),
+            service: None,
+            ca_bundle: None,
+        },
+        rules: vec![],
+        failure_policy: Some(FailurePolicy::Ignore),
+        match_policy: None,
+        namespace_selector: None,
+        object_selector: None,
+        side_effects: SideEffectClass::None,
+        timeout_seconds: Some(1),
+        admission_review_versions: vec!["v1".to_string()],
+        match_conditions: None,
+    };
+
+    let request = AdmissionReviewRequest {
+        uid: "timeout-ignore-uid".to_string(),
+        kind: GroupVersionKind {
+            group: "".to_string(),
+            version: "v1".to_string(),
+            kind: "Pod".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: "".to_string(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+        },
+        sub_resource: None,
+        request_kind: None,
+        request_resource: None,
+        request_sub_resource: None,
+        name: "slow-pod".to_string(),
+        namespace: Some("default".to_string()),
+        operation: Operation::Create,
+        user_info: UserInfo {
+            username: "admin".to_string(),
+            uid: "admin-uid".to_string(),
+            groups: vec!["system:masters".to_string()],
+        },
+        object: Some(json!({"metadata": {"name": "slow-pod"}})),
+        old_object: None,
+        dry_run: None,
+        options: None,
+    };
+
+    let start = std::time::Instant::now();
+    let response = client
+        .call_validating_webhook(&webhook, &request)
+        .await
+        .expect("Ignore policy must not propagate error");
+    let elapsed = start.elapsed();
+
+    assert!(response.allowed, "FailurePolicy=Ignore must allow request");
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "Webhook call exceeded deadline: {:?}",
+        elapsed
+    );
+}
+
+/// reinvocationPolicy=IfNeeded triggers when a later mutating webhook changes
+/// the object after this webhook's first call.
+///
+/// Both A and B have IfNeeded policy. MemoryStorage iterates as a HashMap, so
+/// the order in which the two webhooks fire is non-deterministic; whichever
+/// runs first must be reinvoked after the other mutates the object. We verify
+/// the order-independent invariant: one of {A, B} is called twice and the
+/// other is called once.
+#[tokio::test]
+async fn test_mutating_webhook_reinvocation_if_needed_triggers_when_changed() {
+    let storage = Arc::new(MemoryStorage::new());
+    let manager = AdmissionWebhookManager::new(storage.clone());
+
+    let (url_a, _shutdown_a, counter_a) =
+        start_mock_counting_mutating_server("a".to_string()).await;
+    let (url_b, _shutdown_b, counter_b) =
+        start_mock_counting_mutating_server("b".to_string()).await;
+
+    let mk_webhook = |name: &str, url: String| MutatingWebhook {
+        name: name.to_string(),
+        client_config: WebhookClientConfig {
+            url: Some(url),
+            service: None,
+            ca_bundle: None,
+        },
+        rules: vec![RuleWithOperations {
+            operations: vec![OperationType::Create],
+            rule: Rule {
+                api_groups: vec!["".to_string()],
+                api_versions: vec!["v1".to_string()],
+                resources: vec!["pods".to_string()],
+                scope: None,
+            },
+        }],
+        failure_policy: None,
+        match_policy: None,
+        namespace_selector: None,
+        object_selector: None,
+        side_effects: SideEffectClass::None,
+        timeout_seconds: None,
+        admission_review_versions: vec!["v1".to_string()],
+        reinvocation_policy: Some(ReinvocationPolicy::IfNeeded),
+        match_conditions: None,
+    };
+
+    let config_a = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: ObjectMeta::new("a-mutating"),
+        webhooks: Some(vec![mk_webhook("a-mutator", url_a)]),
+    };
+    let config_b = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: ObjectMeta::new("b-mutating"),
+        webhooks: Some(vec![mk_webhook("b-mutator", url_b)]),
+    };
+
+    storage
+        .create(
+            &build_key("mutatingwebhookconfigurations", None, "a-mutating"),
+            &config_a,
+        )
+        .await
+        .unwrap();
+    storage
+        .create(
+            &build_key("mutatingwebhookconfigurations", None, "b-mutating"),
+            &config_b,
+        )
+        .await
+        .unwrap();
+
+    let object = Some(json!({"metadata": {"name": "rein-pod", "labels": {}}}));
+    let (_response, mutated) = manager
+        .run_mutating_webhooks(
+            &Operation::Create,
+            &GroupVersionKind {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                kind: "Pod".to_string(),
+            },
+            &GroupVersionResource {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                resource: "pods".to_string(),
+            },
+            Some("default"),
+            "rein-pod",
+            object,
+            None,
+            &UserInfo {
+                username: "admin".to_string(),
+                uid: "admin-uid".to_string(),
+                groups: vec!["system:masters".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+    let a_calls = counter_a.load(std::sync::atomic::Ordering::SeqCst);
+    let b_calls = counter_b.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Both A and B have IfNeeded and both mutated the object. After the first
+    // pass each one's snapshot diverges from the final object (because the
+    // other added a label after it), so both are reinvoked. K8s bounds
+    // reinvocation to one extra round per webhook, so each is called at most
+    // twice.
+    // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go
+    assert!(
+        a_calls >= 1 && b_calls >= 1,
+        "Both webhooks must run at least once (a={}, b={})",
+        a_calls,
+        b_calls
+    );
+    assert!(
+        a_calls <= 2 && b_calls <= 2,
+        "Each webhook must be reinvoked at most once (a={}, b={})",
+        a_calls,
+        b_calls
+    );
+    // At least one webhook must have been reinvoked — both mutated the object,
+    // so the webhook that ran first must see the second one's change.
+    assert!(
+        a_calls + b_calls >= 3,
+        "Expected at least one reinvocation (a={}, b={})",
+        a_calls,
+        b_calls
+    );
+
+    // Final object must carry both labels. The webhook(s) reinvoked have
+    // call-2; any not reinvoked stays at call-1.
+    let obj = mutated.expect("object should exist");
+    let label_a = obj["metadata"]["labels"]["a"].as_str().unwrap_or("");
+    let label_b = obj["metadata"]["labels"]["b"].as_str().unwrap_or("");
+    let expected_a = if a_calls == 2 { "call-2" } else { "call-1" };
+    let expected_b = if b_calls == 2 { "call-2" } else { "call-1" };
+    assert_eq!(label_a, expected_a, "label A mismatch");
+    assert_eq!(label_b, expected_b, "label B mismatch");
+}
+
+/// reinvocationPolicy=IfNeeded must NOT trigger when no later webhook mutates
+/// the object after this webhook's call.
+#[tokio::test]
+async fn test_mutating_webhook_reinvocation_if_needed_skipped_when_unchanged() {
+    let storage = Arc::new(MemoryStorage::new());
+    let manager = AdmissionWebhookManager::new(storage.clone());
+
+    let (url, _shutdown, counter) = start_mock_counting_mutating_server("a".to_string()).await;
+
+    let config = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: ObjectMeta::new("lone-mutating"),
+        webhooks: Some(vec![MutatingWebhook {
+            name: "lone-mutator".to_string(),
+            client_config: WebhookClientConfig {
+                url: Some(url),
+                service: None,
+                ca_bundle: None,
+            },
+            rules: vec![RuleWithOperations {
+                operations: vec![OperationType::Create],
+                rule: Rule {
+                    api_groups: vec!["".to_string()],
+                    api_versions: vec!["v1".to_string()],
+                    resources: vec!["pods".to_string()],
+                    scope: None,
+                },
+            }],
+            failure_policy: None,
+            match_policy: None,
+            namespace_selector: None,
+            object_selector: None,
+            side_effects: SideEffectClass::None,
+            timeout_seconds: None,
+            admission_review_versions: vec!["v1".to_string()],
+            reinvocation_policy: Some(ReinvocationPolicy::IfNeeded),
+            match_conditions: None,
+        }]),
+    };
+
+    storage
+        .create(
+            &build_key("mutatingwebhookconfigurations", None, "lone-mutating"),
+            &config,
+        )
+        .await
+        .unwrap();
+
+    let object = Some(json!({"metadata": {"name": "lone-pod", "labels": {}}}));
+    manager
+        .run_mutating_webhooks(
+            &Operation::Create,
+            &GroupVersionKind {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                kind: "Pod".to_string(),
+            },
+            &GroupVersionResource {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                resource: "pods".to_string(),
+            },
+            Some("default"),
+            "lone-pod",
+            object,
+            None,
+            &UserInfo {
+                username: "admin".to_string(),
+                uid: "admin-uid".to_string(),
+                groups: vec!["system:masters".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "Webhook must be called exactly once when nothing else mutates"
+    );
+}
+
+/// reinvocationPolicy=Never (default) must never reinvoke.
+#[tokio::test]
+async fn test_mutating_webhook_reinvocation_never_does_not_reinvoke() {
+    let storage = Arc::new(MemoryStorage::new());
+    let manager = AdmissionWebhookManager::new(storage.clone());
+
+    let (url_a, _shutdown_a, counter_a) =
+        start_mock_counting_mutating_server("a".to_string()).await;
+    let (url_b, _shutdown_b) =
+        start_mock_mutating_server("b".to_string(), "from-b".to_string()).await;
+
+    let config_a = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: ObjectMeta::new("a-never-mutating"),
+        webhooks: Some(vec![MutatingWebhook {
+            name: "a-never-mutator".to_string(),
+            client_config: WebhookClientConfig {
+                url: Some(url_a),
+                service: None,
+                ca_bundle: None,
+            },
+            rules: vec![RuleWithOperations {
+                operations: vec![OperationType::Create],
+                rule: Rule {
+                    api_groups: vec!["".to_string()],
+                    api_versions: vec!["v1".to_string()],
+                    resources: vec!["pods".to_string()],
+                    scope: None,
+                },
+            }],
+            failure_policy: None,
+            match_policy: None,
+            namespace_selector: None,
+            object_selector: None,
+            side_effects: SideEffectClass::None,
+            timeout_seconds: None,
+            admission_review_versions: vec!["v1".to_string()],
+            reinvocation_policy: Some(ReinvocationPolicy::Never),
+            match_conditions: None,
+        }]),
+    };
+    let config_b = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: ObjectMeta::new("b-never-mutating"),
+        webhooks: Some(vec![MutatingWebhook {
+            name: "b-never-mutator".to_string(),
+            client_config: WebhookClientConfig {
+                url: Some(url_b),
+                service: None,
+                ca_bundle: None,
+            },
+            rules: vec![RuleWithOperations {
+                operations: vec![OperationType::Create],
+                rule: Rule {
+                    api_groups: vec!["".to_string()],
+                    api_versions: vec!["v1".to_string()],
+                    resources: vec!["pods".to_string()],
+                    scope: None,
+                },
+            }],
+            failure_policy: None,
+            match_policy: None,
+            namespace_selector: None,
+            object_selector: None,
+            side_effects: SideEffectClass::None,
+            timeout_seconds: None,
+            admission_review_versions: vec!["v1".to_string()],
+            reinvocation_policy: None,
+            match_conditions: None,
+        }]),
+    };
+
+    storage
+        .create(
+            &build_key("mutatingwebhookconfigurations", None, "a-never-mutating"),
+            &config_a,
+        )
+        .await
+        .unwrap();
+    storage
+        .create(
+            &build_key("mutatingwebhookconfigurations", None, "b-never-mutating"),
+            &config_b,
+        )
+        .await
+        .unwrap();
+
+    let object = Some(json!({"metadata": {"name": "rein-never-pod", "labels": {}}}));
+    let (_response, mutated) = manager
+        .run_mutating_webhooks(
+            &Operation::Create,
+            &GroupVersionKind {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                kind: "Pod".to_string(),
+            },
+            &GroupVersionResource {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                resource: "pods".to_string(),
+            },
+            Some("default"),
+            "rein-never-pod",
+            object,
+            None,
+            &UserInfo {
+                username: "admin".to_string(),
+                uid: "admin-uid".to_string(),
+                groups: vec!["system:masters".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        counter_a.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "A with reinvocationPolicy=Never must NOT be reinvoked"
+    );
+    let obj = mutated.expect("object should exist");
+    assert_eq!(obj["metadata"]["labels"]["a"], json!("call-1"));
+    assert_eq!(obj["metadata"]["labels"]["b"], json!("from-b"));
 }
