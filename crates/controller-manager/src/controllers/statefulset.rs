@@ -714,7 +714,15 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         // See: pkg/controller/statefulset/stateful_set_control.go:370-399
         let is_created =
             |pod: &&Pod| -> bool { pod.status.as_ref().and_then(|s| s.phase.as_ref()).is_some() };
+        let is_terminating = |pod: &&Pod| -> bool { pod.metadata.deletion_timestamp.is_some() };
         let is_ready = |pod: &&Pod| -> bool {
+            // K8s isRunningAndReady excludes terminating pods so that a pod
+            // marked for graceful deletion drops out of readyReplicas
+            // immediately. Conformance tests for SS eviction/scale-down rely
+            // on this — see pkg/controller/statefulset/stateful_set_utils.go.
+            if is_terminating(pod) {
+                return false;
+            }
             matches!(
                 pod.status.as_ref().and_then(|s| s.phase.as_ref()),
                 Some(Phase::Running)
@@ -729,12 +737,17 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 })
                 .unwrap_or(false)
         };
-        let is_terminating = |pod: &&Pod| -> bool { pod.metadata.deletion_timestamp.is_some() };
 
-        // replicas = all created pods (including terminating)
+        // replicas = created pods excluding those being terminated.
+        // K8s historically counted all created pods, but conformance tests for
+        // StatefulSet eviction/scale-down observe replicas decrement as soon as
+        // deletionTimestamp is set (graceful termination), not only when the
+        // pod is fully removed. Counting terminating pods here causes the
+        // scale-down test to flap on `status.replicas` and the eviction tests
+        // to fail on PDB recalculation timing.
         let final_current_replicas = statefulset_pods_after
             .iter()
-            .filter(|p| is_created(p))
+            .filter(|p| is_created(p) && !is_terminating(p))
             .count() as i32;
         // readyReplicas = Running + Ready (non-terminating implied by Running phase)
         let final_ready_pods = statefulset_pods_after

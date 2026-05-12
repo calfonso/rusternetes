@@ -96,33 +96,32 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // Find orphaned resources (resources whose owners no longer exist)
         let orphans = self.find_orphans(&all_resources, &owner_map);
 
-        // Two-scan grace period: only delete orphans that were ALSO orphans in
-        // the previous scan. This prevents race conditions where a resource is
-        // created between the GC listing owners and listing dependents.
-        // K8s avoids this via informer caches with consistent snapshots.
-        let orphan_keys: HashSet<String> = orphans.iter().map(|o| o.key.clone()).collect();
-        let confirmed_orphans: Vec<ResourceInfo>;
+        // K8s GC does not require multiple scans to confirm an orphan — it
+        // re-reads each owner from the apiserver before deleting the dependent
+        // (attemptToDeleteItem → getObject in garbagecollector.go:521). We
+        // do the same in `delete_orphan`, which re-reads both the dependent
+        // and every owner from storage and only deletes when all owners are
+        // confirmed gone. The previous 2-scan grace introduced a full-cycle
+        // delay between owner deletion and dependent removal, which
+        // conformance tests for GC orphan-pod cleanup observe as a failure.
+        //
+        // We still record `pending_orphans` as a no-op so existing fields
+        // compile, but it is no longer consulted to gate deletion.
         {
             let mut pending = self.pending_orphans.lock().unwrap();
-            // Only delete orphans that were pending from the PREVIOUS scan
-            confirmed_orphans = orphans
-                .into_iter()
-                .filter(|o| pending.contains(&o.key))
-                .collect();
-            // Update pending set for next scan
-            *pending = orphan_keys;
+            *pending = orphans.iter().map(|o| o.key.clone()).collect();
         }
 
-        if !confirmed_orphans.is_empty() {
+        if !orphans.is_empty() {
             info!(
-                "Found {} confirmed orphaned resources (2-scan grace)",
-                confirmed_orphans.len()
+                "Found {} orphaned resources to verify and delete",
+                orphans.len()
             );
 
             let mut deleted_count = 0;
             let mut failed_count = 0;
 
-            for orphan in &confirmed_orphans {
+            for orphan in &orphans {
                 match self.delete_orphan(orphan).await {
                     Ok(_) => deleted_count += 1,
                     Err(e) => {
@@ -810,6 +809,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     }
 
     /// DFS helper for cycle detection
+    #[allow(clippy::only_used_in_recursion)]
     fn detect_cycle_dfs(
         &self,
         uid: &str,
@@ -1102,5 +1102,56 @@ mod tests {
         // Test remove_finalizer
         metadata.remove_finalizer("my-finalizer");
         assert!(!metadata.has_finalizers());
+    }
+
+    /// A single GC scan must remove an orphan whose owner is already gone.
+    /// Conformance tests for orphan pod cleanup observe per-cycle latency,
+    /// so the previous "2-scan grace" gating added a full reconcile cycle
+    /// of wait before any orphan was reaped. `delete_orphan` already re-reads
+    /// the owner from storage as a race guard, so the second scan was
+    /// unnecessary and observably slow.
+    #[tokio::test]
+    async fn test_orphan_deleted_on_first_scan() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let mut m = ObjectMeta::new("orphan-pod");
+        m.namespace = Some("default".to_string());
+        m.owner_references = Some(vec![OwnerReference {
+            api_version: "apps/v1".to_string(),
+            kind: "ReplicaSet".to_string(),
+            name: "missing-rs".to_string(),
+            uid: "missing-rs-uid-never-existed".to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: m,
+            spec: None,
+            status: None,
+        };
+        storage
+            .create("/registry/pods/default/orphan-pod", &pod)
+            .await
+            .unwrap();
+
+        gc.scan_and_collect().await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list("/registry/pods/default/")
+            .await
+            .unwrap_or_default();
+        assert!(
+            pods.is_empty(),
+            "orphan must be deleted on the first GC scan, got {} remaining",
+            pods.len()
+        );
     }
 }
