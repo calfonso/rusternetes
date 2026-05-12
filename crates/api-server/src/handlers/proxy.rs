@@ -9,8 +9,8 @@
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    extract::{OriginalUri, Path, State},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::Response,
     Extension,
 };
@@ -19,8 +19,54 @@ use rusternetes_common::{
     Result,
 };
 use rusternetes_storage::Storage;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Map an HTTP method to the Kubernetes authorization verb used for proxy
+/// subresources.
+///
+/// K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go
+/// (RequestInfoFactory.NewRequestInfo). For proxy subresources the verb is
+/// derived from the HTTP method just like any other resource verb, so that
+/// RBAC rules can scope `get`/`create`/`update`/`patch`/`delete` separately
+/// even though they all target `*/proxy`.
+fn http_method_to_verb(method: &Method) -> &'static str {
+    match *method {
+        Method::POST => "create",
+        Method::PUT => "update",
+        Method::PATCH => "patch",
+        Method::DELETE => "delete",
+        // GET, HEAD, OPTIONS, and any other method default to "get".
+        _ => "get",
+    }
+}
+
+/// Extract the portion of `uri.path()` that follows the proxy marker for the
+/// given resource. The returned slice preserves a trailing slash so that we
+/// can forward `/foo/` and `/foo` distinctly to the backend (K8s does the
+/// same). Returns an empty slice when no path component follows `proxy`.
+///
+/// `resource` is the resource segment in the URL, e.g. "pods" or "services".
+fn extract_proxy_suffix<'a>(uri_path: &'a str, resource: &str) -> &'a str {
+    // The expected layout is:
+    //   /api/v1/namespaces/<ns>/<resource>/<name>/proxy[/...]
+    // Locate the proxy marker and return whatever follows it (including any
+    // trailing slash) so downstream code can preserve verbatim semantics.
+    let marker = format!("/{}/", resource);
+    if let Some(res_idx) = uri_path.find(&marker) {
+        // Skip past "/<resource>/" then past the name segment.
+        let after_resource = &uri_path[res_idx + marker.len()..];
+        if let Some(name_end) = after_resource.find('/') {
+            let after_name = &after_resource[name_end + 1..];
+            // after_name should start with "proxy" — strip it.
+            if let Some(rest) = after_name.strip_prefix("proxy") {
+                // rest is either "" or "/..."
+                return rest.strip_prefix('/').unwrap_or(rest);
+            }
+        }
+    }
+    ""
+}
 
 /// Parse a resource identifier in Kubernetes proxy format.
 ///
@@ -70,16 +116,20 @@ fn split_scheme_name_port(id: &str) -> Option<(&str, &str, &str)> {
 pub async fn proxy_node(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Path((node_name, path)): Path<(String, String)>,
+    Path((node_name, _path)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     body: Body,
 ) -> Result<Response> {
-    info!("Proxying request to node: {}, path: {}", node_name, path);
+    // Use the original URI to preserve trailing slashes and exact path bytes.
+    let suffix = extract_proxy_suffix(original_uri.path(), "nodes");
+    info!("Proxying request to node: {}, path: /{}", node_name, suffix);
 
-    // Check authorization - requires permission to proxy to nodes
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "nodes/proxy")
+    // Check authorization - requires permission to proxy to nodes.
+    // Verb derives from the HTTP method (matches K8s RBAC semantics).
+    let verb = http_method_to_verb(&method);
+    let attrs = RequestAttributes::new(auth_ctx.user, verb, "nodes/proxy")
         .with_api_group("")
         .with_name(&node_name);
 
@@ -110,13 +160,13 @@ pub async fn proxy_node(
             rusternetes_common::Error::NotFound(format!("No address found for node {}", node_name))
         })?;
 
-    // Build target URL (kubelet typically runs on port 10250)
+    // Build target URL (kubelet typically runs on port 10250).
+    // Preserve the original suffix verbatim, including any trailing slash.
     let kubelet_port = 10250;
-    let path = path.trim_start_matches('/');
-    let target_url = format!("https://{}:{}/{}", node_address, kubelet_port, path);
+    let target_url = format!("https://{}:{}/{}", node_address, kubelet_port, suffix);
 
-    // Forward the request to the kubelet
-    proxy_request(target_url, method, headers, params, body).await
+    // Forward the request to the kubelet, including the original query string.
+    proxy_request(target_url, &original_uri, method, headers, body).await
 }
 
 /// Proxy HTTP requests to a service (root path — no sub-path)
@@ -124,18 +174,18 @@ pub async fn proxy_service_root(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, service_name)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     body: Body,
 ) -> Result<Response> {
     proxy_service(
         State(state),
         Extension(auth_ctx),
         Path((namespace, service_name, String::new())),
+        OriginalUri(original_uri),
         method,
         headers,
-        Query(params),
         body,
     )
     .await
@@ -147,15 +197,17 @@ pub async fn proxy_service_root(
 pub async fn proxy_service(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, service_name, path)): Path<(String, String, String)>,
+    Path((namespace, service_name, _path)): Path<(String, String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     body: Body,
 ) -> Result<Response> {
+    // Use the original URI to preserve trailing slashes and exact path bytes.
+    let suffix = extract_proxy_suffix(original_uri.path(), "services");
     info!(
-        "Proxying request to service: {}/{}, path: {}",
-        namespace, service_name, path
+        "Proxying request to service: {}/{}, path: /{}",
+        namespace, service_name, suffix
     );
 
     // Parse service name — Kubernetes proxy subresource format:
@@ -167,8 +219,9 @@ pub async fn proxy_service(
     // Determine the URL scheme — default to http when unspecified
     let url_scheme = if scheme.is_empty() { "http" } else { scheme };
 
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "services/proxy")
+    // Check authorization. Verb derives from the HTTP method to match K8s RBAC.
+    let verb = http_method_to_verb(&method);
+    let attrs = RequestAttributes::new(auth_ctx.user, verb, "services/proxy")
         .with_api_group("")
         .with_namespace(&namespace)
         .with_name(actual_service_name);
@@ -322,14 +375,15 @@ pub async fn proxy_service(
         }
     }
 
-    // Build target URL — always prefer endpoint IP over ClusterIP
-    let path = path.trim_start_matches('/');
+    // Build target URL — always prefer endpoint IP over ClusterIP.
+    // Preserve the original path bytes (including any trailing slash) so
+    // that proxy behaviour matches K8s verbatim.
     let target_url = if let Some(ep_ip) = &endpoint_ip {
         debug!(
             "Service proxy resolved endpoint: {}://{}:{} (service {}/{})",
             url_scheme, ep_ip, resolved_port, namespace, actual_service_name
         );
-        format!("{}://{}:{}/{}", url_scheme, ep_ip, resolved_port, path)
+        format!("{}://{}:{}/{}", url_scheme, ep_ip, resolved_port, suffix)
     } else {
         // Last resort — use ClusterIP. This only works if kube-proxy rules
         // are somehow visible to the API server container (unlikely).
@@ -342,11 +396,14 @@ pub async fn proxy_service(
             "Service proxy: no endpoints found for {}/{}, falling back to ClusterIP {}",
             namespace, actual_service_name, cluster_ip
         );
-        format!("{}://{}:{}/{}", url_scheme, cluster_ip, service_port, path)
+        format!(
+            "{}://{}:{}/{}",
+            url_scheme, cluster_ip, service_port, suffix
+        )
     };
 
-    // Forward the request
-    proxy_request(target_url, method, headers, params, body).await
+    // Forward the request, preserving the original query string.
+    proxy_request(target_url, &original_uri, method, headers, body).await
 }
 
 /// Proxy HTTP requests to a pod (root path, no trailing path component)
@@ -354,18 +411,18 @@ pub async fn proxy_pod_root(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, pod_name)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     body: Body,
 ) -> Result<Response> {
     proxy_pod(
         State(state),
         Extension(auth_ctx),
         Path((namespace, pod_name, String::new())),
+        OriginalUri(original_uri),
         method,
         headers,
-        Query(params),
         body,
     )
     .await
@@ -377,15 +434,17 @@ pub async fn proxy_pod_root(
 pub async fn proxy_pod(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Path((namespace, pod_name, path)): Path<(String, String, String)>,
+    Path((namespace, pod_name, _path)): Path<(String, String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     body: Body,
 ) -> Result<Response> {
+    // Use the original URI to preserve trailing slashes and exact path bytes.
+    let suffix = extract_proxy_suffix(original_uri.path(), "pods");
     info!(
-        "Proxying request to pod: {}/{}, path: {}",
-        namespace, pod_name, path
+        "Proxying request to pod: {}/{}, path: /{}",
+        namespace, pod_name, suffix
     );
 
     // Parse pod name — Kubernetes proxy subresource format:
@@ -394,6 +453,8 @@ pub async fn proxy_pod(
     let (scheme, actual_pod_name, port_str) =
         split_scheme_name_port(&pod_name).unwrap_or(("", pod_name.as_str(), ""));
 
+    // Port may be a number or a named container port. Numeric ports are
+    // resolved as u16; otherwise we look up by container port name below.
     let explicit_port: Option<u16> = if port_str.is_empty() {
         None
     } else {
@@ -403,8 +464,9 @@ pub async fn proxy_pod(
     // Determine the URL scheme — default to http when unspecified
     let url_scheme = if scheme.is_empty() { "http" } else { scheme };
 
-    // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "pods/proxy")
+    // Check authorization. Verb derives from the HTTP method to match K8s RBAC.
+    let verb = http_method_to_verb(&method);
+    let attrs = RequestAttributes::new(auth_ctx.user, verb, "pods/proxy")
         .with_api_group("")
         .with_namespace(&namespace)
         .with_name(actual_pod_name);
@@ -437,11 +499,30 @@ pub async fn proxy_pod(
             ))
         })?;
 
-    // Use explicit port from URL if provided, otherwise first container port
-    // (scan all containers like K8s does), otherwise default to 80.
+    // Resolve the destination port:
+    //   1. If a numeric port was given in the URL, use it as-is.
+    //   2. If a non-numeric port string was given, treat it as a named
+    //      container port and look it up across all containers.
+    //   3. Otherwise, use the first containerPort on any container.
+    //   4. Fall back to 80.
     // K8s ref: pkg/registry/core/pod/strategy.go ResourceLocation
     let port: u16 = if let Some(p) = explicit_port {
         p
+    } else if !port_str.is_empty() {
+        // Named port resolution.
+        pod.spec
+            .as_ref()
+            .and_then(|spec| {
+                spec.containers.iter().find_map(|c| {
+                    c.ports.as_ref().and_then(|ports| {
+                        ports
+                            .iter()
+                            .find(|cp| cp.name.as_deref() == Some(port_str))
+                            .map(|cp| cp.container_port)
+                    })
+                })
+            })
+            .unwrap_or(80)
     } else {
         pod.spec
             .as_ref()
@@ -461,13 +542,23 @@ pub async fn proxy_pod(
         url_scheme, pod_ip, port, namespace, actual_pod_name
     );
 
-    // Build target URL
-    let path = path.trim_start_matches('/');
-    let target_url = format!("{}://{}:{}/{}", url_scheme, pod_ip, port, path);
+    // Build target URL — preserve the original path bytes (and trailing slash)
+    let target_url = format!("{}://{}:{}/{}", url_scheme, pod_ip, port, suffix);
 
-    // Forward the request with URL rewriting for HTML responses
+    // Forward the request with URL rewriting for HTML responses.
+    // The proxy base path is what clients see; we use the raw `pod_name`
+    // (which may include a port) verbatim so redirected URLs are still
+    // resolvable via this API.
     let proxy_base = format!("/api/v1/namespaces/{}/pods/{}/proxy", namespace, pod_name);
-    proxy_request_with_rewrite(target_url, method, headers, params, body, Some(proxy_base)).await
+    proxy_request_with_rewrite(
+        target_url,
+        &original_uri,
+        method,
+        headers,
+        body,
+        Some(proxy_base),
+    )
+    .await
 }
 
 /// Create a shared reqwest client for proxy requests.
@@ -498,12 +589,12 @@ fn get_proxy_client() -> &'static reqwest::Client {
 /// K8s ref: staging/src/k8s.io/apimachinery/pkg/util/proxy/upgradeaware.go
 async fn proxy_request(
     target_url: String,
+    original_uri: &Uri,
     method: Method,
     headers: HeaderMap,
-    params: HashMap<String, String>,
     body: Body,
 ) -> Result<Response> {
-    proxy_request_with_rewrite(target_url, method, headers, params, body, None).await
+    proxy_request_with_rewrite(target_url, original_uri, method, headers, body, None).await
 }
 
 /// Proxy request with optional URL rewriting for HTML responses.
@@ -512,18 +603,18 @@ async fn proxy_request(
 /// K8s ref: staging/src/k8s.io/apimachinery/pkg/util/proxy/upgradeaware.go
 async fn proxy_request_with_rewrite(
     target_url: String,
+    original_uri: &Uri,
     method: Method,
     headers: HeaderMap,
-    params: HashMap<String, String>,
     body: Body,
     proxy_base_path: Option<String>,
 ) -> Result<Response> {
-    // Build query string from params
-    let query_string = if !params.is_empty() {
-        let pairs: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        format!("?{}", pairs.join("&"))
-    } else {
-        String::new()
+    // Forward the original query string verbatim. Re-encoding a HashMap
+    // loses key ordering, duplicate keys, and exact encoding — all of which
+    // proxy clients rely on. K8s forwards the raw query bytes through.
+    let query_string = match original_uri.query() {
+        Some(q) if !q.is_empty() => format!("?{}", q),
+        _ => String::new(),
     };
 
     let full_url = format!("{}{}", target_url, query_string);
@@ -750,5 +841,88 @@ mod tests {
         assert_eq!(split_scheme_name_port("ftp:myname:21"), None);
         // Empty name with valid scheme
         assert_eq!(split_scheme_name_port("http::8080"), None);
+    }
+
+    #[test]
+    fn test_http_method_to_verb_get_and_head() {
+        // GET/HEAD/OPTIONS all map to "get" — matches K8s RequestInfoFactory.
+        assert_eq!(http_method_to_verb(&Method::GET), "get");
+        assert_eq!(http_method_to_verb(&Method::HEAD), "get");
+        assert_eq!(http_method_to_verb(&Method::OPTIONS), "get");
+    }
+
+    #[test]
+    fn test_http_method_to_verb_mutations() {
+        assert_eq!(http_method_to_verb(&Method::POST), "create");
+        assert_eq!(http_method_to_verb(&Method::PUT), "update");
+        assert_eq!(http_method_to_verb(&Method::PATCH), "patch");
+        assert_eq!(http_method_to_verb(&Method::DELETE), "delete");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_root_no_slash() {
+        // /proxy with no trailing components — suffix is empty.
+        let suffix = extract_proxy_suffix("/api/v1/namespaces/ns/pods/p/proxy", "pods");
+        assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_root_trailing_slash() {
+        // /proxy/ — suffix is empty after the trailing slash strip.
+        // (The forwarder appends `/{suffix}` so /proxy and /proxy/ both
+        // produce a URL ending in `/` which is what backends expect.)
+        let suffix = extract_proxy_suffix("/api/v1/namespaces/ns/pods/p/proxy/", "pods");
+        assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_path_no_trailing_slash() {
+        let suffix = extract_proxy_suffix("/api/v1/namespaces/ns/pods/p/proxy/foo/bar", "pods");
+        assert_eq!(suffix, "foo/bar");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_preserves_trailing_slash() {
+        // Critical for conformance: /foo/ must arrive at the backend as /foo/.
+        let suffix = extract_proxy_suffix("/api/v1/namespaces/ns/pods/p/proxy/foo/", "pods");
+        assert_eq!(suffix, "foo/");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_services() {
+        let suffix = extract_proxy_suffix(
+            "/api/v1/namespaces/ns/services/svc:http/proxy/x/",
+            "services",
+        );
+        assert_eq!(suffix, "x/");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_with_port_in_name() {
+        // The pod/service name may include a port like `mypod:8080`.
+        let suffix =
+            extract_proxy_suffix("/api/v1/namespaces/ns/pods/mypod:8080/proxy/health", "pods");
+        assert_eq!(suffix, "health");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_node() {
+        let suffix = extract_proxy_suffix("/api/v1/nodes/node-1/proxy/stats/summary", "nodes");
+        assert_eq!(suffix, "stats/summary");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_unrelated_path() {
+        // No proxy segment — return empty.
+        let suffix = extract_proxy_suffix("/api/v1/namespaces/ns/pods/p", "pods");
+        assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn test_extract_proxy_suffix_encoded_chars_preserved() {
+        // Path encoding such as %20 must pass through untouched.
+        let suffix =
+            extract_proxy_suffix("/api/v1/namespaces/ns/pods/p/proxy/with%20space", "pods");
+        assert_eq!(suffix, "with%20space");
     }
 }
