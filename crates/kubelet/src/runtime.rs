@@ -846,6 +846,13 @@ impl ContainerRuntime {
                             }
                         }
 
+                        // Publish Running state so watches see the transition from
+                        // PodInitializing → Running for this init container.
+                        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — SyncPod
+                        // publishes status after each container action.
+                        self.refresh_init_container_statuses(namespace, pod_name, None, None)
+                            .await;
+
                         // Wait for init container to complete
                         match self
                             .wait_for_container_completion(pod_name, &container.name)
@@ -853,9 +860,26 @@ impl ContainerRuntime {
                         {
                             Ok(()) => {
                                 info!("Init container {} completed successfully", container.name);
+                                // Publish Terminated/Completed before moving on so the
+                                // next init container starts from a status reflecting prior
+                                // success — required by the "sequential init" conformance test.
+                                self.refresh_init_container_statuses(
+                                    namespace, pod_name, None, None,
+                                )
+                                .await;
                                 break;
                             }
                             Err(e) => {
+                                // Capture Terminated/error BEFORE removing the container.
+                                // After removal, get_init_container_statuses would see only
+                                // the Running prev state, so the failure would never be
+                                // observed by watches — restart_count stays at 0 and the
+                                // "restart_count >= 3" conformance check hangs.
+                                self.refresh_init_container_statuses(
+                                    namespace, pod_name, None, None,
+                                )
+                                .await;
+
                                 if attempt < max_retries && restart_always {
                                     attempt += 1;
                                     let backoff = std::cmp::min(2u64.pow(attempt as u32), 30);
@@ -876,61 +900,35 @@ impl ContainerRuntime {
                                         )
                                         .await;
 
-                                    // Update pod status during backoff to show CrashLoopBackOff.
-                                    // K8s updates status on every sync cycle, not just after retries.
-                                    // This lets tests observe the init container failure state.
-                                    if let Some(ref storage) = self.storage {
-                                        use rusternetes_storage::Storage;
-                                        let pod_key = rusternetes_storage::build_key(
-                                            "pods",
-                                            Some(namespace),
-                                            pod_name,
-                                        );
-                                        if let Ok(mut status_pod) =
-                                            storage.get::<Pod>(&pod_key).await
-                                        {
-                                            let init_statuses =
-                                                self.get_init_container_statuses(&status_pod).await;
-                                            if let Some(ref mut s) = status_pod.status {
-                                                s.init_container_statuses = init_statuses;
-                                                s.reason = Some("PodInitializing".to_string());
-                                                s.message = Some(format!(
-                                                    "Init container {} failed, retrying in {}s",
-                                                    container.name, backoff
-                                                ));
-                                            }
-                                            let _ = storage.update(&pod_key, &status_pod).await;
-                                        }
-                                    }
+                                    // Publish CrashLoopBackOff. Previous state is now
+                                    // Terminated/error (captured above), so the transition
+                                    // Terminated → CrashLoopBackOff increments restart_count.
+                                    self.refresh_init_container_statuses(
+                                        namespace,
+                                        pod_name,
+                                        Some("PodInitializing"),
+                                        Some(format!(
+                                            "Init container {} failed, retrying in {}s",
+                                            container.name, backoff
+                                        )),
+                                    )
+                                    .await;
 
                                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                                 } else {
-                                    // Update init container status to show CrashLoopBackOff
-                                    // before returning error. The kubelet sync loop will
-                                    // re-call start_pod on the next cycle.
+                                    // RestartPolicy=Never (or max retries exhausted): return
+                                    // Err so the caller (kubelet.rs sync_pod) can transition
+                                    // the pod to Failed. For Never, remaining init containers
+                                    // MUST NOT run — the early return guarantees this because
+                                    // we propagate out of the init_containers loop.
+                                    // The Terminated/error state was already captured above
+                                    // (before this branch), so init_container_statuses
+                                    // already reflects the failure.
                                     // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go
                                     warn!(
                                         "Init container {} failed (will retry next sync): {}",
                                         container.name, e
                                     );
-                                    if let Some(ref storage) = self.storage {
-                                        use rusternetes_storage::Storage;
-                                        let pod_key = rusternetes_storage::build_key(
-                                            "pods",
-                                            Some(namespace),
-                                            pod_name,
-                                        );
-                                        if let Ok(mut status_pod) =
-                                            storage.get::<Pod>(&pod_key).await
-                                        {
-                                            let init_statuses =
-                                                self.get_init_container_statuses(&status_pod).await;
-                                            if let Some(ref mut s) = status_pod.status {
-                                                s.init_container_statuses = init_statuses;
-                                            }
-                                            let _ = storage.update(&pod_key, &status_pod).await;
-                                        }
-                                    }
                                     return Err(e);
                                 }
                             }
@@ -1567,6 +1565,38 @@ impl ContainerRuntime {
         Err(anyhow::anyhow!(
             "Pause container started but no IP address was assigned"
         ))
+    }
+
+    /// Refresh `pod.status.init_container_statuses` in storage from the
+    /// live Docker state. Called between init container actions so watches
+    /// observe each transition (Running, Terminated, CrashLoopBackOff).
+    /// Optionally sets `status.reason` and `status.message`.
+    async fn refresh_init_container_statuses(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        reason: Option<&str>,
+        message: Option<String>,
+    ) {
+        let Some(ref storage) = self.storage else {
+            return;
+        };
+        use rusternetes_storage::Storage;
+        let pod_key = rusternetes_storage::build_key("pods", Some(namespace), pod_name);
+        let Ok(mut status_pod) = storage.get::<Pod>(&pod_key).await else {
+            return;
+        };
+        let init_statuses = self.get_init_container_statuses(&status_pod).await;
+        if let Some(ref mut s) = status_pod.status {
+            s.init_container_statuses = init_statuses;
+            if let Some(r) = reason {
+                s.reason = Some(r.to_string());
+            }
+            if let Some(m) = message {
+                s.message = Some(m);
+            }
+        }
+        let _ = storage.update(&pod_key, &status_pod).await;
     }
 
     /// Wait for a container to complete (used for init containers)
