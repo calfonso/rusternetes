@@ -349,14 +349,12 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             endpointslices
         };
 
+        // Mirror under the bare endpoints name when free; otherwise suffix
+        // with "-mirrored" to avoid colliding with a selector-based slice.
+        let bare_owned_by_selector = self.slice_owned_by_selector_controller(ns, name).await;
+
         for (idx, mut slice) in slices_to_create.into_iter().enumerate() {
-            // K8s mirroring controller generates names like "<ep-name>-<hash>"
-            // We use a deterministic suffix to avoid conflicts with selector-based slices
-            let slice_name = if idx == 0 {
-                format!("{}-mirrored", name)
-            } else {
-                format!("{}-mirrored-{}", name, idx)
-            };
+            let slice_name = Self::mirrored_slice_name(name, idx, bare_owned_by_selector);
             slice.metadata.name = slice_name.clone();
             slice.metadata.namespace = Some(ns.to_string());
 
@@ -518,12 +516,10 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 endpointslices
             };
 
+            let bare_owned_by_selector = self.slice_owned_by_selector_controller(ns, ep_name).await;
+
             for (idx, mut slice) in slices_to_create.into_iter().enumerate() {
-                let slice_name = if idx == 0 {
-                    format!("{}-mirrored", ep_name)
-                } else {
-                    format!("{}-mirrored-{}", ep_name, idx)
-                };
+                let slice_name = Self::mirrored_slice_name(ep_name, idx, bare_owned_by_selector);
                 slice.metadata.name = slice_name.clone();
                 slice.metadata.namespace = Some(ns.to_string());
 
@@ -651,6 +647,13 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             .await
             .unwrap_or_default();
 
+        // K8s endpointslice controller keeps terminating pods in slices with
+        // terminating=true (rather than dropping them). Dropping them on the first
+        // reconcile breaks rolling updates and the "serve" conformance tests that
+        // race-check endpoint serving as pods are recreated. Only pods that are
+        // fully terminal (Succeeded/Failed) are excluded.
+        let publish_not_ready = service.spec.publish_not_ready_addresses.unwrap_or(false);
+
         let matching_pods: Vec<&Pod> = all_pods
             .iter()
             .filter(|pod| {
@@ -662,11 +665,13 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 }
             })
             .filter(|pod| {
-                // Skip pods that shouldn't be in endpoints
-                // (terminated, not yet assigned to a node)
+                // K8s ShouldPodBeInEndpointSlice() excludes only:
+                // - Pods in terminal phase (Succeeded/Failed)
+                // - Pods without an IP
+                // Terminating pods (with deletionTimestamp) are KEPT and marked
+                // terminating=true so kube-proxy can drain them gracefully.
                 let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
                 !matches!(phase, Some(Phase::Succeeded) | Some(Phase::Failed))
-                    && pod.metadata.deletion_timestamp.is_none()
             })
             .collect();
 
@@ -700,7 +705,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 continue; // Pod has no IP
             };
 
-            let is_ready = pod
+            let pod_ready = pod
                 .status
                 .as_ref()
                 .and_then(|s| s.conditions.as_ref())
@@ -711,12 +716,26 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 })
                 .unwrap_or(false);
 
+            let is_terminating = pod.metadata.deletion_timestamp.is_some();
+
+            // K8s endpointslice condition semantics:
+            // - ready: pod is Ready AND not terminating, OR publishNotReadyAddresses=true
+            // - serving: pod is Ready (independent of terminating state)
+            // - terminating: pod has deletionTimestamp
+            // Ref: pkg/controller/endpointslice/utils.go — podEndpointConditions
+            let ready = if publish_not_ready {
+                true
+            } else {
+                pod_ready && !is_terminating
+            };
+            let serving = if publish_not_ready { true } else { pod_ready };
+
             let endpoint = Endpoint {
                 addresses: vec![ip.clone()],
                 conditions: Some(EndpointConditions {
-                    ready: Some(is_ready),
-                    serving: Some(is_ready),
-                    terminating: Some(false),
+                    ready: Some(ready),
+                    serving: Some(serving),
+                    terminating: Some(is_terminating),
                 }),
                 hostname: pod.spec.as_ref().and_then(|s| {
                     if s.subdomain.is_some() {
@@ -954,10 +973,88 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         }
     }
 
-    /// Clean up orphaned EndpointSlices
+    /// Check whether the EndpointSlice at `<ns>/<name>` is owned by the
+    /// selector-based controller. Used to avoid collisions between selector-
+    /// and mirror-managed slices that would otherwise share a name.
+    async fn slice_owned_by_selector_controller(&self, ns: &str, name: &str) -> bool {
+        let key = build_key("endpointslices", Some(ns), name);
+        match self.storage.get::<EndpointSlice>(&key).await {
+            Ok(existing) => existing
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("endpointslice.kubernetes.io/managed-by"))
+                .map(|m| m == "endpointslice-controller.k8s.io")
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Resolve the slice name a mirroring controller should use for the
+    /// `idx`-th mirror slice of an Endpoints resource named `name`. Falls back
+    /// to a "-mirrored" suffix when the bare name is already owned by a
+    /// selector-based slice.
+    fn mirrored_slice_name(name: &str, idx: usize, bare_owned: bool) -> String {
+        match (idx, bare_owned) {
+            (0, false) => name.to_string(),
+            (0, true) => format!("{}-mirrored", name),
+            (i, true) => format!("{}-mirrored-{}", name, i),
+            (i, false) => format!("{}-{}", name, i),
+        }
+    }
+
+    /// Clean up orphaned EndpointSlices whose owning Service or Endpoints no
+    /// longer exists. Used by external callers and tests; the regular
+    /// reconcile loop also runs this cleanup.
     #[allow(dead_code)]
     pub async fn cleanup_orphans(&self) -> Result<()> {
-        // Handled in reconcile_all
+        let all_slices: Vec<EndpointSlice> = self
+            .storage
+            .list(&build_prefix("endpointslices", None))
+            .await
+            .unwrap_or_default();
+
+        for slice in all_slices {
+            let ns = slice.metadata.namespace.as_deref().unwrap_or("default");
+            let svc_name = slice
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("kubernetes.io/service-name"))
+                .cloned();
+
+            let Some(svc_name) = svc_name else { continue };
+
+            let managed_by = slice
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("endpointslice.kubernetes.io/managed-by"))
+                .cloned();
+
+            let should_delete = match managed_by.as_deref() {
+                Some("endpointslice-controller.k8s.io") => {
+                    // Selector-based: delete if owning Service no longer exists
+                    self.storage
+                        .get::<Service>(&build_key("services", Some(ns), &svc_name))
+                        .await
+                        .is_err()
+                }
+                Some("endpointslice-mirroring-controller.k8s.io") => {
+                    // Mirrored: delete if source Endpoints no longer exists
+                    self.storage
+                        .get::<serde_json::Value>(&build_key("endpoints", Some(ns), &svc_name))
+                        .await
+                        .is_err()
+                }
+                _ => false,
+            };
+
+            if should_delete {
+                let key = build_key("endpointslices", Some(ns), &slice.metadata.name);
+                let _ = self.storage.delete(&key).await;
+            }
+        }
         Ok(())
     }
 }
@@ -1196,6 +1293,193 @@ mod tests {
                 .and_then(|c| c.ready),
             Some(true),
             "Endpoint must be marked ready"
+        );
+    }
+
+    /// Terminating pods (with deletionTimestamp) must remain in EndpointSlices
+    /// with terminating=true, ready=false. K8s kube-proxy uses these to drain
+    /// connections during rolling updates. Dropping them entirely causes
+    /// in-flight requests to fail mid-flight.
+    #[tokio::test]
+    async fn test_endpointslice_keeps_terminating_pods() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointSliceController::new(Arc::clone(&storage));
+
+        let service = Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("svc").with_namespace("default"),
+            spec: ServiceSpec {
+                ports: vec![ServicePort {
+                    name: None,
+                    port: 80,
+                    target_port: None,
+                    protocol: Some("TCP".to_string()),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                selector: Some(HashMap::from([("app".to_string(), "test".to_string())])),
+                ..Default::default()
+            },
+            status: None,
+        };
+        storage
+            .create(&build_key("services", Some("default"), "svc"), &service)
+            .await
+            .unwrap();
+
+        // Pod with deletionTimestamp set (terminating) but still Ready
+        let mut pod_meta = ObjectMeta::new("p1")
+            .with_namespace("default")
+            .with_labels(HashMap::from([("app".to_string(), "test".to_string())]));
+        pod_meta.deletion_timestamp = Some(chrono::Utc::now());
+        let pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: pod_meta,
+            spec: Some(rusternetes_common::resources::PodSpec {
+                containers: vec![rusternetes_common::resources::Container {
+                    name: "c".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(rusternetes_common::resources::PodStatus {
+                phase: Some(Phase::Running),
+                pod_ip: Some("10.0.0.1".to_string()),
+                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: None,
+                    message: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
+        };
+        storage
+            .create(&build_key("pods", Some("default"), "p1"), &pod)
+            .await
+            .unwrap();
+
+        controller.reconcile_service(&service).await.unwrap();
+
+        let es: EndpointSlice = storage
+            .get(&build_key("endpointslices", Some("default"), "svc"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            es.endpoints.len(),
+            1,
+            "terminating pod must still appear in the EndpointSlice"
+        );
+        let conds = es.endpoints[0].conditions.as_ref().unwrap();
+        assert_eq!(conds.terminating, Some(true), "terminating must be true");
+        assert_eq!(
+            conds.ready,
+            Some(false),
+            "ready must be false for terminating pods (unless publishNotReadyAddresses)"
+        );
+        assert_eq!(
+            conds.serving,
+            Some(true),
+            "serving must mirror Ready condition independent of terminating state"
+        );
+    }
+
+    /// publishNotReadyAddresses=true forces ready=true and serving=true on every
+    /// endpoint, regardless of pod readiness. This is required for headless
+    /// services that fronts gossip-style protocols (e.g. peer-discovery) where
+    /// clients need to see all pods, including those still starting up.
+    #[tokio::test]
+    async fn test_endpointslice_publish_not_ready_addresses() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EndpointSliceController::new(Arc::clone(&storage));
+
+        let service = Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("svc").with_namespace("default"),
+            spec: ServiceSpec {
+                ports: vec![ServicePort {
+                    name: None,
+                    port: 80,
+                    target_port: None,
+                    protocol: Some("TCP".to_string()),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                selector: Some(HashMap::from([("app".to_string(), "test".to_string())])),
+                publish_not_ready_addresses: Some(true),
+                ..Default::default()
+            },
+            status: None,
+        };
+        storage
+            .create(&build_key("services", Some("default"), "svc"), &service)
+            .await
+            .unwrap();
+
+        // A pod that is Running but NOT Ready
+        let pod = Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("p1")
+                .with_namespace("default")
+                .with_labels(HashMap::from([("app".to_string(), "test".to_string())])),
+            spec: Some(rusternetes_common::resources::PodSpec {
+                containers: vec![rusternetes_common::resources::Container {
+                    name: "c".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(rusternetes_common::resources::PodStatus {
+                phase: Some(Phase::Running),
+                pod_ip: Some("10.0.0.2".to_string()),
+                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: None,
+                    message: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
+        };
+        storage
+            .create(&build_key("pods", Some("default"), "p1"), &pod)
+            .await
+            .unwrap();
+
+        controller.reconcile_service(&service).await.unwrap();
+
+        let es: EndpointSlice = storage
+            .get(&build_key("endpointslices", Some("default"), "svc"))
+            .await
+            .unwrap();
+        assert_eq!(es.endpoints.len(), 1);
+        let conds = es.endpoints[0].conditions.as_ref().unwrap();
+        assert_eq!(
+            conds.ready,
+            Some(true),
+            "publishNotReadyAddresses=true must force ready=true even for unready pods"
+        );
+        assert_eq!(
+            conds.serving,
+            Some(true),
+            "publishNotReadyAddresses=true must force serving=true"
         );
     }
 }
