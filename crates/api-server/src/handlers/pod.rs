@@ -259,7 +259,7 @@ pub async fn create(
 
     let (mutation_response, mutated_pod_value) = state
         .webhook_manager
-        .run_mutating_webhooks(
+        .run_mutating_webhooks_with_dryrun(
             &Operation::Create,
             &gvk,
             &gvr,
@@ -268,6 +268,7 @@ pub async fn create(
             Some(pod_value),
             None,
             &user_info,
+            is_dry_run,
         )
         .await?;
 
@@ -452,7 +453,7 @@ pub async fn create(
 
     let validation_response = state
         .webhook_manager
-        .run_validating_webhooks(
+        .run_validating_webhooks_with_dryrun(
             &Operation::Create,
             &gvk,
             &gvr,
@@ -461,6 +462,7 @@ pub async fn create(
             Some(final_pod_value),
             None,
             &user_info,
+            is_dry_run,
         )
         .await?;
 
@@ -692,7 +694,7 @@ pub async fn update(
 
     let (mutation_response, mutated_pod_value) = state
         .webhook_manager
-        .run_mutating_webhooks(
+        .run_mutating_webhooks_with_dryrun(
             &Operation::Update,
             &gvk,
             &gvr,
@@ -701,6 +703,7 @@ pub async fn update(
             Some(pod_value),
             Some(old_pod_value.clone()),
             &user_info,
+            is_dry_run,
         )
         .await?;
 
@@ -726,7 +729,7 @@ pub async fn update(
 
     let validation_response = state
         .webhook_manager
-        .run_validating_webhooks(
+        .run_validating_webhooks_with_dryrun(
             &Operation::Update,
             &gvk,
             &gvr,
@@ -735,6 +738,7 @@ pub async fn update(
             Some(final_pod_value),
             Some(old_pod_value.clone()),
             &user_info,
+            is_dry_run,
         )
         .await?;
 

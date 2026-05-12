@@ -90,7 +90,7 @@ pub async fn create(
         // Run mutating webhooks
         let (_response, mutated_obj) = state
             .webhook_manager
-            .run_mutating_webhooks(
+            .run_mutating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Create,
                 &gvk,
                 &gvr,
@@ -99,6 +99,7 @@ pub async fn create(
                 cm_val.clone(),
                 None,
                 &user_info,
+                is_dry_run,
             )
             .await?;
         // Check if the mutating webhook DENIED the request.
@@ -117,7 +118,7 @@ pub async fn create(
         // Run validating webhooks
         if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
             .webhook_manager
-            .run_validating_webhooks(
+            .run_validating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Create,
                 &gvk,
                 &gvr,
@@ -126,6 +127,7 @@ pub async fn create(
                 serde_json::to_value(&configmap).ok(),
                 None,
                 &user_info,
+                is_dry_run,
             )
             .await?
         {
@@ -243,7 +245,7 @@ pub async fn update(
         // Run mutating webhooks
         let (_response, mutated_obj) = state
             .webhook_manager
-            .run_mutating_webhooks(
+            .run_mutating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Update,
                 &gvk,
                 &gvr,
@@ -252,6 +254,7 @@ pub async fn update(
                 cm_val.clone(),
                 None,
                 &user_info,
+                is_dry_run,
             )
             .await?;
         // Check if the mutating webhook DENIED the request.

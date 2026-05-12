@@ -10,7 +10,7 @@ use rusternetes_common::{
     },
     resources::{
         FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, Rule,
-        ValidatingWebhook, ValidatingWebhookConfiguration, WebhookClientConfig,
+        SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration, WebhookClientConfig,
     },
     Result,
 };
@@ -491,6 +491,34 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         old_object: Option<Value>,
         user_info: &UserInfo,
     ) -> Result<AdmissionResponse> {
+        self.run_validating_webhooks_with_dryrun(
+            operation, gvk, gvr, namespace, name, object, old_object, user_info, false,
+        )
+        .await
+    }
+
+    /// Run validating webhooks honoring the request's dry-run state.
+    ///
+    /// When `dry_run=true`:
+    /// - Webhooks with `sideEffects` of `Some` or `Unknown` are rejected: K8s
+    ///   refuses to admit dry-run requests through webhooks that may have side
+    ///   effects (apiserver returns an error, fail-closed).
+    ///   K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/validating/dispatcher.go
+    /// - The `dryRun: true` field is set on the `AdmissionReviewRequest` so the
+    ///   webhook can short-circuit side-effects on its end.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_validating_webhooks_with_dryrun(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        gvr: &GroupVersionResource,
+        namespace: Option<&str>,
+        name: &str,
+        object: Option<Value>,
+        old_object: Option<Value>,
+        user_info: &UserInfo,
+        dry_run: bool,
+    ) -> Result<AdmissionResponse> {
         // K8s exempts webhook configuration objects from admission webhooks.
         // Webhooks must not be able to mutate or prevent deletion of webhook
         // configuration objects, otherwise a broken webhook could lock the cluster.
@@ -703,6 +731,21 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                     }
 
+                    // Enforce SideEffects policy for dry-run requests.
+                    // K8s rejects dry-run requests through webhooks with sideEffects=Some or Unknown.
+                    // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/validating/dispatcher.go
+                    if dry_run
+                        && matches!(
+                            webhook.side_effects,
+                            SideEffectClass::Some | SideEffectClass::Unknown
+                        )
+                    {
+                        return Ok(AdmissionResponse::Deny(format!(
+                            "admission webhook {:?} does not support dry run",
+                            webhook.name
+                        )));
+                    }
+
                     // Resolve webhook URL and build invocation
                     let raw_url = self.client.build_webhook_url(&webhook.client_config)?;
                     let resolved_url =
@@ -747,7 +790,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         user_info: user_info.clone(),
                         object: object.clone(),
                         old_object: old_object.clone(),
-                        dry_run: None,
+                        dry_run: if dry_run { Some(true) } else { None },
                         options: None,
                     };
 
@@ -876,9 +919,35 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         gvr: &GroupVersionResource,
         namespace: Option<&str>,
         name: &str,
+        object: Option<Value>,
+        old_object: Option<Value>,
+        user_info: &UserInfo,
+    ) -> Result<(AdmissionResponse, Option<Value>)> {
+        self.run_mutating_webhooks_with_dryrun(
+            operation, gvk, gvr, namespace, name, object, old_object, user_info, false,
+        )
+        .await
+    }
+
+    /// Run mutating webhooks honoring the request's dry-run state.
+    ///
+    /// When `dry_run=true`:
+    /// - Webhooks with `sideEffects` of `Some` or `Unknown` are rejected.
+    /// - The `dryRun: true` field is set on the `AdmissionReviewRequest`.
+    ///
+    /// K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_mutating_webhooks_with_dryrun(
+        &self,
+        operation: &Operation,
+        gvk: &GroupVersionKind,
+        gvr: &GroupVersionResource,
+        namespace: Option<&str>,
+        name: &str,
         mut object: Option<Value>,
         old_object: Option<Value>,
         user_info: &UserInfo,
+        dry_run: bool,
     ) -> Result<(AdmissionResponse, Option<Value>)> {
         // K8s exempts webhook configuration objects from admission webhooks.
         // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/rules/rules.go
@@ -1066,6 +1135,24 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                     }
 
+                    // Enforce SideEffects policy for dry-run requests.
+                    // K8s rejects dry-run requests through webhooks with sideEffects=Some or Unknown.
+                    // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go
+                    if dry_run
+                        && matches!(
+                            webhook.side_effects,
+                            SideEffectClass::Some | SideEffectClass::Unknown
+                        )
+                    {
+                        return Ok((
+                            AdmissionResponse::Deny(format!(
+                                "admission webhook {:?} does not support dry run",
+                                webhook.name
+                            )),
+                            object,
+                        ));
+                    }
+
                     info!(
                         "Running mutating webhook {} for {}/{}",
                         webhook.name, gvk.kind, name
@@ -1100,7 +1187,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         user_info: user_info.clone(),
                         object: object.clone(),
                         old_object: old_object.clone(),
-                        dry_run: None,
+                        dry_run: if dry_run { Some(true) } else { None },
                         options: None,
                     };
 
@@ -3082,6 +3169,838 @@ mod tests {
             result.is_ok(),
             "2-replica deployment in correct namespace should be allowed: {:?}",
             result.err()
+        );
+    }
+
+    // ===== Webhook deny / mutate / dry-run / pruning tests =====
+    //
+    // These tests cover the K8s v1.35 admission webhook conformance gap:
+    //   - deny path for pod/configmap/CR + subresource (attach)
+    //   - mutate path producing JSON patches
+    //   - SideEffects gating for dry-run
+    //   - status.message propagation
+
+    use rusternetes_common::admission::AdmissionStatus;
+    use rusternetes_common::resources::{
+        FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, Rule,
+        RuleWithOperations as Rwo, SideEffectClass, ValidatingWebhook,
+        ValidatingWebhookConfiguration, WebhookClientConfig,
+    };
+
+    /// Spin up a tiny axum HTTP server that returns the canned AdmissionReview
+    /// response for every POST. Returns the base URL so the webhook config can
+    /// point at it.
+    async fn spawn_webhook_server(
+        response: AdmissionReviewResponse,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        let resp = Arc::new(response);
+        let resp_clone = resp.clone();
+        let app = Router::new().route(
+            "/admit",
+            post(move |Json(review): Json<AdmissionReview>| {
+                let response = resp_clone.clone();
+                async move {
+                    let mut out = (*response).clone();
+                    if let Some(req) = review.request.as_ref() {
+                        out.uid = req.uid.clone();
+                    }
+                    Json(AdmissionReview::new_response(out))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        (format!("http://{}/admit", addr), handle)
+    }
+
+    fn pods_rule() -> Rwo {
+        Rwo {
+            operations: vec![OperationType::Create],
+            rule: Rule {
+                api_groups: vec!["".to_string()],
+                api_versions: vec!["v1".to_string()],
+                resources: vec!["pods".to_string()],
+                scope: None,
+            },
+        }
+    }
+
+    fn configmaps_rule() -> Rwo {
+        Rwo {
+            operations: vec![OperationType::Create],
+            rule: Rule {
+                api_groups: vec!["".to_string()],
+                api_versions: vec!["v1".to_string()],
+                resources: vec!["configmaps".to_string()],
+                scope: None,
+            },
+        }
+    }
+
+    fn attach_rule() -> Rwo {
+        // K8s admission rules match subresources via "<resource>/<sub>" syntax.
+        // pods/attach is a Connect operation in K8s.
+        Rwo {
+            operations: vec![OperationType::Connect],
+            rule: Rule {
+                api_groups: vec!["".to_string()],
+                api_versions: vec!["v1".to_string()],
+                resources: vec!["pods/attach".to_string()],
+                scope: None,
+            },
+        }
+    }
+
+    fn cr_rule() -> Rwo {
+        Rwo {
+            operations: vec![OperationType::All],
+            rule: Rule {
+                api_groups: vec!["example.com".to_string()],
+                api_versions: vec!["v1".to_string()],
+                resources: vec!["foos".to_string()],
+                scope: None,
+            },
+        }
+    }
+
+    fn make_validating_config(name: &str, url: &str, rule: Rwo) -> ValidatingWebhookConfiguration {
+        ValidatingWebhookConfiguration {
+            api_version: "admissionregistration.k8s.io/v1".to_string(),
+            kind: "ValidatingWebhookConfiguration".to_string(),
+            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            webhooks: Some(vec![ValidatingWebhook {
+                name: format!("{}.example.com", name),
+                client_config: WebhookClientConfig {
+                    url: Some(url.to_string()),
+                    service: None,
+                    ca_bundle: None,
+                },
+                rules: vec![rule],
+                failure_policy: Some(FailurePolicy::Fail),
+                match_policy: None,
+                namespace_selector: None,
+                object_selector: None,
+                side_effects: SideEffectClass::None,
+                timeout_seconds: Some(5),
+                admission_review_versions: vec!["v1".to_string()],
+                match_conditions: None,
+            }]),
+        }
+    }
+
+    fn make_mutating_config(name: &str, url: &str, rule: Rwo) -> MutatingWebhookConfiguration {
+        MutatingWebhookConfiguration {
+            api_version: "admissionregistration.k8s.io/v1".to_string(),
+            kind: "MutatingWebhookConfiguration".to_string(),
+            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            webhooks: Some(vec![MutatingWebhook {
+                name: format!("{}.example.com", name),
+                client_config: WebhookClientConfig {
+                    url: Some(url.to_string()),
+                    service: None,
+                    ca_bundle: None,
+                },
+                rules: vec![rule],
+                failure_policy: Some(FailurePolicy::Fail),
+                match_policy: None,
+                namespace_selector: None,
+                object_selector: None,
+                side_effects: SideEffectClass::None,
+                timeout_seconds: Some(5),
+                admission_review_versions: vec!["v1".to_string()],
+                match_conditions: None,
+                reinvocation_policy: None,
+            }]),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validating_webhook_denies_pod_create_with_status_message() {
+        let deny_resp = AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: false,
+            status: Some(AdmissionStatus {
+                status: "Failure".to_string(),
+                message: Some("this webhook denies all pods".to_string()),
+                reason: Some("Forbidden".to_string()),
+                code: Some(403),
+                metadata: None,
+            }),
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        };
+        let (url, handle) = spawn_webhook_server(deny_resp).await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let config = make_validating_config("deny-pods", &url, pods_rule());
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/deny-pods",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "pods".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let pod = json!({"metadata": {"name": "p", "namespace": "default"}});
+
+        let resp = manager
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "p",
+                Some(pod),
+                None,
+                &user,
+            )
+            .await
+            .unwrap();
+        handle.abort();
+
+        match resp {
+            AdmissionResponse::Deny(reason) => assert_eq!(reason, "this webhook denies all pods"),
+            other => panic!("expected Deny, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validating_webhook_denies_configmap_create() {
+        let deny_resp = AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: false,
+            status: Some(AdmissionStatus {
+                status: "Failure".into(),
+                message: Some("no configmaps for you".into()),
+                reason: None,
+                code: Some(403),
+                metadata: None,
+            }),
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        };
+        let (url, handle) = spawn_webhook_server(deny_resp).await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let config = make_validating_config("deny-cms", &url, configmaps_rule());
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/deny-cms",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "ConfigMap".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "configmaps".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let resp = manager
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "cm",
+                Some(json!({"metadata": {"name": "cm"}})),
+                None,
+                &user,
+            )
+            .await
+            .unwrap();
+        handle.abort();
+
+        assert!(matches!(resp, AdmissionResponse::Deny(ref r) if r == "no configmaps for you"));
+    }
+
+    #[tokio::test]
+    async fn test_validating_webhook_denies_pod_attach_subresource() {
+        let deny_resp = AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: false,
+            status: Some(AdmissionStatus {
+                status: "Failure".into(),
+                message: Some("attach not allowed".into()),
+                reason: None,
+                code: Some(403),
+                metadata: None,
+            }),
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        };
+        let (url, handle) = spawn_webhook_server(deny_resp).await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let config = make_validating_config("deny-attach", &url, attach_rule());
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/deny-attach",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        // GVR resource "pods/attach" carries the subresource separator that the
+        // matcher splits before comparing against rule entries.
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "PodAttachOptions".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "pods/attach".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let resp = manager
+            .run_validating_webhooks(
+                &Operation::Connect,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "p",
+                Some(json!({"container": "main"})),
+                None,
+                &user,
+            )
+            .await
+            .unwrap();
+        handle.abort();
+
+        assert!(matches!(resp, AdmissionResponse::Deny(ref r) if r == "attach not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_validating_webhook_denies_custom_resource_crud() {
+        let deny_resp = AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: false,
+            status: Some(AdmissionStatus {
+                status: "Failure".into(),
+                message: Some("CR rejected".into()),
+                reason: None,
+                code: Some(403),
+                metadata: None,
+            }),
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        };
+        let (url, handle) = spawn_webhook_server(deny_resp).await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let config = make_validating_config("deny-foos", &url, cr_rule());
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/deny-foos",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "example.com".into(),
+            version: "v1".into(),
+            kind: "Foo".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "example.com".into(),
+            version: "v1".into(),
+            resource: "foos".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let cr_obj = json!({"apiVersion": "example.com/v1", "kind": "Foo",
+                            "metadata": {"name": "f1", "namespace": "default"}});
+
+        // CREATE
+        let create_resp = manager
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "f1",
+                Some(cr_obj.clone()),
+                None,
+                &user,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(create_resp, AdmissionResponse::Deny(ref r) if r == "CR rejected"));
+
+        // UPDATE
+        let update_resp = manager
+            .run_validating_webhooks(
+                &Operation::Update,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "f1",
+                Some(cr_obj.clone()),
+                Some(cr_obj.clone()),
+                &user,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(update_resp, AdmissionResponse::Deny(_)));
+
+        // DELETE: object is None, oldObject carries the resource
+        let delete_resp = manager
+            .run_validating_webhooks(
+                &Operation::Delete,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "f1",
+                None,
+                Some(cr_obj),
+                &user,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(delete_resp, AdmissionResponse::Deny(_)));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_mutating_webhook_applies_json_patch_to_custom_resource() {
+        use base64::Engine;
+        // Patch: add a label, then add an unknown field to spec
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/metadata/labels", "value": {"mutated": "true"}},
+            {"op": "add", "path": "/spec/extraField", "value": "leak"},
+        ]);
+        let patch_b64 =
+            base64::engine::general_purpose::STANDARD.encode(patch.to_string().as_bytes());
+
+        let mutate_resp = AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: true,
+            status: None,
+            patch: Some(patch_b64),
+            patch_type: Some("JSONPatch".to_string()),
+            audit_annotations: None,
+            warnings: None,
+        };
+        let (url, handle) = spawn_webhook_server(mutate_resp).await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let config = make_mutating_config("mutate-foos", &url, cr_rule());
+        storage
+            .create(
+                "/registry/mutatingwebhookconfigurations/mutate-foos",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "example.com".into(),
+            version: "v1".into(),
+            kind: "Foo".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "example.com".into(),
+            version: "v1".into(),
+            resource: "foos".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let cr_obj = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Foo",
+            "metadata": {"name": "f1", "labels": {}},
+            "spec": {"replicas": 1}
+        });
+
+        let (resp, mutated) = manager
+            .run_mutating_webhooks(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "f1",
+                Some(cr_obj),
+                None,
+                &user,
+            )
+            .await
+            .unwrap();
+        handle.abort();
+
+        assert!(resp.is_allowed());
+        let mutated = mutated.expect("mutated object");
+        assert_eq!(
+            mutated.pointer("/metadata/labels/mutated"),
+            Some(&json!("true"))
+        );
+        // The webhook injected an unknown field — pruning must remove it next.
+        assert_eq!(mutated.pointer("/spec/extraField"), Some(&json!("leak")));
+    }
+
+    #[tokio::test]
+    async fn test_mutating_webhook_dryrun_rejected_when_side_effects_some() {
+        // K8s rejects dry-run requests if the webhook declares Side Effects.
+        let (url, handle) = spawn_webhook_server(AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: true,
+            status: None,
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        })
+        .await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let mut config = make_mutating_config("mutate-pods", &url, pods_rule());
+        // Mark this webhook as having Some side effects so dry-run must be refused.
+        if let Some(ws) = config.webhooks.as_mut() {
+            ws[0].side_effects = SideEffectClass::Some;
+        }
+        storage
+            .create(
+                "/registry/mutatingwebhookconfigurations/mutate-pods",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "pods".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+
+        let (resp, _obj) = manager
+            .run_mutating_webhooks_with_dryrun(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "p",
+                Some(json!({"metadata": {"name": "p"}})),
+                None,
+                &user,
+                true, // dry-run
+            )
+            .await
+            .unwrap();
+        handle.abort();
+
+        match resp {
+            AdmissionResponse::Deny(reason) => assert!(
+                reason.contains("does not support dry run"),
+                "got reason: {}",
+                reason
+            ),
+            other => panic!(
+                "expected Deny for dry-run with side effects, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mutating_webhook_dryrun_allowed_for_none_on_dryrun() {
+        // sideEffects=NoneOnDryRun means: the webhook has side effects in
+        // normal operation but knows to skip them when dryRun=true. The
+        // apiserver should still call the webhook.
+        let (url, handle) = spawn_webhook_server(AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: true,
+            status: None,
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        })
+        .await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let mut config = make_mutating_config("mutate-pods-noneondryrun", &url, pods_rule());
+        if let Some(ws) = config.webhooks.as_mut() {
+            ws[0].side_effects = SideEffectClass::NoneOnDryRun;
+        }
+        storage
+            .create(
+                "/registry/mutatingwebhookconfigurations/mutate-pods-noneondryrun",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "pods".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+
+        let (resp, _obj) = manager
+            .run_mutating_webhooks_with_dryrun(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "p",
+                Some(json!({"metadata": {"name": "p"}})),
+                None,
+                &user,
+                true,
+            )
+            .await
+            .unwrap();
+        handle.abort();
+        assert!(
+            resp.is_allowed(),
+            "NoneOnDryRun should be allowed under dry-run, got {:?}",
+            resp
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validating_webhook_failure_policy_fail_blocks() {
+        // Point at an unreachable URL with FailurePolicy=Fail so the
+        // request is rejected.
+        let storage = Arc::new(MemoryStorage::new());
+        let mut config = make_validating_config(
+            "fail-closed",
+            "http://127.0.0.1:1/admit", // unreachable port
+            pods_rule(),
+        );
+        if let Some(ws) = config.webhooks.as_mut() {
+            ws[0].failure_policy = Some(FailurePolicy::Fail);
+            ws[0].timeout_seconds = Some(1);
+        }
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/fail-closed",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "pods".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let result = manager
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "p",
+                Some(json!({"metadata": {"name": "p"}})),
+                None,
+                &user,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "Fail policy should reject when webhook is unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validating_webhook_failure_policy_ignore_allows() {
+        // Same setup but with FailurePolicy=Ignore — request must be allowed.
+        let storage = Arc::new(MemoryStorage::new());
+        let mut config =
+            make_validating_config("fail-open", "http://127.0.0.1:1/admit", pods_rule());
+        if let Some(ws) = config.webhooks.as_mut() {
+            ws[0].failure_policy = Some(FailurePolicy::Ignore);
+            ws[0].timeout_seconds = Some(1);
+        }
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/fail-open",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "pods".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let resp = manager
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("default"),
+                "p",
+                Some(json!({"metadata": {"name": "p"}})),
+                None,
+                &user,
+            )
+            .await
+            .unwrap();
+        assert!(resp.is_allowed(), "Ignore policy must fail-open");
+    }
+
+    // ===== CR pruning after mutating webhook =====
+
+    /// Smoke-test the structural pruning function used by the CR create handler.
+    /// The CR handler calls `prune_custom_resource` AFTER applying webhook
+    /// mutations so any fields injected by a mutator that are absent from the
+    /// CRD's structural schema must be stripped before storage.
+    #[test]
+    fn test_prune_unknown_fields_after_webhook_mutation() {
+        use rusternetes_common::resources::{CustomResource, CustomResourceDefinition};
+
+        // Build the CRD from JSON to avoid spelling out every field of the
+        // structured types — the structural schema declares only `spec.replicas`.
+        let crd_json = json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foos.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "foos", "singular": "foo", "kind": "Foo", "listKind": "FooList"},
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "replicas": {"type": "integer"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+        let crd: CustomResourceDefinition = serde_json::from_value(crd_json).unwrap();
+
+        // CR with a webhook-injected unknown field in spec.
+        let cr_json = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Foo",
+            "metadata": {"name": "f1"},
+            "spec": {"replicas": 3, "extraField": "leak"}
+        });
+        let mut cr: CustomResource = serde_json::from_value(cr_json).unwrap();
+
+        // Reuse the same pruning function the create handler calls.
+        crate::handlers::custom_resource::test_prune_custom_resource(&crd, "v1", &mut cr);
+
+        let pruned_spec = cr.spec.expect("spec preserved");
+        assert_eq!(pruned_spec.get("replicas"), Some(&json!(3)));
+        assert!(
+            pruned_spec.get("extraField").is_none(),
+            "extraField must be pruned: {:?}",
+            pruned_spec
         );
     }
 }
