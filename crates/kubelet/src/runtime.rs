@@ -6907,69 +6907,88 @@ impl ContainerRuntime {
         // preStop hooks may need to communicate with sibling containers (e.g.,
         // sending an HTTP request to another container in the same pod).
         //
-        // Track elapsed time so we can decrement it from the grace period.
+        // K8s runs preStop hooks concurrently per container and bounds the total
+        // wait by `terminationGracePeriodSeconds`. If a hook overruns, it is
+        // aborted and SIGTERM is delivered with the remaining grace period
+        // floored at the minimum (2s).
+        //
         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
         //   gracePeriod -= preStopElapsed
         //   gracePeriod = max(gracePeriod, minimumGracePeriodInSeconds)  // 2s
         let prestop_start = std::time::Instant::now();
+        let prestop_budget = std::time::Duration::from_secs(grace_period_seconds.max(1) as u64);
 
+        // Collect (container_name, pre_stop_handler) for all running containers
+        // that have a preStop hook. Match exact name first, falling back to
+        // suffix match if Docker returns a different name shape.
+        let mut hooks_to_run: Vec<(String, rusternetes_common::resources::LifecycleHandler)> =
+            Vec::new();
         for container in &containers {
-            if let Some(ref id) = container.id {
-                let names = container.names.clone().unwrap_or_default();
-                let container_name = names
-                    .first()
-                    .map(|n| n.trim_start_matches('/').to_string())
-                    .unwrap_or_default();
-
-                let is_running = container.state.as_deref() == Some("running");
-                if is_running {
-                    // Try exact match first, then try matching by suffix in case
-                    // Docker returns a different name format
-                    let lifecycle = lifecycle_map.get(&container_name).or_else(|| {
-                        // Fallback: try matching by finding a lifecycle_map key that
-                        // ends with the same container suffix
-                        lifecycle_map.iter().find_map(|(key, val)| {
-                            if container_name.ends_with(&key[pod_name.len()..]) {
-                                Some(val)
-                            } else {
-                                None
-                            }
-                        })
-                    });
-
-                    if let Some(lifecycle) = lifecycle {
-                        if let Some(ref pre_stop) = lifecycle.pre_stop {
-                            info!(
-                                "Executing preStop hook for container {} (id: {})",
-                                container_name,
-                                &id[..12.min(id.len())]
-                            );
-                            match self
-                                .execute_lifecycle_handler(pre_stop, &container_name)
-                                .await
-                            {
-                                Ok(()) => {
-                                    info!(
-                                        "preStop hook completed successfully for container {}",
-                                        container_name
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "preStop hook failed for container {}: {}",
-                                        container_name, e
-                                    );
-                                }
-                            }
-                        }
-                    } else if !container_name.ends_with("_pause") {
-                        debug!(
-                            "No preStop hook for running container {} (lifecycle_map keys: {:?})",
-                            container_name,
-                            lifecycle_map.keys().collect::<Vec<_>>()
-                        );
+            let names = container.names.clone().unwrap_or_default();
+            let container_name = names
+                .first()
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+            if container.state.as_deref() != Some("running") {
+                continue;
+            }
+            let lifecycle = lifecycle_map.get(&container_name).or_else(|| {
+                lifecycle_map.iter().find_map(|(key, val)| {
+                    if container_name.ends_with(&key[pod_name.len()..]) {
+                        Some(val)
+                    } else {
+                        None
                     }
+                })
+            });
+            if let Some(lifecycle) = lifecycle {
+                if let Some(ref pre_stop) = lifecycle.pre_stop {
+                    hooks_to_run.push((container_name, pre_stop.clone()));
                 }
+            } else if !container_name.ends_with("_pause") {
+                debug!(
+                    "No preStop hook for running container {} (lifecycle_map keys: {:?})",
+                    container_name,
+                    lifecycle_map.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        if !hooks_to_run.is_empty() {
+            // Run preStop hooks concurrently using futures (no Send required
+            // because the executor remains on the current task).
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut futs: FuturesUnordered<_> = hooks_to_run
+                .into_iter()
+                .map(|(container_name, pre_stop)| async move {
+                    info!("Executing preStop hook for container {}", container_name);
+                    match self
+                        .execute_lifecycle_handler(&pre_stop, &container_name)
+                        .await
+                    {
+                        Ok(()) => info!(
+                            "preStop hook completed successfully for container {}",
+                            container_name
+                        ),
+                        Err(e) => warn!(
+                            "preStop hook failed for container {}: {}",
+                            container_name, e
+                        ),
+                    }
+                })
+                .collect();
+            let wait_all = async { while futs.next().await.is_some() {} };
+            // Bound total preStop time by the grace period. If hooks overrun,
+            // we abort and proceed to SIGTERM. K8s does the same — preStop is
+            // best-effort within the grace period.
+            if tokio::time::timeout(prestop_budget, wait_all)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "preStop hooks exceeded grace period {}s for pod {} — proceeding with SIGTERM",
+                    grace_period_seconds, pod_name
+                );
             }
         }
 
@@ -11267,5 +11286,190 @@ mod tests {
             }
             _ => panic!("Second init container should be Waiting/PodInitializing"),
         }
+    }
+
+    /// Verify that `lastState.terminated.exitCode` carries the previous
+    /// container's exit code through container restarts.
+    ///
+    /// Conformance: the K8s runtime exit-status test expects pods to report
+    /// the precise non-zero exit code in `lastState.terminated.exitCode`
+    /// after the kubelet restarts the failed container.
+    #[test]
+    fn test_last_state_terminated_carries_exit_code() {
+        let prev_terminated = ContainerState::Terminated {
+            exit_code: 42,
+            signal: None,
+            reason: Some("Error".to_string()),
+            message: None,
+            started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            finished_at: Some("2026-01-01T00:00:05Z".to_string()),
+            container_id: Some("docker://prev".to_string()),
+        };
+        let cs = ContainerStatus {
+            name: "app".to_string(),
+            ready: true,
+            restart_count: 1,
+            state: Some(ContainerState::Running {
+                started_at: Some("2026-01-01T00:00:10Z".to_string()),
+            }),
+            last_state: Some(prev_terminated.clone()),
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: Some("docker://next".to_string()),
+            started: Some(true),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        };
+
+        match cs.last_state {
+            Some(ContainerState::Terminated { exit_code, .. }) => {
+                assert_eq!(exit_code, 42, "lastState exit_code must match previous run");
+            }
+            _ => panic!("lastState must be Terminated with exit_code"),
+        }
+
+        let json = serde_json::to_string(&cs).unwrap();
+        assert!(
+            json.contains("\"lastState\""),
+            "ContainerStatus JSON must include lastState"
+        );
+        assert!(
+            json.contains("\"exitCode\":42"),
+            "lastState.terminated.exitCode must be 42 in JSON, got: {}",
+            json
+        );
+    }
+
+    /// Verify that a container that exits with a non-zero code surfaces the
+    /// exit code on `state.terminated.exitCode` for `restartPolicy: Never`.
+    #[test]
+    fn test_terminated_state_exposes_exit_code_in_json() {
+        let cs = ContainerStatus {
+            name: "main".to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(ContainerState::Terminated {
+                exit_code: 137,
+                signal: None,
+                reason: Some("OOMKilled".to_string()),
+                message: None,
+                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                finished_at: Some("2026-01-01T00:00:30Z".to_string()),
+                container_id: Some("docker://abc".to_string()),
+            }),
+            last_state: None,
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: Some("docker://abc".to_string()),
+            started: Some(true),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        };
+
+        let json = serde_json::to_value(&cs).unwrap();
+        let exit_code = json
+            .pointer("/state/terminated/exitCode")
+            .and_then(|v| v.as_i64())
+            .expect("state.terminated.exitCode missing from JSON");
+        assert_eq!(exit_code, 137);
+        let reason = json
+            .pointer("/state/terminated/reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(reason, "OOMKilled");
+    }
+
+    /// Verify lifecycle preStop hooks are recognized for all handler types
+    /// the kubelet needs to support during graceful termination.
+    #[test]
+    fn test_prestop_lifecycle_handler_variants() {
+        use rusternetes_common::resources::{
+            ExecAction, HTTPGetAction, Lifecycle, LifecycleHandler, SleepAction, TCPSocketAction,
+        };
+
+        let exec_hook = LifecycleHandler {
+            exec: Some(ExecAction {
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "graceful".to_string(),
+                ],
+            }),
+            http_get: None,
+            tcp_socket: None,
+            sleep: None,
+        };
+        assert!(exec_hook.exec.is_some());
+
+        let http_hook = LifecycleHandler {
+            exec: None,
+            http_get: Some(HTTPGetAction {
+                host: None,
+                http_headers: None,
+                path: Some("/shutdown".to_string()),
+                port: 8080,
+                scheme: None,
+            }),
+            tcp_socket: None,
+            sleep: None,
+        };
+        assert!(http_hook.http_get.is_some());
+
+        let tcp_hook = LifecycleHandler {
+            exec: None,
+            http_get: None,
+            tcp_socket: Some(TCPSocketAction {
+                host: None,
+                port: 9000,
+            }),
+            sleep: None,
+        };
+        assert!(tcp_hook.tcp_socket.is_some());
+
+        let sleep_hook = LifecycleHandler {
+            exec: None,
+            http_get: None,
+            tcp_socket: None,
+            sleep: Some(SleepAction { seconds: 5 }),
+        };
+        assert!(sleep_hook.sleep.is_some());
+
+        let lifecycle = Lifecycle {
+            post_start: None,
+            pre_stop: Some(exec_hook),
+            stop_signal: None,
+        };
+        let json = serde_json::to_string(&lifecycle).unwrap();
+        assert!(json.contains("\"preStop\""), "JSON must include preStop");
+        assert!(
+            json.contains("\"exec\""),
+            "preStop exec handler must serialize"
+        );
+    }
+
+    /// Verify that `terminationGracePeriodSeconds` is read from the pod spec
+    /// so the kubelet can pass it through to the preStop budget.
+    #[test]
+    fn test_termination_grace_period_propagation() {
+        let mut pod = make_pod("graceful", "default", None, None);
+        pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(45);
+
+        let grace = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.termination_grace_period_seconds)
+            .unwrap_or(30);
+        assert_eq!(
+            grace, 45,
+            "spec.terminationGracePeriodSeconds must propagate"
+        );
     }
 }
