@@ -9,8 +9,9 @@ use rusternetes_common::{
         GroupVersionKind, GroupVersionResource, Operation, PatchOperation, UserInfo,
     },
     resources::{
-        FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, Rule,
-        SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration, WebhookClientConfig,
+        FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType,
+        ReinvocationPolicy, Rule, SideEffectClass, ValidatingWebhook,
+        ValidatingWebhookConfiguration, WebhookClientConfig,
     },
     Result,
 };
@@ -20,6 +21,27 @@ use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+/// K8s v1.35 admission webhook timeout bounds.
+/// admissionregistration.k8s.io/v1: timeoutSeconds must be 1-30, default 10.
+/// K8s ref: staging/src/k8s.io/api/admissionregistration/v1/types.go
+const WEBHOOK_DEFAULT_TIMEOUT_SECS: u64 = 10;
+const WEBHOOK_MAX_TIMEOUT_SECS: u64 = 30;
+const WEBHOOK_MIN_TIMEOUT_SECS: u64 = 1;
+
+/// Resolve a webhook's `timeoutSeconds` to a [`Duration`], honoring K8s v1.35 bounds.
+/// `None` → 10s default. Values < 1 → 1s. Values > 30 → 30s.
+pub(crate) fn resolve_webhook_timeout(timeout_seconds: Option<i32>) -> Duration {
+    let secs = timeout_seconds
+        .map(|t| {
+            (t as i64).clamp(
+                WEBHOOK_MIN_TIMEOUT_SECS as i64,
+                WEBHOOK_MAX_TIMEOUT_SECS as i64,
+            ) as u64
+        })
+        .unwrap_or(WEBHOOK_DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// Admission webhook client for calling external webhooks
 pub struct AdmissionWebhookClient {
@@ -46,10 +68,7 @@ impl AdmissionWebhookClient {
         request: &AdmissionReviewRequest,
     ) -> Result<AdmissionReviewResponse> {
         let url = self.build_webhook_url(&webhook.client_config)?;
-        let timeout = webhook
-            .timeout_seconds
-            .map(|t| Duration::from_secs(t as u64))
-            .unwrap_or(Duration::from_secs(10));
+        let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
 
         info!("Calling validating webhook {} at {}", webhook.name, url);
 
@@ -92,10 +111,7 @@ impl AdmissionWebhookClient {
         request: &AdmissionReviewRequest,
     ) -> Result<AdmissionReviewResponse> {
         let url = self.build_webhook_url(&webhook.client_config)?;
-        let timeout = webhook
-            .timeout_seconds
-            .map(|t| Duration::from_secs(t as u64))
-            .unwrap_or(Duration::from_secs(10));
+        let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
 
         info!("Calling mutating webhook {} at {}", webhook.name, url);
 
@@ -141,8 +157,38 @@ impl AdmissionWebhookClient {
         self.call_webhook_with_ca(url, review, timeout, None).await
     }
 
-    /// Call a webhook with optional CA bundle for TLS verification
+    /// Call a webhook with optional CA bundle for TLS verification.
+    ///
+    /// The request is bounded by a tokio task-level deadline matching the webhook's
+    /// `spec.timeoutSeconds` (default 10s, clamped to 1-30s per K8s v1.35). The
+    /// reqwest client also enforces the same timeout internally; the tokio wrapper
+    /// guards the full async call (DNS + connect + TLS + send + parse) so the
+    /// request is aborted at the deadline regardless of which phase is blocking.
     async fn call_webhook_with_ca(
+        &self,
+        url: &str,
+        review: &AdmissionReview,
+        timeout: Duration,
+        ca_bundle: Option<&[u8]>,
+    ) -> Result<AdmissionReviewResponse> {
+        // Outer tokio deadline mirrors K8s admissionContext.WithTimeout — if the
+        // entire call exceeds the budget, the future is dropped/aborted.
+        // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/generic/webhook.go
+        match tokio::time::timeout(
+            timeout,
+            self.call_webhook_inner(url, review, timeout, ca_bundle),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => Err(rusternetes_common::Error::Internal(format!(
+                "failed to call webhook: context deadline exceeded ({}s)",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
+    async fn call_webhook_inner(
         &self,
         url: &str,
         review: &AdmissionReview,
@@ -750,10 +796,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     let raw_url = self.client.build_webhook_url(&webhook.client_config)?;
                     let resolved_url =
                         AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
-                    let timeout = webhook
-                        .timeout_seconds
-                        .map(|t| Duration::from_secs(t as u64))
-                        .unwrap_or(Duration::from_secs(10));
+                    let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
                     let failure_policy = webhook
                         .failure_policy
                         .clone()
@@ -965,6 +1008,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
 
         let mut all_patches = Vec::new();
         let mut all_warnings = Vec::new();
+
+        // Track webhooks with reinvocationPolicy=IfNeeded that were invoked in the
+        // first pass. Each entry records the webhook config and the object
+        // snapshot it observed at the end of its first call. After the first
+        // pass, if the final object diverges from a snapshot — i.e. a later
+        // webhook in the chain mutated it — the webhook is reinvoked once.
+        // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go
+        let mut reinvoke_candidates: Vec<(MutatingWebhook, Value)> = Vec::new();
 
         for config in configs {
             if let Some(webhooks) = &config.webhooks {
@@ -1195,10 +1246,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     let raw_url = self.client.build_webhook_url(&webhook.client_config)?;
                     let resolved_url =
                         AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
-                    let timeout = webhook
-                        .timeout_seconds
-                        .map(|t| Duration::from_secs(t as u64))
-                        .unwrap_or(Duration::from_secs(10));
+                    let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
                     let review = AdmissionReview::new_request(request.clone());
                     // K8s caBundle is []byte → JSON base64. Decode to get PEM.
                     let ca_decoded = webhook.client_config.ca_bundle.as_ref().map(|s| {
@@ -1306,7 +1354,184 @@ impl<S: Storage> AdmissionWebhookManager<S> {
 
                         all_patches.extend(patches);
                     }
+
+                    // Record snapshot for IfNeeded reinvocation. Snapshot is the
+                    // object state *after* this webhook's own patches were
+                    // applied — reinvocation triggers only when a *later*
+                    // webhook in the chain mutates it.
+                    if matches!(
+                        webhook.reinvocation_policy,
+                        Some(ReinvocationPolicy::IfNeeded)
+                    ) {
+                        if let Some(ref obj) = object {
+                            reinvoke_candidates.push((webhook.clone(), obj.clone()));
+                        }
+                    }
                 }
+            }
+        }
+
+        // Second pass: reinvoke IfNeeded webhooks whose snapshot diverges from
+        // the current object. K8s performs exactly one extra round of
+        // reinvocations to bound work — webhooks invoked here do not themselves
+        // trigger a third round.
+        for (webhook, snapshot) in reinvoke_candidates {
+            // Skip if the object was removed by a later webhook, or if it is
+            // unchanged from this webhook's last snapshot (no reinvocation needed).
+            match object.as_ref() {
+                None => continue,
+                Some(o) if *o == snapshot => continue,
+                _ => {}
+            }
+
+            info!(
+                "Reinvoking mutating webhook {} (reinvocationPolicy=IfNeeded) — object changed since last call",
+                webhook.name
+            );
+
+            // Re-evaluate objectSelector against the *current* object so we
+            // don't reinvoke when the object no longer matches.
+            if let Some(ref obj_selector) = webhook.object_selector {
+                let obj_labels: std::collections::HashMap<String, String> = object
+                    .as_ref()
+                    .and_then(|o| o.pointer("/metadata/labels"))
+                    .and_then(|l| l.as_object())
+                    .map(|labels_obj| {
+                        labels_obj
+                            .iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let obj_matches = obj_selector
+                    .match_labels
+                    .as_ref()
+                    .map(|ml| ml.iter().all(|(k, v)| obj_labels.get(k) == Some(v)))
+                    .unwrap_or(true);
+                if !obj_matches {
+                    debug!(
+                        "Skipping reinvocation of {} — object labels no longer match objectSelector",
+                        webhook.name
+                    );
+                    continue;
+                }
+            }
+
+            let (wire_gvr, sub_resource) = if let Some(idx) = gvr.resource.find('/') {
+                (
+                    GroupVersionResource {
+                        group: gvr.group.clone(),
+                        version: gvr.version.clone(),
+                        resource: gvr.resource[..idx].to_string(),
+                    },
+                    Some(gvr.resource[idx + 1..].to_string()),
+                )
+            } else {
+                (gvr.clone(), None)
+            };
+
+            let request = AdmissionReviewRequest {
+                uid: uuid::Uuid::new_v4().to_string(),
+                kind: gvk.clone(),
+                resource: wire_gvr.clone(),
+                sub_resource: sub_resource.clone(),
+                request_kind: Some(gvk.clone()),
+                request_resource: Some(wire_gvr),
+                request_sub_resource: sub_resource,
+                name: name.to_string(),
+                namespace: namespace.map(|s| s.to_string()),
+                operation: operation.clone(),
+                user_info: user_info.clone(),
+                object: object.clone(),
+                old_object: old_object.clone(),
+                dry_run: None,
+                options: None,
+            };
+
+            let raw_url = self.client.build_webhook_url(&webhook.client_config)?;
+            let resolved_url =
+                AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
+            let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
+            let review = AdmissionReview::new_request(request.clone());
+            let ca_decoded = webhook.client_config.ca_bundle.as_ref().map(|s| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(s)
+                    .unwrap_or_else(|_| s.as_bytes().to_vec())
+            });
+            let ca_bundle_ref = ca_decoded.as_deref();
+            let response = match self
+                .client
+                .call_webhook_with_ca(&resolved_url, &review, timeout, ca_bundle_ref)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let fp = webhook
+                        .failure_policy
+                        .as_ref()
+                        .unwrap_or(&FailurePolicy::Fail);
+                    match fp {
+                        FailurePolicy::Ignore => {
+                            warn!(
+                                "Reinvoked mutating webhook {} failed (Ignore): {}",
+                                webhook.name, e
+                            );
+                            continue;
+                        }
+                        _ => return Err(e),
+                    }
+                }
+            };
+
+            if let Some(warnings) = &response.warnings {
+                all_warnings.extend(warnings.clone());
+            }
+
+            if !response.allowed {
+                let reason = response
+                    .status
+                    .as_ref()
+                    .and_then(|s| {
+                        s.message
+                            .as_ref()
+                            .filter(|m| !m.is_empty())
+                            .or(s.reason.as_ref())
+                    })
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| format!("Denied by webhook {}", webhook.name));
+                return Ok((AdmissionResponse::Deny(reason), object));
+            }
+
+            if let Some(patch_base64) = &response.patch {
+                use base64::Engine;
+                let patch_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(patch_base64)
+                    .map_err(|e| {
+                        rusternetes_common::Error::InvalidResource(format!(
+                            "Failed to decode webhook patch: {}",
+                            e
+                        ))
+                    })?;
+                let patch_str = String::from_utf8(patch_bytes).map_err(|e| {
+                    rusternetes_common::Error::InvalidResource(format!(
+                        "Failed to parse webhook patch as UTF-8: {}",
+                        e
+                    ))
+                })?;
+                let patches: Vec<PatchOperation> =
+                    serde_json::from_str(&patch_str).map_err(|e| {
+                        rusternetes_common::Error::InvalidResource(format!(
+                            "Failed to parse webhook patch as JSON: {}",
+                            e
+                        ))
+                    })?;
+                if let Some(ref mut obj) = object {
+                    for patch in &patches {
+                        apply_json_patch(obj, patch)?;
+                    }
+                }
+                all_patches.extend(patches);
             }
         }
 
@@ -2005,6 +2230,34 @@ mod tests {
     use rusternetes_common::resources::RuleWithOperations;
     use rusternetes_storage::memory::MemoryStorage;
     use serde_json::json;
+
+    // ===== Timeout Resolution Tests =====
+
+    #[test]
+    fn test_resolve_webhook_timeout_default() {
+        assert_eq!(resolve_webhook_timeout(None), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_resolve_webhook_timeout_explicit() {
+        assert_eq!(resolve_webhook_timeout(Some(5)), Duration::from_secs(5));
+        assert_eq!(resolve_webhook_timeout(Some(1)), Duration::from_secs(1));
+        assert_eq!(resolve_webhook_timeout(Some(30)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_resolve_webhook_timeout_clamped_to_max() {
+        // K8s v1.35 caps timeoutSeconds at 30.
+        assert_eq!(resolve_webhook_timeout(Some(60)), Duration::from_secs(30));
+        assert_eq!(resolve_webhook_timeout(Some(120)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_resolve_webhook_timeout_clamped_to_min() {
+        // Negative and zero values clamp to 1 second.
+        assert_eq!(resolve_webhook_timeout(Some(0)), Duration::from_secs(1));
+        assert_eq!(resolve_webhook_timeout(Some(-5)), Duration::from_secs(1));
+    }
 
     // ===== JSON Patch Tests =====
 
