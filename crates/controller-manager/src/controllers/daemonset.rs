@@ -543,15 +543,15 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // This ensures that at any point in time, the number of unavailable pods
         // never exceeds maxUnavailable, which is what the conformance test checks.
         if update_strategy == "RollingUpdate" {
-            let max_unavailable = daemonset
+            let max_unavailable_raw = daemonset
                 .spec
                 .update_strategy
                 .as_ref()
                 .and_then(|s| s.rolling_update.as_ref())
-                .and_then(|r| r.max_unavailable.as_ref())
-                .and_then(|s| s.trim_end_matches('%').parse::<i32>().ok())
-                .unwrap_or(1)
-                .max(1);
+                .and_then(|r| r.max_unavailable.as_ref());
+            let desired = eligible_nodes.len() as i32;
+            let max_unavailable =
+                resolve_max_unavailable(max_unavailable_raw.map(|s| s.as_str()), desired);
 
             // Re-read pods after manage phase to get accurate state
             let all_pods_now: Vec<Pod> = self.storage.list(&pod_prefix).await?;
@@ -1247,6 +1247,24 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     }
 }
 
+/// Resolve a DaemonSet `maxUnavailable` IntOrString against the desired pod
+/// count (number of eligible nodes). Percentages are rounded UP per K8s
+/// semantics (`intstr.GetScaledValueFromIntOrPercent` with `roundUp=true`).
+/// Absolute values pass through, and any unparseable input defaults to 1.
+/// The result is clamped to at least 1 so the rolling update can always make
+/// progress on small clusters.
+fn resolve_max_unavailable(raw: Option<&str>, desired: i32) -> i32 {
+    match raw {
+        Some(s) if s.ends_with('%') => {
+            let pct = s.trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
+            let scaled = (pct * desired as f64 / 100.0).ceil() as i32;
+            scaled.max(1)
+        }
+        Some(s) => s.parse::<i32>().unwrap_or(1).max(1),
+        None => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1902,5 +1920,34 @@ mod tests {
             "updated_number_scheduled should be set"
         );
         assert_eq!(status.updated_number_scheduled, Some(1));
+    }
+
+    #[test]
+    fn test_resolve_max_unavailable_absolute() {
+        // None defaults to 1
+        assert_eq!(resolve_max_unavailable(None, 3), 1);
+        // Absolute integer passes through
+        assert_eq!(resolve_max_unavailable(Some("2"), 5), 2);
+        // Absolute clamped to at least 1
+        assert_eq!(resolve_max_unavailable(Some("0"), 5), 1);
+        // Unparseable falls back to 1
+        assert_eq!(resolve_max_unavailable(Some("notanumber"), 5), 1);
+    }
+
+    #[test]
+    fn test_resolve_max_unavailable_percentage() {
+        // 25% of 4 nodes = 1 (rounded up from 1.0)
+        assert_eq!(resolve_max_unavailable(Some("25%"), 4), 1);
+        // 50% of 4 nodes = 2
+        assert_eq!(resolve_max_unavailable(Some("50%"), 4), 2);
+        // 25% of 5 nodes = 2 (rounded up from 1.25)
+        assert_eq!(resolve_max_unavailable(Some("25%"), 5), 2);
+        // 100% of 3 nodes = 3
+        assert_eq!(resolve_max_unavailable(Some("100%"), 3), 3);
+        // Tiny percentage on tiny cluster still allows at least 1
+        assert_eq!(resolve_max_unavailable(Some("1%"), 1), 1);
+        // Regression guard: "25%" must NOT be parsed as 25 absolute on a
+        // small cluster — that previously allowed all pods to be deleted.
+        assert_eq!(resolve_max_unavailable(Some("25%"), 3), 1);
     }
 }
