@@ -104,6 +104,23 @@ impl Default for IptablesManager {
 }
 
 impl IptablesManager {
+    /// Construct an IptablesManager with all subprocess detection skipped.
+    /// Useful for unit tests: build_nat_rules() can be exercised in isolation
+    /// without invoking the iptables binary. `recent_available` controls the
+    /// session-affinity codepath the test wants to exercise.
+    #[cfg(test)]
+    pub fn for_testing(recent_available: bool) -> Self {
+        Self {
+            services_chain: "RUSTERNETES-SERVICES".to_string(),
+            nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
+            iptables_cmd: "/usr/sbin/iptables".to_string(),
+            sep_chains: std::sync::Mutex::new(Vec::new()),
+            recent_available,
+            bridge_iface: None,
+            bridge_cidr: None,
+        }
+    }
+
     pub fn new() -> Self {
         let iptables_cmd = detect_iptables_cmd().to_string();
         let bridge_network = detect_bridge_network();
@@ -909,9 +926,12 @@ impl IptablesManager {
         let proto = protocol.to_lowercase();
         let n = endpoints.len();
 
-        if session_affinity && n > 1 && self.recent_available {
+        if session_affinity && self.recent_available {
             // Session affinity with xt_recent module available.
-            // Create per-endpoint chains with separate recent-set and DNAT rules.
+            // Combine recent --set with DNAT in a single rule (K8s pattern) so
+            // --set only fires when the rule actually matches (correct protocol
+            // and port) rather than every packet that traverses the chain.
+            // K8s ref: pkg/proxy/iptables/proxier.go writeServiceToEndpointRules.
             let timeout_str = affinity_timeout.to_string();
             for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
                 let sep_chain =
@@ -927,25 +947,7 @@ impl IptablesManager {
                 );
                 self.track_sep_chain(&sep_chain);
 
-                // Rule 1 in SEP chain: set the recent mark (always matches, does NOT
-                // terminate — no -j target, so processing continues to next rule)
-                self.run_iptables_logged(
-                    &[
-                        "-t",
-                        "nat",
-                        "-A",
-                        &sep_chain,
-                        "-m",
-                        "recent",
-                        "--name",
-                        &recent_name,
-                        "--set",
-                    ],
-                    &format!("SEP {} recent set", sep_chain),
-                );
-
-                // Rule 2 in SEP chain: DNAT to the endpoint (terminates).
-                // Must include -p proto — iptables requires a protocol for port DNAT.
+                // Single SEP rule: recent --set + DNAT in one shot.
                 self.run_iptables_logged(
                     &[
                         "-t",
@@ -954,12 +956,17 @@ impl IptablesManager {
                         &sep_chain,
                         "-p",
                         &proto,
+                        "-m",
+                        "recent",
+                        "--name",
+                        &recent_name,
+                        "--set",
                         "-j",
                         "DNAT",
                         "--to-destination",
                         &dnat_target,
                     ],
-                    &format!("SEP {} DNAT -> {}", sep_chain, dnat_target),
+                    &format!("SEP {} recent-set + DNAT -> {}", sep_chain, dnat_target),
                 );
 
                 // In the main services chain: check if source was recently seen
@@ -1120,8 +1127,9 @@ impl IptablesManager {
         let proto = protocol.to_lowercase();
         let n = endpoints.len();
 
-        if session_affinity && n > 1 && self.recent_available {
-            // Session affinity for NodePort with xt_recent module
+        if session_affinity && self.recent_available {
+            // Session affinity for NodePort with xt_recent module.
+            // Combine --set + DNAT so --set only fires for matching packets.
             let timeout_str = affinity_timeout.to_string();
             for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
                 let sep_chain = format!("KUBE-NP-SEP-{}-{}", node_port, idx);
@@ -1135,23 +1143,7 @@ impl IptablesManager {
                 );
                 self.track_sep_chain(&sep_chain);
 
-                // Rule 1: set recent mark (non-terminating)
-                self.run_iptables_logged(
-                    &[
-                        "-t",
-                        "nat",
-                        "-A",
-                        &sep_chain,
-                        "-m",
-                        "recent",
-                        "--name",
-                        &recent_name,
-                        "--set",
-                    ],
-                    &format!("NP SEP {} recent set", sep_chain),
-                );
-
-                // Rule 2: DNAT (terminating) — must include -p proto for port DNAT
+                // Single rule: recent --set + DNAT
                 self.run_iptables_logged(
                     &[
                         "-t",
@@ -1160,12 +1152,17 @@ impl IptablesManager {
                         &sep_chain,
                         "-p",
                         &proto,
+                        "-m",
+                        "recent",
+                        "--name",
+                        &recent_name,
+                        "--set",
                         "-j",
                         "DNAT",
                         "--to-destination",
                         &dnat_target,
                     ],
-                    &format!("NP SEP {} DNAT -> {}", sep_chain, dnat_target),
+                    &format!("NP SEP {} recent-set + DNAT -> {}", sep_chain, dnat_target),
                 );
 
                 // Recent check in main nodeports chain
@@ -1445,9 +1442,11 @@ impl IptablesManager {
 
                 let n = endpoints.len();
 
-                if session_affinity && n > 1 && self.recent_available {
-                    // Session affinity with xt_recent: create per-endpoint chains
-                    // K8s pattern: writeServiceToEndpointRules (proxier.go:1541-1562)
+                if session_affinity && self.recent_available {
+                    // Session affinity with xt_recent: create per-endpoint chains.
+                    // K8s pattern: writeServiceToEndpointRules (proxier.go:1541-1562).
+                    // Combine recent --set with DNAT in one rule so --set only
+                    // fires for packets that actually DNAT (correct protocol).
                     for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
                         let sep_chain =
                             format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
@@ -1458,14 +1457,10 @@ impl IptablesManager {
                         // Define the per-endpoint chain
                         rules.push_str(&format!(":{} - [0:0]\n", sep_chain));
 
-                        // SEP chain: set recent mark + DNAT
+                        // SEP chain: single rule that sets the recent mark and DNATs.
                         rules.push_str(&format!(
-                            "-A {} -m recent --name {} --set\n",
-                            sep_chain, recent_name
-                        ));
-                        rules.push_str(&format!(
-                            "-A {} -p {} -j DNAT --to-destination {}\n",
-                            sep_chain, proto, dnat_target
+                            "-A {} -p {} -m recent --name {} --set -j DNAT --to-destination {}\n",
+                            sep_chain, proto, recent_name, dnat_target
                         ));
 
                         // Service chain: affinity check (--rcheck) jumps to SEP if recent
@@ -1476,7 +1471,9 @@ impl IptablesManager {
                         ));
                     }
 
-                    // Fallback: probability-based load balancing for new connections
+                    // Fallback: probability-based load balancing for new connections.
+                    // With a single endpoint the rule has no probability match
+                    // and unconditionally jumps to that endpoint's SEP chain.
                     for (idx, (_endpoint_ip, _endpoint_port)) in endpoints.iter().enumerate() {
                         let is_last = idx == n - 1;
                         let sep_chain =
@@ -1592,7 +1589,7 @@ impl IptablesManager {
 
                 let n = endpoints.len();
 
-                if session_affinity && n > 1 && self.recent_available {
+                if session_affinity && self.recent_available {
                     // Session affinity for NodePort: reuse the same SEP chains and
                     // recent names as ClusterIP. The SEP chains (KUBE-SEP-*) were
                     // already defined in the ClusterIP section above and contain
@@ -1865,5 +1862,321 @@ mod tests {
         let node_port: u16 = 30080;
         let np_chain = format!("KUBE-NP-SEP-{}-{}", node_port, idx);
         assert_eq!(np_chain, "KUBE-NP-SEP-30080-0");
+    }
+
+    use super::IptablesManager;
+    use rusternetes_common::resources::service::{ClientIPConfig, SessionAffinityConfig};
+    use rusternetes_common::resources::{Service, ServicePort, ServiceSpec, ServiceType};
+    use rusternetes_common::types::ObjectMeta;
+    use std::collections::HashMap;
+
+    fn make_service(
+        name: &str,
+        namespace: &str,
+        cluster_ip: &str,
+        service_type: ServiceType,
+        ports: Vec<ServicePort>,
+        session_affinity: Option<&str>,
+        timeout: Option<i32>,
+    ) -> Service {
+        let session_affinity_config = if session_affinity == Some("ClientIP") {
+            Some(SessionAffinityConfig {
+                client_ip: Some(ClientIPConfig {
+                    timeout_seconds: timeout.or(Some(10800)),
+                }),
+            })
+        } else {
+            None
+        };
+        Service {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Service".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta {
+                name: name.to_string(),
+                namespace: Some(namespace.to_string()),
+                ..ObjectMeta::default()
+            },
+            spec: ServiceSpec {
+                cluster_ip: Some(cluster_ip.to_string()),
+                service_type: Some(service_type),
+                ports,
+                session_affinity: session_affinity.map(String::from),
+                session_affinity_config,
+                ..ServiceSpec::default()
+            },
+            status: None,
+        }
+    }
+
+    fn make_endpointslice_map(
+        namespace: &str,
+        service: &str,
+        endpoints: &[(&str, Option<&str>, u16)],
+    ) -> HashMap<String, Vec<(String, Option<String>, u16)>> {
+        let mut m = HashMap::new();
+        let key = format!("{}/{}", namespace, service);
+        let v: Vec<(String, Option<String>, u16)> = endpoints
+            .iter()
+            .map(|(ip, name, port)| (ip.to_string(), name.map(String::from), *port))
+            .collect();
+        m.insert(key, v);
+        m
+    }
+
+    #[tokio::test]
+    async fn test_build_nat_rules_clusterip_session_affinity() {
+        // ClusterIP + ClientIP affinity + 2 endpoints. Generated rules must
+        // contain --rcheck rules in the services chain, per-endpoint SEP
+        // chain definitions, and the combined --set+DNAT rule.
+        let mgr = IptablesManager::for_testing(true);
+        let service = make_service(
+            "my-svc",
+            "default",
+            "10.96.0.5",
+            ServiceType::ClusterIP,
+            vec![ServicePort {
+                name: None,
+                port: 80,
+                target_port: None,
+                protocol: Some("TCP".to_string()),
+                node_port: None,
+                app_protocol: None,
+            }],
+            Some("ClientIP"),
+            Some(7200),
+        );
+        let ep_map = make_endpointslice_map(
+            "default",
+            "my-svc",
+            &[("10.0.0.1", None, 80), ("10.0.0.2", None, 80)],
+        );
+
+        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+
+        assert!(
+            rules.contains(":KUBE-SEP-109605-80-0 - [0:0]"),
+            "missing SEP chain 0 declaration:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains(":KUBE-SEP-109605-80-1 - [0:0]"),
+            "missing SEP chain 1 declaration:\n{}",
+            rules
+        );
+
+        // --rcheck rules in services chain with custom timeout
+        assert!(
+            rules.contains(
+                "-A RUSTERNETES-SERVICES -d 10.96.0.5/32 -p tcp --dport 80 -m recent --name AFFINITY-109605-80-0 --rcheck --seconds 7200 --reap -j KUBE-SEP-109605-80-0"
+            ),
+            "missing --rcheck rule for endpoint 0:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("--name AFFINITY-109605-80-1 --rcheck --seconds 7200 --reap"),
+            "missing --rcheck rule for endpoint 1:\n{}",
+            rules
+        );
+
+        // Combined --set + DNAT inside SEP chain (K8s style)
+        assert!(
+            rules.contains(
+                "-A KUBE-SEP-109605-80-0 -p tcp -m recent --name AFFINITY-109605-80-0 --set -j DNAT --to-destination 10.0.0.1:80"
+            ),
+            "missing combined set+DNAT for endpoint 0:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains(
+                "-A KUBE-SEP-109605-80-1 -p tcp -m recent --name AFFINITY-109605-80-1 --set -j DNAT --to-destination 10.0.0.2:80"
+            ),
+            "missing combined set+DNAT for endpoint 1:\n{}",
+            rules
+        );
+
+        // Probability fallback for new connections: idx 0 gets 1/2, last has no prob.
+        assert!(
+            rules.contains("-m statistic --mode random --probability 0.5000000000"),
+            "missing probability fallback rule:\n{}",
+            rules
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_nat_rules_clusterip_affinity_single_endpoint() {
+        // Single-endpoint ClientIP affinity must still produce a sticky path:
+        // SEP chain + --rcheck rule. No probability match for the fallback.
+        let mgr = IptablesManager::for_testing(true);
+        let service = make_service(
+            "solo",
+            "default",
+            "10.96.0.7",
+            ServiceType::ClusterIP,
+            vec![ServicePort {
+                name: None,
+                port: 8080,
+                target_port: None,
+                protocol: Some("TCP".to_string()),
+                node_port: None,
+                app_protocol: None,
+            }],
+            Some("ClientIP"),
+            None,
+        );
+        let ep_map = make_endpointslice_map("default", "solo", &[("10.0.0.9", None, 8080)]);
+
+        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+
+        assert!(
+            rules.contains(":KUBE-SEP-109607-8080-0 - [0:0]"),
+            "single-endpoint SEP chain missing:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains(
+                "-A KUBE-SEP-109607-8080-0 -p tcp -m recent --name AFFINITY-109607-8080-0 --set -j DNAT --to-destination 10.0.0.9:8080"
+            ),
+            "single-endpoint set+DNAT missing:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("--rcheck --seconds 10800 --reap"),
+            "default 10800 timeout missing:\n{}",
+            rules
+        );
+        assert!(
+            !rules.contains("-m statistic"),
+            "single-endpoint must not produce probability match:\n{}",
+            rules
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_nat_rules_nodeport_session_affinity() {
+        // NodePort + ClientIP affinity must emit --rcheck rules in the
+        // nodeports chain that reuse the per-service SEP chains.
+        let mgr = IptablesManager::for_testing(true);
+        let service = make_service(
+            "np-svc",
+            "default",
+            "10.96.0.11",
+            ServiceType::NodePort,
+            vec![ServicePort {
+                name: None,
+                port: 80,
+                target_port: None,
+                protocol: Some("TCP".to_string()),
+                node_port: Some(30080),
+                app_protocol: None,
+            }],
+            Some("ClientIP"),
+            Some(600),
+        );
+        let ep_map = make_endpointslice_map(
+            "default",
+            "np-svc",
+            &[("10.0.0.3", None, 80), ("10.0.0.4", None, 80)],
+        );
+
+        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+
+        assert!(
+            rules.contains(
+                "-A RUSTERNETES-NODEPORTS -p tcp --dport 30080 -m recent --name AFFINITY-1096011-80-0 --rcheck --seconds 600 --reap -j KUBE-SEP-1096011-80-0"
+            ),
+            "missing NodePort --rcheck rule for endpoint 0:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("--name AFFINITY-1096011-80-1 --rcheck --seconds 600 --reap"),
+            "missing NodePort --rcheck rule for endpoint 1:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30080 -m statistic"),
+            "missing NodePort probability fallback:\n{}",
+            rules
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_nat_rules_affinity_off_no_recent() {
+        // sessionAffinity=None must NOT emit any --rcheck / recent rules.
+        let mgr = IptablesManager::for_testing(true);
+        let service = make_service(
+            "plain",
+            "default",
+            "10.96.0.13",
+            ServiceType::ClusterIP,
+            vec![ServicePort {
+                name: None,
+                port: 80,
+                target_port: None,
+                protocol: Some("TCP".to_string()),
+                node_port: None,
+                app_protocol: None,
+            }],
+            Some("None"),
+            None,
+        );
+        let ep_map = make_endpointslice_map(
+            "default",
+            "plain",
+            &[("10.0.0.5", None, 80), ("10.0.0.6", None, 80)],
+        );
+
+        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+        assert!(
+            !rules.contains("-m recent"),
+            "no-affinity service should not emit recent rules:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("-j DNAT --to-destination 10.0.0.5:80"),
+            "missing direct DNAT for endpoint 0:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("-j DNAT --to-destination 10.0.0.6:80"),
+            "missing direct DNAT for endpoint 1:\n{}",
+            rules
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_nat_rules_affinity_recent_unavailable_falls_back() {
+        // Without xt_recent, ClientIP affinity must fall back to direct DNAT
+        // so the service stays reachable (just not sticky).
+        let mgr = IptablesManager::for_testing(false);
+        let service = make_service(
+            "no-recent",
+            "default",
+            "10.96.0.15",
+            ServiceType::ClusterIP,
+            vec![ServicePort {
+                name: None,
+                port: 80,
+                target_port: None,
+                protocol: Some("TCP".to_string()),
+                node_port: None,
+                app_protocol: None,
+            }],
+            Some("ClientIP"),
+            None,
+        );
+        let ep_map = make_endpointslice_map("default", "no-recent", &[("10.0.0.7", None, 80)]);
+        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+        assert!(
+            !rules.contains("-m recent"),
+            "without xt_recent we must not emit recent rules:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("-j DNAT --to-destination 10.0.0.7:80"),
+            "expected direct DNAT fallback:\n{}",
+            rules
+        );
     }
 }
