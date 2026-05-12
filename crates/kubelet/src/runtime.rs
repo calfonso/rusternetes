@@ -154,6 +154,30 @@ fn needs_shell_quoting(s: &str) -> bool {
     })
 }
 
+/// Set up an EmptyDir volume directory with mode 0o777, matching upstream
+/// Kubernetes (pkg/volume/emptydir/empty_dir.go setupDir).
+///
+/// The chmod is idempotent: it runs after `create_dir_all` regardless of whether
+/// the directory was newly created or already existed (e.g. from a prior pod run
+/// that left stale state). This guarantees the host-side directory always exposes
+/// mode 0o777 to bind-mount consumers.
+///
+/// On Linux — where Kubernetes conformance runs — bind mounts preserve these mode
+/// bits inside the container. On macOS dev VMs (Podman Machine / Docker Desktop
+/// virtiofs) the host mode bits are NOT propagated through the shared-filesystem
+/// layer; that is a known dev-env limitation and not a kubelet bug. The
+/// `[Conformance] EmptyDir.*(mode|0644|0666|0777)` tests are all `[LinuxOnly]`,
+/// so the chmod path here is the production code path.
+pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
+    }
+    Ok(())
+}
+
 impl ContainerRuntime {
     pub async fn new(
         volumes_base_path: String,
@@ -2110,15 +2134,13 @@ impl ContainerRuntime {
         // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
         // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
         // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
-        // are pre-existing failures on macOS VM-based runtimes.
+        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
+        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
+        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
+        // when the directory pre-exists from a prior run.
         if volume.empty_dir.is_some() {
             let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
-            std::fs::create_dir_all(&volume_dir).context("Failed to create emptyDir volume")?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&volume_dir, std::fs::Permissions::from_mode(0o777))?;
-            }
+            setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
             info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
             return Ok(volume_dir);
         }
@@ -8258,6 +8280,131 @@ mod tests {
         let expected_path = format!("/volumes/{}/{}", pod_name, volume_name);
 
         assert_eq!(expected_path, "/volumes/test-pod-emptydir/test-volume");
+    }
+
+    // --- EmptyDir mode bits regression tests (conformance [Conformance].*EmptyDir.*) ---
+    //
+    // Kubernetes sets emptyDir directory permissions to 0o777 via setupDir() in
+    // pkg/volume/emptydir/empty_dir.go. The conformance tests
+    //   [Conformance] EmptyDir.*(mode|0644|0666|0777)
+    // are all marked [LinuxOnly] — they exercise the chmod path verified here.
+    //
+    // On macOS dev environments the bind mount through virtiofs strips mode bits;
+    // that is a dev-env limitation, not a kubelet bug. Linux CI hits the path below.
+
+    #[cfg(unix)]
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rusternetes-emptydir-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_sets_mode_0777_on_new_dir() {
+        let tmp = unique_tmp_dir("new");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let mode = mode_of(&tmp);
+        assert_eq!(
+            mode, 0o777,
+            "newly created emptyDir must have mode 0o777, got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_rechmods_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Pre-create the dir with mode 0o700 (simulating a stale dir left from
+        // a prior pod run or pre-existing host directory).
+        let tmp = unique_tmp_dir("existing");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode_of(&tmp), 0o700, "pre-condition: mode 0o700");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let after = mode_of(&tmp);
+        assert_eq!(
+            after, 0o777,
+            "setup_emptydir_dir must re-chmod existing dir to 0o777, got {:o}",
+            after
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_creates_nested_parent_dirs() {
+        // The pod volumes path is {base}/{pod_name}/{volume_name}; parents may not
+        // exist on the first volume of a pod. create_dir_all must build them.
+        let root = unique_tmp_dir("nested");
+        let target = root.join("pod-x").join("vol-y");
+
+        super::setup_emptydir_dir(target.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        assert!(target.exists(), "nested target dir must exist");
+        let mode = mode_of(&target);
+        assert_eq!(
+            mode, 0o777,
+            "nested emptyDir must have mode 0o777, got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// On Linux, the host chmod 0o777 is the production code path; the bind
+    /// mount preserves mode bits inside the container. This test makes that
+    /// invariant explicit so any regression that drops the chmod fails CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_setup_emptydir_dir_linux_full_bit_pattern() {
+        let tmp = unique_tmp_dir("linux");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let mode = mode_of(&tmp);
+        // On Linux, chmod is honored by the kernel — verify every rwx triple.
+        for (shift, label) in [
+            (6, "owner"), // 0o700
+            (3, "group"), // 0o070
+            (0, "other"), // 0o007
+        ] {
+            for (bit, name) in [(4, "read"), (2, "write"), (1, "execute")] {
+                let expected = bit << shift;
+                assert!(
+                    mode & expected != 0,
+                    "{} {} bit missing in mode {:o}",
+                    label,
+                    name,
+                    mode
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
