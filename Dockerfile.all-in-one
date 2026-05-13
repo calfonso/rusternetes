@@ -1,0 +1,79 @@
+# Dockerfile for the all-in-one rusternetes binary.
+#
+# Build context must be the PARENT directory of both rusternetes/ and rhino/
+# so that the rhino crate path (../../../rhino from crates/storage) resolves.
+#
+# Build args:
+#   CARGO_FEATURES — cargo features to enable (default: "sqlite")
+#                    use "redis" for Redis backend, "sqlite,redis" for both
+#
+# Usage (from compose):
+#   build:
+#     context: ..
+#     dockerfile: rusternetes/Dockerfile.all-in-one
+#     args:
+#       CARGO_FEATURES: redis
+
+# Stage 1: Build the console SPA
+FROM node:24-slim AS console-builder
+WORKDIR /console
+COPY rusternetes/console/package.json rusternetes/console/package-lock.json* ./
+RUN npm ci --ignore-scripts
+COPY rusternetes/console/ ./
+RUN npm run build
+
+# Stage 2: Build the Rust binary
+FROM rust:latest AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy rhino crate first (dependency)
+COPY rhino/Cargo.toml rhino/Cargo.lock rhino/build.rs ./rhino/
+COPY rhino/proto/ ./rhino/proto/
+COPY rhino/src/ ./rhino/src/
+
+# Copy rusternetes workspace manifest
+COPY rusternetes/Cargo.toml rusternetes/Cargo.lock* ./rusternetes/
+
+# Copy all crate manifests for layer caching
+COPY rusternetes/crates/rusternetes/Cargo.toml ./rusternetes/crates/rusternetes/
+COPY rusternetes/crates/api-server/Cargo.toml ./rusternetes/crates/api-server/
+COPY rusternetes/crates/common/Cargo.toml ./rusternetes/crates/common/
+COPY rusternetes/crates/storage/Cargo.toml ./rusternetes/crates/storage/
+COPY rusternetes/crates/scheduler/Cargo.toml ./rusternetes/crates/scheduler/
+COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/
+COPY rusternetes/crates/kubelet/Cargo.toml ./rusternetes/crates/kubelet/
+COPY rusternetes/crates/kube-proxy/Cargo.toml ./rusternetes/crates/kube-proxy/
+COPY rusternetes/crates/kubectl/Cargo.toml ./rusternetes/crates/kubectl/
+
+# Copy all source code
+COPY rusternetes/crates ./rusternetes/crates
+
+# Build the all-in-one binary
+ARG CARGO_FEATURES=sqlite
+WORKDIR /build/rusternetes
+RUN cargo build --release --features ${CARGO_FEATURES} -p rusternetes
+
+# Stage 3: Runtime image
+FROM debian:sid-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/rusternetes/target/release/rusternetes /app/rusternetes
+COPY --from=console-builder /console/dist /app/console
+
+EXPOSE 6443 10250
+
+ENTRYPOINT ["/app/rusternetes"]
+CMD ["--storage-backend", "sqlite", "--tls", "--console-dir", "/app/console"]

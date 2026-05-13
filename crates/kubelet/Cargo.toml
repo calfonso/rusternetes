@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [features]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
+redis = ["rusternetes-storage/redis"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }

@@ -1,0 +1,69 @@
+# All-in-one rusternetes with embedded SQLite storage.
+#
+# Single container — no etcd, no Redis, no external dependencies.
+# The entire cluster runs as one binary with SQLite for state.
+#
+# Usage:
+#   podman compose -f compose.all-in-one.yml build
+#   podman compose -f compose.all-in-one.yml up -d
+#
+# Requires the rhino repo adjacent to this one:
+#   dev/
+#     rusternetes/   (this repo)
+#     rhino/         (https://github.com/calfonso/rhino)
+
+services:
+  rusternetes:
+    build:
+      context: ..
+      dockerfile: rusternetes/Dockerfile.all-in-one
+      args:
+        CARGO_FEATURES: sqlite
+    container_name: rusternetes
+    privileged: true
+    ports:
+      - "6443:6443"
+      - "10250:10250"
+    networks:
+      rusternetes-net:
+        aliases:
+          - api-server
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      - sqlite-data:/data/db
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    command:
+      - "--storage-backend"
+      - "sqlite"
+      - "--data-dir"
+      - "/data/db/rusternetes.db"
+      - "--tls"
+      - "--tls-cert-file"
+      - "/etc/kubernetes/pki/api-server.crt"
+      - "--tls-key-file"
+      - "/etc/kubernetes/pki/api-server.key"
+      - "--disable-proxy"
+      - "--console-dir"
+      - "/app/console"
+      - "--network"
+      - "rusternetes-network"
+      - "--cluster-dns"
+      - "10.96.0.10"
+      - "--volume-dir"
+      - "${KUBELET_VOLUMES_PATH}"
+
+networks:
+  rusternetes-net:
+    driver: bridge
+    name: rusternetes-network
+
+volumes:
+  sqlite-data:
+    name: rusternetes-sqlite-data

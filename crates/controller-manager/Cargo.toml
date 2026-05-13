@@ -39,6 +39,7 @@ base64.workspace = true
 [features]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
+redis = ["rusternetes-storage/redis"]
 cloud-providers = ["rusternetes-cloud-providers"]
 aws = ["cloud-providers", "rusternetes-cloud-providers/aws"]
 gcp = ["cloud-providers", "rusternetes-cloud-providers/gcp"]

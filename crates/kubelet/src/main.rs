@@ -267,7 +267,7 @@ async fn handle_exec(
     let stdin_data = if body.is_empty() { None } else { Some(body) };
     let tty = params.get("tty").map(|v| v == "true").unwrap_or(false);
 
-    let docker = Docker::connect_with_socket_defaults()
+    let docker = Docker::connect_with_local_defaults()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let exec_config = CreateExecOptions {
