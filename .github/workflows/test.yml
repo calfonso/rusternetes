@@ -1,7 +1,12 @@
 name: Rust tests
 
 on:
+  # Run once per change: push events only fire for main (post-merge
+  # validation); feature-branch pushes that have an open PR fire via
+  # the pull_request `synchronize` event instead. Without the branch
+  # filter every PR update would trigger two duplicate runs.
   push:
+    branches: [main]
   pull_request:
 
 env:
