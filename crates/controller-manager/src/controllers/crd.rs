@@ -388,6 +388,23 @@ impl<S: Storage + 'static> CRDController<S> {
     ) -> Result<()> {
         let crd_key = format!("/registry/customresourcedefinitions/{}", crd_name);
         let mut crd: CustomResourceDefinition = self.storage.get(&crd_key).await?;
+        let prev_status = crd.status.clone();
+
+        // Capture prior Established / NamesAccepted timestamps so we can carry
+        // them forward when the condition's .status hasn't actually changed.
+        // K8s convention: last_transition_time updates ONLY on a real status
+        // transition. Re-stamping it on every reconcile would emit a MODIFIED
+        // watch event every resync interval (30s here) — a controller hot-loop.
+        let lookup_prev_time = |target_type: &str, target_status: &str| -> Option<String> {
+            prev_status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .and_then(|cs| {
+                    cs.iter()
+                        .find(|c| c.type_ == target_type && c.status == target_status)
+                        .and_then(|c| c.last_transition_time.clone())
+                })
+        };
 
         // Preserve existing conditions and only update/add Established and NamesAccepted.
         // Other conditions (e.g., set by tests or external controllers) must be kept.
@@ -400,21 +417,27 @@ impl<S: Storage + 'static> CRDController<S> {
         // Remove existing Established and NamesAccepted conditions (we'll re-add them)
         conditions.retain(|c| c.type_ != "Established" && c.type_ != "NamesAccepted");
 
+        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+
         if names_accepted {
+            let last_transition_time =
+                lookup_prev_time("NamesAccepted", "True").unwrap_or_else(|| now_rfc3339.clone());
             conditions.push(CustomResourceDefinitionCondition {
                 type_: "NamesAccepted".to_string(),
                 status: "True".to_string(),
-                last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+                last_transition_time: Some(last_transition_time),
                 reason: Some("NoConflicts".to_string()),
                 message: Some("no conflicts found".to_string()),
             });
         }
 
         if established {
+            let last_transition_time =
+                lookup_prev_time("Established", "True").unwrap_or_else(|| now_rfc3339.clone());
             conditions.push(CustomResourceDefinitionCondition {
                 type_: "Established".to_string(),
                 status: "True".to_string(),
-                last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+                last_transition_time: Some(last_transition_time),
                 reason: Some("InitialNamesAccepted".to_string()),
                 message: Some("the initial names have been accepted".to_string()),
             });
@@ -429,12 +452,21 @@ impl<S: Storage + 'static> CRDController<S> {
             .map(|v| v.name.clone())
             .collect();
 
-        crd.status = Some(CustomResourceDefinitionStatus {
+        let new_status = CustomResourceDefinitionStatus {
             conditions: Some(conditions),
             accepted_names: Some(crd.spec.names.clone()),
             stored_versions: Some(stored_versions),
-        });
+        };
 
+        // Skip the write when nothing actually changed. Compare via canonical
+        // JSON so optional field ordering doesn't trigger spurious updates.
+        let old_v = serde_json::to_value(&prev_status).ok();
+        let new_v = serde_json::to_value(Some(&new_status)).ok();
+        if old_v == new_v {
+            return Ok(());
+        }
+
+        crd.status = Some(new_status);
         self.storage.update(&crd_key, &crd).await?;
 
         Ok(())
@@ -705,6 +737,48 @@ mod tests {
         let has_names_accepted = conditions.iter().any(|c| c.type_ == "NamesAccepted");
         assert!(has_established);
         assert!(has_names_accepted);
+    }
+
+    /// Regression test: update_crd_status must not churn last_transition_time
+    /// on successive reconciles when the established/names_accepted state is
+    /// unchanged. Without preservation, every 30s resync re-stamped Utc::now()
+    /// and rewrote the CRD — emitting a MODIFIED watch event each cycle.
+    #[tokio::test]
+    async fn test_update_crd_status_idempotent_when_unchanged() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = CRDController::new(storage.clone());
+
+        let crd = create_test_crd("crontab", "stable.example.com", "crontabs");
+        let crd_key = format!("/registry/customresourcedefinitions/{}", crd.metadata.name);
+        storage.create(&crd_key, &crd).await.unwrap();
+
+        // First reconcile establishes status + condition timestamps.
+        controller
+            .update_crd_status(&crd.metadata.name, true, true)
+            .await
+            .unwrap();
+        let after_first: CustomResourceDefinition = storage.get(&crd_key).await.unwrap();
+        let first_v: serde_json::Value = serde_json::to_value(after_first.status.as_ref()).unwrap();
+
+        // Sleep enough that any Utc::now() on a re-write would advance past
+        // the first call's timestamps.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Second update with identical inputs must NOT bump timestamps and
+        // must NOT re-write the CRD.
+        controller
+            .update_crd_status(&crd.metadata.name, true, true)
+            .await
+            .unwrap();
+        let after_second: CustomResourceDefinition = storage.get(&crd_key).await.unwrap();
+        let second_v: serde_json::Value =
+            serde_json::to_value(after_second.status.as_ref()).unwrap();
+
+        assert_eq!(
+            first_v, second_v,
+            "CRD status (incl. condition.last_transition_time) must remain stable \
+             on a no-op update — otherwise every resync writes the CRD and churns watchers."
+        );
     }
 
     #[tokio::test]
