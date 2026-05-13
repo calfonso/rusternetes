@@ -54,11 +54,11 @@ pub struct CertificateSigningRequestSpec {
     pub uid: Option<String>,
 
     /// groups contains group membership of the user that created the CertificateSigningRequest
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<String>>,
 
     /// extra contains extra attributes of the user that created the CertificateSigningRequest
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<HashMap<String, Vec<String>>>,
 }
 
@@ -117,7 +117,7 @@ pub enum KeyUsage {
 #[serde(rename_all = "camelCase")]
 pub struct CertificateSigningRequestStatus {
     /// conditions applied to the request
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<CertificateSigningRequestCondition>>,
 
     /// certificate is populated with an issued certificate
