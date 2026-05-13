@@ -326,7 +326,15 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     .get_or_insert_with(Vec::new)
                     .push(owner_ref);
                 let rs_key = build_key("replicasets", Some(namespace), &rs.metadata.name);
-                let _ = self.storage.update(&rs_key, &adopted).await;
+                if let Err(e) = self.storage.update(&rs_key, &adopted).await {
+                    if !matches!(e, rusternetes_common::Error::Conflict(_)) {
+                        error!(
+                            error = %e,
+                            replicaset = rs.metadata.name,
+                            "failed to adopt orphan ReplicaSet"
+                        );
+                    }
+                }
                 info!(
                     "Adopted orphan ReplicaSet {} into Deployment {}/{}",
                     rs.metadata.name, namespace, deployment.metadata.name
@@ -425,7 +433,15 @@ impl<S: Storage + 'static> DeploymentController<S> {
                                 revision_str.clone(),
                             );
                         let rs_key = build_key("replicasets", Some(namespace), &rs.metadata.name);
-                        let _ = self.storage.update(&rs_key, &updated_rs).await;
+                        if let Err(e) = self.storage.update(&rs_key, &updated_rs).await {
+                            if !matches!(e, rusternetes_common::Error::Conflict(_)) {
+                                error!(
+                                    error = %e,
+                                    replicaset = rs.metadata.name,
+                                    "failed to refresh ReplicaSet revision annotation"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -449,7 +465,15 @@ impl<S: Storage + 'static> DeploymentController<S> {
                         revision_str,
                     );
                 let key = build_key("deployments", Some(namespace), &deployment.metadata.name);
-                let _ = self.storage.update(&key, &updated).await;
+                if let Err(e) = self.storage.update(&key, &updated).await {
+                    if !matches!(e, rusternetes_common::Error::Conflict(_)) {
+                        error!(
+                            error = %e,
+                            deployment = deployment.metadata.name,
+                            "failed to refresh deployment revision annotation"
+                        );
+                    }
+                }
             }
         }
 
@@ -649,21 +673,17 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 //
                 // Count available replicas from all RSes (status-based, matching K8s).
                 // Fall back to counting pods directly if RS status is not yet populated.
-                let _all_available: i32 = owned_replicasets
-                    .iter()
-                    .map(|rs| {
-                        if let Some(status) = &rs.status {
-                            status.available_replicas
-                        } else {
-                            // Fall back to pod count
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(
-                                    self.count_available_pods_for_rs(&rs.metadata.name, namespace),
-                                )
-                            })
-                        }
-                    })
-                    .sum();
+                let mut all_available: i32 = 0;
+                for rs in &owned_replicasets {
+                    all_available += if let Some(status) = &rs.status {
+                        status.available_replicas
+                    } else {
+                        // Fall back to pod count
+                        self.count_available_pods_for_rs(&rs.metadata.name, namespace)
+                            .await
+                    };
+                }
+                let _all_available = all_available;
 
                 // New RS unavailable count = newRS.Spec.Replicas - newRS.Status.AvailableReplicas
                 let new_rs_available = if let Some(new_rs) = owned_replicasets
@@ -1167,11 +1187,14 @@ impl<S: Storage + 'static> DeploymentController<S> {
             );
         }
 
-        // Also update the deployment's revision annotation (with CAS retry)
+        // Also update the deployment's revision annotation (with CAS retry +
+        // exponential backoff + jitter so contended deployments don't thrash).
         {
+            use rand::Rng;
             let dep_key = build_key("deployments", Some(namespace), &deployment.metadata.name);
             let new_rev = new_revision.clone();
-            for _ in 0..3 {
+            let mut delay_ms: u64 = 10;
+            for attempt in 0..3 {
                 match self.storage.get::<Deployment>(&dep_key).await {
                     Ok(mut dep) => {
                         dep.metadata
@@ -1183,9 +1206,22 @@ impl<S: Storage + 'static> DeploymentController<S> {
                             );
                         match self.storage.update(&dep_key, &dep).await {
                             Ok(_) => break,
-                            Err(e) => {
-                                debug!("CAS retry updating deployment revision: {}", e);
+                            Err(rusternetes_common::Error::Conflict(_)) => {
+                                if attempt + 1 < 3 {
+                                    let jitter = rand::thread_rng().gen_range(0..delay_ms);
+                                    tokio::time::sleep(Duration::from_millis(delay_ms + jitter))
+                                        .await;
+                                    delay_ms = (delay_ms * 2).min(500);
+                                }
                                 continue;
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    deployment = deployment.metadata.name,
+                                    "failed to update deployment revision annotation"
+                                );
+                                break;
                             }
                         }
                     }
@@ -1497,7 +1533,15 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 changed = true;
             }
             if changed {
-                let _ = self.storage.update(&key, &fresh_rs).await;
+                if let Err(e) = self.storage.update(&key, &fresh_rs).await {
+                    if !matches!(e, rusternetes_common::Error::Conflict(_)) {
+                        error!(
+                            error = %e,
+                            replicaset = rs.metadata.name,
+                            "failed to refresh ReplicaSet replica annotations"
+                        );
+                    }
+                }
             }
         }
     }
