@@ -34,11 +34,11 @@ fn default_kind_subject_access_review() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct SubjectAccessReviewSpec {
     /// Extra corresponds to the user.Info.GetExtra() method from the authenticator.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<HashMap<String, Vec<String>>>,
 
     /// Groups is the groups you're testing for.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<String>>,
 
     /// NonResourceAttributes describes information for a non-resource access request.
@@ -121,7 +121,7 @@ pub struct FieldSelectorAttributes {
     pub raw_selector: Option<String>,
 
     /// Requirements is the parsed interpretation of a field selector.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requirements: Option<Vec<FieldSelectorRequirement>>,
 }
 
@@ -136,7 +136,7 @@ pub struct FieldSelectorRequirement {
     pub operator: String,
 
     /// Values is an array of string values.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
 }
 
@@ -149,7 +149,7 @@ pub struct LabelSelectorAttributes {
     pub raw_selector: Option<String>,
 
     /// Requirements is the parsed interpretation of a label selector.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requirements: Option<Vec<LabelSelectorRequirement>>,
 }
 
@@ -164,7 +164,7 @@ pub struct LabelSelectorRequirement {
     pub operator: String,
 
     /// Values is an array of string values.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
 }
 
@@ -312,7 +312,11 @@ pub struct SubjectRulesReviewStatus {
 #[serde(rename_all = "camelCase")]
 pub struct NonResourceRule {
     /// NonResourceURLs is a set of partial urls that a user should have access to.
-    #[serde(rename = "nonResourceURLs", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "nonResourceURLs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub non_resource_urls: Option<Vec<String>>,
 
     /// Verb is a list of kubernetes non-resource API verbs.
@@ -324,15 +328,15 @@ pub struct NonResourceRule {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRule {
     /// APIGroups is the name of the APIGroup that contains the resources.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_groups: Option<Vec<String>>,
 
     /// ResourceNames is an optional white list of names that the rule applies to.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_names: Option<Vec<String>>,
 
     /// Resources is a list of resources this rule applies to.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Vec<String>>,
 
     /// Verb is a list of kubernetes resource API verbs.
