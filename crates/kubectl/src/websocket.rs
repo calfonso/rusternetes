@@ -120,7 +120,10 @@ pub async fn exec_stream(ws_url: String, stdin_enabled: bool, _tty_enabled: bool
                     }
                 }
                 Ok(Message::Close(_)) => break,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("websocket read task error: {e}");
+                    break;
+                }
                 _ => {}
             }
         }
@@ -145,7 +148,10 @@ pub async fn exec_stream(ws_url: String, stdin_enabled: bool, _tty_enabled: bool
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        eprintln!("websocket stdin read error: {e}");
+                        break;
+                    }
                 }
             }
 
@@ -278,7 +284,10 @@ async fn handle_port_forward_connection(
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("port-forward TCP read error: {e}");
+                    break;
+                }
             }
         }
         let _ = ws_write.close().await;
@@ -303,7 +312,10 @@ async fn handle_port_forward_connection(
                     }
                 }
                 Ok(Message::Close(_)) => break,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("port-forward WebSocket read error: {e}");
+                    break;
+                }
                 _ => {}
             }
         }

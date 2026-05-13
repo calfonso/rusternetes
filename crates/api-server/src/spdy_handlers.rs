@@ -252,11 +252,16 @@ async fn setup_port_forward(
         loop {
             match spdy_to_tcp.read_frame().await {
                 Ok(Some(frame)) if frame.channel == SpdyChannel::Stdin => {
-                    if tcp_write.write_all(&frame.data).await.is_err() {
+                    if let Err(e) = tcp_write.write_all(&frame.data).await {
+                        tracing::error!(task = "spdy_to_tcp", error = %e, "TCP write failed");
                         break;
                     }
                 }
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!(task = "spdy_to_tcp", error = %e, "SPDY read_frame failed");
+                    break;
+                }
                 _ => {}
             }
         }
