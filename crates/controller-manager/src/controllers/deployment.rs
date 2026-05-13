@@ -523,119 +523,54 @@ impl<S: Storage + 'static> DeploymentController<S> {
             .map(|rs| rs.spec.replicas)
             .sum();
 
-        // Proportional scaling: only runs during scaling events (when
-        // deployment.spec.replicas changes while a rolling update is in progress).
-        // K8s ref: pkg/controller/deployment/sync.go — scale() + isScalingEvent()
+        // K8s ref: pkg/controller/deployment/deployment_controller.go —
+        //   syncDeployment: when d.Spec.Paused, dc.sync(d, rsList) runs but
+        //   rolloutRolling does NOT. scale() can still adjust replica counts
+        //   (e.g. apply scale-event surges), but the rolling-update
+        //   progression that scales the old RS down is skipped.
+        let is_paused = deployment.spec.paused.unwrap_or(false);
+
+        // Detect a scaling event by comparing deployment.spec.replicas with the
+        // "deployment.kubernetes.io/desired-replicas" annotation on any active RS.
+        // K8s ref: pkg/controller/deployment/sync.go — isScalingEvent()
         //
-        // A scaling event is detected by checking the "deployment.kubernetes.io/desired-replicas"
-        // annotation on active ReplicaSets. If the annotation differs from the deployment's
-        // desired replicas, this is a scaling event that requires proportional distribution.
-        // During normal rolling updates (template change only), this block is skipped.
-        let is_scaling_event = if is_rolling_update && old_rs_total > 0 {
-            let active_rs_list: Vec<&ReplicaSet> = owned_replicasets
-                .iter()
-                .filter(|rs| rs.spec.replicas > 0)
-                .collect();
-            active_rs_list.iter().any(|rs| {
+        // Unlike a "rollout in progress" check, this examines every active RS
+        // regardless of how many old RSes have replicas — the same way K8s
+        // upstream does, so that proportional scaling kicks in even when only
+        // the new RS is currently active.
+        let is_scaling_event = owned_replicasets
+            .iter()
+            .filter(|rs| rs.spec.replicas > 0)
+            .any(|rs| {
                 rs.metadata
                     .annotations
                     .as_ref()
                     .and_then(|a| a.get("deployment.kubernetes.io/desired-replicas"))
                     .and_then(|v| v.parse::<i32>().ok())
-                    .map(|annotated_desired| annotated_desired != desired_replicas)
-                    .unwrap_or(false) // No annotation = not a scaling event
-            })
-        } else {
-            false
-        };
+                    .is_some_and(|annotated_desired| annotated_desired != desired_replicas)
+            });
 
-        if is_scaling_event {
-            let all_rs_replicas: i32 = owned_replicasets.iter().map(|rs| rs.spec.replicas).sum();
-            let allowed_size = desired_replicas + max_surge;
-            let replicas_to_add = allowed_size - all_rs_replicas;
+        // K8s sync() / scale() — runs when the deployment is paused or when a
+        // scaling event is detected. Distributes replicas proportionally across
+        // active RSes (or scales a single active RS directly).
+        // K8s ref: pkg/controller/deployment/sync.go — sync(), scale()
+        if is_paused || is_scaling_event {
+            self.scale_replica_sets(
+                &owned_replicasets,
+                active_rs,
+                desired_replicas,
+                max_surge,
+                is_rolling_update,
+                namespace,
+            )
+            .await?;
 
-            if replicas_to_add != 0 {
-                // K8s proportional scaling formula (deployment_util.go:getReplicaSetFraction):
-                //   newSize = rs.Replicas * (newMaxTotal / oldMaxTotal)
-                //   fraction = round(newSize) - rs.Replicas
-                // where oldMaxTotal comes from the RS "max-replicas" annotation.
-                // K8s ref: pkg/controller/deployment/util/deployment_util.go
-                let mut added = 0i32;
-                let mut updates: Vec<(String, i32)> = Vec::new();
-
-                for rs in owned_replicasets.iter() {
-                    if rs.spec.replicas == 0 {
-                        continue;
-                    }
-                    // Read oldMaxTotal from RS annotation (set during previous scale)
-                    let old_max = rs
-                        .metadata
-                        .annotations
-                        .as_ref()
-                        .and_then(|a| a.get("deployment.kubernetes.io/max-replicas"))
-                        .and_then(|v| v.parse::<i32>().ok())
-                        .unwrap_or(all_rs_replicas); // fallback if no annotation
-
-                    let fraction = if old_max > 0 {
-                        let new_size =
-                            (rs.spec.replicas as f64) * (allowed_size as f64) / (old_max as f64);
-                        new_size.round() as i32 - rs.spec.replicas
-                    } else {
-                        0
-                    };
-
-                    let allowed = replicas_to_add - added;
-                    let proportion = if replicas_to_add > 0 {
-                        fraction.min(allowed).max(0)
-                    } else {
-                        fraction.max(allowed).min(0)
-                    };
-
-                    let new_replicas = (rs.spec.replicas + proportion).max(0);
-                    if new_replicas != rs.spec.replicas {
-                        updates.push((rs.metadata.name.clone(), new_replicas));
-                    }
-                    added += proportion;
-                }
-
-                // Apply leftover to first RS (K8s assigns leftover to largest/newest)
-                if !updates.is_empty() && replicas_to_add != added {
-                    let leftover = replicas_to_add - added;
-                    updates[0].1 = (updates[0].1 + leftover).max(0);
-                }
-
-                for (rs_name, new_replicas) in &updates {
-                    if let Some(rs) = owned_replicasets
-                        .iter()
-                        .find(|r| &r.metadata.name == rs_name)
-                    {
-                        info!(
-                            "Proportional scaling: {}/{} {} -> {}",
-                            namespace, rs_name, rs.spec.replicas, new_replicas
-                        );
-                        self.update_replicaset_replicas(rs, *new_replicas).await?;
-                    }
-                }
-
-                // Update desired-replicas annotation on all active RSes after scaling.
-                // K8s SetReplicasAnnotations sets max-replicas = desired + maxSurge.
-                for rs in owned_replicasets.iter() {
-                    if rs.spec.replicas > 0 {
-                        self.set_desired_replicas_annotation(
-                            rs,
-                            desired_replicas,
-                            max_surge,
-                            namespace,
-                        )
-                        .await;
-                    }
-                }
-
-                if !updates.is_empty() {
-                    // Status will be updated at end of reconcile
-                    return self.update_deployment_status(deployment).await;
-                }
-            }
+            // When paused, do NOT progress the rollout — return after status
+            // and cleanup. When it's only a scaling event (not paused), we
+            // also return to let the next reconcile pick up the now-updated
+            // RSes; this matches upstream which returns from sync() before
+            // attempting rollout progression.
+            return self.update_deployment_status(deployment).await;
         }
 
         if let Some(active) = active_rs {
@@ -655,11 +590,11 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 return self.update_deployment_status(deployment).await;
             }
 
-            // Also handle the case where the new RS has the right count but old
-            // RSes still have pods — need to scale them down even without a
-            // rolling update in progress.
-            // K8s ref: sync.go:320-327 — IsSaturated check
-            if active_replicas >= desired_replicas && old_rs_total > 0 && !is_scaling_event {
+            // Saturated new RS but old RSes still have pods — scale them down.
+            // K8s ref: sync.go:320-327 — IsSaturated check. Reachable only
+            // when not paused and not a scaling event (those return early
+            // above), so no extra guard needed.
+            if active_replicas >= desired_replicas && old_rs_total > 0 {
                 // New RS is saturated — scale all old RSes to 0
                 for rs in owned_replicasets.iter() {
                     if rs.metadata.name != active_name && rs.spec.replicas > 0 {
@@ -1317,6 +1252,209 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     return Err(e);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// K8s `scale()` (pkg/controller/deployment/sync.go) — invoked when the
+    /// deployment is paused or when a scaling event is detected. Mirrors the
+    /// upstream three-branch logic:
+    ///   1. If a single active-or-latest RS exists, scale it directly to the
+    ///      deployment's desired replica count.
+    ///   2. If the new RS is "saturated" (IsSaturated), scale every old RS
+    ///      with pods down to 0.
+    ///   3. Otherwise (multiple active RSes + RollingUpdate), distribute the
+    ///      replica delta proportionally using each RS's max-replicas
+    ///      annotation as the old denominator (GetProportion).
+    #[allow(clippy::too_many_arguments)]
+    async fn scale_replica_sets(
+        &self,
+        owned_replicasets: &[ReplicaSet],
+        active_rs: Option<&ReplicaSet>,
+        desired_replicas: i32,
+        max_surge: i32,
+        is_rolling_update: bool,
+        namespace: &str,
+    ) -> rusternetes_common::Result<()> {
+        // FindActiveOrLatest: if exactly one RS has spec.replicas > 0, scale
+        // that one directly. If none are active, fall back to the new RS (or
+        // newest old RS). If more than one is active, return None and fall
+        // through to the saturated / proportional branches.
+        let active_list: Vec<&ReplicaSet> = owned_replicasets
+            .iter()
+            .filter(|rs| rs.spec.replicas > 0)
+            .collect();
+
+        let single = match active_list.len() {
+            0 => active_rs.or_else(|| owned_replicasets.first()),
+            1 => Some(active_list[0]),
+            _ => None,
+        };
+
+        if let Some(single_rs) = single {
+            if single_rs.spec.replicas != desired_replicas {
+                info!(
+                    "Scale: ReplicaSet {}/{} {} -> {} (single active RS)",
+                    namespace, single_rs.metadata.name, single_rs.spec.replicas, desired_replicas
+                );
+                self.update_replicaset_replicas(single_rs, desired_replicas)
+                    .await?;
+            }
+            self.set_desired_replicas_annotation(single_rs, desired_replicas, max_surge, namespace)
+                .await;
+            return Ok(());
+        }
+
+        // IsSaturated: when the new RS owns all the desired replicas and is
+        // fully available, scale every old RS down to 0. K8s checks the
+        // desired-replicas annotation + status.available_replicas; we mirror
+        // that, falling back to spec.replicas when status isn't populated yet.
+        if let Some(new_rs) = active_rs {
+            let new_rs_available = new_rs
+                .status
+                .as_ref()
+                .map(|s| s.available_replicas)
+                .unwrap_or(new_rs.spec.replicas);
+            let new_rs_annotated_desired = new_rs
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("deployment.kubernetes.io/desired-replicas"))
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(0);
+            let saturated = new_rs.spec.replicas == desired_replicas
+                && new_rs_annotated_desired == desired_replicas
+                && new_rs_available == desired_replicas;
+            if saturated {
+                for rs in owned_replicasets.iter() {
+                    if rs.metadata.name != new_rs.metadata.name && rs.spec.replicas > 0 {
+                        info!(
+                            "Scale (saturated): old RS {}/{} -> 0",
+                            namespace, rs.metadata.name
+                        );
+                        self.update_replicaset_replicas(rs, 0).await?;
+                    }
+                }
+                self.set_desired_replicas_annotation(
+                    new_rs,
+                    desired_replicas,
+                    max_surge,
+                    namespace,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
+        // Proportional scaling (RollingUpdate only). K8s ref:
+        // pkg/controller/deployment/util/deployment_util.go — GetProportion,
+        // getReplicaSetFraction.
+        if !is_rolling_update {
+            return Ok(());
+        }
+
+        let all_rs_replicas: i32 = active_list.iter().map(|rs| rs.spec.replicas).sum();
+        let allowed_size = if desired_replicas == 0 {
+            0
+        } else {
+            desired_replicas + max_surge
+        };
+        let replicas_to_add = allowed_size - all_rs_replicas;
+
+        // Sort active RSes by creation timestamp DESC so the newest RS is
+        // first — matches K8s, where the new RS receives the leftover when
+        // rounding doesn't sum exactly. K8s ref: sync.go scale() loops over
+        // (newRS, oldRSs) sorted newest-first.
+        let mut active_sorted: Vec<&ReplicaSet> = active_list.clone();
+        active_sorted.sort_by(|a, b| {
+            b.metadata
+                .creation_timestamp
+                .cmp(&a.metadata.creation_timestamp)
+        });
+
+        let mut added = 0i32;
+        let mut updates: Vec<(String, i32)> = Vec::new();
+
+        for rs in active_sorted.iter() {
+            // getReplicaSetFraction: when desired == 0, scale RS down to 0.
+            // Otherwise newSize = rs.replicas * (deploymentMaxReplicas /
+            // annotatedMaxReplicas). Missing/zero annotation → fraction 0
+            // (matches upstream, which returns 0 in that case).
+            let fraction = if desired_replicas == 0 {
+                -rs.spec.replicas
+            } else {
+                let annotated_max = rs
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("deployment.kubernetes.io/max-replicas"))
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0);
+                if annotated_max == 0 {
+                    0
+                } else {
+                    let new_size =
+                        (rs.spec.replicas as f64) * (allowed_size as f64) / (annotated_max as f64);
+                    new_size.round() as i32 - rs.spec.replicas
+                }
+            };
+
+            let allowed = replicas_to_add - added;
+            let proportion = if replicas_to_add > 0 {
+                fraction.min(allowed).max(0)
+            } else if replicas_to_add < 0 {
+                fraction.max(allowed).min(0)
+            } else {
+                0
+            };
+
+            added += proportion;
+            let new_replicas = (rs.spec.replicas + proportion).max(0);
+            if new_replicas != rs.spec.replicas {
+                updates.push((rs.metadata.name.clone(), new_replicas));
+            }
+        }
+
+        // Leftover (rounding remainder) goes to the newest active RS.
+        // K8s ref: sync.go scale() — leftover is added to the first RS
+        // (newest after the newRS+oldRSs reverse-sort).
+        if !active_sorted.is_empty() && replicas_to_add != added {
+            let leftover = replicas_to_add - added;
+            let newest_name = active_sorted[0].metadata.name.clone();
+            if let Some(existing) = updates.iter_mut().find(|(n, _)| n == &newest_name) {
+                existing.1 = (existing.1 + leftover).max(0);
+            } else {
+                // Newest RS had no fraction (e.g. fraction was 0); still apply
+                // the leftover so totals balance.
+                let current = active_sorted[0].spec.replicas;
+                let target = (current + leftover).max(0);
+                if target != current {
+                    updates.push((newest_name, target));
+                }
+            }
+        }
+
+        for (rs_name, new_replicas) in &updates {
+            if let Some(rs) = owned_replicasets
+                .iter()
+                .find(|r| &r.metadata.name == rs_name)
+            {
+                info!(
+                    "Proportional scaling: {}/{} {} -> {}",
+                    namespace, rs_name, rs.spec.replicas, new_replicas
+                );
+                self.update_replicaset_replicas(rs, *new_replicas).await?;
+            }
+        }
+
+        // K8s SetReplicasAnnotations sets desired-replicas + max-replicas on
+        // every active RS after scaling so the next reconcile knows the new
+        // baseline. We refresh all owned RSes (including those with 0
+        // replicas), matching upstream behavior.
+        for rs in owned_replicasets.iter() {
+            self.set_desired_replicas_annotation(rs, desired_replicas, max_surge, namespace)
+                .await;
         }
 
         Ok(())
@@ -2338,5 +2476,464 @@ mod tests {
             "deployment revision ({}) should be >= 5 (max from owned ReplicaSets)",
             revision
         );
+    }
+
+    /// Build an owned ReplicaSet that mirrors the deployment's pod template
+    /// (so `replicaset_matches_template` returns true when image matches),
+    /// plus the pod-template-hash label and proportional-scaling annotations.
+    fn build_owned_rs(
+        deployment: &Deployment,
+        suffix: &str,
+        replicas: i32,
+        max_replicas_annotation: i32,
+        desired_replicas_annotation: i32,
+        image: &str,
+    ) -> ReplicaSet {
+        use rusternetes_common::types::LabelSelector;
+        use std::collections::HashMap;
+
+        let mut labels = deployment
+            .spec
+            .selector
+            .match_labels
+            .clone()
+            .unwrap_or_default();
+        labels.insert("pod-template-hash".to_string(), suffix.to_string());
+
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "deployment.kubernetes.io/desired-replicas".to_string(),
+            desired_replicas_annotation.to_string(),
+        );
+        annotations.insert(
+            "deployment.kubernetes.io/max-replicas".to_string(),
+            max_replicas_annotation.to_string(),
+        );
+
+        let namespace = deployment
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+
+        // Clone the deployment template wholesale; only adjust the container
+        // image and add the pod-template-hash label. Template metadata
+        // (UIDs/timestamps from ObjectMeta::new) thus matches exactly so
+        // EqualIgnoreHash returns true for the same image.
+        let mut template = deployment.spec.template.clone();
+        if let Some(metadata) = template.metadata.as_mut() {
+            metadata
+                .labels
+                .get_or_insert_with(HashMap::new)
+                .insert("pod-template-hash".to_string(), suffix.to_string());
+        }
+        if let Some(container) = template.spec.containers.first_mut() {
+            container.image = image.to_string();
+        }
+
+        ReplicaSet {
+            type_meta: TypeMeta {
+                kind: "ReplicaSet".to_string(),
+                api_version: "apps/v1".to_string(),
+            },
+            metadata: ObjectMeta {
+                name: format!("{}-{}", deployment.metadata.name, suffix),
+                namespace: Some(namespace),
+                labels: Some(labels.clone()),
+                annotations: Some(annotations),
+                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                    api_version: "apps/v1".to_string(),
+                    kind: "Deployment".to_string(),
+                    name: deployment.metadata.name.clone(),
+                    uid: deployment.metadata.uid.clone(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }]),
+                ..Default::default()
+            },
+            spec: ReplicaSetSpec {
+                replicas,
+                selector: LabelSelector {
+                    match_labels: Some(labels.clone()),
+                    match_expressions: None,
+                },
+                template,
+                min_ready_seconds: None,
+            },
+            status: None,
+        }
+    }
+
+    /// Build a Deployment with the given image + replicas + (maxSurge,
+    /// maxUnavailable) and optional `paused` flag. Reduces boilerplate in the
+    /// proportional / rollover tests below.
+    fn build_deployment_for_tests(
+        name: &str,
+        replicas: i32,
+        image: &str,
+        labels: &std::collections::HashMap<String, String>,
+        max_surge: serde_json::Value,
+        max_unavailable: serde_json::Value,
+        paused: bool,
+        uid: &str,
+    ) -> Deployment {
+        use rusternetes_common::resources::{
+            deployment::{DeploymentStrategy, RollingUpdateDeployment},
+            PodTemplateSpec,
+        };
+        use rusternetes_common::types::LabelSelector;
+
+        Deployment {
+            type_meta: TypeMeta {
+                kind: "Deployment".to_string(),
+                api_version: "apps/v1".to_string(),
+            },
+            metadata: ObjectMeta {
+                name: name.to_string(),
+                namespace: Some("default".to_string()),
+                uid: uid.to_string(),
+                ..Default::default()
+            },
+            spec: rusternetes_common::resources::DeploymentSpec {
+                replicas: Some(replicas),
+                selector: LabelSelector {
+                    match_labels: Some(labels.clone()),
+                    match_expressions: None,
+                },
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
+                    spec: rusternetes_common::resources::PodSpec {
+                        containers: vec![test_container("main", image)],
+                        ..Default::default()
+                    },
+                },
+                strategy: Some(DeploymentStrategy {
+                    strategy_type: "RollingUpdate".to_string(),
+                    rolling_update: Some(RollingUpdateDeployment {
+                        max_surge: Some(max_surge),
+                        max_unavailable: Some(max_unavailable),
+                    }),
+                }),
+                min_ready_seconds: None,
+                revision_history_limit: None,
+                paused: if paused { Some(true) } else { None },
+                progress_deadline_seconds: None,
+            },
+            status: None,
+        }
+    }
+
+    /// Proportional scaling distributes a scale delta across two active RSes
+    /// (old + new) proportionally to each RS's current size using its
+    /// max-replicas annotation as the denominator. K8s ref:
+    /// pkg/controller/deployment/util/deployment_util.go — GetProportion.
+    #[tokio::test]
+    async fn test_proportional_scaling_distributes_replicas_to_old_and_new() {
+        use rusternetes_storage::memory::MemoryStorage;
+        use std::collections::HashMap;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "prop-scale".to_string());
+
+        // Mirror upstream e2e: replicas was 10 with maxSurge=3 / maxUnavail=2,
+        // mid-rollout state oldRS=8 (image v1), newRS=5 (image v2). The
+        // deployment is then scaled from 10 to 30. Expected distribution:
+        // oldRS=20, newRS=13 (totaling 33).
+        let deployment = build_deployment_for_tests(
+            "prop",
+            30,
+            "v2",
+            &labels,
+            serde_json::json!(3),
+            serde_json::json!(2),
+            false,
+            "dep-uid",
+        );
+        let dep_key = build_key("deployments", Some("default"), "prop");
+        storage.create(&dep_key, &deployment).await.unwrap();
+
+        let mut old_rs = build_owned_rs(&deployment, "old", 8, 13, 10, "v1");
+        old_rs.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        let old_key = build_key("replicasets", Some("default"), &old_rs.metadata.name);
+        storage.create(&old_key, &old_rs).await.unwrap();
+
+        let mut new_rs = build_owned_rs(&deployment, "new", 5, 13, 10, "v2");
+        new_rs.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let new_key = build_key("replicasets", Some("default"), &new_rs.metadata.name);
+        storage.create(&new_key, &new_rs).await.unwrap();
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let old_after: ReplicaSet = storage.get(&old_key).await.unwrap();
+        let new_after: ReplicaSet = storage.get(&new_key).await.unwrap();
+
+        // allowedSize = 30 + 3 = 33, current = 13, delta = 20
+        //   oldRS: 8 * 33/13 = 20.30 -> 20  (fraction +12)
+        //   newRS: 5 * 33/13 = 12.69 -> 13  (fraction +8)
+        assert_eq!(new_after.spec.replicas, 13, "new RS should be 13");
+        assert_eq!(old_after.spec.replicas, 20, "old RS should be 20");
+
+        // Annotations refresh to new baseline (desired=30, max=33).
+        let new_anno = new_after.metadata.annotations.as_ref().unwrap();
+        assert_eq!(
+            new_anno.get("deployment.kubernetes.io/desired-replicas"),
+            Some(&"30".to_string())
+        );
+        assert_eq!(
+            new_anno.get("deployment.kubernetes.io/max-replicas"),
+            Some(&"33".to_string())
+        );
+    }
+
+    /// Proportional scaling for a paused deployment: scaling a paused rollout
+    /// must still distribute replicas proportionally across the two active
+    /// RSes, and the rollout must not progress beyond that.
+    #[tokio::test]
+    async fn test_proportional_scaling_while_paused() {
+        use rusternetes_storage::memory::MemoryStorage;
+        use std::collections::HashMap;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "paused-scale".to_string());
+
+        let deployment = build_deployment_for_tests(
+            "paused",
+            30,
+            "v2",
+            &labels,
+            serde_json::json!(3),
+            serde_json::json!(2),
+            true,
+            "dep-uid",
+        );
+        let dep_key = build_key("deployments", Some("default"), "paused");
+        storage.create(&dep_key, &deployment).await.unwrap();
+
+        let mut old_rs = build_owned_rs(&deployment, "old", 8, 13, 10, "v1");
+        old_rs.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        let old_key = build_key("replicasets", Some("default"), &old_rs.metadata.name);
+        storage.create(&old_key, &old_rs).await.unwrap();
+
+        let mut new_rs = build_owned_rs(&deployment, "new", 5, 13, 10, "v2");
+        new_rs.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let new_key = build_key("replicasets", Some("default"), &new_rs.metadata.name);
+        storage.create(&new_key, &new_rs).await.unwrap();
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let old_after: ReplicaSet = storage.get(&old_key).await.unwrap();
+        let new_after: ReplicaSet = storage.get(&new_key).await.unwrap();
+        assert_eq!(new_after.spec.replicas, 13, "paused new RS should be 13");
+        assert_eq!(old_after.spec.replicas, 20, "paused old RS should be 20");
+    }
+
+    /// Paused deployments must NOT run the rolling-update progression
+    /// (reconcileNewReplicaSet / reconcileOldReplicaSets, which would scale
+    /// the old RS down aggressively). scale() still applies surge leftover
+    /// to the new RS, but never reduces the old RS below its current count.
+    #[tokio::test]
+    async fn test_paused_deployment_does_not_progress_rollout() {
+        use rusternetes_storage::memory::MemoryStorage;
+        use std::collections::HashMap;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "paused-rollout".to_string());
+
+        let deployment = build_deployment_for_tests(
+            "pp",
+            10,
+            "v2",
+            &labels,
+            serde_json::json!(3),
+            serde_json::json!(2),
+            true,
+            "dep-uid",
+        );
+        let dep_key = build_key("deployments", Some("default"), "pp");
+        storage.create(&dep_key, &deployment).await.unwrap();
+
+        let mut old_rs = build_owned_rs(&deployment, "old", 8, 13, 10, "v1");
+        old_rs.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        let old_key = build_key("replicasets", Some("default"), &old_rs.metadata.name);
+        storage.create(&old_key, &old_rs).await.unwrap();
+
+        let mut new_rs = build_owned_rs(&deployment, "new", 2, 13, 10, "v2");
+        new_rs.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let new_key = build_key("replicasets", Some("default"), &new_rs.metadata.name);
+        storage.create(&new_key, &new_rs).await.unwrap();
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let old_after: ReplicaSet = storage.get(&old_key).await.unwrap();
+        let new_after: ReplicaSet = storage.get(&new_key).await.unwrap();
+        // scale() assigns surge leftover (allowed_size 13 - current 10 = 3)
+        // to the newest RS — new RS grows from 2 to 5. The old RS does NOT
+        // shrink: no rolling-update progression while paused.
+        assert_eq!(old_after.spec.replicas, 8, "paused: old RS unchanged");
+        assert_eq!(
+            new_after.spec.replicas, 5,
+            "paused: new RS gets surge leftover (2 + 3)"
+        );
+    }
+
+    /// Rollover: triggering a second rollout before the first finishes must
+    /// not leave two simultaneous in-progress new ReplicaSets. The
+    /// previously in-progress RS becomes an "old" RS, and only ONE new RS —
+    /// matching the current template — is created with a higher revision.
+    #[tokio::test]
+    async fn test_rollover_creates_single_new_replicaset() {
+        use rusternetes_storage::memory::MemoryStorage;
+        use std::collections::HashMap;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "rollover".to_string());
+
+        let deployment = build_deployment_for_tests(
+            "ro",
+            4,
+            "v3",
+            &labels,
+            serde_json::json!(1),
+            serde_json::json!(1),
+            false,
+            "dep-uid",
+        );
+        let dep_key = build_key("deployments", Some("default"), "ro");
+        storage.create(&dep_key, &deployment).await.unwrap();
+
+        let mut rs_v1 = build_owned_rs(&deployment, "v1hash", 3, 5, 4, "v1");
+        rs_v1.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(20));
+        rs_v1
+            .metadata
+            .annotations
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                "deployment.kubernetes.io/revision".to_string(),
+                "1".to_string(),
+            );
+        let v1_key = build_key("replicasets", Some("default"), &rs_v1.metadata.name);
+        storage.create(&v1_key, &rs_v1).await.unwrap();
+
+        let mut rs_v2 = build_owned_rs(&deployment, "v2hash", 1, 5, 4, "v2");
+        rs_v2.metadata.creation_timestamp = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+        rs_v2
+            .metadata
+            .annotations
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                "deployment.kubernetes.io/revision".to_string(),
+                "2".to_string(),
+            );
+        let v2_key = build_key("replicasets", Some("default"), &rs_v2.metadata.name);
+        storage.create(&v2_key, &rs_v2).await.unwrap();
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let rs_prefix = build_prefix("replicasets", Some("default"));
+        let all_rs: Vec<ReplicaSet> = storage.list(&rs_prefix).await.unwrap();
+        let new_rses: Vec<&ReplicaSet> = all_rs
+            .iter()
+            .filter(|rs| {
+                rs.spec
+                    .template
+                    .spec
+                    .containers
+                    .first()
+                    .map(|c| c.image == "v3")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(new_rses.len(), 1, "rollover should produce one new RS");
+
+        let new_rs = new_rses[0];
+        let rev = new_rs
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("deployment.kubernetes.io/revision"))
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(rev >= 3, "new RS revision should be >= 3 (was {})", rev);
+    }
+
+    /// Rollover scale-down: once the new RS is saturated, every old RS
+    /// (including the previously in-progress one) must be scaled to 0.
+    #[tokio::test]
+    async fn test_rollover_scales_down_old_replicasets_to_zero() {
+        use rusternetes_common::resources::ReplicaSetStatus;
+        use rusternetes_storage::memory::MemoryStorage;
+        use std::collections::HashMap;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 5);
+
+        let mut labels = HashMap::new();
+        labels.insert("app".to_string(), "rollover2".to_string());
+
+        let deployment = build_deployment_for_tests(
+            "ro2",
+            4,
+            "v3",
+            &labels,
+            serde_json::json!(1),
+            serde_json::json!(1),
+            false,
+            "dep-uid-2",
+        );
+        let dep_key = build_key("deployments", Some("default"), "ro2");
+        storage.create(&dep_key, &deployment).await.unwrap();
+
+        let mut rs_v3 = build_owned_rs(&deployment, "v3hash", 4, 5, 4, "v3");
+        rs_v3.metadata.creation_timestamp = Some(chrono::Utc::now());
+        rs_v3.status = Some(ReplicaSetStatus {
+            replicas: 4,
+            ready_replicas: 4,
+            available_replicas: 4,
+            fully_labeled_replicas: Some(4),
+            observed_generation: None,
+            conditions: None,
+            terminating_replicas: None,
+        });
+        let v3_key = build_key("replicasets", Some("default"), &rs_v3.metadata.name);
+        storage.create(&v3_key, &rs_v3).await.unwrap();
+
+        let mut rs_v1 = build_owned_rs(&deployment, "v1hash", 2, 5, 4, "v1");
+        rs_v1.metadata.creation_timestamp =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(20));
+        let v1_key = build_key("replicasets", Some("default"), &rs_v1.metadata.name);
+        storage.create(&v1_key, &rs_v1).await.unwrap();
+
+        let mut rs_v2 = build_owned_rs(&deployment, "v2hash", 1, 5, 4, "v2");
+        rs_v2.metadata.creation_timestamp = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+        let v2_key = build_key("replicasets", Some("default"), &rs_v2.metadata.name);
+        storage.create(&v2_key, &rs_v2).await.unwrap();
+
+        controller.reconcile_deployment(&deployment).await.unwrap();
+
+        let v1_after: ReplicaSet = storage.get(&v1_key).await.unwrap();
+        let v2_after: ReplicaSet = storage.get(&v2_key).await.unwrap();
+        let v3_after: ReplicaSet = storage.get(&v3_key).await.unwrap();
+        assert_eq!(v3_after.spec.replicas, 4, "new v3 stays at 4");
+        assert_eq!(v1_after.spec.replicas, 0, "old v1 scales to 0");
+        assert_eq!(v2_after.spec.replicas, 0, "old v2 scales to 0");
     }
 }

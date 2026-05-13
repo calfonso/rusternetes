@@ -139,20 +139,20 @@ pub use node::{
     NodeDaemonEndpoints, NodeSpec, NodeStatus, NodeSystemInfo, Taint,
 };
 pub use pod::{
-    Affinity, Capabilities, ClusterTrustBundleProjection, ConfigMapEnvSource, ConfigMapKeySelector,
-    ConfigMapProjection, ConfigMapVolumeSource, Container, ContainerPort, ContainerState,
-    ContainerStatus, DownwardAPIProjection, DownwardAPIVolumeFile, DownwardAPIVolumeSource,
-    EmptyDirVolumeSource, EnvFromSource, EnvVar, EnvVarSource, EphemeralContainer,
-    EphemeralVolumeSource, ExecAction, GRPCAction, HTTPGetAction, HTTPHeader, HostPathVolumeSource,
-    ImageVolumeSource, KeyToPath, Lifecycle, LifecycleHandler, NodeAffinity, NodeSelector,
-    NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector, PersistentVolumeClaimTemplate,
-    PersistentVolumeClaimVolumeSource, Pod, PodAffinity, PodAffinityTerm, PodAntiAffinity,
-    PodCondition, PodIP, PodSpec, PodStatus, PreferredSchedulingTerm, Probe, ProjectedVolumeSource,
-    ResourceFieldSelector, ResourceHealth, ResourceStatus, SeccompProfile, SecretEnvSource,
-    SecretKeySelector, SecretProjection, SecretVolumeSource, SecurityContext,
-    ServiceAccountTokenProjection, SleepAction, TCPSocketAction, Toleration,
-    TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount, VolumeProjection,
-    WeightedPodAffinityTerm,
+    resolve_probe_port, Affinity, Capabilities, ClusterTrustBundleProjection, ConfigMapEnvSource,
+    ConfigMapKeySelector, ConfigMapProjection, ConfigMapVolumeSource, Container, ContainerPort,
+    ContainerState, ContainerStatus, DownwardAPIProjection, DownwardAPIVolumeFile,
+    DownwardAPIVolumeSource, EmptyDirVolumeSource, EnvFromSource, EnvVar, EnvVarSource,
+    EphemeralContainer, EphemeralVolumeSource, ExecAction, GRPCAction, HTTPGetAction, HTTPHeader,
+    HostPathVolumeSource, ImageVolumeSource, KeyToPath, Lifecycle, LifecycleHandler, NodeAffinity,
+    NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector,
+    PersistentVolumeClaimTemplate, PersistentVolumeClaimVolumeSource, Pod, PodAffinity,
+    PodAffinityTerm, PodAntiAffinity, PodCondition, PodIP, PodSpec, PodStatus,
+    PreferredSchedulingTerm, Probe, ProjectedVolumeSource, ResourceFieldSelector, ResourceHealth,
+    ResourceStatus, SeccompProfile, SecretEnvSource, SecretKeySelector, SecretProjection,
+    SecretVolumeSource, SecurityContext, ServiceAccountTokenProjection, SleepAction,
+    TCPSocketAction, Toleration, TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount,
+    VolumeProjection, WeightedPodAffinityTerm,
 };
 pub use policy::{
     IntOrString, LimitRange, LimitRangeItem, LimitRangeSpec, PodDisruptionBudget,
@@ -163,9 +163,9 @@ pub use policy::{
 pub use rbac::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject};
 pub use runtimeclass::{Overhead, RuntimeClass, Scheduling};
 pub use service::{
-    IPFamily, IPFamilyPolicy, LoadBalancerIngress, LoadBalancerStatus, Service,
+    ClientIPConfig, IPFamily, IPFamilyPolicy, LoadBalancerIngress, LoadBalancerStatus, Service,
     ServiceExternalTrafficPolicy, ServiceInternalTrafficPolicy, ServicePort, ServiceSpec,
-    ServiceStatus, ServiceType,
+    ServiceStatus, ServiceType, SessionAffinityConfig,
 };
 pub use service_account::{LocalObjectReference, ObjectReference, ServiceAccount};
 pub use servicecidr::{ServiceCIDR, ServiceCIDRCondition, ServiceCIDRSpec, ServiceCIDRStatus};

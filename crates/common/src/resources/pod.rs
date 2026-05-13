@@ -1,3 +1,4 @@
+use crate::resources::policy::IntOrString;
 use crate::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -1566,12 +1567,39 @@ pub struct Probe {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GRPCAction {
-    /// Port number of the gRPC service
-    pub port: i32,
+    /// Port number of the gRPC service.
+    /// K8s API: IntOrString — int port or named port from container.ports[].name.
+    pub port: IntOrString,
 
     /// Service is the name of the service to place in the gRPC HealthCheckRequest
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+}
+
+/// Resolve a probe port (which K8s spec'd as IntOrString) against a Container's
+/// declared ports. Integer values pass through; string values are looked up by
+/// `containerPort.name`. Returns None if a named port has no matching entry —
+/// callers should treat that as a probe failure.
+pub fn resolve_probe_port(port: &IntOrString, container: &Container) -> Option<u16> {
+    match port {
+        IntOrString::Int(n) => {
+            if *n < 0 || *n > u16::MAX as i32 {
+                None
+            } else {
+                Some(*n as u16)
+            }
+        }
+        IntOrString::String(name) => container
+            .ports
+            .as_ref()
+            .and_then(|ports| {
+                ports
+                    .iter()
+                    .find(|p| p.name.as_deref() == Some(name.as_str()))
+                    .map(|p| p.container_port)
+            })
+            .or_else(|| name.parse::<u16>().ok()),
+    }
 }
 
 /// HTTPGetAction describes an action based on HTTP Get requests
@@ -1582,8 +1610,9 @@ pub struct HTTPGetAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
-    /// Port to access on the container
-    pub port: i32,
+    /// Port to access on the container.
+    /// K8s API: IntOrString — int port or named port from container.ports[].name.
+    pub port: IntOrString,
 
     /// Host name to connect to
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1610,8 +1639,9 @@ pub struct HTTPHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TCPSocketAction {
-    /// Port to connect to on the container
-    pub port: i32,
+    /// Port to connect to on the container.
+    /// K8s API: IntOrString — int port or named port from container.ports[].name.
+    pub port: IntOrString,
 
     /// Host name to connect to
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2723,6 +2753,76 @@ mod tests {
         assert!(
             status_val.get("resize").is_none(),
             "resize should be omitted from JSON when None"
+        );
+    }
+
+    #[test]
+    fn probe_port_accepts_named_string() {
+        // K8s spec: probe.httpGet.port is IntOrString — must accept a named
+        // port that refers to container.ports[].name (e.g. "http").
+        // Previously typed as i32, which rejected named-port YAML at parse
+        // time and broke any pod using named-port probes.
+        let json = r#"{"path":"/health","port":"http","scheme":"HTTP"}"#;
+        let parsed: HTTPGetAction = serde_json::from_str(json).expect("named port must parse");
+        assert_eq!(parsed.port, IntOrString::String("http".to_string()));
+
+        let json2 = r#"{"port":8080}"#;
+        let parsed2: HTTPGetAction = serde_json::from_str(json2).expect("int port must parse");
+        assert_eq!(parsed2.port, IntOrString::Int(8080));
+    }
+
+    #[test]
+    fn resolve_probe_port_int_passes_through() {
+        let c = Container::default();
+        assert_eq!(resolve_probe_port(&IntOrString::Int(80), &c), Some(80));
+        assert_eq!(resolve_probe_port(&IntOrString::Int(-1), &c), None);
+        assert_eq!(
+            resolve_probe_port(&IntOrString::Int(70_000), &c),
+            None,
+            "ports outside u16 range must not resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_probe_port_named_via_container_ports() {
+        let mut c = Container {
+            name: "web".to_string(),
+            ..Default::default()
+        };
+        c.ports = Some(vec![
+            ContainerPort {
+                container_port: 8080,
+                name: Some("http".to_string()),
+                protocol: None,
+                host_port: None,
+                host_ip: None,
+            },
+            ContainerPort {
+                container_port: 8443,
+                name: Some("https".to_string()),
+                protocol: None,
+                host_port: None,
+                host_ip: None,
+            },
+        ]);
+        assert_eq!(
+            resolve_probe_port(&IntOrString::String("http".to_string()), &c),
+            Some(8080)
+        );
+        assert_eq!(
+            resolve_probe_port(&IntOrString::String("https".to_string()), &c),
+            Some(8443)
+        );
+        // Unknown named port: falls back to parsing the string as a number,
+        // returning None when neither lookup nor parse succeeds.
+        assert_eq!(
+            resolve_probe_port(&IntOrString::String("missing".to_string()), &c),
+            None
+        );
+        // A numeric string is parsed as a fallback (matches K8s relaxed behavior).
+        assert_eq!(
+            resolve_probe_port(&IntOrString::String("9000".to_string()), &c),
+            Some(9000)
         );
     }
 }

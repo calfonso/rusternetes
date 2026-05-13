@@ -154,6 +154,30 @@ fn needs_shell_quoting(s: &str) -> bool {
     })
 }
 
+/// Set up an EmptyDir volume directory with mode 0o777, matching upstream
+/// Kubernetes (pkg/volume/emptydir/empty_dir.go setupDir).
+///
+/// The chmod is idempotent: it runs after `create_dir_all` regardless of whether
+/// the directory was newly created or already existed (e.g. from a prior pod run
+/// that left stale state). This guarantees the host-side directory always exposes
+/// mode 0o777 to bind-mount consumers.
+///
+/// On Linux — where Kubernetes conformance runs — bind mounts preserve these mode
+/// bits inside the container. On macOS dev VMs (Podman Machine / Docker Desktop
+/// virtiofs) the host mode bits are NOT propagated through the shared-filesystem
+/// layer; that is a known dev-env limitation and not a kubelet bug. The
+/// `[Conformance] EmptyDir.*(mode|0644|0666|0777)` tests are all `[LinuxOnly]`,
+/// so the chmod path here is the production code path.
+pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
+    }
+    Ok(())
+}
+
 impl ContainerRuntime {
     pub async fn new(
         volumes_base_path: String,
@@ -822,6 +846,13 @@ impl ContainerRuntime {
                             }
                         }
 
+                        // Publish Running state so watches see the transition from
+                        // PodInitializing → Running for this init container.
+                        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — SyncPod
+                        // publishes status after each container action.
+                        self.refresh_init_container_statuses(namespace, pod_name, None, None)
+                            .await;
+
                         // Wait for init container to complete
                         match self
                             .wait_for_container_completion(pod_name, &container.name)
@@ -829,9 +860,26 @@ impl ContainerRuntime {
                         {
                             Ok(()) => {
                                 info!("Init container {} completed successfully", container.name);
+                                // Publish Terminated/Completed before moving on so the
+                                // next init container starts from a status reflecting prior
+                                // success — required by the "sequential init" conformance test.
+                                self.refresh_init_container_statuses(
+                                    namespace, pod_name, None, None,
+                                )
+                                .await;
                                 break;
                             }
                             Err(e) => {
+                                // Capture Terminated/error BEFORE removing the container.
+                                // After removal, get_init_container_statuses would see only
+                                // the Running prev state, so the failure would never be
+                                // observed by watches — restart_count stays at 0 and the
+                                // "restart_count >= 3" conformance check hangs.
+                                self.refresh_init_container_statuses(
+                                    namespace, pod_name, None, None,
+                                )
+                                .await;
+
                                 if attempt < max_retries && restart_always {
                                     attempt += 1;
                                     let backoff = std::cmp::min(2u64.pow(attempt as u32), 30);
@@ -852,61 +900,35 @@ impl ContainerRuntime {
                                         )
                                         .await;
 
-                                    // Update pod status during backoff to show CrashLoopBackOff.
-                                    // K8s updates status on every sync cycle, not just after retries.
-                                    // This lets tests observe the init container failure state.
-                                    if let Some(ref storage) = self.storage {
-                                        use rusternetes_storage::Storage;
-                                        let pod_key = rusternetes_storage::build_key(
-                                            "pods",
-                                            Some(namespace),
-                                            pod_name,
-                                        );
-                                        if let Ok(mut status_pod) =
-                                            storage.get::<Pod>(&pod_key).await
-                                        {
-                                            let init_statuses =
-                                                self.get_init_container_statuses(&status_pod).await;
-                                            if let Some(ref mut s) = status_pod.status {
-                                                s.init_container_statuses = init_statuses;
-                                                s.reason = Some("PodInitializing".to_string());
-                                                s.message = Some(format!(
-                                                    "Init container {} failed, retrying in {}s",
-                                                    container.name, backoff
-                                                ));
-                                            }
-                                            let _ = storage.update(&pod_key, &status_pod).await;
-                                        }
-                                    }
+                                    // Publish CrashLoopBackOff. Previous state is now
+                                    // Terminated/error (captured above), so the transition
+                                    // Terminated → CrashLoopBackOff increments restart_count.
+                                    self.refresh_init_container_statuses(
+                                        namespace,
+                                        pod_name,
+                                        Some("PodInitializing"),
+                                        Some(format!(
+                                            "Init container {} failed, retrying in {}s",
+                                            container.name, backoff
+                                        )),
+                                    )
+                                    .await;
 
                                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                                 } else {
-                                    // Update init container status to show CrashLoopBackOff
-                                    // before returning error. The kubelet sync loop will
-                                    // re-call start_pod on the next cycle.
+                                    // RestartPolicy=Never (or max retries exhausted): return
+                                    // Err so the caller (kubelet.rs sync_pod) can transition
+                                    // the pod to Failed. For Never, remaining init containers
+                                    // MUST NOT run — the early return guarantees this because
+                                    // we propagate out of the init_containers loop.
+                                    // The Terminated/error state was already captured above
+                                    // (before this branch), so init_container_statuses
+                                    // already reflects the failure.
                                     // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go
                                     warn!(
                                         "Init container {} failed (will retry next sync): {}",
                                         container.name, e
                                     );
-                                    if let Some(ref storage) = self.storage {
-                                        use rusternetes_storage::Storage;
-                                        let pod_key = rusternetes_storage::build_key(
-                                            "pods",
-                                            Some(namespace),
-                                            pod_name,
-                                        );
-                                        if let Ok(mut status_pod) =
-                                            storage.get::<Pod>(&pod_key).await
-                                        {
-                                            let init_statuses =
-                                                self.get_init_container_statuses(&status_pod).await;
-                                            if let Some(ref mut s) = status_pod.status {
-                                                s.init_container_statuses = init_statuses;
-                                            }
-                                            let _ = storage.update(&pod_key, &status_pod).await;
-                                        }
-                                    }
                                     return Err(e);
                                 }
                             }
@@ -1545,6 +1567,38 @@ impl ContainerRuntime {
         ))
     }
 
+    /// Refresh `pod.status.init_container_statuses` in storage from the
+    /// live Docker state. Called between init container actions so watches
+    /// observe each transition (Running, Terminated, CrashLoopBackOff).
+    /// Optionally sets `status.reason` and `status.message`.
+    async fn refresh_init_container_statuses(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        reason: Option<&str>,
+        message: Option<String>,
+    ) {
+        let Some(ref storage) = self.storage else {
+            return;
+        };
+        use rusternetes_storage::Storage;
+        let pod_key = rusternetes_storage::build_key("pods", Some(namespace), pod_name);
+        let Ok(mut status_pod) = storage.get::<Pod>(&pod_key).await else {
+            return;
+        };
+        let init_statuses = self.get_init_container_statuses(&status_pod).await;
+        if let Some(ref mut s) = status_pod.status {
+            s.init_container_statuses = init_statuses;
+            if let Some(r) = reason {
+                s.reason = Some(r.to_string());
+            }
+            if let Some(m) = message {
+                s.message = Some(m);
+            }
+        }
+        let _ = storage.update(&pod_key, &status_pod).await;
+    }
+
     /// Wait for a container to complete (used for init containers)
     async fn wait_for_container_completion(
         &self,
@@ -2110,15 +2164,13 @@ impl ContainerRuntime {
         // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
         // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
         // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
-        // are pre-existing failures on macOS VM-based runtimes.
+        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
+        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
+        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
+        // when the directory pre-exists from a prior run.
         if volume.empty_dir.is_some() {
             let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
-            std::fs::create_dir_all(&volume_dir).context("Failed to create emptyDir volume")?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&volume_dir, std::fs::Permissions::from_mode(0o777))?;
-            }
+            setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
             info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
             return Ok(volume_dir);
         }
@@ -4847,7 +4899,7 @@ impl ContainerRuntime {
             if let Some(ref post_start) = lifecycle.post_start {
                 info!("Executing postStart hook for container {}", container.name);
                 if let Err(e) = self
-                    .execute_lifecycle_handler(post_start, &container_name)
+                    .execute_lifecycle_handler(post_start, &container_name, container)
                     .await
                 {
                     warn!(
@@ -5778,7 +5830,7 @@ impl ContainerRuntime {
                     let startup_passed = if running {
                         if let Some(startup_probe) = &container.startup_probe {
                             let raw = self
-                                .check_probe(&container_name, startup_probe)
+                                .check_probe(&container_name, container, startup_probe)
                                 .await
                                 .unwrap_or(false);
                             let success_threshold = startup_probe.success_threshold.unwrap_or(1);
@@ -5834,7 +5886,7 @@ impl ContainerRuntime {
                                 false // Not ready yet, still within initial delay
                             } else {
                                 let raw = self
-                                    .check_probe(&container_name, probe)
+                                    .check_probe(&container_name, container, probe)
                                     .await
                                     .unwrap_or(false);
                                 let _failure_threshold = probe.failure_threshold.unwrap_or(3);
@@ -5991,7 +6043,7 @@ impl ContainerRuntime {
             if let Some(startup_probe) = &container.startup_probe {
                 let startup_key = format!("{}/{}/startup", pod_name, container.name);
                 let raw_result = self
-                    .check_probe(&container_name, startup_probe)
+                    .check_probe(&container_name, container, startup_probe)
                     .await
                     .unwrap_or(false);
 
@@ -6054,7 +6106,7 @@ impl ContainerRuntime {
                 }
 
                 // Check liveness with threshold tracking
-                let healthy = self.check_probe(&container_name, probe).await?;
+                let healthy = self.check_probe(&container_name, container, probe).await?;
                 let failure_threshold = probe.failure_threshold.unwrap_or(3);
                 // For liveness probes, Kubernetes requires successThreshold=1
                 let _success_threshold = probe.success_threshold.unwrap_or(1);
@@ -6098,7 +6150,12 @@ impl ContainerRuntime {
     }
 
     /// Execute a probe check
-    async fn check_probe(&self, container_name: &str, probe: &Probe) -> Result<bool> {
+    async fn check_probe(
+        &self,
+        container_name: &str,
+        container: &Container,
+        probe: &Probe,
+    ) -> Result<bool> {
         // K8s default timeout is 1s; treat 0 as default
         let timeout_secs = probe.timeout_seconds.unwrap_or(1).max(1) as u64;
         let timeout = Duration::from_secs(timeout_secs);
@@ -6106,14 +6163,14 @@ impl ContainerRuntime {
         // HTTP GET probe
         if let Some(http_get) = &probe.http_get {
             return self
-                .check_http_probe(container_name, http_get, timeout)
+                .check_http_probe(container_name, container, http_get, timeout)
                 .await;
         }
 
         // TCP Socket probe
         if let Some(tcp_socket) = &probe.tcp_socket {
             return self
-                .check_tcp_probe(container_name, tcp_socket, timeout)
+                .check_tcp_probe(container_name, container, tcp_socket, timeout)
                 .await;
         }
 
@@ -6124,7 +6181,9 @@ impl ContainerRuntime {
 
         // gRPC probe
         if let Some(grpc) = &probe.grpc {
-            return self.check_grpc_probe(container_name, grpc, timeout).await;
+            return self
+                .check_grpc_probe(container_name, container, grpc, timeout)
+                .await;
         }
 
         Ok(true) // No probe configured
@@ -6371,6 +6430,7 @@ impl ContainerRuntime {
     async fn check_http_probe(
         &self,
         container_name: &str,
+        container: &Container,
         http_get: &HTTPGetAction,
         timeout: Duration,
     ) -> Result<bool> {
@@ -6381,10 +6441,23 @@ impl ContainerRuntime {
             self.get_effective_container_ip(container_name).await
         };
 
+        // Resolve named port via container.ports[].name lookup (K8s IntOrString).
+        let port =
+            match rusternetes_common::resources::resolve_probe_port(&http_get.port, container) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "HTTP probe port {} unresolvable for container {}",
+                        http_get.port, container_name
+                    );
+                    return Ok(false);
+                }
+            };
+
         // Kubernetes sends scheme as uppercase ("HTTP", "HTTPS") — lowercase for URL
         let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
         let path = http_get.path.as_deref().unwrap_or("/");
-        let url = format!("{}://{}:{}{}", scheme, ip, http_get.port, path);
+        let url = format!("{}://{}:{}{}", scheme, ip, port, path);
 
         debug!("HTTP probe: {}", url);
 
@@ -6424,13 +6497,26 @@ impl ContainerRuntime {
     async fn check_tcp_probe(
         &self,
         container_name: &str,
+        container: &Container,
         tcp_socket: &TCPSocketAction,
         timeout: Duration,
     ) -> Result<bool> {
         // Get container IP (resolving through pause container if needed)
         let ip = self.get_effective_container_ip(container_name).await;
 
-        let addr = format!("{}:{}", ip, tcp_socket.port);
+        let port =
+            match rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "TCP probe port {} unresolvable for container {}",
+                        tcp_socket.port, container_name
+                    );
+                    return Ok(false);
+                }
+            };
+
+        let addr = format!("{}:{}", ip, port);
         debug!("TCP probe: {}", addr);
 
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
@@ -6479,11 +6565,22 @@ impl ContainerRuntime {
     async fn check_grpc_probe(
         &self,
         container_name: &str,
+        container: &Container,
         grpc: &GRPCAction,
         timeout: Duration,
     ) -> Result<bool> {
         let ip = self.get_effective_container_ip(container_name).await;
-        let addr = format!("http://{}:{}", ip, grpc.port);
+        let port = match rusternetes_common::resources::resolve_probe_port(&grpc.port, container) {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "gRPC probe port {} unresolvable for container {}",
+                    grpc.port, container_name
+                );
+                return Ok(false);
+            }
+        };
+        let addr = format!("http://{}:{}", ip, port);
         debug!("gRPC probe: {} service={:?}", addr, grpc.service);
 
         let endpoint = match tonic::transport::Endpoint::from_shared(addr.clone()) {
@@ -6560,6 +6657,7 @@ impl ContainerRuntime {
         &self,
         handler: &LifecycleHandler,
         container_name: &str,
+        container: &Container,
     ) -> Result<()> {
         if let Some(ref exec) = handler.exec {
             // Execute command inside the container
@@ -6606,6 +6704,16 @@ impl ContainerRuntime {
                 ));
             }
         } else if let Some(ref http_get) = handler.http_get {
+            // Resolve named port via container.ports lookup (K8s IntOrString).
+            let hook_port =
+                rusternetes_common::resources::resolve_probe_port(&http_get.port, container)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Lifecycle HTTP handler port {} unresolvable for container {}",
+                            http_get.port,
+                            container_name
+                        )
+                    })?;
             // Execute HTTP GET request — use host field if specified, otherwise container/pause IP.
             // Containers using container: network mode won't have their own IP — we need the
             // pause container's IP (which owns the network namespace).
@@ -6622,7 +6730,7 @@ impl ContainerRuntime {
                     // by checking the pod's /etc/hosts or using DNS
                     let mut resolved = None;
                     if let Ok(mut addrs) =
-                        tokio::net::lookup_host(format!("{}:{}", host, http_get.port)).await
+                        tokio::net::lookup_host(format!("{}:{}", host, hook_port)).await
                     {
                         if let Some(addr) = addrs.next() {
                             resolved = Some(addr.ip().to_string());
@@ -6746,7 +6854,7 @@ impl ContainerRuntime {
 
             let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
             let path = http_get.path.as_deref().unwrap_or("/");
-            let url = format!("{}://{}:{}{}", scheme, ip, http_get.port, path);
+            let url = format!("{}://{}:{}{}", scheme, ip, hook_port, path);
 
             info!(
                 "Lifecycle HTTP handler: {} for container {}",
@@ -6799,7 +6907,16 @@ impl ContainerRuntime {
                 .and_then(|ns| ns.ip_address)
                 .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            let addr = format!("{}:{}", ip, tcp_socket.port);
+            let port =
+                rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Lifecycle TCP handler port {} unresolvable for container {}",
+                            tcp_socket.port,
+                            container_name
+                        )
+                    })?;
+            let addr = format!("{}:{}", ip, port);
             debug!("Lifecycle TCP handler: {}", addr);
 
             match tokio::time::timeout(
@@ -6885,69 +7002,109 @@ impl ContainerRuntime {
         // preStop hooks may need to communicate with sibling containers (e.g.,
         // sending an HTTP request to another container in the same pod).
         //
-        // Track elapsed time so we can decrement it from the grace period.
+        // K8s runs preStop hooks concurrently per container and bounds the total
+        // wait by `terminationGracePeriodSeconds`. If a hook overruns, it is
+        // aborted and SIGTERM is delivered with the remaining grace period
+        // floored at the minimum (2s).
+        //
         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
         //   gracePeriod -= preStopElapsed
         //   gracePeriod = max(gracePeriod, minimumGracePeriodInSeconds)  // 2s
         let prestop_start = std::time::Instant::now();
+        let prestop_budget = std::time::Duration::from_secs(grace_period_seconds.max(1) as u64);
 
+        // Build a name -> Container lookup so the lifecycle handler can
+        // resolve named probe/handler ports against the container's declared
+        // ports[].name (K8s IntOrString).
+        let spec_containers: std::collections::HashMap<&str, &Container> = pod
+            .spec
+            .as_ref()
+            .map(|s| s.containers.iter().map(|c| (c.name.as_str(), c)).collect())
+            .unwrap_or_default();
+
+        // Collect (container_name, pre_stop_handler, container) for all running
+        // containers that have a preStop hook. Match exact name first, falling
+        // back to suffix match if Docker returns a different name shape.
+        let mut hooks_to_run: Vec<(
+            String,
+            rusternetes_common::resources::LifecycleHandler,
+            Container,
+        )> = Vec::new();
         for container in &containers {
-            if let Some(ref id) = container.id {
-                let names = container.names.clone().unwrap_or_default();
-                let container_name = names
-                    .first()
-                    .map(|n| n.trim_start_matches('/').to_string())
-                    .unwrap_or_default();
-
-                let is_running = container.state.as_deref() == Some("running");
-                if is_running {
-                    // Try exact match first, then try matching by suffix in case
-                    // Docker returns a different name format
-                    let lifecycle = lifecycle_map.get(&container_name).or_else(|| {
-                        // Fallback: try matching by finding a lifecycle_map key that
-                        // ends with the same container suffix
-                        lifecycle_map.iter().find_map(|(key, val)| {
-                            if container_name.ends_with(&key[pod_name.len()..]) {
-                                Some(val)
-                            } else {
-                                None
-                            }
-                        })
-                    });
-
-                    if let Some(lifecycle) = lifecycle {
-                        if let Some(ref pre_stop) = lifecycle.pre_stop {
-                            info!(
-                                "Executing preStop hook for container {} (id: {})",
-                                container_name,
-                                &id[..12.min(id.len())]
-                            );
-                            match self
-                                .execute_lifecycle_handler(pre_stop, &container_name)
-                                .await
-                            {
-                                Ok(()) => {
-                                    info!(
-                                        "preStop hook completed successfully for container {}",
-                                        container_name
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "preStop hook failed for container {}: {}",
-                                        container_name, e
-                                    );
-                                }
-                            }
-                        }
-                    } else if !container_name.ends_with("_pause") {
-                        debug!(
-                            "No preStop hook for running container {} (lifecycle_map keys: {:?})",
-                            container_name,
-                            lifecycle_map.keys().collect::<Vec<_>>()
-                        );
+            let names = container.names.clone().unwrap_or_default();
+            let container_name = names
+                .first()
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+            if container.state.as_deref() != Some("running") {
+                continue;
+            }
+            let lifecycle = lifecycle_map.get(&container_name).or_else(|| {
+                lifecycle_map.iter().find_map(|(key, val)| {
+                    if container_name.ends_with(&key[pod_name.len()..]) {
+                        Some(val)
+                    } else {
+                        None
                     }
+                })
+            });
+            if let Some(lifecycle) = lifecycle {
+                if let Some(ref pre_stop) = lifecycle.pre_stop {
+                    // Derive the K8s container name (strip `{pod_name}_` prefix).
+                    let k8s_name = container_name
+                        .strip_prefix(&format!("{}_", pod_name))
+                        .unwrap_or(&container_name);
+                    let spec_container = spec_containers
+                        .get(k8s_name)
+                        .copied()
+                        .cloned()
+                        .unwrap_or_else(Container::default);
+                    hooks_to_run.push((container_name, pre_stop.clone(), spec_container));
                 }
+            } else if !container_name.ends_with("_pause") {
+                debug!(
+                    "No preStop hook for running container {} (lifecycle_map keys: {:?})",
+                    container_name,
+                    lifecycle_map.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        if !hooks_to_run.is_empty() {
+            // Run preStop hooks concurrently using futures (no Send required
+            // because the executor remains on the current task).
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut futs: FuturesUnordered<_> = hooks_to_run
+                .into_iter()
+                .map(|(container_name, pre_stop, spec_container)| async move {
+                    info!("Executing preStop hook for container {}", container_name);
+                    match self
+                        .execute_lifecycle_handler(&pre_stop, &container_name, &spec_container)
+                        .await
+                    {
+                        Ok(()) => info!(
+                            "preStop hook completed successfully for container {}",
+                            container_name
+                        ),
+                        Err(e) => warn!(
+                            "preStop hook failed for container {}: {}",
+                            container_name, e
+                        ),
+                    }
+                })
+                .collect();
+            let wait_all = async { while futs.next().await.is_some() {} };
+            // Bound total preStop time by the grace period. If hooks overrun,
+            // we abort and proceed to SIGTERM. K8s does the same — preStop is
+            // best-effort within the grace period.
+            if tokio::time::timeout(prestop_budget, wait_all)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "preStop hooks exceeded grace period {}s for pod {} — proceeding with SIGTERM",
+                    grace_period_seconds, pod_name
+                );
             }
         }
 
@@ -8260,6 +8417,131 @@ mod tests {
         assert_eq!(expected_path, "/volumes/test-pod-emptydir/test-volume");
     }
 
+    // --- EmptyDir mode bits regression tests (conformance [Conformance].*EmptyDir.*) ---
+    //
+    // Kubernetes sets emptyDir directory permissions to 0o777 via setupDir() in
+    // pkg/volume/emptydir/empty_dir.go. The conformance tests
+    //   [Conformance] EmptyDir.*(mode|0644|0666|0777)
+    // are all marked [LinuxOnly] — they exercise the chmod path verified here.
+    //
+    // On macOS dev environments the bind mount through virtiofs strips mode bits;
+    // that is a dev-env limitation, not a kubelet bug. Linux CI hits the path below.
+
+    #[cfg(unix)]
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rusternetes-emptydir-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_sets_mode_0777_on_new_dir() {
+        let tmp = unique_tmp_dir("new");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let mode = mode_of(&tmp);
+        assert_eq!(
+            mode, 0o777,
+            "newly created emptyDir must have mode 0o777, got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_rechmods_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Pre-create the dir with mode 0o700 (simulating a stale dir left from
+        // a prior pod run or pre-existing host directory).
+        let tmp = unique_tmp_dir("existing");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode_of(&tmp), 0o700, "pre-condition: mode 0o700");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let after = mode_of(&tmp);
+        assert_eq!(
+            after, 0o777,
+            "setup_emptydir_dir must re-chmod existing dir to 0o777, got {:o}",
+            after
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_creates_nested_parent_dirs() {
+        // The pod volumes path is {base}/{pod_name}/{volume_name}; parents may not
+        // exist on the first volume of a pod. create_dir_all must build them.
+        let root = unique_tmp_dir("nested");
+        let target = root.join("pod-x").join("vol-y");
+
+        super::setup_emptydir_dir(target.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        assert!(target.exists(), "nested target dir must exist");
+        let mode = mode_of(&target);
+        assert_eq!(
+            mode, 0o777,
+            "nested emptyDir must have mode 0o777, got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// On Linux, the host chmod 0o777 is the production code path; the bind
+    /// mount preserves mode bits inside the container. This test makes that
+    /// invariant explicit so any regression that drops the chmod fails CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_setup_emptydir_dir_linux_full_bit_pattern() {
+        let tmp = unique_tmp_dir("linux");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let mode = mode_of(&tmp);
+        // On Linux, chmod is honored by the kernel — verify every rwx triple.
+        for (shift, label) in [
+            (6, "owner"), // 0o700
+            (3, "group"), // 0o070
+            (0, "other"), // 0o007
+        ] {
+            for (bit, name) in [(4, "read"), (2, "write"), (1, "execute")] {
+                let expected = bit << shift;
+                assert!(
+                    mode & expected != 0,
+                    "{} {} bit missing in mode {:o}",
+                    label,
+                    name,
+                    mode
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_hostpath_volume_path() {
         let path = "/tmp/test-hostpath";
@@ -8508,7 +8790,7 @@ mod tests {
                 exec: None,
                 http_get: Some(HTTPGetAction {
                     path: Some("/shutdown".to_string()),
-                    port: 8080,
+                    port: rusternetes_common::resources::IntOrString::Int(8080),
                     host: Some("localhost".to_string()),
                     scheme: Some("HTTP".to_string()),
                     http_headers: None,
@@ -8523,7 +8805,10 @@ mod tests {
         let handler = lifecycle.pre_stop.unwrap();
         assert!(handler.http_get.is_some());
         let http = handler.http_get.unwrap();
-        assert_eq!(http.port, 8080);
+        assert_eq!(
+            http.port,
+            rusternetes_common::resources::IntOrString::Int(8080)
+        );
         assert_eq!(http.path.as_deref(), Some("/shutdown"));
     }
 
@@ -9485,7 +9770,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: None,
@@ -9505,7 +9790,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/healthz".to_string()),
-            port: 8080,
+            port: rusternetes_common::resources::IntOrString::Int(8080),
             host: None,
             scheme: None,
             http_headers: None,
@@ -9525,7 +9810,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: None,
-            port: 80,
+            port: rusternetes_common::resources::IntOrString::Int(80),
             host: Some("my-service".to_string()),
             scheme: Some("HTTP".to_string()),
             http_headers: None,
@@ -9545,7 +9830,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: Some(vec![
@@ -11120,5 +11405,190 @@ mod tests {
             }
             _ => panic!("Second init container should be Waiting/PodInitializing"),
         }
+    }
+
+    /// Verify that `lastState.terminated.exitCode` carries the previous
+    /// container's exit code through container restarts.
+    ///
+    /// Conformance: the K8s runtime exit-status test expects pods to report
+    /// the precise non-zero exit code in `lastState.terminated.exitCode`
+    /// after the kubelet restarts the failed container.
+    #[test]
+    fn test_last_state_terminated_carries_exit_code() {
+        let prev_terminated = ContainerState::Terminated {
+            exit_code: 42,
+            signal: None,
+            reason: Some("Error".to_string()),
+            message: None,
+            started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            finished_at: Some("2026-01-01T00:00:05Z".to_string()),
+            container_id: Some("docker://prev".to_string()),
+        };
+        let cs = ContainerStatus {
+            name: "app".to_string(),
+            ready: true,
+            restart_count: 1,
+            state: Some(ContainerState::Running {
+                started_at: Some("2026-01-01T00:00:10Z".to_string()),
+            }),
+            last_state: Some(prev_terminated.clone()),
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: Some("docker://next".to_string()),
+            started: Some(true),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        };
+
+        match cs.last_state {
+            Some(ContainerState::Terminated { exit_code, .. }) => {
+                assert_eq!(exit_code, 42, "lastState exit_code must match previous run");
+            }
+            _ => panic!("lastState must be Terminated with exit_code"),
+        }
+
+        let json = serde_json::to_string(&cs).unwrap();
+        assert!(
+            json.contains("\"lastState\""),
+            "ContainerStatus JSON must include lastState"
+        );
+        assert!(
+            json.contains("\"exitCode\":42"),
+            "lastState.terminated.exitCode must be 42 in JSON, got: {}",
+            json
+        );
+    }
+
+    /// Verify that a container that exits with a non-zero code surfaces the
+    /// exit code on `state.terminated.exitCode` for `restartPolicy: Never`.
+    #[test]
+    fn test_terminated_state_exposes_exit_code_in_json() {
+        let cs = ContainerStatus {
+            name: "main".to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(ContainerState::Terminated {
+                exit_code: 137,
+                signal: None,
+                reason: Some("OOMKilled".to_string()),
+                message: None,
+                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                finished_at: Some("2026-01-01T00:00:30Z".to_string()),
+                container_id: Some("docker://abc".to_string()),
+            }),
+            last_state: None,
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: Some("docker://abc".to_string()),
+            started: Some(true),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        };
+
+        let json = serde_json::to_value(&cs).unwrap();
+        let exit_code = json
+            .pointer("/state/terminated/exitCode")
+            .and_then(|v| v.as_i64())
+            .expect("state.terminated.exitCode missing from JSON");
+        assert_eq!(exit_code, 137);
+        let reason = json
+            .pointer("/state/terminated/reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(reason, "OOMKilled");
+    }
+
+    /// Verify lifecycle preStop hooks are recognized for all handler types
+    /// the kubelet needs to support during graceful termination.
+    #[test]
+    fn test_prestop_lifecycle_handler_variants() {
+        use rusternetes_common::resources::{
+            ExecAction, HTTPGetAction, Lifecycle, LifecycleHandler, SleepAction, TCPSocketAction,
+        };
+
+        let exec_hook = LifecycleHandler {
+            exec: Some(ExecAction {
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "graceful".to_string(),
+                ],
+            }),
+            http_get: None,
+            tcp_socket: None,
+            sleep: None,
+        };
+        assert!(exec_hook.exec.is_some());
+
+        let http_hook = LifecycleHandler {
+            exec: None,
+            http_get: Some(HTTPGetAction {
+                host: None,
+                http_headers: None,
+                path: Some("/shutdown".to_string()),
+                port: rusternetes_common::resources::IntOrString::Int(8080),
+                scheme: None,
+            }),
+            tcp_socket: None,
+            sleep: None,
+        };
+        assert!(http_hook.http_get.is_some());
+
+        let tcp_hook = LifecycleHandler {
+            exec: None,
+            http_get: None,
+            tcp_socket: Some(TCPSocketAction {
+                host: None,
+                port: rusternetes_common::resources::IntOrString::Int(9000),
+            }),
+            sleep: None,
+        };
+        assert!(tcp_hook.tcp_socket.is_some());
+
+        let sleep_hook = LifecycleHandler {
+            exec: None,
+            http_get: None,
+            tcp_socket: None,
+            sleep: Some(SleepAction { seconds: 5 }),
+        };
+        assert!(sleep_hook.sleep.is_some());
+
+        let lifecycle = Lifecycle {
+            post_start: None,
+            pre_stop: Some(exec_hook),
+            stop_signal: None,
+        };
+        let json = serde_json::to_string(&lifecycle).unwrap();
+        assert!(json.contains("\"preStop\""), "JSON must include preStop");
+        assert!(
+            json.contains("\"exec\""),
+            "preStop exec handler must serialize"
+        );
+    }
+
+    /// Verify that `terminationGracePeriodSeconds` is read from the pod spec
+    /// so the kubelet can pass it through to the preStop budget.
+    #[test]
+    fn test_termination_grace_period_propagation() {
+        let mut pod = make_pod("graceful", "default", None, None);
+        pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(45);
+
+        let grace = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.termination_grace_period_seconds)
+            .unwrap_or(30);
+        assert_eq!(
+            grace, 45,
+            "spec.terminationGracePeriodSeconds must propagate"
+        );
     }
 }

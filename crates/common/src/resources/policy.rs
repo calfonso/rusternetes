@@ -271,7 +271,7 @@ pub struct PodDisruptionBudgetSpec {
 }
 
 /// IntOrString can be an integer or a string percentage (e.g., "20%")
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum IntOrString {
     Int(i32),

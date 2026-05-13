@@ -36,6 +36,9 @@ rcgen.workspace = true
 pem.workspace = true
 base64.workspace = true
 
+[dev-dependencies]
+async-trait = { workspace = true }
+
 [features]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]

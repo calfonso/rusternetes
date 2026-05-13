@@ -680,6 +680,47 @@ pub async fn get_api_groups(
         }
     }
 
+    // Merge in groups registered via APIService (kube-aggregator).
+    // Skip groups we already expose to avoid duplicates.
+    if let Some(axum::extract::State(ref st)) = state {
+        let registered = crate::handlers::generic::list_registered_apiservice_groups(st).await;
+        let known: std::collections::HashSet<String> =
+            groups.iter().map(|g| g.name.clone()).collect();
+        for entry in registered {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() || known.contains(&name) {
+                continue;
+            }
+            let versions: Vec<GroupVersionForDiscovery> = entry
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            Some(GroupVersionForDiscovery {
+                                group_version: v.get("groupVersion")?.as_str()?.to_string(),
+                                version: v.get("version")?.as_str()?.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if versions.is_empty() {
+                continue;
+            }
+            let preferred = versions[0].clone();
+            groups.push(APIGroup {
+                name,
+                versions,
+                preferred_version: preferred,
+            });
+        }
+    }
+
     let api_group_list = APIGroupList {
         kind: "APIGroupList".to_string(),
         api_version: "v1".to_string(),

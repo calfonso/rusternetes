@@ -1,0 +1,55 @@
+name: Rust tests
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: cargo build + test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup component add --toolchain stable clippy
+          rustup default stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build (workspace)
+        run: cargo build --workspace --locked
+
+      - name: cargo test (workspace)
+        run: cargo test --workspace --locked
+
+      - name: cargo clippy (informational)
+        # Warnings are surfaced in the run log but do not fail CI yet — the
+        # baseline has 30+ pre-existing warnings (deprecated rand APIs,
+        # unused methods etc.). Ratchet to `-- -D warnings` after that
+        # backlog is cleaned up. Default features only: the optional
+        # `jaeger` feature pulls in opentelemetry-jaeger which is itself
+        # deprecated upstream.
+        run: cargo clippy --workspace --all-targets --locked

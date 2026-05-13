@@ -33,6 +33,23 @@ impl<S: Storage + 'static> NodeController<S> {
         }
     }
 
+    /// Test helper: mark `node_name` as first seen long enough ago that the
+    /// startup grace period is over. Reconcile_node skips condition updates
+    /// within the K8s-standard 60s startup grace; this lets tests observe the
+    /// Ready-flip behavior deterministically without sleeping.
+    #[doc(hidden)]
+    pub fn seed_first_seen_for_test(&self, node_name: &str) {
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(
+                NODE_STARTUP_GRACE_PERIOD_SECS * 2,
+            ))
+            .unwrap_or_else(std::time::Instant::now);
+        self.first_seen
+            .lock()
+            .unwrap()
+            .insert(node_name.to_string(), past);
+    }
+
     /// Watch-based run loop. Performs an initial full reconciliation, then watches
     /// for node changes. Falls back to periodic resync every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
