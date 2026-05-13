@@ -553,7 +553,7 @@ fn make_container_with_prestop_http(
                 } else {
                     Some(host.to_string())
                 },
-                port,
+                port: rusternetes_common::resources::IntOrString::Int(port),
                 path: Some(path.to_string()),
                 scheme: None,
                 http_headers: None,
@@ -595,7 +595,10 @@ fn prestop_hooks_called_before_container_stop() {
     let pre_stop = lifecycle.pre_stop.as_ref().unwrap();
     let http_get = pre_stop.http_get.as_ref().unwrap();
     assert_eq!(http_get.host.as_deref(), Some("10.244.0.5"));
-    assert_eq!(http_get.port, 8080);
+    assert_eq!(
+        http_get.port,
+        rusternetes_common::resources::IntOrString::Int(8080)
+    );
     assert_eq!(http_get.path.as_deref(), Some("/prestop"));
 }
 

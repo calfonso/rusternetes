@@ -8704,7 +8704,7 @@ mod tests {
                 exec: None,
                 http_get: Some(HTTPGetAction {
                     path: Some("/shutdown".to_string()),
-                    port: 8080,
+                    port: rusternetes_common::resources::IntOrString::Int(8080),
                     host: Some("localhost".to_string()),
                     scheme: Some("HTTP".to_string()),
                     http_headers: None,
@@ -8719,7 +8719,10 @@ mod tests {
         let handler = lifecycle.pre_stop.unwrap();
         assert!(handler.http_get.is_some());
         let http = handler.http_get.unwrap();
-        assert_eq!(http.port, 8080);
+        assert_eq!(
+            http.port,
+            rusternetes_common::resources::IntOrString::Int(8080)
+        );
         assert_eq!(http.path.as_deref(), Some("/shutdown"));
     }
 
@@ -9681,7 +9684,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: None,
@@ -9701,7 +9704,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/healthz".to_string()),
-            port: 8080,
+            port: rusternetes_common::resources::IntOrString::Int(8080),
             host: None,
             scheme: None,
             http_headers: None,
@@ -9721,7 +9724,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: None,
-            port: 80,
+            port: rusternetes_common::resources::IntOrString::Int(80),
             host: Some("my-service".to_string()),
             scheme: Some("HTTP".to_string()),
             http_headers: None,
@@ -9741,7 +9744,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: Some(vec![
@@ -11445,7 +11448,7 @@ mod tests {
                 host: None,
                 http_headers: None,
                 path: Some("/shutdown".to_string()),
-                port: 8080,
+                port: rusternetes_common::resources::IntOrString::Int(8080),
                 scheme: None,
             }),
             tcp_socket: None,
@@ -11458,7 +11461,7 @@ mod tests {
             http_get: None,
             tcp_socket: Some(TCPSocketAction {
                 host: None,
-                port: 9000,
+                port: rusternetes_common::resources::IntOrString::Int(9000),
             }),
             sleep: None,
         };
