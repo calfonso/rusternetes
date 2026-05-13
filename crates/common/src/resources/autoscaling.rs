@@ -485,11 +485,11 @@ pub struct ContainerResourcePolicy {
     pub mode: Option<String>,
 
     /// MinAllowed specifies the minimum resource amounts
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_allowed: Option<std::collections::HashMap<String, String>>,
 
     /// MaxAllowed specifies the maximum resource amounts
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_allowed: Option<std::collections::HashMap<String, String>>,
 
     /// ControlledResources specifies which resource types are controlled (cpu, memory)
@@ -538,15 +538,15 @@ pub struct RecommendedContainerResources {
     pub target: std::collections::HashMap<String, String>,
 
     /// Lower bound on resource amounts
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lower_bound: Option<std::collections::HashMap<String, String>>,
 
     /// Upper bound on resource amounts
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upper_bound: Option<std::collections::HashMap<String, String>>,
 
     /// Uncapped target resource amounts (without limits)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uncapped_target: Option<std::collections::HashMap<String, String>>,
 }
 
