@@ -232,7 +232,7 @@ pub enum ReinvocationPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelector {
     /// MatchLabels is a map of {key,value} pairs
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_labels: Option<std::collections::HashMap<String, String>>,
 
     /// MatchExpressions is a list of label selector requirements
