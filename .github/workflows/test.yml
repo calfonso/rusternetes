@@ -15,7 +15,7 @@ env:
 
 jobs:
   build-and-test:
-    name: cargo build + test + clippy
+    name: cargo nextest + clippy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -32,29 +32,41 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@v4
+      - name: Install cargo-nextest
+        # Prebuilt binary install — much faster and more parallel than
+        # `cargo test`. The action caches the binary across runs.
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          tool: nextest
 
-      - name: cargo build (workspace)
-        run: cargo build --workspace --locked
+      - name: Cache cargo registry + target
+        # Rust-aware cache: prunes stale artifacts, hashes Cargo.lock plus
+        # rustc version, and shares hits across feature branches. Much
+        # higher hit rate than the plain actions/cache it replaces.
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Bump if you want to invalidate cache without changing deps.
+          prefix-key: "v1-rust"
 
-      - name: cargo test (workspace)
-        run: cargo test --workspace --locked
+      - name: cargo nextest run (compile + test in one pass)
+        # nextest compiles test binaries and runs them in parallel; reuses
+        # cargo's incremental compilation cache so this is the only Rust
+        # build step needed. --no-fail-fast surfaces all failures per run.
+        # Doctests are not run (nextest limitation) — none of the
+        # workspace currently depends on doctest coverage; add a separate
+        # `cargo test --doc` step if that changes.
+        run: cargo nextest run --workspace --locked --no-fail-fast
 
-      - name: cargo clippy (informational)
-        # Warnings are surfaced in the run log but do not fail CI yet — the
-        # baseline has 30+ pre-existing warnings (deprecated rand APIs,
-        # unused methods etc.). Ratchet to `-- -D warnings` after that
-        # backlog is cleaned up. Default features only: the optional
-        # `jaeger` feature pulls in opentelemetry-jaeger which is itself
-        # deprecated upstream.
+      - name: cargo clippy (informational, all targets)
+        # Warnings are surfaced in the run log but do not fail CI yet —
+        # the baseline has 30+ pre-existing warnings (deprecated rand
+        # APIs, unused methods etc.). Ratchet to `-- -D warnings` after
+        # that backlog is cleaned up. Default features only: the
+        # optional `jaeger` feature pulls in opentelemetry-jaeger which
+        # is itself deprecated upstream.
+        #
+        # `--all-targets` also acts as the bin-target build check the
+        # old explicit `cargo build` step provided — clippy compiles
+        # every target before lint, so any compile error in a bin fails
+        # this step.
         run: cargo clippy --workspace --all-targets --locked
