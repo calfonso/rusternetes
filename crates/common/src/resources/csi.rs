@@ -34,11 +34,11 @@ pub struct CSIDriverSpec {
     pub storage_capacity: Option<bool>,
 
     /// volumeLifecycleModes defines what kind of volumes this CSI volume driver supports
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_lifecycle_modes: Option<Vec<VolumeLifecycleMode>>,
 
     /// tokenRequests indicates the CSI driver needs service account tokens
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_requests: Option<Vec<TokenRequest>>,
 
     /// requiresRepublish indicates the CSI driver wants NodePublishVolume to be periodically called
@@ -107,7 +107,7 @@ pub struct CSINodeDriver {
     pub node_id: String,
 
     /// topologyKeys is the list of keys supported by the driver
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology_keys: Option<Vec<String>>,
 
     /// allocatable represents the volume resources of a node that are available for scheduling
@@ -188,7 +188,7 @@ pub struct CSIVolumeSource {
     pub fs_type: Option<String>,
 
     /// volumeAttributes of the volume to publish
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_attributes: Option<HashMap<String, String>>,
 
     /// nodePublishSecretRef is a reference to the secret object containing sensitive information
@@ -203,7 +203,7 @@ pub struct VolumeAttachmentStatus {
     pub attached: bool,
 
     /// attachmentMetadata is populated with any information returned by the attach operation
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_metadata: Option<HashMap<String, String>>,
 
     /// attachError represents the last error encountered during attach operation
@@ -263,7 +263,7 @@ pub struct VolumeAttributesClass {
     pub driver_name: String,
 
     /// parameters hold volume attributes defined by the CSI driver
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<HashMap<String, String>>,
 }
 
