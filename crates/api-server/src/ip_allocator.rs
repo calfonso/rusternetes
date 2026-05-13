@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Simple ClusterIP allocator for services
 /// Allocates IPs from a predefined CIDR range
@@ -14,6 +14,15 @@ pub struct ClusterIPAllocator {
 }
 
 impl ClusterIPAllocator {
+    /// Lock the allocated-IP set, recovering from poison rather than panicking.
+    /// A panic in another thread shouldn't lock out all future ClusterIP allocation.
+    fn lock_allocated(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.allocated.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ip_allocator mutex poisoned, recovering");
+            poisoned.into_inner()
+        })
+    }
+
     /// Create a new allocator with the default Kubernetes service CIDR
     /// 10.96.0.0/12 provides 1,048,576 IPs (10.96.0.0 - 10.111.255.255)
     pub fn new() -> Self {
@@ -40,7 +49,7 @@ impl ClusterIPAllocator {
     /// Allocate a new ClusterIP
     /// Returns None if all IPs are allocated
     pub fn allocate(&self) -> Option<String> {
-        let mut allocated = self.allocated.lock().unwrap();
+        let mut allocated = self.lock_allocated();
 
         // Try to find an available IP
         // Start from .1 (skip .0 which is network address)
@@ -59,7 +68,7 @@ impl ClusterIPAllocator {
 
     /// Allocate a specific IP if available
     pub fn allocate_specific(&self, ip: String) -> bool {
-        let mut allocated = self.allocated.lock().unwrap();
+        let mut allocated = self.lock_allocated();
 
         if allocated.contains(&ip) {
             return false;
@@ -76,7 +85,7 @@ impl ClusterIPAllocator {
 
     /// Release an allocated IP back to the pool
     pub fn release(&self, ip: &str) {
-        let mut allocated = self.allocated.lock().unwrap();
+        let mut allocated = self.lock_allocated();
         allocated.remove(ip);
     }
 
@@ -104,7 +113,7 @@ impl ClusterIPAllocator {
     #[allow(dead_code)]
     pub fn mark_allocated(&self, ip: String) {
         if self.is_in_range(&ip) {
-            let mut allocated = self.allocated.lock().unwrap();
+            let mut allocated = self.lock_allocated();
             allocated.insert(ip);
         }
     }
@@ -112,7 +121,7 @@ impl ClusterIPAllocator {
     /// Get statistics about IP allocation
     #[allow(dead_code)]
     pub fn stats(&self) -> (usize, u32) {
-        let allocated = self.allocated.lock().unwrap();
+        let allocated = self.lock_allocated();
         (allocated.len(), self.pool_size)
     }
 }
