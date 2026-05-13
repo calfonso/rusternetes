@@ -3932,34 +3932,32 @@ impl Kubelet {
         reason: Option<&str>,
         message: Option<&str>,
     ) -> Result<()> {
-        let mut new_pod = pod.clone();
-
-        new_pod.status = Some(PodStatus {
-            phase: Some(phase),
-            message: message.map(|s| s.to_string()),
-            reason: reason.map(|s| s.to_string()),
-            host_ip: Some("127.0.0.1".to_string()),
-            pod_ip: None,
-            conditions: None,
-            container_statuses: None,
-            init_container_statuses: None,
-            ephemeral_container_statuses: None,
-            resize: None,
-            resource_claim_statuses: None,
-            observed_generation: None,
-            host_i_ps: None,
-            pod_i_ps: None,
-            nominated_node_name: None,
-            qos_class: None,
-            start_time: None,
-        });
-
         let key = build_key(
             "pods",
-            new_pod.metadata.namespace.as_deref(),
-            &new_pod.metadata.name,
+            pod.metadata.namespace.as_deref(),
+            &pod.metadata.name,
         );
-        self.storage.update(&key, &new_pod).await?;
+
+        // Read the fresh pod from storage so we preserve container_statuses,
+        // init_container_statuses, conditions, pod_ip, start_time, etc.
+        // Constructing a fresh PodStatus would WIPE those fields — destructive
+        // when called on a failure path of a previously-Running pod.
+        let mut new_pod = match self.storage.get::<Pod>(&key).await {
+            Ok(p) => p,
+            Err(_) => pod.clone(),
+        };
+        let original = new_pod.clone();
+
+        let mut status = new_pod.status.take().unwrap_or_default();
+        status.phase = Some(phase);
+        status.reason = reason.map(|s| s.to_string());
+        status.message = message.map(|s| s.to_string());
+        new_pod.status = Some(status);
+
+        // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
+        if !pod_status_equal(&original, &new_pod) {
+            self.storage.update(&key, &new_pod).await?;
+        }
 
         Ok(())
     }
