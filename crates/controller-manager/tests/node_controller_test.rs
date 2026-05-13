@@ -141,6 +141,9 @@ async fn test_node_not_ready_with_old_heartbeat() {
     let key = build_key("nodes", None, "test-node-not-ready");
     storage.create(&key, &node).await.unwrap();
 
+    // Skip the 60s startup grace so reconcile flips the condition this tick.
+    controller.seed_first_seen_for_test("test-node-not-ready");
+
     // Reconcile
     controller.reconcile_all().await.unwrap();
 
@@ -208,6 +211,9 @@ async fn test_node_without_ready_condition() {
 
     let key = build_key("nodes", None, "test-node-no-condition");
     storage.create(&key, &node).await.unwrap();
+
+    // Skip the 60s startup grace so reconcile creates the condition this tick.
+    controller.seed_first_seen_for_test("test-node-no-condition");
 
     // Reconcile should create a Ready condition
     controller.reconcile_all().await.unwrap();
