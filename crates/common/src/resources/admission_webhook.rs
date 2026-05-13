@@ -14,7 +14,7 @@ pub struct ValidatingWebhookConfiguration {
     pub api_version: String,
     pub kind: String,
     pub metadata: ObjectMeta,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhooks: Option<Vec<ValidatingWebhook>>,
 }
 
@@ -69,7 +69,7 @@ pub struct ValidatingWebhook {
     pub admission_review_versions: Vec<String>,
 
     /// MatchConditions are CEL expressions that must be true for the webhook to be called
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_conditions: Option<Vec<MatchCondition>>,
 }
 
@@ -80,7 +80,7 @@ pub struct MutatingWebhookConfiguration {
     pub api_version: String,
     pub kind: String,
     pub metadata: ObjectMeta,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhooks: Option<Vec<MutatingWebhook>>,
 }
 
@@ -135,7 +135,7 @@ pub struct MutatingWebhook {
     pub admission_review_versions: Vec<String>,
 
     /// MatchConditions are CEL expressions that must be true for the webhook to be called
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_conditions: Option<Vec<MatchCondition>>,
 
     /// ReinvocationPolicy indicates whether this webhook should be called multiple times
@@ -236,7 +236,7 @@ pub struct LabelSelector {
     pub match_labels: Option<std::collections::HashMap<String, String>>,
 
     /// MatchExpressions is a list of label selector requirements
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_expressions: Option<Vec<LabelSelectorRequirement>>,
 }
 
@@ -251,7 +251,7 @@ pub struct LabelSelectorRequirement {
     pub operator: LabelSelectorOperator,
 
     /// Values is an array of string values
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
 }
 
