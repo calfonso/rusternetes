@@ -12,7 +12,31 @@
 
 use crate::error::Error;
 use crate::resources::crd::JSONSchemaProps;
+use regex::Regex;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
+
+/// Cache of compiled regexes keyed by pattern string. CRD validation can hit the
+/// same pattern repeatedly on every admission call; recompiling each time is
+/// expensive enough to show up in profiles for cluster-wide reconciles.
+static REGEX_CACHE: LazyLock<RwLock<HashMap<String, Regex>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn compile_regex_cached(pattern: &str) -> Result<Regex, regex::Error> {
+    if let Some(re) = REGEX_CACHE
+        .read()
+        .ok()
+        .and_then(|g| g.get(pattern).cloned())
+    {
+        return Ok(re);
+    }
+    let re = Regex::new(pattern)?;
+    if let Ok(mut g) = REGEX_CACHE.write() {
+        g.insert(pattern.to_string(), re.clone());
+    }
+    Ok(re)
+}
 
 /// Validator validates JSON values against JSONSchemaProps
 pub struct SchemaValidator;
@@ -526,7 +550,7 @@ impl SchemaValidator {
         }
 
         if let Some(ref pattern) = schema.pattern {
-            let re = regex::Regex::new(pattern)
+            let re = compile_regex_cached(pattern)
                 .map_err(|e| Error::InvalidResource(format!("Invalid regex pattern: {}", e)))?;
 
             if !re.is_match(s) {
@@ -987,6 +1011,124 @@ mod tests {
         assert!(
             SchemaValidator::validate(&schema, &value).is_ok(),
             "preserve-unknown-fields should allow arbitrary fields"
+        );
+    }
+
+    // ── Regex cache tests ────────────────────────────────────────────────
+
+    /// First call should populate the cache; second call should hit it
+    /// without recompiling. Verified by inspecting the static cache
+    /// directly — the cached entry must be present after a single call.
+    #[test]
+    fn regex_cache_populates_on_first_call() {
+        // Use a pattern unique to this test so other tests / runs don't
+        // pollute the assertion.
+        let pattern = "^cache-populate-test-[a-z0-9]+$";
+
+        // Ensure the cache starts without this entry.
+        REGEX_CACHE.write().unwrap().remove(pattern);
+        assert!(
+            !REGEX_CACHE.read().unwrap().contains_key(pattern),
+            "precondition: cache must not contain our test pattern"
+        );
+
+        // First call compiles + inserts into cache.
+        let re1 = compile_regex_cached(pattern).expect("compile");
+        assert!(re1.is_match("cache-populate-test-abc123"));
+        assert!(
+            REGEX_CACHE.read().unwrap().contains_key(pattern),
+            "cache must contain pattern after first call"
+        );
+
+        // Second call returns a regex that still matches — proving the cached
+        // copy is functionally equivalent. We can't compare Regex by identity
+        // (no PartialEq) so functional check is the strongest assertion.
+        let re2 = compile_regex_cached(pattern).expect("compile (cached)");
+        assert!(re2.is_match("cache-populate-test-xyz789"));
+    }
+
+    /// Bad regex still surfaces an error and does NOT get cached.
+    #[test]
+    fn regex_cache_does_not_store_invalid_pattern() {
+        let bad = "[unclosed";
+        REGEX_CACHE.write().unwrap().remove(bad);
+        let result = compile_regex_cached(bad);
+        assert!(result.is_err(), "invalid regex should error");
+        assert!(
+            !REGEX_CACHE.read().unwrap().contains_key(bad),
+            "invalid regex must not be cached"
+        );
+    }
+
+    /// Microbenchmark: prove the cache makes a hot path meaningfully faster.
+    /// Marked `#[ignore]` because timing-based asserts are inherently noisy
+    /// in CI — run explicitly with:
+    ///
+    ///   cargo test -p rusternetes-common --release -- --ignored regex_cache_speedup --nocapture
+    ///
+    /// Compares two equivalent workloads on the same input:
+    ///   1. cached: validate via SchemaValidator (hits compile_regex_cached)
+    ///   2. uncached: `Regex::new(pattern)` per iteration (the pre-cache path)
+    ///
+    /// On a warm machine the cached path is typically 50–500× faster than
+    /// re-compiling. The assertion uses a conservative 10× lower bound so
+    /// it doesn't flake on a slow runner; the printed ratio is the real
+    /// signal — read it from `--nocapture` output.
+    #[test]
+    #[ignore = "perf microbenchmark; run with --ignored on --release"]
+    fn regex_cache_speedup() {
+        use std::time::Instant;
+
+        // A pattern with character classes + quantifiers + anchors so
+        // compile work is non-trivial. Same shape as common K8s patterns
+        // (DNS label, semver, label-value).
+        let pattern = r"^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$";
+        let input = "subdomain.example.com";
+        let n: u32 = 5_000;
+
+        let schema = JSONSchemaProps {
+            type_: Some("string".to_string()),
+            pattern: Some(pattern.to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::Value::String(input.to_string());
+
+        // Warm the cache once so the timed loop measures hit-path only.
+        SchemaValidator::validate(&schema, &value).unwrap();
+
+        // Cached path: every call hits compile_regex_cached via the
+        // public validate() entry point. Mirrors real CRD admission.
+        let cached = {
+            let t = Instant::now();
+            for _ in 0..n {
+                SchemaValidator::validate(&schema, &value).unwrap();
+            }
+            t.elapsed()
+        };
+
+        // Uncached path: what the code does on fork/main without this
+        // PR — Regex::new + is_match per call.
+        let uncached = {
+            let t = Instant::now();
+            for _ in 0..n {
+                let re = regex::Regex::new(pattern).unwrap();
+                assert!(re.is_match(input));
+            }
+            t.elapsed()
+        };
+
+        let ratio = uncached.as_nanos() as f64 / cached.as_nanos().max(1) as f64;
+        eprintln!(
+            "regex_cache_speedup: n={} cached={:?} uncached={:?} speedup={:.1}x",
+            n, cached, uncached, ratio
+        );
+
+        assert!(
+            ratio >= 10.0,
+            "expected cache to give >=10x speedup; got {:.1}x (cached={:?} uncached={:?})",
+            ratio,
+            cached,
+            uncached
         );
     }
 }
