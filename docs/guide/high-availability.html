@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html" class="active">High Availability</a></li>
         </ul>
       </div>
@@ -111,7 +112,7 @@
       <div class="admonition note">
         <div class="admonition-title">NOTE</div>
         <p>
-          High availability requires the etcd storage backend. The SQLite/Rhino backend does
+          High availability requires the etcd storage backend. The SQLite/Rhino and Redis backends do
           not support replication or multi-writer setups. See the
           <a href="deployment.html">Deployment Overview</a> for a comparison of all modes.
         </p>

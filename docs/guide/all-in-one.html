@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html" class="active">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -179,7 +180,7 @@ kubectl config use-context rusternetes
             <td><code><span class="flag">--storage-backend</span></code></td>
             <td>String</td>
             <td><code><span class="value">"sqlite"</span></code></td>
-            <td>Storage backend to use. Accepts <code>sqlite</code> (embedded, no dependencies) or <code>etcd</code> (requires a running etcd server).</td>
+            <td>Storage backend to use. Accepts <code>sqlite</code> (embedded, no dependencies), <code>redis</code> (requires a running Redis server), or <code>etcd</code> (requires a running etcd server).</td>
           </tr>
           <tr>
             <td><code><span class="flag">--data-dir</span></code></td>
@@ -192,6 +193,12 @@ kubectl config use-context rusternetes
             <td>String</td>
             <td><code><span class="value">"http://localhost:2379"</span></code></td>
             <td>Comma-separated list of etcd endpoints. Only used when <code>--storage-backend=etcd</code>.</td>
+          </tr>
+          <tr>
+            <td><code><span class="flag">--redis-url</span></code></td>
+            <td>String</td>
+            <td><code><span class="value">"redis://localhost:6379"</span></code></td>
+            <td>Redis connection URL. Only used when <code>--storage-backend=redis</code>.</td>
           </tr>
         </tbody>
       </table>
@@ -433,6 +440,25 @@ etcd <span class="flag">--listen-client-urls</span>=<span class="value">http://0
 ./rusternetes \
   <span class="flag">--storage-backend</span>=<span class="value">etcd</span> \
   <span class="flag">--etcd-servers</span>=<span class="value">http://localhost:2379</span>
+</code>
+      </pre>
+
+      <h3>With Redis instead of SQLite</h3>
+      <pre>
+        <div class="code-header">
+          <span class="code-dot red"></span>
+          <span class="code-dot yellow"></span>
+          <span class="code-dot green"></span>
+          <span class="code-title">terminal</span>
+        </div>
+        <code>
+<span class="comment"># Start Redis first</span>
+redis-server <span class="flag">--daemonize</span> <span class="value">yes</span>
+
+<span class="comment"># Point the binary at Redis</span>
+./rusternetes \
+  <span class="flag">--storage-backend</span>=<span class="value">redis</span> \
+  <span class="flag">--redis-url</span>=<span class="value">redis://localhost:6379</span>
 </code>
       </pre>
 
@@ -688,7 +714,7 @@ kubectl get pods -w
       </p>
 
       <ol>
-        <li><strong>Storage</strong> &mdash; Creates a <code>StorageBackend::Sqlite</code> or <code>StorageBackend::Etcd</code> based on <code>--storage-backend</code>.</li>
+        <li><strong>Storage</strong> &mdash; Creates a <code>StorageBackend::Sqlite</code>, <code>StorageBackend::Redis</code>, or <code>StorageBackend::Etcd</code> based on <code>--storage-backend</code>.</li>
         <li><strong>API Server</strong> &mdash; Builds the Axum router with all 76 handlers and starts listening on <code>--bind-address</code>.</li>
         <li><strong>Controller Manager</strong> &mdash; Spawns all 31 controllers as concurrent tasks, sharing the same storage <code>Arc</code>.</li>
         <li><strong>Scheduler</strong> &mdash; Watches for unscheduled pods and assigns them to the node.</li>

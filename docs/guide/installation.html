@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -231,7 +232,12 @@ make pre-commit</code>
           <tr>
             <td><code>sqlite</code></td>
             <td>On</td>
-            <td>Enables the embedded SQLite storage backend via <a href="https://github.com/calfonso/rhino">rhino</a>. Required for the all-in-one binary.</td>
+            <td>Enables the embedded SQLite storage backend via <a href="https://github.com/calfonso/rhino">rhino</a>. Required for the all-in-one binary with SQLite.</td>
+          </tr>
+          <tr>
+            <td><code>redis</code></td>
+            <td>Off</td>
+            <td>Enables the Redis storage backend via <a href="https://github.com/calfonso/rhino">rhino</a>. Requires a running Redis server.</td>
           </tr>
         </tbody>
       </table>
@@ -250,16 +256,24 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span>
 cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--no-default-features</span>
 
 <span class="comment"># Explicitly enable SQLite</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--features</span> <span class="value">sqlite</span></code>
+cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--features</span> <span class="value">sqlite</span>
+
+<span class="comment"># Enable Redis backend</span>
+cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--features</span> <span class="value">redis</span>
+
+<span class="comment"># Enable both SQLite and Redis</span>
+cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--features</span> <span class="value">sqlite,redis</span></code>
       </pre>
 
       <div class="admonition note">
-        <div class="admonition-title">SQLite and rhino</div>
+        <div class="admonition-title">SQLite, Redis, and rhino</div>
         <p>
-          The <code>sqlite</code> feature pulls in <a href="https://github.com/calfonso/rhino">rhino</a>,
-          a gRPC-compatible SQLite storage backend that implements the same <code>Storage</code>
-          trait as etcd. It can run embedded in the same process (all-in-one mode) or as a
-          standalone gRPC server. See <a href="storage-config.html">Storage Backends</a> for details.
+          The <code>sqlite</code> and <code>redis</code> features pull in
+          <a href="https://github.com/calfonso/rhino">rhino</a>, which provides
+          storage backends that implement the same <code>Storage</code> trait as etcd.
+          SQLite can run embedded in the same process (all-in-one mode) or as a standalone
+          gRPC server. Redis connects directly to a Redis server (all-in-one mode) or via
+          rhino's gRPC server. See <a href="storage-config.html">Storage Backends</a> for details.
         </p>
       </div>
 
@@ -368,8 +382,8 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
         <div class="admonition-title">When to use all-in-one vs compose cluster</div>
         <p>
           The all-in-one binary is ideal for development, testing, and single-node deployments.
-          For multi-node clusters or production workloads, use the compose setup with etcd
-          for proper distributed state.
+          For multi-node clusters or production workloads, use the compose setup with etcd,
+          SQLite, or Redis for proper state management.
         </p>
       </div>
 
@@ -591,9 +605,9 @@ xcode-select --install</code>
       <h2>Next Steps</h2>
       <ul>
         <li><a href="quickstart.html">Quick Start</a> &mdash; get a compose cluster running in 5 minutes</li>
-        <li><a href="deployment.html">Deployment Overview</a> &mdash; choose between all-in-one, compose+etcd, and compose+SQLite</li>
+        <li><a href="deployment.html">Deployment Overview</a> &mdash; choose between all-in-one, compose+etcd, compose+SQLite, and compose+Redis</li>
         <li><a href="all-in-one.html">All-in-One Binary</a> &mdash; run everything in a single process</li>
-        <li><a href="storage-config.html">Storage Backends</a> &mdash; compare etcd, SQLite, and in-memory storage</li>
+        <li><a href="storage-config.html">Storage Backends</a> &mdash; compare etcd, SQLite, Redis, and in-memory storage</li>
       </ul>
 
       <div class="doc-pager">

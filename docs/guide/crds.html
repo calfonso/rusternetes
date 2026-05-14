@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -491,7 +492,7 @@ kubectl apply <span class="flag">-f</span> <span class="value">my-crontab.yaml</
       <!-- ───────────────────── Storage ───────────────────── -->
       <h2 id="storage">Storage</h2>
       <p>
-        Custom resources are stored in the backend (etcd or SQLite) at the key path:
+        Custom resources are stored in the backend (etcd, SQLite, or Redis) at the key path:
       </p>
 
       <pre>
