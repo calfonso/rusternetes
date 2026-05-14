@@ -65,9 +65,11 @@ jobs:
           tool: nextest
 
       - name: Cache cargo registry + target
-        # Rust-aware cache: prunes stale artifacts, hashes Cargo.lock plus
-        # rustc version, and shares hits across feature branches. Much
-        # higher hit rate than the plain actions/cache it replaces.
+        # Self-hosted runner's workspace persists between runs, so the
+        # local target/ + ~/.cargo cache survive without help. Only run
+        # this on GH-hosted runners where the workspace is fresh each
+        # time. Keeps the step in place for the GH-hosted code path.
+        if: runner.environment != 'self-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           # Bump if you want to invalidate cache without changing deps.
