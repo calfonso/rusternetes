@@ -16,7 +16,7 @@ env:
 jobs:
   build-and-test:
     name: cargo nextest + clippy
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Free up runner disk space
         # ubuntu-latest only has ~14 GB free on the system disk, which is
