@@ -150,13 +150,14 @@ pub async fn normalize_content_type_middleware(
                     // Extraction failed — the `raw` field contains native protobuf, not JSON.
                     // First try the structured protobuf-to-JSON decoder.
                     // Then fall back to brace-scanning, but always validate the result.
-                    let hex_preview: String = body_bytes
-                        .iter()
-                        .skip(4)
-                        .take(80)
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    use std::fmt::Write as _;
+                    let mut hex_preview = String::with_capacity(80 * 3);
+                    for b in body_bytes.iter().skip(4).take(80) {
+                        let _ = write!(hex_preview, "{:02x} ", b);
+                    }
+                    if hex_preview.ends_with(' ') {
+                        hex_preview.pop();
+                    }
                     debug!(
                         "Protobuf body has no JSON in raw field ({} bytes). Hex after k8s\\0: {}",
                         body_bytes.len(),
