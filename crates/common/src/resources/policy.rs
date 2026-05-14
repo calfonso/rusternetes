@@ -41,11 +41,11 @@ impl ResourceQuota {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceQuotaSpec {
     /// Hard is the set of desired hard limits for each named resource
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard: Option<HashMap<String, String>>,
 
     /// A collection of filters that must match each object tracked by a quota
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
     /// ScopeSelector is also a collection of filters like scopes that must match each object
@@ -72,7 +72,7 @@ pub struct ScopedResourceSelectorRequirement {
     pub operator: String,
 
     /// An array of string values
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
 }
 
@@ -81,11 +81,11 @@ pub struct ScopedResourceSelectorRequirement {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceQuotaStatus {
     /// Hard is the set of enforced hard limits for each named resource
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard: Option<HashMap<String, String>>,
 
     /// Used is the current observed total usage of the resource in the namespace
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used: Option<HashMap<String, String>>,
 }
 
@@ -136,23 +136,23 @@ pub struct LimitRangeItem {
     pub item_type: String,
 
     /// Max usage constraints on this kind by resource name
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<HashMap<String, String>>,
 
     /// Min usage constraints on this kind by resource name
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<HashMap<String, String>>,
 
     /// Default resource requirement limit value by resource name if not specified
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<HashMap<String, String>>,
 
     /// DefaultRequest is the default resource requirement request value by resource name if not specified
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_request: Option<HashMap<String, String>>,
 
     /// MaxLimitRequestRatio represents the max burst value for the named resource
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_limit_request_ratio: Option<HashMap<String, String>>,
 }
 
@@ -312,7 +312,7 @@ pub struct PodDisruptionBudgetStatus {
     pub observed_generation: Option<i64>,
 
     /// Conditions contain the latest available observations of the PDB's state
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<PodDisruptionBudgetCondition>>,
 
     /// DisruptedPods contains information about pods whose eviction was
@@ -322,7 +322,7 @@ pub struct PodDisruptionBudgetStatus {
     /// eviction request to the time when the pod is seen by PDB controller
     /// as having been marked for deletion (or after a timeout). The key in the map is the name of the pod
     /// and the value is the time when the API server processed the eviction request.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disrupted_pods: Option<HashMap<String, DateTime<Utc>>>,
 }
 

@@ -38,15 +38,15 @@ pub struct NetworkPolicySpec {
     pub pod_selector: LabelSelector,
 
     /// List of ingress rules to be applied
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<Vec<NetworkPolicyIngressRule>>,
 
     /// List of egress rules to be applied
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<Vec<NetworkPolicyEgressRule>>,
 
     /// List of policy types that the NetworkPolicy relates to
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_types: Option<Vec<String>>, // "Ingress", "Egress"
 }
 
@@ -55,11 +55,11 @@ pub struct NetworkPolicySpec {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyIngressRule {
     /// List of ports which should be made accessible
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<NetworkPolicyPort>>,
 
     /// List of sources which should be able to access the pods
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<Vec<NetworkPolicyPeer>>,
 }
 
@@ -68,11 +68,11 @@ pub struct NetworkPolicyIngressRule {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyEgressRule {
     /// List of destination ports for outgoing traffic
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<NetworkPolicyPort>>,
 
     /// List of destinations for outgoing traffic of pods selected for this rule
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Vec<NetworkPolicyPeer>>,
 }
 
@@ -118,6 +118,6 @@ pub struct IPBlock {
     pub cidr: String,
 
     /// Except is a slice of CIDRs that should not be included within an IP Block
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub except: Option<Vec<String>>,
 }

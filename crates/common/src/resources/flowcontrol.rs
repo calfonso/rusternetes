@@ -88,7 +88,7 @@ pub struct ExemptPriorityLevelConfiguration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PriorityLevelConfigurationStatus {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<PriorityLevelConfigurationCondition>>,
 }
 
@@ -135,7 +135,7 @@ pub struct FlowSchemaSpec {
     pub matching_precedence: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distinguisher_method: Option<FlowDistinguisherMethod>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<PolicyRulesWithSubjects>>,
 }
 
@@ -162,9 +162,9 @@ pub enum FlowDistinguisherMethodType {
 #[serde(rename_all = "camelCase")]
 pub struct PolicyRulesWithSubjects {
     pub subjects: Vec<FlowSchemaSubject>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_rules: Option<Vec<ResourcePolicyRule>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub non_resource_rules: Option<Vec<NonResourcePolicyRule>>,
 }
 
@@ -214,7 +214,7 @@ pub struct ResourcePolicyRule {
     pub resources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_scope: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespaces: Option<Vec<String>>,
 }
 
@@ -229,7 +229,7 @@ pub struct NonResourcePolicyRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowSchemaStatus {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<FlowSchemaCondition>>,
 }
 
