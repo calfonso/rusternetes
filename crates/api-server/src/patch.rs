@@ -924,6 +924,48 @@ mod tests {
         let result = apply_strategic_merge_patch(&original, &patch).unwrap();
         assert!(result["metadata"]["annotations"].is_null());
     }
+
+    #[test]
+    fn test_json_patch_add_missing_value_returns_err() {
+        let original = json!({"a": 1});
+        let patch = json!([{ "op": "add", "path": "/b" }]);
+        let result = apply_patch(&original, &patch, PatchType::JsonPatch);
+        match result {
+            Err(PatchError::InvalidPatch(msg)) => assert!(msg.contains("add")),
+            other => panic!(
+                "expected InvalidPatch for add without value, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_json_patch_replace_missing_value_returns_err() {
+        let original = json!({"a": 1});
+        let patch = json!([{ "op": "replace", "path": "/a" }]);
+        let result = apply_patch(&original, &patch, PatchType::JsonPatch);
+        match result {
+            Err(PatchError::InvalidPatch(msg)) => assert!(msg.contains("replace")),
+            other => panic!(
+                "expected InvalidPatch for replace without value, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_json_patch_test_missing_value_returns_err() {
+        let original = json!({"a": 1});
+        let patch = json!([{ "op": "test", "path": "/a" }]);
+        let result = apply_patch(&original, &patch, PatchType::JsonPatch);
+        match result {
+            Err(PatchError::InvalidPatch(msg)) => assert!(msg.contains("test")),
+            other => panic!(
+                "expected InvalidPatch for test without value, got {:?}",
+                other
+            ),
+        }
+    }
 }
 
 /// Recursively merge two JSON objects. For nested objects, entries from
