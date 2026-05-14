@@ -16,7 +16,8 @@ cargo test test_name           # Single test by name
 cargo test test_name -- --nocapture  # With stdout
 
 # Lint & Format
-cargo fmt --all                # Format
+cargo fmt --all                # Format (REQUIRED before every commit — see below)
+cargo fmt --all -- --check     # Verify formatting without writing (CI uses this)
 cargo clippy --all-targets --all-features -- -D warnings  # Lint
 make pre-commit                # Format + clippy + test (run before commits)
 
@@ -86,7 +87,26 @@ impl<S: Storage> FooController<S> {
 - Serial tests when needed: `#[serial_test::serial]`
 
 ### Commit Messages
-Conventional Commits: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`
+Conventional Commits: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`.
+
+Keep the subject line ≤72 characters. The GitHub PR-creation page truncates longer titles, and CI / commitlint flags them. If you exceed 72, amend before pushing.
+
+### Pre-push checklist (REQUIRED)
+The `.github/workflows/fmt.yml` action runs `cargo fmt --all -- --check` on every PR. If formatting drift exists, the PR is red and unmergeable. **Before pushing any branch, run:**
+
+```bash
+cargo fmt --all
+```
+
+This applies the canonical style in-place. Then verify with:
+
+```bash
+cargo fmt --all -- --check    # must exit 0
+```
+
+If you forget and push a branch with formatting drift, the `Check formatting` job goes red. Recovery: run `cargo fmt --all` locally, `git add -A`, `git commit --amend --no-edit`, `git push --force-with-lease`. Prefer to catch it before pushing — `make pre-commit` runs fmt + clippy + test in one shot.
+
+When working across multiple branches (rebases, cherry-picks, parallel work), re-run `cargo fmt --all` on **every** branch before pushing, not just the one you happen to be on. Multi-line `if let` bindings and method chains are the most common drift cases.
 
 ## Cluster Details
 
