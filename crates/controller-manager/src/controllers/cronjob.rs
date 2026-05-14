@@ -476,8 +476,12 @@ impl<S: Storage + 'static> CronJobController<S> {
 
     async fn cleanup_old_jobs(&self, cronjob: &CronJob, namespace: &str) -> Result<()> {
         let cronjob_name = &cronjob.metadata.name;
-        let success_limit = cronjob.spec.successful_jobs_history_limit.unwrap_or(3);
-        let failed_limit = cronjob.spec.failed_jobs_history_limit.unwrap_or(1);
+        // Clamp negative user-supplied values to 0 so the cast to usize does not
+        // wrap to a huge number, which would prevent any history cleanup.
+        let success_limit: usize =
+            usize::try_from(cronjob.spec.successful_jobs_history_limit.unwrap_or(3)).unwrap_or(0);
+        let failed_limit: usize =
+            usize::try_from(cronjob.spec.failed_jobs_history_limit.unwrap_or(1)).unwrap_or(0);
 
         let job_prefix = format!("/registry/jobs/{}/", namespace);
         let mut all_jobs: Vec<Job> = self.storage.list(&job_prefix).await?;
@@ -538,8 +542,8 @@ impl<S: Storage + 'static> CronJobController<S> {
         });
 
         // Delete old successful jobs
-        if successful_jobs.len() > success_limit as usize {
-            let to_delete = successful_jobs.len() - success_limit as usize;
+        if successful_jobs.len() > success_limit {
+            let to_delete = successful_jobs.len() - success_limit;
             for job in successful_jobs.iter().take(to_delete) {
                 let job_name = &job.metadata.name;
                 let job_key = format!("/registry/jobs/{}/{}", namespace, job_name);
@@ -549,8 +553,8 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
 
         // Delete old failed jobs
-        if failed_jobs.len() > failed_limit as usize {
-            let to_delete = failed_jobs.len() - failed_limit as usize;
+        if failed_jobs.len() > failed_limit {
+            let to_delete = failed_jobs.len() - failed_limit;
             for job in failed_jobs.iter().take(to_delete) {
                 let job_name = &job.metadata.name;
                 let job_key = format!("/registry/jobs/{}/{}", namespace, job_name);
