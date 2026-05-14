@@ -16,24 +16,8 @@ env:
 jobs:
   build-and-test:
     name: cargo nextest + clippy
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - name: Free up runner disk space
-        # ubuntu-latest only has ~14 GB free on the system disk, which is
-        # not enough for the full debug build of this workspace + rhino +
-        # all test binaries. rustc/ld fail with "No space left on device"
-        # and SIGBUS during link. Strip pre-installed toolchains we do not
-        # use (Android SDK, .NET, Haskell, big docker images) to free
-        # ~30 GB before any cargo step runs.
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: false
-
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -43,7 +27,17 @@ jobs:
         # The default `sqlite` feature on the rusternetes binary activates
         # this dep, so `cargo metadata` (and therefore every cargo step
         # below) fails unless rhino is present on disk.
-        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+        run: |
+          if [ ! -d ../rhino ]; then
+            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+          else
+            echo "rhino already present at ../rhino (self-hosted runner workspace persists)"
+          fi
+
+      - name: Add cargo bin to PATH
+        # Self-hosted runner shells don't source ~/.bashrc, so rustup
+        # (installed at ~/.cargo/bin/rustup) is not on PATH by default.
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         run: |
@@ -51,10 +45,17 @@ jobs:
           rustup component add --toolchain stable clippy
           rustup default stable
 
-      - name: Install protoc
+      - name: Verify protoc on runner
+        # Persistent self-hosted runner — install protoc once on the host
+        # (e.g. `apt-get install protobuf-compiler`). This step fails fast
+        # with a clear message if it's missing.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          command -v protoc >/dev/null || {
+            echo "protoc not found on runner. Install once on the host:" >&2
+            echo "  apt-get install -y protobuf-compiler" >&2
+            exit 1
+          }
+          protoc --version
 
       - name: Install cargo-nextest
         # Prebuilt binary install — much faster and more parallel than
@@ -64,9 +65,11 @@ jobs:
           tool: nextest
 
       - name: Cache cargo registry + target
-        # Rust-aware cache: prunes stale artifacts, hashes Cargo.lock plus
-        # rustc version, and shares hits across feature branches. Much
-        # higher hit rate than the plain actions/cache it replaces.
+        # Self-hosted runner's workspace persists between runs, so the
+        # local target/ + ~/.cargo cache survive without help. Only run
+        # this on GH-hosted runners where the workspace is fresh each
+        # time. Keeps the step in place for the GH-hosted code path.
+        if: runner.environment != 'self-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           # Bump if you want to invalidate cache without changing deps.

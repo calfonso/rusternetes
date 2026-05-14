@@ -8,7 +8,7 @@ on:
 jobs:
   fmt:
     name: Verify formatting with cargo fmt
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -18,7 +18,17 @@ jobs:
         # optional `rhino` path dep (`../../../rhino` from crates/storage)
         # is missing on disk. The default `sqlite` feature on the
         # rusternetes binary activates it, so rhino has to exist.
-        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+        run: |
+          if [ ! -d ../rhino ]; then
+            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+          else
+            echo "rhino already present at ../rhino (self-hosted runner workspace persists)"
+          fi
+
+      - name: Add cargo bin to PATH
+        # Self-hosted runner shells don't source ~/.bashrc, so rustup
+        # (installed at ~/.cargo/bin/rustup) is not on PATH by default.
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         run: |
