@@ -10,10 +10,10 @@ use crate::concurrency;
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
 use rhino::backend::Backend;
-#[cfg(feature = "sqlite")]
-use rhino::{SqliteBackend, SqliteConfig};
 #[cfg(feature = "redis")]
 use rhino::{RedisBackend, RedisConfig};
+#[cfg(feature = "sqlite")]
+use rhino::{SqliteBackend, SqliteConfig};
 use rusternetes_common::{authz::AuthzStorage, Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;

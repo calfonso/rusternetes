@@ -221,7 +221,9 @@ async fn main() -> Result<()> {
         network: args.network,
         sync_interval: args.kubelet_sync_interval,
         metrics_port: 10250,
-        kubernetes_service_host: args.kubernetes_service_host.clone()
+        kubernetes_service_host: args
+            .kubernetes_service_host
+            .clone()
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
             .unwrap_or_else(|| "127.0.0.1".to_string()),
     };
