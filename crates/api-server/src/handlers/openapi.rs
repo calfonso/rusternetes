@@ -705,7 +705,7 @@ fn add_standard_crd_properties(schema: &mut serde_json::Value) {
 ///
 /// K8s ref: JSONSchemaProps fields in apiextensions/v1/types.go all use
 /// `json:",omitempty"` which omits zero values.
-fn strip_false_extensions(value: &mut serde_json::Value) {
+pub fn strip_false_extensions(value: &mut serde_json::Value) {
     if let Some(obj) = value.as_object_mut() {
         // K8s v2 conversion: when x-kubernetes-preserve-unknown-fields is true,
         // clear items and properties (kubectl can't handle them).
