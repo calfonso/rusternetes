@@ -13,6 +13,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Clone rhino adjacent to repo
+        # `cargo fmt --all` loads workspace metadata, which fails if the
+        # optional `rhino` path dep (`../../../rhino` from crates/storage)
+        # is missing on disk. The default `sqlite` feature on the
+        # rusternetes binary activates it, so rhino has to exist.
+        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+
       - name: Install Rust toolchain
         run: |
           rustup update --no-self-update stable
@@ -20,4 +27,13 @@ jobs:
           rustup default stable
 
       - name: Validate formatting
-        run: cargo fmt --all -- --check
+        # `cargo fmt --all` recurses into path-deps (rhino) too, but the
+        # rhino repo has its own rustfmt config and isn't owned by this
+        # project. Format only the workspace members enumerated by
+        # `cargo metadata --no-deps`.
+        run: |
+          PKGS=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].name' \
+            | sed 's/^/-p /' \
+            | tr '\n' ' ')
+          cargo fmt $PKGS -- --check

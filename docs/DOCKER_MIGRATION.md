@@ -23,10 +23,17 @@ Rusternetes supports both **Podman** and **Docker** as container runtimes on all
 
 Rusternetes provides separate compose files for each runtime:
 
-| Runtime | etcd | SQLite | HA |
-|---------|------|--------|----|
-| Podman | `compose.yml` | `compose.sqlite.yml` | `compose.ha.yml` |
-| Docker | `docker-compose.yml` | `docker-compose.sqlite.yml` | `docker-compose.ha.yml` |
+| Runtime | etcd | SQLite | Redis | HA |
+|---------|------|--------|-------|----|
+| Podman | `compose.yml` | `compose.sqlite.yml` | `compose.redis.yml` | `compose.ha.yml` |
+| Docker | `docker-compose.yml` | `docker-compose.sqlite.yml` | — | `docker-compose.ha.yml` |
+
+All-in-one variants (Podman only):
+
+| Storage | Compose file |
+|---------|-------------|
+| Embedded SQLite | `compose.all-in-one.yml` |
+| Redis | `compose.all-in-one-redis.yml` |
 
 The key difference is the container socket path:
 - **Podman:** `/run/podman/podman.sock`

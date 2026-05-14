@@ -6,7 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 pub mod concurrency;
 pub mod etcd;
 pub mod memory;
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "redis"))]
 pub mod rhino;
 pub mod workqueue;
 
@@ -16,9 +16,11 @@ pub use memory::MemoryStorage;
 // Re-export work queue types
 pub use workqueue::{extract_key, WorkQueue, WorkQueueConfig, RECONCILE_ALL_SENTINEL};
 
-// Re-export RhinoStorage when sqlite feature is enabled
+// Re-export RhinoStorage when sqlite or redis features are enabled
 #[cfg(feature = "sqlite")]
-pub use rhino::RhinoStorage;
+pub type RhinoStorage = rhino::RhinoStorage<::rhino::SqliteBackend>;
+#[cfg(feature = "redis")]
+pub type RhinoRedisStorage = rhino::RhinoStorage<::rhino::RedisBackend>;
 
 /// Storage trait for persisting Kubernetes resources
 #[async_trait]
@@ -142,9 +144,15 @@ pub enum StorageConfig {
         /// Path to the SQLite database file.
         path: String,
     },
+    /// Use Redis via rhino (requires `redis` feature).
+    #[cfg(feature = "redis")]
+    Redis {
+        /// Redis connection URL (e.g. `"redis://localhost:6379"`).
+        url: String,
+    },
 }
 
-/// Unified storage backend that dispatches to either etcd or SQLite at runtime.
+/// Unified storage backend that dispatches to etcd, SQLite, or Redis at runtime.
 ///
 /// This allows all components to remain generic over `S: Storage` while the
 /// concrete backend is chosen once at startup via `StorageConfig`.
@@ -152,7 +160,9 @@ pub enum StorageConfig {
 pub enum StorageBackend {
     Etcd(etcd::EtcdStorage),
     #[cfg(feature = "sqlite")]
-    Sqlite(rhino::RhinoStorage),
+    Sqlite(RhinoStorage),
+    #[cfg(feature = "redis")]
+    Redis(RhinoRedisStorage),
 }
 
 impl StorageBackend {
@@ -165,8 +175,13 @@ impl StorageBackend {
             }
             #[cfg(feature = "sqlite")]
             StorageConfig::Sqlite { path } => {
-                let storage = rhino::RhinoStorage::new(&path).await?;
+                let storage = RhinoStorage::new(&path).await?;
                 Ok(StorageBackend::Sqlite(storage))
+            }
+            #[cfg(feature = "redis")]
+            StorageConfig::Redis { url } => {
+                let storage = RhinoRedisStorage::new_redis(&url).await?;
+                Ok(StorageBackend::Redis(storage))
             }
         }
     }
@@ -182,6 +197,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::create(s, key, value).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::create(s, key, value).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::create(s, key, value).await,
         }
     }
 
@@ -193,6 +210,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::get(s, key).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::get(s, key).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::get(s, key).await,
         }
     }
 
@@ -204,6 +223,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::update(s, key, value).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::update(s, key, value).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::update(s, key, value).await,
         }
     }
 
@@ -212,6 +233,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::update_raw(s, key, value).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::update_raw(s, key, value).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::update_raw(s, key, value).await,
         }
     }
 
@@ -220,6 +243,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::delete(s, key).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::delete(s, key).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::delete(s, key).await,
         }
     }
 
@@ -231,6 +256,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::list(s, prefix).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::list(s, prefix).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::list(s, prefix).await,
         }
     }
 
@@ -239,6 +266,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::watch(s, prefix).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::watch(s, prefix).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::watch(s, prefix).await,
         }
     }
 
@@ -247,6 +276,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::watch_from_revision(s, prefix, revision).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::watch_from_revision(s, prefix, revision).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::watch_from_revision(s, prefix, revision).await,
         }
     }
 
@@ -255,6 +286,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::current_revision(s).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::current_revision(s).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::current_revision(s).await,
         }
     }
 
@@ -263,6 +296,8 @@ impl Storage for StorageBackend {
             StorageBackend::Etcd(s) => Storage::is_revision_compacted(s, revision).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => Storage::is_revision_compacted(s, revision).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => Storage::is_revision_compacted(s, revision).await,
         }
     }
 }
@@ -278,6 +313,8 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Etcd(s) => AuthzStorage::get(s, key, namespace).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => AuthzStorage::get(s, key, namespace).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => AuthzStorage::get(s, key, namespace).await,
         }
     }
 
@@ -289,6 +326,8 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Etcd(s) => AuthzStorage::list(s, namespace).await,
             #[cfg(feature = "sqlite")]
             StorageBackend::Sqlite(s) => AuthzStorage::list(s, namespace).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => AuthzStorage::list(s, namespace).await,
         }
     }
 }

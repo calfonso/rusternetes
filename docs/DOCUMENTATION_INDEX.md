@@ -48,7 +48,7 @@
 
 ## Storage
 
-- **[Storage Backends](storage/STORAGE_BACKENDS.md)** — etcd, SQLite (Rhino), memory backends
+- **[Storage Backends](storage/STORAGE_BACKENDS.md)** — etcd, SQLite, Redis (via Rhino), memory backends
 - **[DYNAMIC_PROVISIONING.md](DYNAMIC_PROVISIONING.md)** — Dynamic volume provisioning with StorageClasses
 - **[VOLUME_SNAPSHOTS.md](VOLUME_SNAPSHOTS.md)** — Volume snapshot lifecycle
 - **[VOLUME_EXPANSION.md](VOLUME_EXPANSION.md)** — Online PVC resize

@@ -19,7 +19,7 @@ use tracing::{error, info, Level};
 #[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]
 #[command(version)]
 struct Args {
-    /// Storage backend: "sqlite" or "etcd"
+    /// Storage backend: "sqlite", "etcd", or "redis"
     #[arg(long, default_value = "sqlite")]
     storage_backend: String,
 
@@ -30,6 +30,10 @@ struct Args {
     /// Etcd endpoints, comma-separated (only used when --storage-backend=etcd)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
+
+    /// Redis URL (only used when --storage-backend=redis)
+    #[arg(long, default_value = "redis://localhost:6379")]
+    redis_url: String,
 
     /// API server bind address
     #[arg(long, default_value = "0.0.0.0:6443")]
@@ -99,6 +103,11 @@ struct Args {
     #[arg(long)]
     console_dir: Option<String>,
 
+    /// Kubernetes service host override for pods (e.g. "api-server" in containerized deployments).
+    /// Falls back to KUBERNETES_SERVICE_HOST_OVERRIDE env var if not set.
+    #[arg(long)]
+    kubernetes_service_host: Option<String>,
+
     /// Client CA certificate file for mTLS client certificate authentication
     #[arg(long)]
     client_ca_file: Option<String>,
@@ -139,9 +148,16 @@ async fn main() -> Result<()> {
             info!("Storage: etcd at {:?}", endpoints);
             StorageConfig::Etcd { endpoints }
         }
+        #[cfg(feature = "redis")]
+        "redis" => {
+            info!("Storage: Redis at {}", args.redis_url);
+            StorageConfig::Redis {
+                url: args.redis_url,
+            }
+        }
         other => {
             anyhow::bail!(
-                "Unknown storage backend: {}. Use 'sqlite' or 'etcd'.",
+                "Unknown storage backend: {}. Use 'sqlite', 'etcd', or 'redis'.",
                 other
             );
         }
@@ -205,7 +221,11 @@ async fn main() -> Result<()> {
         network: args.network,
         sync_interval: args.kubelet_sync_interval,
         metrics_port: 10250,
-        kubernetes_service_host: "127.0.0.1".to_string(),
+        kubernetes_service_host: args
+            .kubernetes_service_host
+            .clone()
+            .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {

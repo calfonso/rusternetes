@@ -1,0 +1,135 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chuck-norris-html
+  namespace: chuck-norris
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Chuck Norris Jokes</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+          color: #e0e0e0;
+          min-height: 100vh;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          padding: 2rem;
+        }
+        .container {
+          max-width: 600px;
+          text-align: center;
+        }
+        h1 {
+          font-size: 2.5rem;
+          margin-bottom: 0.5rem;
+          background: linear-gradient(to right, #e94560, #f5a623);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+        }
+        .subtitle {
+          color: #888;
+          margin-bottom: 2rem;
+          font-size: 0.9rem;
+        }
+        .joke-card {
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 16px;
+          padding: 2rem;
+          margin-bottom: 1.5rem;
+          backdrop-filter: blur(10px);
+          min-height: 120px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .joke-text {
+          font-size: 1.3rem;
+          line-height: 1.6;
+          color: #fff;
+        }
+        button {
+          background: linear-gradient(135deg, #e94560, #c23152);
+          color: white;
+          border: none;
+          padding: 12px 32px;
+          font-size: 1rem;
+          border-radius: 8px;
+          cursor: pointer;
+          transition: transform 0.2s, box-shadow 0.2s;
+        }
+        button:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 4px 15px rgba(233, 69, 96, 0.4);
+        }
+        button:active { transform: translateY(0); }
+        .footer {
+          margin-top: 3rem;
+          color: #555;
+          font-size: 0.8rem;
+        }
+        .footer a { color: #e94560; text-decoration: none; }
+        .pod-info {
+          margin-top: 1rem;
+          color: #555;
+          font-size: 0.75rem;
+          font-family: monospace;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Chuck Norris Jokes</h1>
+        <p class="subtitle">Deployed on Rūsternetes</p>
+        <div class="joke-card">
+          <p class="joke-text" id="joke">Loading...</p>
+        </div>
+        <button onclick="newJoke()">Another One</button>
+        <div class="pod-info" id="pod-info"></div>
+        <div class="footer">
+          <p>Powered by <a href="https://github.com/calfonso/rusternetes">Rūsternetes</a></p>
+        </div>
+      </div>
+      <script>
+        const jokes = [
+          "Chuck Norris can divide by zero.",
+          "Chuck Norris counted to infinity. Twice.",
+          "Chuck Norris can slam a revolving door.",
+          "Chuck Norris knows Victoria's secret.",
+          "Chuck Norris can hear sign language.",
+          "Chuck Norris can kill two stones with one bird.",
+          "Chuck Norris beat the Sun in a staring contest.",
+          "Chuck Norris can build a snowman out of rain.",
+          "When Chuck Norris does push-ups, he pushes the Earth down.",
+          "Chuck Norris can light a fire by rubbing two ice cubes together.",
+          "Chuck Norris once kicked a horse in the chin. Its descendants are known today as giraffes.",
+          "Chuck Norris can unscramble an egg.",
+          "Time waits for no man. Unless that man is Chuck Norris.",
+          "Chuck Norris doesn't read books. He stares them down until he gets the information he wants.",
+          "Chuck Norris can strangle you with a cordless phone.",
+          "Chuck Norris destroyed the periodic table because he only recognizes the element of surprise.",
+          "Chuck Norris won a game of Connect Four in three moves.",
+          "The dark is afraid of Chuck Norris.",
+          "Chuck Norris can do a wheelie on a unicycle.",
+          "Chuck Norris can pick oranges from an apple tree and make the best lemonade you've ever tasted."
+        ];
+        let lastIndex = -1;
+        function newJoke() {
+          let idx;
+          do { idx = Math.floor(Math.random() * jokes.length); } while (idx === lastIndex);
+          lastIndex = idx;
+          document.getElementById('joke').textContent = jokes[idx];
+        }
+        newJoke();
+      </script>
+    </body>
+    </html>

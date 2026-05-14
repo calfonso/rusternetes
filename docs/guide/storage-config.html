@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -104,8 +105,8 @@
       <p class="breadcrumb">Configuration &rsaquo; Storage Backends</p>
       <h1>Storage Backends</h1>
       <p class="lead">
-        Rūsternetes supports three storage backends: etcd for production clusters, SQLite
-        (via rhino) for lightweight deployments, and an in-memory backend for testing.
+        Rūsternetes supports four storage backends: etcd for production clusters, SQLite
+        and Redis (via rhino) for lightweight deployments, and an in-memory backend for testing.
         All backends implement the same <code>Storage</code> trait.
       </p>
 
@@ -117,6 +118,7 @@
             <th>Feature</th>
             <th>etcd</th>
             <th>SQLite (rhino)</th>
+            <th>Redis (rhino)</th>
             <th>Memory</th>
           </tr>
         </thead>
@@ -125,17 +127,20 @@
             <td>Use case</td>
             <td>Production clusters</td>
             <td>Lightweight / all-in-one</td>
+            <td>Lightweight / all-in-one</td>
             <td>Unit tests only</td>
           </tr>
           <tr>
             <td>Persistence</td>
             <td>Distributed, replicated</td>
             <td>Single file on disk</td>
+            <td>Redis server (with optional AOF/RDB)</td>
             <td>None (lost on restart)</td>
           </tr>
           <tr>
             <td>Watch support</td>
             <td>gRPC watch streams</td>
+            <td>Broadcast channel (capacity 1000)</td>
             <td>Broadcast channel (capacity 1000)</td>
             <td>Broadcast channel</td>
           </tr>
@@ -143,22 +148,26 @@
             <td>External dependency</td>
             <td>etcd cluster required</td>
             <td>None (embedded) or rhino gRPC server</td>
+            <td>Redis server required</td>
             <td>None</td>
           </tr>
           <tr>
             <td>HA support</td>
             <td>Yes (etcd replication)</td>
             <td>No</td>
+            <td>Yes (Redis Sentinel / Cluster)</td>
             <td>No</td>
           </tr>
           <tr>
             <td>Auto-compaction</td>
             <td>Yes (etcd built-in)</td>
             <td>Yes (every 300s)</td>
+            <td>Yes (every 300s)</td>
             <td>N/A</td>
           </tr>
           <tr>
             <td>Auto-UID generation</td>
+            <td>No</td>
             <td>No</td>
             <td>No</td>
             <td>Yes</td>
@@ -167,6 +176,7 @@
             <td>Feature flag</td>
             <td>Always available</td>
             <td><code>sqlite</code></td>
+            <td><code>redis</code></td>
             <td>Always available</td>
           </tr>
         </tbody>
@@ -317,6 +327,76 @@ rusternetes \
 podman compose -f compose.sqlite.yml up -d</code>
       </pre>
 
+      <h2>Redis Backend (rhino)</h2>
+      <p>
+        The Redis backend uses <a href="https://github.com/calfonso/rhino">rhino</a>'s
+        RedisBackend to store cluster state in a Redis server. Like the SQLite backend,
+        it implements the same key-value semantics as etcd. It can run in two modes:
+      </p>
+
+      <h3>Embedded Mode (All-in-One)</h3>
+      <p>
+        The Redis backend runs in-process with rhino's RedisBackend, connecting directly
+        to a Redis server. No gRPC layer is needed.
+      </p>
+
+      <pre>
+        <div class="code-header">
+          <span class="code-dot red"></span>
+          <span class="code-dot yellow"></span>
+          <span class="code-dot green"></span>
+          <span class="code-title">terminal</span>
+        </div>
+        <code><span class="comment"># All-in-one with embedded Redis backend</span>
+rusternetes \
+  <span class="flag">--storage-backend</span> <span class="value">redis</span> \
+  <span class="flag">--redis-url</span> <span class="value">redis://localhost:6379</span></code>
+      </pre>
+
+      <h3>gRPC Mode (Docker Compose)</h3>
+      <p>
+        For multi-container deployments, rhino can run as a separate gRPC service backed
+        by Redis that multiple components connect to. Use <code>compose.redis.yml</code>:
+      </p>
+
+      <pre>
+        <div class="code-header">
+          <span class="code-dot red"></span>
+          <span class="code-dot yellow"></span>
+          <span class="code-dot green"></span>
+          <span class="code-title">terminal</span>
+        </div>
+        <code><span class="comment"># Start with Redis gRPC backend</span>
+podman compose -f compose.redis.yml up -d</code>
+      </pre>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Setting</th>
+            <th>Value</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>compact_interval</code></td>
+            <td>300s</td>
+            <td>How often to compact old revisions</td>
+          </tr>
+          <tr>
+            <td>Watch mechanism</td>
+            <td>Broadcast channel</td>
+            <td>In-process tokio broadcast for watch events</td>
+          </tr>
+          <tr>
+            <td>Feature flag</td>
+            <td><code>redis</code></td>
+            <td>Must be enabled at compile time</td>
+          </tr>
+        </tbody>
+      </table>
+
       <h2>Memory Backend</h2>
       <p>
         An in-memory <code>HashMap</code>-based storage backend used exclusively for unit tests.
@@ -445,6 +525,7 @@ async fn test_create_pod() {
       <ul>
         <li><strong>etcd</strong>: <code>resourceVersion</code> = etcd <code>mod_revision</code> (monotonically increasing integer)</li>
         <li><strong>SQLite</strong>: <code>resourceVersion</code> = rhino <code>mod_revision</code> (same semantics)</li>
+        <li><strong>Redis</strong>: <code>resourceVersion</code> = rhino <code>mod_revision</code> (same semantics)</li>
         <li><strong>Memory</strong>: <code>resourceVersion</code> = internal counter</li>
       </ul>
 
@@ -458,7 +539,8 @@ async fn test_create_pod() {
         <p>
           Use <strong>etcd</strong> for production multi-node clusters that need HA and replication.
           Use <strong>SQLite</strong> for single-node or development deployments where simplicity
-          matters. Use <strong>memory</strong> only in test code.
+          matters. Use <strong>Redis</strong> when you need a lightweight backend with optional
+          HA via Redis Sentinel or Cluster. Use <strong>memory</strong> only in test code.
         </p>
       </div>
 

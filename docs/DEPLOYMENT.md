@@ -1,12 +1,14 @@
 # Rūsternetes Deployment Guide
 
-Rusternetes supports three deployment modes from the same codebase. Choose based on your needs.
+Rusternetes supports five deployment modes from the same codebase. Choose based on your needs.
 
 | Mode | Storage | Best For | Console |
 |---|---|---|---|
-| Compose + etcd | etcd cluster | Production, multi-node, HA | Included |
+| Compose + etcd | etcd cluster | Production, HA, multi-node | Included |
 | Compose + SQLite | SQLite via Rhino | Development, simpler ops | Included |
+| Compose + Redis | Redis via Rhino | In-memory performance, dev/test | Included |
 | All-in-one binary | Embedded SQLite | Edge, CI/CD, single-node, learning | Included |
+| All-in-one + Redis | Embedded Rhino + Redis | All-in-one with Redis performance | Included |
 
 The web console (`https://localhost:6443/console/`) deploys automatically in all modes.
 
@@ -64,7 +66,19 @@ bash scripts/bootstrap-cluster.sh
 
 Same components as Mode 1, but storage goes through Rhino's etcd-compatible gRPC API backed by SQLite.
 
-## Mode 3: All-in-One Binary
+## Mode 3: Compose + Redis
+
+Same cluster architecture, but [Rhino](https://github.com/calfonso/rhino) uses Redis as its backing store instead of SQLite or etcd. Redis provides in-memory performance with optional persistence.
+
+```bash
+podman compose -f compose.redis.yml build
+podman compose -f compose.redis.yml up -d
+bash scripts/bootstrap-cluster.sh
+```
+
+Same components as Mode 1. Requires the rhino repo adjacent to this one.
+
+## Mode 4: All-in-One Binary
 
 All five Kubernetes components in a single Rust process with embedded SQLite. No containers for infrastructure — just one binary.
 
@@ -90,7 +104,9 @@ This starts the API server, scheduler, controller manager, kubelet, and kube-pro
 
 | Flag | Default | Description |
 |---|---|---|
+| `--storage-backend` | `sqlite` | `sqlite`, `etcd`, or `redis` |
 | `--data-dir` | `./data/rusternetes.db` | SQLite database path |
+| `--redis-url` | `redis://localhost:6379` | Redis URL (redis backend) |
 | `--bind-address` | `0.0.0.0:6443` | API server listen address |
 | `--node-name` | `node-1` | Kubelet node name |
 | `--tls` | off | Enable TLS with self-signed cert |
@@ -98,6 +114,23 @@ This starts the API server, scheduler, controller manager, kubelet, and kube-pro
 | `--console-dir` | *(disabled)* | Path to console SPA build |
 | `--client-ca-file` | *(disabled)* | Client CA for mTLS auth |
 | `--disable-proxy` | off | Disable kube-proxy (no iptables) |
+
+## Mode 5: All-in-One + Redis
+
+The all-in-one binary with Redis for storage. Two containers total.
+
+```bash
+podman compose -f compose.all-in-one-redis.yml build
+podman compose -f compose.all-in-one-redis.yml up -d
+bash scripts/bootstrap-cluster.sh
+```
+
+Or run locally with your own Redis:
+
+```bash
+cargo build -p rusternetes --features redis --release
+./target/release/rusternetes --storage-backend redis --redis-url redis://localhost:6379
+```
 
 ## High Availability
 

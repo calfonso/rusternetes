@@ -1,0 +1,203 @@
+# Rusternetes cluster with Redis storage via rhino.
+#
+# Rhino is an etcd-compatible gRPC server backed by Redis.
+# All components use their existing --etcd-servers flag pointed at rhino.
+#
+# Usage:
+#   podman compose -f compose.redis.yml build
+#   podman compose -f compose.redis.yml up -d
+#   bash scripts/bootstrap-cluster.sh
+#
+# Requires the rhino repo adjacent to this one:
+#   dev/
+#     rusternetes/   (this repo)
+#     rhino/         (https://github.com/calfonso/rhino)
+
+services:
+  # Redis - backing store for rhino
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: rusternetes-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - rusternetes-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  # Rhino - etcd-compatible gRPC server backed by Redis
+  rhino:
+    build:
+      context: ../rhino
+      dockerfile: ../rusternetes/Dockerfile.rhino
+    container_name: rusternetes-rhino
+    ports:
+      - "2379:2379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rusternetes-net
+    command:
+      - "--listen-address"
+      - "0.0.0.0:2379"
+      - "--endpoint"
+      - "redis://redis:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+
+  # API Server - central management component
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.api-server
+    container_name: rusternetes-api-server
+    privileged: true
+    ports:
+      - "6443:6443"
+    depends_on:
+      rhino:
+        condition: service_healthy
+    networks:
+      rusternetes-net:
+        aliases:
+          - api-server
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///run/podman/podman.sock
+    command:
+      - "--bind-address"
+      - "0.0.0.0:6443"
+      - "--etcd-servers"
+      - "http://rhino:2379"
+      - "--tls"
+      - "--tls-cert-file"
+      - "/etc/kubernetes/pki/api-server.crt"
+      - "--tls-key-file"
+      - "/etc/kubernetes/pki/api-server.key"
+      - "--skip-auth"
+      - "--console-dir"
+      - "/app/console"
+      - "--log-level"
+      - "info"
+
+  # Scheduler - assigns pods to nodes
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    container_name: rusternetes-scheduler
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - rusternetes-net
+    environment:
+      - RUST_LOG=info
+    command: ["--etcd-servers", "http://rhino:2379", "--interval", "1"]
+
+  # Controller Manager - runs controllers
+  controller-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller-manager
+    container_name: rusternetes-controller-manager
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - rusternetes-net
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+    environment:
+      - RUST_LOG=info
+    command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "3"]
+
+  # Kubelet - node agent that manages containers
+  kubelet:
+    build:
+      context: .
+      dockerfile: Dockerfile.kubelet
+    container_name: rusternetes-kubelet
+    privileged: true
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - rusternetes-net
+    volumes:
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+
+  # Kubelet 2 - second node agent for multi-node conformance tests
+  kubelet2:
+    build:
+      context: .
+      dockerfile: Dockerfile.kubelet
+    container_name: rusternetes-kubelet2
+    privileged: true
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - rusternetes-net
+    volumes:
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    command: ["--node-name", "node-2", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10251", "--sync-interval", "3"]
+
+  # Kube-proxy - network proxy (host network mode for iptables)
+  kube-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.kube-proxy
+    container_name: rusternetes-kube-proxy
+    privileged: true
+    network_mode: host
+    user: "0:0"
+    depends_on:
+      - api-server
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    environment:
+      - RUST_LOG=info
+    # Host network: rhino is accessible via the mapped port on localhost
+    command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
+
+networks:
+  rusternetes-net:
+    driver: bridge
+    name: rusternetes-network
+
+volumes:
+  redis-data:
+    name: rusternetes-redis-data
