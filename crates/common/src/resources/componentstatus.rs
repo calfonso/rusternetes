@@ -11,7 +11,7 @@ pub struct ComponentStatus {
     pub metadata: ObjectMeta,
 
     /// Conditions holds the status of the component
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<ComponentCondition>>,
 }
 
