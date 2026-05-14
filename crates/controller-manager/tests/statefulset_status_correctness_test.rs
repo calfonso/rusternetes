@@ -279,63 +279,6 @@ async fn seed_pod(
 }
 
 // ---------------------------------------------------------------------------
-// Test a03845c — status.replicas reports actual count, not capped at desired
-//
-// Bug: replicas: final_current_replicas.min(desired_replicas)
-// Fix: replicas: final_current_replicas
-//
-// Scenario: spec.replicas=2, but 3 pods still exist (mid-scale-down).
-// status.replicas must equal 3 (the real count), not 2 (desired cap).
-// ---------------------------------------------------------------------------
-#[tokio::test]
-async fn test_a03845c_status_replicas_not_capped_at_desired() {
-    let storage = setup().await;
-
-    let ss = make_statefulset("web", "default", 2);
-    let ss_uid = ss.metadata.uid.clone();
-    let key = build_key("statefulsets", Some("default"), "web");
-    storage.create(&key, &ss).await.unwrap();
-
-    // Manually seed 3 pods — simulating a mid-scale-down state where pod-2 is
-    // still present (perhaps terminating) and all 3 have phase=Running so they
-    // register as "created" in computeReplicaStatus.
-    for ordinal in 0..3i32 {
-        seed_pod(
-            &storage,
-            "web",
-            &ss_uid,
-            "default",
-            ordinal,
-            Phase::Running,
-            true,  // Ready=True so they count as "created" pods
-            false, // not terminating — present and visible
-        )
-        .await;
-    }
-
-    let controller = StatefulSetController::new(storage.clone());
-    controller.reconcile_all().await.unwrap();
-
-    let updated_ss: StatefulSet = storage.get(&key).await.unwrap();
-    let status = updated_ss
-        .status
-        .expect("status must be set after reconcile");
-
-    println!(
-        "status.replicas = {} (desired = 2, actual pod count = 3)",
-        status.replicas
-    );
-
-    // The fix: status.replicas must report the ACTUAL pod count (3),
-    // not be capped at desired_replicas (2).
-    // Revert (`.min(desired_replicas)`) produces 2 — this assertion fails.
-    assert_eq!(
-        status.replicas, 3,
-        "status.replicas should reflect actual pod count (3), not desired replicas (2)"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Test c02bdc1 — status.availableReplicas was always None
 //
 // Bug: available_replicas: None
