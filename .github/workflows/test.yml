@@ -18,22 +18,6 @@ jobs:
     name: cargo nextest + clippy
     runs-on: self-hosted
     steps:
-      - name: Free up runner disk space
-        # ubuntu-latest only has ~14 GB free on the system disk, which is
-        # not enough for the full debug build of this workspace + rhino +
-        # all test binaries. rustc/ld fail with "No space left on device"
-        # and SIGBUS during link. Strip pre-installed toolchains we do not
-        # use (Android SDK, .NET, Haskell, big docker images) to free
-        # ~30 GB before any cargo step runs.
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: false
-
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
