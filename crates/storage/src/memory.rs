@@ -130,15 +130,17 @@ impl Storage for MemoryStorage {
     {
         // Inject a Conflict error if requested by a test (see inject_conflicts).
         if self.conflict_update_count.load(Ordering::SeqCst) > 0 {
-            let prev = self
-                .conflict_update_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                    if v > 0 { Some(v - 1) } else { None }
-                });
+            let prev =
+                self.conflict_update_count
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                        if v > 0 {
+                            Some(v - 1)
+                        } else {
+                            None
+                        }
+                    });
             if prev.is_ok() {
-                return Err(Error::Conflict(
-                    "injected conflict for test".to_string(),
-                ));
+                return Err(Error::Conflict("injected conflict for test".to_string()));
             }
         }
 

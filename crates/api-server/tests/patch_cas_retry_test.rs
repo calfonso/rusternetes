@@ -17,11 +17,11 @@
 //! to the client as HTTP 409 instead of the expected 200.
 
 use axum::{body::Body, http::Request};
+use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::auth::TokenManager;
 use rusternetes_common::authz::AlwaysAllowAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_storage::{build_key, memory::MemoryStorage, StorageBackend, Storage};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -50,11 +50,7 @@ fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
 /// Send a PATCH request to `uri` with the given JSON body and
 /// `Content-Type: application/merge-patch+json`.
 /// Returns the HTTP status code and the response body as a `serde_json::Value`.
-async fn patch_json(
-    state: Arc<ApiServerState>,
-    uri: &str,
-    body: &Value,
-) -> (u16, Value) {
+async fn patch_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
     let router = build_router(state, None);
     let body_bytes = serde_json::to_vec(body).unwrap();
     let req = Request::builder()
@@ -109,8 +105,12 @@ async fn test_patch_generic_retries_on_conflict() {
 
     let state = make_state(mem.clone());
     let patch = json!({"data": {"key": "patched"}});
-    let (status, body) =
-        patch_json(state, "/api/v1/namespaces/default/configmaps/cm-retry-test", &patch).await;
+    let (status, body) = patch_json(
+        state,
+        "/api/v1/namespaces/default/configmaps/cm-retry-test",
+        &patch,
+    )
+    .await;
 
     println!("status={} body={}", status, body);
 

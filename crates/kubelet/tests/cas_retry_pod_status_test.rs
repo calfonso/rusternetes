@@ -90,7 +90,12 @@ impl Storage for RvEnforcingStorage {
         let serialized = serde_json::to_string(&json)?;
         // Store directly in inner without going through inner.create (which adds its own UID/RV)
         // We bypass inner by using update_raw after creating a placeholder
-        self.inner.create(key, &serde_json::from_str::<serde_json::Value>(&serialized)?).await?;
+        self.inner
+            .create(
+                key,
+                &serde_json::from_str::<serde_json::Value>(&serialized)?,
+            )
+            .await?;
         Ok(serde_json::from_value(json)?)
     }
 
@@ -532,10 +537,7 @@ async fn test_3147f7b_cas_reread_uses_fresh_pod_not_stale() {
     );
 
     // POST-FIX: Re-read correctly gets fresh pod (Ok(p), not stale clone)
-    let reread: Pod = storage
-        .get(&key)
-        .await
-        .expect("re-read must succeed");
+    let reread: Pod = storage.get(&key).await.expect("re-read must succeed");
     let reread_rv = reread.metadata.resource_version.clone();
     println!(
         "re-read rv = {:?} (must match after_external_rv = {:?})",
@@ -584,7 +586,9 @@ async fn test_3147f7b_cas_reread_uses_fresh_pod_not_stale() {
         .and_then(|s| s.conditions.as_ref())
         .expect("conditions must be set");
     assert!(
-        conditions.iter().any(|c| c.condition_type == "Ready" && c.status == "True"),
+        conditions
+            .iter()
+            .any(|c| c.condition_type == "Ready" && c.status == "True"),
         "Ready=True condition must be persisted after proper re-read + retry"
     );
     assert_eq!(
@@ -600,7 +604,9 @@ async fn test_3147f7b_cas_reread_uses_fresh_pod_not_stale() {
         .and_then(|s| s.conditions.as_ref())
         .expect("final conditions must be set");
     assert!(
-        final_conditions.iter().any(|c| c.condition_type == "Ready" && c.status == "True"),
+        final_conditions
+            .iter()
+            .any(|c| c.condition_type == "Ready" && c.status == "True"),
         "Ready=True must persist in storage after CAS retry with fresh re-read"
     );
     println!("test passed: fresh re-read enables successful CAS retry");

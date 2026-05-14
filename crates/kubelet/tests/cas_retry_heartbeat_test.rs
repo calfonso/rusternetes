@@ -220,8 +220,14 @@ async fn test_f94882a_heartbeat_cas_retry_persists_heartbeat() {
 
     // First attempt: Conflict (injected) — simulates the CAS failure
     let result = storage.update(&key, &heartbeat_node).await;
-    assert!(result.is_err(), "expected Conflict on first heartbeat update");
-    println!("first heartbeat conflict (expected): {}", result.unwrap_err());
+    assert!(
+        result.is_err(),
+        "expected Conflict on first heartbeat update"
+    );
+    println!(
+        "first heartbeat conflict (expected): {}",
+        result.unwrap_err()
+    );
 
     // Fixed retry pattern: re-read and apply heartbeat
     // Pre-fix: the error is `let _ = ` discarded — heartbeat never sent

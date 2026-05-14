@@ -15,9 +15,7 @@
 
 use async_trait::async_trait;
 use rusternetes_common::{
-    resources::{
-        Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus,
-    },
+    resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec, PodStatus},
     types::{ObjectMeta, Phase, TypeMeta},
     Error,
 };
@@ -265,7 +263,11 @@ fn make_pod_with_inits(name: &str, namespace: &str) -> Pod {
                     name: "init-1".to_string(),
                     image: "busybox:latest".to_string(),
                     image_pull_policy: None,
-                    command: Some(vec!["sh".to_string(), "-c".to_string(), "echo init1".to_string()]),
+                    command: Some(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo init1".to_string(),
+                    ]),
                     args: None,
                     ports: None,
                     env: None,
@@ -291,7 +293,11 @@ fn make_pod_with_inits(name: &str, namespace: &str) -> Pod {
                     name: "init-2".to_string(),
                     image: "busybox:latest".to_string(),
                     image_pull_policy: None,
-                    command: Some(vec!["sh".to_string(), "-c".to_string(), "echo init2".to_string()]),
+                    command: Some(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo init2".to_string(),
+                    ]),
                     args: None,
                     ports: None,
                     env: None,
@@ -470,11 +476,7 @@ async fn test_9ff9e3a_init_container_statuses_refreshed_on_cas_retry() {
         println!("  {} ready={} state={:?}", ic.name, ic.ready, ic.state);
     }
 
-    assert_eq!(
-        saved_ics.len(),
-        2,
-        "both init containers must be present"
-    );
+    assert_eq!(saved_ics.len(), 2, "both init containers must be present");
     for ic in saved_ics {
         assert!(
             ic.ready,

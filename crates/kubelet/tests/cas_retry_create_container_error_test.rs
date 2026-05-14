@@ -254,7 +254,10 @@ async fn test_7881f80_create_container_error_persisted_after_cas_conflict() {
     if let Some(ref mut s) = concurrent.status {
         s.message = Some("concurrent update".to_string());
     }
-    let _ = inner.update(&key, &concurrent).await.expect("concurrent update");
+    let _ = inner
+        .update(&key, &concurrent)
+        .await
+        .expect("concurrent update");
 
     // Wrap in ConflictOnceStorage
     let storage = ConflictOnceStorage::new(inner);
@@ -341,10 +344,7 @@ async fn test_7881f80_create_container_error_persisted_after_cas_conflict() {
         }
     }
 
-    println!(
-        "saved state = {:?}",
-        main_status.state
-    );
+    println!("saved state = {:?}", main_status.state);
 
     // Verify via final read from storage
     let final_pod: Pod = storage.get(&key).await.expect("final get");
