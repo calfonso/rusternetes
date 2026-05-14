@@ -34,6 +34,11 @@ jobs:
             echo "rhino already present at ../rhino (self-hosted runner workspace persists)"
           fi
 
+      - name: Add cargo bin to PATH
+        # Self-hosted runner shells don't source ~/.bashrc, so rustup
+        # (installed at ~/.cargo/bin/rustup) is not on PATH by default.
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Install Rust toolchain
         run: |
           rustup update --no-self-update stable
