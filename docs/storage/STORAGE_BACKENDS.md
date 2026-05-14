@@ -10,7 +10,9 @@ configuration flags and which compose file you use.
 |------|---------|-------------|---------------|----------|
 | Normal | etcd | `compose.yml` | etcd cluster | Production, HA, multi-node |
 | SQLite (normal) | rhino (gRPC) | `compose.sqlite.yml` | rhino container | Multi-container without etcd |
-| SQLite (embedded) | rhino (in-process) | — | None | All-in-one single binary |
+| Redis (normal) | rhino (gRPC) | `compose.redis.yml` | rhino + Redis | Multi-container with Redis |
+| SQLite (embedded) | rhino (in-process) | `compose.all-in-one.yml` | None | All-in-one single binary |
+| Redis (embedded) | rhino (in-process) | `compose.all-in-one-redis.yml` | Redis | All-in-one + Redis |
 
 ---
 
@@ -50,7 +52,18 @@ dev/
   rhino/         (https://github.com/calfonso/rhino)
 ```
 
-### 3. All-in-one binary (embedded SQLite)
+### 3. Normal mode with Redis via rhino
+
+Same as the SQLite mode, but rhino uses Redis as its backing store instead
+of SQLite. Redis provides in-memory performance with optional persistence.
+
+```bash
+podman compose -f compose.redis.yml build
+podman compose -f compose.redis.yml up -d
+bash scripts/bootstrap-cluster.sh
+```
+
+### 4. All-in-one binary (embedded SQLite)
 
 All components run as concurrent tokio tasks in a single process with
 rhino's `SqliteBackend` embedded directly — no gRPC, no network, no
@@ -71,6 +84,25 @@ You can also point the all-in-one at etcd if you prefer:
 ./target/debug/rusternetes --storage-backend etcd --etcd-servers http://etcd:2379
 ```
 
+### 5. All-in-one binary with Redis
+
+Same single-binary approach but with Redis for storage. Rhino's
+`RedisBackend` is embedded directly — no rhino gRPC server needed.
+Requires a Redis server.
+
+```bash
+# Build with redis feature
+cargo build -p rusternetes --features redis --release
+
+# Run with a local Redis
+./target/release/rusternetes --storage-backend redis --redis-url redis://localhost:6379
+
+# Or use the compose file (builds and runs everything)
+podman compose -f compose.all-in-one-redis.yml build
+podman compose -f compose.all-in-one-redis.yml up -d
+bash scripts/bootstrap-cluster.sh
+```
+
 ---
 
 ## Architecture
@@ -86,59 +118,65 @@ All storage access flows through the `Storage` trait defined in `crates/storage/
 Components use the `etcd-client` crate to talk to either real etcd or rhino
 over gRPC. From the component's perspective, there is no difference.
 
-**Embedded mode (in-process SQLite):**
+**Embedded mode (in-process SQLite or Redis):**
 
 ```
-    Component  --storage-backend=sqlite-->  RhinoStorage  --direct-->  SQLite file
+    Component  --storage-backend=sqlite-->  RhinoStorage<SqliteBackend>  --direct-->  SQLite file
+    Component  --storage-backend=redis-->   RhinoStorage<RedisBackend>   --direct-->  Redis server
 ```
 
 The `StorageBackend` enum dispatches to the concrete implementation:
 
 ```
-    +-----------------+          +------------------+
-    | StorageBackend  |          | StorageBackend   |
-    |   ::Etcd        |          |   ::Sqlite       |
-    |                 |          |                  |
-    | EtcdStorage     |          | RhinoStorage     |
-    |   etcd-client   |          |   SqliteBackend  |
-    |   gRPC          |          |   in-process     |
-    +-----------------+          +------------------+
-           |                             |
-           v                             v
-     etcd or rhino              SQLite file on disk
-     (network, :2379)           (e.g. ./data/cluster.db)
+    +-----------------+     +------------------+     +------------------+
+    | StorageBackend  |     | StorageBackend   |     | StorageBackend   |
+    |   ::Etcd        |     |   ::Sqlite       |     |   ::Redis        |
+    |                 |     |                  |     |                  |
+    | EtcdStorage     |     | RhinoStorage     |     | RhinoStorage     |
+    |   etcd-client   |     |   SqliteBackend  |     |   RedisBackend   |
+    |   gRPC          |     |   in-process     |     |   in-process     |
+    +-----------------+     +------------------+     +------------------+
+           |                        |                        |
+           v                        v                        v
+     etcd or rhino         SQLite file on disk          Redis server
+     (network, :2379)      (./data/cluster.db)          (redis://host:6379)
 ```
 
 ---
 
-## Feature Flag
+## Feature Flags
 
-SQLite support is behind the `sqlite` Cargo feature to keep the default build
-lean. When disabled, the SQLite code and all sqlx/rhino dependencies are
-excluded entirely.
+SQLite and Redis support are behind Cargo features to keep the default build
+lean. When disabled, the rhino dependency and related code are excluded.
 
 ```bash
-# Build with SQLite support
+# Build with SQLite support (default for all-in-one)
 cargo build --features sqlite
 
-# Build without (default — etcd only)
+# Build with Redis support
+cargo build --features redis
+
+# Build with both
+cargo build --features sqlite,redis
+
+# Build without either (etcd only)
 cargo build
 ```
 
-The feature propagates through the crate graph:
+The features propagate through the crate graph:
 
 ```
-rusternetes-api-server/sqlite
-  -> rusternetes-storage/sqlite
-    -> dep:rhino (git)
+rusternetes-api-server/sqlite  -> rusternetes-storage/sqlite  -> dep:rhino
+rusternetes-api-server/redis   -> rusternetes-storage/redis   -> dep:rhino
 ```
 
 Every binary crate (api-server, scheduler, controller-manager, kubelet,
-kube-proxy) defines a `sqlite` feature that forwards to
-`rusternetes-storage/sqlite`.
+kube-proxy) defines both `sqlite` and `redis` features that forward to
+`rusternetes-storage`.
 
 The `rusternetes` all-in-one crate enables the `sqlite` feature **by
-default** — no extra flags needed when building it.
+default** — no extra flags needed when building it. For Redis, pass
+`--features redis`.
 
 ---
 
@@ -185,6 +223,33 @@ scheduler --etcd-servers http://localhost:2379
 # ... etc
 ```
 
+### Redis via rhino (normal multi-container)
+
+Use `compose.redis.yml` to swap etcd for rhino+Redis. Rhino translates the
+etcd gRPC API to Redis operations. Components use their existing
+`--etcd-servers` flag pointed at rhino.
+
+```bash
+podman compose -f compose.redis.yml build
+podman compose -f compose.redis.yml up -d
+bash scripts/bootstrap-cluster.sh
+```
+
+Or run rhino with Redis directly:
+
+```bash
+# Start Redis
+redis-server
+
+# Start rhino pointed at Redis (from the rhino repo)
+rhino-server --listen-address 0.0.0.0:2379 --endpoint redis://localhost:6379
+
+# Point components at rhino
+api-server --etcd-servers http://localhost:2379
+scheduler --etcd-servers http://localhost:2379
+# ... etc
+```
+
 ### All-in-one binary
 
 The `rusternetes` binary spawns all components as tokio tasks in one process.
@@ -194,6 +259,10 @@ The `sqlite` feature is enabled by default for this crate.
 # Build and run with defaults (SQLite, localhost:6443, node-1)
 cargo build -p rusternetes
 ./target/debug/rusternetes
+
+# With Redis instead
+cargo build -p rusternetes --features redis
+./target/debug/rusternetes --storage-backend redis --redis-url redis://localhost:6379
 
 # Custom configuration
 ./target/debug/rusternetes \
@@ -209,14 +278,6 @@ cargo build -p rusternetes
 
 The database file is created automatically if it does not exist.
 
-Individual components can also be run standalone with embedded SQLite
-(requires building them with the `sqlite` feature):
-
-```bash
-cargo build --features sqlite -p rusternetes-api-server
-./target/debug/api-server --storage-backend sqlite --data-dir ./data/cluster.db
-```
-
 ---
 
 ## CLI Flags
@@ -227,17 +288,20 @@ Every component binary accepts these storage flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--storage-backend` | `etcd` | `etcd` or `sqlite` |
-| `--data-dir` | `./data/rusternetes.db` | SQLite database file path (ignored when backend is etcd) |
-| `--etcd-servers` | `http://localhost:2379` | etcd endpoints, comma-separated (ignored when backend is sqlite) |
+| `--storage-backend` | `etcd` | `etcd`, `sqlite`, or `redis` |
+| `--data-dir` | `./data/rusternetes.db` | SQLite database file path (sqlite backend) |
+| `--etcd-servers` | `http://localhost:2379` | etcd endpoints, comma-separated (etcd backend) |
+| `--redis-url` | `redis://localhost:6379` | Redis connection URL (redis backend) |
 
 ### All-in-one binary (`rusternetes`)
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--storage-backend` | `sqlite` | `sqlite` or `etcd` |
+| `--storage-backend` | `sqlite` | `sqlite`, `etcd`, or `redis` |
 | `--data-dir` | `./data/rusternetes.db` | SQLite database file path |
 | `--etcd-servers` | `http://localhost:2379` | etcd endpoints (when `--storage-backend=etcd`) |
+| `--redis-url` | `redis://localhost:6379` | Redis URL (when `--storage-backend=redis`) |
+| `--kubernetes-service-host` | `127.0.0.1` | API server address injected into pods (or `KUBERNETES_SERVICE_HOST_OVERRIDE` env var) |
 | `--bind-address` | `0.0.0.0:6443` | API server listen address |
 | `--node-name` | `node-1` | Node name for the embedded kubelet |
 | `--volume-dir` | `./data/volumes` | Pod volume directory |
@@ -274,8 +338,11 @@ Both backends support the full watch API including `watch_from_revision`.
 - **etcd**: Uses etcd's native gRPC watch streams with `prev_kv` for delete
   events.
 - **SQLite**: Rhino's poll loop detects new rows in the `kine` table and
-  broadcasts events via `tokio::sync::broadcast` channels. Historical replay
+  broadcasts events via per-subscriber mpsc channels. Historical replay
   is supported by querying rows with `id > revision`.
+- **Redis**: Same poll loop architecture as SQLite, but backed by Redis
+  sorted sets and Lua scripts for atomic operations. Events are broadcast
+  via the same subscriber pattern.
 
 ### Optimistic concurrency
 
@@ -286,6 +353,8 @@ differs:
 - **etcd**: Compare-and-swap transactions checking `mod_revision`.
 - **SQLite**: The `kine` table's `(name, prev_revision)` unique index
   prevents concurrent updates to the same key at the same revision.
+- **Redis**: Atomic Lua scripts ensure create/update/delete operations
+  are serialized per key.
 
 ### Compaction
 
@@ -293,6 +362,8 @@ differs:
 - **SQLite**: Rhino runs a background compaction loop (default every 300s)
   that removes superseded revisions, keeping at least the most recent 1000.
   After compaction, a `PRAGMA wal_checkpoint(FULL)` reclaims disk space.
+- **Redis**: Same compaction loop, removing old revision entries from
+  sorted sets and hash keys.
 
 ---
 
@@ -304,10 +375,10 @@ crates/
     src/
       lib.rs          # Storage trait, StorageConfig, StorageBackend enum
       etcd.rs         # EtcdStorage — etcd-client gRPC implementation
-      rhino.rs        # RhinoStorage — direct rhino::Backend (behind sqlite feature)
+      rhino.rs        # RhinoStorage<B> — generic over rhino::Backend (sqlite/redis features)
       memory.rs       # MemoryStorage — in-memory for unit tests
       concurrency.rs  # resourceVersion <-> mod_revision conversion
-    Cargo.toml        # rhino = { optional = true }, [features] sqlite = ["dep:rhino"]
+    Cargo.toml        # rhino = { optional = true }, [features] sqlite/redis = ["dep:rhino"]
 
   rusternetes/        # All-in-one meta-crate
     src/main.rs       # Spawns all components as tokio tasks
@@ -358,6 +429,8 @@ pub enum StorageConfig {
     Etcd { endpoints: Vec<String> },
     #[cfg(feature = "sqlite")]
     Sqlite { path: String },
+    #[cfg(feature = "redis")]
+    Redis { url: String },
 }
 ```
 
@@ -367,7 +440,9 @@ pub enum StorageConfig {
 pub enum StorageBackend {
     Etcd(EtcdStorage),
     #[cfg(feature = "sqlite")]
-    Sqlite(RhinoStorage),
+    Sqlite(RhinoStorage),          // RhinoStorage<SqliteBackend>
+    #[cfg(feature = "redis")]
+    Redis(RhinoRedisStorage),      // RhinoStorage<RedisBackend>
 }
 
 impl Storage for StorageBackend { /* dispatches to inner */ }
@@ -392,32 +467,34 @@ is SQLite.
 
 ---
 
-## Rhino gRPC Mode (compose.sqlite.yml)
+## Rhino gRPC Mode (compose.sqlite.yml / compose.redis.yml)
 
-The simplest way to use SQLite in a normal multi-container deployment.
-Rhino replaces etcd as a drop-in: same gRPC API, backed by SQLite.
+The simplest way to use SQLite or Redis in a normal multi-container deployment.
+Rhino replaces etcd as a drop-in: same gRPC API, backed by the chosen database.
 
 **Files:**
 - `Dockerfile.rhino` — builds the rhino-server binary from the adjacent repo
-- `compose.sqlite.yml` — full cluster with rhino instead of etcd
+- `compose.sqlite.yml` — full cluster with rhino backed by SQLite
+- `compose.redis.yml` — full cluster with rhino backed by Redis
 
 **How it works:** Components use their existing `--etcd-servers` flag pointed
 at `http://rhino:2379`. The `etcd-client` crate in `EtcdStorage` connects to
-rhino's tonic gRPC server, which translates operations to SQLite queries.
+rhino's tonic gRPC server, which translates operations to the chosen backend.
 Watch streams work via rhino's poll loop (1-second intervals).
 
 **Advantages over the embedded approach:**
 - No feature flags or recompilation needed — same binaries as etcd mode
 - Watches work correctly across process boundaries via gRPC streaming
-- Can inspect cluster state with `sqlite3 /data/db/state.db`
+- Can inspect cluster state with `sqlite3` or `redis-cli`
 
-**Trade-off:** One extra container (rhino) vs. zero containers for embedded.
+**Trade-off:** Extra container(s) (rhino + optionally Redis) vs. fewer for embedded.
 
 ---
 
 ## Rhino Library Dependency (embedded mode)
 
-Rhino is included as a git dependency in the storage crate. This assumes the following directory layout for local development:
+Rhino is included as a local path dependency in the storage crate. This
+requires the following directory layout:
 
 ```
 dev/
@@ -425,10 +502,11 @@ dev/
   rhino/          # https://github.com/calfonso/rhino
 ```
 
-Rhino provides three database backends (SQLite, PostgreSQL, MySQL) behind its
-`Backend` trait. Rusternetes currently uses `SqliteBackend` only. Adding
-PostgreSQL or MySQL support would require adding new `StorageConfig` variants
-and corresponding `StorageBackend` arms — the plumbing is identical.
+Rhino provides four database backends (SQLite, Redis, PostgreSQL, MySQL) behind
+its `Backend` trait. Rusternetes uses `SqliteBackend` and `RedisBackend`.
+`RhinoStorage<B>` is generic over the `Backend` trait, so adding PostgreSQL
+or MySQL would only require a new constructor and `StorageConfig`/`StorageBackend`
+variant.
 
 ### Key rhino details
 
@@ -443,11 +521,14 @@ and corresponding `StorageBackend` arms — the plumbing is identical.
 
 ## Limitations
 
-- **No cross-backend migration**: Data cannot be moved between etcd and SQLite
+- **No cross-backend migration**: Data cannot be moved between backends
   without a manual export/import process. Resource versions are not portable.
 - **Single-writer for SQLite**: SQLite supports concurrent reads but serializes
   writes. This is fine for single-node and small multi-container deployments
   but would bottleneck under heavy multi-node write load.
+- **Redis persistence**: Redis is in-memory by default. Enable RDB or AOF
+  persistence in your Redis config to survive restarts. Without persistence,
+  restarting Redis loses all cluster state.
 - **Leader election requires etcd**: Even with embedded SQLite storage, leader
   election still needs an etcd cluster. This is a non-issue for the primary
   use case (single-node, no HA). In rhino gRPC mode, leader election could
@@ -462,6 +543,6 @@ and corresponding `StorageBackend` arms — the plumbing is identical.
 
 ## Related
 
-- [Rhino](https://github.com/calfonso/rhino) — the SQLite/SQL-backed etcd shim
+- [Rhino](https://github.com/calfonso/rhino) — the SQLite/Redis/SQL-backed etcd shim
 - [kine](https://github.com/k3s-io/kine) — the Go project rhino is inspired by
 - [CSI Integration](csi-integration.md) — volume plugin storage (separate concern)

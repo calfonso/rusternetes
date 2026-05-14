@@ -6,8 +6,11 @@
 
 ```bash
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
-podman compose build                              # Full cluster with etcd
-podman compose -f compose.sqlite.yml build # SQLite cluster (no etcd)
+podman compose build                               # Full cluster with etcd
+podman compose -f compose.sqlite.yml build         # SQLite cluster (no etcd)
+podman compose -f compose.redis.yml build          # Redis cluster (no etcd)
+podman compose -f compose.all-in-one.yml build     # All-in-one with SQLite
+podman compose -f compose.all-in-one-redis.yml build # All-in-one with Redis
 ```
 
 ### Deploy the cluster

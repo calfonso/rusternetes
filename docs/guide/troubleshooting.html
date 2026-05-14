@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -293,7 +294,7 @@ kubectl get sc <span class="flag">-o</span> jsonpath='{.items[?(@.metadata.annot
       <h2>"Port already in use" on startup</h2>
       <p>
         <strong>Symptom:</strong> <code>podman compose -f compose.yml up</code> fails with
-        <code>bind: address already in use</code> on port 6443 or 2379.
+        <code>bind: address already in use</code> on port 6443, 2379, or 6379.
       </p>
       <p>
         <strong>Cause:</strong> Another process (minikube, kind, a real Kubernetes cluster, or
@@ -313,6 +314,9 @@ lsof <span class="flag">-i</span> :6443
 
 <span class="comment"># Find what is using port 2379 (etcd)</span>
 lsof <span class="flag">-i</span> :2379
+
+<span class="comment"># Find what is using port 6379 (Redis)</span>
+lsof <span class="flag">-i</span> :6379
 
 <span class="comment"># Stop a previous Rūsternetes cluster</span>
 podman compose -f compose.yml down
@@ -461,7 +465,10 @@ curl <span class="flag">-k</span> https://localhost:6443/healthz
 podman compose -f compose.yml exec kube-proxy iptables <span class="flag">-t</span> nat <span class="flag">-L</span> KUBE-SERVICES
 
 <span class="comment"># Check etcd health</span>
-podman compose -f compose.yml exec etcd etcdctl endpoint health</code>
+podman compose -f compose.yml exec etcd etcdctl endpoint health
+
+<span class="comment"># Check Redis health (if using Redis backend)</span>
+podman compose -f compose.redis.yml exec redis redis-cli ping</code>
       </pre>
 
       <div class="doc-pager">

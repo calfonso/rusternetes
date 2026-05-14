@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -142,7 +143,7 @@
 
       <h3>3. Clean Up Existing CoreDNS</h3>
       <p>
-        Removes any existing CoreDNS container and etcd key to ensure a fresh deployment
+        Removes any existing CoreDNS container and storage key to ensure a fresh deployment
         with the latest ServiceAccount token mounted.
       </p>
 
@@ -441,7 +442,10 @@ kubectl <span class="flag">--insecure-skip-tls-verify</span> get nodes</code>
 bash scripts/generate-certs.sh
 
 <span class="comment"># 2. Start the cluster</span>
-podman compose -f compose.yml up -d
+podman compose -f compose.yml up -d              <span class="comment"># etcd backend</span>
+<span class="comment"># Or: podman compose -f compose.redis.yml up -d  # Redis backend via rhino</span>
+<span class="comment"># Or: podman compose -f compose.all-in-one.yml up -d  # embedded SQLite</span>
+<span class="comment"># Or: podman compose -f compose.all-in-one-redis.yml up -d  # Redis all-in-one</span>
 
 <span class="comment"># 3. Wait for the API server to be ready</span>
 until kubectl <span class="flag">--insecure-skip-tls-verify</span> get <span class="flag">--raw</span> /healthz 2>/dev/null; do

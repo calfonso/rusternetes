@@ -16,6 +16,7 @@ path = "src/main.rs"
 [features]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
+redis = ["rusternetes-storage/redis"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "integration-tests"))'] }

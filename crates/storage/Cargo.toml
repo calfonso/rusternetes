@@ -8,10 +8,11 @@ license.workspace = true
 [features]
 default = []
 sqlite = ["dep:rhino"]
+redis = ["dep:rhino"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
-rhino = { git = "https://github.com/calfonso/rhino.git", optional = true }
+rhino = { path = "../../../rhino", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

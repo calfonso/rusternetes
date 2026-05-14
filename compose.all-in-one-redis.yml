@@ -1,0 +1,92 @@
+# All-in-one rusternetes with Redis storage.
+#
+# Two containers: the rusternetes binary (API server, scheduler,
+# controller manager, kubelet) and Redis. Rhino's RedisBackend is
+# embedded in the binary — no separate rhino server needed.
+#
+# Usage:
+#   podman compose -f compose.all-in-one-redis.yml build
+#   podman compose -f compose.all-in-one-redis.yml up -d
+#
+# Requires the rhino repo adjacent to this one:
+#   dev/
+#     rusternetes/   (this repo)
+#     rhino/         (https://github.com/calfonso/rhino)
+
+services:
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: rusternetes-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - rusternetes-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  rusternetes:
+    build:
+      context: ..
+      dockerfile: rusternetes/Dockerfile.all-in-one
+      args:
+        CARGO_FEATURES: redis
+    container_name: rusternetes
+    privileged: true
+    ports:
+      - "6443:6443"
+      - "10250:10250"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      rusternetes-net:
+        ipv4_address: 10.89.0.10
+        aliases:
+          - api-server
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=10.89.0.10
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    command:
+      - "--storage-backend"
+      - "redis"
+      - "--redis-url"
+      - "redis://redis:6379"
+      - "--tls"
+      - "--tls-cert-file"
+      - "/etc/kubernetes/pki/api-server.crt"
+      - "--tls-key-file"
+      - "/etc/kubernetes/pki/api-server.key"
+      - "--disable-proxy"
+      - "--console-dir"
+      - "/app/console"
+      - "--network"
+      - "rusternetes-network"
+      - "--cluster-dns"
+      - "10.96.0.10"
+      - "--volume-dir"
+      - "${KUBELET_VOLUMES_PATH}"
+
+networks:
+  rusternetes-net:
+    driver: bridge
+    name: rusternetes-network
+    ipam:
+      config:
+        - subnet: 10.89.0.0/24
+
+volumes:
+  redis-data:
+    name: rusternetes-redis-data

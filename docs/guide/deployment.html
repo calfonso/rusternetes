@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -103,8 +104,8 @@
     <main class="doc-content">
       <h1>Deployment Overview</h1>
       <p class="lead">
-        Rūsternetes supports three deployment modes: a full compose cluster with etcd,
-        a lighter compose cluster with SQLite (via Rhino), and a single all-in-one binary
+        Rūsternetes supports four deployment modes: a full compose cluster with etcd,
+        lighter compose clusters with SQLite or Redis (via Rhino), and a single all-in-one binary
         that embeds every component in one process. Choose the mode that matches your needs.
       </p>
 
@@ -115,6 +116,7 @@
             <th>Feature</th>
             <th>Full Cluster (etcd)</th>
             <th>SQLite Cluster (Rhino)</th>
+            <th>Redis Cluster (Rhino)</th>
             <th>All-in-One Binary</th>
           </tr>
         </thead>
@@ -123,16 +125,19 @@
             <td>Orchestration</td>
             <td><code>podman compose</code> or <code>docker compose</code></td>
             <td><code>podman compose</code> or <code>docker compose</code></td>
+            <td><code>podman compose</code> or <code>docker compose</code></td>
             <td>Single process</td>
           </tr>
           <tr>
             <td>Storage backend</td>
             <td>etcd (distributed KV)</td>
             <td>SQLite via Rhino gRPC</td>
-            <td>Embedded SQLite</td>
+            <td>Redis via Rhino gRPC</td>
+            <td>Embedded SQLite or Redis</td>
           </tr>
           <tr>
             <td>Node count</td>
+            <td>Multi-node (2+ kubelets)</td>
             <td>Multi-node (2+ kubelets)</td>
             <td>Multi-node (2+ kubelets)</td>
             <td>Single node</td>
@@ -141,10 +146,12 @@
             <td>HA support</td>
             <td>Yes (3-node etcd, leader election)</td>
             <td>No</td>
+            <td>Yes (Redis Sentinel / Cluster)</td>
             <td>No</td>
           </tr>
           <tr>
             <td>TLS</td>
+            <td>Yes (auto-generated certs)</td>
             <td>Yes (auto-generated certs)</td>
             <td>Yes (auto-generated certs)</td>
             <td>Optional (<code>--tls</code> flag)</td>
@@ -153,23 +160,27 @@
             <td>Container runtime</td>
             <td>Yes (Podman or Docker)</td>
             <td>Yes (Podman or Docker)</td>
+            <td>Yes (Podman or Docker)</td>
             <td>Only for pods (not the binary)</td>
           </tr>
           <tr>
             <td>External dependencies</td>
             <td>etcd, Podman or Docker</td>
             <td>Rhino, Podman or Docker</td>
+            <td>Redis, Rhino, Podman or Docker</td>
             <td>Podman or Docker (for pod containers)</td>
           </tr>
           <tr>
             <td>State persistence</td>
             <td>etcd data volume</td>
             <td>Single SQLite file</td>
-            <td>Single SQLite file</td>
+            <td>Redis (AOF/RDB)</td>
+            <td>Single SQLite file or Redis</td>
           </tr>
           <tr>
             <td>Conformance tested</td>
             <td>Yes (90% pass rate)</td>
+            <td>Yes</td>
             <td>Yes</td>
             <td>Yes</td>
           </tr>
@@ -177,11 +188,13 @@
             <td>Production ready</td>
             <td>Yes</td>
             <td>Suitable for non-HA</td>
+            <td>Suitable for non-HA (HA with Sentinel)</td>
             <td>Edge / dev / CI</td>
           </tr>
           <tr>
             <td>Resource footprint</td>
             <td>~1 GB RAM</td>
+            <td>~600 MB RAM</td>
             <td>~600 MB RAM</td>
             <td>~200 MB RAM</td>
           </tr>
@@ -267,10 +280,51 @@
 </code>
       </pre>
 
+      <h2>Architecture: Redis Cluster (Rhino)</h2>
+      <p>
+        Replaces etcd with <a href="https://github.com/calfonso/rhino">Rhino</a> backed by
+        Redis. Components connect to Rhino the same way as in the SQLite cluster, but state
+        is stored in a Redis server. Redis can optionally provide HA via Sentinel or Cluster mode.
+      </p>
+
+      <pre>
+        <div class="code-header">
+          <span class="code-dot red"></span>
+          <span class="code-dot yellow"></span>
+          <span class="code-dot green"></span>
+          <span class="code-title">redis cluster architecture</span>
+        </div>
+        <code>
+<span class="comment"># Compose: Redis Cluster with Rhino</span>
+
+  +-----------------------------------------------------+
+  |                rusternetes-net (bridge)              |
+  |                                                     |
+  |  +-----------+   +-----------+   +---------------+  |
+  |  |  redis    |   |  rhino    |   | controller-   |  |
+  |  |  :6379    |   |  :2379    |   | manager       |  |
+  |  +-----------+   | (redis)   |   +---------------+  |
+  |                  +-----------+                      |
+  |                        |                            |
+  |              +---------+---------+                  |
+  |              |         |         |                  |
+  |  +-----------+   +-----+-----+  +----------+----+  |
+  |  |api-server |   | scheduler |  | kube-proxy   |  |
+  |  |  :6443    |   +-----------+  | (host net)   |  |
+  |  +-----------+                  +--------------+  |
+  |  +---------------+   +---------------+            |
+  |  | kubelet       |   | kubelet       |            |
+  |  | (node-1)      |   | (node-2)      |            |
+  |  +---------------+   +---------------+            |
+  +-----------------------------------------------------+
+</code>
+      </pre>
+
       <h2>Architecture: All-in-One Binary</h2>
       <p>
         Every component runs as a concurrent tokio task inside a single Rust process. Storage
-        is an embedded SQLite database (no network hop). The binary still requires a container
+        is an embedded SQLite or Redis database (no gRPC hop for SQLite; direct Redis connection
+        for Redis). The binary still requires a container
         runtime (Podman or Docker) for running pod containers, but the Kubernetes control plane
         itself is entirely self-contained.
       </p>
@@ -299,7 +353,8 @@
   |  +-------------+  +-----------+                   |
   |         |                                         |
   |  +------+------+                                  |
-  |  | SQLite      |  <span class="comment"># embedded, no network hop</span>       |
+  |  | SQLite or   |  <span class="comment"># embedded SQLite or Redis</span>       |
+  |  | Redis       |                                  |
   |  | (rhino)     |                                  |
   |  +-------------+                                  |
   +---------------------------------------------------+
@@ -329,6 +384,14 @@
         <li>You are running in <strong>resource-constrained</strong> environments where etcd's memory footprint is too large</li>
         <li>You don't need <strong>high availability</strong> (single point of failure is acceptable)</li>
         <li>You want to <strong>inspect state directly</strong> with <code>sqlite3</code></li>
+      </ul>
+
+      <h3>Choose the Redis Cluster (Rhino) when:</h3>
+      <ul>
+        <li>You want a <strong>multi-node</strong> cluster without etcd, backed by Redis</li>
+        <li>You already have <strong>Redis infrastructure</strong> in your environment</li>
+        <li>You want optional <strong>HA</strong> via Redis Sentinel or Redis Cluster without using etcd Raft</li>
+        <li>You prefer <strong>in-memory performance</strong> with optional persistence (AOF/RDB)</li>
       </ul>
 
       <h3>Choose the All-in-One Binary when:</h3>
@@ -370,6 +433,10 @@
           <tr>
             <td>Easiest to operate</td>
             <td><a href="sqlite-cluster.html">Compose + SQLite</a> &mdash; no etcd, state is one file</td>
+          </tr>
+          <tr>
+            <td>Lightweight with HA option</td>
+            <td><a href="redis-cluster.html">Compose + Redis</a> &mdash; no etcd, optional Redis Sentinel HA</td>
           </tr>
           <tr>
             <td>Highest availability</td>

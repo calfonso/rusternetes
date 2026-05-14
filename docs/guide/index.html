@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -162,7 +163,7 @@
         <a href="deployment.html" class="feature-card" style="text-decoration:none;">
           <div class="feature-icon">&#9881;</div>
           <h3>Deployment Modes</h3>
-          <p style="font-family:'VT323',monospace;font-size:17px;color:var(--text-dim);">Choose: full cluster with etcd, SQLite cluster, or single binary.</p>
+          <p style="font-family:'VT323',monospace;font-size:17px;color:var(--text-dim);">Choose: full cluster with etcd, SQLite cluster, Redis cluster, or single binary.</p>
         </a>
         <a href="all-in-one.html" class="feature-card" style="text-decoration:none;">
           <div class="feature-icon">&#128230;</div>
@@ -266,6 +267,7 @@
 <span class="comment">Storage</span>
   etcd                Production — distributed key-value store
   SQLite (rhino)      Lightweight — embedded or gRPC server
+  Redis (rhino)       Lightweight — embedded or gRPC server
   memory              Testing only
 </code>
       </pre>
@@ -280,7 +282,7 @@
         <li>RBAC — Roles, ClusterRoles, Bindings, ServiceAccount tokens (RS256 JWT)</li>
         <li>Admission webhooks — validating, mutating, and ValidatingAdmissionPolicy (CEL)</li>
         <li>Probes — liveness, readiness, startup with HTTP, TCP, exec, and gRPC handlers</li>
-        <li>Three deployment modes — full cluster, SQLite cluster, or single binary</li>
+        <li>Four deployment modes — full cluster, SQLite cluster, Redis cluster, or single binary</li>
         <li>91% Kubernetes conformance — tested against the official K8s v1.35 e2e test suite</li>
       </ul>
 
