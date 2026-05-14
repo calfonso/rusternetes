@@ -142,12 +142,7 @@ fn make_ready_pod_with_phase(
     rs: &ReplicaSet,
     phase: Phase,
 ) -> Pod {
-    let labels = rs
-        .spec
-        .selector
-        .match_labels
-        .clone()
-        .unwrap_or_default();
+    let labels = rs.spec.selector.match_labels.clone().unwrap_or_default();
 
     let owner_ref = OwnerReference::new(
         "apps/v1",
@@ -226,10 +221,7 @@ async fn test_rs_available_replicas_ready_non_running_phase() {
         status.replicas, status.ready_replicas, status.available_replicas
     );
 
-    assert_eq!(
-        status.replicas, 3,
-        "RS must report 3 total replicas"
-    );
+    assert_eq!(status.replicas, 3, "RS must report 3 total replicas");
     assert_eq!(
         status.ready_replicas, 3,
         "RS must report 3 ready replicas (Ready=True)"

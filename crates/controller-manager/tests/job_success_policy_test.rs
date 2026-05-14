@@ -94,13 +94,7 @@ fn make_indexed_job(name: &str, namespace: &str, completions: i32, parallelism: 
     }
 }
 
-fn make_indexed_pod(
-    name: &str,
-    namespace: &str,
-    phase: Phase,
-    job_name: &str,
-    index: i32,
-) -> Pod {
+fn make_indexed_pod(name: &str, namespace: &str, phase: Phase, job_name: &str, index: i32) -> Pod {
     let mut labels = HashMap::new();
     labels.insert("job-name".to_string(), job_name.to_string());
     labels.insert(
@@ -140,7 +134,11 @@ fn make_indexed_pod(
             containers: vec![Container {
                 name: "task".to_string(),
                 image: "busybox:latest".to_string(),
-                command: Some(vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()]),
+                command: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "exit 0".to_string(),
+                ]),
                 args: None,
                 env: None,
                 ports: None,
@@ -300,7 +298,11 @@ async fn test_both_conditions_preserve_completed_status_across_reconciles() {
             .await
             .unwrap();
     }
-    for (name, idx) in [("sp-both-pod-2", 2i32), ("sp-both-pod-3", 3), ("sp-both-pod-4", 4)] {
+    for (name, idx) in [
+        ("sp-both-pod-2", 2i32),
+        ("sp-both-pod-3", 3),
+        ("sp-both-pod-4", 4),
+    ] {
         let pod = make_indexed_pod(name, "default", Phase::Pending, "sp-both-job", idx);
         storage
             .create(&format!("/registry/pods/default/{}", name), &pod)

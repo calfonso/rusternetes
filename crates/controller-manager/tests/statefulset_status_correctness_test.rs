@@ -317,7 +317,9 @@ async fn test_a03845c_status_replicas_not_capped_at_desired() {
     controller.reconcile_all().await.unwrap();
 
     let updated_ss: StatefulSet = storage.get(&key).await.unwrap();
-    let status = updated_ss.status.expect("status must be set after reconcile");
+    let status = updated_ss
+        .status
+        .expect("status must be set after reconcile");
 
     println!(
         "status.replicas = {} (desired = 2, actual pod count = 3)",
@@ -353,7 +355,14 @@ async fn test_c02bdc1_available_replicas_not_none() {
     // Seed 2 running and ready pods
     for ordinal in 0..2i32 {
         seed_pod(
-            &storage, "svc", &ss_uid, "default", ordinal, Phase::Running, true, false,
+            &storage,
+            "svc",
+            &ss_uid,
+            "default",
+            ordinal,
+            Phase::Running,
+            true,
+            false,
         )
         .await;
     }
@@ -402,19 +411,40 @@ async fn test_b1aefae_ready_replicas_checks_condition_not_just_phase() {
 
     // Pod 0: Running + Ready=True  → should count toward readyReplicas
     seed_pod(
-        &storage, "app", &ss_uid, "default", 0, Phase::Running, true, false,
+        &storage,
+        "app",
+        &ss_uid,
+        "default",
+        0,
+        Phase::Running,
+        true,
+        false,
     )
     .await;
 
     // Pod 1: Running but NO Ready condition  → should NOT count
     seed_pod(
-        &storage, "app", &ss_uid, "default", 1, Phase::Running, false, false,
+        &storage,
+        "app",
+        &ss_uid,
+        "default",
+        1,
+        Phase::Running,
+        false,
+        false,
     )
     .await;
 
     // Pod 2: Running but NO Ready condition  → should NOT count
     seed_pod(
-        &storage, "app", &ss_uid, "default", 2, Phase::Running, false, false,
+        &storage,
+        "app",
+        &ss_uid,
+        "default",
+        2,
+        Phase::Running,
+        false,
+        false,
     )
     .await;
 
@@ -460,7 +490,14 @@ async fn test_b0a3215_scale_down_sets_deletion_timestamp_not_hard_delete() {
     // Seed 3 running + ready pods
     for ordinal in 0..3i32 {
         seed_pod(
-            &storage, "db", &ss_uid, "default", ordinal, Phase::Running, true, false,
+            &storage,
+            "db",
+            &ss_uid,
+            "default",
+            ordinal,
+            Phase::Running,
+            true,
+            false,
         )
         .await;
     }
