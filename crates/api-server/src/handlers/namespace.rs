@@ -102,10 +102,15 @@ pub async fn create(
     }
 
     // Create kube-root-ca.crt ConfigMap (required by Kubernetes conformance)
-    let ca_cert = std::fs::read_to_string("/etc/kubernetes/pki/ca.crt")
-        .or_else(|_| std::fs::read_to_string("/etc/kubernetes/pki/api-server.crt"))
-        .or_else(|_| std::fs::read_to_string("/root/.rusternetes/certs/ca.crt"))
-        .unwrap_or_else(|_| "".to_string());
+    let ca_cert = match tokio::fs::read_to_string("/etc/kubernetes/pki/ca.crt").await {
+        Ok(s) => s,
+        Err(_) => match tokio::fs::read_to_string("/etc/kubernetes/pki/api-server.crt").await {
+            Ok(s) => s,
+            Err(_) => tokio::fs::read_to_string("/root/.rusternetes/certs/ca.crt")
+                .await
+                .unwrap_or_default(),
+        },
+    };
 
     info!(
         "kube-root-ca.crt for namespace {}: cert_len={}, ns_name={}",
