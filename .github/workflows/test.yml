@@ -21,6 +21,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Clone rhino adjacent to repo
+        # crates/storage/Cargo.toml resolves the optional `rhino` dep via
+        # `path = "../../../rhino"`, i.e. as a sibling of $GITHUB_WORKSPACE.
+        # The default `sqlite` feature on the rusternetes binary activates
+        # this dep, so `cargo metadata` (and therefore every cargo step
+        # below) fails unless rhino is present on disk.
+        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+
       - name: Install Rust toolchain
         run: |
           rustup update --no-self-update stable
