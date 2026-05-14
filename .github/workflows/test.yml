@@ -40,10 +40,17 @@ jobs:
           rustup component add --toolchain stable clippy
           rustup default stable
 
-      - name: Install protoc
+      - name: Verify protoc on runner
+        # Persistent self-hosted runner — install protoc once on the host
+        # (e.g. `apt-get install protobuf-compiler`). This step fails fast
+        # with a clear message if it's missing.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          command -v protoc >/dev/null || {
+            echo "protoc not found on runner. Install once on the host:" >&2
+            echo "  apt-get install -y protobuf-compiler" >&2
+            exit 1
+          }
+          protoc --version
 
       - name: Install cargo-nextest
         # Prebuilt binary install — much faster and more parallel than
