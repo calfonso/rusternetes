@@ -39,7 +39,7 @@ pub struct TokenReviewSpec {
     /// verify that the token was intended for at least one of the audiences in
     /// this list. If no audiences are provided, the audience will default to the
     /// audience of the Kubernetes apiserver.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audiences: Option<Vec<String>>,
 
     /// Token is the opaque bearer token.
@@ -57,7 +57,7 @@ pub struct TokenReviewStatus {
     /// spec.audiences field should validate that a compatible audience identifier
     /// is returned in the status.audiences field to ensure that the TokenReview
     /// server is audience aware.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audiences: Option<Vec<String>>,
 
     /// Authenticated indicates that the token was associated with a known user.
@@ -78,11 +78,11 @@ pub struct TokenReviewStatus {
 #[serde(rename_all = "camelCase")]
 pub struct UserInfo {
     /// Any additional information provided by the authenticator.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<HashMap<String, Vec<String>>>,
 
     /// The names of groups this user is a part of.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<String>>,
 
     /// A unique value that identifies this user across time. If this user is

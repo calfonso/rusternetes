@@ -49,7 +49,7 @@ pub struct HorizontalPodAutoscalerSpec {
     pub max_replicas: i32,
 
     /// Metrics to use for scaling decisions
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Vec<MetricSpec>>,
 
     /// Behavior configures the scaling behavior (v2 API)
@@ -221,7 +221,7 @@ pub struct HPAScalingRules {
     pub select_policy: Option<String>,
 
     /// Policies is a list of potential scaling policies
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policies: Option<Vec<HPAScalingPolicy>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,11 +262,11 @@ pub struct HorizontalPodAutoscalerStatus {
     pub desired_replicas: i32,
 
     /// Current metric values
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_metrics: Option<Vec<MetricStatus>>,
 
     /// Conditions describe the current state of the autoscaler
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<HorizontalPodAutoscalerCondition>>,
 }
 
@@ -450,7 +450,7 @@ pub struct VerticalPodAutoscalerSpec {
     pub resource_policy: Option<PodResourcePolicy>,
 
     /// Recommenders lists the names of vertical pod autoscaler recommenders to use
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommenders: Option<Vec<VerticalPodAutoscalerRecommenderSelector>>,
 }
 
@@ -468,7 +468,7 @@ pub struct PodUpdatePolicy {
 #[serde(rename_all = "camelCase")]
 pub struct PodResourcePolicy {
     /// Per-container resource policies
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_policies: Option<Vec<ContainerResourcePolicy>>,
 }
 
@@ -493,7 +493,7 @@ pub struct ContainerResourcePolicy {
     pub max_allowed: Option<std::collections::HashMap<String, String>>,
 
     /// ControlledResources specifies which resource types are controlled (cpu, memory)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controlled_resources: Option<Vec<String>>,
 }
 
@@ -514,7 +514,7 @@ pub struct VerticalPodAutoscalerStatus {
     pub recommendation: Option<RecommendedPodResources>,
 
     /// Conditions describe the current state of the VPA
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<VerticalPodAutoscalerCondition>>,
 }
 
@@ -523,7 +523,7 @@ pub struct VerticalPodAutoscalerStatus {
 #[serde(rename_all = "camelCase")]
 pub struct RecommendedPodResources {
     /// Recommended resources for each container
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_recommendations: Option<Vec<RecommendedContainerResources>>,
 }
 
