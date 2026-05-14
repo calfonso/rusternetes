@@ -27,7 +27,12 @@ jobs:
         # The default `sqlite` feature on the rusternetes binary activates
         # this dep, so `cargo metadata` (and therefore every cargo step
         # below) fails unless rhino is present on disk.
-        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+        run: |
+          if [ ! -d ../rhino ]; then
+            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+          else
+            echo "rhino already present at ../rhino (self-hosted runner workspace persists)"
+          fi
 
       - name: Install Rust toolchain
         run: |

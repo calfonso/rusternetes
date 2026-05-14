@@ -18,7 +18,12 @@ jobs:
         # optional `rhino` path dep (`../../../rhino` from crates/storage)
         # is missing on disk. The default `sqlite` feature on the
         # rusternetes binary activates it, so rhino has to exist.
-        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+        run: |
+          if [ ! -d ../rhino ]; then
+            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+          else
+            echo "rhino already present at ../rhino (self-hosted runner workspace persists)"
+          fi
 
       - name: Install Rust toolchain
         run: |
