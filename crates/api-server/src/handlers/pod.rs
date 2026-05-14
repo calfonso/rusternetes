@@ -672,6 +672,57 @@ pub async fn update(
         &name,
     )?;
 
+    // Validate pod spec immutability.
+    // K8s ValidatePodUpdate only allows changing:
+    //   - spec.containers[*].image
+    //   - spec.initContainers[*].image
+    //   - spec.activeDeadlineSeconds
+    //   - spec.terminationGracePeriodSeconds
+    //   - spec.tolerations (additions only)
+    //   - spec.schedulingGates (deletions only)
+    // All other spec fields are immutable after creation.
+    // K8s ref: pkg/apis/core/validation/validation.go:5701 — ValidatePodUpdate
+    if let (Some(old_spec), Some(new_spec)) = (&old_pod.spec, &pod.spec) {
+        // Check container count hasn't changed
+        if old_spec.containers.len() != new_spec.containers.len() {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "pod updates may not add or remove containers".to_string(),
+            ));
+        }
+
+        // Build a munged copy: reset mutable fields to old values, then compare
+        let mut munged = new_spec.clone();
+        // Reset images to old values
+        for (i, c) in munged.containers.iter_mut().enumerate() {
+            if i < old_spec.containers.len() {
+                c.image = old_spec.containers[i].image.clone();
+            }
+        }
+        if let (Some(old_init), Some(new_init)) =
+            (&old_spec.init_containers, &mut munged.init_containers)
+        {
+            for (i, c) in new_init.iter_mut().enumerate() {
+                if i < old_init.len() {
+                    c.image = old_init[i].image.clone();
+                }
+            }
+        }
+        // Reset other mutable fields
+        munged.active_deadline_seconds = old_spec.active_deadline_seconds;
+        munged.termination_grace_period_seconds = old_spec.termination_grace_period_seconds;
+        munged.tolerations = old_spec.tolerations.clone();
+        munged.scheduling_gates = old_spec.scheduling_gates.clone();
+
+        // Compare: if munged spec != old spec, immutable fields were changed
+        let munged_json = serde_json::to_value(&munged).unwrap_or_default();
+        let old_json = serde_json::to_value(old_spec).unwrap_or_default();
+        if munged_json != old_json {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "pod updates may not change fields other than `spec.containers[*].image`, `spec.initContainers[*].image`, `spec.activeDeadlineSeconds`, `spec.terminationGracePeriodSeconds`, `spec.tolerations`, `spec.schedulingGates`".to_string(),
+            ));
+        }
+    }
+
     let old_pod_value = serde_json::to_value(&old_pod)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
 
@@ -778,19 +829,10 @@ pub async fn update(
         }
     }
 
-    // Check ResourceQuota on update — K8s enforces quota when pod resources change.
-    // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
-    match crate::admission::check_resource_quota(&state.storage, &namespace, &pod).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(rusternetes_common::Error::Forbidden(
-                "exceeded quota".to_string(),
-            ));
-        }
-        Err(e) => {
-            warn!("Error checking ResourceQuota on pod update: {}", e);
-        }
-    }
+    // Note: ResourceQuota is NOT checked on pod UPDATE because the spec
+    // immutability validation above already rejects resource changes.
+    // K8s only checks quota on CREATE.
+    // K8s ref: pkg/apis/core/validation/validation.go:5701 — ValidatePodUpdate
 
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
