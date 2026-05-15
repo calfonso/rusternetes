@@ -356,10 +356,21 @@ impl IptablesManager {
             }
         }
 
-        // Add general MASQUERADE for all DNAT'd traffic.
-        // This covers both ClusterIP and NodePort: when traffic is DNATed to a pod
-        // the source must be rewritten so the reply comes back through the node for
-        // proper connection tracking.
+        // MASQUERADE for ClusterIP DNATed traffic. When a pod connects to a
+        // service ClusterIP, the packet is DNATed to a backend pod. The
+        // source needs to be rewritten so the reply comes back through the
+        // node for connection tracking.
+        //
+        // CRITICAL: scope this match to packets whose ORIGINAL destination
+        // was the ClusterIP CIDR (`--ctorigdst 10.96.0.0/12`). Without
+        // `--ctorigdst`, the rule fires on ANY DNATed packet — including
+        // Docker's own DNS DNAT (127.0.0.11 → upstream resolver), which
+        // makes container DNS lookups fail and breaks the host's DNS
+        // resolution path. Upstream kube-proxy avoids this by gating its
+        // MASQUERADE on a packet mark (`KUBE-MARK-MASQ`); the `--ctorigdst`
+        // filter accomplishes the same scope with fewer moving parts.
+        let masq_comment = "rusternetes ClusterIP DNAT masquerade";
+        let cluster_cidr = "10.96.0.0/12";
         let dnat_masq_check = Command::new(&self.iptables_cmd)
             .args([
                 "-t",
@@ -369,11 +380,13 @@ impl IptablesManager {
                 "-m",
                 "comment",
                 "--comment",
-                "rusternetes DNAT traffic masquerade",
+                masq_comment,
                 "-m",
                 "conntrack",
                 "--ctstate",
                 "DNAT",
+                "--ctorigdst",
+                cluster_cidr,
                 "-j",
                 "MASQUERADE",
             ])
@@ -388,7 +401,46 @@ impl IptablesManager {
                     "-m",
                     "comment",
                     "--comment",
-                    "rusternetes DNAT traffic masquerade",
+                    masq_comment,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "DNAT",
+                    "--ctorigdst",
+                    cluster_cidr,
+                    "-j",
+                    "MASQUERADE",
+                ])
+                .output()
+                .context("Failed to add ClusterIP MASQUERADE rule")?;
+            if output.status.success() {
+                info!(
+                    "Added MASQUERADE rule for DNAT'd traffic to {}",
+                    cluster_cidr
+                );
+            } else {
+                warn!(
+                    "Failed to add ClusterIP MASQUERADE: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        // Remove the legacy over-broad rule from older versions. Best-effort
+        // — if it isn't there, -D fails silently. Looped so older versions
+        // that stacked duplicates get fully cleared.
+        let legacy_comment = "rusternetes DNAT traffic masquerade";
+        for _ in 0..16 {
+            let r = Command::new(&self.iptables_cmd)
+                .args([
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    legacy_comment,
                     "-m",
                     "conntrack",
                     "--ctstate",
@@ -396,16 +448,14 @@ impl IptablesManager {
                     "-j",
                     "MASQUERADE",
                 ])
-                .output()
-                .context("Failed to add DNAT MASQUERADE rule")?;
-            if output.status.success() {
-                info!("Added MASQUERADE rule for all DNAT'd traffic");
-            } else {
-                warn!(
-                    "Failed to add DNAT MASQUERADE: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                .output();
+            if r.map_or(true, |o| !o.status.success()) {
+                break;
             }
+            info!(
+                "Removed legacy over-broad MASQUERADE rule (comment: {})",
+                legacy_comment
+            );
         }
 
         // Add FILTER table rules to accept forwarded traffic.
@@ -1322,6 +1372,64 @@ impl IptablesManager {
         // the host's filter table and the next run stacks duplicates.
         self.remove_jump_rule("filter", "FORWARD", "KUBE-FORWARD")?;
         self.remove_jump_rule("filter", "OUTPUT", "KUBE-FORWARD")?;
+
+        // Remove the POSTROUTING MASQUERADE rules that initialize() added
+        // directly (they aren't in our own chains, so flush_rules above
+        // doesn't touch them). Looped to remove any duplicates left from
+        // an older version that stacked them on each restart.
+        let masq_comment = "rusternetes ClusterIP DNAT masquerade";
+        let cluster_cidr = "10.96.0.0/12";
+        for _ in 0..16 {
+            let r = Command::new(&self.iptables_cmd)
+                .args([
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    masq_comment,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "DNAT",
+                    "--ctorigdst",
+                    cluster_cidr,
+                    "-j",
+                    "MASQUERADE",
+                ])
+                .output();
+            if r.map_or(true, |o| !o.status.success()) {
+                break;
+            }
+        }
+        // Also clean up the legacy over-broad rule shape from older
+        // installations, same loop pattern.
+        let legacy_comment = "rusternetes DNAT traffic masquerade";
+        for _ in 0..16 {
+            let r = Command::new(&self.iptables_cmd)
+                .args([
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    legacy_comment,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "DNAT",
+                    "-j",
+                    "MASQUERADE",
+                ])
+                .output();
+            if r.map_or(true, |o| !o.status.success()) {
+                break;
+            }
+        }
 
         // Delete our chains
         self.delete_chain("nat", &self.services_chain)?;

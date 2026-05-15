@@ -55,7 +55,24 @@ for tgt in RUSTERNETES-SERVICES RUSTERNETES-NODEPORTS; do
 done
 remove_all_jumps_to filter FORWARD KUBE-FORWARD
 remove_all_jumps_to filter OUTPUT  KUBE-FORWARD
-ok "host jump rules removed"
+
+# Also remove the over-broad POSTROUTING MASQUERADE rules that older
+# kube-proxy versions installed directly on the host. These are NOT
+# inside our managed chains, so flush_rules / delete_chain wouldn't
+# touch them — they persist forever otherwise.
+remove_all_matching() {
+  local table="$1"; shift
+  while "$IPT" -t "$table" -D "$@" 2>/dev/null; do
+    :
+  done
+}
+remove_all_matching nat POSTROUTING \
+  -m comment --comment "rusternetes DNAT traffic masquerade" \
+  -m conntrack --ctstate DNAT -j MASQUERADE
+remove_all_matching nat POSTROUTING \
+  -m comment --comment "rusternetes ClusterIP DNAT masquerade" \
+  -m conntrack --ctstate DNAT --ctorigdst 10.96.0.0/12 -j MASQUERADE
+ok "host jump rules + legacy MASQUERADE rules removed"
 
 step "2/4 — flush and delete RUSTERNETES-* / KUBE-FORWARD chains"
 # Discover any RUSTERNETES-* or KUBE-SEP-* / KUBE-NP-SEP-* chains and
