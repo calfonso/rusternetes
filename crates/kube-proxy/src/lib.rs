@@ -68,6 +68,13 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
         }
     });
 
+    // SIGTERM is what `docker stop` (and Kubernetes pod termination) sends.
+    // Without an explicit handler, tokio just lets the process get killed
+    // and the IptablesManager::Drop never runs — leaving the host's
+    // iptables polluted with RUSTERNETES-* chains and jump rules.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+
     loop {
         queue.add(RECONCILE_ALL_SENTINEL.into()).await;
 
@@ -160,7 +167,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
                     queue.add(RECONCILE_ALL_SENTINEL.into()).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal");
+                    info!("Received SIGINT — shutting down");
+                    return Ok(());
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM — shutting down");
                     return Ok(());
                 }
             }

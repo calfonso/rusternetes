@@ -174,6 +174,14 @@ impl IptablesManager {
     pub fn initialize(&self) -> Result<()> {
         info!("Initializing iptables chains for kube-proxy");
 
+        // Best-effort flush of any RUSTERNETES-* chains left over from a
+        // previous instance that was force-killed (SIGKILL / OOM) and never
+        // ran its Drop. Without this the next run would stack duplicate jump
+        // rules onto the host's PREROUTING/OUTPUT and the iptables state
+        // diverges from what kube-proxy believes it controls. Errors are
+        // ignored — on a clean first run the chains simply don't exist yet.
+        let _ = self.cleanup();
+
         // Enable bridge-nf-call-iptables so that iptables rules apply to
         // bridge-forwarded traffic. Without this, pod-to-NodePort traffic
         // within the container bridge bypasses PREROUTING/OUTPUT DNAT rules.
@@ -783,6 +791,10 @@ impl IptablesManager {
 
         self.flush_chain("nat", &self.services_chain)?;
         self.flush_chain("nat", &self.nodeports_chain)?;
+        // KUBE-FORWARD must be flushed too — without this, cleanup()'s
+        // delete_chain("filter", "KUBE-FORWARD") fails because the chain
+        // still has rules.
+        self.flush_chain("filter", "KUBE-FORWARD")?;
 
         // Clean up all per-endpoint (SEP) chains from previous sync.
         // These must be flushed and deleted, otherwise on resync:
@@ -1304,10 +1316,17 @@ impl IptablesManager {
         self.remove_jump_rule("nat", "OUTPUT", &self.services_chain)?;
         self.remove_jump_rule("nat", "PREROUTING", &self.nodeports_chain)?;
         self.remove_jump_rule("nat", "OUTPUT", &self.nodeports_chain)?;
+        // KUBE-FORWARD lives in the filter table — initialize() jumps to it
+        // from FORWARD and OUTPUT (see ensure_jump_rule call sites). Without
+        // these two removals a force-killed kube-proxy leaves the jumps on
+        // the host's filter table and the next run stacks duplicates.
+        self.remove_jump_rule("filter", "FORWARD", "KUBE-FORWARD")?;
+        self.remove_jump_rule("filter", "OUTPUT", "KUBE-FORWARD")?;
 
         // Delete our chains
         self.delete_chain("nat", &self.services_chain)?;
         self.delete_chain("nat", &self.nodeports_chain)?;
+        self.delete_chain("filter", "KUBE-FORWARD")?;
 
         info!("Kube-proxy iptables cleanup complete");
         Ok(())
