@@ -9,6 +9,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Pull in the adjacent rhino crate (named build context in compose.yml).
+# crates/storage/Cargo.toml declares `rhino = { path = "../../../rhino", ... }`
+# which from /app/crates/storage resolves to /rhino, so land it there.
+COPY --from=rhino . /rhino
+
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/kubelet/Cargo.toml ./crates/kubelet/
 COPY crates/common/Cargo.toml ./crates/common/
