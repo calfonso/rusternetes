@@ -9,6 +9,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Pull in the adjacent rhino crate (named build context in compose.yml).
+# kubectl itself doesn't use rhino, but the workspace manifest references it
+# transitively via crates/storage, so cargo metadata fails without it.
+COPY --from=rhino . /rhino
+
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/kubectl/Cargo.toml ./crates/kubectl/
 COPY crates/common/Cargo.toml ./crates/common/
