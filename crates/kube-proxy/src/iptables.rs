@@ -304,39 +304,90 @@ impl IptablesManager {
             warn!("No bridge CIDR detected, skipping hairpin MASQUERADE rule");
         }
 
-        // Add MASQUERADE for NodePort traffic from local sources.
-        // When a process on the node itself connects to a NodePort, the source IP
-        // is local. Without MASQUERADE the backend pod replies directly, bypassing
-        // conntrack, and the connection breaks (asymmetric routing).
-        let nodeport_masq_check = Command::new(&self.iptables_cmd)
-            .args([
-                "-t",
-                "nat",
-                "-C",
-                "POSTROUTING",
-                "-m",
-                "comment",
-                "--comment",
-                "rusternetes nodeport masquerade",
-                "-m",
-                "addrtype",
-                "--src-type",
-                "LOCAL",
-                "-j",
-                "MASQUERADE",
-            ])
-            .output();
-        if nodeport_masq_check.map_or(true, |o| !o.status.success()) {
-            let output = Command::new(&self.iptables_cmd)
+        // MASQUERADE for NodePort traffic. Scope it to packets whose
+        // ORIGINAL destination port was in the NodePort range
+        // (30000-32767, K8s default) — without this scope the rule fires
+        // on every locally-sourced outbound packet (`--src-type LOCAL`
+        // alone), including the host's own DNS lookups, breaking
+        // resolution while kube-proxy is running.
+        //
+        // Match on both `--ctorigdstport` (TCP) and a second rule for UDP
+        // because conntrack stores per-protocol.
+        let nodeport_masq_comment = "rusternetes NodePort masquerade";
+        for proto in ["tcp", "udp"] {
+            let check = Command::new(&self.iptables_cmd)
                 .args([
                     "-t",
                     "nat",
-                    "-A",
+                    "-C",
                     "POSTROUTING",
                     "-m",
                     "comment",
                     "--comment",
-                    "rusternetes nodeport masquerade",
+                    nodeport_masq_comment,
+                    "-p",
+                    proto,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "DNAT",
+                    "--ctorigdstport",
+                    "30000:32767",
+                    "-j",
+                    "MASQUERADE",
+                ])
+                .output();
+            if check.map_or(true, |o| !o.status.success()) {
+                let output = Command::new(&self.iptables_cmd)
+                    .args([
+                        "-t",
+                        "nat",
+                        "-A",
+                        "POSTROUTING",
+                        "-m",
+                        "comment",
+                        "--comment",
+                        nodeport_masq_comment,
+                        "-p",
+                        proto,
+                        "-m",
+                        "conntrack",
+                        "--ctstate",
+                        "DNAT",
+                        "--ctorigdstport",
+                        "30000:32767",
+                        "-j",
+                        "MASQUERADE",
+                    ])
+                    .output()
+                    .context("Failed to add NodePort MASQUERADE rule")?;
+                if output.status.success() {
+                    info!("Added MASQUERADE rule for {} NodePort traffic", proto);
+                } else {
+                    warn!(
+                        "Failed to add NodePort MASQUERADE ({}): {}",
+                        proto,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+
+        // Remove the legacy over-broad NodePort MASQUERADE rule (no
+        // ctorigdstport scope) from older installations. Looped to remove
+        // duplicates.
+        let legacy_nodeport_comment = "rusternetes nodeport masquerade";
+        for _ in 0..16 {
+            let r = Command::new(&self.iptables_cmd)
+                .args([
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    legacy_nodeport_comment,
                     "-m",
                     "addrtype",
                     "--src-type",
@@ -344,15 +395,9 @@ impl IptablesManager {
                     "-j",
                     "MASQUERADE",
                 ])
-                .output()
-                .context("Failed to add NodePort MASQUERADE rule")?;
-            if output.status.success() {
-                info!("Added MASQUERADE rule for NodePort traffic (local source)");
-            } else {
-                warn!(
-                    "Failed to add NodePort MASQUERADE: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                .output();
+            if r.map_or(true, |o| !o.status.success()) {
+                break;
             }
         }
 
@@ -1377,58 +1422,117 @@ impl IptablesManager {
         // directly (they aren't in our own chains, so flush_rules above
         // doesn't touch them). Looped to remove any duplicates left from
         // an older version that stacked them on each restart.
-        let masq_comment = "rusternetes ClusterIP DNAT masquerade";
-        let cluster_cidr = "10.96.0.0/12";
-        for _ in 0..16 {
-            let r = Command::new(&self.iptables_cmd)
-                .args([
-                    "-t",
-                    "nat",
-                    "-D",
-                    "POSTROUTING",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    masq_comment,
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "DNAT",
-                    "--ctorigdst",
-                    cluster_cidr,
-                    "-j",
-                    "MASQUERADE",
-                ])
-                .output();
-            if r.map_or(true, |o| !o.status.success()) {
-                break;
+        //
+        // Six rule shapes can exist on POSTROUTING from current + previous
+        // versions of kube-proxy:
+        //   1. ClusterIP MASQUERADE (current, narrowed)
+        //   2. ClusterIP MASQUERADE (legacy, over-broad — `--ctstate DNAT`)
+        //   3. NodePort tcp MASQUERADE (current, scoped to port range)
+        //   4. NodePort udp MASQUERADE (current, scoped to port range)
+        //   5. NodePort MASQUERADE (legacy, over-broad — `--src-type LOCAL`)
+        //   6. Hairpin MASQUERADE (`-s bridge_cidr -d bridge_cidr`)
+        let remove_loop = |args: Vec<&str>| {
+            for _ in 0..16 {
+                let r = Command::new(&self.iptables_cmd).args(&args).output();
+                if r.map_or(true, |o| !o.status.success()) {
+                    break;
+                }
             }
+        };
+        // (1) current ClusterIP MASQUERADE
+        remove_loop(vec![
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-m",
+            "comment",
+            "--comment",
+            "rusternetes ClusterIP DNAT masquerade",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "DNAT",
+            "--ctorigdst",
+            "10.96.0.0/12",
+            "-j",
+            "MASQUERADE",
+        ]);
+        // (2) legacy ClusterIP/DNAT broad MASQUERADE
+        remove_loop(vec![
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-m",
+            "comment",
+            "--comment",
+            "rusternetes DNAT traffic masquerade",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "DNAT",
+            "-j",
+            "MASQUERADE",
+        ]);
+        // (3) + (4) current NodePort MASQUERADE (tcp + udp)
+        for proto in ["tcp", "udp"] {
+            remove_loop(vec![
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-m",
+                "comment",
+                "--comment",
+                "rusternetes NodePort masquerade",
+                "-p",
+                proto,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "DNAT",
+                "--ctorigdstport",
+                "30000:32767",
+                "-j",
+                "MASQUERADE",
+            ]);
         }
-        // Also clean up the legacy over-broad rule shape from older
-        // installations, same loop pattern.
-        let legacy_comment = "rusternetes DNAT traffic masquerade";
-        for _ in 0..16 {
-            let r = Command::new(&self.iptables_cmd)
-                .args([
-                    "-t",
-                    "nat",
-                    "-D",
-                    "POSTROUTING",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    legacy_comment,
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "DNAT",
-                    "-j",
-                    "MASQUERADE",
-                ])
-                .output();
-            if r.map_or(true, |o| !o.status.success()) {
-                break;
-            }
+        // (5) legacy NodePort broad MASQUERADE
+        remove_loop(vec![
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-m",
+            "comment",
+            "--comment",
+            "rusternetes nodeport masquerade",
+            "-m",
+            "addrtype",
+            "--src-type",
+            "LOCAL",
+            "-j",
+            "MASQUERADE",
+        ]);
+        // (6) hairpin MASQUERADE — only present when we detected a bridge CIDR
+        if let Some(ref cidr) = self.bridge_cidr {
+            remove_loop(vec![
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-m",
+                "comment",
+                "--comment",
+                "rusternetes service hairpin masquerade",
+                "-s",
+                cidr,
+                "-d",
+                cidr,
+                "-j",
+                "MASQUERADE",
+            ]);
         }
 
         // Delete our chains

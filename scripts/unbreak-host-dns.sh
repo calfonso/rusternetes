@@ -72,6 +72,23 @@ remove_all_matching nat POSTROUTING \
 remove_all_matching nat POSTROUTING \
   -m comment --comment "rusternetes ClusterIP DNAT masquerade" \
   -m conntrack --ctstate DNAT --ctorigdst 10.96.0.0/12 -j MASQUERADE
+remove_all_matching nat POSTROUTING \
+  -m comment --comment "rusternetes nodeport masquerade" \
+  -m addrtype --src-type LOCAL -j MASQUERADE
+for proto in tcp udp; do
+  remove_all_matching nat POSTROUTING \
+    -m comment --comment "rusternetes NodePort masquerade" \
+    -p "$proto" \
+    -m conntrack --ctstate DNAT --ctorigdstport 30000:32767 -j MASQUERADE
+done
+# Hairpin MASQUERADE is scoped to a bridge CIDR. Discover and remove any
+# rule whose comment matches, regardless of CIDR.
+while "$IPT" -t nat -S POSTROUTING 2>/dev/null \
+      | grep -F 'rusternetes service hairpin masquerade' | head -1 | read -r line; do
+  # Replace -A with -D and execute
+  delete_cmd=$(echo "$line" | sed 's/^-A /-D /')
+  "$IPT" -t nat $delete_cmd 2>/dev/null || break
+done
 ok "host jump rules + legacy MASQUERADE rules removed"
 
 step "2/4 — flush and delete RUSTERNETES-* / KUBE-FORWARD chains"
