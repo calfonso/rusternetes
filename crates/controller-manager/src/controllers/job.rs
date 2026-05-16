@@ -537,34 +537,6 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
-        // Helper: extract completion index from a pod
-        fn get_pod_index(pod: &Pod) -> Option<i32> {
-            pod.metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get("batch.kubernetes.io/job-completion-index"))
-                .and_then(|v| v.parse::<i32>().ok())
-                .or_else(|| {
-                    pod.metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("batch.kubernetes.io/job-completion-index"))
-                        .and_then(|v| v.parse::<i32>().ok())
-                })
-                .or_else(|| {
-                    pod.spec.as_ref().and_then(|s| {
-                        s.containers.first().and_then(|c| {
-                            c.env.as_ref().and_then(|envs| {
-                                envs.iter()
-                                    .find(|e| e.name == "JOB_COMPLETION_INDEX")
-                                    .and_then(|e| e.value.as_ref())
-                                    .and_then(|v| v.parse::<i32>().ok())
-                            })
-                        })
-                    })
-                })
-        }
-
         // For Indexed completion mode, track which indexes have completed
         let completed_indexes: Option<String> = if is_indexed {
             let mut indexes: Vec<i32> = Vec::new();
@@ -761,23 +733,35 @@ impl<S: Storage + 'static> JobController<S> {
             None
         };
 
-        // Count succeeded indexes for Indexed mode
+        // For Indexed mode, K8s sets status.succeeded to the count of unique
+        // succeeded indexes (NOT raw succeeded pod count); status.failed
+        // excludes pods whose index has already succeeded. K8s ref:
+        //   pkg/controller/job/job_controller.go — status.Succeeded =
+        //   succeededIndexes.total().
+        let succeeded_index_set: HashSet<i32> = if is_indexed {
+            collect_indexes_in_phase(job_pods.iter(), Phase::Succeeded)
+        } else {
+            HashSet::new()
+        };
         let succeeded_index_count = if is_indexed {
-            let mut idx_set: HashSet<i32> = HashSet::new();
-            for pod in job_pods.iter() {
-                if matches!(
-                    pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                    Some(Phase::Succeeded)
-                ) {
-                    if let Some(idx) = get_pod_index(pod) {
-                        idx_set.insert(idx);
-                    }
-                }
-            }
-            idx_set.len() as i32
+            succeeded_index_set.len() as i32
         } else {
             succeeded
         };
+
+        if is_indexed {
+            succeeded = succeeded_index_count;
+            failed = job_pods
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                        Some(Phase::Failed)
+                    ) && !ignored_pods.contains(&p.metadata.name)
+                        && !get_pod_index(p).is_some_and(|i| succeeded_index_set.contains(&i))
+                })
+                .count() as i32;
+        }
 
         info!(
             "Job {}/{}: active={}, succeeded={}, failed={}, target={}",
@@ -1144,24 +1128,41 @@ impl<S: Storage + 'static> JobController<S> {
                     })
                     .collect();
 
-                // Recalculate counts
+                // Recalculate counts. For Indexed jobs apply the same unique-index
+                // semantics as above so status.succeeded/failed stay consistent.
                 active = 0;
                 succeeded = 0;
                 failed = 0;
 
+                let after_succeeded_idx: HashSet<i32> = if is_indexed {
+                    collect_indexes_in_phase(job_pods_after.iter(), Phase::Succeeded)
+                } else {
+                    HashSet::new()
+                };
+
                 for pod in job_pods_after.iter() {
-                    if let Some(status) = &pod.status {
-                        match &status.phase {
-                            Some(Phase::Running) | Some(Phase::Pending) => active += 1,
-                            Some(Phase::Succeeded) => succeeded += 1,
-                            Some(Phase::Failed) => {
-                                if !ignored_pods.contains(&pod.metadata.name) {
-                                    failed += 1;
-                                }
+                    let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+                    match phase {
+                        Some(Phase::Running) | Some(Phase::Pending) => active += 1,
+                        Some(Phase::Succeeded) if !is_indexed => succeeded += 1,
+                        Some(Phase::Failed) => {
+                            if ignored_pods.contains(&pod.metadata.name) {
+                                continue;
                             }
-                            _ => {}
+                            // For Indexed jobs, skip Failed pods on an already-succeeded index.
+                            if is_indexed
+                                && get_pod_index(pod)
+                                    .is_some_and(|i| after_succeeded_idx.contains(&i))
+                            {
+                                continue;
+                            }
+                            failed += 1;
                         }
+                        _ => {}
                     }
+                }
+                if is_indexed {
+                    succeeded = after_succeeded_idx.len() as i32;
                 }
             }
 
@@ -1408,6 +1409,53 @@ impl<S: Storage + 'static> JobController<S> {
 
         Ok(())
     }
+}
+
+/// Extract the completion index from a pod owned by an Indexed Job.
+/// Looks for `batch.kubernetes.io/job-completion-index` on annotations,
+/// then labels, then the `JOB_COMPLETION_INDEX` env var on the first container.
+fn get_pod_index(pod: &Pod) -> Option<i32> {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("batch.kubernetes.io/job-completion-index"))
+        .and_then(|v| v.parse::<i32>().ok())
+        .or_else(|| {
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("batch.kubernetes.io/job-completion-index"))
+                .and_then(|v| v.parse::<i32>().ok())
+        })
+        .or_else(|| {
+            pod.spec.as_ref().and_then(|s| {
+                s.containers.first().and_then(|c| {
+                    c.env.as_ref().and_then(|envs| {
+                        envs.iter()
+                            .find(|e| e.name == "JOB_COMPLETION_INDEX")
+                            .and_then(|e| e.value.as_ref())
+                            .and_then(|v| v.parse::<i32>().ok())
+                    })
+                })
+            })
+        })
+}
+
+/// Collect the set of unique completion indexes whose pods are in the given
+/// phase. Used for K8s-compatible Indexed Job status accounting.
+fn collect_indexes_in_phase<'a, I>(pods: I, phase: Phase) -> HashSet<i32>
+where
+    I: IntoIterator<Item = &'a Pod>,
+{
+    let mut set = HashSet::new();
+    for pod in pods {
+        if pod.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&phase) {
+            if let Some(idx) = get_pod_index(pod) {
+                set.insert(idx);
+            }
+        }
+    }
+    set
 }
 
 /// Parse index ranges like "0,1,3-5" into a set of integers {0, 1, 3, 4, 5}
