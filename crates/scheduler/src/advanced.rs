@@ -1,6 +1,6 @@
 use rusternetes_common::resources::{
-    Node, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, Taint, Toleration,
-    TopologySpreadConstraint,
+    IntOrString, Node, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod,
+    PodDisruptionBudget, Taint, Toleration, TopologySpreadConstraint,
 };
 use std::collections::HashMap;
 use tracing::debug;
@@ -792,9 +792,34 @@ fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i64 {
 /// can only be preempted by pods with strictly higher priority.
 const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 
-/// Check if preemption should occur and return pods to evict
-/// Returns (should_preempt, pods_to_evict)
+/// Check if preemption should occur and return pods to evict.
+///
+/// This is the PDB-unaware entry point retained for callers that don't have
+/// PodDisruptionBudgets loaded. Equivalent to
+/// `check_preemption_with_pdbs(node, pod, all_pods, &[])`.
+///
+/// Returns (should_preempt, pods_to_evict).
 pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<String>) {
+    check_preemption_with_pdbs(node, pod, all_pods, &[])
+}
+
+/// PDB-aware preemption victim selection.
+///
+/// The base algorithm (resource-fit, lowest-priority-first eviction with the
+/// "remove all, then reprieve" reprieve pass) is identical to
+/// `check_preemption`. After candidate victims are chosen, we run a second
+/// reprieve pass that swaps PDB-covered victims for non-PDB-covered candidates
+/// when resources still fit. This mirrors upstream Kubernetes' behavior at
+/// `pkg/scheduler/framework/preemption/preemption.go::selectVictimsOnNode`,
+/// which sorts candidates so that PDB-violating evictions are picked last.
+///
+/// Returns (should_preempt, pods_to_evict).
+pub fn check_preemption_with_pdbs(
+    node: &Node,
+    pod: &Pod,
+    all_pods: &[Pod],
+    pdbs: &[PodDisruptionBudget],
+) -> (bool, Vec<String>) {
     // Get the priority of the incoming pod
     let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
 
@@ -1024,6 +1049,69 @@ pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<
         // else: must evict this candidate
     }
 
+    // PDB-aware reprieve: if any PDBs are supplied, re-run the reprieve pass
+    // with PDB-covered candidates considered FIRST. The reprieve pass favors
+    // keeping candidates that are visited early (they get their "fits without
+    // me?" check while the rest of the candidates are still presumed to be
+    // evicted, which gives them the best chance of being reprieved). Visiting
+    // PDB-covered candidates first therefore biases the algorithm toward
+    // evicting PDB-free pods. This mirrors the upstream Kubernetes scheduler's
+    // dryRunPreemption/selectVictimsOnNode preference for non-PDB-violating
+    // victims at pkg/scheduler/framework/preemption/preemption.go.
+    if !pdbs.is_empty() {
+        let pdb_covered: std::collections::HashSet<String> = candidates
+            .iter()
+            .filter(|(p, _)| pod_violates_any_pdb(p, pdbs, all_pods))
+            .map(|(p, _)| p.metadata.name.clone())
+            .collect();
+
+        let mut pdb_aware_order = candidates.clone();
+        // Primary key: PDB-covered first (reverse: true → 0, false → 1).
+        // Secondary key: highest priority first (existing behavior).
+        pdb_aware_order.sort_by_key(|(p, priority)| {
+            let covered = pdb_covered.contains(&p.metadata.name);
+            (if covered { 0 } else { 1 }, std::cmp::Reverse(*priority))
+        });
+
+        let mut reprieved_pdb: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (candidate_pod, _) in &pdb_aware_order {
+            let mut freed_without_this: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            for (other_pod, _) in &candidates {
+                if other_pod.metadata.name == candidate_pod.metadata.name {
+                    continue;
+                }
+                if reprieved_pdb.contains(&other_pod.metadata.name) {
+                    continue;
+                }
+                if let Some(spec) = &other_pod.spec {
+                    for container in &spec.containers {
+                        if let Some(ref resources) = container.resources {
+                            if let Some(ref requests) = resources.requests {
+                                for (key, val) in requests {
+                                    *freed_without_this.entry(key.clone()).or_insert(0) +=
+                                        parse_resource_quantity(val, key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let fits_without = resources_needed.iter().all(|(key, needed)| {
+                let rem = remaining(key);
+                let free = freed_without_this.get(key).copied().unwrap_or(0);
+                (rem + free) >= *needed
+            });
+
+            if fits_without {
+                reprieved_pdb.insert(candidate_pod.metadata.name.clone());
+            }
+        }
+
+        reprieved = reprieved_pdb;
+    }
+
     // Collect final victims (candidates that were NOT reprieved)
     let pods_to_evict: Vec<String> = candidates
         .iter()
@@ -1043,6 +1131,85 @@ pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<
         reprieved.len()
     );
     (true, pods_to_evict)
+}
+
+/// Returns true if evicting `victim` would violate any of the supplied PDBs.
+///
+/// Conservative definition: any PDB whose selector matches the victim's labels
+/// is considered to cover it. If the PDB's `minAvailable` is an integer, we
+/// compare against the current count of running matching pods; if removing
+/// `victim` drops the count below `minAvailable`, eviction is a violation.
+/// Percentage minAvailable values are also evaluated against the current
+/// matching population. `maxUnavailable` is treated as "1 disruption allowed"
+/// from the current matching set (we don't track historical disruptions here).
+fn pod_violates_any_pdb(victim: &Pod, pdbs: &[PodDisruptionBudget], all_pods: &[Pod]) -> bool {
+    for pdb in pdbs {
+        if !pdb_covers_pod(pdb, victim) {
+            continue;
+        }
+        let healthy_now = all_pods
+            .iter()
+            .filter(|p| pdb_covers_pod(pdb, p))
+            .filter(|p| !is_pod_terminal(p))
+            .count() as i32;
+
+        if let Some(ref min_avail) = pdb.spec.min_available {
+            let min_avail_i = match min_avail {
+                IntOrString::Int(n) => *n,
+                IntOrString::String(s) => parse_min_available_percent(s, healthy_now),
+            };
+            if healthy_now - 1 < min_avail_i {
+                return true;
+            }
+        }
+        if let Some(ref max_unavail) = pdb.spec.max_unavailable {
+            let max_unavail_i = match max_unavail {
+                IntOrString::Int(n) => *n,
+                IntOrString::String(s) => parse_min_available_percent(s, healthy_now),
+            };
+            // A single eviction counts as one unavailable.
+            if max_unavail_i < 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True if the PDB's selector matches the pod's labels and the pod's namespace
+/// equals the PDB's namespace.
+fn pdb_covers_pod(pdb: &PodDisruptionBudget, pod: &Pod) -> bool {
+    if pdb.metadata.namespace != pod.metadata.namespace
+        && pdb.metadata.namespace.is_some()
+        && pod.metadata.namespace.is_some()
+    {
+        return false;
+    }
+    match_selector(&pdb.spec.selector, &pod.metadata.labels)
+}
+
+fn is_pod_terminal(p: &Pod) -> bool {
+    let phase = p.status.as_ref().and_then(|s| s.phase.as_ref());
+    if matches!(
+        phase,
+        Some(rusternetes_common::types::Phase::Succeeded)
+            | Some(rusternetes_common::types::Phase::Failed)
+    ) {
+        return true;
+    }
+    p.metadata.deletion_timestamp.is_some()
+}
+
+/// Parse a percentage string like "20%" into an absolute count given the
+/// current healthy population. Falls back to 0 on parse error.
+fn parse_min_available_percent(s: &str, healthy_now: i32) -> i32 {
+    if let Some(num) = s.strip_suffix('%') {
+        if let Ok(pct) = num.trim().parse::<f32>() {
+            // Round up like K8s does (ceil): minimum of pct% of healthy.
+            return ((healthy_now as f32) * pct / 100.0).ceil() as i32;
+        }
+    }
+    s.trim().parse::<i32>().unwrap_or(0)
 }
 
 /// Check topology spread constraints for a pod
