@@ -6955,27 +6955,7 @@ impl ContainerRuntime {
         );
 
         // Build a map of container name -> lifecycle for preStop hook lookup
-        let mut lifecycle_map: HashMap<String, _> = HashMap::new();
-        if let Some(spec) = &pod.spec {
-            for container in &spec.containers {
-                if let Some(ref lifecycle) = container.lifecycle {
-                    if lifecycle.pre_stop.is_some() {
-                        let container_name = format!("{}_{}", pod_name, container.name);
-                        lifecycle_map.insert(container_name, lifecycle.clone());
-                    }
-                }
-            }
-            if let Some(init_containers) = &spec.init_containers {
-                for container in init_containers {
-                    if let Some(ref lifecycle) = container.lifecycle {
-                        if lifecycle.pre_stop.is_some() {
-                            let container_name = format!("{}_{}", pod_name, container.name);
-                            lifecycle_map.insert(container_name, lifecycle.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let lifecycle_map = crate::lifecycle::build_prestop_lifecycle_map(pod);
 
         if !lifecycle_map.is_empty() {
             info!(
@@ -7005,13 +6985,17 @@ impl ContainerRuntime {
         // K8s runs preStop hooks concurrently per container and bounds the total
         // wait by `terminationGracePeriodSeconds`. If a hook overruns, it is
         // aborted and SIGTERM is delivered with the remaining grace period
-        // floored at the minimum (2s).
+        // floored at the minimum (2s) — UNLESS the initial grace period was 0
+        // (force-delete), in which case preStop is skipped entirely and the
+        // container is SIGKILL'd immediately.
         //
-        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
+        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:killContainer
+        //   if gracePeriod == 0 { skip preStop, force SIGKILL }
         //   gracePeriod -= preStopElapsed
         //   gracePeriod = max(gracePeriod, minimumGracePeriodInSeconds)  // 2s
+        let run_prestop = crate::lifecycle::should_run_prestop(grace_period_seconds);
         let prestop_start = std::time::Instant::now();
-        let prestop_budget = std::time::Duration::from_secs(grace_period_seconds.max(1) as u64);
+        let prestop_budget = crate::lifecycle::compute_prestop_budget(grace_period_seconds);
 
         // Build a name -> Container lookup so the lifecycle handler can
         // resolve named probe/handler ports against the container's declared
@@ -7025,11 +7009,18 @@ impl ContainerRuntime {
         // Collect (container_name, pre_stop_handler, container) for all running
         // containers that have a preStop hook. Match exact name first, falling
         // back to suffix match if Docker returns a different name shape.
+        // Skipped entirely on force-delete (grace_period == 0).
         let mut hooks_to_run: Vec<(
             String,
             rusternetes_common::resources::LifecycleHandler,
             Container,
         )> = Vec::new();
+        if !run_prestop && !lifecycle_map.is_empty() {
+            info!(
+                "Pod {} has preStop hooks but grace period is 0 — skipping (force-delete)",
+                pod_name
+            );
+        }
         for container in &containers {
             let names = container.names.clone().unwrap_or_default();
             let container_name = names
@@ -7070,7 +7061,7 @@ impl ContainerRuntime {
             }
         }
 
-        if !hooks_to_run.is_empty() {
+        if run_prestop && !hooks_to_run.is_empty() {
             // Run preStop hooks concurrently using futures (no Send required
             // because the executor remains on the current task).
             use futures::stream::{FuturesUnordered, StreamExt};
@@ -7112,8 +7103,12 @@ impl ContainerRuntime {
         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860-862
         //   gracePeriod -= executePreStopHook elapsed
         //   gracePeriod = max(gracePeriod, minimumGracePeriodInSeconds)
+        // For force-delete (initial grace == 0), remaining_grace stays 0
+        // and the container is SIGKILL'd immediately — the 2s floor does
+        // not apply.
         let prestop_elapsed = prestop_start.elapsed().as_secs() as i64;
-        let remaining_grace = (grace_period_seconds - prestop_elapsed).max(2);
+        let remaining_grace =
+            crate::lifecycle::remaining_grace_after_prestop(grace_period_seconds, prestop_elapsed);
         if prestop_elapsed > 0 {
             info!(
                 "preStop hooks took {}s, remaining grace period: {}s (was {}s)",

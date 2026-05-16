@@ -4,6 +4,7 @@ pub mod config;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
+pub mod lifecycle;
 pub mod runtime;
 
 pub use kubelet::PodWorkerState;
