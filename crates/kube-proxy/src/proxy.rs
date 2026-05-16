@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusternetes_common::resources::{EndpointSlice, Endpoints, Service, ServiceType};
+use rusternetes_common::resources::{EndpointSlice, Endpoints, Pod, Service, ServiceType};
 use rusternetes_storage::{Storage, StorageBackend};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +11,9 @@ use crate::iptables::IptablesManager;
 pub struct KubeProxy {
     storage: Arc<StorageBackend>,
     iptables: IptablesManager,
+    /// Name of the node we're running on. Used to filter pods so we only
+    /// install KUBE-HOSTPORTS DNAT rules for locally-scheduled pods.
+    node_name: String,
     /// Hash of last synced state to avoid unnecessary flush+rebuild cycles.
     /// K8s uses iptables-restore for atomic updates; we approximate by skipping
     /// sync when state hasn't changed, eliminating the flush gap.
@@ -22,6 +25,7 @@ impl KubeProxy {
         storage: Arc<StorageBackend>,
         cluster_cidr: String,
         nodeport_range: String,
+        node_name: String,
     ) -> Result<Self> {
         let iptables = IptablesManager::new(cluster_cidr, nodeport_range);
         iptables.initialize()?;
@@ -29,6 +33,7 @@ impl KubeProxy {
         Ok(Self {
             storage,
             iptables,
+            node_name,
             last_sync_hash: 0,
         })
     }
@@ -65,6 +70,15 @@ impl KubeProxy {
         let all_endpointslices: Vec<EndpointSlice> = self
             .storage
             .list("/registry/endpointslices/")
+            .await
+            .unwrap_or_default();
+
+        // Get all pods so we can install KUBE-HOSTPORTS DNAT rules for pods
+        // scheduled on this node. Filtering is done inside
+        // `build_hostport_rules` based on `pod.spec.node_name`.
+        let all_pods: Vec<Pod> = self
+            .storage
+            .list("/registry/pods/")
             .await
             .unwrap_or_default();
 
@@ -146,6 +160,31 @@ impl KubeProxy {
         current_hash ^= services.len() as u64;
         current_hash ^= (endpoints_map.len() as u64).wrapping_mul(31);
         current_hash ^= (all_endpointslices.len() as u64).wrapping_mul(37);
+        // Hash hostPort-relevant pod state so KUBE-HOSTPORTS resyncs
+        // when a local pod is added, gets an IP, or has its ports changed.
+        for pod in &all_pods {
+            let Some(spec) = pod.spec.as_ref() else {
+                continue;
+            };
+            if spec.node_name.as_deref() != Some(&self.node_name) {
+                continue;
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            pod.metadata.uid.hash(&mut h);
+            pod.status
+                .as_ref()
+                .and_then(|s| s.pod_ip.as_deref())
+                .hash(&mut h);
+            for c in &spec.containers {
+                for p in c.ports.iter().flatten() {
+                    p.host_port.hash(&mut h);
+                    p.container_port.hash(&mut h);
+                    p.protocol.hash(&mut h);
+                    p.host_ip.hash(&mut h);
+                }
+            }
+            current_hash ^= h.finish();
+        }
 
         for svc in &services {
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -203,7 +242,7 @@ impl KubeProxy {
         );
         let nat_rules = self
             .iptables
-            .build_nat_rules(&services, &endpointslice_map)
+            .build_nat_rules(&services, &endpointslice_map, &all_pods, &self.node_name)
             .await;
         info!("Kube-proxy built {} bytes of NAT rules", nat_rules.len());
 
