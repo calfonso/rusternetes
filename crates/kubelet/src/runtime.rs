@@ -1108,76 +1108,27 @@ impl ContainerRuntime {
     /// Returns the path to the hosts file, or None if the pod is CoreDNS
     /// (which uses the host's /etc/hosts directly).
     fn create_pod_hosts_file(&self, pod: &Pod, pod_ip: Option<&str>) -> Result<Option<String>> {
-        let pod_name = &pod.metadata.name;
-        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
-        let spec = pod.spec.as_ref().unwrap();
-
-        // Host network pods should NOT have kubelet-managed /etc/hosts.
-        // They use the host's /etc/hosts directly.
-        if spec.host_network == Some(true) {
+        // hostNetwork pods use the host's /etc/hosts directly — skip.
+        let Some(content) =
+            crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain)
+        else {
             return Ok(None);
-        }
-
-        // Determine the pod's hostname: spec.hostname if set, otherwise pod name
-        // Linux hostnames limited to 63 chars
-        let raw_hostname = spec.hostname.as_deref().unwrap_or(pod_name);
-        let hostname = if raw_hostname.len() > 63 {
-            raw_hostname[..63].trim_end_matches('-')
-        } else {
-            raw_hostname
         };
 
+        let pod_name = &pod.metadata.name;
         let pod_dir = format!("{}/{}", self.volumes_base_path, pod_name);
         std::fs::create_dir_all(&pod_dir)
             .context("Failed to create pod directory for /etc/hosts")?;
 
         let hosts_path = format!("{}/hosts", pod_dir);
-
-        let mut content = String::from(
-            "# Kubernetes-managed hosts file.\n\
-             127.0.0.1\tlocalhost\n\
-             ::1\tlocalhost ip6-localhost ip6-loopback\n\
-             fe00::\tip6-localnet\n\
-             fe00::\tip6-mcastprefix\n\
-             fe00::1\tip6-allnodes\n\
-             fe00::2\tip6-allrouters\n",
-        );
-
-        // Add the pod's own hostname → IP entry if we have an IP
-        if let Some(ip) = pod_ip {
-            // Build FQDN aliases based on subdomain and cluster domain
-            let mut aliases = vec![hostname.to_string()];
-            if let Some(subdomain) = &spec.subdomain {
-                // <hostname>.<subdomain>.<namespace>.svc.<cluster-domain>
-                aliases.push(format!(
-                    "{}.{}.{}.svc.{}",
-                    hostname, subdomain, namespace, self.cluster_domain
-                ));
-            }
-            content.push_str(&format!("{}\t{}\n", ip, aliases.join("\t")));
-            info!(
-                "Added /etc/hosts entry for pod {}/{}: {} -> {}",
-                namespace,
-                pod_name,
-                aliases.join(", "),
-                ip
-            );
-        }
-
-        // Add entries from spec.hostAliases
-        // Kubernetes groups all hostnames for the same IP on a single line
-        if let Some(host_aliases) = &spec.host_aliases {
-            for alias in host_aliases {
-                if let Some(hostnames) = &alias.hostnames {
-                    if !hostnames.is_empty() {
-                        content.push_str(&format!("{}\t{}\n", alias.ip, hostnames.join("\t")));
-                    }
-                }
-            }
-        }
-
         std::fs::write(&hosts_path, &content)
             .with_context(|| format!("Failed to write /etc/hosts for pod {}", pod_name))?;
+
+        info!(
+            "Wrote kubelet-managed /etc/hosts for pod {}/{}",
+            pod.metadata.namespace.as_deref().unwrap_or("default"),
+            pod_name,
+        );
 
         Ok(Some(hosts_path))
     }
@@ -8203,51 +8154,10 @@ mod tests {
 
     /// Build the /etc/hosts content string the same way create_pod_hosts_file does,
     /// so we can unit-test the logic without needing a live ContainerRuntime.
+    /// Delegates to the canonical kubelet helper; returns an empty string for
+    /// hostNetwork pods (these tests don't exercise that branch).
     fn build_hosts_content(pod: &Pod, pod_ip: Option<&str>, cluster_domain: &str) -> String {
-        let pod_name = &pod.metadata.name;
-        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
-        let spec = pod.spec.as_ref().unwrap();
-        let raw_hostname = spec.hostname.as_deref().unwrap_or(pod_name);
-        let hostname = if raw_hostname.len() > 63 {
-            raw_hostname[..63].trim_end_matches('-')
-        } else {
-            raw_hostname
-        };
-
-        let mut content = String::from(
-            "# Kubernetes-managed hosts file.\n\
-             127.0.0.1\tlocalhost\n\
-             ::1\tlocalhost ip6-localhost ip6-loopback\n\
-             fe00::\tip6-localnet\n\
-             fe00::\tip6-mcastprefix\n\
-             fe00::1\tip6-allnodes\n\
-             fe00::2\tip6-allrouters\n",
-        );
-
-        if let Some(ip) = pod_ip {
-            let mut aliases = vec![hostname.to_string()];
-            if let Some(subdomain) = &spec.subdomain {
-                aliases.push(format!(
-                    "{}.{}.{}.svc.{}",
-                    hostname, subdomain, namespace, cluster_domain
-                ));
-            }
-            content.push_str(&format!("{}\t{}\n", ip, aliases.join("\t")));
-        }
-
-        // Add entries from spec.hostAliases
-        // Kubernetes groups all hostnames for the same IP on a single line
-        if let Some(host_aliases) = &spec.host_aliases {
-            for alias in host_aliases {
-                if let Some(hostnames) = &alias.hostnames {
-                    if !hostnames.is_empty() {
-                        content.push_str(&format!("{}\t{}\n", alias.ip, hostnames.join("\t")));
-                    }
-                }
-            }
-        }
-
-        content
+        crate::kubelet::build_managed_hosts_content(pod, pod_ip, cluster_domain).unwrap_or_default()
     }
 
     // --- hosts file content tests ---
@@ -10634,11 +10544,12 @@ mod tests {
         let pod = make_pod("ipv6-pod", "default", None, None);
         let content = build_hosts_content(&pod, Some("10.244.1.1"), "cluster.local");
 
-        // Check that standard IPv6 entries are present
-        assert!(content.contains("fe00::\tip6-localnet"));
-        assert!(content.contains("fe00::\tip6-mcastprefix"));
-        assert!(content.contains("fe00::1\tip6-allnodes"));
-        assert!(content.contains("fe00::2\tip6-allrouters"));
+        // Check that standard IPv6 entries are present — addresses must match
+        // upstream kubelet exactly (pkg/kubelet/kubelet_pods.go).
+        assert!(content.contains("fe00::0\tip6-localnet"));
+        assert!(content.contains("ff00::0\tip6-mcastprefix"));
+        assert!(content.contains("ff02::1\tip6-allnodes"));
+        assert!(content.contains("ff02::2\tip6-allrouters"));
     }
 
     #[test]
