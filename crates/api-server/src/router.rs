@@ -903,8 +903,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/resize",
+            // PUT goes through the dedicated subresource handler so we can do
+            // CAS-retry on resourceVersion conflicts (KEP-1287). GET/PATCH fall
+            // back to the generic pod handlers — only PUT is the resize hot path.
             get(handlers::pod::get)
-                .put(handlers::pod::update)
+                .put(handlers::pod_subresources::resize_pod)
                 .patch(handlers::pod::patch),
         )
         .route(
