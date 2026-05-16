@@ -83,11 +83,25 @@ for proto in tcp udp; do
 done
 # Hairpin MASQUERADE is scoped to a bridge CIDR. Discover and remove any
 # rule whose comment matches, regardless of CIDR.
-while "$IPT" -t nat -S POSTROUTING 2>/dev/null \
-      | grep -F 'rusternetes service hairpin masquerade' | head -1 | read -r line; do
-  # Replace -A with -D and execute
-  delete_cmd=$(echo "$line" | sed 's/^-A /-D /')
-  "$IPT" -t nat $delete_cmd 2>/dev/null || break
+#
+# The previous shape of this loop was `... | head -1 | read -r line`,
+# which is buggy: `read` in a pipeline runs in a subshell so `$line` is
+# empty in the loop body and the hairpin rule never gets deleted.
+#
+# Using `read -ra cmd <<< "$line"` is also wrong here because plain bash
+# word-splitting doesn't honor the double-quotes that `iptables -S`
+# emits around comment values — the comment `"rusternetes service
+# hairpin masquerade"` would be torn into 4 separate args.
+#
+# `xargs` reads stdin with shell-style quoting, so a quoted comment
+# stays a single argument. Loop until no hairpin rule is left.
+while :; do
+  line=$("$IPT" -t nat -S POSTROUTING 2>/dev/null \
+         | grep -F 'rusternetes service hairpin masquerade' | head -1)
+  [ -n "$line" ] || break
+  if ! echo "$line" | sed 's/^-A /-D /' | xargs "$IPT" -t nat 2>/dev/null; then
+    break
+  fi
 done
 ok "host jump rules + legacy MASQUERADE rules removed"
 
