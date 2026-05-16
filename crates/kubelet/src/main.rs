@@ -4,6 +4,7 @@ mod config;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;
+mod lifecycle;
 mod runtime;
 
 use anyhow::Result;
