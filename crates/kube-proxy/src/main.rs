@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use rusternetes_kube_proxy::KubeProxyConfig;
+use rusternetes_kube_proxy::{
+    iptables::{DEFAULT_CLUSTER_CIDR, DEFAULT_NODEPORT_RANGE},
+    KubeProxyConfig,
+};
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{info, Level};
@@ -32,6 +35,18 @@ struct Args {
     /// Sync interval in seconds
     #[arg(long, default_value = "1")]
     sync_interval: u64,
+
+    /// ClusterIP CIDR — must match the apiserver's
+    /// `--service-cluster-ip-range`. Used to scope the POSTROUTING
+    /// MASQUERADE rule so it doesn't fire on non-cluster traffic.
+    #[arg(long, default_value = DEFAULT_CLUSTER_CIDR)]
+    cluster_cidr: String,
+
+    /// NodePort range in iptables `start:end` form — must match the
+    /// apiserver's `--service-node-port-range`. Hyphen also accepted
+    /// (`30000-32767`) and normalized.
+    #[arg(long, default_value = DEFAULT_NODEPORT_RANGE)]
+    node_port_range: String,
 }
 
 #[tokio::main]
@@ -72,6 +87,10 @@ async fn main() -> Result<()> {
     let config = KubeProxyConfig {
         node_name: args.node_name,
         sync_interval: args.sync_interval,
+        cluster_cidr: args.cluster_cidr,
+        // Accept hyphen form (`30000-32767`) as a convenience — k8s and Go
+        // flags use the hyphen, iptables wants the colon. Normalize here.
+        nodeport_range: args.node_port_range.replace('-', ":"),
     };
 
     rusternetes_kube_proxy::run(storage, config).await

@@ -11,6 +11,25 @@ use tracing::{info, warn};
 pub struct KubeProxyConfig {
     pub node_name: String,
     pub sync_interval: u64,
+    /// ClusterIP CIDR — must match the apiserver's
+    /// `--service-cluster-ip-range`. Defaults to k8s' `10.96.0.0/12`.
+    /// Used to scope POSTROUTING MASQUERADE so it doesn't fire on
+    /// non-cluster traffic (e.g. Docker's own DNS DNAT).
+    pub cluster_cidr: String,
+    /// NodePort range in iptables `start:end` form — must match the
+    /// apiserver's `--service-node-port-range`. Defaults to `30000:32767`.
+    pub nodeport_range: String,
+}
+
+impl Default for KubeProxyConfig {
+    fn default() -> Self {
+        Self {
+            node_name: String::new(),
+            sync_interval: 1,
+            cluster_cidr: iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+            nodeport_range: iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+        }
+    }
 }
 
 /// Run the kube-proxy component.
@@ -40,9 +59,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
         }
     }
 
-    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(Arc::clone(
-        &storage,
-    ))?));
+    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(
+        Arc::clone(&storage),
+        config.cluster_cidr.clone(),
+        config.nodeport_range.clone(),
+    )?));
 
     info!("Kube-proxy initialized successfully");
     info!("Syncing services every {} seconds", config.sync_interval);
@@ -67,6 +88,13 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
             worker_queue.done(&key).await;
         }
     });
+
+    // SIGTERM is what `docker stop` (and Kubernetes pod termination) sends.
+    // Without an explicit handler, tokio just lets the process get killed
+    // and the IptablesManager::Drop never runs — leaving the host's
+    // iptables polluted with RUSTERNETES-* chains and jump rules.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
 
     loop {
         queue.add(RECONCILE_ALL_SENTINEL.into()).await;
@@ -160,7 +188,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
                     queue.add(RECONCILE_ALL_SENTINEL.into()).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal");
+                    info!("Received SIGINT — shutting down");
+                    return Ok(());
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM — shutting down");
                     return Ok(());
                 }
             }

@@ -18,8 +18,12 @@ pub struct KubeProxy {
 }
 
 impl KubeProxy {
-    pub fn new(storage: Arc<StorageBackend>) -> Result<Self> {
-        let iptables = IptablesManager::new();
+    pub fn new(
+        storage: Arc<StorageBackend>,
+        cluster_cidr: String,
+        nodeport_range: String,
+    ) -> Result<Self> {
+        let iptables = IptablesManager::new(cluster_cidr, nodeport_range);
         iptables.initialize()?;
 
         Ok(Self {
