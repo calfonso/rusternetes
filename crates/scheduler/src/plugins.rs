@@ -3,13 +3,72 @@
 //! These plugins implement the standard Kubernetes scheduling policies using the scheduling framework.
 
 use crate::advanced::{
-    calculate_resource_score, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
-    check_taints_tolerations, check_topology_spread_constraints,
+    calculate_resource_score, check_host_port_conflicts, check_node_affinity, check_pod_affinity,
+    check_pod_anti_affinity, check_taints_tolerations, check_topology_spread_constraints,
 };
 use crate::framework::*;
 use async_trait::async_trait;
 use rusternetes_common::resources::{Node, Pod};
 use std::collections::HashMap;
+
+/// K8s treats an empty string and an unset field as equivalent for toleration
+/// `value`/`effect` and taint `value`, but `check_taints_tolerations` in
+/// `advanced.rs` does strict `Option<&String>` comparisons. These helpers
+/// normalize the relevant fields, cloning only when normalization is actually
+/// needed so the hot path stays free of allocations.
+fn empty_string(opt: &Option<String>) -> bool {
+    opt.as_deref() == Some("")
+}
+
+fn pod_needs_toleration_normalization(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.tolerations.as_ref())
+        .map(|tols| {
+            tols.iter()
+                .any(|t| empty_string(&t.value) || empty_string(&t.effect))
+        })
+        .unwrap_or(false)
+}
+
+fn node_needs_taint_normalization(node: &Node) -> bool {
+    node.spec
+        .as_ref()
+        .and_then(|s| s.taints.as_ref())
+        .map(|taints| taints.iter().any(|t| empty_string(&t.value)))
+        .unwrap_or(false)
+}
+
+fn normalize_pod_tolerations(pod: &Pod) -> Pod {
+    let mut normalized = pod.clone();
+    if let Some(tols) = normalized
+        .spec
+        .as_mut()
+        .and_then(|s| s.tolerations.as_mut())
+    {
+        for t in tols.iter_mut() {
+            if empty_string(&t.value) {
+                t.value = None;
+            }
+            if empty_string(&t.effect) {
+                t.effect = None;
+            }
+        }
+    }
+    normalized
+}
+
+fn normalize_node_taints(node: &Node) -> Node {
+    let mut normalized = node.clone();
+    if let Some(taints) = normalized.spec.as_mut().and_then(|s| s.taints.as_mut()) {
+        for t in taints.iter_mut() {
+            if empty_string(&t.value) {
+                t.value = None;
+            }
+        }
+    }
+    normalized
+}
 
 // ============================================================================
 // Filter Plugins
@@ -64,7 +123,24 @@ impl FilterPlugin for TaintTolerationPlugin {
         node: &Node,
         _handle: &FrameworkHandle,
     ) -> PluginResult {
-        if check_taints_tolerations(node, pod) {
+        // Clone only when an empty-string field is actually present; the
+        // common case (well-formed specs with None or non-empty strings) hits
+        // the underlying helper with zero extra allocations.
+        let pod_owned;
+        let node_owned;
+        let pod_ref = if pod_needs_toleration_normalization(pod) {
+            pod_owned = normalize_pod_tolerations(pod);
+            &pod_owned
+        } else {
+            pod
+        };
+        let node_ref = if node_needs_taint_normalization(node) {
+            node_owned = normalize_node_taints(node);
+            &node_owned
+        } else {
+            node
+        };
+        if check_taints_tolerations(node_ref, pod_ref) {
             PluginResult::success()
         } else {
             PluginResult::unschedulable(format!(
@@ -237,6 +313,37 @@ impl FilterPlugin for TopologySpreadConstraintsPlugin {
     }
 }
 
+/// HostPort filters nodes where the pod's hostPort requirements would
+/// conflict with hostPorts already in use by pods already scheduled on the
+/// node. Two pods conflict if they share `(hostPort, protocol)` with
+/// overlapping `hostIP` values (wildcard IPs `0.0.0.0`, `::`, or empty overlap
+/// with anything).
+pub struct HostPortPlugin;
+
+#[async_trait]
+impl FilterPlugin for HostPortPlugin {
+    fn name(&self) -> &'static str {
+        "HostPort"
+    }
+
+    async fn filter(
+        &self,
+        _state: &CycleState,
+        pod: &Pod,
+        node: &Node,
+        handle: &FrameworkHandle,
+    ) -> PluginResult {
+        if check_host_port_conflicts(node, pod, &handle.all_pods) {
+            PluginResult::success()
+        } else {
+            PluginResult::unschedulable(format!(
+                "Pod hostPort conflicts with an existing pod on node {}",
+                node.metadata.name
+            ))
+        }
+    }
+}
+
 // ============================================================================
 // Score Plugins
 // ============================================================================
@@ -365,6 +472,7 @@ pub fn get_default_plugins() -> PluginRegistry {
     registry.register_filter_plugin(std::sync::Arc::new(PodAffinityPlugin));
     registry.register_filter_plugin(std::sync::Arc::new(PodAntiAffinityPlugin));
     registry.register_filter_plugin(std::sync::Arc::new(TopologySpreadConstraintsPlugin));
+    registry.register_filter_plugin(std::sync::Arc::new(HostPortPlugin));
 
     // Register score plugins
     registry.register_score_plugin(std::sync::Arc::new(NodeResourcesFitPlugin));
