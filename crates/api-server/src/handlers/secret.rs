@@ -7,13 +7,63 @@ use axum::{
 };
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::Secret,
+    resources::{PodSpec, Secret},
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// K8s default file-mode bits for Secret/ConfigMap/DownwardAPI/Projected
+/// volumes when `defaultMode` is omitted by the client. Decimal 420 == 0o644.
+///
+/// K8s ref: `pkg/apis/core/v1/defaults.go`:
+/// - `SetDefaults_SecretVolumeSource`
+/// - `SetDefaults_ConfigMapVolumeSource`
+/// - `SetDefaults_DownwardAPIVolumeSource`
+/// - `SetDefaults_ProjectedVolumeSource`
+#[allow(dead_code)]
+pub const DEFAULT_VOLUME_FILE_MODE: i32 = 0o644;
+
+/// Apply K8s defaulting for volume `defaultMode` bits to every Secret,
+/// ConfigMap, DownwardAPI, and Projected volume source on a [`PodSpec`].
+///
+/// Per-item `mode` (on `KeyToPath` / `DownwardAPIVolumeFile`) is intentionally
+/// left untouched — the kubelet falls back to `defaultMode` when a per-item
+/// mode is unset, which is the K8s contract.
+///
+/// Explicit caller-supplied values (including `0`) are never overwritten:
+/// only `None` is defaulted. This matches the upstream Go defaulting which
+/// only fills in nil pointers.
+#[allow(dead_code)]
+pub fn apply_volume_mode_defaults(spec: &mut PodSpec) {
+    let Some(volumes) = spec.volumes.as_mut() else {
+        return;
+    };
+    for vol in volumes.iter_mut() {
+        if let Some(sv) = vol.secret.as_mut() {
+            if sv.default_mode.is_none() {
+                sv.default_mode = Some(DEFAULT_VOLUME_FILE_MODE);
+            }
+        }
+        if let Some(cm) = vol.config_map.as_mut() {
+            if cm.default_mode.is_none() {
+                cm.default_mode = Some(DEFAULT_VOLUME_FILE_MODE);
+            }
+        }
+        if let Some(dapi) = vol.downward_api.as_mut() {
+            if dapi.default_mode.is_none() {
+                dapi.default_mode = Some(DEFAULT_VOLUME_FILE_MODE);
+            }
+        }
+        if let Some(proj) = vol.projected.as_mut() {
+            if proj.default_mode.is_none() {
+                proj.default_mode = Some(DEFAULT_VOLUME_FILE_MODE);
+            }
+        }
+    }
+}
 
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
