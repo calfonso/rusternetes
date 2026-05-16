@@ -91,6 +91,17 @@ struct Args {
     #[arg(long, default_value = "1")]
     proxy_sync_interval: u64,
 
+    /// ClusterIP CIDR — must match the apiserver's
+    /// `--service-cluster-ip-range`. Used by kube-proxy to scope its
+    /// POSTROUTING MASQUERADE rule.
+    #[arg(long, default_value = rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR)]
+    cluster_cidr: String,
+
+    /// NodePort range in iptables `start:end` form — must match the
+    /// apiserver's `--service-node-port-range`. Hyphen also accepted.
+    #[arg(long, default_value = rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE)]
+    node_port_range: String,
+
     /// Skip authentication (insecure, for development)
     #[arg(long, default_value = "true")]
     skip_auth: bool,
@@ -239,6 +250,9 @@ async fn main() -> Result<()> {
         let proxy_config = rusternetes_kube_proxy::KubeProxyConfig {
             node_name: args.node_name,
             sync_interval: args.proxy_sync_interval,
+            cluster_cidr: args.cluster_cidr,
+            // Accept hyphen form as a convenience; iptables wants colon.
+            nodeport_range: args.node_port_range.replace('-', ":"),
         };
         tokio::spawn(async move {
             if let Err(e) = rusternetes_kube_proxy::run(proxy_storage, proxy_config).await {

@@ -80,6 +80,12 @@ fn detect_bridge_network() -> Option<(String, String)> {
     None
 }
 
+/// k8s upstream defaults — match `kube-apiserver`'s `--service-cluster-ip-range`
+/// (10.0.0.0/12) and `--service-node-port-range` (30000-32767). Used when the
+/// caller doesn't override.
+pub const DEFAULT_CLUSTER_CIDR: &str = "10.96.0.0/12";
+pub const DEFAULT_NODEPORT_RANGE: &str = "30000:32767";
+
 /// IptablesManager handles iptables rule programming for service networking
 pub struct IptablesManager {
     /// Chain names we create
@@ -87,6 +93,13 @@ pub struct IptablesManager {
     nodeports_chain: String,
     /// The iptables command to use (detected at init)
     iptables_cmd: String,
+    /// ClusterIP CIDR — narrows the POSTROUTING MASQUERADE so it doesn't fire
+    /// on Docker's own DNS DNAT and other non-cluster traffic. Must match the
+    /// apiserver's `--service-cluster-ip-range`.
+    cluster_cidr: String,
+    /// NodePort range as iptables `start:end` (e.g. "30000:32767"). Narrows
+    /// the NodePort MASQUERADE. Must match `--service-node-port-range`.
+    nodeport_range: String,
     /// Track per-endpoint chains (KUBE-SEP-*) so we can clean them up on flush
     sep_chains: std::sync::Mutex<Vec<String>>,
     /// Whether the xt_recent kernel module is available
@@ -99,7 +112,10 @@ pub struct IptablesManager {
 
 impl Default for IptablesManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(
+            DEFAULT_CLUSTER_CIDR.to_string(),
+            DEFAULT_NODEPORT_RANGE.to_string(),
+        )
     }
 }
 
@@ -114,6 +130,8 @@ impl IptablesManager {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
             iptables_cmd: "/usr/sbin/iptables".to_string(),
+            cluster_cidr: DEFAULT_CLUSTER_CIDR.to_string(),
+            nodeport_range: DEFAULT_NODEPORT_RANGE.to_string(),
             sep_chains: std::sync::Mutex::new(Vec::new()),
             recent_available,
             bridge_iface: None,
@@ -121,7 +139,7 @@ impl IptablesManager {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new(cluster_cidr: String, nodeport_range: String) -> Self {
         let iptables_cmd = detect_iptables_cmd().to_string();
         let bridge_network = detect_bridge_network();
         // Probe whether the xt_recent module is available by trying a dummy check rule.
@@ -163,6 +181,8 @@ impl IptablesManager {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
             iptables_cmd,
+            cluster_cidr,
+            nodeport_range,
             sep_chains: std::sync::Mutex::new(Vec::new()),
             recent_available,
             bridge_iface,
@@ -332,7 +352,7 @@ impl IptablesManager {
                     "--ctstate",
                     "DNAT",
                     "--ctorigdstport",
-                    "30000:32767",
+                    &self.nodeport_range,
                     "-j",
                     "MASQUERADE",
                 ])
@@ -355,7 +375,7 @@ impl IptablesManager {
                         "--ctstate",
                         "DNAT",
                         "--ctorigdstport",
-                        "30000:32767",
+                        &self.nodeport_range,
                         "-j",
                         "MASQUERADE",
                     ])
@@ -415,7 +435,7 @@ impl IptablesManager {
         // MASQUERADE on a packet mark (`KUBE-MARK-MASQ`); the `--ctorigdst`
         // filter accomplishes the same scope with fewer moving parts.
         let masq_comment = "rusternetes ClusterIP DNAT masquerade";
-        let cluster_cidr = "10.96.0.0/12";
+        let cluster_cidr = self.cluster_cidr.as_str();
         let dnat_masq_check = Command::new(&self.iptables_cmd)
             .args([
                 "-t",
@@ -568,7 +588,7 @@ impl IptablesManager {
             }
 
             // Accept packets from/to the service CIDR
-            for cidr in &["10.96.0.0/12"] {
+            for cidr in &[self.cluster_cidr.as_str()] {
                 for flag in &["-s", "-d"] {
                     let check = Command::new(&self.iptables_cmd)
                         .args([
@@ -661,24 +681,27 @@ impl IptablesManager {
             info!("Ensured KUBE-FORWARD filter rules for service traffic");
         }
 
-        // Ensure the service CIDR (10.96.0.0/12) is routable.
+        // Ensure the service CIDR is routable.
         // Without a route, packets to ClusterIPs may be dropped before reaching
         // iptables PREROUTING/DNAT. We add a route pointing to the container bridge
         // so the kernel accepts the packets and lets iptables DNAT them.
         // Note: PREROUTING DNAT happens before routing, so the route is mainly
         // needed for locally originated traffic (OUTPUT chain) and as a safety net.
         let route_check = Command::new("ip")
-            .args(["route", "show", "10.96.0.0/12"])
+            .args(["route", "show", &self.cluster_cidr])
             .output();
         if route_check.map_or(true, |o| o.stdout.is_empty()) {
             // Use the dynamically detected bridge interface
             if let Some(ref iface) = self.bridge_iface {
                 let output = Command::new("ip")
-                    .args(["route", "add", "10.96.0.0/12", "dev", iface])
+                    .args(["route", "add", &self.cluster_cidr, "dev", iface])
                     .output();
                 match output {
                     Ok(o) if o.status.success() => {
-                        info!("Added route for service CIDR 10.96.0.0/12 via {}", iface);
+                        info!(
+                            "Added route for service CIDR {} via {}",
+                            self.cluster_cidr, iface
+                        );
                     }
                     Ok(o) => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
@@ -1454,7 +1477,7 @@ impl IptablesManager {
             "--ctstate",
             "DNAT",
             "--ctorigdst",
-            "10.96.0.0/12",
+            self.cluster_cidr.as_str(),
             "-j",
             "MASQUERADE",
         ]);
@@ -1493,7 +1516,7 @@ impl IptablesManager {
                 "--ctstate",
                 "DNAT",
                 "--ctorigdstport",
-                "30000:32767",
+                self.nodeport_range.as_str(),
                 "-j",
                 "MASQUERADE",
             ]);

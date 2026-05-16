@@ -11,6 +11,25 @@ use tracing::{info, warn};
 pub struct KubeProxyConfig {
     pub node_name: String,
     pub sync_interval: u64,
+    /// ClusterIP CIDR — must match the apiserver's
+    /// `--service-cluster-ip-range`. Defaults to k8s' `10.96.0.0/12`.
+    /// Used to scope POSTROUTING MASQUERADE so it doesn't fire on
+    /// non-cluster traffic (e.g. Docker's own DNS DNAT).
+    pub cluster_cidr: String,
+    /// NodePort range in iptables `start:end` form — must match the
+    /// apiserver's `--service-node-port-range`. Defaults to `30000:32767`.
+    pub nodeport_range: String,
+}
+
+impl Default for KubeProxyConfig {
+    fn default() -> Self {
+        Self {
+            node_name: String::new(),
+            sync_interval: 1,
+            cluster_cidr: iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+            nodeport_range: iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+        }
+    }
 }
 
 /// Run the kube-proxy component.
@@ -40,9 +59,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
         }
     }
 
-    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(Arc::clone(
-        &storage,
-    ))?));
+    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(
+        Arc::clone(&storage),
+        config.cluster_cidr.clone(),
+        config.nodeport_range.clone(),
+    )?));
 
     info!("Kube-proxy initialized successfully");
     info!("Syncing services every {} seconds", config.sync_interval);
