@@ -211,6 +211,16 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         }
     }
 
+    /// Reconcile a single APIService by name. Intended for integration tests
+    /// and one-shot reconciliation; the production code path drives reconcile
+    /// through the work-queue worker, which doesn't call this entry point.
+    #[allow(dead_code)]
+    pub async fn reconcile(&self, name: &str) -> Result<()> {
+        let key = rusternetes_storage::build_key("apiservices", None, name);
+        let apiservice: serde_json::Value = self.storage.get(&key).await?;
+        self.reconcile_one(&apiservice).await
+    }
+
     async fn reconcile_one(&self, apiservice: &serde_json::Value) -> Result<()> {
         let name = apiservice
             .pointer("/metadata/name")
@@ -405,7 +415,10 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             Err(_) => return Ok(()), // APIService was deleted
         };
 
-        // Check if the condition already matches — skip update if unchanged
+        // Check if the condition already matches — skip update if unchanged.
+        // Status, reason AND message must all match: conformance tooling reads
+        // `message` directly to diagnose failures, so a stale message hiding
+        // behind a matching reason is observable as a bug.
         if let Some(conditions) = apiservice
             .pointer("/status/conditions")
             .and_then(|v| v.as_array())
@@ -414,6 +427,7 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
                 if c.get("type").and_then(|v| v.as_str()) == Some("Available")
                     && c.get("status").and_then(|v| v.as_str()) == Some(status)
                     && c.get("reason").and_then(|v| v.as_str()) == Some(reason)
+                    && c.get("message").and_then(|v| v.as_str()) == Some(message)
                 {
                     // Already up to date
                     return Ok(());
@@ -421,11 +435,28 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             }
         }
 
+        // K8s convention: lastTransitionTime only advances when `status` flips.
+        // Reason/message-only updates retain the prior transition time so
+        // observers can tell how long the condition has held its current
+        // status. Default to "now" if there's no prior Available condition.
         let now = chrono::Utc::now().to_rfc3339();
+        let prior_transition = apiservice
+            .pointer("/status/conditions")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|c| {
+                    c.get("type").and_then(|v| v.as_str()) == Some("Available")
+                        && c.get("status").and_then(|v| v.as_str()) == Some(status)
+                })
+            })
+            .and_then(|c| c.get("lastTransitionTime"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| now.clone());
         let condition = serde_json::json!({
             "type": "Available",
             "status": status,
-            "lastTransitionTime": now,
+            "lastTransitionTime": prior_transition,
             "reason": reason,
             "message": message,
         });
@@ -433,7 +464,12 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         // Update the status conditions
         if let Some(status_obj) = apiservice.get_mut("status") {
             if let Some(conditions) = status_obj.get_mut("conditions") {
-                if let Some(arr) = conditions.as_array_mut() {
+                if conditions.as_array().is_none() {
+                    // Defensive: status.conditions is present but not an array
+                    // (corrupted/null). Reset to a fresh array so the new
+                    // condition isn't silently dropped.
+                    *conditions = serde_json::json!([condition]);
+                } else if let Some(arr) = conditions.as_array_mut() {
                     // Replace existing Available condition
                     let mut found = false;
                     for c in arr.iter_mut() {
@@ -463,45 +499,56 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         match self.storage.update(&key, &apiservice).await {
             Ok(_) => {}
             Err(rusternetes_common::Error::Conflict(_)) => {
-                // Another writer raced — re-read and retry once.
-                if let Ok(mut fresh) = self.storage.get::<serde_json::Value>(&key).await {
-                    if let Some(status_obj) = fresh.get_mut("status") {
-                        if let Some(conditions) = status_obj
-                            .get_mut("conditions")
-                            .and_then(|v| v.as_array_mut())
-                        {
-                            let mut found = false;
-                            for c in conditions.iter_mut() {
-                                if c.get("type").and_then(|v| v.as_str()) == Some("Available") {
-                                    *c = condition.clone();
-                                    found = true;
-                                    break;
-                                }
+                // Another writer raced — re-read and retry once in-place.
+                let mut fresh = self
+                    .storage
+                    .get::<serde_json::Value>(&key)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to re-read APIService {} after conflict: {}",
+                            apiservice_name,
+                            e
+                        )
+                    })?;
+                if let Some(status_obj) = fresh.get_mut("status") {
+                    if let Some(conditions) = status_obj
+                        .get_mut("conditions")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        let mut found = false;
+                        for c in conditions.iter_mut() {
+                            if c.get("type").and_then(|v| v.as_str()) == Some("Available") {
+                                *c = condition.clone();
+                                found = true;
+                                break;
                             }
-                            if !found {
-                                conditions.push(condition);
-                            }
-                        } else {
-                            status_obj["conditions"] = serde_json::json!([condition]);
+                        }
+                        if !found {
+                            conditions.push(condition);
                         }
                     } else {
-                        fresh["status"] = serde_json::json!({ "conditions": [condition] });
+                        status_obj["conditions"] = serde_json::json!([condition]);
                     }
-                    if let Err(e) = self.storage.update(&key, &fresh).await {
-                        error!(
-                            error = %e,
-                            apiservice = apiservice_name,
-                            "failed to update apiservice after conflict retry"
-                        );
-                    }
+                } else {
+                    fresh["status"] = serde_json::json!({ "conditions": [condition] });
                 }
+                // Propagate any further error so the work-queue requeues with
+                // backoff instead of getting stuck on stale state.
+                self.storage.update(&key, &fresh).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to update APIService {} after conflict retry: {}",
+                        apiservice_name,
+                        e
+                    )
+                })?;
             }
             Err(e) => {
-                error!(
-                    error = %e,
-                    apiservice = apiservice_name,
-                    "failed to update apiservice"
-                );
+                return Err(anyhow::anyhow!(
+                    "failed to update APIService {}: {}",
+                    apiservice_name,
+                    e
+                ));
             }
         }
         Ok(())
