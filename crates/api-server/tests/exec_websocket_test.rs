@@ -151,11 +151,11 @@ async fn test_exec_websocket_nonzero_exit_status() {
 
     while let Some(msg) = ws_stream.next().await {
         match msg {
-            Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
-                if !data.is_empty() && data[0] == 3 {
-                    received_status = true;
-                    status_content = String::from_utf8_lossy(&data[1..]).to_string();
-                }
+            Ok(tokio_tungstenite::tungstenite::Message::Binary(data))
+                if !data.is_empty() && data[0] == 3 =>
+            {
+                received_status = true;
+                status_content = String::from_utf8_lossy(&data[1..]).to_string();
             }
             Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
             Err(_) => break,
