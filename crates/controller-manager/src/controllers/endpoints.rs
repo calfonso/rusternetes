@@ -217,6 +217,21 @@ impl<S: Storage + 'static> EndpointsController<S> {
         // List all services across all namespaces
         let services: Vec<Service> = self.storage.list("/registry/services/").await?;
 
+        // Snapshot surviving Service identities for orphan-Endpoints GC below.
+        // Without this, deleted Services leave stale Endpoints behind and
+        // upstream e2e network/service.go:3459 (DeleteService) times out.
+        let surviving: std::collections::HashSet<(String, String)> = services
+            .iter()
+            .map(|s| {
+                let ns = s
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                (ns, s.metadata.name.clone())
+            })
+            .collect();
+
         for service in services {
             if let Err(e) = self.reconcile_service(&service).await {
                 error!(
@@ -229,6 +244,25 @@ impl<S: Storage + 'static> EndpointsController<S> {
                     &service.metadata.name,
                     e
                 );
+            }
+        }
+
+        // GC Endpoints whose owning Service no longer exists.
+        let all_endpoints: Vec<Endpoints> = self
+            .storage
+            .list(&build_prefix("endpoints", None))
+            .await
+            .unwrap_or_default();
+        for ep in &all_endpoints {
+            let ns = ep.metadata.namespace.as_deref().unwrap_or("default");
+            let name = ep.metadata.name.as_str();
+            if surviving.contains(&(ns.to_string(), name.to_string())) {
+                continue;
+            }
+            let key = build_key("endpoints", Some(ns), name);
+            match self.storage.delete(&key).await {
+                Ok(_) => debug!("Deleted orphan Endpoints {}/{}", ns, name),
+                Err(e) => debug!("Failed to delete orphan Endpoints {}/{}: {}", ns, name, e),
             }
         }
 
