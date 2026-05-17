@@ -63,6 +63,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
         Arc::clone(&storage),
         config.cluster_cidr.clone(),
         config.nodeport_range.clone(),
+        config.node_name.clone(),
     )?));
 
     info!("Kube-proxy initialized successfully");
@@ -105,6 +106,9 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
         let svc_watch = storage.watch("/registry/services/").await;
         let ep_watch = storage.watch("/registry/endpoints/").await;
         let es_watch = storage.watch("/registry/endpointslices/").await;
+        // Watch pods so that hostPort changes (new pod scheduled, pod IP
+        // assigned, pod deleted) trigger a fast KUBE-HOSTPORTS rebuild.
+        let pod_watch = storage.watch("/registry/pods/").await;
 
         let mut svc_watch = match svc_watch {
             Ok(w) => w,
@@ -126,6 +130,14 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
             Ok(w) => w,
             Err(e) => {
                 tracing::error!("Failed to establish endpointslice watch: {}, retrying", e);
+                tokio::time::sleep(sync_interval).await;
+                continue;
+            }
+        };
+        let mut pod_watch = match pod_watch {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("Failed to establish pod watch: {}, retrying", e);
                 tokio::time::sleep(sync_interval).await;
                 continue;
             }
@@ -180,6 +192,21 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
                         }
                         None => {
                             tracing::warn!("EndpointSlice watch stream ended, reconnecting");
+                            watch_broken = true;
+                        }
+                    }
+                }
+                event = pod_watch.next() => {
+                    match event {
+                        Some(Ok(_)) => {
+                            queue.add(RECONCILE_ALL_SENTINEL.into()).await;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("Pod watch error: {}, reconnecting", e);
+                            watch_broken = true;
+                        }
+                        None => {
+                            tracing::warn!("Pod watch stream ended, reconnecting");
                             watch_broken = true;
                         }
                     }

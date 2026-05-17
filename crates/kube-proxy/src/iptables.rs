@@ -91,6 +91,9 @@ pub struct IptablesManager {
     /// Chain names we create
     services_chain: String,
     nodeports_chain: String,
+    /// Chain for pod hostPort DNAT (KUBE-HOSTPORTS).
+    /// Populated by `build_hostport_rules` from the pod list each sync.
+    hostports_chain: String,
     /// The iptables command to use (detected at init)
     iptables_cmd: String,
     /// ClusterIP CIDR — narrows the POSTROUTING MASQUERADE so it doesn't fire
@@ -129,6 +132,7 @@ impl IptablesManager {
         Self {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
+            hostports_chain: "KUBE-HOSTPORTS".to_string(),
             iptables_cmd: "/usr/sbin/iptables".to_string(),
             cluster_cidr: DEFAULT_CLUSTER_CIDR.to_string(),
             nodeport_range: DEFAULT_NODEPORT_RANGE.to_string(),
@@ -180,6 +184,7 @@ impl IptablesManager {
         Self {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
+            hostports_chain: "KUBE-HOSTPORTS".to_string(),
             iptables_cmd,
             cluster_cidr,
             nodeport_range,
@@ -263,6 +268,28 @@ impl IptablesManager {
             "OUTPUT",
             &self.nodeports_chain,
             "kubernetes service node ports",
+        )?;
+
+        // KUBE-HOSTPORTS: DNAT rules for pod hostPorts.
+        // Upstream K8s installs a per-host KUBE-HOSTPORTS chain hit from both
+        // PREROUTING and OUTPUT so that traffic to `nodeIP:hostPort` is routed
+        // to the pod regardless of whether the source is on the bridge or
+        // the host itself. Without this, hostPort connectivity depends on the
+        // container runtime's published-port forwarding, which is flaky in
+        // nested-container setups.
+        // K8s ref: pkg/kubelet/dockershim/network/hostport/hostport_manager.go
+        self.ensure_chain("nat", &self.hostports_chain)?;
+        self.ensure_jump_rule(
+            "nat",
+            "PREROUTING",
+            &self.hostports_chain,
+            "kubernetes hostport rules",
+        )?;
+        self.ensure_jump_rule(
+            "nat",
+            "OUTPUT",
+            &self.hostports_chain,
+            "kubernetes hostport rules",
         )?;
 
         // Add MASQUERADE rule for hairpin NAT (container→ClusterIP→container on same bridge).
@@ -909,6 +936,7 @@ impl IptablesManager {
 
         self.flush_chain("nat", &self.services_chain)?;
         self.flush_chain("nat", &self.nodeports_chain)?;
+        self.flush_chain("nat", &self.hostports_chain)?;
         // KUBE-FORWARD must be flushed too — without this, cleanup()'s
         // delete_chain("filter", "KUBE-FORWARD") fails because the chain
         // still has rules.
@@ -1557,10 +1585,13 @@ impl IptablesManager {
                 "MASQUERADE",
             ]);
         }
+        self.remove_jump_rule("nat", "PREROUTING", &self.hostports_chain)?;
+        self.remove_jump_rule("nat", "OUTPUT", &self.hostports_chain)?;
 
         // Delete our chains
         self.delete_chain("nat", &self.services_chain)?;
         self.delete_chain("nat", &self.nodeports_chain)?;
+        self.delete_chain("nat", &self.hostports_chain)?;
         self.delete_chain("filter", "KUBE-FORWARD")?;
 
         info!("Kube-proxy iptables cleanup complete");
@@ -1608,11 +1639,17 @@ impl IptablesManager {
     /// Returns the rules as a string ready for `iptables-restore --noflush`.
     /// K8s builds all rules in memory then applies atomically.
     /// See: pkg/proxy/iptables/proxier.go:1495
+    ///
+    /// `pods` and `node_name` are used to install KUBE-HOSTPORTS DNAT rules
+    /// for pods scheduled on this node. Pass an empty slice to skip hostPort
+    /// programming (e.g. when the caller hasn't fetched pods yet).
     #[allow(clippy::type_complexity)]
     pub async fn build_nat_rules(
         &self,
         services: &[rusternetes_common::resources::Service],
         endpointslice_map: &std::collections::HashMap<String, Vec<(String, Option<String>, u16)>>,
+        pods: &[rusternetes_common::resources::Pod],
+        node_name: &str,
     ) -> String {
         let mut rules = String::new();
 
@@ -1620,6 +1657,9 @@ impl IptablesManager {
         rules.push_str("*nat\n");
         rules.push_str(&format!(":{} - [0:0]\n", self.services_chain));
         rules.push_str(&format!(":{} - [0:0]\n", self.nodeports_chain));
+        // KUBE-HOSTPORTS lines (chain header + DNAT rules) emitted in-place
+        // so the entire NAT table is replaced atomically with one restore.
+        rules.push_str(&self.build_hostport_chain_block(pods, node_name));
 
         // Build DNAT rules for each service
         for service in services {
@@ -1911,6 +1951,104 @@ impl IptablesManager {
         }
 
         rules.push_str("COMMIT\n");
+        rules
+    }
+
+    /// Build DNAT rules for pod hostPorts on this node.
+    ///
+    /// For every pod scheduled on `node_name` that declares a `hostPort` on
+    /// any container, emit a DNAT rule that maps `<hostPort>` (any destination
+    /// hitting the node) to `<podIP>:<containerPort>`. Without these rules,
+    /// `nodeIP:hostPort` traffic falls through to the host's INPUT chain and
+    /// is dropped (or routed to the wrong process).
+    ///
+    /// Returns an iptables-restore snippet that defines the `KUBE-HOSTPORTS`
+    /// chain and appends one DNAT rule per (pod, port) pair. Pods on other
+    /// nodes, pods without a podIP, and ports without `host_port` are skipped.
+    ///
+    /// K8s ref: pkg/kubelet/dockershim/network/hostport — openHostports +
+    /// HostportSyncer.SyncHostports.
+    pub fn build_hostport_rules(
+        &self,
+        pods: &[rusternetes_common::resources::Pod],
+        node_name: &str,
+    ) -> String {
+        let mut rules = String::new();
+        rules.push_str("*nat\n");
+        rules.push_str(&self.build_hostport_chain_block(pods, node_name));
+        rules.push_str("COMMIT\n");
+        rules
+    }
+
+    /// Build just the chain header + DNAT rules for hostPorts, with no
+    /// `*nat` / `COMMIT` wrapper. Used when embedding the hostPort rules
+    /// inside the larger NAT restore blob for atomic application.
+    fn build_hostport_chain_block(
+        &self,
+        pods: &[rusternetes_common::resources::Pod],
+        node_name: &str,
+    ) -> String {
+        let mut rules = String::new();
+        rules.push_str(&format!(":{} - [0:0]\n", self.hostports_chain));
+
+        // Track (host_port, protocol, host_ip) to dedupe in case two
+        // containers in the same pod declare the same hostPort (only the
+        // first wins — kubelet admission also rejects intra-pod duplicates).
+        let mut seen: std::collections::HashSet<(u16, String, String)> =
+            std::collections::HashSet::new();
+
+        for pod in pods {
+            let Some(spec) = pod.spec.as_ref() else {
+                continue;
+            };
+            if spec.node_name.as_deref() != Some(node_name) {
+                continue;
+            }
+            let pod_ip = match pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()) {
+                Some(ip) if !ip.is_empty() => ip,
+                _ => continue,
+            };
+
+            for c in &spec.containers {
+                let Some(ports) = c.ports.as_ref() else {
+                    continue;
+                };
+                for port in ports {
+                    let Some(host_port) = port.host_port.filter(|hp| *hp > 0) else {
+                        continue;
+                    };
+                    let proto = port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
+                    let host_ip = port.host_ip.as_deref().unwrap_or("");
+
+                    // Dedupe duplicate (port, proto, host_ip) tuples. The
+                    // cross-pod conflict case is rejected by kubelet admission
+                    // (kubelet.rs:1572); this mostly guards intra-pod dupes.
+                    if !seen.insert((host_port, proto.clone(), host_ip.to_string())) {
+                        continue;
+                    }
+
+                    let dnat_target = format!("{}:{}", pod_ip, port.container_port);
+                    let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+                    let comment = format!(
+                        "rusternetes hostPort {}/{} {}",
+                        pod_ns, pod.metadata.name, host_port
+                    );
+
+                    let mut rule = format!("-A {}", self.hostports_chain);
+                    // Bind to a specific hostIP if requested; otherwise match all.
+                    if !host_ip.is_empty() && host_ip != "0.0.0.0" && host_ip != "::" {
+                        rule.push_str(&format!(" -d {}/32", host_ip));
+                    }
+                    rule.push_str(&format!(
+                        " -p {} --dport {} -j DNAT --to-destination {} -m comment --comment \"{}\"",
+                        proto, host_port, dnat_target, comment
+                    ));
+                    rules.push_str(&rule);
+                    rules.push('\n');
+                }
+            }
+        }
+
         rules
     }
 
@@ -2207,7 +2345,9 @@ mod tests {
             &[("10.0.0.1", None, 80), ("10.0.0.2", None, 80)],
         );
 
-        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+        let rules = mgr
+            .build_nat_rules(&[service], &ep_map, &[], "test-node")
+            .await;
 
         assert!(
             rules.contains(":KUBE-SEP-109605-80-0 - [0:0]"),
@@ -2281,7 +2421,9 @@ mod tests {
         );
         let ep_map = make_endpointslice_map("default", "solo", &[("10.0.0.9", None, 8080)]);
 
-        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+        let rules = mgr
+            .build_nat_rules(&[service], &ep_map, &[], "test-node")
+            .await;
 
         assert!(
             rules.contains(":KUBE-SEP-109607-8080-0 - [0:0]"),
@@ -2334,7 +2476,9 @@ mod tests {
             &[("10.0.0.3", None, 80), ("10.0.0.4", None, 80)],
         );
 
-        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+        let rules = mgr
+            .build_nat_rules(&[service], &ep_map, &[], "test-node")
+            .await;
 
         assert!(
             rules.contains(
@@ -2381,7 +2525,9 @@ mod tests {
             &[("10.0.0.5", None, 80), ("10.0.0.6", None, 80)],
         );
 
-        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+        let rules = mgr
+            .build_nat_rules(&[service], &ep_map, &[], "test-node")
+            .await;
         assert!(
             !rules.contains("-m recent"),
             "no-affinity service should not emit recent rules:\n{}",
@@ -2421,7 +2567,9 @@ mod tests {
             None,
         );
         let ep_map = make_endpointslice_map("default", "no-recent", &[("10.0.0.7", None, 80)]);
-        let rules = mgr.build_nat_rules(&[service], &ep_map).await;
+        let rules = mgr
+            .build_nat_rules(&[service], &ep_map, &[], "test-node")
+            .await;
         assert!(
             !rules.contains("-m recent"),
             "without xt_recent we must not emit recent rules:\n{}",
