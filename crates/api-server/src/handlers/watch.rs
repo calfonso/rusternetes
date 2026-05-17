@@ -1216,15 +1216,11 @@ fn matches_field_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
         let requirement = requirement.trim();
         if let Some((field, value)) = requirement.split_once('=') {
             match field {
-                "metadata.name" => {
-                    if metadata.name != value {
-                        return false;
-                    }
+                "metadata.name" if metadata.name != value => {
+                    return false;
                 }
-                "metadata.namespace" => {
-                    if metadata.namespace.as_deref() != Some(value) {
-                        return false;
-                    }
+                "metadata.namespace" if metadata.namespace.as_deref() != Some(value) => {
+                    return false;
                 }
                 _ => {} // Unknown fields pass through
             }

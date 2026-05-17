@@ -63,25 +63,17 @@ fn pod_matches_quota_scopes(pod: &Pod, quota: &ResourceQuota) -> bool {
     if let Some(scopes) = &quota.spec.scopes {
         for scope in scopes {
             match scope.as_str() {
-                "Terminating" => {
-                    if !is_terminating {
-                        return false;
-                    }
+                "Terminating" if !is_terminating => {
+                    return false;
                 }
-                "NotTerminating" => {
-                    if is_terminating {
-                        return false;
-                    }
+                "NotTerminating" if is_terminating => {
+                    return false;
                 }
-                "BestEffort" => {
-                    if !is_best_effort {
-                        return false;
-                    }
+                "BestEffort" if !is_best_effort => {
+                    return false;
                 }
-                "NotBestEffort" => {
-                    if is_best_effort {
-                        return false;
-                    }
+                "NotBestEffort" if is_best_effort => {
+                    return false;
                 }
                 _ => {}
             }
