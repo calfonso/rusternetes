@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 # Dockerfile for Kube-proxy component
 FROM rust:latest AS builder
 
@@ -28,7 +29,16 @@ COPY crates ./crates
 
 ENV CARGO_BUILD_JOBS=2
 ARG CARGO_FEATURES=""
-RUN cargo build --release $CARGO_FEATURES --bin kube-proxy
+# BuildKit cache mounts: dep registry, git checkouts, and the workspace
+# target/ all persist across image rebuilds. Without these, every build
+# re-fetches ~600 crates and recompiles them from scratch. The binary is
+# copied out of the cache-mounted target/ into /out so the runtime stage
+# can pick it up (cache-mount contents disappear after the RUN).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release $CARGO_FEATURES --bin kube-proxy && \
+    mkdir -p /out && cp target/release/kube-proxy /out/kube-proxy
 
 FROM debian:sid-slim
 
@@ -41,7 +51,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/kube-proxy /app/kube-proxy
+COPY --from=builder /out/kube-proxy /app/kube-proxy
 
 # Kube-proxy needs privileged access for network operations
 ENTRYPOINT ["/app/kube-proxy"]
