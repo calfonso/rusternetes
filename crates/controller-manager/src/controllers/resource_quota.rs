@@ -273,25 +273,17 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         // All scopes must match (AND logic)
         for scope in scopes {
             match scope.as_str() {
-                "Terminating" => {
-                    if !is_terminating {
-                        return false;
-                    }
+                "Terminating" if !is_terminating => {
+                    return false;
                 }
-                "NotTerminating" => {
-                    if is_terminating {
-                        return false;
-                    }
+                "NotTerminating" if is_terminating => {
+                    return false;
                 }
-                "BestEffort" => {
-                    if !is_best_effort {
-                        return false;
-                    }
+                "BestEffort" if !is_best_effort => {
+                    return false;
                 }
-                "NotBestEffort" => {
-                    if is_best_effort {
-                        return false;
-                    }
+                "NotBestEffort" if is_best_effort => {
+                    return false;
                 }
                 _ => {}
             }
