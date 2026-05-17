@@ -7900,7 +7900,7 @@ impl ContainerRuntime {
         // For existing pods, keep at most MaxPerPodContainerCount (default 1).
         for (pod_name, mut exited) in exited_by_pod {
             // Sort by created time descending — keep the newest
-            exited.sort_by(|a, b| b.1.cmp(&a.1));
+            exited.sort_by_key(|e| std::cmp::Reverse(e.1));
 
             // For pods still in etcd, keep 1 dead container for log access.
             // For deleted pods, remove ALL dead containers.
