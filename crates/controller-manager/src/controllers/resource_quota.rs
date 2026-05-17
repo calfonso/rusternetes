@@ -207,6 +207,18 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         }
     }
 
+    /// Reconcile a single ResourceQuota by namespace + name.
+    ///
+    /// Re-reads the quota from storage (so the recompute always sees fresh
+    /// state, including the deletion of tracked objects since the last
+    /// reconcile) and recomputes `.status.used`. This is the per-key entry
+    /// point used by the controller's worker loop and by integration tests.
+    pub async fn reconcile_one(&self, namespace: &str, name: &str) -> Result<()> {
+        let key = build_key("resourcequotas", Some(namespace), name);
+        let quota: ResourceQuota = self.storage.get(&key).await?;
+        self.reconcile_quota(&quota).await
+    }
+
     #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting resource quota reconciliation");
