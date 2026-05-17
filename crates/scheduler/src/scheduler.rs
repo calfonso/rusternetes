@@ -256,7 +256,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     }
 
     /// Run one scheduling cycle — schedules all pending pods.
-    /// Public for testing.
+    ///
+    /// Public for testing. The production bin path uses `run()` →
+    /// `worker()` (watch + work-queue driven), not this direct method;
+    /// `dead_code` is allowed because the unit tests below DO call it
+    /// but the bin doesn't, and the test cfg is gated out of the bin
+    /// compilation unit.
+    #[allow(dead_code)]
     pub async fn schedule_pending_pods(&self) -> rusternetes_common::Result<()> {
         debug!("Looking for pending pods to schedule");
 

@@ -790,6 +790,7 @@ fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i64 {
 
 /// System-critical priority threshold. Pods at or above this priority
 /// can only be preempted by pods with strictly higher priority.
+#[allow(dead_code)]
 const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 
 /// Check if preemption should occur and return pods to evict.
@@ -799,6 +800,11 @@ const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 /// `check_preemption_with_pdbs(node, pod, all_pods, &[])`.
 ///
 /// Returns (should_preempt, pods_to_evict).
+///
+/// `dead_code`: invoked from integration tests under `crates/scheduler/tests/`
+/// and from the legacy direct-scheduling path in `scheduler.rs`. The bin's
+/// Framework-based path doesn't call it.
+#[allow(dead_code)]
 pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<String>) {
     check_preemption_with_pdbs(node, pod, all_pods, &[])
 }
@@ -814,6 +820,9 @@ pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<
 /// which sorts candidates so that PDB-violating evictions are picked last.
 ///
 /// Returns (should_preempt, pods_to_evict).
+///
+/// `dead_code`: exercised by integration tests; bin uses Framework path.
+#[allow(dead_code)]
 pub fn check_preemption_with_pdbs(
     node: &Node,
     pod: &Pod,
