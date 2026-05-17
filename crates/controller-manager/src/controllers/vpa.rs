@@ -351,7 +351,7 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         container: &rusternetes_common::resources::Container,
     ) -> (i64, i64) {
         use rand::Rng;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Get CPU request (default to 100m if not specified)
         let cpu_request = container
@@ -372,8 +372,8 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
             .unwrap_or(128 * 1024 * 1024);
 
         // Simulate usage as 60-90% of request with some variance
-        let cpu_usage = (cpu_request as f64 * (0.6 + rng.gen::<f64>() * 0.3)) as i64;
-        let memory_usage = (memory_request as f64 * (0.6 + rng.gen::<f64>() * 0.3)) as i64;
+        let cpu_usage = (cpu_request as f64 * (0.6 + rng.random::<f64>() * 0.3)) as i64;
+        let memory_usage = (memory_request as f64 * (0.6 + rng.random::<f64>() * 0.3)) as i64;
 
         (cpu_usage, memory_usage)
     }
