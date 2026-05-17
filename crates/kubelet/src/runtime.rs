@@ -168,7 +168,7 @@ fn needs_shell_quoting(s: &str) -> bool {
 /// layer; that is a known dev-env limitation and not a kubelet bug. The
 /// `[Conformance] EmptyDir.*(mode|0644|0666|0777)` tests are all `[LinuxOnly]`,
 /// so the chmod path here is the production code path.
-pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
+pub fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
@@ -176,6 +176,143 @@ pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
     }
     Ok(())
+}
+
+/// Unix special-file kinds that HostPath validates separately from
+/// regular files / directories. Internal helper for `check_host_path_type`.
+#[derive(Debug, Clone, Copy)]
+enum UnixKind {
+    Socket,
+    CharDevice,
+    BlockDevice,
+}
+
+fn check_unix_special(
+    meta_res: std::io::Result<std::fs::Metadata>,
+    kind: UnixKind,
+) -> HostPathCheck {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        match meta_res {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                let matched = match kind {
+                    UnixKind::Socket => ft.is_socket(),
+                    UnixKind::CharDevice => ft.is_char_device(),
+                    UnixKind::BlockDevice => ft.is_block_device(),
+                };
+                if matched {
+                    HostPathCheck::Ok
+                } else {
+                    HostPathCheck::WrongKind
+                }
+            }
+            Err(_) => HostPathCheck::Missing,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (meta_res, kind);
+        HostPathCheck::WrongKind
+    }
+}
+
+/// Result of validating a HostPath volume against its declared `type` per
+/// upstream Kubernetes `pkg/volume/host_path/host_path.go::checkType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPathCheck {
+    /// The host path exists (or was created) and matches the declared type.
+    Ok,
+    /// The declared type requires the path to pre-exist but it does not.
+    Missing,
+    /// The path exists but is not the kind the declared type requires
+    /// (e.g. `File` but the path is a directory).
+    WrongKind,
+    /// The declared type string is not one of the supported variants.
+    UnsupportedType,
+}
+
+/// Pure-function mirror of upstream `pkg/volume/host_path/host_path.go`
+/// HostPath `type` validation + "OrCreate" creation, made available so
+/// scoped conformance tests can pin the [sig-storage] HostPath type
+/// semantics without spinning up a real kubelet.
+///
+/// Semantics (matches Kubernetes v1.35):
+/// - `None` or `Some("")` → accept anything (legacy unchecked behavior).
+/// - `Some("Directory")` → path must exist and be a directory.
+/// - `Some("DirectoryOrCreate")` → create the directory (and any missing
+///   parents) if absent; otherwise it must be a directory.
+/// - `Some("File")` → path must exist and be a regular file.
+/// - `Some("FileOrCreate")` → create an empty file if absent; otherwise it
+///   must be a regular file. Parent directory must already exist.
+/// - `Some("Socket")` → path must exist and be a Unix socket.
+/// - `Some("CharDevice")` / `Some("BlockDevice")` → must exist and be the
+///   matching device kind (treated as `WrongKind` on non-Unix targets).
+/// - Anything else → `UnsupportedType`.
+pub fn check_host_path_type(path: &str, type_: Option<&str>) -> HostPathCheck {
+    let kind = match type_ {
+        None | Some("") => return HostPathCheck::Ok,
+        Some(k) => k,
+    };
+
+    let meta_res = std::fs::symlink_metadata(path);
+
+    match kind {
+        "DirectoryOrCreate" => {
+            if let Ok(meta) = &meta_res {
+                if meta.file_type().is_dir() {
+                    return HostPathCheck::Ok;
+                }
+                return HostPathCheck::WrongKind;
+            }
+            match std::fs::create_dir_all(path) {
+                Ok(()) => HostPathCheck::Ok,
+                Err(_) => HostPathCheck::Missing,
+            }
+        }
+        "Directory" => match meta_res {
+            Ok(meta) if meta.file_type().is_dir() => HostPathCheck::Ok,
+            Ok(_) => HostPathCheck::WrongKind,
+            Err(_) => HostPathCheck::Missing,
+        },
+        "FileOrCreate" => {
+            if let Ok(meta) = &meta_res {
+                if meta.file_type().is_file() {
+                    return HostPathCheck::Ok;
+                }
+                return HostPathCheck::WrongKind;
+            }
+            // Parent directory must already exist — `FileOrCreate` does
+            // NOT recursively create parent dirs (only `DirectoryOrCreate`
+            // does). This matches upstream `host_path.go::createHostPathFile`.
+            let parent_ok = std::path::Path::new(path)
+                .parent()
+                .map(|p| p.as_os_str().is_empty() || p.is_dir())
+                .unwrap_or(false);
+            if !parent_ok {
+                return HostPathCheck::Missing;
+            }
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)
+            {
+                Ok(_) => HostPathCheck::Ok,
+                Err(_) => HostPathCheck::Missing,
+            }
+        }
+        "File" => match meta_res {
+            Ok(meta) if meta.file_type().is_file() => HostPathCheck::Ok,
+            Ok(_) => HostPathCheck::WrongKind,
+            Err(_) => HostPathCheck::Missing,
+        },
+        "Socket" => check_unix_special(meta_res, UnixKind::Socket),
+        "CharDevice" => check_unix_special(meta_res, UnixKind::CharDevice),
+        "BlockDevice" => check_unix_special(meta_res, UnixKind::BlockDevice),
+        _ => HostPathCheck::UnsupportedType,
+    }
 }
 
 /// Runtime observation of a single init container, derived from the
@@ -2272,14 +2409,35 @@ impl ContainerRuntime {
             return Ok(volume_dir);
         }
 
-        // HostPath: use the specified host path
+        // HostPath: use the specified host path. The `type` field is validated
+        // (and "OrCreate" variants are materialised) via `check_host_path_type`,
+        // mirroring upstream `pkg/volume/host_path/host_path.go::checkType` —
+        // see also tests/conformance_storage_emptydir_hostpath.rs.
         if let Some(host_path) = &volume.host_path {
             // Expand environment variables in the path
             let path = Self::expand_env_vars(&host_path.path);
-            // Optionally create the directory if it doesn't exist
-            if let Some(type_) = &host_path.type_ {
-                if type_ == "DirectoryOrCreate" {
-                    std::fs::create_dir_all(&path).context("Failed to create hostPath volume")?;
+            match check_host_path_type(&path, host_path.type_.as_deref()) {
+                HostPathCheck::Ok => {}
+                HostPathCheck::Missing => {
+                    return Err(anyhow::anyhow!(
+                        "hostPath {} does not exist (type={:?})",
+                        path,
+                        host_path.type_
+                    ));
+                }
+                HostPathCheck::WrongKind => {
+                    return Err(anyhow::anyhow!(
+                        "hostPath {} exists but does not match type={:?}",
+                        path,
+                        host_path.type_
+                    ));
+                }
+                HostPathCheck::UnsupportedType => {
+                    return Err(anyhow::anyhow!(
+                        "hostPath {} declared unknown type {:?}",
+                        path,
+                        host_path.type_
+                    ));
                 }
             }
             info!("Using hostPath volume {} at {}", volume.name, path);
