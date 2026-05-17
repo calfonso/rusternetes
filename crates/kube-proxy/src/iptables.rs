@@ -124,10 +124,14 @@ impl Default for IptablesManager {
 
 impl IptablesManager {
     /// Construct an IptablesManager with all subprocess detection skipped.
-    /// Useful for unit tests: build_nat_rules() can be exercised in isolation
+    /// Useful for tests: build_nat_rules() can be exercised in isolation
     /// without invoking the iptables binary. `recent_available` controls the
     /// session-affinity codepath the test wants to exercise.
-    #[cfg(test)]
+    ///
+    /// Not gated on `#[cfg(test)]` so integration tests in the `tests/`
+    /// crate (which compiles separately from the lib) can call it.
+    /// Production code MUST use `IptablesManager::new` so xt_recent
+    /// availability is detected from the host kernel.
     pub fn for_testing(recent_available: bool) -> Self {
         Self {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
