@@ -42,6 +42,24 @@ A full run takes ~30-60 minutes (each spec creates a pod and waits for it to rea
 | `GET /logs/:pod/:ns/:container` — log proxy | ⏳ pending |
 | `POST /run/:pod/:ns/:container` — exec alias | ⏳ pending |
 
+## Watching a run in progress
+
+In one terminal, kick off a run:
+
+```bash
+bash scripts/run-node-conformance.sh
+```
+
+In a second terminal, tail the running pass/fail counters:
+
+```bash
+bash scripts/node-conformance-progress.sh
+```
+
+## CI
+
+`.github/workflows/node-conformance.yml` runs nightly at 03:00 UTC and is also manually dispatchable from the GitHub Actions tab. It runs on `runs-on: self-hosted` to respect the project's GitHub Actions minute budget; the log is uploaded as a `node-conformance-log-<run_id>` artifact.
+
 ## Related
 
 - `docs/CONFORMANCE.md` — full Sonobuoy suite
