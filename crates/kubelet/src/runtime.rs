@@ -178,6 +178,152 @@ pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Runtime observation of a single init container, derived from the
+/// container runtime's inspect call (or test fixtures).
+///
+/// The `decide_next_init_action` helper consumes a slice of these (one per
+/// declared init container, in declaration order) and is the single place
+/// that encodes K8s init-container restart semantics: failed inits on a
+/// `restartPolicy=Never` pod are terminal (not retried), failed inits on
+/// `Always` / `OnFailure` pods retry, sidecar inits (per-container
+/// `restartPolicy=Always`, KEP-753) do not gate app-container startup, and
+/// init containers run sequentially.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitContainerObserved {
+    /// Container does not yet exist (never created/started).
+    NotStarted,
+    /// Container is currently running.
+    Running,
+    /// Container has exited with the given exit code.
+    Exited(i32),
+}
+
+/// Decision the kubelet's reconcile loop should take for a pod's init
+/// containers, as a structured value. Mirrors the historical
+/// `(all_init_done, next_index, should_retry)` tuple returned from
+/// `compute_init_container_actions`, but in a form that's easier to read
+/// and test exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitAction {
+    /// True iff every non-sidecar init container has completed successfully
+    /// (exit code 0). When true the kubelet may start app containers.
+    pub all_init_done: bool,
+    /// Index (into the pod's `init_containers` slice) of the next init
+    /// container to start or retry, if any.
+    pub next_index: Option<usize>,
+    /// True iff `next_index` refers to a failed init container that should
+    /// be retried under the pod's restart policy.
+    pub should_retry: bool,
+}
+
+/// Decide the next init-container action for `pod` given a snapshot of how
+/// each declared init container is currently observed by the runtime.
+///
+/// `observed[i]` corresponds to `pod.spec.init_containers[i]`. Missing
+/// entries (a short slice) are treated as `NotStarted`, matching the prior
+/// behaviour for inspect errors and unknown container states.
+///
+/// Semantics (matches upstream `pkg/kubelet/kuberuntime`):
+/// - Sidecar init containers (per-container `restartPolicy=Always`) are
+///   skipped from the gating check — they run alongside app containers
+///   and must not block them, even while still Running or after they exit.
+/// - The first regular init container that isn't successfully terminated
+///   determines the action.
+/// - A Running regular init container blocks advancement (`next_index =
+///   None`) — the kubelet should wait, not start another container.
+/// - A non-zero-exit regular init container is a retry candidate when the
+///   pod's `restartPolicy` is `Always` or `OnFailure`; with `Never` the
+///   pod is terminal (`next_index = None`).
+/// - A NotStarted regular init container returns its index without
+///   `should_retry` — the kubelet should create and start it.
+///
+/// This is a pure function: it makes no I/O calls and is the unit covered
+/// by `tests/init_container_restart_test.rs`.
+pub fn decide_next_init_action(pod: &Pod, observed: &[InitContainerObserved]) -> InitAction {
+    let init_containers = match pod.spec.as_ref().and_then(|s| s.init_containers.as_ref()) {
+        Some(ics) if !ics.is_empty() => ics,
+        _ => {
+            return InitAction {
+                all_init_done: true,
+                next_index: None,
+                should_retry: false,
+            };
+        }
+    };
+
+    // K8s rule: init containers are retried on pod restart policies
+    // "Always" and "OnFailure"; "Never" is terminal on failure.
+    // Default (unset) is "Always".
+    let restart_on_failure = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.restart_policy.as_deref())
+        .unwrap_or("Always")
+        != "Never";
+
+    for (i, ic) in init_containers.iter().enumerate() {
+        // Sidecar init containers (KEP-753) run alongside app containers
+        // and do NOT gate app-container startup, so skip them here.
+        let is_sidecar = ic.restart_policy.as_deref() == Some("Always");
+        if is_sidecar {
+            continue;
+        }
+
+        let obs = observed
+            .get(i)
+            .copied()
+            .unwrap_or(InitContainerObserved::NotStarted);
+
+        match obs {
+            InitContainerObserved::Running => {
+                // Current init container is still running — wait for it.
+                return InitAction {
+                    all_init_done: false,
+                    next_index: None,
+                    should_retry: false,
+                };
+            }
+            InitContainerObserved::Exited(0) => {
+                // Completed successfully — advance to the next init container.
+                continue;
+            }
+            InitContainerObserved::Exited(_) => {
+                // Failed with a non-zero exit code.
+                return if restart_on_failure {
+                    InitAction {
+                        all_init_done: false,
+                        next_index: Some(i),
+                        should_retry: true,
+                    }
+                } else {
+                    // RestartPolicy=Never: pod is terminal. The kubelet
+                    // sync loop will mark the pod as Failed.
+                    InitAction {
+                        all_init_done: false,
+                        next_index: None,
+                        should_retry: false,
+                    }
+                };
+            }
+            InitContainerObserved::NotStarted => {
+                // Container needs to be created/started — not a retry.
+                return InitAction {
+                    all_init_done: false,
+                    next_index: Some(i),
+                    should_retry: false,
+                };
+            }
+        }
+    }
+
+    // Every non-sidecar init container completed successfully.
+    InitAction {
+        all_init_done: true,
+        next_index: None,
+        should_retry: false,
+    }
+}
+
 impl ContainerRuntime {
     pub async fn new(
         volumes_base_path: String,
@@ -5509,6 +5655,9 @@ impl ContainerRuntime {
     /// - should_retry: true if the next init container failed and should be retried
     ///
     /// K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go — computeInitContainerActions
+    ///
+    /// This is a thin wrapper that gathers Docker observations and delegates the
+    /// state-machine decision to the pure helper [`decide_next_init_action`].
     pub async fn compute_init_container_actions(&self, pod: &Pod) -> (bool, Option<usize>, bool) {
         let init_containers = match pod.spec.as_ref().and_then(|s| s.init_containers.as_ref()) {
             Some(ics) if !ics.is_empty() => ics,
@@ -5516,27 +5665,18 @@ impl ContainerRuntime {
         };
 
         let pod_name = &pod.metadata.name;
-        let restart_on_failure = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.restart_policy.as_deref())
-            .unwrap_or("Always")
-            != "Never";
 
-        // Check each init container in order
-        for (i, ic) in init_containers.iter().enumerate() {
-            let is_sidecar = ic.restart_policy.as_deref() == Some("Always");
-            if is_sidecar {
-                continue; // Sidecar init containers are handled separately
-            }
-
+        // Gather observations from Docker for every declared init container.
+        // Inspect errors and unknown container states map to `NotStarted`
+        // (matching the prior tuple-returning implementation).
+        let mut observed: Vec<InitContainerObserved> = Vec::with_capacity(init_containers.len());
+        for ic in init_containers.iter() {
             let container_name = format!("{}_{}", pod_name, ic.name);
-            let inspect = self
+            let obs = match self
                 .docker
                 .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await;
-
-            match inspect {
+                .await
+            {
                 Ok(info) => {
                     let state = info.state.unwrap_or_default();
                     let running = state.running.unwrap_or(false);
@@ -5544,41 +5684,23 @@ impl ContainerRuntime {
                     let status = state.status;
 
                     if running {
-                        // Init container is still running — wait for it
-                        return (false, None, false);
-                    }
-
-                    if matches!(
+                        InitContainerObserved::Running
+                    } else if matches!(
                         status,
                         Some(bollard::secret::ContainerStateStatusEnum::EXITED)
                     ) {
-                        if exit_code == 0 {
-                            // This init container completed successfully — check next
-                            continue;
-                        } else {
-                            // Failed with non-zero exit code
-                            if restart_on_failure {
-                                // Should retry this init container
-                                return (false, Some(i), true);
-                            } else {
-                                // RestartPolicy=Never — pod is terminal
-                                return (false, None, false);
-                            }
-                        }
+                        InitContainerObserved::Exited(exit_code as i32)
+                    } else {
+                        InitContainerObserved::NotStarted
                     }
-
-                    // Container exists but in unknown state — treat as not started
-                    return (false, Some(i), false);
                 }
-                Err(_) => {
-                    // Container doesn't exist — need to start this init container
-                    return (false, Some(i), false);
-                }
-            }
+                Err(_) => InitContainerObserved::NotStarted,
+            };
+            observed.push(obs);
         }
 
-        // All init containers completed successfully
-        (true, None, false)
+        let action = decide_next_init_action(pod, &observed);
+        (action.all_init_done, action.next_index, action.should_retry)
     }
 
     /// Get detailed status of all containers in a pod
