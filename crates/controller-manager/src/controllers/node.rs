@@ -37,6 +37,11 @@ impl<S: Storage + 'static> NodeController<S> {
     /// startup grace period is over. Reconcile_node skips condition updates
     /// within the K8s-standard 60s startup grace; this lets tests observe the
     /// Ready-flip behavior deterministically without sleeping.
+    ///
+    /// `dead_code` allowed because the bin compilation unit never calls this
+    /// (cfg(test) blocks aren't compiled for the bin), but integration tests
+    /// under `crates/controller-manager/tests/` do.
+    #[allow(dead_code)]
     #[doc(hidden)]
     pub fn seed_first_seen_for_test(&self, node_name: &str) {
         let past = std::time::Instant::now()
