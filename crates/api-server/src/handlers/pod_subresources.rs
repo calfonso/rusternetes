@@ -1340,6 +1340,135 @@ async fn compute_pdb_disruptions_allowed<S: Storage>(
     healthy_pods - desired_healthy
 }
 
+/// Maximum number of CAS retry attempts for `/pods/{name}/resize` (KEP-1287).
+///
+/// In-place pod resize is a hot path: kubelet + admission webhooks may bump the
+/// stored resourceVersion between the client's GET and PUT, producing a Conflict.
+/// Upstream `kubectl` and the e2e in `common/node/pod_resize.go` expect the API
+/// server to absorb a small number of races by re-reading the latest object and
+/// re-applying the spec-resource changes, mirroring the behaviour of the Go
+/// apiserver's `RetryConflict` helper.
+const POD_RESIZE_MAX_RETRIES: usize = 5;
+
+/// Apply an in-place resize to a Pod with CAS-retry on conflict.
+///
+/// Reads the latest stored Pod, copies the requested `spec.containers[*].resources`
+/// (and `spec.initContainers[*].resources`) from `desired` onto it, marks
+/// `status.resize = "Proposed"` so the kubelet picks the change up (KEP-1287),
+/// and writes it back. On `Error::Conflict` (storage-level resourceVersion mismatch),
+/// we drop the stale RV and retry up to [`POD_RESIZE_MAX_RETRIES`] times.
+///
+/// Generic over `S: Storage` so the same code path is exercised by both the
+/// production `StorageBackend` and the in-memory test harness.
+pub async fn apply_pod_resize_with_retry<S: Storage>(
+    storage: &S,
+    namespace: &str,
+    name: &str,
+    desired: &rusternetes_common::resources::Pod,
+) -> Result<rusternetes_common::resources::Pod> {
+    let key = rusternetes_storage::build_key("pods", Some(namespace), name);
+
+    let mut last_err: Option<Error> = None;
+    for attempt in 0..POD_RESIZE_MAX_RETRIES {
+        // Always re-read so the storage CAS compares against the freshest resourceVersion.
+        let mut fresh: rusternetes_common::resources::Pod = storage.get(&key).await?;
+
+        merge_container_resources_from(&mut fresh, desired);
+        fresh.status.get_or_insert_with(Default::default).resize = Some("Proposed".to_string());
+
+        match storage.update(&key, &fresh).await {
+            Ok(updated) => {
+                if attempt > 0 {
+                    info!(
+                        "Pod resize succeeded for {}/{} after {} retries",
+                        namespace, name, attempt
+                    );
+                }
+                return Ok(updated);
+            }
+            Err(Error::Conflict(msg)) => {
+                debug!(
+                    "Pod resize conflict for {}/{} on attempt {}: {} — retrying",
+                    namespace, name, attempt, msg
+                );
+                last_err = Some(Error::Conflict(msg));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        Error::Conflict(format!(
+            "pod resize failed after {} retries for {}/{}",
+            POD_RESIZE_MAX_RETRIES, namespace, name
+        ))
+    }))
+}
+
+/// Copy `spec.containers[*].resources` and `spec.initContainers[*].resources`
+/// from `desired` onto `target`, matching by container name. Containers in
+/// `target` that are not mentioned in `desired` are left untouched.
+fn merge_container_resources_from(
+    target: &mut rusternetes_common::resources::Pod,
+    desired: &rusternetes_common::resources::Pod,
+) {
+    let (Some(target_spec), Some(desired_spec)) = (target.spec.as_mut(), desired.spec.as_ref())
+    else {
+        return;
+    };
+
+    for desired_c in &desired_spec.containers {
+        if let Some(target_c) = target_spec
+            .containers
+            .iter_mut()
+            .find(|c| c.name == desired_c.name)
+        {
+            target_c.resources = desired_c.resources.clone();
+        }
+    }
+
+    if let (Some(target_inits), Some(desired_inits)) = (
+        target_spec.init_containers.as_mut(),
+        desired_spec.init_containers.as_ref(),
+    ) {
+        for desired_c in desired_inits {
+            if let Some(target_c) = target_inits.iter_mut().find(|c| c.name == desired_c.name) {
+                target_c.resources = desired_c.resources.clone();
+            }
+        }
+    }
+}
+
+/// PUT /api/v1/namespaces/{namespace}/pods/{name}/resize
+///
+/// Subresource handler for in-place pod resize (KEP-1287). Wraps
+/// [`apply_pod_resize_with_retry`] with auth + axum extraction.
+pub async fn resize_pod(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<rusternetes_common::resources::Pod>> {
+    info!("Resizing pod {}/{}", namespace, name);
+
+    let attrs = RequestAttributes::new(auth_ctx.user, "update", "pods")
+        .with_namespace(&namespace)
+        .with_name(&name)
+        .with_subresource("resize");
+
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => return Err(Error::Forbidden(reason)),
+    }
+
+    let desired: rusternetes_common::resources::Pod = serde_json::from_slice(&body)
+        .map_err(|e| Error::InvalidResource(format!("failed to decode resize body: {}", e)))?;
+
+    let updated =
+        apply_pod_resize_with_retry(state.storage.as_ref(), &namespace, &name, &desired).await?;
+    Ok(axum::Json(updated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -66,3 +66,4 @@ prost-build = "0.13"
 tokio-test = "0.4"
 rusternetes-controller-manager = { path = "../controller-manager" }
 warp.workspace = true
+async-trait.workspace = true
