@@ -1,0 +1,18 @@
+# Optional Cargo build config — opt in by copying to `.cargo/config.toml`.
+#
+# Switches the linker on x86_64 Linux to mold (https://github.com/rui314/mold).
+# mold links large Rust binaries (especially api-server, kubelet) 3-5x faster
+# than the system `ld`. Linking dominates incremental builds on this
+# workspace, so enabling this is the single biggest dev-loop win.
+#
+# One-time setup:
+#   sudo apt-get install -y mold clang
+#   cp .cargo/config.toml.example .cargo/config.toml
+#
+# `.cargo/config.toml` is gitignored so each developer opts in independently.
+# CI: the self-hosted runner has mold installed; the workflow copies this
+# file into place before `cargo build`.
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

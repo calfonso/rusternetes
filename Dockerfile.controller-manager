@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 # Dockerfile for Controller Manager component
 FROM rust:latest AS builder
 
@@ -27,7 +28,11 @@ COPY crates/kubectl/Cargo.toml ./crates/kubectl/
 COPY crates ./crates
 
 ARG CARGO_FEATURES=""
-RUN cargo build --release $CARGO_FEATURES --bin controller-manager
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release $CARGO_FEATURES --bin controller-manager && \
+    mkdir -p /out && cp target/release/controller-manager /out/controller-manager
 
 FROM debian:sid-slim
 
@@ -38,7 +43,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/controller-manager /app/controller-manager
+COPY --from=builder /out/controller-manager /app/controller-manager
 
 ENTRYPOINT ["/app/controller-manager"]
 CMD ["--etcd-servers", "http://etcd:2379"]

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 # Dockerfile for API Server component
 
 # Stage 1: Build the console SPA
@@ -42,7 +43,11 @@ COPY crates ./crates
 
 # Build the api-server
 ARG CARGO_FEATURES=""
-RUN cargo build $CARGO_FEATURES --bin api-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build $CARGO_FEATURES --bin api-server && \
+    mkdir -p /out && cp target/debug/api-server /out/api-server
 
 # Stage 3: Runtime image
 FROM debian:sid-slim
@@ -54,7 +59,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/debug/api-server /app/api-server
+COPY --from=builder /out/api-server /app/api-server
 COPY --from=console-builder /console/dist /app/console
 
 EXPOSE 6443

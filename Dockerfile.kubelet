@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 # Dockerfile for Kubelet component
 FROM rust:latest AS builder
 
@@ -27,7 +28,11 @@ COPY crates/kubectl/Cargo.toml ./crates/kubectl/
 COPY crates ./crates
 
 ARG CARGO_FEATURES=""
-RUN cargo build --release $CARGO_FEATURES --bin kubelet
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release $CARGO_FEATURES --bin kubelet && \
+    mkdir -p /out && cp target/release/kubelet /out/kubelet
 
 FROM debian:sid-slim
 
@@ -51,7 +56,7 @@ RUN mkdir -p /opt/cni/bin && \
 RUN mkdir -p /etc/cni/net.d
 COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
 
-COPY --from=builder /app/target/release/kubelet /app/kubelet
+COPY --from=builder /out/kubelet /app/kubelet
 
 # Kubelet needs access to container runtime socket
 VOLUME ["/var/run"]

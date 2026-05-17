@@ -57,6 +57,26 @@ jobs:
           }
           protoc --version
 
+      - name: Verify mold linker on runner
+        # mold + clang give 3-5x faster link of the api-server / kubelet
+        # binaries. Install once on the host. Fail fast if missing.
+        run: |
+          for cmd in mold clang; do
+            command -v "$cmd" >/dev/null || {
+              echo "$cmd not found on runner. Install once on the host:" >&2
+              echo "  apt-get install -y mold clang" >&2
+              exit 1
+            }
+          done
+          mold --version
+          clang --version | head -1
+
+      - name: Enable mold linker
+        # `.cargo/config.toml` is gitignored (so devs without mold installed
+        # can still `cargo build`). CI activates the template before any
+        # cargo invocation.
+        run: cp .cargo/config.toml.example .cargo/config.toml
+
       - name: Install cargo-nextest
         # Prebuilt binary install — much faster and more parallel than
         # `cargo test`. The action caches the binary across runs.
@@ -65,11 +85,12 @@ jobs:
           tool: nextest
 
       - name: Cache cargo registry + target
-        # Self-hosted runner's workspace persists between runs, so the
-        # local target/ + ~/.cargo cache survive without help. Only run
-        # this on GH-hosted runners where the workspace is fresh each
-        # time. Keeps the step in place for the GH-hosted code path.
-        if: runner.environment != 'self-hosted'
+        # Runs on BOTH self-hosted and GH-hosted runners. Even though
+        # the self-hosted workspace persists between runs, rust-cache
+        # adds value: it scopes the cache key to Cargo.lock + rustc
+        # version, prunes stale artifacts on miss, and is the safety
+        # net when the runner's disk is wiped (which happened during
+        # the 2026-05 conformance push and cost ~30min of recompile).
         uses: Swatinem/rust-cache@v2
         with:
           # Bump if you want to invalidate cache without changing deps.

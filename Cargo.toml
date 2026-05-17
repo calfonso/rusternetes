@@ -68,6 +68,15 @@ aws-config = "1.1"
 aws-sdk-elasticloadbalancingv2 = "1.14"
 aws-sdk-ec2 = "1.30"
 
+[profile.dev]
+# Default `debug = 2` (full DWARF) inflates target/debug to ~80GB on this
+# workspace and dominates link time for the big crates (api-server alone
+# is ~900MB per rlib copy). `line-tables-only` keeps panics + backtraces
+# usable but cuts debug-info size 5-10x — huge link-time + I/O win, no
+# correctness impact. Override locally with
+# `RUSTFLAGS="-C debuginfo=2" cargo build` when stepping in a debugger.
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 # Dockerfile for Scheduler component
 FROM rust:latest AS builder
 
@@ -27,7 +28,11 @@ COPY crates/kubectl/Cargo.toml ./crates/kubectl/
 COPY crates ./crates
 
 ARG CARGO_FEATURES=""
-RUN cargo build --release $CARGO_FEATURES --bin scheduler
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release $CARGO_FEATURES --bin scheduler && \
+    mkdir -p /out && cp target/release/scheduler /out/scheduler
 
 FROM debian:sid-slim
 
@@ -38,7 +43,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/scheduler /app/scheduler
+COPY --from=builder /out/scheduler /app/scheduler
 
 ENTRYPOINT ["/app/scheduler"]
 CMD ["--etcd-servers", "http://etcd:2379"]

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 # Dockerfile for kubectl CLI tool
 FROM rust:latest AS builder
 
@@ -27,7 +28,11 @@ COPY crates/kube-proxy/Cargo.toml ./crates/kube-proxy/
 COPY crates ./crates
 
 ENV CARGO_BUILD_JOBS=2
-RUN cargo build --release --bin kubectl
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --bin kubectl && \
+    mkdir -p /out && cp target/release/kubectl /out/kubectl
 
 FROM debian:sid-slim
 
@@ -38,7 +43,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/kubectl /app/kubectl
+COPY --from=builder /out/kubectl /app/kubectl
 
 ENTRYPOINT ["/app/kubectl"]
 CMD ["--server", "http://api-server:6443"]
