@@ -517,18 +517,16 @@ async fn exec_with_stdin(
             Ok(Message::Binary(data)) => {
                 if let Ok(stream_msg) = StreamMessage::decode(&data) {
                     match stream_msg.channel {
-                        StreamChannel::Stdout => {
+                        StreamChannel::Stdout
                             // Print any stdout for debugging
-                            if !stream_msg.data.is_empty() {
+                            if !stream_msg.data.is_empty() => {
                                 print!("{}", String::from_utf8_lossy(&stream_msg.data));
                             }
-                        }
-                        StreamChannel::Stderr => {
+                        StreamChannel::Stderr
                             // Print stderr
-                            if !stream_msg.data.is_empty() {
+                            if !stream_msg.data.is_empty() => {
                                 eprint!("{}", String::from_utf8_lossy(&stream_msg.data));
                             }
-                        }
                         StreamChannel::Error => {
                             return Err(anyhow::anyhow!(
                                 "Exec error: {}",
