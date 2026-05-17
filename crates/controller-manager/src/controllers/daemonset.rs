@@ -884,11 +884,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // returns NotFound via GET.
         let suffix: String = {
             use rand::Rng;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             (0..5)
                 .map(|_| {
                     const CHARSET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
-                    CHARSET[rng.gen_range(0..CHARSET.len())] as char
+                    CHARSET[rng.random_range(0..CHARSET.len())] as char
                 })
                 .collect()
         };
