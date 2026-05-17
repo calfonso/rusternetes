@@ -30,6 +30,19 @@ jobs:
         # (installed at ~/.cargo/bin/rustup) is not on PATH by default.
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      - name: Ensure rustup is installed (self-heal)
+        # Twin of the step in test.yml — the runner has lost
+        # `~/.cargo/bin/rustup` twice now. Reinstall idempotently when
+        # absent so the next step doesn't fail with `command not found`.
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            echo "rustup missing on runner — reinstalling"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          else
+            echo "rustup present: $(command -v rustup)"
+          fi
+
       - name: Install Rust toolchain
         run: |
           rustup update --no-self-update stable
