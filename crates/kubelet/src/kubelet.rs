@@ -4058,6 +4058,83 @@ impl Kubelet {
     }
 }
 
+/// Build the kubelet-managed /etc/hosts content for a pod.
+///
+/// Returns `None` for `hostNetwork: true` pods — those use the host's
+/// /etc/hosts directly and must NOT receive a managed file (upstream
+/// `pkg/kubelet/kubelet_pods.go::managedHostsFileContent`).
+///
+/// For non-host-network pods, the content matches upstream byte-for-byte:
+/// - `# Kubernetes-managed hosts file.` header
+/// - Standard IPv4/IPv6 localhost + multicast entries
+/// - The pod's own IP / hostname (and FQDN if `spec.subdomain` is set)
+/// - Every `spec.hostAliases[]` entry, one line per IP with hostnames
+///   tab-separated. Aliases with empty/missing hostnames are skipped.
+///
+/// Mirrors upstream e2e site
+/// `test/e2e/common/node/kubelet_etc_hosts.go:143`.
+pub fn build_managed_hosts_content(
+    pod: &Pod,
+    pod_ip: Option<&str>,
+    cluster_domain: &str,
+) -> Option<String> {
+    let spec = pod.spec.as_ref()?;
+
+    // hostNetwork pods use the host's /etc/hosts directly.
+    if spec.host_network == Some(true) {
+        return None;
+    }
+
+    let pod_name = &pod.metadata.name;
+    let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+
+    // Linux hostnames are limited to 63 chars; trim trailing hyphens.
+    let raw_hostname = spec.hostname.as_deref().unwrap_or(pod_name);
+    let hostname = if raw_hostname.len() > 63 {
+        raw_hostname[..63].trim_end_matches('-')
+    } else {
+        raw_hostname
+    };
+
+    // Header + standard entries. IPv6 addresses match upstream
+    // `pkg/kubelet/kubelet_pods.go` exactly — do NOT change without
+    // verifying the upstream constants.
+    let mut content = String::from(
+        "# Kubernetes-managed hosts file.\n\
+         127.0.0.1\tlocalhost\n\
+         ::1\tlocalhost ip6-localhost ip6-loopback\n\
+         fe00::0\tip6-localnet\n\
+         ff00::0\tip6-mcastprefix\n\
+         ff02::1\tip6-allnodes\n\
+         ff02::2\tip6-allrouters\n",
+    );
+
+    // Pod's own IP entry (when known). Includes the FQDN built from
+    // <hostname>.<subdomain>.<namespace>.svc.<cluster-domain> if subdomain set.
+    if let Some(ip) = pod_ip {
+        let mut aliases = vec![hostname.to_string()];
+        if let Some(subdomain) = &spec.subdomain {
+            aliases.push(format!(
+                "{}.{}.{}.svc.{}",
+                hostname, subdomain, namespace, cluster_domain
+            ));
+        }
+        content.push_str(&format!("{}\t{}\n", ip, aliases.join("\t")));
+    }
+
+    // spec.hostAliases — one line per IP, hostnames tab-joined.
+    // Skip aliases with empty/missing hostnames (upstream behaviour).
+    for alias in spec.host_aliases.iter().flatten() {
+        let hostnames = match alias.hostnames.as_deref() {
+            Some(h) if !h.is_empty() => h,
+            _ => continue,
+        };
+        content.push_str(&format!("{}\t{}\n", alias.ip, hostnames.join("\t")));
+    }
+
+    Some(content)
+}
+
 #[cfg(test)]
 mod tests {
     use rusternetes_common::resources::pod::PodSpec;

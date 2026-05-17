@@ -172,24 +172,26 @@ fn test_hostname_override_takes_precedence() {
 
 #[test]
 fn test_hosts_file_ipv6_entries_present() {
-    // The standard localhost entries required by conformance tests
+    // The standard localhost entries required by conformance tests.
+    // IPv6 addresses must match upstream kubelet
+    // (pkg/kubelet/kubelet_pods.go::managedHostsFileContent) exactly.
     let required_entries = [
         "127.0.0.1\tlocalhost",
         "::1\tlocalhost ip6-localhost ip6-loopback",
-        "fe00::\tip6-localnet",
-        "fe00::\tip6-mcastprefix",
-        "fe00::1\tip6-allnodes",
-        "fe00::2\tip6-allrouters",
+        "fe00::0\tip6-localnet",
+        "ff00::0\tip6-mcastprefix",
+        "ff02::1\tip6-allnodes",
+        "ff02::2\tip6-allrouters",
     ];
 
     // Build the base content (same logic as create_pod_hosts_file)
     let base_content = "# Kubernetes-managed hosts file\n\
         127.0.0.1\tlocalhost\n\
         ::1\tlocalhost ip6-localhost ip6-loopback\n\
-        fe00::\tip6-localnet\n\
-        fe00::\tip6-mcastprefix\n\
-        fe00::1\tip6-allnodes\n\
-        fe00::2\tip6-allrouters\n";
+        fe00::0\tip6-localnet\n\
+        ff00::0\tip6-mcastprefix\n\
+        ff02::1\tip6-allnodes\n\
+        ff02::2\tip6-allrouters\n";
 
     for entry in &required_entries {
         assert!(
