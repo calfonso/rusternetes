@@ -614,37 +614,29 @@ impl SchemaValidator {
 
     fn validate_format(format: &str, value: &str, path: &str) -> Result<(), Error> {
         match format {
-            "date-time" => {
-                if !value.contains('T') || !value.contains(':') {
-                    return Err(Error::InvalidResource(format!(
-                        "String at {} must be a valid date-time",
-                        path
-                    )));
-                }
+            "date-time" if (!value.contains('T') || !value.contains(':')) => {
+                return Err(Error::InvalidResource(format!(
+                    "String at {} must be a valid date-time",
+                    path
+                )));
             }
-            "email" => {
-                if !value.contains('@') || !value.contains('.') {
-                    return Err(Error::InvalidResource(format!(
-                        "String at {} must be a valid email",
-                        path
-                    )));
-                }
+            "email" if (!value.contains('@') || !value.contains('.')) => {
+                return Err(Error::InvalidResource(format!(
+                    "String at {} must be a valid email",
+                    path
+                )));
             }
-            "uri" | "url" => {
-                if !value.starts_with("http://") && !value.starts_with("https://") {
-                    return Err(Error::InvalidResource(format!(
-                        "String at {} must be a valid URL",
-                        path
-                    )));
-                }
+            "uri" | "url" if !value.starts_with("http://") && !value.starts_with("https://") => {
+                return Err(Error::InvalidResource(format!(
+                    "String at {} must be a valid URL",
+                    path
+                )));
             }
-            "uuid" => {
-                if value.len() != 36 || value.chars().filter(|c| *c == '-').count() != 4 {
-                    return Err(Error::InvalidResource(format!(
-                        "String at {} must be a valid UUID",
-                        path
-                    )));
-                }
+            "uuid" if (value.len() != 36 || value.chars().filter(|c| *c == '-').count() != 4) => {
+                return Err(Error::InvalidResource(format!(
+                    "String at {} must be a valid UUID",
+                    path
+                )));
             }
             _ => {}
         }
