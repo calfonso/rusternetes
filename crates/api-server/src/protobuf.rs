@@ -33,6 +33,13 @@ pub enum FieldType {
     Bool,
     /// Nested message — value is the message type name for schema lookup
     Message(String),
+    /// Inline-embedded message — Go's JSON tags flatten the inner fields
+    /// into the parent object. The proto wire format still nests the
+    /// message at this field number, but the decoded JSON merges the
+    /// inner fields one level up. Used for `Volume.volumeSource` and
+    /// every `LocalObjectReference` embedding (ConfigMapVolumeSource,
+    /// SecretProjection, ConfigMapProjection, ...).
+    InlineMessage(String),
     /// map<string, string> — encoded as repeated MapEntry messages
     StringMap,
     /// Repeated field — value is the element type
@@ -575,6 +582,7 @@ impl ProtoRegistry {
             Self::resource_requirements_schema(),
         );
         schemas.insert("Volume".into(), Self::volume_schema());
+        schemas.insert("VolumeSource".into(), Self::volume_source_schema());
         schemas.insert("VolumeMount".into(), Self::volume_mount_schema());
         schemas.insert("EnvVar".into(), Self::env_var_schema());
         schemas.insert("EnvVarSource".into(), Self::env_var_source_schema());
@@ -2106,16 +2114,12 @@ impl ProtoRegistry {
         // "missing field `path`" (KeyToPath.path and
         // ServiceAccountTokenProjection.path are required).
         //
-        // Inline-flattening caveat: ConfigMapVolumeSource, SecretProjection,
-        // and ConfigMapProjection define field 1 as an embedded
-        // LocalObjectReference message that Go's JSON tag flattens to a
-        // top-level `name`. The current decoder has no inline-message
-        // facility, so field 1 is intentionally NOT registered for those
-        // three types. Hydrophone setup uses ServiceAccountTokenProjection
-        // (no LocalObjectReference) and SecretVolumeSource (scalar
-        // `secretName`, no inlining), so the gap does not block conformance
-        // bring-up. Promote to a `FieldType::InlineMessage` variant if a
-        // future client needs the projection name decoded.
+        // ConfigMapVolumeSource, SecretProjection, and ConfigMapProjection
+        // define field 1 as an embedded LocalObjectReference message that
+        // Go's JSON tag flattens to a top-level `name`. They use
+        // `FieldType::InlineMessage` to merge the inner `name` into the
+        // parent's JSON output (same mechanism Volume uses for
+        // VolumeSource).
         schemas.insert(
             "ProjectedVolumeSource".into(),
             MessageSchema {
@@ -2246,7 +2250,13 @@ impl ProtoRegistry {
             "SecretProjection".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    // field 1 = LocalObjectReference (inlined `name`) — see caveat above.
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
                     (
                         2,
                         (
@@ -2262,7 +2272,13 @@ impl ProtoRegistry {
             "ConfigMapProjection".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    // field 1 = LocalObjectReference (inlined `name`) — see caveat above.
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
                     (
                         2,
                         (
@@ -2278,7 +2294,13 @@ impl ProtoRegistry {
             "ConfigMapVolumeSource".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    // field 1 = LocalObjectReference (inlined `name`) — see caveat above.
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
                     (
                         2,
                         (
@@ -2840,21 +2862,46 @@ impl ProtoRegistry {
     }
 
     fn volume_schema() -> MessageSchema {
-        // Volumes have many source types — we handle the most common
+        // The proto wire format wraps every Volume source type in an
+        // embedded `VolumeSource` message at field 2. Go's JSON tag
+        // flattens VolumeSource into Volume, so decoded JSON keys
+        // (`hostPath`, `emptyDir`, ...) appear at the Volume level.
+        // The inline-message variant performs that merge — fields live in
+        // `volume_source_schema()` below.
         MessageSchema {
             fields: HashMap::from([
                 (1, ("name".into(), FieldType::String)),
-                // VolumeSource is inlined — each source type has its own field number
-                // We handle the most common ones
                 (
                     2,
+                    (
+                        "volumeSource".into(),
+                        FieldType::InlineMessage("VolumeSource".into()),
+                    ),
+                ),
+            ]),
+        }
+    }
+
+    fn volume_source_schema() -> MessageSchema {
+        // Field numbers from
+        // https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/api/core/v1/generated.proto
+        // (message VolumeSource). Source kinds we don't yet decode
+        // (gitRepo, nfs, iscsi, glusterfs, rbd, flex, cinder, cephfs,
+        // flocker, azure*, vsphere, photon, portworx, scaleIO,
+        // storageOS, csi, ephemeral) are intentionally omitted — the
+        // decoder ignores unknown field numbers so requests using them
+        // still round-trip with the supported subset.
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
                     (
                         "hostPath".into(),
                         FieldType::Message("HostPathVolumeSource".into()),
                     ),
                 ),
                 (
-                    3,
+                    2,
                     (
                         "emptyDir".into(),
                         FieldType::Message("EmptyDirVolumeSource".into()),
@@ -2868,7 +2915,7 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
-                    9,
+                    10,
                     (
                         "persistentVolumeClaim".into(),
                         FieldType::Message("PersistentVolumeClaimVolumeSource".into()),
@@ -2882,17 +2929,17 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
+                    16,
+                    (
+                        "downwardAPI".into(),
+                        FieldType::Message("DownwardAPIVolumeSource".into()),
+                    ),
+                ),
+                (
                     26,
                     (
                         "projected".into(),
                         FieldType::Message("ProjectedVolumeSource".into()),
-                    ),
-                ),
-                (
-                    28,
-                    (
-                        "downwardAPI".into(),
-                        FieldType::Message("DownwardAPIVolumeSource".into()),
                     ),
                 ),
             ]),
@@ -3123,10 +3170,23 @@ impl ProtoRegistry {
                     pos += len;
 
                     if let Some((name, field_type)) = schema.fields.get(&field_num) {
-                        let json_val = self.decode_field_value(field_type, field_data);
-
                         match field_type {
+                            FieldType::InlineMessage(msg_type) => {
+                                // Go's JSON tag flattens this nested message
+                                // into the parent. Decode the embedded message,
+                                // then merge its fields into `obj` directly so
+                                // the surrounding JSON struct sees them at the
+                                // top level (e.g. `Volume.volumeSource → emptyDir`).
+                                if let Some(Value::Object(inner)) =
+                                    self.decode_message(msg_type, field_data)
+                                {
+                                    for (k, v) in inner {
+                                        obj.insert(k, v);
+                                    }
+                                }
+                            }
                             FieldType::Repeated(_) => {
+                                let json_val = self.decode_field_value(field_type, field_data);
                                 repeated_fields
                                     .entry(name.clone())
                                     .or_default()
@@ -3155,6 +3215,7 @@ impl ProtoRegistry {
                                 }
                             }
                             _ => {
+                                let json_val = self.decode_field_value(field_type, field_data);
                                 obj.insert(name.clone(), json_val);
                             }
                         }
@@ -3190,7 +3251,10 @@ impl ProtoRegistry {
                 use base64::Engine;
                 Value::String(base64::engine::general_purpose::STANDARD.encode(data))
             }
-            FieldType::Message(msg_type) => {
+            FieldType::Message(msg_type) | FieldType::InlineMessage(msg_type) => {
+                // InlineMessage merging is handled at the caller (decode_with_schema).
+                // Reaching here means it's nested under a Repeated wrapper, which is
+                // not a documented K8s pattern — decode as a normal message instead.
                 if msg_type == "Time" {
                     // K8s Time is a Timestamp proto — decode to RFC3339 string
                     return decode_timestamp(data);
