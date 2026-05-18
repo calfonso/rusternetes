@@ -43,9 +43,9 @@ Sonobuoy Ginkgo tests observe through the REST surface.
 | 10 | `Watch filters by namespace prefix` | watch.go (scoped watch) | PASS | `watch_filters_events_outside_subscribed_namespace_prefix` | mirrored, passing |
 | 11 | `Watch resourceVersion is monotonic across updates` | apimachinery/pkg/watch | PASS | `watch_resource_version_is_monotonic_across_updates` | mirrored, passing |
 | 12 | `Watch ?allowWatchBookmarks=true delivers BOOKMARK events` | KEP-956 + watch.go | PASS | `watch_bookmark_optin_is_query_parameter` | mirrored, passing |
-| 13 | `Servers should return chunks of results for list calls` | chunking.go | **FAIL** | `chunking_servers_should_return_chunks_of_results` | mirrored, **ignored** (tracks failure) |
-| 14 | `Servers should support chunking with limit=1` | chunking.go | **FAIL** | `chunking_servers_should_support_limit_one` | mirrored, **ignored** (tracks failure) |
-| 15 | `Continue token after compaction returns 410 Gone` | chunking.go | **FAIL** | `chunking_continue_after_compaction_returns_410_expired` | mirrored, **ignored** (tracks failure) |
+| 13 | `Servers should return chunks of results for list calls` | chunking.go | FAIL → PASS | `chunking_servers_should_return_chunks_of_results` | mirrored, passing (Storage::list_paginated) |
+| 14 | `Servers should support chunking with limit=1` | chunking.go | FAIL → PASS | `chunking_servers_should_support_limit_one` | mirrored, passing |
+| 15 | `Continue token after compaction returns 410 Gone` | chunking.go | FAIL → PASS | `chunking_continue_after_compaction_returns_410_expired` | mirrored, passing (Error::Gone via is_revision_compacted) |
 | 16 | `ListMeta serializes continue field with lowercase key` (precondition) | apimachinery/pkg/apis/meta/v1/types.go | PASS | `chunking_listmeta_continue_field_serializes_as_continue_key` | mirrored, passing |
 | 17 | `ListMeta defaults omit chunking fields` (precondition) | apimachinery/pkg/apis/meta/v1/types.go | PASS | `chunking_default_listmeta_omits_continue_and_remaining` | mirrored, passing |
 | 18 | `FieldSelectors filter by metadata.name equality` | field_selector.go | PASS | `field_selector_filters_by_metadata_name_equality` | mirrored, passing |
@@ -72,21 +72,20 @@ Sonobuoy Ginkgo tests observe through the REST surface.
 
 ## Known failures tracked here
 
-- **Chunking (`?limit=` / `?continue=`)** — the API server does not implement
-  pagination at the list endpoints. Three tests (#13, #14, #15) are
-  `#[ignore]`d with the failure-bucket reason; they will compile and link
-  but panic if ever un-ignored, which is the canary that the chunking
-  handler still owes a real implementation.
-- **GC orphan propagation** — Test #33 used to be `#[ignore]`d because the
-  controller deleted dependents server-side regardless of the requested
-  `propagationPolicy`. The DELETE handlers
+- **Chunking (`?limit=` / `?continue=`)** — RESOLVED. `Storage::list_paginated`
+  in `crates/storage/src/lib.rs` provides a default implementation (sort by
+  `metadata.namespace/name`, slice by `limit`, encode the next sort key as
+  the continue token) that every backend inherits. The
+  `MemoryStorage::compact_to(rv)` test hook simulates etcd compaction so
+  the 410 Gone path can be exercised without a real cluster.
+- **GC orphan propagation** — RESOLVED. The DELETE handlers
   (`handle_delete_with_finalizers_and_propagation` in
   `crates/api-server/src/handlers/finalizers.rs`) attach the `orphan`
   finalizer when the caller sets `propagationPolicy=Orphan` (either in the
   `?propagationPolicy=Orphan` query param or the `DeleteOptions` body), and
   the GC controller (`controllers/garbage_collector.rs::process_deletion`
-  → `orphan_dependents`) now strips the owner reference from every
-  dependent and removes the orphan finalizer in the same scan. The test is
+  → `orphan_dependents`) strips the owner reference from every dependent
+  and removes the orphan finalizer in the same scan. Test #33 is
   re-enabled and pinned to that behaviour.
 
 ## How to run

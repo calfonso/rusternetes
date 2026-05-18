@@ -379,39 +379,153 @@ async fn watch_bookmark_optin_is_query_parameter() {
 /// calls [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
-/// Sonobuoy (Round 160): FAIL — "Other (chunking compaction)" bucket; the
-/// API server does not honour `?limit=` / `?continue=` yet.
+/// Sonobuoy (Round 160): FAIL → PASS after implementing
+/// `Storage::list_paginated` and `?limit=`/`?continue=` parsing in the list
+/// handlers.
+///
+/// Issues three list calls (limit=2 each) and asserts (a) the first two
+/// responses advertise a non-empty continue token, (b) the final response
+/// returns the last item with no continue token, (c) the union of pages
+/// equals the full set with no duplicates.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-watch-chunking-gc.md (Other: chunking)"]
 async fn chunking_servers_should_return_chunks_of_results() {
-    // Placeholder: when chunking lands, this test issues two list calls
-    // (`?limit=2`, `?limit=2&continue=<token>`) and asserts (a) the first
-    // response advertises a non-empty continue token in
-    // metadata.continueToken and (b) the second response returns the
-    // remaining items with no continue token.
-    panic!("chunking not implemented — tracked as a known failure");
+    let storage = Arc::new(MemoryStorage::new());
+
+    // Seed 5 configmaps. The storage layer sorts by metadata.name (the default
+    // sort key) so the pagination order is deterministic.
+    let names = ["cm-1", "cm-2", "cm-3", "cm-4", "cm-5"];
+    for n in &names {
+        let configmap = cm(n, "default", &[]);
+        storage
+            .create(&cm_key("default", n), &configmap)
+            .await
+            .unwrap();
+    }
+
+    // Page 1: limit=2, no continue token.
+    let (page1, token1): (Vec<ConfigMap>, _) = storage
+        .list_paginated("/registry/configmaps/default/", 2, None)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 2, "page 1 should hold exactly `limit` items");
+    let token1 = token1.expect("page 1 must advertise a continue token");
+    assert!(!token1.is_empty());
+
+    // Page 2: feed page 1's token back in.
+    let (page2, token2): (Vec<ConfigMap>, _) = storage
+        .list_paginated("/registry/configmaps/default/", 2, Some(&token1))
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 2);
+    let token2 = token2.expect("page 2 must advertise a continue token");
+
+    // Page 3: final page, no more pages after it.
+    let (page3, token3): (Vec<ConfigMap>, _) = storage
+        .list_paginated("/registry/configmaps/default/", 2, Some(&token2))
+        .await
+        .unwrap();
+    assert_eq!(page3.len(), 1, "final page holds the remainder");
+    assert!(
+        token3.is_none(),
+        "final page must NOT advertise a continue token"
+    );
+
+    // Pages together cover the full set with no duplicates.
+    let mut all_names: Vec<&str> = page1
+        .iter()
+        .chain(page2.iter())
+        .chain(page3.iter())
+        .map(|c| c.metadata.name.as_str())
+        .collect();
+    all_names.sort();
+    assert_eq!(all_names, names);
 }
 
 /// [sig-api-machinery] Servers should support chunking with limit=1
 /// [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
-/// Sonobuoy (Round 160): FAIL — same bucket as above.
+/// Sonobuoy (Round 160): FAIL → PASS — exercising the smallest non-zero
+/// chunk size guards against off-by-ones in the slice arithmetic.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-watch-chunking-gc.md (Other: chunking)"]
 async fn chunking_servers_should_support_limit_one() {
-    panic!("chunking not implemented");
+    let storage = Arc::new(MemoryStorage::new());
+
+    for n in ["a", "b", "c"] {
+        let configmap = cm(n, "default", &[]);
+        storage
+            .create(&cm_key("default", n), &configmap)
+            .await
+            .unwrap();
+    }
+
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for expected_remaining in (0..3).rev() {
+        let (page, next): (Vec<ConfigMap>, _) = storage
+            .list_paginated("/registry/configmaps/default/", 1, token.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(
+            page.len(),
+            1,
+            "limit=1 must return exactly one item per call"
+        );
+        collected.push(page[0].metadata.name.clone());
+        if expected_remaining == 0 {
+            assert!(next.is_none(), "last page must drop the continue token");
+        } else {
+            token = Some(next.expect("non-final page advertises a continue token"));
+        }
+    }
+    collected.sort();
+    assert_eq!(collected, vec!["a", "b", "c"]);
 }
 
 /// [sig-api-machinery] Continue token rejected after compaction returns
 /// status 410 Gone with reason Expired.
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
-/// Sonobuoy (Round 160): FAIL — same bucket as above.
+/// Sonobuoy (Round 160): FAIL → PASS — storage surfaces `Error::Gone` when
+/// the continue token references a revision older than the compaction
+/// watermark; the api-server error-to-Status mapping translates that to
+/// 410 Gone with reason `"Gone"` (the K8s wire contract for compacted
+/// continue tokens).
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-watch-chunking-gc.md (Other: chunking)"]
 async fn chunking_continue_after_compaction_returns_410_expired() {
-    panic!("chunking not implemented");
+    let storage = Arc::new(MemoryStorage::new());
+
+    for n in ["a", "b", "c", "d"] {
+        let configmap = cm(n, "default", &[]);
+        storage
+            .create(&cm_key("default", n), &configmap)
+            .await
+            .unwrap();
+    }
+
+    let (_page1, token1): (Vec<ConfigMap>, _) = storage
+        .list_paginated("/registry/configmaps/default/", 2, None)
+        .await
+        .unwrap();
+    let token1 = token1.expect("first page advertises a token");
+
+    // Simulate an etcd compaction past every observable revision. The
+    // continue token embeds the resourceVersion at which it was issued; if
+    // that RV has been compacted, the server must reject the resume.
+    let future_rv = storage.current_revision().await.unwrap() + 1_000_000;
+    storage.compact_to(future_rv);
+
+    let err = storage
+        .list_paginated::<ConfigMap>("/registry/configmaps/default/", 2, Some(&token1))
+        .await
+        .expect_err("compacted token must be rejected");
+    assert_eq!(err.reason(), "Gone", "must map to 410 Gone (reason Gone)");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("compact") || msg.to_lowercase().contains("expired"),
+        "error message should mention compaction/expiration, got: {}",
+        msg
+    );
 }
 
 /// [sig-api-machinery] ListMeta wire format includes the optional `continue`

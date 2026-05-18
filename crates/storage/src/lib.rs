@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rusternetes_common::authz::AuthzStorage;
-use rusternetes_common::Result;
+use rusternetes_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 
@@ -52,6 +52,81 @@ pub trait Storage: Send + Sync {
     where
         T: Serialize + DeserializeOwned + Send + Sync;
 
+    /// Paginated list — return up to `limit` items in deterministic (sorted by
+    /// storage key) order and a continue token for the next page, if any.
+    ///
+    /// `continue_token` is the opaque token returned from a previous call;
+    /// `None` requests the first page. When the storage backend has compacted
+    /// past the token's referenced revision, returns [`Error::Gone`] so the
+    /// handler can surface `410 Gone` with reason `Expired`.
+    ///
+    /// The default implementation performs in-memory chunking on top of
+    /// [`Storage::list`]: list the full prefix, sort by key, slice, and
+    /// embed the next sort key in the token. Backends that can stream a
+    /// partial range from native pagination (e.g. etcd `RangeRequest.limit`)
+    /// may override for efficiency.
+    ///
+    /// This is a *storage-level* primitive that resumes by sort key. The
+    /// handler-level offset-based helper in `rusternetes_common::pagination`
+    /// (see `paginate`) operates on already-fetched `Vec<T>` and is used by
+    /// resource handlers that need to filter/decorate items before paging.
+    async fn list_paginated<T>(
+        &self,
+        prefix: &str,
+        limit: usize,
+        continue_token: Option<&str>,
+    ) -> Result<(Vec<T>, Option<String>)>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        if limit == 0 {
+            // limit=0 means "no chunking, return everything".
+            return Ok((self.list(prefix).await?, None));
+        }
+
+        // Default path: list everything, sort by a stable per-item key, slice.
+        // Backends with native pagination (e.g. etcd `RangeRequest.limit`) may
+        // override this for efficiency.
+        let all: Vec<serde_json::Value> = self.list(prefix).await?;
+
+        let mut indexed: Vec<(String, serde_json::Value)> =
+            all.into_iter().map(|v| (default_sort_key(&v), v)).collect();
+        indexed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let start = if let Some(token) = continue_token {
+            let decoded = decode_default_token(token)?;
+            if let Some(rv) = decoded.compacted_at {
+                if self.is_revision_compacted(rv).await.unwrap_or(false) {
+                    return Err(Error::Gone(format!(
+                        "continue token expired (resource version {} has been compacted)",
+                        rv
+                    )));
+                }
+            }
+            indexed
+                .iter()
+                .position(|(k, _)| k.as_str() >= decoded.start_key.as_str())
+                .unwrap_or(indexed.len())
+        } else {
+            0
+        };
+
+        let end = (start + limit).min(indexed.len());
+        let next_token = if end < indexed.len() {
+            let next_key = &indexed[end].0;
+            let rv = self.current_revision().await.unwrap_or(0);
+            Some(encode_default_token(next_key, rv))
+        } else {
+            None
+        };
+
+        let mut out = Vec::with_capacity(end - start);
+        for (_, v) in indexed.drain(start..end) {
+            out.push(serde_json::from_value(v).map_err(Error::Serialization)?);
+        }
+        Ok((out, next_token))
+    }
+
     /// Watch for changes to resources with a given prefix
     async fn watch(&self, prefix: &str) -> Result<WatchStream>;
 
@@ -63,6 +138,64 @@ pub trait Storage: Send + Sync {
 
     /// Check if a revision has been compacted (no longer available)
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool>;
+}
+
+/// Default sort key for an opaque JSON resource — uses
+/// `metadata.namespace/metadata.name` so iteration order matches
+/// `/registry/<type>/<ns>/<name>` storage layout.
+fn default_sort_key(v: &serde_json::Value) -> String {
+    let ns = v
+        .pointer("/metadata/namespace")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    let name = v
+        .pointer("/metadata/name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    if ns.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", ns, name)
+    }
+}
+
+/// Decoded continue token (opaque to callers).
+#[derive(Debug, Clone)]
+pub struct ContinueToken {
+    /// Sort key of the next item to return.
+    pub start_key: String,
+    /// Resource version at which the token was issued; used to detect
+    /// compaction.
+    pub compacted_at: Option<i64>,
+}
+
+/// Encode a continue token. Format: `c1:<rv>:<key>`. The version prefix lets
+/// us evolve the format without breaking existing clients.
+pub fn encode_default_token(start_key: &str, rv: i64) -> String {
+    format!("c1:{}:{}", rv, start_key)
+}
+
+/// Decode a continue token produced by [`encode_default_token`].
+pub fn decode_default_token(token: &str) -> Result<ContinueToken> {
+    let rest = token.strip_prefix("c1:").ok_or_else(|| {
+        Error::InvalidResource(format!(
+            "malformed continue token (unknown version): {}",
+            token
+        ))
+    })?;
+    let (rv_str, start_key) = rest.split_once(':').ok_or_else(|| {
+        Error::InvalidResource(format!("malformed continue token (missing key): {}", token))
+    })?;
+    let rv: i64 = rv_str.parse().map_err(|_| {
+        Error::InvalidResource(format!(
+            "malformed continue token (bad resource version): {}",
+            token
+        ))
+    })?;
+    Ok(ContinueToken {
+        start_key: start_key.to_string(),
+        compacted_at: Some(rv),
+    })
 }
 
 /// Event types for watch operations
@@ -113,6 +246,18 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         (**self).list(prefix).await
+    }
+
+    async fn list_paginated<T>(
+        &self,
+        prefix: &str,
+        limit: usize,
+        continue_token: Option<&str>,
+    ) -> Result<(Vec<T>, Option<String>)>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self).list_paginated(prefix, limit, continue_token).await
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
@@ -276,6 +421,33 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::list(s, prefix).await,
             StorageBackend::Memory(s) => Storage::list(s.as_ref(), prefix).await,
+        }
+    }
+
+    async fn list_paginated<T>(
+        &self,
+        prefix: &str,
+        limit: usize,
+        continue_token: Option<&str>,
+    ) -> Result<(Vec<T>, Option<String>)>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            StorageBackend::Etcd(s) => {
+                Storage::list_paginated(s, prefix, limit, continue_token).await
+            }
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => {
+                Storage::list_paginated(s, prefix, limit, continue_token).await
+            }
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => {
+                Storage::list_paginated(s, prefix, limit, continue_token).await
+            }
+            StorageBackend::Memory(s) => {
+                Storage::list_paginated(s.as_ref(), prefix, limit, continue_token).await
+            }
         }
     }
 
