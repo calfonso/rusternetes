@@ -11,6 +11,7 @@
 //!   2. When validating a custom resource the api-server reads the CRD back
 //!      as a typed `CustomResourceDefinition` and runs `SchemaValidator`
 //!      against the CR.
+//!
 //! If the typed round-trip drops `enum` (or any other constraint) the CR
 //! is silently accepted — which is exactly the conformance failure we are
 //! fixing.

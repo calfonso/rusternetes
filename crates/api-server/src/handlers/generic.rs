@@ -594,8 +594,8 @@ pub async fn list_registered_apiservice_groups_with_storage<S: Storage + Send + 
 
     let mut out = Vec::new();
     for (group, mut versions) in by_group {
-        // Highest priority first; ties keep insertion order.
-        versions.sort_by(|a, b| b.1.cmp(&a.1));
+        // Highest priority first; ties keep insertion order (sort_by_key is stable).
+        versions.sort_by_key(|v| std::cmp::Reverse(v.1));
         let versions_arr: Vec<Value> = versions
             .iter()
             .map(|(v, _)| {
