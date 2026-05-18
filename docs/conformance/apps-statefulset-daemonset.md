@@ -45,7 +45,7 @@ That matches the prior art in
 | `StatefulSet AvailableReplicas should get updated accordingly when MinReadySeconds is enabled` | apps/statefulset.go (MinReadySeconds suite) | FAIL ("Other" bucket) | `statefulset_available_replicas_should_track_min_ready_seconds` | mirrored, ignored — `availableReplicas` / `minReadySeconds` not implemented in the controller |
 | `StatefulSet PVC retention — whenScaled=Delete reclaims PVCs` | apps/statefulset.go (PVC retention suite) | FAIL ("Other" bucket) | `statefulset_pvc_retention_policy_should_delete_pvcs_on_scale_down` | mirrored, ignored — `persistentVolumeClaimRetentionPolicy` deletes are not implemented |
 | `StatefulSet PVC retention — whenScaled=Retain keeps PVCs` | apps/statefulset.go (PVC retention suite) | PASS | `statefulset_pvc_retention_policy_retain_keeps_pvcs_on_scale_down` | mirrored, passing (default Retain behaviour) |
-| `StatefulSet pods bind their headless Service via subdomain` | apps/statefulset.go (identity tests) | FAIL ("Other" bucket) | `statefulset_pods_should_bind_headless_service_via_subdomain` | mirrored, ignored — controller does not stamp `pod.spec.subdomain` from `serviceName` |
+| `StatefulSet pods bind their headless Service via subdomain` | apps/statefulset.go (identity tests) | PASS | `statefulset_pods_should_bind_headless_service_via_subdomain` | mirrored, passing — `create_pod` stamps `pod.spec.subdomain` from `serviceName` |
 | `Daemon set [Serial] should run and stop simple daemon` | apps/daemon_set.go:240 | FAIL ("Other" bucket — DaemonSet) | `daemonset_should_run_and_stop_simple_daemon` | mirrored, passing |
 | `Daemon set [Serial] should run and stop complex daemon` | apps/daemon_set.go:258 | FAIL ("Other" bucket — DaemonSet) | `daemonset_should_run_and_stop_complex_daemon_with_node_selector` | mirrored, passing |
 | `Daemon set [Serial] should retry creating failed daemon pods` | apps/daemon_set.go:368 | FAIL ("Other" bucket — DaemonSet) | `daemonset_should_retry_creating_failed_daemon_pods` | mirrored, passing |
@@ -71,8 +71,9 @@ That matches the prior art in
   fact "retain".
 - **Headless Service binding** — upstream stamps
   `pod.spec.subdomain = statefulset.spec.serviceName` so DNS A records
-  resolve under the headless Service. Our `create_pod` path leaves
-  `subdomain` empty; the mirror is `#[ignore]`d until that field is set.
+  resolve under the headless Service. The StatefulSet controller now
+  applies the same assignment in both `create_pod` and
+  `create_pod_with_template`, and the mirror test is no longer ignored.
 - **Eviction simulation** — Sonobuoy relies on the kubelet to actually
   eject a pod. We emulate that by deleting the pod from storage outright
   before reconciling, which is the minimum signal needed to verify the

@@ -879,10 +879,9 @@ async fn statefulset_pvc_retention_policy_retain_keeps_pvcs_on_scale_down() {
 /// Service name as their `subdomain` so DNS A records resolve.
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/statefulset.go (Identity tests)
-/// Sonobuoy (Round 160, "Other" bucket): FAIL — controller does not stamp
-/// `pod.spec.subdomain` from `statefulset.spec.serviceName`.
+/// Sonobuoy (Round 160): was FAIL; fixed by this PR — pod.spec.subdomain now
+/// stamped from sts.spec.serviceName.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-statefulset-daemonset.md (subdomain not stamped)"]
 async fn statefulset_pods_should_bind_headless_service_via_subdomain() {
     let storage = setup_test().await;
     let ns = "default";
