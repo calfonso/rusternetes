@@ -315,6 +315,41 @@ pub fn check_host_path_type(path: &str, type_: Option<&str>) -> HostPathCheck {
     }
 }
 
+/// Compute the supplementary group IDs that must be added to a container's
+/// GIDs so a non-root `runAsUser` can read volume files we chowned to
+/// `:fsGroup` in `create_pod_volumes`.
+///
+/// Per `PodSecurityContext` semantics: `fsGroup` is appended first (when
+/// set), followed by `securityContext.supplementalGroups`. Duplicates are
+/// elided to keep the runtime arg list compact. Returns `None` when there
+/// are no GIDs to add — Docker's `HostConfig.group_add` treats `None` and
+/// an empty list identically, but `None` avoids a wasted allocation.
+///
+/// This is a pure function and is unit-tested in this module's test block.
+pub(crate) fn compute_group_add(pod: &Pod) -> Option<Vec<String>> {
+    let pod_sc = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.security_context.as_ref())?;
+    let mut gids: Vec<String> = Vec::new();
+    if let Some(fs_group) = pod_sc.fs_group {
+        gids.push(fs_group.to_string());
+    }
+    if let Some(ref supplemental) = pod_sc.supplemental_groups {
+        for gid in supplemental {
+            let gid_str = gid.to_string();
+            if !gids.contains(&gid_str) {
+                gids.push(gid_str);
+            }
+        }
+    }
+    if gids.is_empty() {
+        None
+    } else {
+        Some(gids)
+    }
+}
+
 /// Runtime observation of a single init container, derived from the
 /// container runtime's inspect call (or test fixtures).
 ///
@@ -4706,6 +4741,14 @@ impl ContainerRuntime {
                     .security_context
                     .as_ref()
                     .and_then(|sc| sc.privileged),
+                // Supplementary groups: fsGroup + securityContext.supplementalGroups
+                // must be added to the container's GIDs so a non-root runAsUser can
+                // read volume files we chowned to `:fsGroup` in create_pod_volumes()
+                // above. Without this, mode-0440 secret/projected/configMap volumes
+                // owned by root:fsGroup return EACCES to the in-container reader —
+                // exactly the upstream [sig-storage] Projected secret + Secret volume
+                // "consumable as non-root with defaultMode and fsGroup set" failures.
+                group_add: compute_group_add(pod),
                 // Sysctls are set on the pause container (which owns the namespaces).
                 // App containers share namespaces via ipc_mode/pid_mode above.
                 ..Default::default()
@@ -11776,5 +11819,87 @@ mod tests {
             grace, 45,
             "spec.terminationGracePeriodSeconds must propagate"
         );
+    }
+
+    // --- compute_group_add (fsGroup → container GIDs) ---
+
+    mod group_add {
+        use super::*;
+        use crate::runtime::compute_group_add;
+        use rusternetes_common::resources::pod::PodSecurityContext;
+
+        fn pod_with_security_context(sc: PodSecurityContext) -> Pod {
+            let mut pod = make_pod("p", "default", None, None);
+            pod.spec.as_mut().unwrap().security_context = Some(sc);
+            pod
+        }
+
+        #[test]
+        fn returns_none_when_no_security_context() {
+            let pod = make_pod("p", "default", None, None);
+            assert_eq!(compute_group_add(&pod), None);
+        }
+
+        #[test]
+        fn returns_none_when_no_fs_group_or_supplemental() {
+            let pod = pod_with_security_context(Default::default());
+            assert_eq!(compute_group_add(&pod), None);
+        }
+
+        /// The bug fix: a pod with `fsGroup` set must add that GID to the
+        /// container's supplementary groups so files chowned to `:fsGroup`
+        /// in `create_pod_volumes` are readable by a non-root runAsUser.
+        #[test]
+        fn includes_fs_group() {
+            let pod = pod_with_security_context(PodSecurityContext {
+                fs_group: Some(2000),
+                ..Default::default()
+            });
+            assert_eq!(compute_group_add(&pod), Some(vec!["2000".to_string()]));
+        }
+
+        #[test]
+        fn includes_supplemental_groups_when_no_fs_group() {
+            let pod = pod_with_security_context(PodSecurityContext {
+                supplemental_groups: Some(vec![3000, 4000]),
+                ..Default::default()
+            });
+            assert_eq!(
+                compute_group_add(&pod),
+                Some(vec!["3000".to_string(), "4000".to_string()])
+            );
+        }
+
+        #[test]
+        fn combines_fs_group_first_then_supplemental() {
+            let pod = pod_with_security_context(PodSecurityContext {
+                fs_group: Some(2000),
+                supplemental_groups: Some(vec![3000, 4000]),
+                ..Default::default()
+            });
+            assert_eq!(
+                compute_group_add(&pod),
+                Some(vec![
+                    "2000".to_string(),
+                    "3000".to_string(),
+                    "4000".to_string()
+                ])
+            );
+        }
+
+        /// fsGroup repeated in supplementalGroups must not be added twice —
+        /// keeps the runtime arg list compact.
+        #[test]
+        fn dedupes_fs_group_against_supplemental() {
+            let pod = pod_with_security_context(PodSecurityContext {
+                fs_group: Some(2000),
+                supplemental_groups: Some(vec![2000, 3000]),
+                ..Default::default()
+            });
+            assert_eq!(
+                compute_group_add(&pod),
+                Some(vec!["2000".to_string(), "3000".to_string()])
+            );
+        }
     }
 }
