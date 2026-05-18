@@ -223,7 +223,7 @@ mod pod_metrics_tests {
     #[test]
     fn test_sort_pods_by_cpu() {
         fn sort_by_cpu(pods: &mut Vec<(&str, u64)>) {
-            pods.sort_by(|a, b| b.1.cmp(&a.1));
+            pods.sort_by_key(|p| std::cmp::Reverse(p.1));
         }
 
         let mut pods = vec![("pod-1", 100), ("pod-3", 500), ("pod-2", 300)];
@@ -237,7 +237,7 @@ mod pod_metrics_tests {
     #[test]
     fn test_sort_pods_by_memory() {
         fn sort_by_memory(pods: &mut Vec<(&str, u64)>) {
-            pods.sort_by(|a, b| b.1.cmp(&a.1));
+            pods.sort_by_key(|p| std::cmp::Reverse(p.1));
         }
 
         let mut pods = vec![

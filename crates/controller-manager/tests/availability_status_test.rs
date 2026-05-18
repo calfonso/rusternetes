@@ -96,7 +96,6 @@ fn make_pod_spec(_labels: HashMap<String, String>) -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
-        ..Default::default()
     }
 }
 
