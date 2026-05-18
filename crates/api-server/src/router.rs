@@ -784,20 +784,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/apiregistration.k8s.io/v1",
             get(handlers::discovery::get_apiregistration_v1_resources),
         )
-        .route(
-            "/apis/apiregistration.k8s.io/v1/apiservices",
-            get(handlers::generic::list_apiservices).post(handlers::generic::create_apiservice),
-        )
-        .route(
-            "/apis/apiregistration.k8s.io/v1/apiservices/:name",
-            get(handlers::generic::get_apiservice)
-                .put(handlers::generic::update_apiservice)
-                .delete(handlers::generic::delete_apiservice),
-        )
-        .route(
-            "/apis/apiregistration.k8s.io/v1/apiservices/:name/status",
-            get(handlers::generic::get_apiservice).put(handlers::generic::update_apiservice_status),
-        )
+        // APIService CRUD routes live in protected_routes (below) because the
+        // handlers consume `Extension<AuthContext>` which is only injected by
+        // the protected_routes auth middleware. Wiring them here previously
+        // produced a 500 on every request — the extension extractor failed
+        // before the handler ran.
         .route("/version", get(handlers::discovery::get_version))
         // OpenAPI spec endpoints
         .route("/openapi/v2", get(handlers::openapi::get_swagger_spec))
@@ -1643,6 +1634,24 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::status::get_cluster_status)
                 .put(handlers::status::update_cluster_status)
                 .patch(handlers::status::update_cluster_status),
+        )
+        // APIService (cluster-scoped, aggregator layer). Handlers require
+        // Extension<AuthContext> for authz checks, so these routes must live
+        // in protected_routes — the public discovery route at
+        // /apis/apiregistration.k8s.io/v1 stays public (no AuthContext).
+        .route(
+            "/apis/apiregistration.k8s.io/v1/apiservices",
+            get(handlers::generic::list_apiservices).post(handlers::generic::create_apiservice),
+        )
+        .route(
+            "/apis/apiregistration.k8s.io/v1/apiservices/:name",
+            get(handlers::generic::get_apiservice)
+                .put(handlers::generic::update_apiservice)
+                .delete(handlers::generic::delete_apiservice),
+        )
+        .route(
+            "/apis/apiregistration.k8s.io/v1/apiservices/:name/status",
+            get(handlers::generic::get_apiservice).put(handlers::generic::update_apiservice_status),
         )
         // ValidatingWebhookConfiguration (cluster-scoped)
         .route(
