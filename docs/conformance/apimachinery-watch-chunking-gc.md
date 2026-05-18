@@ -63,7 +63,7 @@ Sonobuoy Ginkgo tests observe through the REST surface.
 | 30 | `Object supports multiple owner references` | garbage_collector.go | PASS | `gc_object_supports_multiple_owner_references` | mirrored, passing |
 | 31 | `DeletionPropagation policies match wire format` (precondition) | apimachinery/pkg/apis/meta/v1/types.go | PASS | `gc_deletion_propagation_policies_match_wire_format` | mirrored, passing |
 | 32 | `GC deletes RC pods with Background propagation` | garbage_collector.go | PASS | `gc_background_deletion_leaves_no_orphan_dependents` | mirrored, passing |
-| 33 | `GC orphans pods with Orphan propagation` | garbage_collector.go | **FAIL** | `gc_orphan_propagation_should_strip_owner_refs_not_delete` | mirrored, **ignored** (tracks failure) |
+| 33 | `GC orphans pods with Orphan propagation` | garbage_collector.go | PASS | `gc_orphan_propagation_should_strip_owner_refs_not_delete` | mirrored, passing — GC now strips owner refs and removes the orphan finalizer in the same scan |
 | 34 | `GC Foreground deletion via DeleteOptions body` | garbage_collector.go | PASS | `gc_foreground_deletion_propagation_serializes_in_delete_options` | mirrored, passing |
 | 35 | `OwnerReferences round-trip through storage` | garbage_collector.go | PASS | `gc_owner_references_round_trip_through_storage` | mirrored, passing |
 | 36 | `Object without owner refs omits field (omitempty)` | apimachinery/pkg/apis/meta/v1/types.go | PASS | `gc_object_without_owner_refs_omits_field` | mirrored, passing |
@@ -77,12 +77,17 @@ Sonobuoy Ginkgo tests observe through the REST surface.
   `#[ignore]`d with the failure-bucket reason; they will compile and link
   but panic if ever un-ignored, which is the canary that the chunking
   handler still owes a real implementation.
-- **GC orphan propagation** — Test #33 mirrors the upstream Orphan policy
-  test which the controller does not honour server-side; the dependents
-  are still deleted. `#[ignore]`d for the same reason. The companion crate
-  `controller-manager` carries the implementation gap; this entry exists
-  to surface the failure at the api-server layer where the wire contract
-  (DeleteOptions.propagationPolicy) is parsed.
+- **GC orphan propagation** — Test #33 used to be `#[ignore]`d because the
+  controller deleted dependents server-side regardless of the requested
+  `propagationPolicy`. The DELETE handlers
+  (`handle_delete_with_finalizers_and_propagation` in
+  `crates/api-server/src/handlers/finalizers.rs`) attach the `orphan`
+  finalizer when the caller sets `propagationPolicy=Orphan` (either in the
+  `?propagationPolicy=Orphan` query param or the `DeleteOptions` body), and
+  the GC controller (`controllers/garbage_collector.rs::process_deletion`
+  → `orphan_dependents`) now strips the owner reference from every
+  dependent and removes the orphan finalizer in the same scan. The test is
+  re-enabled and pinned to that behaviour.
 
 ## How to run
 
@@ -93,6 +98,6 @@ cargo clippy -p rusternetes-api-server --tests -- -D warnings
 cargo test -p rusternetes-api-server --test conformance_apimachinery_watch_chunking_gc
 ```
 
-All non-`#[ignore]` tests must pass. The three `#[ignore]`d tests reproduce
-the Sonobuoy-failing scenarios and are expected to remain ignored until the
-underlying gaps are closed.
+All non-`#[ignore]` tests must pass. The three remaining `#[ignore]`d
+chunking tests reproduce the Sonobuoy-failing scenarios and are expected
+to remain ignored until the underlying gaps are closed.
