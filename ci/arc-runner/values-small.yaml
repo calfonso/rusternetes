@@ -1,0 +1,53 @@
+# Helm values for the gha-runner-scale-set release `arc-runner-set-small`
+# (the light tier — clippy, fmt, anything that loads cargo metadata but
+# doesn't link the full workspace). Workflow jobs select it via
+# `runs-on: arc-runner-set-small`. For the nextest-tier runner see
+# `values-large.yaml`.
+#
+# Initial install (one-time, requires GitHub config inputs):
+#
+#   helm install arc-runner-set-small \
+#     --namespace arc-runners \
+#     --create-namespace \
+#     --set githubConfigUrl=https://github.com/indyjonesnl/rusternetes \
+#     --set githubConfigSecret=<existing-arc-github-secret> \
+#     --values ci/arc-runner/values-small.yaml \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+#
+# Subsequent upgrades:
+#
+#   helm upgrade arc-runner-set-small \
+#     --namespace arc-runners \
+#     --reuse-values \
+#     --values ci/arc-runner/values-small.yaml \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+#
+# Same controllerServiceAccount as the large set — both scale sets are
+# driven by the single gha-rs-controller in arc-systems.
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+template:
+  spec:
+    containers:
+      - name: runner
+        image: ghcr.io/indyjonesnl/rusternetes-arc-runner:latest
+        command: ["/home/runner/run.sh"]
+        env:
+          # Clippy / fmt don't fan out wide enough for this to matter,
+          # but keep the same cap as the large tier for consistency so
+          # both runner tiers behave identically on identical inputs.
+          - name: CARGO_BUILD_JOBS
+            value: "4"
+        resources:
+          # Measured peaks: cargo clippy --workspace ~250 MiB resident;
+          # cargo fmt --check ~80 MiB. 512Mi request gives ~2x headroom
+          # for the GitHub Actions listener + checkout + rust-cache
+          # download overhead. Requests-only — same eviction rationale
+          # as values-large.yaml.
+          requests:
+            memory: 512Mi
+            # 500m fits ~14 of these per 7.5-CPU node, so light jobs
+            # never queue behind a busy large runner.
+            cpu: "500m"

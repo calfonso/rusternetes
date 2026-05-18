@@ -9,8 +9,10 @@ jobs:
   fmt:
     name: Verify formatting with cargo fmt
     # Runs on the custom ARC image (ci/arc-runner/Dockerfile) which
-    # ships rustup + rustfmt + jq preinstalled.
-    runs-on: arc-runner-set
+    # ships rustup + rustfmt + jq preinstalled. Uses the light-tier
+    # scale set (ci/arc-runner/values-small.yaml, 512Mi/500m); fmt peaks
+    # well under 100 MiB.
+    runs-on: arc-runner-set-small
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
