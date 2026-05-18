@@ -2094,6 +2094,249 @@ impl ProtoRegistry {
             },
         );
 
+        // ========== core/v1 Pod volume + projection types ==========
+        //
+        // Field numbers from
+        // https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/api/core/v1/generated.proto
+        //
+        // Without these the Volume schema references projection/source
+        // submessages that have no registered decoder, so client-go pod
+        // CREATE/UPDATE bodies decode KeyToPath / ServiceAccountTokenProjection
+        // entries as `{}` and the JSON-conversion step rejects them with
+        // "missing field `path`" (KeyToPath.path and
+        // ServiceAccountTokenProjection.path are required).
+        //
+        // Inline-flattening caveat: ConfigMapVolumeSource, SecretProjection,
+        // and ConfigMapProjection define field 1 as an embedded
+        // LocalObjectReference message that Go's JSON tag flattens to a
+        // top-level `name`. The current decoder has no inline-message
+        // facility, so field 1 is intentionally NOT registered for those
+        // three types. Hydrophone setup uses ServiceAccountTokenProjection
+        // (no LocalObjectReference) and SecretVolumeSource (scalar
+        // `secretName`, no inlining), so the gap does not block conformance
+        // bring-up. Promote to a `FieldType::InlineMessage` variant if a
+        // future client needs the projection name decoded.
+        schemas.insert(
+            "ProjectedVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "sources".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "VolumeProjection".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("defaultMode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "VolumeProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "secret".into(),
+                            FieldType::Message("SecretProjection".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "downwardAPI".into(),
+                            FieldType::Message("DownwardAPIProjection".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "configMap".into(),
+                            FieldType::Message("ConfigMapProjection".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "serviceAccountToken".into(),
+                            FieldType::Message("ServiceAccountTokenProjection".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ServiceAccountTokenProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("audience".into(), FieldType::String)),
+                    (2, ("expirationSeconds".into(), FieldType::Int)),
+                    (3, ("path".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "KeyToPath".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("mode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIVolumeFile".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "fieldRef".into(),
+                            FieldType::Message("ObjectFieldSelector".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resourceFieldRef".into(),
+                            FieldType::Message("ResourceFieldSelector".into()),
+                        ),
+                    ),
+                    (4, ("mode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DownwardAPIVolumeFile".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("defaultMode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "DownwardAPIVolumeFile".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "SecretProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    // field 1 = LocalObjectReference (inlined `name`) — see caveat above.
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    // field 1 = LocalObjectReference (inlined `name`) — see caveat above.
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    // field 1 = LocalObjectReference (inlined `name`) — see caveat above.
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (3, ("defaultMode".into(), FieldType::Int)),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SecretVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("secretName".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (3, ("defaultMode".into(), FieldType::Int)),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EmptyDirVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("medium".into(), FieldType::String)),
+                    // field 2 = sizeLimit (Quantity) — no FieldType variant
+                    // for Quantity strings; skip until callers need it.
+                ]),
+            },
+        );
+        schemas.insert(
+            "HostPathVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (2, ("type".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PersistentVolumeClaimVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("claimName".into(), FieldType::String)),
+                    (2, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
         ProtoRegistry { schemas }
     }
 
