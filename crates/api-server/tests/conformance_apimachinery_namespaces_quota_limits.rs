@@ -588,16 +588,19 @@ async fn resource_quota_list_all_namespaces() {
 ///
 /// PR #45 (`748241cf  fix(conformance): ResourceQuota usage recompute on
 /// object delete`) added the `reconcile_one(ns, name)` controller entry
-/// point + watch-fanout that this scoped suite exercises elsewhere — but
-/// the upstream test still fails on the strict request-immutability
-/// assertion at line :312 that depends on the admission path on
-/// pod-update. That admission path is not yet implemented end-to-end, so
-/// this mirror remains `#[ignore]`d to track the failure without masking
-/// it: see `docs/conformance/apimachinery-namespaces-quota-limits.md`.
+/// point + watch-fanout. This test now also asserts the second half of
+/// the upstream scenario: a Pod **UPDATE** that would push usage past the
+/// quota `.spec.hard` budget must be rejected with `403 Forbidden`
+/// ("exceeded quota"), with delta-usage semantics so an in-budget update
+/// (new request − old request ≤ remaining budget) still passes.
+///
+/// See `docs/conformance/apimachinery-namespaces-quota-limits.md`.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — resource_quota.go:312; see docs/conformance/apimachinery-namespaces-quota-limits.md"]
 async fn resource_quota_captures_full_pod_lifecycle() {
-    let (router, _mem) = spawn_router();
+    let (router, mem) = spawn_router();
+    let ns = "rq-lifecycle";
+
+    // 1. Create the quota: 5 pods, 1 CPU, 500Mi memory.
     let body = quota_body(
         "test-quota",
         &[
@@ -607,15 +610,130 @@ async fn resource_quota_captures_full_pod_lifecycle() {
         ],
     );
     let (s, _) = send_json(
-        router,
+        router.clone(),
         "POST",
-        "/api/v1/namespaces/rq-lifecycle/resourcequotas",
+        &format!("/api/v1/namespaces/{}/resourcequotas", ns),
         Some(&body),
     )
     .await;
     assert_eq!(s, 201);
-    // Full pod-lifecycle + request-immutability admission not yet wired —
-    // see PR #45 follow-up.
+
+    // 2. Create a pod that fits the quota (cpu=300m, memory=200Mi).
+    let pod_body = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "p1", "namespace": ns },
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "pause:latest",
+                "resources": {
+                    "requests": { "cpu": "300m", "memory": "200Mi" }
+                }
+            }]
+        }
+    });
+    let (s, body) = send_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/namespaces/{}/pods", ns),
+        Some(&pod_body),
+    )
+    .await;
+    assert_eq!(s, 201, "initial pod create must succeed: body={}", body);
+
+    // 3. Reconcile so quota.status.used reflects the pod we just created.
+    ResourceQuotaController::new(mem.clone())
+        .reconcile_one(ns, "test-quota")
+        .await
+        .unwrap();
+
+    // 4. UPDATE the pod with resource requests that would exceed the
+    //    quota (cpu=2 > 1). Expect 403 Forbidden / "exceeded quota".
+    //    Without delta-usage admission on UPDATE, this would silently
+    //    succeed (the Round-160 failure).
+    let over_quota_body = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "p1", "namespace": ns },
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "pause:latest",
+                "resources": {
+                    "requests": { "cpu": "2", "memory": "200Mi" }
+                }
+            }]
+        }
+    });
+    let (s, body) = send_json(
+        router.clone(),
+        "PUT",
+        &format!("/api/v1/namespaces/{}/pods/p1", ns),
+        Some(&over_quota_body),
+    )
+    .await;
+    assert_eq!(
+        s, 403,
+        "UPDATE that pushes requests.cpu past quota must be 403: body={}",
+        body
+    );
+
+    // 5. An in-budget UPDATE (cpu=500m: delta = 500m − 300m = +200m,
+    //    new total = 500m ≤ 1000m) must still succeed — delta-usage
+    //    semantics, not a flat reject.
+    let in_budget_body = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "p1", "namespace": ns },
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "pause:latest",
+                "resources": {
+                    "requests": { "cpu": "500m", "memory": "200Mi" }
+                }
+            }]
+        }
+    });
+    let (s, body) = send_json(
+        router.clone(),
+        "PUT",
+        &format!("/api/v1/namespaces/{}/pods/p1", ns),
+        Some(&in_budget_body),
+    )
+    .await;
+    assert_eq!(
+        s, 200,
+        "in-budget UPDATE (delta within remaining quota) must succeed: body={}",
+        body
+    );
+
+    // 6. PATCH path: same delta semantics. A PATCH that pushes memory
+    //    past the quota (memory=600Mi > 500Mi) must be rejected.
+    let over_quota_patch = json!({
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "pause:latest",
+                "resources": {
+                    "requests": { "cpu": "500m", "memory": "600Mi" }
+                }
+            }]
+        }
+    });
+    let (s, body) = send_patch(
+        router,
+        &format!("/api/v1/namespaces/{}/pods/p1", ns),
+        &over_quota_patch,
+        "application/merge-patch+json",
+    )
+    .await;
+    assert_eq!(
+        s, 403,
+        "PATCH that pushes requests.memory past quota must be 403: body={}",
+        body
+    );
 }
 
 /// PR #45 regression guard (HTTP surface): after a tracked pod is deleted
