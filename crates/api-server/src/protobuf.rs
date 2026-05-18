@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_core_v1_container_runtime(&mut schemas);
         Self::register_core_v1_kinds(&mut schemas);
         Self::register_apps_v1(&mut schemas);
 
@@ -2384,6 +2385,399 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_core_v1_container_runtime(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "ContainerImage".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "names".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("sizeBytes".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ContainerResizePolicy".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("resourceName".into(), FieldType::String)),
+                    (2, ("restartPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ContainerRestartRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("action".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "exitCodes".into(),
+                            FieldType::Message("ContainerRestartRuleOnExitCodes".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ContainerRestartRuleOnExitCodes".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("operator".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "values".into(),
+                            FieldType::Repeated(Box::new(FieldType::Int)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ContainerStateRunning".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    ("startedAt".into(), FieldType::Message("Time".into())),
+                )]),
+            },
+        );
+        schemas.insert(
+            "ContainerStateTerminated".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("exitCode".into(), FieldType::Int)),
+                    (2, ("signal".into(), FieldType::Int)),
+                    (3, ("reason".into(), FieldType::String)),
+                    (4, ("message".into(), FieldType::String)),
+                    (5, ("startedAt".into(), FieldType::Message("Time".into()))),
+                    (6, ("finishedAt".into(), FieldType::Message("Time".into()))),
+                    (7, ("containerID".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ContainerStateWaiting".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("reason".into(), FieldType::String)),
+                    (2, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ContainerUser".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "linux".into(),
+                        FieldType::Message("LinuxContainerUser".into()),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "EnvFromSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("prefix".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "configMapRef".into(),
+                            FieldType::Message("ConfigMapEnvSource".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretEnvSource".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EphemeralContainer".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "ephemeralContainerCommon".into(),
+                            FieldType::Message("EphemeralContainerCommon".into()),
+                        ),
+                    ),
+                    (2, ("targetContainerName".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EphemeralContainerCommon".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("image".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "command".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "args".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (5, ("workingDir".into(), FieldType::String)),
+                    (
+                        6,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerPort".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "env".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("EnvVar".into()))),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "resources".into(),
+                            FieldType::Message("ResourceRequirements".into()),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "volumeMounts".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("VolumeMount".into()))),
+                        ),
+                    ),
+                    (
+                        10,
+                        ("livenessProbe".into(), FieldType::Message("Probe".into())),
+                    ),
+                    (
+                        11,
+                        ("readinessProbe".into(), FieldType::Message("Probe".into())),
+                    ),
+                    (
+                        12,
+                        ("lifecycle".into(), FieldType::Message("Lifecycle".into())),
+                    ),
+                    (13, ("terminationMessagePath".into(), FieldType::String)),
+                    (14, ("imagePullPolicy".into(), FieldType::String)),
+                    (
+                        15,
+                        (
+                            "securityContext".into(),
+                            FieldType::Message("SecurityContext".into()),
+                        ),
+                    ),
+                    (16, ("stdin".into(), FieldType::Bool)),
+                    (17, ("stdinOnce".into(), FieldType::Bool)),
+                    (18, ("tty".into(), FieldType::Bool)),
+                    (
+                        19,
+                        (
+                            "envFrom".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EnvFromSource".into(),
+                            ))),
+                        ),
+                    ),
+                    (20, ("terminationMessagePolicy".into(), FieldType::String)),
+                    (
+                        21,
+                        (
+                            "volumeDevices".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "VolumeDevice".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        22,
+                        ("startupProbe".into(), FieldType::Message("Probe".into())),
+                    ),
+                    (
+                        23,
+                        (
+                            "resizePolicy".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerResizePolicy".into(),
+                            ))),
+                        ),
+                    ),
+                    (24, ("restartPolicy".into(), FieldType::String)),
+                    (
+                        25,
+                        (
+                            "restartPolicyRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerRestartRule".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LinuxContainerUser".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("uid".into(), FieldType::Int)),
+                    (2, ("gid".into(), FieldType::Int)),
+                    (
+                        3,
+                        (
+                            "supplementalGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::Int)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodResourceClaim".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (3, ("resourceClaimName".into(), FieldType::String)),
+                    (4, ("resourceClaimTemplateName".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodResourceClaimStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("resourceClaimName".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodSchedulingGate".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "ResourceClaim".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("request".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ResourceHealth".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("resourceID".into(), FieldType::String)),
+                    (2, ("health".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ResourceStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ResourceHealth".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "Sysctl".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("value".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "WindowsSecurityContextOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("gmsaCredentialSpecName".into(), FieldType::String)),
+                    (2, ("gmsaCredentialSpec".into(), FieldType::String)),
+                    (3, ("runAsUserName".into(), FieldType::String)),
+                    (4, ("hostProcess".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LocalVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PreferredSchedulingTerm".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("weight".into(), FieldType::Int)),
+                    (
+                        2,
+                        (
+                            "preference".into(),
+                            FieldType::Message("NodeSelectorTerm".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "WeightedPodAffinityTerm".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("weight".into(), FieldType::Int)),
+                    (
+                        2,
+                        (
+                            "podAffinityTerm".into(),
+                            FieldType::Message("PodAffinityTerm".into()),
+                        ),
+                    ),
                 ]),
             },
         );
