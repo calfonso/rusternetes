@@ -9,8 +9,6 @@
 //!   - test/e2e/common/node/container_probe.go (liveness/readiness/startup
 //!     probes with exec/httpGet/tcpSocket/grpc actions + threshold knobs)
 //!
-//! Mirrored from Sonobuoy run captured in
-//!   .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //!
 //! See docs/conformance/node-probes-init-containers.md for the
 //! test-by-test status table and cross-reference into

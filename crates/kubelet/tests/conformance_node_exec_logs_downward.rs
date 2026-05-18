@@ -3,8 +3,6 @@
 //!
 //! Source of truth: Ginkgo descriptors at
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/
-//! Mirrored from Sonobuoy run captured in
-//! .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //!
 //! Upstream source files this suite shadows:
 //!   - test/e2e/common/node/kubelet.go           — pod log stream, hostAliases header

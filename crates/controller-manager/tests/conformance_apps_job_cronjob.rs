@@ -4,8 +4,6 @@
 //! Source of truth: Ginkgo descriptors at
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/apps/
 //! (`job.go`, `cronjob.go`).
-//! Mirrored from Sonobuoy run captured in
-//! .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //!
 //! See docs/conformance/apps-job-cronjob.md for the test-by-test status table.
 //!

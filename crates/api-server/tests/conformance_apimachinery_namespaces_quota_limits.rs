@@ -8,9 +8,6 @@
 //!   - test/e2e/apimachinery/resource_quota.go
 //!   - test/e2e/apimachinery/limit_range.go
 //!
-//! Mirrored from the Sonobuoy run captured in
-//! `.rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log`.
-//!
 //! See `docs/conformance/apimachinery-namespaces-quota-limits.md` for the
 //! test-by-test status table and the cross-reference into `docs/CONFORMANCE.md`
 //! (Round 160 "Other" bucket — ResourceQuota pod lifecycle).

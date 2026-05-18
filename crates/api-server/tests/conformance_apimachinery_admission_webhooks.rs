@@ -2,7 +2,6 @@
 //! Admission webhooks (Validating + Mutating).
 //!
 //! Source: https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/apimachinery/
-//! Sonobuoy capture: .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //! Status table: docs/conformance/apimachinery-admission-webhooks.md
 //!
 //! Each test mirrors a single `framework.ConformanceIt(...)` block from
