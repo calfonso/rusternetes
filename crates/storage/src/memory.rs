@@ -16,6 +16,10 @@ pub struct MemoryStorage {
     /// Number of remaining update() calls that will return Error::Conflict
     /// before delegating to the real update. Used by tests to inject CAS conflicts.
     conflict_update_count: Arc<AtomicUsize>,
+    /// Highest compacted revision. Continue tokens issued before this RV are
+    /// rejected with `Error::Gone`. Used by chunking tests to simulate the
+    /// etcd compaction window.
+    compacted_revision: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl MemoryStorage {
@@ -26,7 +30,17 @@ impl MemoryStorage {
             data: Arc::new(RwLock::new(HashMap::new())),
             watch_tx,
             conflict_update_count: Arc::new(AtomicUsize::new(0)),
+            compacted_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
+    }
+
+    /// Simulate an etcd-style compaction: any continue token referencing a
+    /// resource version `<= revision` will be rejected with `Error::Gone`.
+    /// Used by the chunking conformance suite to drive the 410-after-compaction
+    /// path without standing up a real etcd cluster.
+    pub fn compact_to(&self, revision: i64) {
+        self.compacted_revision
+            .store(revision, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Clear all data (useful for test cleanup)
@@ -243,8 +257,13 @@ impl Storage for MemoryStorage {
         Ok(chrono::Utc::now().timestamp())
     }
 
-    async fn is_revision_compacted(&self, _revision: i64) -> Result<bool> {
-        Ok(false) // Memory storage never compacts
+    async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
+        // Memory storage only compacts when a test explicitly calls
+        // `compact_to(rv)` — see the chunking conformance suite.
+        let compacted = self
+            .compacted_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Ok(compacted > 0 && revision <= compacted)
     }
 }
 
