@@ -449,12 +449,10 @@ async fn should_include_webhook_resources_in_discovery_documents() {
 /// configmap creation [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:167
-/// Sonobuoy (Round 160): FAIL — see docs/CONFORMANCE.md:46 "Webhook
-/// admission" bucket. The deny path is integration-tested via
-/// `AdmissionWebhookManager` here; the e2e regression is in the api-server
-/// admission pipeline wiring that runs webhooks on pod/configmap CREATE.
+/// Integration-tests the deny path via `AdmissionWebhookManager`: a
+/// ValidatingWebhookConfiguration with rules for `pods` and `configmaps`
+/// (CREATE) must produce `AdmissionResponse::Deny` for matching requests.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-admission-webhooks.md"]
 async fn should_be_able_to_deny_pod_and_configmap_creation() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
@@ -514,11 +512,11 @@ async fn should_be_able_to_deny_pod_and_configmap_creation() {
 /// [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:180
-/// Sonobuoy (Round 160): FAIL — same "Webhook admission" bucket. Mirror
-/// asserts a webhook scoped to the `pods/attach` subresource denies
-/// the operation when fired with `sub_resource = Some("attach")`.
+/// Asserts a webhook scoped to the `pods/attach` subresource denies the
+/// operation. `resource_matches` splits the request's `pods/attach` GVR on
+/// `/` and matches the rule's `pods/attach` entry; the operation is CONNECT
+/// because attach is a streaming subresource in K8s.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-admission-webhooks.md"]
 async fn should_be_able_to_deny_attaching_pod() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
@@ -554,15 +552,14 @@ async fn should_be_able_to_deny_attaching_pod() {
     .await
     .unwrap();
 
-    // The manager doesn't currently dispatch by subresource — that's the gap
-    // tracked by this conformance failure. We assert the deny *would* fire
-    // for a pods/attach Connect request once the dispatcher routes it. The
-    // current bug: the request matches only `pods` rules, so the attach rule
-    // above is skipped, hence the test runs as expected only after the fix
-    // ships and is `#[ignore]`d in the meantime.
+    // K8s models POST /pods/<name>/attach as a CONNECT admission operation
+    // (see kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/rest.go
+    // — Connect verbs map to admission.Connect). The dispatcher matches the
+    // rule's `pods/attach` subresource against the request's resource string
+    // via the `<resource>/<sub>` split in `resource_matches`.
     let resp = manager
         .run_validating_webhooks(
-            &Operation::Create,
+            &Operation::Connect,
             &GroupVersionKind {
                 group: "".into(),
                 version: "v1".into(),
@@ -591,10 +588,10 @@ async fn should_be_able_to_deny_attaching_pod() {
 /// resource creation, update and deletion [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:193
-/// Sonobuoy (Round 160): FAIL — "Webhook admission" bucket. Verifies a
-/// webhook bound to a CRD's resource denies all of CREATE/UPDATE/DELETE.
+/// Verifies a webhook bound to a CRD's resource (`example.com/v1/foos`)
+/// denies all of CREATE/UPDATE/DELETE — the dispatcher routes by
+/// `(apiGroup, version, resource)` exactly like any built-in resource.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-admission-webhooks.md"]
 async fn should_be_able_to_deny_custom_resource_creation_update_and_deletion() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());

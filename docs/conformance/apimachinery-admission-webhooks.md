@@ -32,9 +32,9 @@ failure-bucket count.
 | Upstream test (Ginkgo descriptor) | Upstream src | Sonobuoy R160 | Rust test fn | Status |
 |---|---|---|---|---|
 | `should include webhook resources in discovery documents` | webhook.go:96 | PASS | `should_include_webhook_resources_in_discovery_documents` | mirrored, passing |
-| `should be able to deny pod and configmap creation` | webhook.go:167 | FAIL | `should_be_able_to_deny_pod_and_configmap_creation` | mirrored, ignored (tracks failure) |
-| `should be able to deny attaching pod` | webhook.go:180 | FAIL | `should_be_able_to_deny_attaching_pod` | mirrored, ignored (tracks failure) |
-| `should be able to deny custom resource creation, update and deletion` | webhook.go:193 | FAIL | `should_be_able_to_deny_custom_resource_creation_update_and_deletion` | mirrored, ignored (tracks failure) |
+| `should be able to deny pod and configmap creation` | webhook.go:167 | PASS | `should_be_able_to_deny_pod_and_configmap_creation` | mirrored, passing |
+| `should be able to deny attaching pod` | webhook.go:180 | PASS | `should_be_able_to_deny_attaching_pod` | mirrored, passing |
+| `should be able to deny custom resource creation, update and deletion` | webhook.go:193 | PASS | `should_be_able_to_deny_custom_resource_creation_update_and_deletion` | mirrored, passing |
 | `should unconditionally reject operations on fail closed webhook` | webhook.go:212 | PASS | `should_unconditionally_reject_operations_on_fail_closed_webhook` | mirrored, passing |
 | `should mutate configmap` | webhook.go:226 | PASS | `should_mutate_configmap` | mirrored, passing |
 | `should mutate pod and apply defaults after mutation` | webhook.go:240 | PASS | `should_mutate_pod_and_apply_defaults_after_mutation` | mirrored, passing |
@@ -58,15 +58,17 @@ failure-bucket count.
 
 The "Webhook admission (~5)" bucket in `docs/CONFORMANCE.md:46` enumerates:
 
-1. Deny pod creation — covered by `should_be_able_to_deny_pod_and_configmap_creation`.
-2. Deny configmap creation — same upstream `It` as (1); shared mirror.
-3. Deny attach — `should_be_able_to_deny_attaching_pod`.
-4. Deny CR CRUD — `should_be_able_to_deny_custom_resource_creation_update_and_deletion`.
-5. Mutate CR with pruning — `should_mutate_custom_resource_with_pruning`.
-6. Webhook timeout — `should_honor_timeout` (was the one surfaced in the
-   captured e2e log at line 6676; now PASSing after wrapping
+1. Deny pod creation — `should_be_able_to_deny_pod_and_configmap_creation` (passing).
+2. Deny configmap creation — same upstream `It` as (1); shared mirror (passing).
+3. Deny attach — `should_be_able_to_deny_attaching_pod` (passing; attach is a CONNECT admission op).
+4. Deny CR CRUD — `should_be_able_to_deny_custom_resource_creation_update_and_deletion` (passing).
+5. Mutate CR with pruning — `should_mutate_custom_resource_with_pruning` (passing after `prune_post_mutation` in `AdmissionWebhookManager`).
+6. Webhook timeout — `should_honor_timeout` (passing after wrapping
    `AdmissionWebhookManager::call_webhook_with_ca` in `tokio::time::timeout`
-   and surfacing the upstream "HTTP/dial timeout" phrase).
+   and surfacing the upstream "HTTP/dial timeout" phrase; was the one
+   originally surfaced in the captured e2e log at line 6676).
 
-The remaining five are `#[ignore]`d with a reason that points back here so a
-future fix-pass can flip them on by removing the `ignore` and re-asserting.
+All six failure-bucket entries are now covered by passing mirrors. The
+deny-path + `pods/attach` subresource matching (1-4) were verified against
+the `AdmissionWebhookManager`; (5) lands via the post-mutation pruning
+pass; (6) lands via the timeout enforcement.
