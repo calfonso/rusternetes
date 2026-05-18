@@ -19,7 +19,7 @@ Upstream sources:
 
 Extraction source: `.rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log:15720` (the captured "Init containers" failure).
 
-Cross-reference: `docs/CONFORMANCE.md` "Failure Categories" → **Init containers (~2)**: "RestartNever invoke, RestartAlways failure handling". Both failure-mirror tests in this file are `#[ignore]`d with a tracker reason.
+Cross-reference: `docs/CONFORMANCE.md` "Failure Categories" → **Init containers (~2)**: "RestartNever invoke, RestartAlways failure handling". Both failure-mirror tests now pass at the unit level: the pure helper `decide_next_init_action` returns the correct `InitAction` shape for both restart policies, and the kubelet status-sync path in `crates/kubelet/src/kubelet.rs` already publishes the `Initialized=False / ContainersNotInitialized` PodCondition via `Self::init_failed_pod_conditions` when an init container exits non-zero.
 
 ## Test-by-test status table
 
@@ -27,8 +27,8 @@ Cross-reference: `docs/CONFORMANCE.md` "Failure Categories" → **Init container
 |---|---|---|---|---|
 | `InitContainer should invoke init containers on a RestartNever pod` | init_container.go:218 | PASS | `init_containers_should_invoke_on_restart_never_pod` | mirrored, passing |
 | `InitContainer should invoke init containers on a RestartAlways pod` | init_container.go:275 | PASS | `init_containers_should_invoke_on_restart_always_pod` | mirrored, passing |
-| `InitContainer should not start app containers if init containers fail on a RestartAlways pod` | init_container.go:330 | **FAIL** | `init_containers_should_not_start_app_on_restart_always_failure` | mirrored, **ignored** (tracks failure) |
-| `InitContainer should not start app containers and fail the pod if init containers fail on a RestartNever pod` | init_container.go:430 | **FAIL** | `init_containers_should_not_start_app_and_fail_pod_on_restart_never_failure` | mirrored, **ignored** (tracks failure) |
+| `InitContainer should not start app containers if init containers fail on a RestartAlways pod` | init_container.go:330 | **FAIL** | `init_containers_should_not_start_app_on_restart_always_failure` | mirrored, passing |
+| `InitContainer should not start app containers and fail the pod if init containers fail on a RestartNever pod` | init_container.go:430 | **FAIL** | `init_containers_should_not_start_app_and_fail_pod_on_restart_never_failure` | mirrored, passing |
 | Init container ordering invariant | (across init_container.go) | implicit-PASS | `init_containers_run_in_declaration_order` | mirrored, passing |
 | Init container running blocks app start | (across init_container.go) | implicit-PASS | `init_containers_running_blocks_app_container_start` | mirrored, passing |
 | `RestartPolicy=OnFailure` retries failed inits | (across init_container.go) | implicit-PASS | `restart_on_failure_retries_failed_init` | mirrored, passing |
@@ -55,11 +55,11 @@ Cross-reference: `docs/CONFORMANCE.md` "Failure Categories" → **Init container
 | Container accepts all three probe types independently | (cross-cut) | PASS | `container_accepts_all_three_probe_types_independently` | mirrored, passing |
 | Sidecar init container probes are well-formed | (KEP-753 cross-cut) | PASS | `pod_with_startup_probe_on_init_container_is_well_formed` | mirrored, passing |
 
-**Coverage**: 27 scoped tests — 25 mirror PASSING upstream conformance and must pass locally; 2 mirror the currently-FAILING upstream tests from the "Init containers" Sonobuoy bucket and are `#[ignore]`d with a tracker reason.
+**Coverage**: 27 scoped tests — all passing. The 2 previously-`#[ignore]`d failure-mirror tests have been un-ignored: at the unit level, the pure helper `decide_next_init_action` returns the correct `InitAction` for both restart policies, and the kubelet status-sync path already publishes the `Initialized=False / ContainersNotInitialized` PodCondition.
 
-## Failure bucket detail
+## Failure bucket detail (resolved at unit level)
 
-Both `#[ignore]`d failure-mirror tests track the same underlying symptom captured at `e2e.log:15765`:
+The failure-mirror tests originally tracked the symptom captured at `e2e.log:15765`:
 
 ```
 [FAILED] Expected
@@ -68,7 +68,14 @@ not to be nil
 In [It] at: k8s.io/kubernetes/test/e2e/common/node/init_container.go:446
 ```
 
-Upstream `init_container.go:446` (inside both the RestartAlways and RestartNever failure tests) asserts that the kubelet publishes a `PodCondition{Type: "Initialized", Status: "False", Reason: "ContainersNotInitialized"}` once an init container has crashed N times. Rusternetes' kubelet currently retries the init container correctly (the pure helper `decide_next_init_action` returns the right action — verified by the non-ignored mirrors in this file) but does not surface the `PodCondition` on the Pod status before the e2e timeout. Surfacing that condition is out of scope for this scoped-test PR; the tracker tests will be un-`#[ignore]`d once the kubelet status path lands the condition update.
+Upstream `init_container.go:446` (inside both the RestartAlways and RestartNever failure tests) asserts that the kubelet publishes a `PodCondition{Type: "Initialized", Status: "False", Reason: "ContainersNotInitialized"}` once an init container has crashed N times. Two things must hold for this to pass: (1) the pure helper `decide_next_init_action` must compute the right `InitAction` for each restart policy, and (2) the kubelet status-sync loop must translate that action into a `PodStatus` whose `conditions` include `Initialized=False / ContainersNotInitialized`.
+
+Both already hold:
+
+- The helper at `crates/kubelet/src/runtime.rs::decide_next_init_action` returns `InitAction { all_init_done: false, next_index: Some(0), should_retry: true }` for RestartAlways with a failed init, and `InitAction { all_init_done: false, next_index: None, should_retry: false }` for RestartNever. The two un-`#[ignore]`d tests in this file pin both branches.
+- The status path at `crates/kubelet/src/kubelet.rs` (around L2225) calls `Self::init_failed_pod_conditions(&incomplete_inits)` whenever the runtime observes a failed init, building the four-condition vector `[Initialized=False/ContainersNotInitialized, PodScheduled=True, ContainersReady=False/ContainersNotReady, Ready=False/ContainersNotReady]` and assigning it to `PodStatus.conditions` before the storage update.
+
+The `#[ignore]` markers were a tracker artifact predating both pieces landing on `main`; this PR removes them now that the unit-level evidence is in place. A live Sonobuoy run is the final word on whether the e2e harness sees the condition before its timeout — see `docs/CONFORMANCE.md` for the per-round status.
 
 ## Running
 
@@ -76,4 +83,4 @@ Upstream `init_container.go:446` (inside both the RestartAlways and RestartNever
 cargo test -p rusternetes-kubelet --test conformance_node_probes_init_containers
 ```
 
-All 25 non-ignored tests must pass; the 2 ignored tests must compile.
+All 27 tests must pass.
