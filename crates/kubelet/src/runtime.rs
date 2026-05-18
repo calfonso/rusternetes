@@ -101,6 +101,12 @@ pub struct ContainerRuntime {
     image_cache: Mutex<std::collections::HashSet<String>>,
     /// Cache of shell availability per image (true = has /bin/sh)
     shell_cache: Mutex<HashMap<String, bool>>,
+    /// Whether the underlying runtime accepts `--uts container:<id>` shared
+    /// UTS namespace mode. Probed once at startup via `Docker::version()`.
+    /// Docker >=24 rejects the option; Podman still supports it. When false,
+    /// app containers get their own UTS namespace and the kubelet sets the
+    /// pod hostname explicitly on the bollard `Config.hostname` field.
+    shared_uts_supported: bool,
 }
 
 /// Join a list of strings into a shell-safe command string.
@@ -352,6 +358,41 @@ pub fn compute_group_add(pod: &Pod) -> Option<Vec<String>> {
     }
 }
 
+/// Whether the container runtime accepts `--uts container:<id>` (shared UTS
+/// namespace with the pause container). Podman supports it; Docker dropped
+/// support in 24.0 and now rejects the option with `invalid UTS mode`.
+///
+/// Detection order:
+/// 1. If the platform name or any component name contains "podman", trust it.
+/// 2. Otherwise parse `version.version` as a `MAJOR.MINOR.PATCH` string;
+///    Docker <24 is supported, Docker >=24 is not.
+/// 3. If neither signal is available (or the version doesn't parse), return
+///    `false` — assume the conservative path so we never produce a
+///    create-container call that the runtime will reject.
+///
+/// Pure function: takes the bollard `Version` value and returns a bool.
+/// Unit-tested in this module's test block.
+pub(crate) fn runtime_supports_shared_uts(version: &bollard::system::Version) -> bool {
+    if let Some(platform) = version.platform.as_ref() {
+        if platform.name.to_lowercase().contains("podman") {
+            return true;
+        }
+    }
+    if let Some(components) = version.components.as_ref() {
+        for c in components {
+            if c.name.to_lowercase().contains("podman") {
+                return true;
+            }
+        }
+    }
+    if let Some(ver) = version.version.as_ref() {
+        if let Some(major) = ver.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+            return major < 24;
+        }
+    }
+    false
+}
+
 /// Runtime observation of a single init container, derived from the
 /// container runtime's inspect call (or test fixtures).
 ///
@@ -515,6 +556,31 @@ impl ContainerRuntime {
         );
         info!("Kubernetes service host: {}", kubernetes_service_host);
 
+        // Probe runtime capability: Docker >=24 rejects `--uts container:<id>`
+        // with "invalid UTS mode" (only `host` and `private` are allowed there).
+        // Podman still accepts it. Detect once at startup so the create-container
+        // path can pick the right strategy without per-pod RPCs.
+        let shared_uts_supported = match docker.version().await {
+            Ok(v) => {
+                let supported = runtime_supports_shared_uts(&v);
+                info!(
+                    "Container runtime version={:?} platform={:?} shared_uts_supported={}",
+                    v.version.as_deref().unwrap_or("?"),
+                    v.platform.as_ref().map(|p| p.name.as_str()).unwrap_or("?"),
+                    supported
+                );
+                supported
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to query container runtime version ({e}); assuming Docker >=24 \
+                     semantics (shared UTS unsupported). Pods will get own UTS namespace + \
+                     explicit hostname."
+                );
+                false
+            }
+        };
+
         // Initialize CNI if plugins are available
         let (cni, use_cni) = match Self::initialize_cni() {
             Ok(cni_runtime) => {
@@ -549,6 +615,7 @@ impl ContainerRuntime {
             probe_states: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
+            shared_uts_supported,
         })
     }
 
@@ -4603,10 +4670,26 @@ impl ContainerRuntime {
             (None, None) => None,
         };
 
-        // Set container hostname to pod hostname — but only when NOT using container:
-        // network mode (Docker rejects hostname on containers sharing another's network NS)
+        // UTS namespace strategy:
+        //   `using_container_network` (no CNI + no netns) is when the pod shares
+        //   the pause container's network namespace. Historically we ALSO shared
+        //   pause's UTS namespace there so app containers inherit pause's
+        //   hostname (Docker rejects `Config.hostname` when `HostConfig.uts_mode`
+        //   is set, so the two are mutually exclusive).
+        //
+        //   Docker >=24 dropped support for `--uts container:<id>` (the only
+        //   valid values are now `host` and `private`). `shared_uts_supported`
+        //   is probed at startup. When false we give every app container its
+        //   own UTS namespace and set `Config.hostname` explicitly — same
+        //   end-user-visible hostname, just achieved without shared namespace.
         let using_container_network = !self.use_cni && netns_path.is_none();
-        let pod_hostname = if !using_container_network {
+        let share_uts_with_pause = using_container_network && self.shared_uts_supported;
+        let pod_hostname = if !share_uts_with_pause {
+            // Own UTS namespace path: hostname must be set on Config so
+            // /etc/hostname + os.Hostname() report the pod name, not the
+            // container ID. Used when (a) CNI/netns gives the app container
+            // its own network namespace, or (b) Docker >=24 forbids the
+            // shared-UTS shortcut.
             let raw = pod
                 .spec
                 .as_ref()
@@ -4620,7 +4703,7 @@ impl ContainerRuntime {
             };
             Some(truncated)
         } else {
-            None // Hostname is set on the pause container instead
+            None // Shared-UTS path: Docker rejects hostname + uts_mode combo
         };
 
         let mut config = Config {
@@ -4690,10 +4773,11 @@ impl ContainerRuntime {
                     None
                 },
                 // Share UTS namespace with pause container so app containers
-                // inherit the pod hostname. Without this, containers get their
-                // container ID as hostname instead of the pod name.
-                // K8s CRI shares UTS via the pod sandbox; Docker/Podman need explicit uts_mode.
-                uts_mode: if using_container_network {
+                // inherit the pod hostname (only when the runtime allows it —
+                // see `share_uts_with_pause` above). Without sharing, the app
+                // container has its own UTS namespace and `Config.hostname`
+                // (set above) provides the same end-user-visible hostname.
+                uts_mode: if share_uts_with_pause {
                     Some(format!("container:{}_pause", pod_name))
                 } else {
                     None
@@ -11902,6 +11986,109 @@ mod tests {
                 compute_group_add(&pod),
                 Some(vec!["2000".to_string(), "3000".to_string()])
             );
+        }
+    }
+
+    // --- runtime_supports_shared_uts ---
+
+    mod shared_uts {
+        use crate::runtime::runtime_supports_shared_uts;
+        use bollard::models::SystemVersionPlatform;
+        use bollard::system::{Version, VersionComponents};
+
+        fn version(
+            ver: Option<&str>,
+            platform: Option<&str>,
+            components: Vec<(&str, &str)>,
+        ) -> Version {
+            Version {
+                version: ver.map(|s| s.to_string()),
+                platform: platform.map(|name| SystemVersionPlatform {
+                    name: name.to_string(),
+                }),
+                components: if components.is_empty() {
+                    None
+                } else {
+                    Some(
+                        components
+                            .into_iter()
+                            .map(|(name, ver)| VersionComponents {
+                                name: name.to_string(),
+                                version: ver.to_string(),
+                                details: None,
+                            })
+                            .collect(),
+                    )
+                },
+                ..Default::default()
+            }
+        }
+
+        /// Podman reported via platform name: supports container:<id> UTS.
+        #[test]
+        fn podman_platform_name_is_supported() {
+            let v = version(Some("4.7.0"), Some("Podman Engine"), vec![]);
+            assert!(runtime_supports_shared_uts(&v));
+        }
+
+        /// Podman reported via components entry (some setups expose it there).
+        #[test]
+        fn podman_component_name_is_supported() {
+            let v = version(
+                Some("1.41"),
+                None,
+                vec![("Podman Engine", "4.7.0"), ("conmon", "2.1.7")],
+            );
+            assert!(runtime_supports_shared_uts(&v));
+        }
+
+        /// Docker 23.x still accepts container:<id> UTS.
+        #[test]
+        fn docker_23_is_supported() {
+            let v = version(
+                Some("23.0.6"),
+                Some("Docker Engine - Community"),
+                vec![("Engine", "23.0.6")],
+            );
+            assert!(runtime_supports_shared_uts(&v));
+        }
+
+        /// Docker 24.x dropped container:<id> UTS — this is the bug we fix.
+        #[test]
+        fn docker_24_is_not_supported() {
+            let v = version(
+                Some("24.0.7"),
+                Some("Docker Engine - Community"),
+                vec![("Engine", "24.0.7")],
+            );
+            assert!(!runtime_supports_shared_uts(&v));
+        }
+
+        #[test]
+        fn docker_27_is_not_supported() {
+            let v = version(Some("27.3.1"), Some("Docker Engine - Community"), vec![]);
+            assert!(!runtime_supports_shared_uts(&v));
+        }
+
+        /// Garbage version string: be conservative and return false.
+        #[test]
+        fn unparseable_version_returns_false() {
+            let v = version(Some("not-a-version"), Some("Mystery Engine"), vec![]);
+            assert!(!runtime_supports_shared_uts(&v));
+        }
+
+        /// Missing version + no podman signal: conservative false.
+        #[test]
+        fn empty_version_returns_false() {
+            let v = version(None, None, vec![]);
+            assert!(!runtime_supports_shared_uts(&v));
+        }
+
+        /// Case-insensitive podman detection.
+        #[test]
+        fn podman_lowercase_in_platform_is_supported() {
+            let v = version(Some("4.7.0"), Some("podman engine"), vec![]);
+            assert!(runtime_supports_shared_uts(&v));
         }
     }
 }
