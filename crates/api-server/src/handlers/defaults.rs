@@ -14,20 +14,29 @@ use rusternetes_common::resources::workloads::{
 /// K8s ref: pkg/apis/apps/v1/defaults.go
 use rusternetes_common::resources::PodSpec;
 
+/// Returns `true` when an `Option<String>` is `None` or `Some("")`.
+/// Mirrors the upstream Go check `if obj.<Field> == ""` for non-pointer
+/// `string` fields in PodSpec — protobuf-decoded payloads from client-go
+/// reach us as `Some("")` rather than `None` because the Go wire format
+/// emits zero-valued strings.
+fn is_unset_or_empty(s: &Option<String>) -> bool {
+    s.as_deref().is_none_or(str::is_empty)
+}
+
 /// Apply K8s defaults to a PodSpec.
 /// Matches SetDefaults_PodSpec from pkg/apis/core/v1/defaults.go
 pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
     // K8s: SetDefaults_PodSpec
-    if spec.dns_policy.is_none() {
+    if is_unset_or_empty(&spec.dns_policy) {
         spec.dns_policy = Some("ClusterFirst".to_string());
     }
-    if spec.restart_policy.is_none() {
+    if is_unset_or_empty(&spec.restart_policy) {
         spec.restart_policy = Some("Always".to_string());
     }
     if spec.termination_grace_period_seconds.is_none() {
         spec.termination_grace_period_seconds = Some(30);
     }
-    if spec.scheduler_name.is_none() {
+    if is_unset_or_empty(&spec.scheduler_name) {
         spec.scheduler_name = Some("default-scheduler".to_string());
     }
     // K8s defaults securityContext to empty struct (not nil).
@@ -369,6 +378,60 @@ mod tests {
             spec.containers[0].image_pull_policy.as_deref(),
             Some("Always")
         );
+    }
+
+    /// Regression: protobuf-encoded PodSpecs from client-go arrive with
+    /// `schedulerName: ""` for an unset Go `string` field (no `omitempty`
+    /// over the protobuf wire — zero values are still emitted). Upstream
+    /// `SetDefaults_PodSpec` checks `if obj.SchedulerName == ""`, so an
+    /// empty string is also defaulted to `v1.DefaultSchedulerName`. The
+    /// rusternetes check used `Option::is_none()` only and missed
+    /// `Some("")`, which made the scheduler silently skip such pods
+    /// (their canonical name stayed `""` ≠ `"default-scheduler"`).
+    /// Surfaced via hydrophone after PR #134.
+    #[test]
+    fn test_empty_scheduler_name_defaults_to_default_scheduler() {
+        let mut spec = PodSpec {
+            containers: vec![Container {
+                name: "c".to_string(),
+                image: "nginx:1.27".to_string(),
+                ..Default::default()
+            }],
+            scheduler_name: Some(String::new()),
+            ..Default::default()
+        };
+        apply_pod_spec_defaults(&mut spec);
+        assert_eq!(spec.scheduler_name.as_deref(), Some("default-scheduler"));
+    }
+
+    #[test]
+    fn test_empty_dns_policy_defaults_to_cluster_first() {
+        let mut spec = PodSpec {
+            containers: vec![Container {
+                name: "c".to_string(),
+                image: "nginx:1.27".to_string(),
+                ..Default::default()
+            }],
+            dns_policy: Some(String::new()),
+            ..Default::default()
+        };
+        apply_pod_spec_defaults(&mut spec);
+        assert_eq!(spec.dns_policy.as_deref(), Some("ClusterFirst"));
+    }
+
+    #[test]
+    fn test_empty_restart_policy_defaults_to_always() {
+        let mut spec = PodSpec {
+            containers: vec![Container {
+                name: "c".to_string(),
+                image: "nginx:1.27".to_string(),
+                ..Default::default()
+            }],
+            restart_policy: Some(String::new()),
+            ..Default::default()
+        };
+        apply_pod_spec_defaults(&mut spec);
+        assert_eq!(spec.restart_policy.as_deref(), Some("Always"));
     }
 
     #[test]
