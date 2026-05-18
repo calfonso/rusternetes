@@ -32,7 +32,7 @@ Mirrored from the Sonobuoy run captured in
 | `ConfigMap binaryData should be consumable as files` | configmap_volume.go:175 | PASS | `configmap_volume_binary_data_should_be_consumable` | mirrored, passing |
 | `Secrets should be consumable from pods in volume` | secrets_volume.go:47 | PASS | `secret_volume_should_be_consumable_from_pods` | mirrored, passing |
 | `Secrets should be consumable from pods in volume with defaultMode set` | secrets_volume.go:61 | PASS | `secret_volume_should_be_consumable_with_defaultmode_set` | mirrored, passing |
-| `Secrets should be consumable from pods in volume as non-root with defaultMode and fsGroup set` | secrets_volume.go:73 | **FAIL** | `secret_volume_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup` | mirrored, ignored (tracks failure) |
+| `Secrets should be consumable from pods in volume as non-root with defaultMode and fsGroup set` | secrets_volume.go:73 | was FAIL → PASS (PR #87) | `secret_volume_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup` | mirrored, passing |
 | `Secrets should be consumable from pods in volume with mappings` | secrets_volume.go:106 | PASS | `secret_volume_should_be_consumable_with_mappings` | mirrored, passing |
 | `Secrets should be consumable from pods in volume with mappings and Item Mode set` | secrets_volume.go:133 | PASS | `secret_volume_should_be_consumable_with_mappings_and_item_mode_set` | mirrored, passing |
 | `Secrets optional should not fail pod start` | secrets_volume.go:300 | PASS | `secret_volume_optional_missing_should_create_empty_volume` | mirrored, passing |
@@ -41,7 +41,7 @@ Mirrored from the Sonobuoy run captured in
 | `Projected configMap should be consumable from pods in volume` | projected_configmap.go:44 | PASS | `projected_configmap_should_be_consumable_from_pods` | mirrored, passing |
 | `Projected configMap should be consumable in volume with mappings` | projected_configmap.go:120 | PASS | `projected_configmap_should_be_consumable_with_mappings` | mirrored, passing |
 | `Projected secret should be consumable from pods in volume` | projected_secret.go:44 | PASS | `projected_secret_should_be_consumable_from_pods` | mirrored, passing |
-| `Projected secret should be consumable from pods in volume as non-root with defaultMode and fsGroup set` | projected_secret.go:67 | **FAIL** | `projected_secret_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup` | mirrored, ignored (tracks failure) |
+| `Projected secret should be consumable from pods in volume as non-root with defaultMode and fsGroup set` | projected_secret.go:67 | was FAIL → PASS (PR #87) | `projected_secret_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup` | mirrored, passing |
 | `Projected secret should be consumable in volume with mappings` | projected_secret.go:106 | PASS | `projected_secret_should_be_consumable_with_mappings` | mirrored, passing |
 | `Projected downwardAPI should provide podname only` | projected_downwardapi.go:48 | PASS | `projected_downwardapi_should_provide_podname_only` | mirrored, passing |
 | `Projected downwardAPI should set DefaultMode on files` | projected_downwardapi.go:80 | PASS | `projected_downwardapi_should_set_defaultmode_on_files` | mirrored, passing |
@@ -55,15 +55,16 @@ Mirrored from the Sonobuoy run captured in
 | `Pod volume serde — Secret source uses secretName` | (kubelet wire contract) | PASS | `pod_volume_with_secret_source_uses_secret_name_field` | smoke test |
 | `Pod volume serde — Projected source preserves sources list` | (kubelet wire contract) | PASS | `pod_volume_with_projected_source_preserves_sources_list` | smoke test |
 
-Total: 32 scoped tests (30 passing, 2 `#[ignore]`d failure trackers).
+Total: 32 scoped tests, all passing.
 
-## Known failures (R160)
+## Resolved failures (R160 → fixed)
 
-### Projected secret, non-root + defaultMode + fsGroup
+### Secret + Projected secret, non-root + defaultMode + fsGroup
 
-Upstream: `test/e2e/common/storage/projected_secret.go:67`
+Upstream: `test/e2e/common/storage/secrets_volume.go:73` and
+`test/e2e/common/storage/projected_secret.go:67`.
 
-Failure mode (verbatim from the e2e log):
+R160 failure mode (verbatim from the e2e log):
 
 ```
 Output of node "node-2" pod "pod-projected-secrets-..."
@@ -82,26 +83,43 @@ What the upstream test does:
    as a non-root user belonging to that group.
 4. Execs into the container and reads the file.
 
-What the kubelet does today (`crates/kubelet/src/runtime.rs` — projected
-secret branch around line 2882): writes the file with `0o440`, but **does
-not chown the file (or the volume directory) to the requested `fsGroup`**.
-The file is therefore owned by root:root, and the non-root reader has
-neither owner nor group permission — `open(2)` returns `EACCES`.
+### Root cause
 
-The same root cause affects the bare-Secret variant of the test
-(`secrets_volume.go:73`), which is tracked here as
-`secret_volume_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup`.
+Two layers had to line up; one was missing.
 
-The fix is an `fsGroup`-aware chown pass after the file writes (mirroring
-upstream's `VolumeOwnershipApplicator`). Scoped here for tracking; the
-implementation change is out of scope for this conformance-mirror PR.
+- **Volume layer** (`runtime.rs::create_volume`): writes the file at mode
+  `0o440`. ✓ Correct.
+- **Volume ownership pass** (`runtime.rs::apply_fs_group_to_volumes`,
+  around line 1771): chowns every file in the volume to `:fsGroup` and
+  copies owner bits to group bits. ✓ Correct.
+- **Container-arg layer** (bollard `HostConfig.group_add`): **was not
+  populated**. The container therefore started without `fsGroup` in its
+  supplementary GID list. The file was `root:fsGroup` mode `0o440`, but
+  the non-root `runAsUser` had no membership in `fsGroup` and `open(2)`
+  returned `EACCES`.
+
+### Fix
+
+PR #87 — *fix(kubelet): add fsGroup + supplementalGroups to container
+GIDs* — introduced `runtime::compute_group_add(pod)` (extracts
+`securityContext.fsGroup` and `supplementalGroups` into a deduped
+`Vec<String>`) and wires it into the `HostConfig.group_add` field where
+the app container is created. With `--group-add <fsGroup>` set, the
+non-root `runAsUser` inherits the group membership that owns the
+chowned files, and the `open(2)` succeeds.
+
+PR #97 un-`#[ignore]`d the two trackers in this file and added an
+end-to-end assertion against `runtime::compute_group_add` so a future
+regression that drops the `group_add` wiring re-trips the test.
 
 ### Failure category
 
-These two map to the **EmptyDir perms ~4** bucket in
-`docs/CONFORMANCE.md:40-53` (the bucket is named for EmptyDir but is in
-fact a generic "kubelet does not honour `fsGroup` on
-projection-style volumes" cluster).
+These two used to live in the **EmptyDir perms ~4** bucket of
+`docs/CONFORMANCE.md:40-53` (the bucket is named for EmptyDir but covered
+"kubelet does not honour `fsGroup` on projection-style volumes"). After
+PR #87 + PR #97 they no longer count toward that bucket; the
+`docs/CONFORMANCE.md` ledger should drop them on the next Sonobuoy round
+that confirms the in-cluster pass.
 
 ## Re-running the suite
 
@@ -109,4 +127,4 @@ projection-style volumes" cluster).
 cargo test -p rusternetes-kubelet --test conformance_storage_configmap_secret_projected
 ```
 
-Expected: `30 passed; 0 failed; 2 ignored`.
+Expected: `32 passed; 0 failed; 0 ignored`.

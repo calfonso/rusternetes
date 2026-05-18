@@ -30,11 +30,13 @@
 //!   - Projected volume (composing ConfigMap, Secret, DownwardAPI, and
 //!     ServiceAccountToken sources into a single mount)
 //!
-//! Known upstream failure tracked here:
-//!   `[sig-storage] Projected secret should be consumable from pods in
-//!   volume as non-root with defaultMode and fsGroup set` — fails on R160
-//!   because file mode `0o440` denies the non-root reader despite the
-//!   `fsGroup` change ("permission denied" on `/etc/projected-secret-volume/data-1`).
+//! R160 had two `fsGroup` + non-root reader failures (secret + projected
+//! secret variants); both were fixed by PR #87 (`fix(kubelet): add fsGroup
+//! + supplementalGroups to container GIDs`) and the two tests in this
+//! file now PASS instead of being `#[ignore]`d. See the "Resolved
+//! failures (R160 → fixed)" section in
+//! docs/conformance/storage-configmap-secret-projected.md for the root
+//! cause (the missing `HostConfig.group_add` wiring, not a chown bug).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -638,12 +640,14 @@ fn secret_volume_should_be_consumable_with_defaultmode_set() {
 /// [sig-storage] Secrets should be consumable from pods in volume as non-root with defaultMode and fsGroup set [LinuxOnly] [NodeConformance] [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/storage/secrets_volume.go:73
-/// Sonobuoy (Round 160): FAIL — same kernel as the projected-secret failure;
-/// `0o440` denies the non-root reader despite fsGroup. Tracked under
-/// docs/conformance/storage-configmap-secret-projected.md.
+/// Sonobuoy (Round 160): was FAIL; fixed by `fix(kubelet): add fsGroup +
+/// supplementalGroups to container GIDs` (PR #87). The two layers that
+/// have to line up are now both covered here: the volume layer writes the
+/// requested mode, and the container-arg layer surfaces `fsGroup` as a
+/// supplementary GID via `runtime::compute_group_add`, so a non-root
+/// `runAsUser` ends up in `fsGroup` and reads the mode-0o440 file.
 #[cfg(unix)]
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/storage-configmap-secret-projected.md"]
 fn secret_volume_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup() {
     let tmp = tempfile::tempdir().unwrap();
     let secret = secret_with_data("s-nr", "ns", &[("data-1", b"value-1")]);
@@ -654,11 +658,33 @@ fn secret_volume_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup()
         optional: None,
     };
     build_secret_volume(tmp.path(), &source, Some(&secret)).unwrap();
-    // Upstream contract: a non-root group reader opens the file successfully.
-    // The kubelet writes mode 0o440 but does not chown to fsGroup, so the
-    // non-root reader hits EACCES. Implementation gap, not a test gap —
-    // see docs/conformance/storage-configmap-secret-projected.md.
-    unreachable!("kubelet does not yet chown to fsGroup for Secret volumes");
+
+    // Volume layer: file is written with the requested mode (0o440).
+    // `apply_fs_group_to_volumes` later chowns it to `:fsGroup` and copies
+    // owner bits to group bits — that's an in-process effect on real
+    // pods and not exercised by this pure-function test.
+    assert_eq!(mode_of(&tmp.path().join("data-1")), 0o440);
+    assert_eq!(
+        std::fs::read(tmp.path().join("data-1")).unwrap(),
+        b"value-1"
+    );
+
+    // Container-arg layer: a pod with `securityContext.fsGroup` must
+    // surface that GID via `compute_group_add` so the container is
+    // launched with `--group-add <fsGroup>` and the non-root runAsUser
+    // gains the group membership needed to read mode 0o440.
+    let mut pod = make_pod_with_volumes("s-nr-pod", "ns", vec![]);
+    pod.spec.as_mut().unwrap().security_context =
+        Some(rusternetes_common::resources::pod::PodSecurityContext {
+            fs_group: Some(2000),
+            ..Default::default()
+        });
+    assert_eq!(
+        rusternetes_kubelet::runtime::compute_group_add(&pod),
+        Some(vec!["2000".to_string()]),
+        "fsGroup must flow into HostConfig.group_add so non-root runAsUser \
+         joins the group that owns mode-0o440 secret files"
+    );
 }
 
 /// [sig-storage] Secrets should be consumable from pods in volume with mappings [NodeConformance] [Conformance]
@@ -885,17 +911,22 @@ fn projected_secret_should_be_consumable_from_pods() {
 /// [sig-storage] Projected secret should be consumable from pods in volume as non-root with defaultMode and fsGroup set [LinuxOnly] [NodeConformance] [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/storage/projected_secret.go:67
-/// Sonobuoy (Round 160): FAIL — Output of pod container shows file mode
-/// `-r--r-----` for `/etc/projected-secret-volume/data-1` and then
-/// `open ...: permission denied`. The kubelet writes the mode but does not
-/// chown the file to fsGroup, so the non-root container user has neither
-/// owner nor group permission. See docs/conformance/storage-configmap-secret-projected.md.
+/// Sonobuoy (Round 160): was FAIL with file mode `-r--r-----` and
+/// `permission denied`; fixed by `fix(kubelet): add fsGroup +
+/// supplementalGroups to container GIDs` (PR #87). Same two-layer assertion
+/// as the secret-volume test above: volume layer writes the mode, container
+/// layer surfaces fsGroup as a supplementary GID so the non-root reader
+/// inherits group membership for the chowned file.
 #[cfg(unix)]
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/storage-configmap-secret-projected.md"]
 fn projected_secret_should_be_consumable_as_non_root_with_defaultmode_and_fsgroup() {
     let tmp = tempfile::tempdir().unwrap();
-    let pod = make_pod_with_volumes("p", "ns", vec![]);
+    let mut pod = make_pod_with_volumes("p", "ns", vec![]);
+    pod.spec.as_mut().unwrap().security_context =
+        Some(rusternetes_common::resources::pod::PodSecurityContext {
+            fs_group: Some(2000),
+            ..Default::default()
+        });
     let secret = secret_with_data("p-s-nr", "ns", &[("data-1", b"value-1")]);
     let mut ss = HashMap::new();
     ss.insert(("ns".to_string(), "p-s-nr".to_string()), secret);
@@ -914,11 +945,22 @@ fn projected_secret_should_be_consumable_as_non_root_with_defaultmode_and_fsgrou
         default_mode: Some(0o440),
     };
     build_projected_volume(tmp.path(), &source, &pod, &HashMap::new(), &ss, "").unwrap();
-    // The file is written with mode 0o440 but owned by root:root because
-    // create_volume does not chown to the pod's fsGroup. A non-root reader
-    // therefore hits EACCES. Implementation gap — see
-    // docs/conformance/storage-configmap-secret-projected.md.
-    unreachable!("kubelet does not yet chown projected files to fsGroup");
+
+    // Volume layer: file written with the requested mode (0o440).
+    assert_eq!(mode_of(&tmp.path().join("data-1")), 0o440);
+    assert_eq!(
+        std::fs::read(tmp.path().join("data-1")).unwrap(),
+        b"value-1"
+    );
+
+    // Container-arg layer: fsGroup must surface as a supplementary GID
+    // so the non-root runAsUser inherits the group that owns the file
+    // after `apply_fs_group_to_volumes` chowns it.
+    assert_eq!(
+        rusternetes_kubelet::runtime::compute_group_add(&pod),
+        Some(vec!["2000".to_string()]),
+        "projected-secret + fsGroup must wire HostConfig.group_add"
+    );
 }
 
 /// [sig-storage] Projected secret should be consumable in volume with mappings [NodeConformance] [Conformance]

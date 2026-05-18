@@ -326,7 +326,9 @@ pub fn check_host_path_type(path: &str, type_: Option<&str>) -> HostPathCheck {
 /// an empty list identically, but `None` avoids a wasted allocation.
 ///
 /// This is a pure function and is unit-tested in this module's test block.
-pub(crate) fn compute_group_add(pod: &Pod) -> Option<Vec<String>> {
+/// `pub` so integration tests in the `tests/` crate can assert that the
+/// container-arg layer is wired to `securityContext.fsGroup`.
+pub fn compute_group_add(pod: &Pod) -> Option<Vec<String>> {
     let pod_sc = pod
         .spec
         .as_ref()
