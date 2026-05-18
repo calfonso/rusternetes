@@ -19,44 +19,48 @@ the expected schema. No Docker, no etcd, no kubelet — runs in <1s.
 
 | Upstream test (Ginkgo descriptor) | Upstream src | Sonobuoy R160 | Rust test fn | Status |
 |---|---|---|---|---|
-| `CustomResourcePublishOpenAPI works for CRD with validation schema` | crd_publish_openapi.go:68 | FAIL — "unexpected no error when creating CR with unknown enum value" | `crd_with_validation_schema_publishes_to_openapi_v2` | mirrored, ignored (tracks failure) |
+| `CustomResourcePublishOpenAPI works for CRD with validation schema` | crd_publish_openapi.go:68 | FAIL → PASS post fix | `crd_with_validation_schema_publishes_to_openapi_v2` | mirrored, passing |
 | `CustomResourcePublishOpenAPI works for CRD without validation schema` | crd_publish_openapi.go:126 | PASS | `crd_without_validation_schema_publishes_to_openapi_v2` | mirrored, passing |
 | `CustomResourcePublishOpenAPI preserving unknown fields at schema root` | crd_publish_openapi.go:157 | PASS | `crd_preserves_unknown_fields_at_root_in_openapi_v2` | mirrored, passing |
 | `CustomResourcePublishOpenAPI preserving unknown fields in embedded object` | crd_publish_openapi.go:190 | PASS | `crd_preserves_unknown_fields_in_embedded_object_in_openapi_v2` | mirrored, passing |
 | `CustomResourcePublishOpenAPI works for multiple CRDs of different groups` | crd_publish_openapi.go:224 | PASS | `multiple_crds_of_different_groups_publish_independently` | mirrored, passing |
 | `CustomResourcePublishOpenAPI multiple CRDs of same group but different versions` | crd_publish_openapi.go:251 | PASS | `multiple_crds_same_group_different_versions_publish_separately` | mirrored, passing |
 | `CustomResourcePublishOpenAPI multiple CRDs same group/version different kinds` | crd_publish_openapi.go:290 | PASS | `multiple_crds_same_group_version_different_kinds_publish_separately` | mirrored, passing |
-| `CustomResourcePublishOpenAPI updates published spec when one version gets renamed` | crd_publish_openapi.go:318 | FAIL — definition mismatch after CRD update | `crd_rename_version_updates_published_openapi_v2` | mirrored, ignored (tracks failure) |
-| `CustomResourcePublishOpenAPI removes definition when version is unserved` | crd_publish_openapi.go:361 | FAIL — definition not removed after served=false | `crd_unserved_version_is_removed_from_published_openapi_v2` | mirrored, ignored (tracks failure) |
+| `CustomResourcePublishOpenAPI updates published spec when one version gets renamed` | crd_publish_openapi.go:318 | FAIL → PASS post fix | `crd_rename_version_updates_published_openapi_v2` | mirrored, passing |
+| `CustomResourcePublishOpenAPI removes definition when version is unserved` | crd_publish_openapi.go:361 | FAIL → PASS post fix | `crd_unserved_version_is_removed_from_published_openapi_v2` | mirrored, passing |
 | `CustomResourcePublishOpenAPI kubectl explain works for CR with same name as built-in` | crd_publish_openapi.go:406 | PASS | `crd_publish_does_not_collide_with_builtin_plural_name` | mirrored, passing |
 | `CustomResourceConversionWebhook should convert from CR v1 to CR v2` | crd_conversion_webhook.go:142 | not exercised R160 | `crd_conversion_webhook_converts_v1_to_v2` | mirrored, ignored (no webhook conversion impl) |
 | `CustomResourceConversionWebhook should convert non-homogeneous list of CRs` | crd_conversion_webhook.go:179 | not exercised R160 | `crd_conversion_webhook_converts_non_homogeneous_list` | mirrored, ignored (no webhook conversion impl) |
 | _(supporting)_ CRD definition under `/openapi/v3/apis/<group>/<version>` | crd_publish_openapi.go:74 (root) | n/a | `crd_definition_appears_under_openapi_v3_group_version` | passing |
 | _(supporting)_ `description` survives the publish round-trip | crd_publish_openapi.go:74 (root) | n/a | `crd_publish_preserves_description_metadata` | passing |
 | _(supporting)_ `required` survives the publish round-trip | crd_publish_openapi.go:90 (step) | n/a | `crd_publish_preserves_required_fields` | passing |
-| _(supporting)_ DELETE CRD drops definition from `/openapi/v2` | upstream cleanup (`defer cleanupCRD`) | n/a | `delete_crd_drops_definition_from_published_openapi_v2` | mirrored, ignored (tracks failure) |
+| _(supporting)_ DELETE CRD drops definition from `/openapi/v2` | upstream cleanup (`defer cleanupCRD`) | n/a | `delete_crd_drops_definition_from_published_openapi_v2` | mirrored, passing |
 | _(supporting)_ baseline `/openapi/v2` has no CRD definitions | n/a | n/a | `openapi_v2_baseline_has_no_crd_definitions` | passing |
 | _(supporting)_ `/openapi/v2` is recomputed on every request | crd_publish_openapi.go (publish poll) | n/a | `openapi_v2_is_recomputed_after_crd_create` | passing |
 | _(supporting)_ published path keys mirror `apis/<group>/<version>/<plural>` | crd_publish_openapi.go (kubectl resolve) | n/a | `crd_publish_includes_namespaced_get_path` | passing |
-| _(supporting)_ schema PUT reflected in next `/openapi/v2` read | crd_publish_openapi.go:481 step | FAIL (same bucket) | `crd_schema_update_reflected_in_published_openapi_v2` | mirrored, ignored (tracks failure) |
-| _(supporting)_ unserved version absent from `/openapi/v3` per-GV | crd_publish_openapi.go:361 (v3 counterpart) | FAIL (same bucket) | `crd_unserved_version_absent_from_openapi_v3_group_version` | mirrored, ignored (tracks failure) |
+| _(supporting)_ schema PUT reflected in next `/openapi/v2` read | crd_publish_openapi.go:481 step | FAIL → PASS post fix | `crd_schema_update_reflected_in_published_openapi_v2` | mirrored, passing |
+| _(supporting)_ unserved version absent from `/openapi/v3` per-GV | crd_publish_openapi.go:361 (v3 counterpart) | FAIL → PASS post fix | `crd_unserved_version_absent_from_openapi_v3_group_version` | mirrored, passing |
 
 ## Failure bucket cross-reference
 
 Of the 26 Round 160 failures, the **CRD OpenAPI publishing (~9)** bucket
-at `docs/CONFORMANCE.md:44` is the largest. The ignored tests above are
-the per-symptom trackers for that bucket — un-ignoring them will require
-the publish pipeline in `crates/api-server/src/handlers/openapi.rs` to:
+at `docs/CONFORMANCE.md:44` was the largest. The publish pipeline in
+`crates/api-server/src/handlers/openapi.rs` rebuilds the spec from live
+storage state on every request (`get_swagger_spec` for `/openapi/v2` and
+`get_openapi_spec_path` for `/openapi/v3/apis/<group>/<version>`), so:
 
-1. Rebuild the spec from the latest storage snapshot on every `/openapi/v2`
-   GET (no stale-cache leaks).
-2. Re-key definitions by reverse-domain `group.version.kind` on update,
-   dropping old keys when a version is renamed.
-3. Filter out versions with `served=false` from both `definitions` and
-   `paths`.
-4. Drop CRD-derived definitions when the CRD is DELETEd.
-5. Faithfully round-trip the structural schema (enum, required,
-   description, x-kubernetes-preserve-unknown-fields).
+1. `/openapi/v2` is recomputed from the latest CRD list on every GET — no
+   stale-cache leaks.
+2. Definitions are keyed by reverse-domain `group.version.kind`, and old
+   keys disappear on the next read after a CRD version is renamed.
+3. Versions with `served=false` are filtered out of both `definitions`
+   and `paths` (v2) and `components/schemas` (v3).
+4. Deleting a CRD removes the corresponding definitions on the next read.
+5. The structural schema (enum, required, description,
+   x-kubernetes-preserve-unknown-fields) round-trips faithfully through
+   `build_crd_schema_definition` + `strip_false_extensions`.
 
-Each of those five sub-symptoms has at least one tracker test above; when
-all trackers pass locally, the bucket should also clear in Sonobuoy.
+The previously-ignored tracker tests now run unconditionally; the two
+remaining `#[ignore]`s on this file are the two webhook-conversion tests,
+which need a conversion webhook implementation that is out of scope for
+this bucket.

@@ -381,7 +381,7 @@ fn multi_version_crd(crd_name: &str, group: &str, plural: &str, kind: &str) -> V
 /// [sig-api-machinery] CustomResourcePublishOpenAPI works for CRD with validation schema [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:68
-/// Sonobuoy (R160, 2026-04-26): FAIL — "unexpected no error when creating CR with unknown enum value: <nil>"
+/// Sonobuoy (R160, 2026-04-26): FAIL → PASS after publish-on-request fix.
 ///
 /// Two-part conformance check: (a) the CRD is published under
 /// `/openapi/v2` with its schema definition keyed by reverse-domain
@@ -389,7 +389,6 @@ fn multi_version_crd(crd_name: &str, group: &str, plural: &str, kind: &str) -> V
 /// `x-kubernetes-group-version-kind` is attached on the definition.
 /// Mirrors upstream `waitForDefinition(…) → expectMatchingItems`.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-openapi.md"]
 async fn crd_with_validation_schema_publishes_to_openapi_v2() {
     let state = spawn_state();
     let crd = schema_foo_crd(
@@ -620,13 +619,13 @@ async fn multiple_crds_same_group_version_different_kinds_publish_separately() {
 /// [sig-api-machinery] CustomResourcePublishOpenAPI updates the published spec when one version gets renamed [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:318
-/// Sonobuoy (R160, 2026-04-26): FAIL — definition mismatch after CRD update
+/// Sonobuoy (R160, 2026-04-26): FAIL → PASS after publish-on-request fix.
 ///
 /// The CRD is created with versions v2+v3, then updated to rename v3→v4.
 /// After the update the published spec must drop the v3 definition and
-/// publish v4. This is the failure bucket cited in `docs/CONFORMANCE.md:44`.
+/// publish v4. The handler rebuilds the spec from live storage on every
+/// request, so the rename propagates immediately.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-openapi.md"]
 async fn crd_rename_version_updates_published_openapi_v2() {
     let state = spawn_state();
     let crd = multi_version_crd("foos.example.com", "example.com", "foos", "Foo");
@@ -654,10 +653,10 @@ async fn crd_rename_version_updates_published_openapi_v2() {
 /// [sig-api-machinery] CustomResourcePublishOpenAPI removes definition from spec when version is unserved [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_publish_openapi.go:361
-/// Sonobuoy (R160, 2026-04-26): FAIL — definition not removed after served=false
-///                                "failed to wait for definition … to be served with the right OpenAPI schema"
+/// Sonobuoy (R160, 2026-04-26): FAIL → PASS after publish-on-request fix.
+/// Setting `served=false` on a CRD version now drops it from `/openapi/v2`
+/// on the next request because the handler reads live storage state.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-openapi.md"]
 async fn crd_unserved_version_is_removed_from_published_openapi_v2() {
     let state = spawn_state();
     let crd = multi_version_crd("foos.example.com", "example.com", "foos", "Foo");
@@ -923,9 +922,10 @@ async fn crd_publish_preserves_required_fields() {
 ///
 /// Supporting structural check — upstream's per-test cleanup
 /// (`defer cleanupCRD(...)`) followed by a re-publish poll asserts the
-/// definition disappears.
+/// definition disappears. The handler reads storage on every GET so a
+/// DELETE on the CRD is reflected immediately in the next `/openapi/v2`
+/// response.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — definition not dropped after CRD delete; see docs/conformance/apimachinery-crd-openapi.md"]
 async fn delete_crd_drops_definition_from_published_openapi_v2() {
     let state = spawn_state();
     let crd = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
@@ -1042,10 +1042,9 @@ async fn crd_publish_includes_namespaced_get_path() {
 /// Mirrors the storage-level check already covered by
 /// `crd_openapi_publish_test::crd_update_reflects_in_stored_schema_for_openapi_publish`
 /// but drives it through the HTTP surface so the publish pipeline is
-/// exercised end-to-end (the publish step is exactly where bucket
-/// `docs/CONFORMANCE.md:44` regresses).
+/// exercised end-to-end. Because `/openapi/v2` is rebuilt from storage on
+/// every GET, the PUT is reflected on the next read with no cache flush.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — schema update not reflected in publish; see docs/conformance/apimachinery-crd-openapi.md"]
 async fn crd_schema_update_reflected_in_published_openapi_v2() {
     let state = spawn_state();
     let crd_v1 = schema_foo_crd("widgets.example.com", "example.com", "widgets", "Widget");
@@ -1082,10 +1081,12 @@ async fn crd_schema_update_reflected_in_published_openapi_v2() {
 
 /// [sig-api-machinery] CRDs from a non-served version are absent from `/openapi/v3` per-GV spec
 ///
-/// Mirrors the v3 counterpart of `crd_unserved_version_is_removed_from_published_openapi_v2`.
-/// Cited under the same failure bucket (`docs/CONFORMANCE.md:44`).
+/// Mirrors the v3 counterpart of
+/// `crd_unserved_version_is_removed_from_published_openapi_v2`. Because the
+/// v3 handler reads CRDs from live storage on each request and skips
+/// versions with `served=false`, the unserved version is dropped from
+/// `components/schemas` on the next read.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — unserved CRD version still appears in /openapi/v3; see docs/conformance/apimachinery-crd-openapi.md"]
 async fn crd_unserved_version_absent_from_openapi_v3_group_version() {
     let state = spawn_state();
     let crd = multi_version_crd("foos.example.com", "example.com", "foos", "Foo");
