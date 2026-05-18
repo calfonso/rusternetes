@@ -100,16 +100,18 @@ jobs:
           shared-key: "clippy"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: cargo clippy (informational, all targets)
-        # Warnings are surfaced in the run log but do not fail CI yet —
-        # the baseline has 30+ pre-existing warnings (deprecated rand
-        # APIs, unused methods etc.). Ratchet to `-- -D warnings` after
-        # that backlog is cleaned up. Default features only: the
-        # optional `jaeger` feature pulls in opentelemetry-jaeger which
-        # is itself deprecated upstream.
+      - name: cargo clippy (hard gate, all targets)
+        # `-- -D warnings` converts every clippy lint into a build error
+        # so warnings cannot accrete unnoticed. The backlog that used to
+        # block this gate was cleared in `chore(clippy): clear backlog +
+        # ratchet test.yml to -D warnings`; future PRs must keep clippy
+        # green or `#[allow(<lint>)]` the specific case with a comment.
+        #
+        # Default features only: the optional `jaeger` feature pulls in
+        # opentelemetry-jaeger which is itself deprecated upstream.
         #
         # `--all-targets` also acts as the bin-target build check the
         # old explicit `cargo build` step provided — clippy compiles
         # every target before lint, so any compile error in a bin fails
         # this step.
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -143,6 +143,7 @@ fn make_statefulset(name: &str, namespace: &str, replicas: i32) -> StatefulSet {
 
 /// Seed a pod directly into storage without going through the controller.
 /// The pod has phase=Running and the ss_name label so the controller can find it.
+#[allow(clippy::too_many_arguments)] // Test helper — args mirror StatefulSet pod fields, not an API surface.
 async fn seed_pod(
     storage: &Arc<MemoryStorage>,
     ss_name: &str,

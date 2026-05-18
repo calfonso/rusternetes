@@ -213,6 +213,12 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
     /// state, including the deletion of tracked objects since the last
     /// reconcile) and recomputes `.status.used`. This is the per-key entry
     /// point used by the controller's worker loop and by integration tests.
+    ///
+    /// `#[allow(dead_code)]` — only reachable from the downstream
+    /// integration-test crate (`tests/resource_quota_usage_recompute_test.rs`)
+    /// and the controller-manager binary's worker loop, neither of which
+    /// the lib-target dead-code analysis sees.
+    #[allow(dead_code)]
     pub async fn reconcile_one(&self, namespace: &str, name: &str) -> Result<()> {
         let key = build_key("resourcequotas", Some(namespace), name);
         let quota: ResourceQuota = self.storage.get(&key).await?;

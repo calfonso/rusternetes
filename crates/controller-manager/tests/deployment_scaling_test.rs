@@ -98,6 +98,7 @@ fn create_deployment(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Test builder — args mirror upstream RS fields, not an API surface.
 fn create_owned_rs(
     name: &str,
     namespace: &str,

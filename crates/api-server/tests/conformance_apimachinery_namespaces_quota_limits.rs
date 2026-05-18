@@ -7,6 +7,7 @@
 //!   - test/e2e/apimachinery/namespace.go
 //!   - test/e2e/apimachinery/resource_quota.go
 //!   - test/e2e/apimachinery/limit_range.go
+//!
 //! Mirrored from the Sonobuoy run captured in
 //! `.rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log`.
 //!
