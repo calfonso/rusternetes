@@ -19,11 +19,11 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 | policy/v1 | 0 / 4 | 0% |
 | discovery/v1 | 0 / 7 | 0% |
 | autoscaling/v2 | 0 / 23 | 0% |
-| scheduling/v1 | 0 / 1 | 0% |
+| scheduling/v1 | 1 / 1 | 100% |
 | storage/v1 | 0 / 15 | 0% |
 | apiregistration/v1 | 0 / 5 | 0% |
 | apimachinery/meta/v1 | 8 / 15 | 53% |
-| **Total** | **122 / 405** | **30%** |
+| **Total** | **123 / 405** | **30%** |
 
 ## core/v1
 
@@ -486,7 +486,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 ### Kinds
 
-- [ ] `PriorityClass`
+- [x] `PriorityClass`
 
 ### Nested messages
 
