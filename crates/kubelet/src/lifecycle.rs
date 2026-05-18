@@ -107,6 +107,125 @@ pub fn build_prestop_lifecycle_map(pod: &Pod) -> HashMap<String, Lifecycle> {
     map
 }
 
+/// Decide whether the kubelet should restart a container that has just
+/// exited, given the pod's `restartPolicy` and the container's exit code.
+///
+/// Mirrors the upstream table-driven semantics pinned by
+/// `test/e2e/common/node/runtime.go:53` ("should run with the expected
+/// status"):
+///   - `restartPolicy=Always`    → restart on every exit (zero or non-zero)
+///   - `restartPolicy=OnFailure` → restart only on non-zero exit
+///   - `restartPolicy=Never`     → never restart
+///   - Unset → defaults to `Always` (K8s PodSpec default).
+#[inline]
+#[allow(dead_code)]
+pub fn should_restart_container(restart_policy: Option<&str>, exit_code: i32) -> bool {
+    match restart_policy.unwrap_or("Always") {
+        "Always" => true,
+        "OnFailure" => exit_code != 0,
+        "Never" => false,
+        // Unknown values are treated as the default ("Always") — this
+        // matches K8s' tolerant handling of forward-compatible enum
+        // values (see PodSpec.RestartPolicy comment in core/v1/types.go).
+        _ => true,
+    }
+}
+
+/// Decide the terminal pod phase for a pod whose every container has
+/// exited, given the pod's `restartPolicy` and whether *any* container
+/// failed (non-zero exit).
+///
+/// Pinned by `runtime.go:53` table:
+///   - `Never` + any failure   → `Failed`
+///   - `Never` + all succeeded → `Succeeded`
+///   - `OnFailure` + all succeeded → `Succeeded`
+///   - `Always` is non-terminal — callers should not invoke this for
+///     `Always` pods (the kubelet restarts containers instead). We return
+///     `None` so the caller can treat it as "no terminal phase".
+///
+/// Returns the K8s phase string used in `Pod.status.phase`.
+#[inline]
+#[allow(dead_code)]
+pub fn terminal_pod_phase(restart_policy: Option<&str>, any_failed: bool) -> Option<&'static str> {
+    match restart_policy.unwrap_or("Always") {
+        "Always" => None,
+        "OnFailure" if any_failed => None, // OnFailure with failure → restart, not terminal
+        "OnFailure" => Some("Succeeded"),
+        "Never" if any_failed => Some("Failed"),
+        "Never" => Some("Succeeded"),
+        _ => None,
+    }
+}
+
+/// Whether the kubelet should pull a container image given the
+/// `imagePullPolicy` and whether the image is already present locally.
+///
+/// Mirrors `kuberuntime_image.go` and the e2e `should be able to pull
+/// image` family:
+///   - `Always`       → always pull
+///   - `Never`        → never pull (fail if absent)
+///   - `IfNotPresent` → pull only when absent
+///   - Unset → K8s default is `IfNotPresent`, but if the image tag is
+///     literally `:latest` (or no tag), the default flips to `Always`.
+///     This helper applies the explicit-policy path; tag-based defaulting
+///     is handled by [`default_image_pull_policy`].
+#[inline]
+#[allow(dead_code)]
+pub fn should_pull_image(image_pull_policy: Option<&str>, image_exists_locally: bool) -> bool {
+    match image_pull_policy.unwrap_or("IfNotPresent") {
+        "Always" => true,
+        "Never" => false,
+        "IfNotPresent" => !image_exists_locally,
+        // K8s default for unknown values: behave like IfNotPresent.
+        _ => !image_exists_locally,
+    }
+}
+
+/// Default `imagePullPolicy` for a container image when the user did not
+/// set one. K8s rule (`pkg/api/v1/pod/util.go::GetContainerStatus`):
+///   - tag is `:latest` or absent → `Always`
+///   - any explicit non-`latest` tag → `IfNotPresent`
+///   - digest reference → `IfNotPresent`
+#[allow(dead_code)]
+pub fn default_image_pull_policy(image: &str) -> &'static str {
+    // Digest reference (`image@sha256:...`) → IfNotPresent.
+    if image.contains('@') {
+        return "IfNotPresent";
+    }
+    // Split off any tag after the last colon, but be careful with
+    // registries that include a port (`registry:5000/img`). The K8s parser
+    // uses go-containerregistry which treats the last `:` after the final
+    // `/` as the tag separator.
+    let after_slash = match image.rfind('/') {
+        Some(i) => &image[i + 1..],
+        None => image,
+    };
+    match after_slash.rfind(':') {
+        Some(i) => {
+            let tag = &after_slash[i + 1..];
+            if tag == "latest" {
+                "Always"
+            } else {
+                "IfNotPresent"
+            }
+        }
+        // No tag at all → defaults to `:latest` → Always.
+        None => "Always",
+    }
+}
+
+/// Effective `terminationGracePeriodSeconds` for a pod, given the value
+/// set on the PodSpec (if any) and the K8s default.
+///
+/// K8s defaults to 30 seconds when unset (`pkg/apis/core/v1/defaults.go`).
+/// Negative values are clamped to 0 — the K8s API server normalises this
+/// at admission time, but the kubelet must defend against legacy objects.
+#[inline]
+#[allow(dead_code)]
+pub fn effective_termination_grace_period(spec_grace: Option<i64>) -> i64 {
+    spec_grace.unwrap_or(30).max(0)
+}
+
 /// Map a Docker exit code → [`ContainerState::Terminated`] in the canonical
 /// way the kubelet reports it on `containerStatuses[].state.terminated`.
 ///
@@ -183,6 +302,68 @@ mod tests {
             MINIMUM_GRACE_PERIOD_SECS
         );
         assert_eq!(remaining_grace_after_prestop(30, 10), 20);
+    }
+
+    #[test]
+    fn restart_decision_matches_policy_matrix() {
+        assert!(should_restart_container(Some("Always"), 0));
+        assert!(should_restart_container(Some("Always"), 1));
+        assert!(!should_restart_container(Some("OnFailure"), 0));
+        assert!(should_restart_container(Some("OnFailure"), 1));
+        assert!(!should_restart_container(Some("Never"), 0));
+        assert!(!should_restart_container(Some("Never"), 1));
+        assert!(should_restart_container(None, 0));
+    }
+
+    #[test]
+    fn terminal_phase_matches_policy_matrix() {
+        assert_eq!(terminal_pod_phase(Some("Never"), true), Some("Failed"));
+        assert_eq!(terminal_pod_phase(Some("Never"), false), Some("Succeeded"));
+        assert_eq!(
+            terminal_pod_phase(Some("OnFailure"), false),
+            Some("Succeeded")
+        );
+        assert_eq!(terminal_pod_phase(Some("OnFailure"), true), None);
+        assert_eq!(terminal_pod_phase(Some("Always"), false), None);
+        assert_eq!(terminal_pod_phase(Some("Always"), true), None);
+    }
+
+    #[test]
+    fn pull_decision_matches_policy_matrix() {
+        assert!(should_pull_image(Some("Always"), true));
+        assert!(should_pull_image(Some("Always"), false));
+        assert!(!should_pull_image(Some("Never"), true));
+        assert!(!should_pull_image(Some("Never"), false));
+        assert!(!should_pull_image(Some("IfNotPresent"), true));
+        assert!(should_pull_image(Some("IfNotPresent"), false));
+    }
+
+    #[test]
+    fn default_pull_policy_follows_tag_rule() {
+        assert_eq!(default_image_pull_policy("nginx"), "Always");
+        assert_eq!(default_image_pull_policy("nginx:latest"), "Always");
+        assert_eq!(default_image_pull_policy("nginx:1.27"), "IfNotPresent");
+        assert_eq!(
+            default_image_pull_policy("registry.k8s.io/nginx:1.27"),
+            "IfNotPresent"
+        );
+        assert_eq!(
+            default_image_pull_policy("registry:5000/nginx:1.27"),
+            "IfNotPresent"
+        );
+        assert_eq!(default_image_pull_policy("registry:5000/nginx"), "Always");
+        assert_eq!(
+            default_image_pull_policy("nginx@sha256:deadbeef"),
+            "IfNotPresent"
+        );
+    }
+
+    #[test]
+    fn effective_grace_period_defaults_and_clamps() {
+        assert_eq!(effective_termination_grace_period(None), 30);
+        assert_eq!(effective_termination_grace_period(Some(60)), 60);
+        assert_eq!(effective_termination_grace_period(Some(0)), 0);
+        assert_eq!(effective_termination_grace_period(Some(-5)), 0);
     }
 
     #[test]
