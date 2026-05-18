@@ -48,19 +48,17 @@ exercised through the same handler stack that production HTTPS traffic hits.
 | `MUST fail to update a resource due to CRD Validation Rule errors on changed fields` | crd_validation_ratcheting.go:448 | PASS | `ratcheting_changed_cel_errors_blocked` | tracker only (ratcheting not implemented) |
 | `MUST NOT ratchet errors raised by transition rules` | crd_validation_ratcheting.go:511 | PASS | `ratcheting_transition_rule_errors_never_ratcheted` | tracker only (ratcheting not implemented) |
 | `MUST evaluate a CRD Validation Rule with oldSelf = nil for new values when optionalOldSelf is true` | crd_validation_ratcheting.go:569 | PASS | `ratcheting_optional_old_self_nil_for_new_values` | tracker only (ratcheting not implemented) |
-| Lifecycle: scale subresource get + update (from `crd_publish_openapi.go` scale spec) | custom_resource_definition.go:142 (subresource family) | PASS upstream / **FAIL locally** | `crd_scale_subresource_get_and_update` | **regression — `get_custom_resource_scale` resolves `specReplicasPath` against `cr.spec` instead of CR root** |
+| Lifecycle: scale subresource get + update (from `crd_publish_openapi.go` scale spec) | custom_resource_definition.go:142 (subresource family) | PASS | `crd_scale_subresource_get_and_update` | mirrored, passing (fix in PR #86) |
 | Lifecycle: list CRDs across the group reflects newly created definitions | custom_resource_definition.go:188 | PASS | `crd_list_all_includes_newly_created` | mirrored, passing |
 | Lifecycle: GET returns 404 with NotFound StatusReason for missing CRD | custom_resource_definition.go:69 (negative case) | PASS | `crd_get_unknown_name_returns_not_found` | mirrored, passing |
 
 ## Notes
 
-- The scale subresource regression is a real local bug: `extract_json_path`
-  is called on `&cr.spec` while the configured path is `.spec.replicas`. The
-  leading `.spec` segment cannot match a key in the already-narrowed object,
-  so replicas resolves to 0. Upstream K8s treats `specReplicasPath` as
-  rooted at the CR object. The test is `#[ignore]`d as a tracker until
-  `crates/api-server/src/handlers/custom_resource.rs::get_custom_resource_scale`
-  is fixed to walk from the CR root.
+- The scale subresource regression was fixed in PR #86 — `get_custom_resource_scale`
+  and `update_custom_resource_scale` now strip the configured root prefix
+  (`spec` / `status`) via `strip_root_prefix` before walking the already-narrowed
+  `cr.spec` / `cr.status` value. The test was un-ignored once the helper landed
+  on main.
 - CEL (`x-kubernetes-validations`) is parsed and stored but never evaluated
   during CR write paths today. Once evaluation is wired in, drop `#[ignore]`
   from each `cel_*` test; their bodies are intentionally empty so adding
