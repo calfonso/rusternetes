@@ -415,7 +415,7 @@ mod tests {
                 liveness_probe: Some(Probe {
                     http_get: Some(HTTPGetAction {
                         path: Some("/health".to_string()),
-                        port: 8080,
+                        port: rusternetes_common::resources::IntOrString::Int(8080),
                         host: None,
                         scheme: None,
                         http_headers: None,

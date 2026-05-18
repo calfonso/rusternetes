@@ -4899,7 +4899,7 @@ impl ContainerRuntime {
             if let Some(ref post_start) = lifecycle.post_start {
                 info!("Executing postStart hook for container {}", container.name);
                 if let Err(e) = self
-                    .execute_lifecycle_handler(post_start, &container_name)
+                    .execute_lifecycle_handler(post_start, &container_name, container)
                     .await
                 {
                     warn!(
@@ -5830,7 +5830,7 @@ impl ContainerRuntime {
                     let startup_passed = if running {
                         if let Some(startup_probe) = &container.startup_probe {
                             let raw = self
-                                .check_probe(&container_name, startup_probe)
+                                .check_probe(&container_name, container, startup_probe)
                                 .await
                                 .unwrap_or(false);
                             let success_threshold = startup_probe.success_threshold.unwrap_or(1);
@@ -5886,7 +5886,7 @@ impl ContainerRuntime {
                                 false // Not ready yet, still within initial delay
                             } else {
                                 let raw = self
-                                    .check_probe(&container_name, probe)
+                                    .check_probe(&container_name, container, probe)
                                     .await
                                     .unwrap_or(false);
                                 let _failure_threshold = probe.failure_threshold.unwrap_or(3);
@@ -6043,7 +6043,7 @@ impl ContainerRuntime {
             if let Some(startup_probe) = &container.startup_probe {
                 let startup_key = format!("{}/{}/startup", pod_name, container.name);
                 let raw_result = self
-                    .check_probe(&container_name, startup_probe)
+                    .check_probe(&container_name, container, startup_probe)
                     .await
                     .unwrap_or(false);
 
@@ -6106,7 +6106,7 @@ impl ContainerRuntime {
                 }
 
                 // Check liveness with threshold tracking
-                let healthy = self.check_probe(&container_name, probe).await?;
+                let healthy = self.check_probe(&container_name, container, probe).await?;
                 let failure_threshold = probe.failure_threshold.unwrap_or(3);
                 // For liveness probes, Kubernetes requires successThreshold=1
                 let _success_threshold = probe.success_threshold.unwrap_or(1);
@@ -6150,7 +6150,12 @@ impl ContainerRuntime {
     }
 
     /// Execute a probe check
-    async fn check_probe(&self, container_name: &str, probe: &Probe) -> Result<bool> {
+    async fn check_probe(
+        &self,
+        container_name: &str,
+        container: &Container,
+        probe: &Probe,
+    ) -> Result<bool> {
         // K8s default timeout is 1s; treat 0 as default
         let timeout_secs = probe.timeout_seconds.unwrap_or(1).max(1) as u64;
         let timeout = Duration::from_secs(timeout_secs);
@@ -6158,14 +6163,14 @@ impl ContainerRuntime {
         // HTTP GET probe
         if let Some(http_get) = &probe.http_get {
             return self
-                .check_http_probe(container_name, http_get, timeout)
+                .check_http_probe(container_name, container, http_get, timeout)
                 .await;
         }
 
         // TCP Socket probe
         if let Some(tcp_socket) = &probe.tcp_socket {
             return self
-                .check_tcp_probe(container_name, tcp_socket, timeout)
+                .check_tcp_probe(container_name, container, tcp_socket, timeout)
                 .await;
         }
 
@@ -6176,7 +6181,9 @@ impl ContainerRuntime {
 
         // gRPC probe
         if let Some(grpc) = &probe.grpc {
-            return self.check_grpc_probe(container_name, grpc, timeout).await;
+            return self
+                .check_grpc_probe(container_name, container, grpc, timeout)
+                .await;
         }
 
         Ok(true) // No probe configured
@@ -6423,6 +6430,7 @@ impl ContainerRuntime {
     async fn check_http_probe(
         &self,
         container_name: &str,
+        container: &Container,
         http_get: &HTTPGetAction,
         timeout: Duration,
     ) -> Result<bool> {
@@ -6433,10 +6441,23 @@ impl ContainerRuntime {
             self.get_effective_container_ip(container_name).await
         };
 
+        // Resolve named port via container.ports[].name lookup (K8s IntOrString).
+        let port =
+            match rusternetes_common::resources::resolve_probe_port(&http_get.port, container) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "HTTP probe port {} unresolvable for container {}",
+                        http_get.port, container_name
+                    );
+                    return Ok(false);
+                }
+            };
+
         // Kubernetes sends scheme as uppercase ("HTTP", "HTTPS") — lowercase for URL
         let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
         let path = http_get.path.as_deref().unwrap_or("/");
-        let url = format!("{}://{}:{}{}", scheme, ip, http_get.port, path);
+        let url = format!("{}://{}:{}{}", scheme, ip, port, path);
 
         debug!("HTTP probe: {}", url);
 
@@ -6476,13 +6497,26 @@ impl ContainerRuntime {
     async fn check_tcp_probe(
         &self,
         container_name: &str,
+        container: &Container,
         tcp_socket: &TCPSocketAction,
         timeout: Duration,
     ) -> Result<bool> {
         // Get container IP (resolving through pause container if needed)
         let ip = self.get_effective_container_ip(container_name).await;
 
-        let addr = format!("{}:{}", ip, tcp_socket.port);
+        let port =
+            match rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "TCP probe port {} unresolvable for container {}",
+                        tcp_socket.port, container_name
+                    );
+                    return Ok(false);
+                }
+            };
+
+        let addr = format!("{}:{}", ip, port);
         debug!("TCP probe: {}", addr);
 
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
@@ -6531,11 +6565,22 @@ impl ContainerRuntime {
     async fn check_grpc_probe(
         &self,
         container_name: &str,
+        container: &Container,
         grpc: &GRPCAction,
         timeout: Duration,
     ) -> Result<bool> {
         let ip = self.get_effective_container_ip(container_name).await;
-        let addr = format!("http://{}:{}", ip, grpc.port);
+        let port = match rusternetes_common::resources::resolve_probe_port(&grpc.port, container) {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "gRPC probe port {} unresolvable for container {}",
+                    grpc.port, container_name
+                );
+                return Ok(false);
+            }
+        };
+        let addr = format!("http://{}:{}", ip, port);
         debug!("gRPC probe: {} service={:?}", addr, grpc.service);
 
         let endpoint = match tonic::transport::Endpoint::from_shared(addr.clone()) {
@@ -6612,6 +6657,7 @@ impl ContainerRuntime {
         &self,
         handler: &LifecycleHandler,
         container_name: &str,
+        container: &Container,
     ) -> Result<()> {
         if let Some(ref exec) = handler.exec {
             // Execute command inside the container
@@ -6658,6 +6704,16 @@ impl ContainerRuntime {
                 ));
             }
         } else if let Some(ref http_get) = handler.http_get {
+            // Resolve named port via container.ports lookup (K8s IntOrString).
+            let hook_port =
+                rusternetes_common::resources::resolve_probe_port(&http_get.port, container)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Lifecycle HTTP handler port {} unresolvable for container {}",
+                            http_get.port,
+                            container_name
+                        )
+                    })?;
             // Execute HTTP GET request — use host field if specified, otherwise container/pause IP.
             // Containers using container: network mode won't have their own IP — we need the
             // pause container's IP (which owns the network namespace).
@@ -6674,7 +6730,7 @@ impl ContainerRuntime {
                     // by checking the pod's /etc/hosts or using DNS
                     let mut resolved = None;
                     if let Ok(mut addrs) =
-                        tokio::net::lookup_host(format!("{}:{}", host, http_get.port)).await
+                        tokio::net::lookup_host(format!("{}:{}", host, hook_port)).await
                     {
                         if let Some(addr) = addrs.next() {
                             resolved = Some(addr.ip().to_string());
@@ -6798,7 +6854,7 @@ impl ContainerRuntime {
 
             let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
             let path = http_get.path.as_deref().unwrap_or("/");
-            let url = format!("{}://{}:{}{}", scheme, ip, http_get.port, path);
+            let url = format!("{}://{}:{}{}", scheme, ip, hook_port, path);
 
             info!(
                 "Lifecycle HTTP handler: {} for container {}",
@@ -6851,7 +6907,16 @@ impl ContainerRuntime {
                 .and_then(|ns| ns.ip_address)
                 .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            let addr = format!("{}:{}", ip, tcp_socket.port);
+            let port =
+                rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Lifecycle TCP handler port {} unresolvable for container {}",
+                            tcp_socket.port,
+                            container_name
+                        )
+                    })?;
+            let addr = format!("{}:{}", ip, port);
             debug!("Lifecycle TCP handler: {}", addr);
 
             match tokio::time::timeout(
@@ -6948,11 +7013,23 @@ impl ContainerRuntime {
         let prestop_start = std::time::Instant::now();
         let prestop_budget = std::time::Duration::from_secs(grace_period_seconds.max(1) as u64);
 
-        // Collect (container_name, pre_stop_handler) for all running containers
-        // that have a preStop hook. Match exact name first, falling back to
-        // suffix match if Docker returns a different name shape.
-        let mut hooks_to_run: Vec<(String, rusternetes_common::resources::LifecycleHandler)> =
-            Vec::new();
+        // Build a name -> Container lookup so the lifecycle handler can
+        // resolve named probe/handler ports against the container's declared
+        // ports[].name (K8s IntOrString).
+        let spec_containers: std::collections::HashMap<&str, &Container> = pod
+            .spec
+            .as_ref()
+            .map(|s| s.containers.iter().map(|c| (c.name.as_str(), c)).collect())
+            .unwrap_or_default();
+
+        // Collect (container_name, pre_stop_handler, container) for all running
+        // containers that have a preStop hook. Match exact name first, falling
+        // back to suffix match if Docker returns a different name shape.
+        let mut hooks_to_run: Vec<(
+            String,
+            rusternetes_common::resources::LifecycleHandler,
+            Container,
+        )> = Vec::new();
         for container in &containers {
             let names = container.names.clone().unwrap_or_default();
             let container_name = names
@@ -6973,7 +7050,16 @@ impl ContainerRuntime {
             });
             if let Some(lifecycle) = lifecycle {
                 if let Some(ref pre_stop) = lifecycle.pre_stop {
-                    hooks_to_run.push((container_name, pre_stop.clone()));
+                    // Derive the K8s container name (strip `{pod_name}_` prefix).
+                    let k8s_name = container_name
+                        .strip_prefix(&format!("{}_", pod_name))
+                        .unwrap_or(&container_name);
+                    let spec_container = spec_containers
+                        .get(k8s_name)
+                        .copied()
+                        .cloned()
+                        .unwrap_or_else(Container::default);
+                    hooks_to_run.push((container_name, pre_stop.clone(), spec_container));
                 }
             } else if !container_name.ends_with("_pause") {
                 debug!(
@@ -6990,10 +7076,10 @@ impl ContainerRuntime {
             use futures::stream::{FuturesUnordered, StreamExt};
             let mut futs: FuturesUnordered<_> = hooks_to_run
                 .into_iter()
-                .map(|(container_name, pre_stop)| async move {
+                .map(|(container_name, pre_stop, spec_container)| async move {
                     info!("Executing preStop hook for container {}", container_name);
                     match self
-                        .execute_lifecycle_handler(&pre_stop, &container_name)
+                        .execute_lifecycle_handler(&pre_stop, &container_name, &spec_container)
                         .await
                     {
                         Ok(()) => info!(
@@ -8704,7 +8790,7 @@ mod tests {
                 exec: None,
                 http_get: Some(HTTPGetAction {
                     path: Some("/shutdown".to_string()),
-                    port: 8080,
+                    port: rusternetes_common::resources::IntOrString::Int(8080),
                     host: Some("localhost".to_string()),
                     scheme: Some("HTTP".to_string()),
                     http_headers: None,
@@ -8719,7 +8805,10 @@ mod tests {
         let handler = lifecycle.pre_stop.unwrap();
         assert!(handler.http_get.is_some());
         let http = handler.http_get.unwrap();
-        assert_eq!(http.port, 8080);
+        assert_eq!(
+            http.port,
+            rusternetes_common::resources::IntOrString::Int(8080)
+        );
         assert_eq!(http.path.as_deref(), Some("/shutdown"));
     }
 
@@ -9681,7 +9770,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: None,
@@ -9701,7 +9790,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/healthz".to_string()),
-            port: 8080,
+            port: rusternetes_common::resources::IntOrString::Int(8080),
             host: None,
             scheme: None,
             http_headers: None,
@@ -9721,7 +9810,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: None,
-            port: 80,
+            port: rusternetes_common::resources::IntOrString::Int(80),
             host: Some("my-service".to_string()),
             scheme: Some("HTTP".to_string()),
             http_headers: None,
@@ -9741,7 +9830,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: Some(vec![
@@ -11445,7 +11534,7 @@ mod tests {
                 host: None,
                 http_headers: None,
                 path: Some("/shutdown".to_string()),
-                port: 8080,
+                port: rusternetes_common::resources::IntOrString::Int(8080),
                 scheme: None,
             }),
             tcp_socket: None,
@@ -11458,7 +11547,7 @@ mod tests {
             http_get: None,
             tcp_socket: Some(TCPSocketAction {
                 host: None,
-                port: 9000,
+                port: rusternetes_common::resources::IntOrString::Int(9000),
             }),
             sleep: None,
         };
