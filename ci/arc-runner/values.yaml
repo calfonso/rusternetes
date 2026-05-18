@@ -29,3 +29,30 @@ template:
         # The default actions-runner image entrypoint runs the listener;
         # we keep that here so the custom image stays a drop-in replacement.
         command: ["/home/runner/run.sh"]
+        env:
+          # Cap parallel rustc invocations per pod. Cargo defaults to
+          # `nproc`, which on a 7.5-CPU node gives 7-8 concurrent rustc
+          # processes peaking at ~5.5 GiB resident — observed on a
+          # 2026-05-18 eviction (kubelet reclaimed the runner with
+          # `Container runner was using 5748148Ki, request is 0`). At 4
+          # jobs the peak drops to ~3-4 GiB and three runners co-fit on
+          # the 14 GiB node without eviction.
+          - name: CARGO_BUILD_JOBS
+            value: "4"
+        resources:
+          # Requests-only (no limits): kubelet's eviction prefers pods
+          # exceeding their request, so we want the request high enough
+          # that ordinary compile peaks stay UNDER it; bursts beyond it
+          # are allowed but only get evicted when the node itself is
+          # under pressure. Limits would convert bursts into hard
+          # OOMKills, which is worse for transient compile spikes.
+          requests:
+            memory: 4Gi
+            # 2 cores requested matches the productive parallelism we
+            # actually want from CARGO_BUILD_JOBS=4 (cargo will burst
+            # to 4 rustc threads when other pods are idle, but the
+            # scheduler reserves 2). Big node (7.5 CPU) fits three of
+            # these comfortably; small nodes (~0.5 CPU allocatable)
+            # can't, which is fine since they can't run a real Rust
+            # compile anyway.
+            cpu: "2"
