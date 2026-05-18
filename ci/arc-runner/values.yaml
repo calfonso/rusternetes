@@ -1,0 +1,20 @@
+# Helm values for the gha-runner-scale-set release `arc-runner-set`.
+#
+# Apply with:
+#
+#   helm upgrade arc-runner-set \
+#     --namespace arc-runners \
+#     --reuse-values \
+#     --values ci/arc-runner/values.yaml \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+#
+# `--reuse-values` keeps githubConfigUrl + githubConfigSecret set at
+# install time so we don't have to re-pass them.
+template:
+  spec:
+    containers:
+      - name: runner
+        image: ghcr.io/indyjonesnl/rusternetes-arc-runner:latest
+        # The default actions-runner image entrypoint runs the listener;
+        # we keep that here so the custom image stays a drop-in replacement.
+        command: ["/home/runner/run.sh"]

@@ -1,0 +1,69 @@
+name: Build ARC runner image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ci/arc-runner/Dockerfile
+      - .github/workflows/build-runner-image.yml
+  pull_request:
+    paths:
+      - ci/arc-runner/Dockerfile
+      - .github/workflows/build-runner-image.yml
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/indyjonesnl/rusternetes-arc-runner
+
+jobs:
+  build:
+    name: Build and push ARC runner image
+    # GH-hosted on purpose: the ARC runner pods don't have a docker
+    # daemon, and image builds happen rarely (only when this Dockerfile
+    # changes), so the minute cost is acceptable.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # PR runs from forks don't get write packages — skip the login so
+        # the build still verifies but won't try to push.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:sha-${short_sha}"
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "${IMAGE}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: ci/arc-runner
+          file: ci/arc-runner/Dockerfile
+          # Push only on direct pushes to main; PRs from this repo build
+          # but don't publish. Forks skip the login step above and so
+          # would fail to push anyway.
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
