@@ -42,7 +42,7 @@ That matches the prior art in
 | `StatefulSet should have a working scale subresource` | apps/statefulset.go:714 | PASS | `statefulset_should_have_a_working_scale_subresource` | mirrored, passing |
 | `StatefulSet should list, patch and delete a collection of StatefulSets` | apps/statefulset.go:760 | PASS | `statefulset_should_list_patch_and_delete_collection` | mirrored, passing |
 | `StatefulSet should validate Statefulset Status endpoints` | apps/statefulset.go:811 | PASS | `statefulset_should_validate_status_endpoint_fields` | mirrored, passing |
-| `StatefulSet AvailableReplicas should get updated accordingly when MinReadySeconds is enabled` | apps/statefulset.go (MinReadySeconds suite) | FAIL ("Other" bucket) | `statefulset_available_replicas_should_track_min_ready_seconds` | mirrored, ignored — `availableReplicas` / `minReadySeconds` not implemented in the controller |
+| `StatefulSet AvailableReplicas should get updated accordingly when MinReadySeconds is enabled` | apps/statefulset.go (MinReadySeconds suite) | PASS | `statefulset_available_replicas_should_track_min_ready_seconds` | mirrored, passing — `compute_status` filters by Ready=True `lastTransitionTime` ≥ `spec.minReadySeconds` |
 | `StatefulSet PVC retention — whenScaled=Delete reclaims PVCs` | apps/statefulset.go (PVC retention suite) | PASS | `statefulset_pvc_retention_policy_should_delete_pvcs_on_scale_down` | mirrored, passing — `gc_scaled_down_pvcs` deletes PVCs for ordinals beyond `spec.replicas` when `whenScaled=Delete` |
 | `StatefulSet PVC retention — whenScaled=Retain keeps PVCs` | apps/statefulset.go (PVC retention suite) | PASS | `statefulset_pvc_retention_policy_retain_keeps_pvcs_on_scale_down` | mirrored, passing (default Retain behaviour) |
 | `StatefulSet pods bind their headless Service via subdomain` | apps/statefulset.go (identity tests) | PASS | `statefulset_pods_should_bind_headless_service_via_subdomain` | mirrored, passing — `create_pod` stamps `pod.spec.subdomain` from `serviceName` |
@@ -59,10 +59,10 @@ That matches the prior art in
 
 ## Notes on intentional scope reductions
 
-- **`availableReplicas` / `minReadySeconds`** — the StatefulSet controller
-  populates `replicas`, `currentReplicas`, and `updatedReplicas` but does
-  not yet compute `availableReplicas` from `minReadySeconds`. The mirror
-  test is `#[ignore]`d so a future enablement is one re-run away.
+- **`availableReplicas` / `minReadySeconds`** — `compute_status` now
+  mirrors K8s `IsPodAvailable`: a pod counts toward `availableReplicas`
+  only when its Ready=True condition's `lastTransitionTime` is at least
+  `spec.minReadySeconds` in the past. The mirror test is enabled.
 - **PVC retention (`whenScaled=Delete`)** — `ensure_pvcs_for_ordinal`
   creates PVCs from `volumeClaimTemplates`, and `gc_scaled_down_pvcs`
   reclaims PVCs whose ordinal is beyond `spec.replicas` when the policy's

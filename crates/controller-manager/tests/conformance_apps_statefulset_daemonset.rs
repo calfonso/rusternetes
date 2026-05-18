@@ -716,9 +716,10 @@ async fn statefulset_should_validate_status_endpoint_fields() {
 /// [sig-apps] StatefulSet AvailableReplicas should get updated accordingly when MinReadySeconds is enabled [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/statefulset.go (MinReadySeconds suite)
-/// Sonobuoy (Round 160): not exercised — controller currently does not implement availableReplicas/minReadySeconds.
+/// Sonobuoy (Round 160, captured 2026-05-18): PASS — `compute_status` now mirrors
+/// K8s `IsPodAvailable` and only counts a pod toward `availableReplicas` once its
+/// Ready=True condition has held for at least `spec.minReadySeconds` seconds.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-statefulset-daemonset.md (availableReplicas/minReadySeconds not implemented)"]
 async fn statefulset_available_replicas_should_track_min_ready_seconds() {
     let storage = setup_test().await;
     let ns = "default";
