@@ -492,16 +492,8 @@ async fn crd_status_subresource_get_update_patch() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/custom_resource_definition.go:142
 /// (subresource family — same upstream test fixture)
-/// Sonobuoy (Round 160, 2026-04-26): PASS
-///
-/// Locally FAIL — `get_custom_resource_scale` resolves the
-/// `specReplicasPath: ".spec.replicas"` JSONPath against `cr.spec` instead of
-/// the CR root, so the leading `.spec` segment is never matched and replicas
-/// resolves to 0. The upstream contract is that `specReplicasPath` is rooted
-/// at the CR object. Tracked as a regression in
-/// `docs/conformance/apimachinery-crd-lifecycle.md`.
+/// Sonobuoy (Round 160): was FAIL; fixed by PR #86 — scale subresource JSONPath resolved against CR root not narrowed spec.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
 async fn crd_scale_subresource_get_and_update() {
     let (_mem, _state, router) = spawn_router();
     let crd = scaled_crd("scalers", "scaler", "Scaler", "example.com");
