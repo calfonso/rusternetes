@@ -697,6 +697,11 @@ fn validate_crd(crd: &CustomResourceDefinition) -> Result<()> {
         )));
     }
 
+    // Validate every served version's x-kubernetes-validations rules:
+    // syntax check, unknown-property check, and estimated-cost check.
+    // K8s rejects CRD creation when any rule is malformed.
+    crate::handlers::cel_validation::validate_crd_versions(crd)?;
+
     Ok(())
 }
 

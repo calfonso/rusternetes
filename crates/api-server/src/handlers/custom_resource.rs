@@ -474,8 +474,19 @@ pub async fn update_custom_resource(
     // Apply schema defaults before validation
     apply_schema_defaults(&crd, &version, &mut cr);
 
-    // Validate the resource against CRD schema
-    validate_custom_resource(&crd, &version, &cr)?;
+    // Load the prior version so transition rules (`oldSelf`) can be evaluated.
+    // Missing prior versions are not an error — the resource may be PUTting
+    // a fresh object (which K8s allows as create-on-PUT for some clients).
+    let resource_type_for_lookup = format!("{}_{}", group.replace('.', "_"), plural);
+    let old_key = if let Some(ref ns) = namespace {
+        build_key(&resource_type_for_lookup, Some(ns), &name)
+    } else {
+        build_key(&resource_type_for_lookup, None, &name)
+    };
+    let old_cr: Option<CustomResource> = state.storage.get(&old_key).await.ok();
+
+    // Validate the resource against CRD schema + CEL rules
+    validate_custom_resource_with_old(&crd, &version, &cr, old_cr.as_ref())?;
 
     // Check authorization
     let attrs = if let Some(ref ns) = namespace {
@@ -840,8 +851,10 @@ pub async fn patch_custom_resource(
         }
     }
 
-    // Validate the patched resource against CRD schema
-    validate_custom_resource(&crd, &version, &patched)?;
+    // Validate the patched resource against CRD schema + CEL rules.
+    // Pass the prior version (when one exists — server-side apply may create)
+    // so transition rules are evaluated.
+    validate_custom_resource_with_old(&crd, &version, &patched, current_result.as_ref().ok())?;
 
     // Ensure name matches
     patched.metadata.name = name.clone();
@@ -1309,8 +1322,33 @@ fn prune_value_against_schema(
     }
 }
 
-/// Validate a custom resource against its CRD schema
+/// Validate a custom resource against its CRD schema.
+///
+/// On UPDATE/PATCH callers should use [`validate_custom_resource_with_old`]
+/// so transition rules (`oldSelf`) are evaluated against the prior version.
 fn validate_custom_resource(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    cr: &CustomResource,
+) -> Result<()> {
+    validate_custom_resource_with_old(crd, version, cr, None)
+}
+
+/// Like [`validate_custom_resource`] but also evaluates `x-kubernetes-validations`
+/// transition rules using `old_cr` as the prior version for `oldSelf` bindings.
+fn validate_custom_resource_with_old(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    cr: &CustomResource,
+    old_cr: Option<&CustomResource>,
+) -> Result<()> {
+    validate_custom_resource_schema(crd, version, cr)?;
+    crate::handlers::cel_validation::validate_cr_against_crd(crd, version, cr, old_cr)
+}
+
+/// Schema-only portion of CR validation, kept as a separate helper so the
+/// CEL pass can run after structural validation is known to succeed.
+fn validate_custom_resource_schema(
     crd: &CustomResourceDefinition,
     version: &str,
     cr: &CustomResource,
