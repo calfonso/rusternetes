@@ -200,6 +200,47 @@ async fn start_mutator_label(key: String, value: String) -> (String, oneshot::Se
     (format!("http://{}", addr), tx)
 }
 
+/// Mutating mock that adds an arbitrary JSON pointer path → value. Used by the
+/// structural-schema pruning test: the path lands inside the CR's `spec` so
+/// the api-server's post-mutation pruning pass can strip it when the CRD
+/// schema doesn't declare the field.
+async fn start_mutator_path(path: String, value: Value) -> (String, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel();
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(move |r: AdmissionReview| {
+            let request = match r.request {
+                Some(r) => r,
+                None => {
+                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
+                }
+            };
+            let patch = vec![PatchOperation {
+                op: PatchOp::Add,
+                path: path.clone(),
+                value: Some(value.clone()),
+                from: None,
+            }];
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&patch).unwrap());
+            warp::reply::json(&wrap(AdmissionReviewResponse {
+                uid: request.uid,
+                allowed: true,
+                status: None,
+                patch: Some(b64),
+                patch_type: Some("JSONPatch".to_string()),
+                audit_annotations: None,
+                warnings: None,
+            }))
+        });
+    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+        rx.await.ok();
+    });
+    tokio::spawn(srv);
+    (format!("http://{}", addr), tx)
+}
+
 /// Mutating mock that adds an init container to a pod (`/spec/initContainers`).
 /// Mirrors the upstream `addPodSpec`-style mutation that the
 /// "mutate pod and apply defaults after mutation" test relies on.
@@ -1097,21 +1138,65 @@ async fn should_mutate_custom_resource_with_different_stored_version() {
 /// pruning [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:323
-/// Sonobuoy (Round 160): FAIL — "Webhook admission" bucket. The expected
-/// behaviour is: webhook adds a field, then schema-driven pruning removes
-/// it because the CRD's `openAPIV3Schema` does not declare it. The current
-/// gap is that the mutate+prune pipeline in the api-server doesn't run
-/// pruning after the mutating webhook patch.
+///
+/// Verifies the K8s contract: after a mutating webhook injects a field into
+/// a CR via JSON patch, the api-server runs structural-schema pruning. Any
+/// field absent from the CRD's `openAPIV3Schema` must be stripped (unless
+/// `x-kubernetes-preserve-unknown-fields` is set).
+///
+/// Setup: a CRD declares `spec.replicas` only. A mutating webhook adds an
+/// extra field `/spec/notInSchema`. After `run_mutating_webhooks`, the
+/// returned object must have `spec.replicas` intact and `spec.notInSchema`
+/// removed by the pruning pass.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-admission-webhooks.md"]
 async fn should_mutate_custom_resource_with_pruning() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
 
-    // Mutator adds a label key that the (notional) CRD schema doesn't
-    // declare. Pruning would strip it; in the regression it survives.
+    // Persist a CRD whose structural schema declares only `spec.replicas`.
+    // Pruning must remove any other field a webhook injects under `spec`.
+    let crd_json = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "foos.example.com"},
+        "spec": {
+            "group": "example.com",
+            "names": {"plural": "foos", "singular": "foo", "kind": "Foo", "listKind": "FooList"},
+            "scope": "Namespaced",
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object",
+                                "properties": {
+                                    "replicas": {"type": "integer"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }
+    });
+    let crd: rusternetes_common::resources::CustomResourceDefinition =
+        serde_json::from_value(crd_json).unwrap();
+    mem.create(
+        &build_key("customresourcedefinitions", None, "foos.example.com"),
+        &crd,
+    )
+    .await
+    .unwrap();
+
+    // Mutator adds an unknown field under `spec`. With the CRD above this
+    // field is NOT in the schema, so the api-server must strip it after the
+    // webhook returns.
     let (url, _shutdown) =
-        start_mutator_label("not-in-schema".into(), "should-be-pruned".into()).await;
+        start_mutator_path("/spec/notInSchema".into(), json!("should-be-pruned")).await;
 
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
@@ -1132,7 +1217,8 @@ async fn should_mutate_custom_resource_with_pruning() {
     let cr = Some(json!({
         "apiVersion": "example.com/v1",
         "kind": "Foo",
-        "metadata": {"name": "cr-prune", "labels": {}}
+        "metadata": {"name": "cr-prune"},
+        "spec": {"replicas": 3}
     }));
     let (_resp, mutated) = manager
         .run_mutating_webhooks(
@@ -1156,9 +1242,14 @@ async fn should_mutate_custom_resource_with_pruning() {
         .await
         .unwrap();
     let obj = mutated.expect("mutated CR");
+    assert_eq!(
+        obj["spec"]["replicas"],
+        json!(3),
+        "declared schema fields must survive pruning; got {obj}"
+    );
     assert!(
-        obj["metadata"]["labels"].get("not-in-schema").is_none(),
-        "schema pruning must remove the webhook-added label after mutation; got {obj}"
+        obj["spec"].get("notInSchema").is_none(),
+        "schema pruning must remove the webhook-added field after mutation; got {obj}"
     );
 }
 

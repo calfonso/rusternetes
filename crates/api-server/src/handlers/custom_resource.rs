@@ -1284,7 +1284,7 @@ fn prune_custom_resource(crd: &CustomResourceDefinition, version: &str, cr: &mut
 /// enclosing object) carries x-kubernetes-preserve-unknown-fields.
 ///
 /// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning/prune.go
-fn prune_value_against_schema(
+pub(crate) fn prune_value_against_schema(
     value: &mut serde_json::Value,
     schema: &rusternetes_common::resources::JSONSchemaProps,
     path: &str,
@@ -1319,6 +1319,64 @@ fn prune_value_against_schema(
             }
         }
         _ => {}
+    }
+}
+
+/// Prune a CR represented as a raw JSON `Value` against its CRD's structural
+/// schema. Used by the admission webhook pipeline after mutating webhooks
+/// apply JSON patches, so any unknown field a webhook injects is stripped
+/// before the value is persisted (mirrors the in-handler `prune_custom_resource`
+/// path used on the `CustomResource` struct).
+///
+/// Top-level `apiVersion`, `kind`, and `metadata` are never pruned — they are
+/// owned by the Kubernetes object meta, not the structural schema.
+///
+/// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning/prune.go
+pub(crate) fn prune_custom_resource_value(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    value: &mut serde_json::Value,
+) {
+    let Some(crd_version) = crd.spec.versions.iter().find(|v| v.name == version) else {
+        return;
+    };
+
+    // Spec-level preserveUnknownFields disables structural-schema pruning.
+    if crd.spec.preserve_unknown_fields == Some(true) {
+        return;
+    }
+
+    let Some(validation) = &crd_version.schema else {
+        return;
+    };
+    let schema = &validation.open_apiv3_schema;
+
+    // Root-level preserveUnknownFields disables pruning for the whole object.
+    if schema.x_kubernetes_preserve_unknown_fields == Some(true) {
+        return;
+    }
+
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+
+    // Top-level keys allowed even without an explicit schema entry — these
+    // are k8s object meta, not part of the CRD's structural schema.
+    const META_KEYS: &[&str] = &["apiVersion", "kind", "metadata"];
+
+    let schema_props = schema.properties.as_ref();
+    let allowed_top: std::collections::HashSet<&str> = schema_props
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    obj.retain(|k, _| META_KEYS.contains(&k.as_str()) || allowed_top.contains(k.as_str()));
+
+    if let Some(props) = schema_props {
+        for (k, child_schema) in props {
+            if let Some(child_val) = obj.get_mut(k) {
+                prune_value_against_schema(child_val, child_schema, k);
+            }
+        }
     }
 }
 
