@@ -460,6 +460,19 @@ impl<S: Storage + 'static> DeploymentController<S> {
             deployment.metadata.name
         );
 
+        // Paused deployments freeze all rollout activity: no new ReplicaSet
+        // creation, no scaling of existing RSes (up or down). Status is still
+        // refreshed so callers see current replica counts.
+        // K8s ref: pkg/controller/deployment/deployment_controller.go — syncDeployment
+        // delegates to sync() (status-only path) when d.Spec.Paused is true.
+        if deployment.spec.paused.unwrap_or(false) {
+            debug!(
+                "Deployment {}/{} is paused; skipping rollout (status only)",
+                namespace, deployment.metadata.name
+            );
+            return self.update_deployment_status(deployment).await;
+        }
+
         // Find the active ReplicaSet (matches current pod template)
         let active_rs = owned_replicasets
             .iter()
