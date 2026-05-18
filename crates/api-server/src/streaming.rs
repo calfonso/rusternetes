@@ -9,13 +9,26 @@ use rusternetes_common::resources::Pod;
 use tracing::{debug, error, info};
 
 /// Handle WebSocket exec by proxying to the kubelet
+///
+/// Implements the Kubernetes `v5.channel.k8s.io` (and back-compat `v4`/`v1`)
+/// WebSocket exec protocol. Channels are prefixed on every binary frame:
+///   0 = stdin (client → server)
+///   1 = stdout (server → client)
+///   2 = stderr (server → client)
+///   3 = error / status (server → client, JSON-encoded `metav1.Status`)
+///   4 = resize (client → server, TerminalSize JSON for TTY)
+///
+/// `v5` additionally supports a "close stream" control message: a binary
+/// frame containing only the channel byte indicates the client has finished
+/// sending on that stream. We honor this by closing stdin to the runtime
+/// so processes like `cat` exit cleanly.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_ws_exec(
     mut socket: WebSocket,
     pod: Pod,
     container_name: String,
     command: Vec<String>,
-    _stdin: bool,
+    stdin: bool,
     _stdout: bool,
     _stderr: bool,
     tty: bool,
@@ -35,15 +48,15 @@ pub async fn handle_ws_exec(
         Docker::connect_with_local_defaults().expect("Failed to connect to container runtime")
     });
     info!(
-        "WS exec: using container runtime client for {}",
-        container_id
+        "WS exec: using container runtime client for {} (stdin={}, tty={})",
+        container_id, stdin, tty
     );
 
     let exec_config = CreateExecOptions {
         cmd: Some(command.iter().map(|s| s.as_str()).collect()),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
-        attach_stdin: Some(false),
+        attach_stdin: Some(stdin),
         tty: Some(tty),
         ..Default::default()
     };
@@ -95,19 +108,68 @@ pub async fn handle_ws_exec(
     // (stdin, close) concurrently with writing exec output.
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Spawn a task to drain incoming WebSocket messages. Without this, the
-    // client's messages (close frames, pings) fill the buffer and the
-    // connection stalls. Forward stdin (channel 0) if stdin is enabled.
+    let (mut output_stream, exec_input) = match output {
+        StartExecResults::Attached { output, input } => (output, Some(input)),
+        StartExecResults::Detached => {
+            // No streams to attach — just send a Success status and close.
+            let mut status_data = vec![3u8];
+            status_data.extend_from_slice(br#"{"status":"Success"}"#);
+            let _ = ws_sender.send(Message::Binary(status_data)).await;
+            let _ = ws_sender
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1000,
+                    reason: "".to_string().into(),
+                })))
+                .await;
+            return;
+        }
+    };
+
+    // Spawn a task to drain incoming WebSocket messages and forward stdin to
+    // the exec process. Without this drain, client pings/close frames stall
+    // the connection. v5 also defines a "close stream" message (just the
+    // channel byte) which we honor by dropping the writer half for stdin.
     let client_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let client_closed2 = client_closed.clone();
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut exec_input = exec_input;
         while let Some(msg) = ws_receiver.next().await {
             match msg {
                 Ok(Message::Close(_)) | Err(_) => {
                     client_closed2.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(mut w) = exec_input.take() {
+                        let _ = w.shutdown().await;
+                    }
                     break;
                 }
-                _ => {} // Consume pings, pongs, stdin data
+                Ok(Message::Binary(data)) if !data.is_empty() => {
+                    let channel = data[0];
+                    let payload = &data[1..];
+                    match channel {
+                        0 => {
+                            // stdin frame
+                            if payload.is_empty() {
+                                // v5 close-stream signal for stdin
+                                if let Some(mut w) = exec_input.take() {
+                                    let _ = w.shutdown().await;
+                                }
+                            } else if let Some(w) = exec_input.as_mut() {
+                                if w.write_all(payload).await.is_err() {
+                                    let _ = w.shutdown().await;
+                                    exec_input = None;
+                                } else {
+                                    let _ = w.flush().await;
+                                }
+                            }
+                        }
+                        // Channel 4 (resize) and other channels are accepted
+                        // but not acted on — bollard doesn't expose resize_exec
+                        // here, and channels 1-3 are server→client only.
+                        _ => {}
+                    }
+                }
+                _ => {} // ignore text frames, pings, pongs
             }
         }
     });
@@ -119,41 +181,47 @@ pub async fn handle_ws_exec(
     // exec command produces no output or finishes before we read from the stream.
     let _ = ws_sender.send(Message::Binary(vec![1u8])).await;
 
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = output
-    {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
-                Ok(Some(Ok(msg))) => {
-                    match msg {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            let mut data = vec![1u8]; // stdout channel
-                            data.extend_from_slice(&message);
-                            if ws_sender.send(Message::Binary(data)).await.is_err() {
-                                break;
-                            }
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            let mut data = vec![2u8]; // stderr channel
-                            data.extend_from_slice(&message);
-                            if ws_sender.send(Message::Binary(data)).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Some(Err(_))) | Ok(None) => break,
-                Err(_) => {
-                    // 1s timeout hit — check if command finished
-                    if let Ok(info) = docker.inspect_exec(&exec.id).await {
-                        if !info.running.unwrap_or(false) {
-                            break;
-                        }
-                    } else {
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), output_stream.next()).await {
+            Ok(Some(Ok(msg))) => match msg {
+                bollard::container::LogOutput::StdOut { message } => {
+                    let mut data = vec![1u8]; // stdout channel
+                    data.extend_from_slice(&message);
+                    if ws_sender.send(Message::Binary(data)).await.is_err() {
                         break;
                     }
+                }
+                bollard::container::LogOutput::StdErr { message } => {
+                    let mut data = vec![2u8]; // stderr channel
+                    data.extend_from_slice(&message);
+                    if ws_sender.send(Message::Binary(data)).await.is_err() {
+                        break;
+                    }
+                }
+                // Some runtimes (TTY mode) deliver everything as Console.
+                // Treat console output as stdout for client compatibility.
+                bollard::container::LogOutput::Console { message } => {
+                    let mut data = vec![1u8];
+                    data.extend_from_slice(&message);
+                    if ws_sender.send(Message::Binary(data)).await.is_err() {
+                        break;
+                    }
+                }
+                _ => {}
+            },
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => {
+                // 1s timeout hit — check if command finished
+                if let Ok(info) = docker.inspect_exec(&exec.id).await {
+                    if !info.running.unwrap_or(false) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                // Also bail if client disconnected
+                if client_closed.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
                 }
             }
         }
