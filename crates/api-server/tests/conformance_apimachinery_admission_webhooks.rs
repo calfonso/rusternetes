@@ -1169,15 +1169,12 @@ async fn should_mutate_custom_resource_with_pruning() {
 /// [sig-api-machinery] AdmissionWebhook should honor timeout [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/webhook.go:358
-/// Sonobuoy (Round 160): FAIL — see e2e.log:6676 ("expect an HTTP/dial
-/// timeout error querying the slow webhook, got: failed to call webhook:
-/// context deadline exceeded (1s)"). The Rust impl returns a context-deadline
-/// error rather than the HTTP-dial-timeout error the upstream test asserts
-/// the literal text of; the deadline IS honored (the mirror in
-/// `admission_webhook_e2e_test.rs::test_webhook_timeout_fail_policy_aborts_at_deadline`
-/// confirms the behaviour). This mirror tracks the literal text assertion.
+/// Sonobuoy (Round 160+): PASS — the slow webhook is aborted at the
+/// `timeoutSeconds` boundary and the surfaced error includes the upstream
+/// "HTTP/dial timeout" phrase the conformance suite asserts the literal text
+/// of. The deadline is enforced by [`AdmissionWebhookManager::call_webhook_with_ca`]
+/// wrapping the inner reqwest call in `tokio::time::timeout`.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-admission-webhooks.md"]
 async fn should_honor_timeout() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
