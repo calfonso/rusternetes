@@ -36,6 +36,35 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
     }
 
+    /// Write a pod update with one-attempt retry on resource-version Conflict
+    /// and tracing for all other errors. Avoids silently dropping storage
+    /// failures from `let _ = storage.update(...)`. The mutator is re-applied
+    /// to the freshly-read pod on Conflict, so it must be idempotent.
+    async fn update_pod_with_retry<F>(&self, pod_key: &str, mutate: F)
+    where
+        F: Fn(&mut Pod) + Send,
+    {
+        for attempt in 0..2 {
+            let mut pod: Pod = match self.storage.get(pod_key).await {
+                Ok(p) => p,
+                Err(rusternetes_common::Error::NotFound(_)) => return,
+                Err(e) => {
+                    error!(error = %e, pod = pod_key, "scheduler: failed to read pod");
+                    return;
+                }
+            };
+            mutate(&mut pod);
+            match self.storage.update(pod_key, &pod).await {
+                Ok(_) => return,
+                Err(rusternetes_common::Error::Conflict(_)) if attempt == 0 => continue,
+                Err(e) => {
+                    error!(error = %e, pod = pod_key, "scheduler: failed to update pod");
+                    return;
+                }
+            }
+        }
+    }
+
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         use futures::StreamExt;
 
@@ -202,7 +231,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 if let Some(ref mut spec) = pod.spec {
                     spec.priority = Some(resolved);
                 }
-                let _ = self.storage.update(&pod_key, &pod).await;
+                self.update_pod_with_retry(&pod_key, |p| {
+                    if let Some(ref mut spec) = p.spec {
+                        if spec.priority.is_none() {
+                            spec.priority = Some(resolved);
+                        }
+                    }
+                })
+                .await;
             }
         }
 
@@ -321,12 +357,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
                     let pod_key =
                         rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
-                    if let Ok(mut stored_pod) = self.storage.get::<Pod>(&pod_key).await {
-                        if let Some(ref mut spec) = stored_pod.spec {
-                            spec.priority = Some(resolved);
+                    self.update_pod_with_retry(&pod_key, |p| {
+                        if let Some(ref mut spec) = p.spec {
+                            if spec.priority.is_none() {
+                                spec.priority = Some(resolved);
+                            }
                         }
-                        let _ = self.storage.update(&pod_key, &stored_pod).await;
-                    }
+                    })
+                    .await;
                 }
             }
             // 5-second timeout per pod — if scheduling takes longer (e.g.,
@@ -413,12 +451,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                 if let Err(e) = self.bind_pod_to_node(fresh_pod, &node_name).await {
                                     error!("Failed to bind preemptor to nominated node: {}", e);
                                     // Fall back to setting nominatedNodeName
-                                    if let Ok(mut p) = self.storage.get::<Pod>(&pod_key).await {
+                                    let nn = node_name.clone();
+                                    self.update_pod_with_retry(&pod_key, |p| {
                                         if let Some(ref mut status) = p.status {
-                                            status.nominated_node_name = Some(node_name.clone());
+                                            status.nominated_node_name = Some(nn.clone());
                                         }
-                                        let _ = self.storage.update(&pod_key, &p).await;
-                                    }
+                                    })
+                                    .await;
                                 } else {
                                     info!(
                                         "Immediately bound preemptor pod {} to node {}",
@@ -427,25 +466,27 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                 }
                             } else {
                                 // Resources not yet free (victims still running) — set nominatedNodeName
-                                if let Ok(mut p) = self.storage.get::<Pod>(&pod_key).await {
+                                let nn = node_name.clone();
+                                self.update_pod_with_retry(&pod_key, |p| {
                                     if let Some(ref mut status) = p.status {
-                                        status.nominated_node_name = Some(node_name.clone());
+                                        status.nominated_node_name = Some(nn.clone());
                                     }
-                                    let _ = self.storage.update(&pod_key, &p).await;
-                                    info!(
-                                        "Set nominatedNodeName={} on preempting pod {} (resources not yet free)",
-                                        node_name, pod.metadata.name
-                                    );
-                                }
+                                })
+                                .await;
+                                info!(
+                                    "Set nominatedNodeName={} on preempting pod {} (resources not yet free)",
+                                    node_name, pod.metadata.name
+                                );
                             }
                         } else {
                             // Node not found — set nominatedNodeName anyway
-                            if let Ok(mut p) = self.storage.get::<Pod>(&pod_key).await {
+                            let nn = node_name.clone();
+                            self.update_pod_with_retry(&pod_key, |p| {
                                 if let Some(ref mut status) = p.status {
-                                    status.nominated_node_name = Some(node_name.clone());
+                                    status.nominated_node_name = Some(nn.clone());
                                 }
-                                let _ = self.storage.update(&pod_key, &p).await;
-                            }
+                            })
+                            .await;
                         }
                     }
 
@@ -464,12 +505,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     );
                     let pod_key =
                         rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
-                    if let Ok(mut p) = self.storage.get::<Pod>(&pod_key).await {
+                    let msg = sched_message.clone();
+                    self.update_pod_with_retry(&pod_key, |p| {
                         let condition = rusternetes_common::resources::PodCondition {
                             condition_type: "PodScheduled".to_string(),
                             status: "False".to_string(),
                             reason: Some("Unschedulable".to_string()),
-                            message: Some(sched_message.clone()),
+                            message: Some(msg.clone()),
                             last_transition_time: Some(chrono::Utc::now()),
                             observed_generation: None,
                         };
@@ -478,8 +520,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             conditions.retain(|c| c.condition_type != "PodScheduled");
                             conditions.push(condition);
                         }
-                        let _ = self.storage.update(&pod_key, &p).await;
-                    }
+                    })
+                    .await;
 
                     // Emit FailedScheduling event — K8s conformance tests wait for this
                     let event_name = format!(
