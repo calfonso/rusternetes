@@ -65,13 +65,15 @@ jobs:
         # ARC runner pods are ephemeral, so anything the build needs has
         # to be installed per-job until we bake a custom runner image.
         # `sudo` is preconfigured NOPASSWD on the actions-runner user.
-        # - protobuf-compiler: protoc for kubelet CRI proto codegen
+        # - protobuf-compiler: protoc binary for CRI + openapiv2 codegen
+        # - libprotobuf-dev: well-known protos (google/protobuf/any.proto)
+        #   that api-server/build.rs imports without vendoring them
         # - mold + clang: fast linker for api-server / kubelet binaries
         # - pkg-config + libssl-dev: required by openssl-sys
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler mold clang pkg-config libssl-dev
+            protobuf-compiler libprotobuf-dev mold clang pkg-config libssl-dev
           protoc --version
           mold --version
           clang --version | head -1
