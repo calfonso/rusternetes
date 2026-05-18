@@ -801,8 +801,42 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             .iter()
             .filter(|p| is_ready(p))
             .count() as i32;
-        // availableReplicas = same as ready for now (minReadySeconds=0 default)
-        let final_available_pods = final_ready_pods;
+        // availableReplicas = pods that have been Ready for at least
+        // `spec.minReadySeconds`. K8s computes this via IsPodAvailable
+        // (pkg/api/v1/pod/util.go), which looks at the Ready condition's
+        // `lastTransitionTime` and checks whether the elapsed wall-clock
+        // duration meets the threshold. When `minReadySeconds` is zero (the
+        // default) every ready pod is immediately available.
+        let min_ready_seconds = statefulset.spec.min_ready_seconds.unwrap_or(0).max(0);
+        let now = chrono::Utc::now();
+        let is_available = |pod: &&Pod| -> bool {
+            if !is_ready(pod) {
+                return false;
+            }
+            if min_ready_seconds == 0 {
+                return true;
+            }
+            let ready_since = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .and_then(|conds| {
+                    conds
+                        .iter()
+                        .find(|c| c.condition_type == "Ready" && c.status == "True")
+                        .and_then(|c| c.last_transition_time)
+                });
+            match ready_since {
+                Some(ts) => now.signed_duration_since(ts).num_seconds() >= min_ready_seconds as i64,
+                // No transition timestamp means we can't prove the pod has met
+                // the threshold yet — treat as not-available.
+                None => false,
+            }
+        };
+        let final_available_pods = statefulset_pods_after
+            .iter()
+            .filter(|p| is_available(p))
+            .count() as i32;
 
         // Generate a revision hash from the current pod template spec
         let update_revision = Self::compute_revision(&statefulset.spec.template);
