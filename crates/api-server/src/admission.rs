@@ -1157,7 +1157,13 @@ pub async fn check_count_quota<S: Storage>(
     resource_type: &str,
 ) -> Result<(), rusternetes_common::Error> {
     let quota_prefix = format!("/registry/resourcequotas/{}/", namespace);
-    let quotas: Vec<ResourceQuota> = storage.list(&quota_prefix).await.unwrap_or_default();
+    let quotas: Vec<ResourceQuota> = match storage.list(&quota_prefix).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, namespace, "failed to list resource quotas; skipping count quota check");
+            return Ok(());
+        }
+    };
 
     for quota in &quotas {
         if let Some(hard) = &quota.spec.hard {
@@ -1168,8 +1174,16 @@ pub async fn check_count_quota<S: Storage>(
                     let limit: i64 = limit_str.parse().unwrap_or(i64::MAX);
                     // Count current resources
                     let prefix = format!("/registry/{}/{}/", resource_type, namespace);
-                    let current: Vec<serde_json::Value> =
-                        storage.list(&prefix).await.unwrap_or_default();
+                    let current: Vec<serde_json::Value> = match storage.list(&prefix).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(error = %e, namespace, resource_type, "failed to list resources for quota check; treating as over-quota");
+                            return Err(rusternetes_common::Error::Forbidden(format!(
+                                "could not verify quota for {}: {}",
+                                limit_key, e
+                            )));
+                        }
+                    };
                     if current.len() as i64 >= limit {
                         return Err(rusternetes_common::Error::Forbidden(format!(
                             "exceeded quota: {}, requested: 1, used: {}, limited: {}",
