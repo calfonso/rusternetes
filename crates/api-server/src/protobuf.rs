@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_core_v1_kinds(&mut schemas);
         Self::register_apps_v1(&mut schemas);
 
         ProtoRegistry { schemas }
@@ -2383,6 +2384,445 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_core_v1_kinds(schemas: &mut HashMap<String, MessageSchema>) {
+        // Binding — core/v1
+        schemas.insert(
+            "Binding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "target".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ComponentStatus / ComponentCondition
+        schemas.insert(
+            "ComponentStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ComponentCondition".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ComponentCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (3, ("message".into(), FieldType::String)),
+                    (4, ("error".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // Event / EventSeries / EventSource
+        schemas.insert(
+            "Event".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "involvedObject".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (3, ("reason".into(), FieldType::String)),
+                    (4, ("message".into(), FieldType::String)),
+                    (
+                        5,
+                        ("source".into(), FieldType::Message("EventSource".into())),
+                    ),
+                    (
+                        6,
+                        ("firstTimestamp".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        7,
+                        ("lastTimestamp".into(), FieldType::Message("Time".into())),
+                    ),
+                    (8, ("count".into(), FieldType::Int)),
+                    (9, ("type".into(), FieldType::String)),
+                    (
+                        10,
+                        ("eventTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (
+                        11,
+                        ("series".into(), FieldType::Message("EventSeries".into())),
+                    ),
+                    (12, ("action".into(), FieldType::String)),
+                    (
+                        13,
+                        (
+                            "related".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (14, ("reportingComponent".into(), FieldType::String)),
+                    (15, ("reportingInstance".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EventSeries".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("count".into(), FieldType::Int)),
+                    (
+                        2,
+                        (
+                            "lastObservedTime".into(),
+                            FieldType::Message("MicroTime".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EventSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("component".into(), FieldType::String)),
+                    (2, ("host".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // LimitRange / LimitRangeSpec / LimitRangeItem
+        schemas.insert(
+            "LimitRange".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("LimitRangeSpec".into())),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LimitRangeSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "limits".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("LimitRangeItem".into()))),
+                    ),
+                )]),
+            },
+        );
+        // LimitRangeItem: max/min/default/defaultRequest/maxLimitRequestRatio are
+        // map<string, Quantity> — Quantity is a leaf scalar with no schema entry,
+        // so we skip those fields silently. Only `type` is registered.
+        schemas.insert(
+            "LimitRangeItem".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("type".into(), FieldType::String))]),
+            },
+        );
+
+        // PersistentVolume / PersistentVolumeSpec / PersistentVolumeStatus / VolumeNodeAffinity
+        schemas.insert(
+            "PersistentVolume".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("PersistentVolumeSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("PersistentVolumeStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // PersistentVolumeSpec.capacity is map<string, Quantity> — skipped.
+        // persistentVolumeSource (field 2) references PersistentVolumeSource, which
+        // is not registered (one of many vendor volume sources excluded from this
+        // worker's scope) — it will decode to `{}` per the registry's fallback.
+        schemas.insert(
+            "PersistentVolumeSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        2,
+                        (
+                            "persistentVolumeSource".into(),
+                            FieldType::Message("PersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "accessModes".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "claimRef".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        5,
+                        ("persistentVolumeReclaimPolicy".into(), FieldType::String),
+                    ),
+                    (6, ("storageClassName".into(), FieldType::String)),
+                    (
+                        7,
+                        (
+                            "mountOptions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (8, ("volumeMode".into(), FieldType::String)),
+                    (
+                        9,
+                        (
+                            "nodeAffinity".into(),
+                            FieldType::Message("VolumeNodeAffinity".into()),
+                        ),
+                    ),
+                    (10, ("volumeAttributesClassName".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PersistentVolumeStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("phase".into(), FieldType::String)),
+                    (2, ("message".into(), FieldType::String)),
+                    (3, ("reason".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "lastPhaseTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // VolumeNodeAffinity.required references NodeSelector which is not yet
+        // registered — decodes as `{}`. Field number per generated.proto.
+        schemas.insert(
+            "VolumeNodeAffinity".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    ("required".into(), FieldType::Message("NodeSelector".into())),
+                )]),
+            },
+        );
+
+        // PersistentVolumeClaimTemplate
+        schemas.insert(
+            "PersistentVolumeClaimTemplate".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("PersistentVolumeClaimSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // PodStatusResult
+        schemas.insert(
+            "PodStatusResult".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("status".into(), FieldType::Message("PodStatus".into()))),
+                ]),
+            },
+        );
+
+        // PodTemplate
+        schemas.insert(
+            "PodTemplate".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "template".into(),
+                            FieldType::Message("PodTemplateSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // RangeAllocation
+        schemas.insert(
+            "RangeAllocation".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("range".into(), FieldType::String)),
+                    (3, ("data".into(), FieldType::Bytes)),
+                ]),
+            },
+        );
+
+        // ResourceQuota / ResourceQuotaSpec / ResourceQuotaStatus
+        schemas.insert(
+            "ResourceQuota".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ResourceQuotaSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("ResourceQuotaStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // ResourceQuotaSpec.hard is map<string, Quantity> — skipped.
+        schemas.insert(
+            "ResourceQuotaSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        2,
+                        (
+                            "scopes".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "scopeSelector".into(),
+                            FieldType::Message("ScopeSelector".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // ResourceQuotaStatus.hard and .used are map<string, Quantity> — skipped.
+        // No non-Quantity fields remain, but register an empty schema so the type
+        // is known to the decoder (otherwise nested decode produces a missing-schema
+        // warning instead of `{}`).
+        schemas.insert(
+            "ResourceQuotaStatus".into(),
+            MessageSchema {
+                fields: HashMap::new(),
+            },
+        );
+
+        // ScopeSelector / ScopedResourceSelectorRequirement
+        schemas.insert(
+            "ScopeSelector".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "matchExpressions".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "ScopedResourceSelectorRequirement".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "ScopedResourceSelectorRequirement".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("scopeName".into(), FieldType::String)),
+                    (2, ("operator".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "values".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
                 ]),
             },
         );
