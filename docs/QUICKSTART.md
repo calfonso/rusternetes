@@ -97,7 +97,7 @@ Standard `kubectl` works because rusternetes implements the same REST API as ups
 | Kubelet (node-1, node-2) | Container runtime via Docker/bollard, probes, volumes |
 | Kube-Proxy | iptables ClusterIP/NodePort/LoadBalancer routing |
 | CoreDNS | Kubernetes service discovery |
-| Storage | etcd (default) or SQLite via [Rhino](https://github.com/calfonso/rhino) |
+| Storage | etcd (default), SQLite, or Redis via [Rhino](https://github.com/calfonso/rhino) |
 | Default StorageClass | `standard` with `rusternetes.io/hostpath` provisioner |
 
 TLS certificates are auto-generated in `.rusternetes/certs/`.
@@ -118,13 +118,32 @@ docker compose -f docker-compose.sqlite.yml up -d
 bash scripts/bootstrap-cluster.sh
 ```
 
+## Alternative: Redis Instead of etcd
+
+Same cluster, but [Rhino](https://github.com/calfonso/rhino) replaces etcd with Redis:
+
+```bash
+# Podman
+podman compose -f compose.redis.yml build
+podman compose -f compose.redis.yml up -d
+
+bash scripts/bootstrap-cluster.sh
+```
+
 ## Alternative: All-in-One Binary
 
-Full Kubernetes in a single process with embedded SQLite — no Docker Compose, no etcd:
+Full Kubernetes in a single process with embedded SQLite -- no Docker Compose, no etcd:
 
 ```bash
 cargo build -p rusternetes --release
 ./target/release/rusternetes --data-dir ./cluster.db --console-dir ./console/dist
+```
+
+Or with Redis instead of SQLite:
+
+```bash
+cargo build -p rusternetes --features redis --release
+./target/release/rusternetes --storage-backend redis --redis-url redis://localhost:6379 --console-dir ./console/dist
 ```
 
 Open `https://localhost:6443/console/` for the web console.
