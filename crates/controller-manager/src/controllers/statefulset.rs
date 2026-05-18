@@ -616,6 +616,14 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
+        // PVC retention policy: when `whenScaled=Delete`, garbage-collect PVCs
+        // whose ordinal is beyond the desired replica count. K8s creates a PVC
+        // per ordinal from `volumeClaimTemplates`; on scale-down those PVCs
+        // become orphaned and must be reclaimed (default policy is `Retain`).
+        // See: pkg/controller/statefulset/stateful_set_control.go (PVC GC).
+        self.gc_scaled_down_pvcs(statefulset, namespace, desired_replicas)
+            .await?;
+
         // Rolling update: if replica count matches but pods have old revision, delete one at a time.
         // The controller will recreate them with the new template on the next reconcile.
         // Skip if updateStrategy is OnDelete (user must manually delete pods to trigger update).
@@ -1016,6 +1024,92 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     "Created PVC {} for StatefulSet {}/{}",
                     pvc_name, namespace, statefulset.metadata.name
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete PVCs for ordinals at or above `desired_replicas` when the
+    /// StatefulSet's `persistentVolumeClaimRetentionPolicy.whenScaled` is
+    /// `Delete`. PVCs are matched via the `<template>-<statefulset>-<ordinal>`
+    /// naming scheme used in `ensure_pvcs_for_ordinal`. Other policies
+    /// (`Retain`, unset) leave the PVCs in place.
+    async fn gc_scaled_down_pvcs(
+        &self,
+        statefulset: &StatefulSet,
+        namespace: &str,
+        desired_replicas: i32,
+    ) -> Result<()> {
+        let when_scaled = statefulset
+            .spec
+            .persistent_volume_claim_retention_policy
+            .as_ref()
+            .and_then(|p| p.when_scaled.as_deref());
+        if when_scaled != Some("Delete") {
+            return Ok(());
+        }
+        let Some(templates) = statefulset.spec.volume_claim_templates.as_ref() else {
+            return Ok(());
+        };
+        if templates.is_empty() {
+            return Ok(());
+        }
+
+        let ss_name = &statefulset.metadata.name;
+        let ss_uid = &statefulset.metadata.uid;
+        let pvc_prefix = format!("/registry/persistentvolumeclaims/{}/", namespace);
+        let pvcs: Vec<PersistentVolumeClaim> =
+            self.storage.list(&pvc_prefix).await.unwrap_or_default();
+
+        for pvc in pvcs {
+            // Match PVC names produced by ensure_pvcs_for_ordinal:
+            // "<template>-<statefulset>-<ordinal>". The ordinal is the final
+            // dash-separated segment; the StatefulSet name precedes it.
+            let pvc_name = &pvc.metadata.name;
+            let Some((prefix, ordinal_str)) = pvc_name.rsplit_once('-') else {
+                continue;
+            };
+            let Ok(ordinal) = ordinal_str.parse::<i32>() else {
+                continue;
+            };
+            let suffix = format!("-{}", ss_name);
+            if !prefix.ends_with(&suffix) {
+                continue;
+            }
+            let template_name = &prefix[..prefix.len() - suffix.len()];
+            if !templates.iter().any(|t| t.metadata.name == template_name) {
+                continue;
+            }
+            // Defensive: only delete PVCs we actually own. The ownerRef is set
+            // in ensure_pvcs_for_ordinal — if it points at this StatefulSet's
+            // UID we're clear to reclaim it. Skip otherwise to avoid stomping
+            // on a PVC the user adopted manually.
+            let owned = pvc
+                .metadata
+                .owner_references
+                .as_ref()
+                .map(|refs| refs.iter().any(|r| &r.uid == ss_uid))
+                .unwrap_or(false);
+            if !owned {
+                continue;
+            }
+            if ordinal < desired_replicas {
+                continue;
+            }
+
+            let key = build_key("persistentvolumeclaims", Some(namespace), pvc_name);
+            match self.storage.delete(&key).await {
+                Ok(_) => info!(
+                    "PVC retention (whenScaled=Delete): deleted PVC {} for StatefulSet {}/{}",
+                    pvc_name, namespace, ss_name
+                ),
+                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(e) => {
+                    warn!(
+                        "PVC retention: failed to delete PVC {} for {}/{}: {}",
+                        pvc_name, namespace, ss_name, e
+                    );
+                }
             }
         }
         Ok(())
