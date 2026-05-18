@@ -61,29 +61,15 @@ jobs:
           rustup component add --toolchain stable clippy
           rustup default stable
 
-      - name: Verify protoc on runner
-        # Persistent self-hosted runner — install protoc once on the host
-        # (e.g. `apt-get install protobuf-compiler`). This step fails fast
-        # with a clear message if it's missing.
+      - name: Install protoc + mold + clang
+        # ARC runner pods are ephemeral, so anything the build needs has
+        # to be installed per-job until we bake a custom runner image.
+        # `sudo` is preconfigured NOPASSWD on the actions-runner user.
         run: |
-          command -v protoc >/dev/null || {
-            echo "protoc not found on runner. Install once on the host:" >&2
-            echo "  apt-get install -y protobuf-compiler" >&2
-            exit 1
-          }
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler mold clang
           protoc --version
-
-      - name: Verify mold linker on runner
-        # mold + clang give 3-5x faster link of the api-server / kubelet
-        # binaries. Install once on the host. Fail fast if missing.
-        run: |
-          for cmd in mold clang; do
-            command -v "$cmd" >/dev/null || {
-              echo "$cmd not found on runner. Install once on the host:" >&2
-              echo "  apt-get install -y mold clang" >&2
-              exit 1
-            }
-          done
           mold --version
           clang --version | head -1
 
