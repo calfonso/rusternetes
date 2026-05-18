@@ -346,6 +346,11 @@ pub async fn get_custom_resource(
     // Apply schema defaults on read (K8s "defaulting on read")
     apply_schema_defaults(&crd, &version, &mut cr);
 
+    // Convert the CR if the request version differs from the stored version.
+    // For `Webhook` strategy this round-trips through the configured webhook;
+    // for the default `None` strategy this just rewrites `apiVersion`.
+    cr = crate::conversion::convert_custom_resource(&crd, cr, &version).await?;
+
     Ok(Json(cr))
 }
 
@@ -391,6 +396,11 @@ pub async fn list_custom_resources(
     for cr in &mut crs {
         apply_schema_defaults(&crd, &version, cr);
     }
+
+    // Convert any CR whose stored version differs from the request version.
+    // `convert_custom_resources` batches Webhook calls into a single
+    // ConversionReview round-trip (mirrors upstream non-homogeneous list path).
+    crs = crate::conversion::convert_custom_resources(&crd, crs, &version).await?;
 
     let list = List::new("List", "v1", crs);
     Ok(Json(list))

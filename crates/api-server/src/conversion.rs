@@ -31,7 +31,12 @@ pub struct ConversionReview {
 pub struct ConversionRequest {
     /// UID is an identifier for the conversion request
     pub uid: String,
-    /// DesiredAPIVersion is the version to convert to
+    /// DesiredAPIVersion is the version to convert to.
+    ///
+    /// Wire field is `desiredAPIVersion` (uppercase `API`), matching the
+    /// upstream apiextensions.k8s.io/v1 `ConversionRequest` schema —
+    /// `staging/src/k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/types.go`.
+    #[serde(rename = "desiredAPIVersion")]
     pub desired_api_version: String,
     /// Objects is the list of custom resources to convert
     pub objects: Vec<serde_json::Value>,
@@ -249,42 +254,86 @@ impl Default for ConversionWebhookClient {
     }
 }
 
-/// Convert a custom resource to a different version
+/// Convert a custom resource to a different version.
+///
+/// Mirrors the upstream apiextensions-apiserver behavior:
+/// - If the stored object is already at `target_version`, return it as-is.
+/// - If `spec.conversion` is unset, default to `None` strategy (no schema change,
+///   just rewrite `apiVersion`).
+/// - For `None` strategy, rewrite the `apiVersion` field on the wire object.
+/// - For `Webhook` strategy, POST a `ConversionReview` to the configured
+///   webhook URL and return the converted object from the response.
 pub async fn convert_custom_resource(
     crd: &CustomResourceDefinition,
     resource: CustomResource,
     target_version: &str,
 ) -> Result<CustomResource> {
-    // Check if conversion is needed
-    let current_version = extract_version(&resource.api_version);
-    if current_version == target_version {
-        debug!("Resource already at target version {}", target_version);
-        return Ok(resource);
+    convert_custom_resources(crd, vec![resource], target_version)
+        .await
+        .map(|mut v| v.remove(0))
+}
+
+/// Batch version of [`convert_custom_resource`] — converts a list of CRs in a
+/// single ConversionReview round-trip when the strategy is Webhook.
+pub async fn convert_custom_resources(
+    crd: &CustomResourceDefinition,
+    resources: Vec<CustomResource>,
+    target_version: &str,
+) -> Result<Vec<CustomResource>> {
+    if resources.is_empty() {
+        return Ok(resources);
     }
 
-    // Check conversion strategy
-    let conversion = crd.spec.conversion.as_ref().ok_or_else(|| {
-        rusternetes_common::Error::InvalidResource(
-            "Conversion not configured for this CRD".to_string(),
-        )
-    })?;
+    // Default strategy is None when spec.conversion is unset.
+    let strategy = crd
+        .spec
+        .conversion
+        .as_ref()
+        .map(|c| c.strategy.clone())
+        .unwrap_or(rusternetes_common::resources::ConversionStrategyType::None);
 
-    match conversion.strategy {
+    match strategy {
         rusternetes_common::resources::ConversionStrategyType::None => {
-            // No conversion - just update the API version
-            warn!(
-                "Conversion strategy is None, simply updating API version from {} to {}",
-                current_version, target_version
-            );
-            let mut converted = resource;
-            converted.api_version = format!("{}/{}", crd.spec.group, target_version);
-            Ok(converted)
+            // No conversion - just update the API version on objects that need it.
+            let target_api_version = format!("{}/{}", crd.spec.group, target_version);
+            Ok(resources
+                .into_iter()
+                .map(|mut r| {
+                    if extract_version(&r.api_version) != target_version {
+                        r.api_version = target_api_version.clone();
+                    }
+                    r
+                })
+                .collect())
         }
         rusternetes_common::resources::ConversionStrategyType::Webhook => {
-            // Use webhook for conversion
-            let client = ConversionWebhookClient::new();
-            let mut converted = client.convert(crd, vec![resource], target_version).await?;
-            Ok(converted.remove(0))
+            // Webhook strategy: only objects whose stored version differs from
+            // the target need to round-trip through the webhook. Preserve
+            // input order when stitching converted objects back into the result.
+            let mut needs_idx: Vec<usize> = Vec::new();
+            let mut needs_obj: Vec<CustomResource> = Vec::new();
+            let mut passthrough: Vec<(usize, CustomResource)> = Vec::new();
+            for (i, r) in resources.into_iter().enumerate() {
+                if extract_version(&r.api_version) == target_version {
+                    passthrough.push((i, r));
+                } else {
+                    needs_idx.push(i);
+                    needs_obj.push(r);
+                }
+            }
+
+            let converted = if needs_obj.is_empty() {
+                Vec::new()
+            } else {
+                ConversionWebhookClient::new()
+                    .convert(crd, needs_obj, target_version)
+                    .await?
+            };
+
+            let mut indexed: Vec<(usize, CustomResource)> = passthrough;
+            indexed.extend(needs_idx.into_iter().zip(converted));
+            indexed.sort_by_key(|(i, _)| *i);
+            Ok(indexed.into_iter().map(|(_, r)| r).collect())
         }
     }
 }
