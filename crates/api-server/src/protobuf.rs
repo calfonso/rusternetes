@@ -1921,6 +1921,179 @@ impl ProtoRegistry {
             },
         );
 
+        // ========== rbac.authorization.k8s.io/v1 types ==========
+        //
+        // Field numbers from
+        // https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/api/rbac/v1/generated.proto
+        // Without these, client-go (hydrophone, controller-runtime) sends
+        // `Content-Type: application/vnd.kubernetes.protobuf` for RBAC
+        // CREATE/UPDATE and the api-server rejects the body with
+        // "No schema found for kind 'ClusterRole'" before any handler runs.
+
+        schemas.insert(
+            "PolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "resourceNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "nonResourceURLs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "Subject".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("apiGroup".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                    (4, ("namespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "RoleRef".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("apiGroup".into(), FieldType::String)),
+                    (2, ("kind".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "AggregationRule".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "clusterRoleSelectors".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("LabelSelector".into()))),
+                    ),
+                )]),
+            },
+        );
+
+        schemas.insert(
+            "Role".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ClusterRole".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "aggregationRule".into(),
+                            FieldType::Message("AggregationRule".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "RoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ClusterRoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+
         ProtoRegistry { schemas }
     }
 
