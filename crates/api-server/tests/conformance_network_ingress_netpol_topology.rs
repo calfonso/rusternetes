@@ -5,8 +5,6 @@
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/network/
 //! (`ingress.go`, `ingressclass.go`, `netpol/network_policy_api.go`,
 //! `netpol/network_policy.go`, `topology_hints.go`).
-//! Mirrored from Sonobuoy run captured in
-//! .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //!
 //! See docs/conformance/network-ingress-netpol-topology.md for the
 //! test-by-test status table.

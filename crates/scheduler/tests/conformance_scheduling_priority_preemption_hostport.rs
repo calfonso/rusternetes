@@ -5,8 +5,6 @@
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/scheduling/
 //! and
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/network/
-//! Mirrored from Sonobuoy run captured in
-//! .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //!
 //! Specific upstream files referenced:
 //! - k8s.io/kubernetes/test/e2e/scheduling/priorities.go

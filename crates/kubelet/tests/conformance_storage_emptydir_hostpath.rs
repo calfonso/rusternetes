@@ -6,9 +6,6 @@
 //!   - empty_dir.go  (line numbers cited per-test below)
 //!   - host_path.go  (line numbers cited per-test below)
 //!
-//! Mirrored from the Sonobuoy round captured in
-//! .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
-//!
 //! Pattern: pure-function. This file is a kubelet *unit* test — no Docker,
 //! no api-server, no axum router. We exercise the two helpers that pin the
 //! production volume-setup invariants:

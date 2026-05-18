@@ -5,10 +5,8 @@
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/scheduling/
 //! (`predicates.go`, `taints.go`, `priorities.go`)
 //!
-//! Mirrored from Sonobuoy run captured in
-//! `.rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log`
-//! which reports two [sig-scheduling] SchedulerPredicates [Conformance]
-//! Ginkgo descriptors:
+//! A Sonobuoy v1.35 conformance run reports two
+//! [sig-scheduling] SchedulerPredicates [Conformance] Ginkgo descriptors:
 //!
 //!   - predicates.go:333 `validates resource limits of pods that are allowed
 //!     to run` — Round 160: FAIL (`predicates.go:1102 context deadline exceeded`,

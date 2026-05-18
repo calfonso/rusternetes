@@ -10,8 +10,6 @@
 //!   - projected_downwardapi.go
 //!   - projected_combined.go
 //!
-//! Mirrored from Sonobuoy run captured in
-//! .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //!
 //! See docs/conformance/storage-configmap-secret-projected.md for the
 //! test-by-test status table.

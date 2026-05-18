@@ -4,8 +4,6 @@
 //! Source of truth: Ginkgo descriptors at
 //! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/network/
 //! (endpointslice.go, endpointslicemirroring.go, dns.go, dns_common.go)
-//! Mirrored from Sonobuoy run captured in
-//! .rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/results/e2e.log
 //!
 //! These tests are the kube-proxy/EndpointSlice-controller-facing slice of the
 //! upstream sig-network conformance suite. They do NOT spawn an axum router or
