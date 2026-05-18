@@ -251,11 +251,10 @@ fn host_aliases_with_empty_hostnames_are_dropped() {
 /// [sig-node] Kubelet should write entries to /etc/hosts when hostNetwork is enabled
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/kubelet.go:200 (f.It)
-/// Sonobuoy (Round 160): FAIL — privileged-namespace gating
+/// Sonobuoy (Round 160): was FAIL; fixed by this PR — hostNetwork pods now inherit host /etc/hosts.
 /// Local mirror asserts the spec contract: hostNetwork pods must NOT receive
 /// a kubelet-managed file (they share the host's /etc/hosts).
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-exec-logs-downward.md"]
 fn host_network_pod_inherits_host_etc_hosts() {
     let mut pod = make_pod("hostnet-pod", "default");
     pod.spec.as_mut().unwrap().host_network = Some(true);

@@ -38,7 +38,7 @@ methods, so the conformance test does not need to spin up a Docker runtime.
 | `KubeletManagedEtcHosts verifyEtcHosts (standard entries)` | kubelet_etc_hosts.go:67 | PASS | `kubelet_managed_etc_hosts_includes_ipv4_and_ipv6_loopback` | mirrored, passing |
 | `Kubelet should write entries to /etc/hosts` (HostAliases) | kubelet.go:133 | FAIL | `host_aliases_are_appended_one_line_per_ip` | mirrored, passing (helper-level) |
 | `Kubelet HostAliases — empty hostnames dropped` | kubelet.go:133 | PASS | `host_aliases_with_empty_hostnames_are_dropped` | mirrored, passing |
-| `Kubelet should write entries to /etc/hosts when hostNetwork is enabled` | kubelet.go:200 | FAIL | `host_network_pod_inherits_host_etc_hosts` | mirrored, ignored (tracks failure) |
+| `Kubelet should write entries to /etc/hosts when hostNetwork is enabled` | kubelet.go:200 | FAIL | `host_network_pod_inherits_host_etc_hosts` | mirrored, passing (fix in this PR) |
 | `KubeletManagedEtcHosts pod IP + FQDN line` | kubelet_etc_hosts.go | PASS | `managed_etc_hosts_contains_pod_fqdn_when_subdomain_set` | mirrored, passing |
 | `Downward API should provide pod name, namespace and IP as env vars` | downwardapi.go:39 | PASS | `downward_api_provides_pod_name_namespace_and_ip` | mirrored, passing |
 | `Downward API should provide host IP as an env var` | downwardapi.go:67 | PASS | `downward_api_provides_host_ip_env_var` | mirrored, passing |
@@ -59,10 +59,10 @@ methods, so the conformance test does not need to spin up a Docker runtime.
 | `Pods should print the output to logs` | kubelet.go:58 | PASS | `pod_terminated_state_for_log_lookup_propagates_exit_code` | mirrored, passing |
 | `Pods should have a terminated reason` | kubelet.go:90 | PASS | `pod_terminated_state_surfaces_nonzero_exit_with_error_reason` | mirrored, passing |
 
-24 tests total; 21 mirror passing upstream tests and run green; 3 are
-`#[ignore]`d as conformance failure trackers (WebSocket exec, WebSocket logs,
-hostNetwork HostAliases). The kubelet has the helpers in place — the
-remaining failures are in api-server's streaming layer.
+24 tests total; 22 mirror passing upstream tests and run green; 2 are
+`#[ignore]`d as conformance failure trackers (WebSocket exec, WebSocket logs).
+The kubelet has the helpers in place — the remaining failures are in
+api-server's streaming layer.
 
 ## Helpers introduced
 
