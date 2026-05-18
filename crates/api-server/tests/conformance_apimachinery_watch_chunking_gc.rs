@@ -759,17 +759,93 @@ async fn gc_background_deletion_leaves_no_orphan_dependents() {
     assert!(remaining.is_empty(), "expected zero remaining configmaps");
 }
 
-/// [sig-api-machinery] Garbage collector should orphan pods created by custom
-/// finalizer when propagation policy is Orphan [Conformance]
+/// [sig-api-machinery] Garbage collector should orphan dependents when the
+/// owner is deleted with propagationPolicy=Orphan [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/garbage_collector.go
-/// Sonobuoy (Round 160): FAIL — "Other (GC orphan pods)" bucket: the GC
-/// controller currently deletes dependents even when the caller asks for
-/// Orphan propagation.
+/// (TestSimpleOrphan / "should orphan pods created by rc if delete options
+/// say so").
+/// Sonobuoy (Round 160, 2026-04-26): FAIL — the GC controller deleted
+/// dependents even when the caller asked for Orphan propagation.
+/// Status: PASS — the GC honours the `orphan` finalizer (added by the
+/// resource DELETE handler when `propagationPolicy=Orphan` via
+/// `handle_delete_with_finalizers_and_propagation`), strips the owner
+/// reference from each dependent in `orphan_dependents`, then removes the
+/// finalizer so the owner itself can be deleted. Dependents survive the
+/// scan with the relevant ownerReference gone.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-watch-chunking-gc.md (Other: GC orphan pods)"]
 async fn gc_orphan_propagation_should_strip_owner_refs_not_delete() {
-    panic!("orphan propagation not implemented as a server-side operation");
+    use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
+
+    // -----------------------------------------------------------------
+    // Arrange — owner is being deleted with propagationPolicy=Orphan.
+    // -----------------------------------------------------------------
+    // The DELETE handler in api-server attaches the `orphan` finalizer and
+    // sets deletionTimestamp when the caller requests Orphan propagation
+    // (see crates/api-server/src/handlers/finalizers.rs::
+    // handle_delete_with_finalizers_and_propagation). We mirror that
+    // exact wire state directly into storage so the test exercises the
+    // GC controller's reaction to it without spinning the full HTTP
+    // stack.
+    let storage = Arc::new(MemoryStorage::new());
+
+    let mut owner = cm("owner-cm", "default", &[]);
+    let owner_uid = owner.metadata.uid.clone();
+    owner.metadata.finalizers = Some(vec!["orphan".to_string()]);
+    owner.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    storage
+        .create(&cm_key("default", "owner-cm"), &owner)
+        .await
+        .unwrap();
+
+    // Two dependents that reference the owner via ownerReferences.
+    for name in ["dep-a", "dep-b"] {
+        let mut dep = cm(name, "default", &[]);
+        dep.metadata.owner_references = Some(vec![OwnerReference::new(
+            "v1",
+            "ConfigMap",
+            "owner-cm",
+            &owner_uid,
+        )
+        .with_controller(true)]);
+        storage
+            .create(&cm_key("default", name), &dep)
+            .await
+            .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Act — one GC scan with the owner sitting under the orphan policy.
+    // -----------------------------------------------------------------
+    let gc = GarbageCollector::new(storage.clone());
+    gc.scan_and_collect().await.unwrap();
+
+    // -----------------------------------------------------------------
+    // Assert — owner gone, dependents survived with their owner ref to
+    // `owner-cm` stripped.
+    // -----------------------------------------------------------------
+    let remaining: Vec<ConfigMap> = storage.list("/registry/configmaps/default/").await.unwrap();
+    let mut by_name: HashMap<String, ConfigMap> = remaining
+        .into_iter()
+        .map(|cm| (cm.metadata.name.clone(), cm))
+        .collect();
+
+    assert!(
+        !by_name.contains_key("owner-cm"),
+        "owner must be deleted once its orphan finalizer is removed"
+    );
+
+    for name in ["dep-a", "dep-b"] {
+        let dep = by_name
+            .remove(name)
+            .unwrap_or_else(|| panic!("dependent {name} must survive Orphan propagation"));
+        let owners = dep.metadata.owner_references.unwrap_or_default();
+        assert!(
+            owners.iter().all(|oref| oref.uid != owner_uid),
+            "dependent {name} must have its ownerReference to {owner_uid} stripped, got {:?}",
+            owners,
+        );
+    }
 }
 
 /// [sig-api-machinery] Garbage collector should delete RS and pods when
