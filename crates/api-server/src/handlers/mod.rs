@@ -2,6 +2,7 @@ pub mod admission_webhook;
 pub mod apply;
 pub mod authentication;
 pub mod authorization;
+pub mod cel_validation;
 pub mod certificates;
 pub mod componentstatus;
 pub mod configmap;

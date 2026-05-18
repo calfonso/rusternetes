@@ -758,83 +758,356 @@ async fn crd_selectable_fields_list_watch_informer() {
 // x-kubernetes-validations (CEL) — crd_validation_rules.go
 // ---------------------------------------------------------------------------
 //
-// The api-server stores `x-kubernetes-validations` rules but does NOT evaluate
-// CEL expressions on custom resource create/update yet (see
-// `crates/api-server/src/handlers/custom_resource.rs::validate_custom_resource`).
-// Mirroring the upstream tests means asserting CEL enforcement, which would
-// fail locally — so each CEL test below is `#[ignore]`d as a tracker. Once
-// CEL is wired in, drop the `#[ignore]`.
+// The api-server evaluates `x-kubernetes-validations[].rule` at CR
+// CREATE/UPDATE time and verifies rules at CRD admission time (syntax,
+// unknown-property, estimated cost). See
+// `crates/api-server/src/handlers/cel_validation.rs` and
+// `crates/api-server/src/handlers/custom_resource.rs::validate_custom_resource_with_old`.
+
+/// Helper: produce a CRD with a single CEL rule on `spec`.
+/// The schema defines `spec.replicas` (int) and `spec.foo` (string).
+fn crd_with_cel_rule(rule: &str, message: &str) -> Value {
+    json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "celrules.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {
+                "plural": "celrules",
+                "singular": "celrule",
+                "kind": "CelRule",
+                "listKind": "CelRuleList",
+            },
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object",
+                                "properties": {
+                                    "replicas": {"type": "integer"},
+                                    "foo": {"type": "string"}
+                                },
+                                "x-kubernetes-validations": [
+                                    {"rule": rule, "message": message}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }]
+        }
+    })
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail validation for create of a custom resource that satisfies the x-kubernetes-validations rules [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:97
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
-async fn cel_rule_satisfied_create_succeeds() {}
+async fn cel_rule_satisfied_create_succeeds() {
+    let (_mem, _state, router) = spawn_router();
+    let crd = crd_with_cel_rule("self.replicas <= 5", "too many replicas");
+    let (s, body) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert_eq!(
+        s, 201,
+        "CRD create with valid CEL rule must succeed, body={body}"
+    );
+
+    let cr = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "CelRule",
+        "metadata": {"name": "ok", "namespace": "default"},
+        "spec": {"replicas": 3, "foo": "bar"},
+    });
+    let (s, body) = post_json(
+        &router,
+        "/apis/example.com/v1/namespaces/default/celrules",
+        &cr,
+    )
+    .await;
+    assert_eq!(
+        s, 201,
+        "CR satisfying the rule (replicas=3 ≤ 5) must succeed, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail validation for create of a custom resource that does not satisfy the x-kubernetes-validations rules [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:124
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
-async fn cel_rule_violated_create_fails() {}
+async fn cel_rule_violated_create_fails() {
+    let (_mem, _state, router) = spawn_router();
+    let crd = crd_with_cel_rule("self.replicas <= 5", "replicas must be <= 5");
+    let (s, _) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert_eq!(s, 201);
+
+    let cr = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "CelRule",
+        "metadata": {"name": "bad", "namespace": "default"},
+        "spec": {"replicas": 99, "foo": "bar"},
+    });
+    let (s, body) = post_json(
+        &router,
+        "/apis/example.com/v1/namespaces/default/celrules",
+        &cr,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "CR violating rule must be rejected, got {s}, body={body}"
+    );
+    let msg = body["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("replicas must be <= 5"),
+        "rule message must surface in error, got {msg}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains a x-kubernetes-validations rule that refers to a property that do not exist [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:150
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
-async fn cel_rule_unknown_property_crd_rejected() {}
+async fn cel_rule_unknown_property_crd_rejected() {
+    let (_mem, _state, router) = spawn_router();
+    // `self.nonsense` is not declared in properties — CRD must be rejected.
+    let crd = crd_with_cel_rule("self.nonsense > 0", "msg");
+    let (s, body) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "CRD with unknown property reference must be rejected, got {s}, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains an x-kubernetes-validations rule that contains a syntax error [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:177
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
-async fn cel_rule_syntax_error_crd_rejected() {}
+async fn cel_rule_syntax_error_crd_rejected() {
+    let (_mem, _state, router) = spawn_router();
+    // `self.replicas <=` is incomplete — must be a parse error.
+    let crd = crd_with_cel_rule("self.replicas <= ", "msg");
+    let (s, body) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "CRD with syntactically-invalid rule must be rejected, got {s}, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CRD that contains an x-kubernetes-validations rule that exceeds the estimated cost limit [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:203
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
-async fn cel_rule_cost_limit_exceeded_crd_rejected() {}
+async fn cel_rule_cost_limit_exceeded_crd_rejected() {
+    let (_mem, _state, router) = spawn_router();
+    // Nested `.all(...)` calls inflate estimated cost past the 10M-token limit.
+    let expensive = "self.foo.all(a, self.foo.all(b, self.foo.all(c, c == a)))";
+    let crd = crd_with_cel_rule(expensive, "msg");
+    let (s, body) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "CRD with rule exceeding cost limit must be rejected, got {s}, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CR that exceeds the runtime cost limit for x-kubernetes-validations rule execution [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:231
 /// Sonobuoy (Round 160, 2026-04-26): PASS
+///
+/// Mirrored as: a CRD whose rule fits under the per-rule budget but with
+/// enough rules to blow the per-request budget at evaluation time. Each rule
+/// individually is cheap but the request total exceeds the runtime limit.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
-async fn cel_rule_runtime_cost_limit_exceeded() {}
+async fn cel_rule_runtime_cost_limit_exceeded() {
+    let (_mem, _state, router) = spawn_router();
+    // Many comprehension-style rules → per-request total trips the runtime
+    // budget. Each rule's estimated cost is rule_len * 1024 (one `all(`) →
+    // ~50K. We need cumulative cost > 100M, so 3000+ rules suffice.
+    let mut rules: Vec<Value> = Vec::new();
+    for _ in 0..3000 {
+        rules.push(json!({
+            "rule": "[1,2,3].all(x, x > 0) && self.replicas == self.replicas",
+            "message": "noop",
+        }));
+    }
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "manyrules.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {
+                "plural": "manyrules",
+                "singular": "manyrule",
+                "kind": "ManyRule",
+                "listKind": "ManyRuleList",
+            },
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object",
+                                "properties": {
+                                    "replicas": {"type": "integer"}
+                                },
+                                "x-kubernetes-validations": rules
+                            }
+                        }
+                    }
+                }
+            }]
+        }
+    });
+    // The CRD itself passes admission (each rule cheap), but the CR rejects.
+    let (s, _) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert_eq!(
+        s, 201,
+        "CRD with many cheap rules must be admitted (each rule under per-rule limit)"
+    );
+
+    let cr = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "ManyRule",
+        "metadata": {"name": "victim", "namespace": "default"},
+        "spec": {"replicas": 1},
+    });
+    let (s, body) = post_json(
+        &router,
+        "/apis/example.com/v1/namespaces/default/manyrules",
+        &cr,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "CR exceeding runtime cost limit must be rejected, got {s}, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail update of a CR that does not satisfy a x-kubernetes-validations transition rule [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:260
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
-async fn cel_transition_rule_violated_update_fails() {}
+async fn cel_transition_rule_violated_update_fails() {
+    let (_mem, _state, router) = spawn_router();
+    // Transition rule: replicas may not decrease.
+    let crd = crd_with_cel_rule(
+        "self.replicas >= oldSelf.replicas",
+        "replicas may not decrease",
+    );
+    let (s, _) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert_eq!(s, 201);
+
+    // CREATE the CR (no oldSelf — transition rules are skipped on CREATE).
+    let cr = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "CelRule",
+        "metadata": {"name": "t1", "namespace": "default"},
+        "spec": {"replicas": 5, "foo": "x"},
+    });
+    let (s, body) = post_json(
+        &router,
+        "/apis/example.com/v1/namespaces/default/celrules",
+        &cr,
+    )
+    .await;
+    assert_eq!(s, 201, "CREATE skips transition rule, body={body}");
+
+    // UPDATE with smaller replicas — must fail because oldSelf.replicas=5
+    // but self.replicas=2.
+    let cr_smaller = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "CelRule",
+        "metadata": {"name": "t1", "namespace": "default"},
+        "spec": {"replicas": 2, "foo": "x"},
+    });
+    let (s, body) = put_json(
+        &router,
+        "/apis/example.com/v1/namespaces/default/celrules/t1",
+        &cr_smaller,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "UPDATE violating transition rule must be rejected, got {s}, body={body}"
+    );
+    let msg = body["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("replicas may not decrease"),
+        "transition rule message must surface, got {msg}"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Validation ratcheting — crd_validation_ratcheting.go
 // ---------------------------------------------------------------------------
 //
-// Ratcheting (the behaviour where unchanged correlatable fields are
-// exempted from new schema constraints on update) is not implemented in
-// the api-server today. All ratcheting tests are `#[ignore]`d trackers.
+// Ratcheting (the behaviour where unchanged correlatable fields are exempted
+// from new schema constraints on update) builds on CEL eval (this PR landed
+// CR-level rule evaluation + transition rules) plus a schema-diff engine that
+// walks the old/new CR pair and selectively re-validates only changed
+// sub-trees. The schema-diff engine is multi-week work, so all ratcheting
+// trackers stay `#[ignore]`d for now.
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to JSONSchema errors on unchanged correlatable fields [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:201
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on unchanged uncorrelatable fields [Conformance]
@@ -842,7 +1115,7 @@ async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {}
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:244
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on changed fields [Conformance]
@@ -850,7 +1123,7 @@ async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {}
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:280
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_changed_jsonschema_errors_blocked() {}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to CRD Validation Rule errors on unchanged correlatable fields [Conformance]
@@ -858,7 +1131,7 @@ async fn ratcheting_changed_jsonschema_errors_blocked() {}
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:333
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on unchanged uncorrelatable fields [Conformance]
@@ -866,7 +1139,7 @@ async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {}
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:412
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on changed fields [Conformance]
@@ -874,7 +1147,7 @@ async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {}
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:448
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_changed_cel_errors_blocked() {}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST NOT ratchet errors raised by transition rules [Conformance]
@@ -882,7 +1155,7 @@ async fn ratcheting_changed_cel_errors_blocked() {}
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:511
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_transition_rule_errors_never_ratcheted() {}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST evaluate a CRD Validation Rule with oldSelf = nil for new values when optionalOldSelf is true [Conformance]
@@ -890,5 +1163,5 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {}
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:569
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
+#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
 async fn ratcheting_optional_old_self_nil_for_new_values() {}
