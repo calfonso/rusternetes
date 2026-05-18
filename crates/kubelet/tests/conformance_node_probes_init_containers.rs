@@ -202,13 +202,19 @@ fn init_containers_should_invoke_on_restart_always_pod() {
 /// [sig-node] InitContainer should not start app containers if init containers fail on a RestartAlways pod [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/init_container.go:330
-/// Sonobuoy (Round 160): FAIL — "Expected <*v1.PodCondition>: nil not to be nil"
-/// (the test expects the kubelet to publish a `PodInitializing` condition
-/// once init1 has failed >= 3 times; current main does not surface that
-/// condition before the e2e timeout). See docs/CONFORMANCE.md "Init
-/// containers" failure bucket.
+/// Sonobuoy (Round 160): FAIL — "Expected <*v1.PodCondition>: nil not to be nil".
+/// This unit-level mirror covers the pure helper
+/// `decide_next_init_action`, which already returns
+/// `InitAction { all_init_done: false, next_index: Some(0),
+/// should_retry: true }` for a RestartAlways pod with a failed init.
+/// The accompanying production-side publishing of
+/// `PodCondition{Type: "Initialized", Status: "False", Reason:
+/// "ContainersNotInitialized"}` is provided by
+/// `Self::init_failed_pod_conditions` on the kubelet status-sync path
+/// in `crates/kubelet/src/kubelet.rs` (around the init-container
+/// failure branch, ~L2225) — those conditions are what the upstream
+/// e2e assertion at init_container.go:446 checks.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-probes-init-containers.md"]
 fn init_containers_should_not_start_app_on_restart_always_failure() {
     let pod = make_pod_with_inits(
         "fail-always",
@@ -238,9 +244,14 @@ fn init_containers_should_not_start_app_on_restart_always_failure() {
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/init_container.go:430
 /// Sonobuoy (Round 160): FAIL — same PodCondition-not-published symptom as
-/// the RestartAlways failure case; tracked in the "Init containers" bucket.
+/// the RestartAlways failure case. The pure helper `decide_next_init_action`
+/// returns `InitAction { all_init_done: false, next_index: None,
+/// should_retry: false }` for a RestartNever pod with a failed init, and
+/// the kubelet status-sync path in `crates/kubelet/src/kubelet.rs`
+/// marks the pod `Phase::Failed` with the
+/// `Initialized=False / Reason=ContainersNotInitialized` condition via
+/// `Self::init_failed_pod_conditions`.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-probes-init-containers.md"]
 fn init_containers_should_not_start_app_and_fail_pod_on_restart_never_failure() {
     let pod = make_pod_with_inits(
         "fail-never",
