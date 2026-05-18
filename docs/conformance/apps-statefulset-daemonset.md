@@ -43,7 +43,7 @@ That matches the prior art in
 | `StatefulSet should list, patch and delete a collection of StatefulSets` | apps/statefulset.go:760 | PASS | `statefulset_should_list_patch_and_delete_collection` | mirrored, passing |
 | `StatefulSet should validate Statefulset Status endpoints` | apps/statefulset.go:811 | PASS | `statefulset_should_validate_status_endpoint_fields` | mirrored, passing |
 | `StatefulSet AvailableReplicas should get updated accordingly when MinReadySeconds is enabled` | apps/statefulset.go (MinReadySeconds suite) | FAIL ("Other" bucket) | `statefulset_available_replicas_should_track_min_ready_seconds` | mirrored, ignored — `availableReplicas` / `minReadySeconds` not implemented in the controller |
-| `StatefulSet PVC retention — whenScaled=Delete reclaims PVCs` | apps/statefulset.go (PVC retention suite) | FAIL ("Other" bucket) | `statefulset_pvc_retention_policy_should_delete_pvcs_on_scale_down` | mirrored, ignored — `persistentVolumeClaimRetentionPolicy` deletes are not implemented |
+| `StatefulSet PVC retention — whenScaled=Delete reclaims PVCs` | apps/statefulset.go (PVC retention suite) | PASS | `statefulset_pvc_retention_policy_should_delete_pvcs_on_scale_down` | mirrored, passing — `gc_scaled_down_pvcs` deletes PVCs for ordinals beyond `spec.replicas` when `whenScaled=Delete` |
 | `StatefulSet PVC retention — whenScaled=Retain keeps PVCs` | apps/statefulset.go (PVC retention suite) | PASS | `statefulset_pvc_retention_policy_retain_keeps_pvcs_on_scale_down` | mirrored, passing (default Retain behaviour) |
 | `StatefulSet pods bind their headless Service via subdomain` | apps/statefulset.go (identity tests) | PASS | `statefulset_pods_should_bind_headless_service_via_subdomain` | mirrored, passing — `create_pod` stamps `pod.spec.subdomain` from `serviceName` |
 | `Daemon set [Serial] should run and stop simple daemon` | apps/daemon_set.go:240 | FAIL ("Other" bucket — DaemonSet) | `daemonset_should_run_and_stop_simple_daemon` | mirrored, passing |
@@ -64,11 +64,11 @@ That matches the prior art in
   not yet compute `availableReplicas` from `minReadySeconds`. The mirror
   test is `#[ignore]`d so a future enablement is one re-run away.
 - **PVC retention (`whenScaled=Delete`)** — `ensure_pvcs_for_ordinal`
-  creates PVCs from `volumeClaimTemplates`, but the controller never
-  deletes them; honoring `persistentVolumeClaimRetentionPolicy.whenScaled`
-  is its own slice. The mirror is `#[ignore]`d and tracks the gap, while
-  the `Retain` variant is exercised because the default behaviour is in
-  fact "retain".
+  creates PVCs from `volumeClaimTemplates`, and `gc_scaled_down_pvcs`
+  reclaims PVCs whose ordinal is beyond `spec.replicas` when the policy's
+  `whenScaled` is `Delete`. The `whenDeleted` half (StatefulSet-level
+  teardown) still relies on default GC semantics. The `Retain` variant
+  is also exercised because that is the default behaviour.
 - **Headless Service binding** — upstream stamps
   `pod.spec.subdomain = statefulset.spec.serviceName` so DNS A records
   resolve under the headless Service. The StatefulSet controller now

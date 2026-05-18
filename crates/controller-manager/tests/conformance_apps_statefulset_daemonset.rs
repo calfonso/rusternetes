@@ -744,10 +744,9 @@ async fn statefulset_available_replicas_should_track_min_ready_seconds() {
 /// [sig-apps] StatefulSet PVC retention policy — whenScaled=Delete reclaims PVCs on scale-down
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/statefulset.go (PVC retention suite)
-/// Sonobuoy (Round 160, "Other" bucket): FAIL — controller creates PVCs but
-/// does not honor `persistentVolumeClaimRetentionPolicy` on scale-down.
+/// Sonobuoy (Round 160, "Other" bucket): PASS — controller GCs PVCs for
+/// ordinals beyond `spec.replicas` when `whenScaled=Delete` is set.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-statefulset-daemonset.md (PVC retention not implemented)"]
 async fn statefulset_pvc_retention_policy_should_delete_pvcs_on_scale_down() {
     let storage = setup_test().await;
     let ns = "default";
