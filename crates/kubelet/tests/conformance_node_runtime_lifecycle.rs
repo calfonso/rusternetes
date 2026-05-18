@@ -414,8 +414,14 @@ fn termination_message_empty_when_pod_succeeds_under_fallback_policy() {
 /// Sonobuoy (Round 160): PASS
 #[test]
 fn image_pull_policy_always_pulls_regardless_of_presence() {
-    assert!(lifecycle::should_pull_image(Some("Always"), true));
-    assert!(lifecycle::should_pull_image(Some("Always"), false));
+    assert_eq!(
+        lifecycle::image_action(Some("Always"), true),
+        lifecycle::ImageAction::Pull
+    );
+    assert_eq!(
+        lifecycle::image_action(Some("Always"), false),
+        lifecycle::ImageAction::Pull
+    );
 }
 
 /// [sig-node] Container Runtime — imagePullPolicy=Never never pulls
@@ -423,9 +429,173 @@ fn image_pull_policy_always_pulls_regardless_of_presence() {
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtime.go:307
 /// Sonobuoy (Round 160): PASS
 #[test]
-fn image_pull_policy_never_skips_pull_even_when_missing() {
-    assert!(!lifecycle::should_pull_image(Some("Never"), true));
-    assert!(!lifecycle::should_pull_image(Some("Never"), false));
+fn image_pull_policy_never_uses_local_when_present() {
+    assert_eq!(
+        lifecycle::image_action(Some("Never"), true),
+        lifecycle::ImageAction::UseLocal
+    );
+}
+
+/// [sig-node] Container Runtime — imagePullPolicy=Never errors when image absent
+///
+/// Upstream: k8s.io/kubernetes/pkg/kubelet/images/image_manager.go:EnsureImageExists
+/// — Never policy with no local image yields `ErrImageNeverPull` (mapped to the
+/// container `waiting.reason` of the same name); the kubelet must NOT pull and
+/// must NOT silently proceed to container creation.
+#[test]
+fn image_action_never_with_missing_image_errors() {
+    assert_eq!(
+        lifecycle::image_action(Some("Never"), false),
+        lifecycle::ImageAction::ErrImageNeverPull
+    );
+}
+
+/// An unset policy defaults to `IfNotPresent` (the explicit-policy branch,
+/// before any `:latest`-based defaulting handled by
+/// [`lifecycle::default_image_pull_policy`]).
+#[test]
+fn image_action_unset_defaults_to_if_not_present_missing() {
+    assert_eq!(
+        lifecycle::image_action(None, false),
+        lifecycle::ImageAction::Pull
+    );
+}
+
+#[test]
+fn image_action_unset_defaults_to_if_not_present_existing() {
+    assert_eq!(
+        lifecycle::image_action(None, true),
+        lifecycle::ImageAction::UseLocal
+    );
+}
+
+/// Unknown / future policy strings degrade to `IfNotPresent` semantics —
+/// matches the catch-all in upstream `kuberuntime_image.go`.
+#[test]
+fn image_action_unknown_policy_treated_as_if_not_present() {
+    assert_eq!(
+        lifecycle::image_action(Some("FutureUnknownValue"), false),
+        lifecycle::ImageAction::Pull
+    );
+    assert_eq!(
+        lifecycle::image_action(Some("FutureUnknownValue"), true),
+        lifecycle::ImageAction::UseLocal
+    );
+}
+
+/// The Display impl populates `containerStatus.waiting.message`. To match
+/// upstream `pkg/kubelet/images/image_manager.go::imagePullPrecheck`, the
+/// phrasing is `Container image "X" is not present with pull policy of Never`
+/// — no reason prefix (that lives in `waiting.reason` separately).
+#[test]
+fn image_never_pull_error_display_matches_upstream() {
+    let err = lifecycle::ImageNeverPullError {
+        image: "nginx:1.27".to_string(),
+    };
+    assert_eq!(
+        err.to_string(),
+        r#"Container image "nginx:1.27" is not present with pull policy of Never"#,
+    );
+}
+
+/// The kubelet recovers the typed error from `anyhow::Error` via downcast,
+/// so the reason is derived from the type, not from the Display string.
+/// This avoids substring-sniffing the user-facing message.
+#[test]
+fn reason_from_anyhow_recognizes_typed_image_never_pull_error() {
+    let err: anyhow::Error = anyhow::Error::new(lifecycle::ImageNeverPullError {
+        image: "nginx:1.27".to_string(),
+    });
+    assert_eq!(
+        lifecycle::reason_from_anyhow(&err),
+        Some("ErrImageNeverPull"),
+    );
+}
+
+/// Legacy substring path still works for errors that were constructed as
+/// plain strings (other paths in the codebase still propagate string-only
+/// errors). Defence in depth.
+#[test]
+fn reason_from_anyhow_falls_back_to_substring_for_string_errors() {
+    let err: anyhow::Error = anyhow::anyhow!("Image pull failed: registry down");
+    assert_eq!(lifecycle::reason_from_anyhow(&err), Some("ErrImagePull"));
+
+    let err: anyhow::Error = anyhow::anyhow!("CreateContainerConfigError: invalid mount");
+    assert_eq!(
+        lifecycle::reason_from_anyhow(&err),
+        Some("CreateContainerConfigError"),
+    );
+}
+
+#[test]
+fn reason_from_anyhow_returns_none_for_unrelated_errors() {
+    let err: anyhow::Error = anyhow::anyhow!("something completely unrelated");
+    assert_eq!(lifecycle::reason_from_anyhow(&err), None);
+}
+
+/// The kubelet maps a low-level `start_pod` error message back to the
+/// upstream `containerStatus.waiting.reason` string by sniffing substrings
+/// of the error text. The `ErrImageNeverPull` reason must be recognised
+/// from the Display output of [`lifecycle::ImageNeverPullError`] so a pod
+/// whose image is absent under `imagePullPolicy=Never` surfaces the same
+/// waiting reason as upstream.
+///
+/// NOTE: `"ErrImageNeverPull"` does NOT contain `"ErrImagePull"` as a
+/// substring (the `Never` token sits between `Image` and `Pull`), so the
+/// pre-existing `ErrImagePull` cascade does not catch it. This is a
+/// regression guard against re-merging the two branches.
+///
+/// The primary path uses [`lifecycle::reason_from_anyhow`] (typed downcast).
+/// This substring entry is the defence-in-depth fallback for callers that
+/// wrap the error as a plain string before bubbling it up.
+#[test]
+fn container_reason_recognizes_err_image_never_pull_substring() {
+    assert_eq!(
+        lifecycle::container_reason_from_error_message("kubelet: ErrImageNeverPull"),
+        Some("ErrImageNeverPull"),
+    );
+    assert_eq!(
+        lifecycle::container_reason_from_error_message("Image pull failed: bollard error"),
+        Some("ErrImagePull"),
+    );
+}
+
+#[test]
+fn container_reason_still_recognizes_err_image_pull() {
+    assert_eq!(
+        lifecycle::container_reason_from_error_message("Image pull failed: timeout"),
+        Some("ErrImagePull")
+    );
+    assert_eq!(
+        lifecycle::container_reason_from_error_message("image not found: nginx:9.99"),
+        Some("ErrImagePull")
+    );
+    assert_eq!(
+        lifecycle::container_reason_from_error_message("ErrImagePull: registry down"),
+        Some("ErrImagePull")
+    );
+}
+
+#[test]
+fn container_reason_recognizes_create_container_errors() {
+    assert_eq!(
+        lifecycle::container_reason_from_error_message(
+            "CreateContainerConfigError: bad mount spec"
+        ),
+        Some("CreateContainerConfigError")
+    );
+    assert_eq!(
+        lifecycle::container_reason_from_error_message("CreateContainerError: oci runtime failed"),
+        Some("CreateContainerError")
+    );
+}
+
+#[test]
+fn container_reason_returns_none_for_unrelated_error() {
+    assert_eq!(
+        lifecycle::container_reason_from_error_message("something completely unrelated"),
+        None
+    );
 }
 
 /// [sig-node] Container Runtime — imagePullPolicy=IfNotPresent pulls only when missing
@@ -434,8 +604,14 @@ fn image_pull_policy_never_skips_pull_even_when_missing() {
 /// Sonobuoy (Round 160): PASS
 #[test]
 fn image_pull_policy_if_not_present_only_pulls_when_missing() {
-    assert!(!lifecycle::should_pull_image(Some("IfNotPresent"), true));
-    assert!(lifecycle::should_pull_image(Some("IfNotPresent"), false));
+    assert_eq!(
+        lifecycle::image_action(Some("IfNotPresent"), true),
+        lifecycle::ImageAction::UseLocal
+    );
+    assert_eq!(
+        lifecycle::image_action(Some("IfNotPresent"), false),
+        lifecycle::ImageAction::Pull
+    );
 }
 
 /// [sig-node] Container Runtime — image with :latest tag defaults to Always

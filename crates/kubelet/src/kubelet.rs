@@ -1711,6 +1711,7 @@ impl Kubelet {
                         r == "CreateContainerError"
                             || r == "CreateContainerConfigError"
                             || r == "ErrImagePull"
+                            || r == "ErrImageNeverPull"
                             || r == "ImagePullBackOff"
                     });
 
@@ -2036,23 +2037,11 @@ impl Kubelet {
                             );
 
                             // Determine the error reason matching K8s container status reasons.
-                            // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go
+                            // Prefers typed downcast over substring sniffing — see upstream
+                            // `pkg/kubelet/images/types.go` (sentinel errors) and
+                            // `pkg/kubelet/kuberuntime/kuberuntime_container.go`.
                             let create_error_reason =
-                                if err_msg.starts_with("CreateContainerConfigError:") {
-                                    Some("CreateContainerConfigError".to_string())
-                                } else if err_msg.starts_with("CreateContainerError:") {
-                                    Some("CreateContainerError".to_string())
-                                } else if err_msg.contains("Image pull failed")
-                                    || err_msg.contains("image not found")
-                                    || err_msg.contains("ErrImagePull")
-                                {
-                                    // K8s sets ErrImagePull on first failure, then
-                                    // ImagePullBackOff on retries with exponential backoff.
-                                    // See: pkg/kubelet/images/image_manager.go
-                                    Some("ErrImagePull".to_string())
-                                } else {
-                                    None
-                                };
+                                crate::lifecycle::reason_from_anyhow(&e).map(str::to_string);
 
                             if let Some(reason) = create_error_reason {
                                 // Container creation/config error — pod stays Pending with

@@ -157,27 +157,111 @@ pub fn terminal_pod_phase(restart_policy: Option<&str>, any_failed: bool) -> Opt
     }
 }
 
-/// Whether the kubelet should pull a container image given the
-/// `imagePullPolicy` and whether the image is already present locally.
+/// Decision returned by [`image_action`] when reconciling `imagePullPolicy`
+/// against local image presence. Mirrors the three branches of upstream
+/// `pkg/kubelet/images/image_manager.go::EnsureImageExists`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageAction {
+    /// Image is present locally and policy allows reuse — no pull needed.
+    UseLocal,
+    /// Image must be pulled from the registry.
+    Pull,
+    /// `imagePullPolicy=Never` and the image is absent locally. The kubelet
+    /// must surface this as a `waiting.reason="ErrImageNeverPull"` container
+    /// status without attempting to pull.
+    ErrImageNeverPull,
+}
+
+/// Decide what to do for a container image given the `imagePullPolicy` and
+/// whether the image is already present locally. Pure replacement for
+/// [`should_pull_image`] that also distinguishes the `Never`+missing case.
 ///
-/// Mirrors `kuberuntime_image.go` and the e2e `should be able to pull
-/// image` family:
-///   - `Always`       → always pull
-///   - `Never`        → never pull (fail if absent)
-///   - `IfNotPresent` → pull only when absent
-///   - Unset → K8s default is `IfNotPresent`, but if the image tag is
-///     literally `:latest` (or no tag), the default flips to `Always`.
-///     This helper applies the explicit-policy path; tag-based defaulting
-///     is handled by [`default_image_pull_policy`].
-#[inline]
-#[allow(dead_code)]
-pub fn should_pull_image(image_pull_policy: Option<&str>, image_exists_locally: bool) -> bool {
+/// Mirrors `pkg/kubelet/images/image_manager.go::EnsureImageExists`:
+///   - `Always`       → always `Pull`
+///   - `Never`        → `UseLocal` if present, else `ErrImageNeverPull`
+///   - `IfNotPresent` → `UseLocal` if present, else `Pull`
+///   - Unset / unknown → behave like `IfNotPresent`
+pub fn image_action(image_pull_policy: Option<&str>, image_exists_locally: bool) -> ImageAction {
     match image_pull_policy.unwrap_or("IfNotPresent") {
-        "Always" => true,
-        "Never" => false,
-        "IfNotPresent" => !image_exists_locally,
-        // K8s default for unknown values: behave like IfNotPresent.
-        _ => !image_exists_locally,
+        "Always" => ImageAction::Pull,
+        "Never" if image_exists_locally => ImageAction::UseLocal,
+        "Never" => ImageAction::ErrImageNeverPull,
+        _ if image_exists_locally => ImageAction::UseLocal,
+        _ => ImageAction::Pull,
+    }
+}
+
+/// Typed error surfaced when `imagePullPolicy=Never` collides with an absent
+/// local image. The kubelet maps this to a container `waiting.reason` of
+/// `ErrImageNeverPull` per upstream `kuberuntime_image.go`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageNeverPullError {
+    pub image: String,
+}
+
+impl std::fmt::Display for ImageNeverPullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Phrasing mirrors upstream `pkg/kubelet/images/image_manager.go`
+        // `imagePullPrecheck`: `Container image %q is not present with pull
+        // policy of Never`. The reason token ("ErrImageNeverPull") lives in
+        // `containerStatus.waiting.reason`, not here.
+        write!(
+            f,
+            r#"Container image "{}" is not present with pull policy of Never"#,
+            self.image
+        )
+    }
+}
+
+impl std::error::Error for ImageNeverPullError {}
+
+/// Recover the kubelet `containerStatus.waiting.reason` string from an
+/// [`anyhow::Error`] returned by [`crate::runtime::ContainerRuntime::start_pod`].
+///
+/// Prefers a typed downcast to [`ImageNeverPullError`] so the reason does
+/// not depend on the user-facing Display string. Falls back to the legacy
+/// substring matcher in [`container_reason_from_error_message`] for error
+/// paths that propagate plain string errors (eg the pull retry loop in
+/// `runtime::pull_image_with_retry` wraps bollard errors as
+/// `anyhow::anyhow!("Image pull failed: ...")`).
+///
+/// Mirrors upstream's preference for typed errors over substring sniffing —
+/// `pkg/kubelet/images/types.go` declares `ErrImageNeverPull` as a sentinel
+/// and the kubelet matches on the typed value, not the message text.
+pub fn reason_from_anyhow(err: &anyhow::Error) -> Option<&'static str> {
+    if err.downcast_ref::<ImageNeverPullError>().is_some() {
+        return Some("ErrImageNeverPull");
+    }
+    container_reason_from_error_message(&err.to_string())
+}
+
+/// Map a low-level `start_pod` error message back to the upstream
+/// `containerStatus.waiting.reason` string. The kubelet's sync loop uses
+/// this to translate a `Result<_, anyhow::Error>` from
+/// [`crate::runtime::ContainerRuntime::start_pod`] into the reason field
+/// of `ContainerState::Waiting`.
+///
+/// Order matters: `ErrImageNeverPull` is checked before `ErrImagePull`
+/// because the former does not contain the latter as a substring (the
+/// `Never` token splits `Image` and `Pull`), and we want the more specific
+/// reason to win.
+///
+/// K8s ref: `pkg/kubelet/kuberuntime/kuberuntime_container.go` —
+/// `containerStartingError` to `Waiting.reason`.
+pub fn container_reason_from_error_message(err_msg: &str) -> Option<&'static str> {
+    if err_msg.starts_with("CreateContainerConfigError:") {
+        Some("CreateContainerConfigError")
+    } else if err_msg.starts_with("CreateContainerError:") {
+        Some("CreateContainerError")
+    } else if err_msg.contains("ErrImageNeverPull") {
+        Some("ErrImageNeverPull")
+    } else if err_msg.contains("Image pull failed")
+        || err_msg.contains("image not found")
+        || err_msg.contains("ErrImagePull")
+    {
+        Some("ErrImagePull")
+    } else {
+        None
     }
 }
 
@@ -329,13 +413,19 @@ mod tests {
     }
 
     #[test]
-    fn pull_decision_matches_policy_matrix() {
-        assert!(should_pull_image(Some("Always"), true));
-        assert!(should_pull_image(Some("Always"), false));
-        assert!(!should_pull_image(Some("Never"), true));
-        assert!(!should_pull_image(Some("Never"), false));
-        assert!(!should_pull_image(Some("IfNotPresent"), true));
-        assert!(should_pull_image(Some("IfNotPresent"), false));
+    fn image_action_matches_policy_matrix() {
+        assert_eq!(image_action(Some("Always"), true), ImageAction::Pull);
+        assert_eq!(image_action(Some("Always"), false), ImageAction::Pull);
+        assert_eq!(image_action(Some("Never"), true), ImageAction::UseLocal);
+        assert_eq!(
+            image_action(Some("Never"), false),
+            ImageAction::ErrImageNeverPull
+        );
+        assert_eq!(
+            image_action(Some("IfNotPresent"), true),
+            ImageAction::UseLocal
+        );
+        assert_eq!(image_action(Some("IfNotPresent"), false), ImageAction::Pull);
     }
 
     #[test]

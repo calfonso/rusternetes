@@ -795,17 +795,20 @@ impl ContainerRuntime {
             exists
         };
 
-        let should_pull = match policy {
-            "Always" => true,
-            "Never" => false,
-            "IfNotPresent" => !image_exists,
-            _ => !image_exists, // Default to IfNotPresent
-        };
-
+        let action = crate::lifecycle::image_action(Some(policy), image_exists);
         debug!(
-            "Image {} - exists: {}, should_pull: {}",
-            image, image_exists, should_pull
+            "Image {} - exists: {}, action: {:?}",
+            image, image_exists, action
         );
+        let should_pull = match action {
+            crate::lifecycle::ImageAction::Pull => true,
+            crate::lifecycle::ImageAction::UseLocal => false,
+            crate::lifecycle::ImageAction::ErrImageNeverPull => {
+                return Err(anyhow::Error::new(crate::lifecycle::ImageNeverPullError {
+                    image: image.to_string(),
+                }));
+            }
+        };
 
         if should_pull {
             info!("Pulling image: {}", normalized_image);
