@@ -19,6 +19,13 @@ env:
 # pkg-config + libssl-dev). They share an anchor block so the
 # repeated setup (checkout, rhino clone, mold enable, rust-cache) stays
 # in lock-step.
+#
+# Memory budget differs per job, so each picks a differently-sized ARC
+# scale set:
+#   - `arc-runner-set`       — 8Gi/2cpu, for nextest (peaks near 8 GiB)
+#   - `arc-runner-set-small` — 512Mi/500m, for clippy (~250 MiB peak)
+# Both scale sets share one runner image; only the pod resource
+# requests differ. See ci/arc-runner/values-{large,small}.yaml.
 jobs:
   nextest:
     name: cargo nextest
@@ -70,7 +77,11 @@ jobs:
 
   clippy:
     name: cargo clippy
-    runs-on: arc-runner-set
+    # Clippy peaks at ~250 MiB resident, so it runs on the light-tier
+    # scale set (512Mi/500m request) defined by
+    # ci/arc-runner/values-small.yaml. Nextest stays on `arc-runner-set`
+    # (8Gi/2cpu) because its workspace test peaks hit ~8 GiB.
+    runs-on: arc-runner-set-small
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

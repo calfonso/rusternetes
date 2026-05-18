@@ -1,11 +1,14 @@
-# Helm values for the gha-runner-scale-set release `arc-runner-set`.
+# Helm values for the gha-runner-scale-set release `arc-runner-set`
+# (the heavy / nextest-tier runner). Workflow jobs select it via
+# `runs-on: arc-runner-set`. For the small tier (clippy, fmt) see
+# `values-small.yaml`.
 #
 # Apply with:
 #
 #   helm upgrade arc-runner-set \
 #     --namespace arc-runners \
 #     --reuse-values \
-#     --values ci/arc-runner/values.yaml \
+#     --values ci/arc-runner/values-large.yaml \
 #     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 #
 # `--reuse-values` keeps githubConfigUrl + githubConfigSecret set at
@@ -33,10 +36,10 @@ template:
           # Cap parallel rustc invocations per pod. Cargo defaults to
           # `nproc`, which on a 7.5-CPU node gives 7-8 concurrent rustc
           # processes peaking at ~5.5 GiB resident — observed on a
-          # 2026-05-18 eviction (kubelet reclaimed the runner with
-          # `Container runner was using 5748148Ki, request is 0`). At 4
-          # jobs the peak drops to ~3-4 GiB and three runners co-fit on
-          # the 14 GiB node without eviction.
+          # 2026-05-18 eviction. At 4 jobs the peak drops to ~3-4 GiB
+          # for clippy/check, but the full nextest run (workspace test
+          # binaries + linker peaks) still spikes near 8 GiB, which is
+          # why the request below is 8Gi.
           - name: CARGO_BUILD_JOBS
             value: "4"
         resources:
@@ -47,12 +50,16 @@ template:
           # under pressure. Limits would convert bursts into hard
           # OOMKills, which is worse for transient compile spikes.
           requests:
-            memory: 4Gi
+            # Nextest workspace runs peak at ~8 GiB resident on this
+            # ARC image (full target/ link + concurrent test binaries).
+            # 4Gi (the previous value) caused repeated kubelet evictions
+            # on PRs that landed multi-crate test changes. Bumped to 8Gi
+            # so the request matches the observed steady-state peak; a
+            # 14 GiB node now fits exactly one large runner plus a small
+            # one with headroom for system pods.
+            memory: 8Gi
             # 2 cores requested matches the productive parallelism we
             # actually want from CARGO_BUILD_JOBS=4 (cargo will burst
             # to 4 rustc threads when other pods are idle, but the
-            # scheduler reserves 2). Big node (7.5 CPU) fits three of
-            # these comfortably; small nodes (~0.5 CPU allocatable)
-            # can't, which is fine since they can't run a real Rust
-            # compile anyway.
+            # scheduler reserves 2).
             cpu: "2"
