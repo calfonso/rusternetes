@@ -375,9 +375,11 @@ async fn deployment_should_track_old_replicasets_for_history() {
 /// [sig-apps] Deployment deployment should support rollover [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/deployment.go:129
-/// Sonobuoy (Round 160): FAIL — see docs/CONFORMANCE.md "Apps controllers" bucket
+/// Local status (2026-05-18): the controller-level contract that the v3 RS
+/// converges to desired replicas after a mid-rollout template flip
+/// (v1 -> v2 -> v3) now holds against `MemoryStorage`. The end-to-end
+/// Sonobuoy verdict is still tracked separately in `docs/CONFORMANCE.md`.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-deployment-replicaset.md"]
 async fn deployment_should_support_rollover() {
     let storage = setup();
     let ns = "default";
@@ -452,9 +454,11 @@ async fn deployment_scale_subresource_changes_replicaset_size() {
 /// [sig-apps] Deployment deployment should support proportional scaling [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/deployment.go:154
-/// Sonobuoy (Round 160): FAIL — see docs/CONFORMANCE.md "Apps controllers" bucket
+/// Local status (2026-05-18): a scale event that arrives mid-rollout grows
+/// the active ReplicaSet without overshooting `desired + maxSurge`. The
+/// end-to-end Sonobuoy verdict is still tracked separately in
+/// `docs/CONFORMANCE.md`.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-deployment-replicaset.md"]
 async fn deployment_should_support_proportional_scaling() {
     let storage = setup();
     let ns = "default";
@@ -477,12 +481,21 @@ async fn deployment_should_support_proportional_scaling() {
         .unwrap();
     let total: i32 = rsets.iter().map(|rs| rs.spec.replicas).sum();
     let max_surge = (30.0_f64 * 0.25).ceil() as i32;
+    // Upper bound: cannot exceed desired + maxSurge.
     assert!(
         total <= 30 + max_surge,
         "total replicas {} must not exceed desired+maxSurge ({} + {})",
         total,
         30,
         max_surge
+    );
+    // Lower bound: the scale event must actually grow the active RS — a
+    // controller that swallows the scale (e.g. leaves it at 10) would still
+    // satisfy the upper bound, so pin both ends.
+    assert!(
+        total >= 30,
+        "total replicas {} must reach the new desired count of 30",
+        total
     );
 }
 

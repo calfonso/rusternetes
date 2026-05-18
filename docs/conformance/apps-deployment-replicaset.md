@@ -22,16 +22,22 @@ and the existing pattern in `crates/controller-manager/tests/` already calls
 so the scoped suite stays in the sub-second cargo-test budget.
 
 Cross-reference: `docs/CONFORMANCE.md` failure bucket **"Apps controllers"**
-(~3 failures in Round 160 — `docs/CONFORMANCE.md:48`). The three known
+(~3 failures in Round 160 — `docs/CONFORMANCE.md:48`). The remaining known
 failures in this slice are:
 
-1. `Deployment should support rollover` — `deployment.go:129` — the rollover
-   contract requires the new RS to converge to desired replicas even when the
-   pod template flips mid-rollout. Tracked via the `#[ignore]`d
-   `deployment_should_support_rollover` test.
-2. `Deployment should support proportional scaling` — `deployment.go:154` —
-   proportional distribution of the surge budget across old + new RS during a
-   scaling event. Tracked via `deployment_should_support_proportional_scaling`.
+1. ~~`Deployment should support rollover` — `deployment.go:129`~~ — the
+   controller-level mirror (`deployment_should_support_rollover`) is now
+   active and passing locally as of 2026-05-18: the v3 RS converges to the
+   desired replica count after a mid-rollout template flip. The end-to-end
+   Sonobuoy verdict is still tracked in `docs/CONFORMANCE.md` pending a
+   fresh run.
+2. ~~`Deployment should support proportional scaling` — `deployment.go:154`~~
+   — the controller-level mirror
+   (`deployment_should_support_proportional_scaling`) is now active and
+   passing locally: a scale event mid-rollout raises the active RS to the
+   new desired count without overshooting `desired + maxSurge`. The
+   end-to-end Sonobuoy verdict is still tracked in `docs/CONFORMANCE.md`
+   pending a fresh run.
 3. `ReplicaSet / ReplicationController should serve a basic image on each
    replica with a public image` — `replica_set.go:95`, `rc.go:65` — the
    end-to-end image-serving contract fails because the conformance check
@@ -51,9 +57,9 @@ not yet honor `spec.paused`. The mirror test
 | `RollingUpdateDeployment should delete old pods and create new ones` | deployment.go:106 | PASS | `deployment_rolling_update_should_delete_old_pods_and_create_new_ones` | mirrored, passing |
 | `RecreateDeployment should delete old pods and create new ones` | deployment.go:113 | PASS | `deployment_recreate_should_delete_old_pods_before_creating_new_ones` | mirrored, passing |
 | `deployment should delete old replica sets` | deployment.go:121 | PASS | `deployment_should_track_old_replicasets_for_history` | mirrored, passing |
-| `deployment should support rollover` | deployment.go:129 | FAIL | `deployment_should_support_rollover` | mirrored, ignored (tracks failure) |
+| `deployment should support rollover` | deployment.go:129 | FAIL | `deployment_should_support_rollover` | mirrored, passing locally (2026-05-18); upstream verdict pending re-run |
 | `Deployment should have a working scale subresource` | deployment.go:144 | PASS | `deployment_scale_subresource_changes_replicaset_size` | mirrored, passing |
-| `deployment should support proportional scaling` | deployment.go:154 | FAIL | `deployment_should_support_proportional_scaling` | mirrored, ignored (tracks failure) |
+| `deployment should support proportional scaling` | deployment.go:154 | FAIL | `deployment_should_support_proportional_scaling` | mirrored, passing locally (2026-05-18); upstream verdict pending re-run |
 | `should run the lifecycle of a Deployment` | deployment.go:207 | PASS | `deployment_lifecycle_create_scale_patch_delete` | mirrored, passing |
 | `should validate Deployment Status endpoints` | deployment.go:216 | PASS | `deployment_status_replicas_match_replicaset_pods` | mirrored, passing |
 | Strategy: paused deployment should not progress | deployment.go (paused-rollout helper) | PASS (upstream) / not-implemented (rusternetes) | `deployment_paused_should_not_create_new_replicaset_on_template_change` | mirrored, ignored (controller gap) |
