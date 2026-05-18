@@ -29,15 +29,16 @@ Cross-reference: `docs/CONFORMANCE.md` failure bucket
 
 with the failure recorded at upstream `resource_quota.go:312`
 (`Ensuring a pod cannot update its resource requirements` →
-`Expected an error to have occurred. Got: nil`). The fix landed for the
-**recompute-on-delete** sub-symptom in
-[PR #45 (`fix(conformance): ResourceQuota usage recompute on object
-delete`, commit `748241cf`)](https://github.com/indyjonesnl/rusternetes/pull/45).
-PR #45 added the controller's public `reconcile_one()` entry point and a
-pod-watch fanout into the quota work queue. The upstream test still fails
-because the *request-immutability admission check on Pod UPDATE* (also
-asserted at line :312) is not yet implemented end-to-end — that scope is
-out of band for this batch.
+`Expected an error to have occurred. Got: nil`). The fix landed in two
+stages: PR #45 (`748241cf`) wired the `reconcile_one()` entry point +
+pod-watch fanout for the **recompute-on-delete** sub-symptom, and the
+follow-up `fix(api-server): run ResourceQuota admission on pod
+UPDATE/PATCH` plumbed the **request-immutability admission check** into
+the Pod UPDATE and PATCH handlers with delta-usage semantics (new
+request − old request, fail if cumulative exceeds `.spec.hard`). With
+both pieces in place the upstream `:312` assertion is now satisfied
+end-to-end and `resource_quota_captures_full_pod_lifecycle` no longer
+needs an `#[ignore]`.
 
 ## Coverage matrix
 
@@ -52,7 +53,7 @@ out of band for this batch.
 | `ResourceQuota should create a ResourceQuota and ensure its status is promptly calculated` | resource_quota.go:90 | PASS | `resource_quota_create_seeds_status_used_to_zero` | mirrored, passing |
 | `ResourceQuota CRUD round-trip` | resource_quota.go:412 | PASS | `resource_quota_crud_round_trip_over_http` | mirrored, passing |
 | `ResourceQuota list across namespaces` | resource_quota.go:412 (cross-ns) | PASS | `resource_quota_list_all_namespaces` | mirrored, passing |
-| `ResourceQuota should create a ResourceQuota and capture the life of a pod` | resource_quota.go:243 (asserts at :312) | **FAIL** | `resource_quota_captures_full_pod_lifecycle` | mirrored, **ignored** (tracks Round-160 failure) |
+| `ResourceQuota should create a ResourceQuota and capture the life of a pod` | resource_quota.go:243 (asserts at :312) | **FAIL** → fixed | `resource_quota_captures_full_pod_lifecycle` | mirrored, **passing** (Pod UPDATE/PATCH now run ResourceQuota admission with delta-usage semantics) |
 | `ResourceQuota usage recompute on object delete` (PR #45 regression guard, HTTP surface) | resource_quota.go:243 (sub-assertion) | n/a (regression guard) | `resource_quota_usage_recomputes_on_pod_delete_via_http` | mirrored, passing |
 | `ResourceQuota /status subresource returns reconciled used` | resource_quota.go (status family) | PASS | `resource_quota_status_subresource_returns_used` | mirrored, passing |
 | `ResourceQuota PATCH spec.hard persists` | resource_quota.go:412 (update family) | PASS | `resource_quota_patch_spec_hard_persists` | mirrored, passing |
@@ -68,13 +69,16 @@ out of band for this batch.
 
 ## Notes
 
-- The single `#[ignore]`d test (`resource_quota_captures_full_pod_lifecycle`)
-  documents the Round-160 failure mode without masking it. The constituent
-  sub-symptoms (usage initialization, usage recompute on pod create + delete,
-  status subresource, scope filtering, terminal-pod exclusion) are each
-  asserted by individual tests in this file, so a regression in any one of
-  them surfaces immediately instead of being hidden inside a single
-  end-to-end failure.
+- `resource_quota_captures_full_pod_lifecycle` now drives the full
+  scenario end-to-end: quota seed → pod CREATE in-budget → controller
+  reconcile → pod UPDATE that would exceed `requests.cpu` (rejected with
+  403) → in-budget UPDATE (accepted, delta semantics) → PATCH that would
+  exceed `requests.memory` (rejected with 403). The constituent
+  sub-symptoms (usage initialization, usage recompute on pod create +
+  delete, status subresource, scope filtering, terminal-pod exclusion)
+  remain asserted by individual tests so a regression in any one of them
+  surfaces immediately instead of being hidden inside this single
+  end-to-end check.
 - The recompute regression guard
   (`resource_quota_usage_recomputes_on_pod_delete_via_http`) drives the
   PR-#45 entry point `ResourceQuotaController::reconcile_one()` directly

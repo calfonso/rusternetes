@@ -778,9 +778,20 @@ pub async fn update(
         }
     }
 
-    // Check ResourceQuota on update — K8s enforces quota when pod resources change.
+    // Check ResourceQuota on update with delta-usage semantics.
+    // The old pod's resource contribution is subtracted from the live
+    // namespace recount before the new pod's footprint is added, so an
+    // UPDATE that keeps total usage at or below `.spec.hard` is admitted
+    // even though the stale pod row is still in storage.
     // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
-    match crate::admission::check_resource_quota(&state.storage, &namespace, &pod).await {
+    match crate::admission::check_resource_quota_with_old(
+        &state.storage,
+        &namespace,
+        &pod,
+        Some(&old_pod),
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => {
             return Err(rusternetes_common::Error::Forbidden(
@@ -1345,6 +1356,29 @@ pub async fn patch(
             if let Some(ref mut status) = patched_pod.status {
                 status.resize = Some("Proposed".to_string());
             }
+        }
+    }
+
+    // Check ResourceQuota on patch with delta-usage semantics — same as
+    // pod UPDATE. A PATCH that pushes the per-namespace total past
+    // `.spec.hard` (after subtracting the stale row) must be rejected.
+    // K8s ref: pkg/quota/v1/evaluator/core/pods.go — PodEvaluator
+    match crate::admission::check_resource_quota_with_old(
+        &state.storage,
+        &namespace,
+        &patched_pod,
+        Some(&current_pod),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(rusternetes_common::Error::Forbidden(
+                "exceeded quota".to_string(),
+            ));
+        }
+        Err(e) => {
+            warn!("Error checking ResourceQuota on pod patch: {}", e);
         }
     }
 
