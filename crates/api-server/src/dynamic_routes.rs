@@ -259,6 +259,7 @@ mod tests {
             schema: None,
             subresources: None,
             additional_printer_columns: None,
+            selectable_fields: None,
         };
 
         if with_subresources {

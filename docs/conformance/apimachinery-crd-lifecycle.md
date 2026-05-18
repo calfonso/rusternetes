@@ -32,7 +32,7 @@ exercised through the same handler stack that production HTTPS traffic hits.
 | `should include custom resource definition resources in discovery documents` | custom_resource_definition.go:188 | PASS | `crd_resources_in_discovery_documents` | mirrored, passing |
 | `custom resource defaulting for requests and from storage works` | custom_resource_definition.go:238 | PASS | `crd_defaulting_for_requests_and_storage` | mirrored, passing |
 | `watch on custom resource definition objects` | crd_watch.go:53 | PASS | `crd_watch_create_modify_delete` | mirrored, passing |
-| `MUST list and watch custom resources matching the field selector` | crd_selectable_fields.go:174 | PASS | `crd_selectable_fields_list_watch_informer` | tracker only (selectable-fields not implemented) |
+| `MUST list and watch custom resources matching the field selector` | crd_selectable_fields.go:174 | PASS | `crd_selectable_fields_list_watch_informer` | mirrored (single-version subset; conversion-webhook v1↔v2 path still TODO) |
 | `MUST NOT fail validation for create of a custom resource that satisfies the x-kubernetes-validations rules` | crd_validation_rules.go:97 | PASS | `cel_rule_satisfied_create_succeeds` | mirrored, passing |
 | `MUST fail validation for create of a custom resource that does not satisfy the x-kubernetes-validations rules` | crd_validation_rules.go:124 | PASS | `cel_rule_violated_create_fails` | mirrored, passing |
 | `MUST fail create of a CRD that contains a x-kubernetes-validations rule that refers to a property that do not exist` | crd_validation_rules.go:150 | PASS | `cel_rule_unknown_property_crd_rejected` | mirrored, passing |

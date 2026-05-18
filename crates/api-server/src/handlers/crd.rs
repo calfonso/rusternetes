@@ -1082,6 +1082,7 @@ mod tests {
                     schema: None,
                     subresources: None,
                     additional_printer_columns: None,
+                    selectable_fields: None,
                 }],
                 conversion: None,
                 preserve_unknown_fields: None,
@@ -1122,6 +1123,7 @@ mod tests {
             schema: None,
             subresources: None,
             additional_printer_columns: None,
+            selectable_fields: None,
         });
         assert!(validate_crd(&crd).is_err());
     }

@@ -393,6 +393,7 @@ async fn custom_resource_fallback(
                         plural.to_string(),
                         namespace.map(|s| s.to_string()),
                     )),
+                    axum::extract::Query(query_params),
                 )
                 .await
                 {
