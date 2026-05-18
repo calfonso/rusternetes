@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_apps_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -3711,6 +3712,35 @@ fn decode_int_or_string(data: &[u8]) -> Value {
 // These are empty — the decoder treats unknown fields as ignored
 impl ProtoRegistry {
     // Additional placeholder types that we reference but don't need full schemas for
+
+    /// Register apps/v1 schemas not covered by the dedicated kind helpers above.
+    ///
+    /// Existing apps/v1 kinds (`Deployment`, `ReplicaSet`, `DaemonSet`,
+    /// `StatefulSet`) and their nested messages are registered inline in
+    /// [`ProtoRegistry::new`]. This helper rounds out the group with the
+    /// remaining kind, `ControllerRevision`, so that conformant clients
+    /// (kubectl / controllers) can decode it from native protobuf.
+    ///
+    /// Upstream proto: k8s.io/api/apps/v1/generated.proto (release-1.35).
+    fn register_apps_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // ControllerRevision: an immutable snapshot used by DaemonSet and
+        // StatefulSet for rollouts. The `data` field is a RawExtension, which
+        // is encoded as a message with a single `raw` bytes field carrying
+        // the serialized payload — modelled by `FieldType::JsonRaw`.
+        schemas.insert(
+            "ControllerRevision".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("data".into(), FieldType::JsonRaw)),
+                    (3, ("revision".into(), FieldType::Int)),
+                ]),
+            },
+        );
+    }
 }
 
 #[cfg(test)]
