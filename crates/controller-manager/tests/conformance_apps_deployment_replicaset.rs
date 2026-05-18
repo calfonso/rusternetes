@@ -571,10 +571,9 @@ async fn deployment_status_replicas_match_replicaset_pods() {
 /// across rollover/proportional-scaling specs).
 /// Sonobuoy (Round 160, 2026-04-26): PASS (paused = no progress)
 ///
-/// The current controller does not yet honor `spec.paused`; this test is
-/// tracked as a conformance gap (see doc fragment).
+/// `reconcile_deployment` returns early (status only) when `spec.paused` is
+/// true, so a template hash change cannot create a new ReplicaSet.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-deployment-replicaset.md (paused spec not yet honored)"]
 async fn deployment_paused_should_not_create_new_replicaset_on_template_change() {
     let storage = setup();
     let ns = "default";

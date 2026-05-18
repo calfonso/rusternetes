@@ -45,10 +45,11 @@ failures in this slice are:
    `replicaset_should_serve_basic_image_on_each_replica` and
    `rc_should_serve_basic_image_on_each_replica`.
 
-`Deployment paused` is also tracked as a gap — the current controller does
-not yet honor `spec.paused`. The mirror test
-`deployment_paused_should_not_create_new_replicaset_on_template_change` is
-`#[ignore]`d with an inline note pointing back here.
+`Deployment paused` is now honored — `reconcile_deployment` short-circuits to
+a status-only path when `spec.paused` is true, so a template hash change does
+not trigger a new ReplicaSet. The mirror test
+`deployment_paused_should_not_create_new_replicaset_on_template_change`
+exercises that guarantee.
 
 ## Coverage matrix
 
@@ -62,7 +63,7 @@ not yet honor `spec.paused`. The mirror test
 | `deployment should support proportional scaling` | deployment.go:154 | FAIL | `deployment_should_support_proportional_scaling` | mirrored, passing locally (2026-05-18); upstream verdict pending re-run |
 | `should run the lifecycle of a Deployment` | deployment.go:207 | PASS | `deployment_lifecycle_create_scale_patch_delete` | mirrored, passing |
 | `should validate Deployment Status endpoints` | deployment.go:216 | PASS | `deployment_status_replicas_match_replicaset_pods` | mirrored, passing |
-| Strategy: paused deployment should not progress | deployment.go (paused-rollout helper) | PASS (upstream) / not-implemented (rusternetes) | `deployment_paused_should_not_create_new_replicaset_on_template_change` | mirrored, ignored (controller gap) |
+| Strategy: paused deployment should not progress | deployment.go (paused-rollout helper) | PASS | `deployment_paused_should_not_create_new_replicaset_on_template_change` | mirrored, passing |
 | Strategy: RollingUpdate maxSurge=0 maxUnavailable=1 | deployment.go:106 (knob variant) | PASS | `deployment_rolling_update_zero_surge_one_unavailable_caps_replicas` | mirrored, passing |
 | Strategy: RollingUpdate maxSurge=2 maxUnavailable=0 | deployment.go:106 (knob variant) | PASS | `deployment_rolling_update_with_surge_permits_extra_replicas` | mirrored, passing |
 | Strategy: rollback to previous template | deployment.go:207 (lifecycle rollback) | PASS | `deployment_rollback_reuses_existing_old_replicaset` | mirrored, passing |
@@ -88,8 +89,7 @@ not yet honor `spec.paused`. The mirror test
 - The ignored tests stay compiled and named so a future fix can flip them
   active simply by removing the `#[ignore]` attribute. They are the
   per-controller manifestation of the three failures in
-  `docs/CONFORMANCE.md:48` ("Apps controllers (~3)") plus the
-  `paused`-rollout controller gap.
+  `docs/CONFORMANCE.md:48` ("Apps controllers (~3)").
 - The `rc_publishes_status_after_reconcile` test is a deliberately narrower
   mirror of the upstream "surface a failure condition on exceeded quota"
   scenario. The upstream test couples the ReplicaFailure condition to an
