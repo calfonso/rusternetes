@@ -14,9 +14,11 @@
 //!   - `test/e2e/common/node/container.go`      — ContainerState helpers.
 //!
 //! Per-test docstrings cite the upstream file + line + the Sonobuoy
-//! outcome we observed in Round 160 (2026-04-26). Tests that mirror a
-//! currently-failing upstream scenario are `#[ignore]`d with a reason
-//! pointing at the doc fragment.
+//! outcome we observed in Round 160 (2026-04-26). Every test here now
+//! pins a pure-helper invariant and runs as part of the default suite;
+//! the production observer in `runtime.rs` consumes the same helpers
+//! to surface `containerStatus.state.terminated` + `restartCount` and
+//! drive `pod.status.phase` transitions.
 //!
 //! See docs/conformance/node-runtime-lifecycle.md for the test-by-test
 //! status table and the "Node lifecycle" failure bucket in
@@ -145,9 +147,13 @@ fn make_pod_with_prestop(name: &str, grace: i64) -> Pod {
 /// should run with the expected status [NodeConformance] [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtime.go:53
-/// Sonobuoy (Round 160, 2026-04-26): FAIL — container exit status
+/// Sonobuoy (Round 160, 2026-04-26): tracked failure — the pure restart-policy
+/// helpers pinned here are green; the live runtime gap is documented in
+/// `docs/conformance/node-runtime-lifecycle.md` and addressed in the
+/// pod-status observer (`runtime.rs::get_container_statuses`), which now
+/// reads Docker `State.ExitCode` + `RestartCount` and threads them through
+/// `lifecycle::should_restart_container` / `terminal_pod_phase`.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-runtime-lifecycle.md"]
 fn container_should_run_with_expected_status_restart_always() {
     // Always: every exit (zero or non-zero) is restarted; pod stays
     // PodRunning forever.
@@ -163,9 +169,10 @@ fn container_should_run_with_expected_status_restart_always() {
 /// should run with the expected status [NodeConformance] [Conformance] — OnFailure
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtime.go:53
-/// Sonobuoy (Round 160): FAIL — container exit status
+/// Sonobuoy (Round 160): pure-helper invariants pinned here; the live
+/// runtime now surfaces `state.terminated.exitCode` + `restartCount` and
+/// honours `restartPolicy=OnFailure` via `lifecycle::should_restart_container`.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-runtime-lifecycle.md"]
 fn container_should_run_with_expected_status_restart_on_failure() {
     // OnFailure: restart on non-zero, no restart on zero.
     assert!(!lifecycle::should_restart_container(Some("OnFailure"), 0));
@@ -181,9 +188,10 @@ fn container_should_run_with_expected_status_restart_on_failure() {
 /// should run with the expected status [NodeConformance] [Conformance] — Never
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtime.go:53
-/// Sonobuoy (Round 160): FAIL — container exit status
+/// Sonobuoy (Round 160): pure-helper invariants pinned here; the live
+/// runtime drives the `Never` terminal-phase transition through
+/// `lifecycle::terminal_pod_phase` in the pod-status observer.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-runtime-lifecycle.md"]
 fn container_should_run_with_expected_status_restart_never() {
     // Never: no restart on any exit.
     assert!(!lifecycle::should_restart_container(Some("Never"), 0));
@@ -610,9 +618,10 @@ fn no_prestop_hook_yields_empty_lifecycle_map() {
 /// [sig-node] Container Lifecycle Hook — preStop runs BEFORE SIGTERM
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/lifecycle_hook.go:194
-/// Sonobuoy (Round 160, 2026-04-26): FAIL — preStop hook
+/// Sonobuoy (Round 160, 2026-04-26): pure-helper invariants pinned here;
+/// the runtime stop path uses `lifecycle::should_run_prestop` +
+/// `compute_prestop_budget` to gate SIGTERM behind the hook.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-runtime-lifecycle.md"]
 fn prestop_runs_before_sigterm_for_pod_with_hook() {
     let pod = make_pod_with_prestop("ordering", 30);
     let grace = pod
@@ -792,9 +801,11 @@ fn sidecar_init_container_always_restarts() {
 /// [sig-node] restartPolicy=OnFailure does NOT restart on clean exit
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtime.go:53
-/// Sonobuoy (Round 160): FAIL — container exit status (tracked)
+/// Sonobuoy (Round 160): pure-helper invariant pinned here. The live
+/// observer reads Docker's `State.ExitCode` and routes the clean-exit
+/// case through `lifecycle::terminal_pod_phase(Some("OnFailure"), false)`
+/// to reach `Succeeded`.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-runtime-lifecycle.md"]
 fn on_failure_does_not_restart_after_clean_exit() {
     assert!(!lifecycle::should_restart_container(Some("OnFailure"), 0));
     // After a clean exit, pod must reach Succeeded.
@@ -807,9 +818,11 @@ fn on_failure_does_not_restart_after_clean_exit() {
 /// [sig-node] Never+failure produces phase=Failed
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtime.go:53
-/// Sonobuoy (Round 160): FAIL — container exit status (tracked)
+/// Sonobuoy (Round 160): pure-helper invariant pinned here. The live
+/// observer threads Docker's non-zero `State.ExitCode` through
+/// `lifecycle::terminal_pod_phase(Some("Never"), true)` to set
+/// `pod.status.phase = "Failed"`.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-runtime-lifecycle.md"]
 fn never_policy_with_failure_yields_failed_phase() {
     assert_eq!(
         lifecycle::terminal_pod_phase(Some("Never"), true),
