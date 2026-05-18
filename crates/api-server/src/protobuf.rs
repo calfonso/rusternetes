@@ -2359,7 +2359,32 @@ impl ProtoRegistry {
             },
         );
 
+        Self::register_scheduling_v1(&mut schemas);
+
         ProtoRegistry { schemas }
+    }
+
+    /// Register scheduling/v1 message schemas.
+    ///
+    /// Field numbers from
+    /// k8s.io/api/scheduling/v1/generated.proto (release-1.35).
+    fn register_scheduling_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // PriorityClass — maps a priority class name to an integer priority.
+        schemas.insert(
+            "PriorityClass".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("value".into(), FieldType::Int)),
+                    (3, ("globalDefault".into(), FieldType::Bool)),
+                    (4, ("description".into(), FieldType::String)),
+                    (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
     }
 
     fn object_meta_schema() -> MessageSchema {
