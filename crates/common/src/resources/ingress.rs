@@ -49,11 +49,11 @@ pub struct IngressSpec {
     pub default_backend: Option<IngressBackend>,
 
     /// List of TLS configurations
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<Vec<IngressTLS>>,
 
     /// List of host rules
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<IngressRule>>,
 }
 
@@ -62,7 +62,7 @@ pub struct IngressSpec {
 #[serde(rename_all = "camelCase")]
 pub struct IngressTLS {
     /// Hosts are a list of hosts included in the TLS certificate
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosts: Option<Vec<String>>,
 
     /// SecretName is the name of the secret used to terminate TLS traffic
@@ -160,7 +160,7 @@ pub struct IngressStatus {
 #[serde(rename_all = "camelCase")]
 pub struct IngressLoadBalancerStatus {
     /// Ingress is a list containing ingress points for the load-balancer
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<Vec<IngressLoadBalancerIngress>>,
 }
 
@@ -177,7 +177,7 @@ pub struct IngressLoadBalancerIngress {
     pub hostname: Option<String>,
 
     /// Ports provide information about the ports exposed by the load-balancer
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<IngressPortStatus>>,
 }
 

@@ -35,15 +35,19 @@ impl Endpoints {
 #[serde(rename_all = "camelCase")]
 pub struct EndpointSubset {
     /// IP addresses which offer the related ports that are marked as ready.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addresses: Option<Vec<EndpointAddress>>,
 
     /// IP addresses which offer the related ports but are not currently marked as ready.
-    #[serde(skip_serializing_if = "Option::is_none", rename = "notReadyAddresses")]
+    #[serde(
+        rename = "notReadyAddresses",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub not_ready_addresses: Option<Vec<EndpointAddress>>,
 
     /// Port numbers available on the related IP addresses.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<EndpointPort>>,
 }
 

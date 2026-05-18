@@ -78,21 +78,25 @@ pub struct PolicyRule {
 
     /// APIGroups is the name of the APIGroup that contains the resources
     /// If multiple API groups are specified, any action requested against one of the enumerated resources in any API group will be allowed
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_groups: Option<Vec<String>>,
 
     /// Resources is a list of resources this rule applies to
     /// Examples: pods, services, deployments
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Vec<String>>,
 
     /// ResourceNames is an optional white list of names that the rule applies to
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_names: Option<Vec<String>>,
 
     /// NonResourceURLs is a set of partial urls that a user should have access to
     /// *s are allowed, but only as the full, final step in the path
-    #[serde(rename = "nonResourceURLs", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "nonResourceURLs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub non_resource_urls: Option<Vec<String>>,
 }
 
@@ -294,6 +298,6 @@ impl RoleRef {
 #[serde(rename_all = "camelCase")]
 pub struct AggregationRule {
     /// ClusterRoleSelectors holds a list of selectors which will be used to find ClusterRoles and create the rules
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_role_selectors: Option<Vec<crate::types::LabelSelector>>,
 }
