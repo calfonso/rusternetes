@@ -435,15 +435,23 @@ async fn test_controller_revision_name_includes_hash() {
         cr.metadata.name.starts_with("hash-ds-"),
         "ControllerRevision name should start with DaemonSet name followed by a dash"
     );
-    // The hash suffix should be a hex string
+    // The hash suffix follows the K8s SafeEncodeString convention: each digit
+    // of the decimal FNV hash is remapped through the
+    // "bcdfghjklmnpqrstvwxz2456789" alphabet. Length varies (1–10 chars for a
+    // u32) and characters are NOT hex.
+    // K8s ref: staging/src/k8s.io/apimachinery/pkg/util/rand/rand.go
+    const SAFE_ALPHABET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
     let suffix = cr.metadata.name.strip_prefix("hash-ds-").unwrap();
     assert!(
-        suffix.len() == 10,
-        "Hash suffix should be 10 characters (first 10 chars of hex hash)"
+        !suffix.is_empty() && suffix.len() <= 10,
+        "Hash suffix should be 1-10 SafeEncodeString chars, got: {} ({} chars)",
+        suffix,
+        suffix.len()
     );
     assert!(
-        suffix.chars().all(|c| c.is_ascii_hexdigit()),
-        "Hash suffix should be hexadecimal"
+        suffix.bytes().all(|b| SAFE_ALPHABET.contains(&b)),
+        "Hash suffix should only use the SafeEncodeString alphabet, got: {}",
+        suffix
     );
 }
 

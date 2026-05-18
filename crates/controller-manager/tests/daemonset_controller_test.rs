@@ -474,9 +474,14 @@ async fn test_daemonset_pod_naming_convention() {
     assert_eq!(pods.len(), 1);
 
     let pod = &pods[0];
+    // K8s convention: DaemonSet pods are named "<ds-name>-<random>" via
+    // generateName, NOT "<ds-name>-<node-name>-...". A fresh suffix every
+    // time a pod is recreated is required by the "should retry creating
+    // failed daemon pods" conformance test, which asserts the original
+    // failed pod's name returns NotFound via GET.
     assert!(
-        pod.metadata.name.starts_with("test-ds-node-example-com-"),
-        "Pod name should start with 'test-ds-node-example-com-', got: {}",
+        pod.metadata.name.starts_with("test-ds-"),
+        "Pod name should start with 'test-ds-', got: {}",
         pod.metadata.name
     );
     assert!(

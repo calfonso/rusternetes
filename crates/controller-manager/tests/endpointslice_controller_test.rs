@@ -653,9 +653,12 @@ async fn test_endpointslice_multi_port_multi_ip_service() {
         labels.get("kubernetes.io/service-name"),
         Some(&"multi-svc".to_string())
     );
+    // The slice is mirrored from Endpoints (no Service exists here), so the
+    // mirroring controller's label is expected. K8s splits ownership into two
+    // distinct managed-by values: selector-based vs mirrored Endpoints.
     assert_eq!(
         labels.get("endpointslice.kubernetes.io/managed-by"),
-        Some(&"endpointslice-controller.k8s.io".to_string())
+        Some(&"endpointslice-mirroring-controller.k8s.io".to_string())
     );
 }
 

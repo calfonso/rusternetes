@@ -16,6 +16,21 @@ async fn setup_test() -> Arc<MemoryStorage> {
     storage
 }
 
+/// Simulate kubelet behavior: remove from storage any pods the controller has
+/// marked for deletion. StatefulSet reconcile only sets a deletionTimestamp
+/// (graceful delete handed off to kubelet). Without a real kubelet,
+/// scale-down and rolling-update assertions on storage state need this helper.
+async fn simulate_kubelet_cleanup(storage: &Arc<MemoryStorage>, namespace: &str) {
+    let prefix = format!("/registry/pods/{}/", namespace);
+    let pods: Vec<Pod> = storage.list(&prefix).await.unwrap_or_default();
+    for pod in pods {
+        if pod.metadata.deletion_timestamp.is_some() {
+            let key = format!("/registry/pods/{}/{}", namespace, pod.metadata.name);
+            let _ = storage.delete(&key).await;
+        }
+    }
+}
+
 fn create_test_statefulset(name: &str, namespace: &str, replicas: i32) -> StatefulSet {
     let mut labels = HashMap::new();
     labels.insert("app".to_string(), name.to_string());
@@ -223,9 +238,13 @@ async fn test_statefulset_scales_down_reverse_order() {
     statefulset.spec.replicas = Some(2);
     storage.update(&key, &statefulset).await.unwrap();
 
-    // Run controller multiple times (one pod deleted per cycle, matching K8s behavior)
+    // Run controller multiple times (one pod deleted per cycle, matching K8s
+    // behavior). Simulate kubelet between cycles so pods marked for deletion
+    // are actually removed from storage and the next reconcile sees the new
+    // pod count.
     for _ in 0..4 {
         controller.reconcile_all().await.unwrap();
+        simulate_kubelet_cleanup(&storage, "default").await;
     }
 
     // Verify only 2 pods remain
@@ -390,8 +409,11 @@ async fn test_statefulset_rolling_update_changes_image() {
     fresh_ss.spec.template.spec.containers[0].image = "nginx:1.26-alpine".to_string();
     storage.update(&key, &fresh_ss).await.unwrap();
 
-    // Reconcile — should detect revision mismatch and delete one pod
+    // Reconcile — should detect revision mismatch and mark one pod for
+    // deletion. Simulate kubelet to actually remove the marked pod from
+    // storage so the assertion below observes the new pod count.
     controller.reconcile_all().await.unwrap();
+    simulate_kubelet_cleanup(&storage, "default").await;
 
     // Should have deleted one pod (rolling update deletes one at a time)
     let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
@@ -403,6 +425,7 @@ async fn test_statefulset_rolling_update_changes_image() {
 
     // Reconcile again — should recreate the deleted pod with new revision
     controller.reconcile_all().await.unwrap();
+    simulate_kubelet_cleanup(&storage, "default").await;
 
     let pods_recreated: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert_eq!(
