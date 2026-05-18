@@ -201,6 +201,7 @@ pub async fn create_custom_resource(
 
     // Run admission webhooks (mutating + validating) for custom resources
     // K8s runs webhooks for ALL resource types including CRDs
+    let cr_is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     {
         let gvk = rusternetes_common::admission::GroupVersionKind {
             group: group.clone(),
@@ -219,9 +220,9 @@ pub async fn create_custom_resource(
         };
         let cr_val = serde_json::to_value(&cr).ok();
         // Run mutating webhooks
-        let (_response, mutated_obj) = state
+        let (mutation_response, mutated_obj) = state
             .webhook_manager
-            .run_mutating_webhooks(
+            .run_mutating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Create,
                 &gvk,
                 &gvr,
@@ -230,8 +231,16 @@ pub async fn create_custom_resource(
                 cr_val.clone(),
                 None,
                 &user_info,
+                cr_is_dry_run,
             )
             .await?;
+        // K8s mutating webhooks CAN deny — enforce the denial.
+        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &mutation_response {
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "admission webhook denied the request: {}",
+                reason
+            )));
+        }
         if let Some(mutated) = mutated_obj {
             if let Ok(m) = serde_json::from_value::<CustomResource>(mutated) {
                 cr = m;
@@ -240,7 +249,7 @@ pub async fn create_custom_resource(
         // Run validating webhooks
         if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
             .webhook_manager
-            .run_validating_webhooks(
+            .run_validating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Create,
                 &gvk,
                 &gvr,
@@ -249,6 +258,7 @@ pub async fn create_custom_resource(
                 serde_json::to_value(&cr).ok(),
                 None,
                 &user_info,
+                cr_is_dry_run,
             )
             .await?
         {
@@ -266,7 +276,7 @@ pub async fn create_custom_resource(
     prune_custom_resource(&crd, &version, &mut cr);
 
     // Check for dry-run
-    if crate::handlers::dryrun::is_dry_run(&params) {
+    if cr_is_dry_run {
         return Ok((StatusCode::OK, Json(cr)));
     }
 
@@ -481,13 +491,11 @@ pub async fn update_custom_resource(
     cr.api_version = format!("{}/{}", group, version);
     cr.kind = crd.spec.names.kind.clone();
 
-    // Check for dry-run
-    if crate::handlers::dryrun::is_dry_run(&params) {
-        return Ok(Json(cr));
-    }
+    let cr_is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Run validating webhooks for UPDATE operations.
-    // K8s runs webhooks on all mutating operations (CREATE, UPDATE, DELETE).
+    // K8s runs webhooks on all mutating operations (CREATE, UPDATE, DELETE),
+    // and webhooks fire even for dry-run requests so deny decisions are honored.
     {
         use rusternetes_common::admission::{
             AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
@@ -510,7 +518,7 @@ pub async fn update_custom_resource(
         let cr_value = serde_json::to_value(&cr).ok();
         if let AdmissionResponse::Deny(reason) = state
             .webhook_manager
-            .run_validating_webhooks(
+            .run_validating_webhooks_with_dryrun(
                 &Operation::Update,
                 &gvk,
                 &gvr,
@@ -519,11 +527,17 @@ pub async fn update_custom_resource(
                 cr_value,
                 None,
                 &user_info,
+                cr_is_dry_run,
             )
             .await?
         {
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
+    }
+
+    // Skip persistence for dry-run after webhooks have run.
+    if cr_is_dry_run {
+        return Ok(Json(cr));
     }
 
     // Build storage key
@@ -1037,9 +1051,10 @@ pub async fn delete_custom_resource(
         let cr_value = serde_json::to_value(&cr).ok();
         // K8s DELETE AdmissionReview: object is nil, oldObject has the resource being deleted.
         // The webhook inspects oldObject to decide whether to allow deletion.
+        let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
         if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
             .webhook_manager
-            .run_validating_webhooks(
+            .run_validating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Delete,
                 &gvk,
                 &gvr,
@@ -1048,6 +1063,7 @@ pub async fn delete_custom_resource(
                 None,
                 cr_value,
                 &user_info,
+                is_dry_run,
             )
             .await?
         {
@@ -1134,6 +1150,17 @@ fn apply_schema_defaults(crd: &CustomResourceDefinition, version: &str, cr: &mut
     }
 }
 
+/// Test-only re-export of `prune_custom_resource` so admission webhook tests
+/// can verify the pruning path applied after mutating webhooks.
+#[cfg(test)]
+pub(crate) fn test_prune_custom_resource(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    cr: &mut CustomResource,
+) {
+    prune_custom_resource(crd, version, cr)
+}
+
 /// Prune unknown fields from a CR based on the CRD schema.
 /// K8s removes fields not in the schema unless x-kubernetes-preserve-unknown-fields is set.
 /// This runs AFTER webhook mutation so webhook-added fields not in the schema are removed.
@@ -1182,11 +1209,26 @@ fn prune_custom_resource(crd: &CustomResourceDefinition, version: &str, cr: &mut
     }
 
     // Also prune within known fields like "data", "spec", "status"
-    // by checking their nested schema properties
+    // by checking their nested schema properties.
     if let Some(schema_props) = &schema.properties {
         for (field_name, field_schema) in schema_props {
             // Check if this field preserves unknown fields
             if field_schema.x_kubernetes_preserve_unknown_fields == Some(true) {
+                continue;
+            }
+            // The CustomResource type lifts "spec" and "status" out of the flat
+            // map and stores them on their own fields. Walk those as well so
+            // webhook-injected unknown fields under spec/status get pruned.
+            if field_name == "spec" {
+                if let Some(spec_val) = cr.spec.as_mut() {
+                    prune_value_against_schema(spec_val, field_schema, "spec");
+                }
+                continue;
+            }
+            if field_name == "status" {
+                if let Some(status_val) = cr.status.as_mut() {
+                    prune_value_against_schema(status_val, field_schema, "status");
+                }
                 continue;
             }
             if let Some(field_props) = &field_schema.properties {
@@ -1211,6 +1253,49 @@ fn prune_custom_resource(crd: &CustomResourceDefinition, version: &str, cr: &mut
                 }
             }
         }
+    }
+}
+
+/// Recursively prune unknown fields from a JSON value against a JSONSchema.
+/// Fields not declared as a property are removed unless the schema (or the
+/// enclosing object) carries x-kubernetes-preserve-unknown-fields.
+///
+/// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning/prune.go
+fn prune_value_against_schema(
+    value: &mut serde_json::Value,
+    schema: &rusternetes_common::resources::JSONSchemaProps,
+    path: &str,
+) {
+    if schema.x_kubernetes_preserve_unknown_fields == Some(true) {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(obj) => {
+            let Some(props) = schema.properties.as_ref() else {
+                return;
+            };
+            obj.retain(|k, _| {
+                let keep = props.contains_key(k);
+                if !keep {
+                    tracing::debug!("Pruning unknown field '{}.{}'", path, k);
+                }
+                keep
+            });
+            for (k, child_schema) in props {
+                if let Some(child_val) = obj.get_mut(k) {
+                    prune_value_against_schema(child_val, child_schema, &format!("{}.{}", path, k));
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            use rusternetes_common::resources::JSONSchemaPropsOrArray;
+            if let Some(JSONSchemaPropsOrArray::Schema(item_schema)) = schema.items.as_deref() {
+                for (i, item) in arr.iter_mut().enumerate() {
+                    prune_value_against_schema(item, item_schema, &format!("{}[{}]", path, i));
+                }
+            }
+        }
+        _ => {}
     }
 }
 
