@@ -43,12 +43,21 @@ jobs:
         # ARC runner pods are ephemeral; rust-cache restores ~/.cargo
         # and target/ from the GitHub Actions cache scoped to
         # Cargo.lock + rustc version.
+        #
+        # `save-if: main only` is deliberate: PRs restore from the
+        # cache main wrote on the most recent merge, then SKIP the
+        # multi-GB upload at job end. Cache uploads from the ARC
+        # cluster to the GHA cache service (Azure blob) were eating
+        # 1-3 min per PR job; main pays that cost once per Cargo.lock
+        # change. PRs that touch Cargo.lock will recompile new deps
+        # but still benefit from the warm cache for everything else.
         uses: Swatinem/rust-cache@v2
         with:
           # Distinct cache namespace from clippy: the test profile and
           # check profile produce different artifacts under target/.
           prefix-key: "v1-rust"
           shared-key: "nextest"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo nextest run
         # `--status-level fail` suppresses per-test PASS lines; the
@@ -73,10 +82,12 @@ jobs:
         run: cp .cargo/config.toml.example .cargo/config.toml
 
       - name: Cache cargo registry + target
+        # See save-if rationale in the nextest job's cache step.
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
           shared-key: "clippy"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo clippy (informational, all targets)
         # Warnings are surfaced in the run log but do not fail CI yet —
