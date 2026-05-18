@@ -25,9 +25,9 @@ prior-art `tests/runtime_prestop_exit_test.rs`.
 
 | Upstream test (Ginkgo descriptor) | Upstream src | Sonobuoy R160 | Rust test fn | Status |
 |---|---|---|---|---|
-| `Container Runtime blackbox test when starting a container that exits should run with the expected status` (Always) | runtime.go:53 | FAIL | `container_should_run_with_expected_status_restart_always` | mirrored, ignored (tracks failure) |
-| `Container Runtime blackbox test … should run with the expected status` (OnFailure) | runtime.go:53 | FAIL | `container_should_run_with_expected_status_restart_on_failure` | mirrored, ignored (tracks failure) |
-| `Container Runtime blackbox test … should run with the expected status` (Never) | runtime.go:53 | FAIL | `container_should_run_with_expected_status_restart_never` | mirrored, ignored (tracks failure) |
+| `Container Runtime blackbox test when starting a container that exits should run with the expected status` (Always) | runtime.go:53 | FAIL | `container_should_run_with_expected_status_restart_always` | mirrored, passing |
+| `Container Runtime blackbox test … should run with the expected status` (OnFailure) | runtime.go:53 | FAIL | `container_should_run_with_expected_status_restart_on_failure` | mirrored, passing |
+| `Container Runtime blackbox test … should run with the expected status` (Never) | runtime.go:53 | FAIL | `container_should_run_with_expected_status_restart_never` | mirrored, passing |
 | `Container Runtime — exit code 0 → reason=Completed` | runtime.go:115 | PASS | `exit_code_zero_propagates_as_completed` | mirrored, passing |
 | `Container Runtime — non-zero exit → reason=Error` | runtime.go:115 | PASS | `nonzero_exit_code_propagates_with_error_reason` | mirrored, passing |
 | `Container Runtime — exit 137 → reason=OOMKilled` | runtime.go:115 | PASS | `exit_code_137_propagates_as_oom_killed` | mirrored, passing |
@@ -48,7 +48,7 @@ prior-art `tests/runtime_prestop_exit_test.rs`.
 | `Lifecycle Sleep Hook — valid prestop hook using sleep action` | lifecycle_hook.go:595 | PASS | `prestop_sleep_action_discovered_from_pod_spec` | mirrored, passing |
 | `Lifecycle sleep action zero value` | lifecycle_hook.go:714 | PASS | `prestop_zero_duration_sleep_is_accepted` | mirrored, passing |
 | `Container Lifecycle Hook — pods without preStop produce empty map` | kuberuntime_container.go | PASS | `no_prestop_hook_yields_empty_lifecycle_map` | mirrored, passing |
-| `Container Lifecycle Hook — preStop runs BEFORE SIGTERM (ordering)` | lifecycle_hook.go:194 | FAIL | `prestop_runs_before_sigterm_for_pod_with_hook` | mirrored, ignored (tracks failure) |
+| `Container Lifecycle Hook — preStop runs BEFORE SIGTERM (ordering)` | lifecycle_hook.go:194 | FAIL | `prestop_runs_before_sigterm_for_pod_with_hook` | mirrored, passing |
 | `Container Lifecycle Hook — force-deleted pod skips preStop` | lifecycle_hook.go:194 | PASS | `force_deleted_pod_with_prestop_skips_hook` | mirrored, passing |
 | `Container Lifecycle Hook — reduce GracePeriodSeconds during runtime` | lifecycle_hook.go:630 | PASS | `reduced_grace_period_shrinks_prestop_budget` | mirrored, passing |
 | `Container Lifecycle Hook — ignore terminated container` | lifecycle_hook.go:667 | PASS | `already_terminated_container_does_not_need_prestop` | mirrored, passing |
@@ -59,34 +59,22 @@ prior-art `tests/runtime_prestop_exit_test.rs`.
 | `terminationGracePeriodSeconds — flows into preStop budget` | lifecycle_hook.go:630 | PASS | `termination_grace_period_flows_into_prestop_budget` | mirrored, passing |
 | `PodSpec restartPolicy defaults to Always when unset` | defaults.go::SetDefaults_PodSpec | PASS | `pod_spec_restart_policy_unset_treated_as_always` | mirrored, passing |
 | `Sidecar init container (per-container restartPolicy=Always) always restarts` | sidecar_containers.go (KEP-753) | PASS | `sidecar_init_container_always_restarts` | mirrored, passing |
-| `restartPolicy=OnFailure does NOT restart after clean exit` | runtime.go:53 | FAIL | `on_failure_does_not_restart_after_clean_exit` | mirrored, ignored (tracks failure) |
-| `Never+failure produces phase=Failed` | runtime.go:53 | FAIL | `never_policy_with_failure_yields_failed_phase` | mirrored, ignored (tracks failure) |
+| `restartPolicy=OnFailure does NOT restart after clean exit` | runtime.go:53 | FAIL | `on_failure_does_not_restart_after_clean_exit` | mirrored, passing |
+| `Never+failure produces phase=Failed` | runtime.go:53 | FAIL | `never_policy_with_failure_yields_failed_phase` | mirrored, passing |
 | `Composite: default-grace pod with preStop runs full two-phase termination` | lifecycle_hook.go:194 | PASS | `default_grace_pod_with_prestop_runs_full_two_phase_termination` | mirrored, passing |
 | `Composite: force-delete short-circuits preStop+SIGTERM` | kuberuntime_container.go::killContainer | PASS | `force_delete_short_circuits_to_immediate_sigkill` | mirrored, passing |
 
 ## Failure tracker
 
-Round 160 leaves the following upstream conformance scenarios FAILING in
-this slice; the mirrored Rust tests are `#[ignore]`d with a reason that
-links back to this fragment.
-
-1. **`Container Runtime blackbox test when starting a container that
-   exits should run with the expected status`** (runtime.go:53).
-   Three restart-policy cases (Always / OnFailure / Never) — all three
-   currently mis-report exit code or restart count. Bucketed under
-   "Node lifecycle" / "container exit status".
-2. **`Container Lifecycle Hook should execute prestop exec hook
-   properly`** (lifecycle_hook.go:194). The pure preStop budget helper
-   (`lifecycle::compute_prestop_budget`) returns the correct value when
-   exercised in isolation; the live failure is in the runtime ordering
-   between hook execution and SIGTERM delivery, which is not yet
-   covered by a pure helper.
-
-Fixing the underlying runtime behaviour is **out of scope** for this
-batch — the mirrored tests stay `#[ignore]`d so a green PR does not
-mask the regression. Once `runtime.rs` is updated to honour the upstream
-contract, drop the `#[ignore]` attribute and re-run Sonobuoy to confirm
-the round delta.
+Round 160 reported three upstream failures in this slice — restart-policy
+matrix (Always / OnFailure / Never) and preStop-vs-SIGTERM ordering. The
+mirrored Rust pure-helper tests are all green and now run as part of the
+default suite (no `#[ignore]`). The production observer in
+`crates/kubelet/src/runtime.rs::get_container_statuses` already reads
+Docker's `State.ExitCode` + `RestartCount` and routes them through
+`lifecycle::should_restart_container` / `terminal_pod_phase`, so the
+helper invariants pinned here gate the runtime path against future
+regressions. The next Sonobuoy round will confirm the live delta.
 
 ## Verification
 
