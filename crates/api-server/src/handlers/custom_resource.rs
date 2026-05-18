@@ -1562,17 +1562,28 @@ pub async fn get_custom_resource_scale(
 
     let cr: CustomResource = state.storage.get(&key).await?;
 
-    // Extract scale information using JSONPath
-    let spec_replicas = extract_json_path(&cr.spec, &scale_config.spec_replicas_path)
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as i32;
+    // Per apiextensions.k8s.io/v1 CustomResourceSubresourceScale:
+    //   specReplicasPath   MUST be a JSONPath under .spec
+    //   statusReplicasPath MUST be a JSONPath under .status
+    //   labelSelectorPath  MUST be a JSONPath under .status
+    // Strip the root segment so we can resolve against the already-narrowed
+    // cr.spec / cr.status objects.
+    let spec_replicas = extract_json_path(
+        &cr.spec,
+        strip_root_prefix(&scale_config.spec_replicas_path, "spec"),
+    )
+    .and_then(|v| v.as_i64())
+    .unwrap_or(0) as i32;
 
-    let status_replicas = extract_json_path(&cr.status, &scale_config.status_replicas_path)
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as i32;
+    let status_replicas = extract_json_path(
+        &cr.status,
+        strip_root_prefix(&scale_config.status_replicas_path, "status"),
+    )
+    .and_then(|v| v.as_i64())
+    .unwrap_or(0) as i32;
 
     let label_selector = if let Some(ref selector_path) = scale_config.label_selector_path {
-        extract_json_path(&cr.status, selector_path)
+        extract_json_path(&cr.status, strip_root_prefix(selector_path, "status"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     } else {
@@ -1671,9 +1682,15 @@ pub async fn update_custom_resource_scale(
 
     let mut cr: CustomResource = state.storage.get(&key).await?;
 
-    // Update the replica count in the spec using JSONPath
+    // Update the replica count in the spec using JSONPath.
+    // specReplicasPath is rooted at .spec (see GET path above) — strip the
+    // root segment before writing into the narrowed cr.spec object.
     if let Some(ref mut spec) = cr.spec {
-        set_json_path(spec, &scale_config.spec_replicas_path, scale.spec.replicas);
+        set_json_path(
+            spec,
+            strip_root_prefix(&scale_config.spec_replicas_path, "spec"),
+            scale.spec.replicas,
+        );
     }
 
     // Save the updated resource
@@ -1686,6 +1703,21 @@ pub async fn update_custom_resource_scale(
         Path((group, version, plural, namespace, name)),
     )
     .await
+}
+
+/// Strip the CRD scale subresource root segment (`spec` or `status`) from a
+/// JSONPath so it can be resolved against the already-narrowed `cr.spec` /
+/// `cr.status` value. Handles both `.spec.replicas` and `spec.replicas`
+/// input forms. Returns the path **unchanged** if the prefix isn't present
+/// or doesn't form a full path segment, so a caller passing the wrong root
+/// surfaces the mismatch instead of silently rewriting the path.
+fn strip_root_prefix<'a>(path: &'a str, root: &str) -> &'a str {
+    let trimmed = path.strip_prefix('.').unwrap_or(path);
+    match trimmed.strip_prefix(root) {
+        Some(rest) if rest.starts_with('.') => &rest[1..],
+        Some("") => "",
+        _ => path,
+    }
 }
 
 /// Helper to extract a value from a JSON object using a simple JSONPath
@@ -2064,5 +2096,55 @@ mod tests {
             "Strict validation should pass for valid CR: {:?}",
             result
         );
+    }
+
+    /// Regression: `get_custom_resource_scale` resolved `.spec.replicas`
+    /// against the already-narrowed `cr.spec` object, ending up at the
+    /// non-existent `spec.spec.replicas` path → replicas always 0.
+    #[test]
+    fn strip_root_prefix_resolves_scale_subresource_paths() {
+        // K8s-conventional CRD paths
+        assert_eq!(strip_root_prefix(".spec.replicas", "spec"), "replicas");
+        assert_eq!(strip_root_prefix(".status.replicas", "status"), "replicas");
+        assert_eq!(strip_root_prefix(".status.selector", "status"), "selector");
+
+        // Nested paths under .spec / .status
+        assert_eq!(
+            strip_root_prefix(".spec.scaling.replicas", "spec"),
+            "scaling.replicas"
+        );
+
+        // Tolerate missing leading dot
+        assert_eq!(strip_root_prefix("spec.replicas", "spec"), "replicas");
+
+        // Tolerate already-stripped path (no-op)
+        assert_eq!(strip_root_prefix("replicas", "spec"), "replicas");
+
+        // Wrong root prefix is left untouched (caller mismatch — surfaces as
+        // empty lookup, not silent rewrite)
+        assert_eq!(
+            strip_root_prefix(".status.replicas", "spec"),
+            ".status.replicas"
+        );
+    }
+
+    /// End-to-end: a `.spec.replicas`-pathed scale subresource read through
+    /// `extract_json_path` after `strip_root_prefix` returns the actual
+    /// replicas count, not the pre-fix `0` it produced before.
+    #[test]
+    fn extract_scale_replicas_after_strip_returns_expected_value() {
+        let spec = Some(serde_json::json!({ "replicas": 7 }));
+        let path = strip_root_prefix(".spec.replicas", "spec");
+        let got = extract_json_path(&spec, path).and_then(|v| v.as_i64());
+        assert_eq!(got, Some(7));
+    }
+
+    /// And the symmetric write path: setting `.spec.replicas` after strip
+    /// stamps `replicas` on the spec root, not `spec.replicas` underneath it.
+    #[test]
+    fn set_scale_replicas_after_strip_writes_at_spec_root() {
+        let mut spec = serde_json::json!({});
+        set_json_path(&mut spec, strip_root_prefix(".spec.replicas", "spec"), 5);
+        assert_eq!(spec, serde_json::json!({ "replicas": 5 }));
     }
 }
