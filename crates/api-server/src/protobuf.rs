@@ -33,6 +33,13 @@ pub enum FieldType {
     Bool,
     /// Nested message — value is the message type name for schema lookup
     Message(String),
+    /// Inline-embedded message — Go's JSON tags flatten the inner fields
+    /// into the parent object. The proto wire format still nests the
+    /// message at this field number, but the decoded JSON merges the
+    /// inner fields one level up. Used for `Volume.volumeSource` and
+    /// every `LocalObjectReference` embedding (ConfigMapVolumeSource,
+    /// SecretProjection, ConfigMapProjection, ...).
+    InlineMessage(String),
     /// map<string, string> — encoded as repeated MapEntry messages
     StringMap,
     /// Repeated field — value is the element type
@@ -575,6 +582,7 @@ impl ProtoRegistry {
             Self::resource_requirements_schema(),
         );
         schemas.insert("Volume".into(), Self::volume_schema());
+        schemas.insert("VolumeSource".into(), Self::volume_source_schema());
         schemas.insert("VolumeMount".into(), Self::volume_mount_schema());
         schemas.insert("EnvVar".into(), Self::env_var_schema());
         schemas.insert("EnvVarSource".into(), Self::env_var_source_schema());
@@ -1921,6 +1929,436 @@ impl ProtoRegistry {
             },
         );
 
+        // ========== rbac.authorization.k8s.io/v1 types ==========
+        //
+        // Field numbers from
+        // https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/api/rbac/v1/generated.proto
+        // Without these, client-go (hydrophone, controller-runtime) sends
+        // `Content-Type: application/vnd.kubernetes.protobuf` for RBAC
+        // CREATE/UPDATE and the api-server rejects the body with
+        // "No schema found for kind 'ClusterRole'" before any handler runs.
+
+        schemas.insert(
+            "PolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "resourceNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "nonResourceURLs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "Subject".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("apiGroup".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                    (4, ("namespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "RoleRef".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("apiGroup".into(), FieldType::String)),
+                    (2, ("kind".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "AggregationRule".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "clusterRoleSelectors".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("LabelSelector".into()))),
+                    ),
+                )]),
+            },
+        );
+
+        schemas.insert(
+            "Role".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ClusterRole".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "aggregationRule".into(),
+                            FieldType::Message("AggregationRule".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "RoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ClusterRoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+
+        // ========== core/v1 Pod volume + projection types ==========
+        //
+        // Field numbers from
+        // https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/api/core/v1/generated.proto
+        //
+        // Without these the Volume schema references projection/source
+        // submessages that have no registered decoder, so client-go pod
+        // CREATE/UPDATE bodies decode KeyToPath / ServiceAccountTokenProjection
+        // entries as `{}` and the JSON-conversion step rejects them with
+        // "missing field `path`" (KeyToPath.path and
+        // ServiceAccountTokenProjection.path are required).
+        //
+        // ConfigMapVolumeSource, SecretProjection, and ConfigMapProjection
+        // define field 1 as an embedded LocalObjectReference message that
+        // Go's JSON tag flattens to a top-level `name`. They use
+        // `FieldType::InlineMessage` to merge the inner `name` into the
+        // parent's JSON output (same mechanism Volume uses for
+        // VolumeSource).
+        schemas.insert(
+            "ProjectedVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "sources".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "VolumeProjection".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("defaultMode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "VolumeProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "secret".into(),
+                            FieldType::Message("SecretProjection".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "downwardAPI".into(),
+                            FieldType::Message("DownwardAPIProjection".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "configMap".into(),
+                            FieldType::Message("ConfigMapProjection".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "serviceAccountToken".into(),
+                            FieldType::Message("ServiceAccountTokenProjection".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ServiceAccountTokenProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("audience".into(), FieldType::String)),
+                    (2, ("expirationSeconds".into(), FieldType::Int)),
+                    (3, ("path".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "KeyToPath".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("mode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIVolumeFile".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "fieldRef".into(),
+                            FieldType::Message("ObjectFieldSelector".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resourceFieldRef".into(),
+                            FieldType::Message("ResourceFieldSelector".into()),
+                        ),
+                    ),
+                    (4, ("mode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DownwardAPIVolumeFile".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("defaultMode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "DownwardAPIVolumeFile".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "SecretProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (3, ("defaultMode".into(), FieldType::Int)),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SecretVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("secretName".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (3, ("defaultMode".into(), FieldType::Int)),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EmptyDirVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("medium".into(), FieldType::String)),
+                    // field 2 = sizeLimit (Quantity) — no FieldType variant
+                    // for Quantity strings; skip until callers need it.
+                ]),
+            },
+        );
+        schemas.insert(
+            "HostPathVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (2, ("type".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PersistentVolumeClaimVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("claimName".into(), FieldType::String)),
+                    (2, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
         ProtoRegistry { schemas }
     }
 
@@ -2424,21 +2862,46 @@ impl ProtoRegistry {
     }
 
     fn volume_schema() -> MessageSchema {
-        // Volumes have many source types — we handle the most common
+        // The proto wire format wraps every Volume source type in an
+        // embedded `VolumeSource` message at field 2. Go's JSON tag
+        // flattens VolumeSource into Volume, so decoded JSON keys
+        // (`hostPath`, `emptyDir`, ...) appear at the Volume level.
+        // The inline-message variant performs that merge — fields live in
+        // `volume_source_schema()` below.
         MessageSchema {
             fields: HashMap::from([
                 (1, ("name".into(), FieldType::String)),
-                // VolumeSource is inlined — each source type has its own field number
-                // We handle the most common ones
                 (
                     2,
+                    (
+                        "volumeSource".into(),
+                        FieldType::InlineMessage("VolumeSource".into()),
+                    ),
+                ),
+            ]),
+        }
+    }
+
+    fn volume_source_schema() -> MessageSchema {
+        // Field numbers from
+        // https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/api/core/v1/generated.proto
+        // (message VolumeSource). Source kinds we don't yet decode
+        // (gitRepo, nfs, iscsi, glusterfs, rbd, flex, cinder, cephfs,
+        // flocker, azure*, vsphere, photon, portworx, scaleIO,
+        // storageOS, csi, ephemeral) are intentionally omitted — the
+        // decoder ignores unknown field numbers so requests using them
+        // still round-trip with the supported subset.
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
                     (
                         "hostPath".into(),
                         FieldType::Message("HostPathVolumeSource".into()),
                     ),
                 ),
                 (
-                    3,
+                    2,
                     (
                         "emptyDir".into(),
                         FieldType::Message("EmptyDirVolumeSource".into()),
@@ -2452,7 +2915,7 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
-                    9,
+                    10,
                     (
                         "persistentVolumeClaim".into(),
                         FieldType::Message("PersistentVolumeClaimVolumeSource".into()),
@@ -2466,17 +2929,17 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
+                    16,
+                    (
+                        "downwardAPI".into(),
+                        FieldType::Message("DownwardAPIVolumeSource".into()),
+                    ),
+                ),
+                (
                     26,
                     (
                         "projected".into(),
                         FieldType::Message("ProjectedVolumeSource".into()),
-                    ),
-                ),
-                (
-                    28,
-                    (
-                        "downwardAPI".into(),
-                        FieldType::Message("DownwardAPIVolumeSource".into()),
                     ),
                 ),
             ]),
@@ -2707,10 +3170,23 @@ impl ProtoRegistry {
                     pos += len;
 
                     if let Some((name, field_type)) = schema.fields.get(&field_num) {
-                        let json_val = self.decode_field_value(field_type, field_data);
-
                         match field_type {
+                            FieldType::InlineMessage(msg_type) => {
+                                // Go's JSON tag flattens this nested message
+                                // into the parent. Decode the embedded message,
+                                // then merge its fields into `obj` directly so
+                                // the surrounding JSON struct sees them at the
+                                // top level (e.g. `Volume.volumeSource → emptyDir`).
+                                if let Some(Value::Object(inner)) =
+                                    self.decode_message(msg_type, field_data)
+                                {
+                                    for (k, v) in inner {
+                                        obj.insert(k, v);
+                                    }
+                                }
+                            }
                             FieldType::Repeated(_) => {
+                                let json_val = self.decode_field_value(field_type, field_data);
                                 repeated_fields
                                     .entry(name.clone())
                                     .or_default()
@@ -2739,6 +3215,7 @@ impl ProtoRegistry {
                                 }
                             }
                             _ => {
+                                let json_val = self.decode_field_value(field_type, field_data);
                                 obj.insert(name.clone(), json_val);
                             }
                         }
@@ -2774,7 +3251,10 @@ impl ProtoRegistry {
                 use base64::Engine;
                 Value::String(base64::engine::general_purpose::STANDARD.encode(data))
             }
-            FieldType::Message(msg_type) => {
+            FieldType::Message(msg_type) | FieldType::InlineMessage(msg_type) => {
+                // InlineMessage merging is handled at the caller (decode_with_schema).
+                // Reaching here means it's nested under a Repeated wrapper, which is
+                // not a documented K8s pattern — decode as a normal message instead.
                 if msg_type == "Time" {
                     // K8s Time is a Timestamp proto — decode to RFC3339 string
                     return decode_timestamp(data);
