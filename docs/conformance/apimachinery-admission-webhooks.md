@@ -42,7 +42,7 @@ failure-bucket count.
 | `should mutate custom resource` | webhook.go:270 | PASS | `should_mutate_custom_resource` | mirrored, passing |
 | `should deny crd creation` | webhook.go:288 | PASS | `should_deny_crd_creation` | mirrored, passing |
 | `should mutate custom resource with different stored version` | webhook.go:304 | PASS | `should_mutate_custom_resource_with_different_stored_version` | mirrored, passing |
-| `should mutate custom resource with pruning` | webhook.go:323 | FAIL | `should_mutate_custom_resource_with_pruning` | mirrored, ignored (tracks failure) |
+| `should mutate custom resource with pruning` | webhook.go:323 | PASS | `should_mutate_custom_resource_with_pruning` | mirrored, passing |
 | `should honor timeout` | webhook.go:358 | PASS | `should_honor_timeout` | mirrored, passing |
 | `patching/updating a validating webhook should work` | webhook.go:391 | PASS | `patching_updating_a_validating_webhook_should_work` | mirrored, passing |
 | `patching/updating a mutating webhook should work` | webhook.go:492 | PASS | `patching_updating_a_mutating_webhook_should_work` | mirrored, passing |

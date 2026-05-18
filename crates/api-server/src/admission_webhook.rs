@@ -1557,6 +1557,19 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             info!("Mutating webhooks returned warnings: {:?}", all_warnings);
         }
 
+        // K8s structural-schema pruning runs AFTER mutating webhooks: any
+        // field a webhook injected that isn't declared in the CRD's
+        // openAPIV3Schema must be stripped before storage (unless the schema
+        // sets x-kubernetes-preserve-unknown-fields). For non-CRD resources
+        // (no matching CRD in storage) this is a no-op — those types use
+        // structured Rust deserialization which rejects unknown fields.
+        // K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning
+        if !all_patches.is_empty() {
+            if let Some(ref mut obj) = object {
+                self.prune_post_mutation(gvr, obj).await;
+            }
+        }
+
         let response = if all_patches.is_empty() {
             AdmissionResponse::Allow
         } else {
@@ -1564,6 +1577,29 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         };
 
         Ok((response, object))
+    }
+
+    /// Look up the CRD for the given GVR and prune any field the mutating
+    /// webhooks added that isn't in the CRD's structural schema. Best-effort:
+    /// if there is no CRD for this GVR (i.e. the resource is a built-in
+    /// type), we leave the object untouched.
+    async fn prune_post_mutation(&self, gvr: &GroupVersionResource, object: &mut Value) {
+        // CRD names are `{plural}.{group}` — only resources with a non-empty
+        // group can be CRD-backed; built-in core resources have group="".
+        if gvr.group.is_empty() {
+            return;
+        }
+        let crd_name = format!("{}.{}", gvr.resource, gvr.group);
+        let key = rusternetes_storage::build_key("customresourcedefinitions", None, &crd_name);
+        let crd = match self
+            .storage
+            .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
+            .await
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        crate::handlers::custom_resource::prune_custom_resource_value(&crd, &gvr.version, object);
     }
 
     /// Check if a webhook matches the given request
