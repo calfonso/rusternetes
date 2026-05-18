@@ -163,9 +163,9 @@ pub use policy::{
 pub use rbac::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject};
 pub use runtimeclass::{Overhead, RuntimeClass, Scheduling};
 pub use service::{
-    IPFamily, IPFamilyPolicy, LoadBalancerIngress, LoadBalancerStatus, Service,
+    ClientIPConfig, IPFamily, IPFamilyPolicy, LoadBalancerIngress, LoadBalancerStatus, Service,
     ServiceExternalTrafficPolicy, ServiceInternalTrafficPolicy, ServicePort, ServiceSpec,
-    ServiceStatus, ServiceType,
+    ServiceStatus, ServiceType, SessionAffinityConfig,
 };
 pub use service_account::{LocalObjectReference, ObjectReference, ServiceAccount};
 pub use servicecidr::{ServiceCIDR, ServiceCIDRCondition, ServiceCIDRSpec, ServiceCIDRStatus};
