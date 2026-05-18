@@ -711,19 +711,167 @@ async fn crd_publish_does_not_collide_with_builtin_plural_name() {
 
 // ---------------------------------------------------------------------------
 // crd_conversion_webhook.go conformance mirror (2 tests)
+//
+// Mock conversion webhook server below mirrors upstream's `crconverter`
+// reference implementation in test/images/agnhost/crd-conversion-webhook/converter,
+// scoped to the two transformations exercised by the two upstream Ginkgo
+// descriptors:
+//   v1 `hostPort: "host:port"`  <->  v2 `host: "host", port: "port"`.
+// The server speaks the apiextensions.k8s.io/v1 ConversionReview protocol.
 // ---------------------------------------------------------------------------
+
+/// Spawn a tiny HTTP server on a random localhost port that performs the
+/// hostPort <-> host/port conversion between the two CRD versions. Returns
+/// the URL to install in `conversion.webhook.clientConfig.url`.
+async fn spawn_mock_conversion_webhook() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                // Read the full request — header + body. We don't pipeline.
+                let mut buf = Vec::with_capacity(8192);
+                let mut tmp = [0u8; 4096];
+                // Naive read loop with a short bound — webhook bodies are tiny.
+                for _ in 0..16 {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    // Stop once we've definitely seen the body — last `}` after the
+                    // CRLF/CRLF terminator.
+                    let s = String::from_utf8_lossy(&buf);
+                    if let Some(idx) = s.find("\r\n\r\n") {
+                        let body = &s[idx + 4..];
+                        if !body.is_empty() && body.trim_end().ends_with('}') {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+                let body = &text[body_start..];
+                let review: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let req = &review["request"];
+                let desired = req["desiredAPIVersion"].as_str().unwrap_or("").to_string();
+                let uid = req["uid"].as_str().unwrap_or("").to_string();
+                let objects = req["objects"].as_array().cloned().unwrap_or_default();
+
+                let mut converted: Vec<Value> = Vec::with_capacity(objects.len());
+                for mut obj in objects {
+                    let from_ver = obj["apiVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let to_ver = desired.rsplit('/').next().unwrap_or("").to_string();
+                    if from_ver == "v1" && to_ver == "v2" {
+                        if let Some(hp) = obj.get("hostPort").and_then(|v| v.as_str()) {
+                            let mut parts = hp.splitn(2, ':');
+                            let host = parts.next().unwrap_or("").to_string();
+                            let port = parts.next().unwrap_or("").to_string();
+                            let map = obj.as_object_mut().unwrap();
+                            map.remove("hostPort");
+                            map.insert("host".into(), Value::String(host));
+                            map.insert("port".into(), Value::String(port));
+                        }
+                    } else if from_ver == "v2" && to_ver == "v1" {
+                        let host = obj
+                            .get("host")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let port = obj
+                            .get("port")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let map = obj.as_object_mut().unwrap();
+                        map.remove("host");
+                        map.remove("port");
+                        map.insert(
+                            "hostPort".into(),
+                            Value::String(format!("{}:{}", host, port)),
+                        );
+                    }
+                    obj["apiVersion"] = Value::String(desired.clone());
+                    converted.push(obj);
+                }
+
+                let resp_body = json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": uid,
+                        "convertedObjects": converted,
+                        "result": { "status": "Success" }
+                    }
+                });
+                let resp_bytes = serde_json::to_vec(&resp_body).unwrap();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_bytes.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&resp_bytes).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    format!("http://{}/convert", addr)
+}
+
+/// Issue a request through the router built on `state` and return `(status, body)`.
+async fn router_request(
+    state: Arc<ApiServerState>,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let router = build_router(state, None);
+    let mut req = Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        req = req.header("content-type", "application/json");
+    }
+    let req = match body {
+        Some(b) => req
+            .body(Body::from(serde_json::to_vec(b).unwrap()))
+            .unwrap(),
+        None => req.body(Body::empty()).unwrap(),
+    };
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
 
 /// [sig-api-machinery] CustomResourceConversionWebhook should be able to convert from CR v1 to CR v2 [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_conversion_webhook.go:142
-/// Sonobuoy (R160, 2026-04-26): not exercised in this round (no entry in e2e.log);
-/// tracked as expected-FAIL because rusternetes does not yet implement
-/// `spec.conversion.strategy: Webhook` (handler defaults to `None`).
+///
+/// Drives the full webhook conversion path end-to-end through the Axum router:
+/// register a multi-version CRD whose `spec.conversion.strategy=Webhook` points
+/// at an in-process mock that performs the canonical hostPort -> host/port
+/// transformation, create a CR at v1, GET it at v2, then assert the response
+/// body has the v2 shape (separate `host` + `port`, no `hostPort`).
 #[tokio::test]
-#[ignore = "Conformance failure tracker — webhook conversion not implemented yet; see docs/conformance/apimachinery-crd-openapi.md"]
 async fn crd_conversion_webhook_converts_v1_to_v2() {
     let state = spawn_state();
-    // Multi-version CRD with conversion.strategy=Webhook.
+    let webhook_url = spawn_mock_conversion_webhook().await;
+
     let crd = json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
@@ -741,13 +889,7 @@ async fn crd_conversion_webhook_converts_v1_to_v2() {
                 "strategy": "Webhook",
                 "webhook": {
                     "conversionReviewVersions": ["v1"],
-                    "clientConfig": {
-                        "service": {
-                            "namespace": "default",
-                            "name": "conversion-webhook",
-                            "path": "/convert"
-                        }
-                    }
+                    "clientConfig": { "url": webhook_url }
                 }
             },
             "versions": [
@@ -775,32 +917,86 @@ async fn crd_conversion_webhook_converts_v1_to_v2() {
             ]
         }
     });
-    let (status, body) = post_crd(state, &crd).await;
+    let (status, body) = post_crd(state.clone(), &crd).await;
     assert!(
         (200..300).contains(&status),
         "conversion-strategy=Webhook CRD must be accepted, got {} body={:?}",
         status,
         body
     );
+
+    // Create a v1 CR with `hostPort: localhost:8080`.
+    let cr_v1 = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "Conversion",
+        "metadata": { "name": "sample" },
+        "hostPort": "localhost:8080"
+    });
+    let (cs, cb) = router_request(
+        state.clone(),
+        "POST",
+        "/apis/example.com/v1/namespaces/default/conversions",
+        Some(&cr_v1),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&cs),
+        "create v1 CR failed: {} {}",
+        cs,
+        cb
+    );
+
+    // GET the same CR at v2 — must round-trip through the webhook.
+    let (gs, gb) = router_request(
+        state,
+        "GET",
+        "/apis/example.com/v2/namespaces/default/conversions/sample",
+        None,
+    )
+    .await;
+    assert!((200..300).contains(&gs), "GET v2 CR failed: {} {}", gs, gb);
+    assert_eq!(
+        gb["apiVersion"].as_str(),
+        Some("example.com/v2"),
+        "GET v2 must return apiVersion=example.com/v2; body={}",
+        gb
+    );
+    assert_eq!(
+        gb["host"].as_str(),
+        Some("localhost"),
+        "v2 body must have host=localhost (webhook split hostPort); body={}",
+        gb
+    );
+    assert_eq!(
+        gb["port"].as_str(),
+        Some("8080"),
+        "v2 body must have port=8080 (webhook split hostPort); body={}",
+        gb
+    );
+    assert!(
+        gb.get("hostPort").is_none(),
+        "v2 body must not retain v1 hostPort; body={}",
+        gb
+    );
 }
 
 /// [sig-api-machinery] CustomResourceConversionWebhook should be able to convert non-homogeneous list of CRs [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_conversion_webhook.go:179
-/// Sonobuoy (R160, 2026-04-26): not exercised in this round; tracked as
-/// expected-FAIL until webhook conversion is implemented (see test above).
+///
+/// Creates two CRs at different stored versions (v1 + v2), LISTs at v2, and
+/// asserts the webhook converted the v1-stored item into the v2 shape while
+/// leaving the already-v2 item alone. Drives `convert_custom_resources` on
+/// the LIST path.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — webhook conversion not implemented yet; see docs/conformance/apimachinery-crd-openapi.md"]
 async fn crd_conversion_webhook_converts_non_homogeneous_list() {
-    // Same fixture as above; the upstream test creates one v1 and one v2 CR,
-    // then LISTs as v2 and expects both to round-trip through the webhook.
-    // Without conversion-webhook support we cannot drive the LIST through a
-    // converter; mark as failure tracker.
     let state = spawn_state();
+    let webhook_url = spawn_mock_conversion_webhook().await;
+
     let crd = json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
-        "metadata": { "name": "mixed.example.com" },
+        "metadata": { "name": "mixeds.example.com" },
         "spec": {
             "group": "example.com",
             "names": {
@@ -808,17 +1004,111 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
                 "kind": "Mixed", "listKind": "MixedList"
             },
             "scope": "Namespaced",
-            "conversion": { "strategy": "Webhook" },
+            "conversion": {
+                "strategy": "Webhook",
+                "webhook": {
+                    "conversionReviewVersions": ["v1"],
+                    "clientConfig": { "url": webhook_url }
+                }
+            },
             "versions": [
                 { "name": "v1", "served": true, "storage": true,
-                  "schema": { "openAPIV3Schema": { "type": "object" } } },
+                  "schema": { "openAPIV3Schema": {
+                      "type": "object",
+                      "properties": { "hostPort": { "type": "string" } }
+                  }}},
                 { "name": "v2", "served": true, "storage": false,
-                  "schema": { "openAPIV3Schema": { "type": "object" } } }
+                  "schema": { "openAPIV3Schema": {
+                      "type": "object",
+                      "properties": {
+                          "host": { "type": "string" },
+                          "port": { "type": "string" }
+                      }
+                  }}}
             ]
         }
     });
-    let (status, _) = post_crd(state, &crd).await;
+    let (status, _) = post_crd(state.clone(), &crd).await;
     assert!((200..300).contains(&status));
+
+    // CR #1: created at v1 (stored as v1).
+    let cr_v1 = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "Mixed",
+        "metadata": { "name": "from-v1" },
+        "hostPort": "alpha:1000"
+    });
+    let (s1, _) = router_request(
+        state.clone(),
+        "POST",
+        "/apis/example.com/v1/namespaces/default/mixeds",
+        Some(&cr_v1),
+    )
+    .await;
+    assert!((200..300).contains(&s1));
+
+    // CR #2: created at v2 (stored as v2 — upstream test analogue switches
+    // the served route; our storage records whichever version was used to POST).
+    let cr_v2 = json!({
+        "apiVersion": "example.com/v2",
+        "kind": "Mixed",
+        "metadata": { "name": "from-v2" },
+        "host": "beta",
+        "port": "2000"
+    });
+    let (s2, _) = router_request(
+        state.clone(),
+        "POST",
+        "/apis/example.com/v2/namespaces/default/mixeds",
+        Some(&cr_v2),
+    )
+    .await;
+    assert!((200..300).contains(&s2));
+
+    // LIST at v2 — webhook must convert the v1-stored item, the v2-stored
+    // item must pass through untouched.
+    let (ls, lb) = router_request(
+        state,
+        "GET",
+        "/apis/example.com/v2/namespaces/default/mixeds",
+        None,
+    )
+    .await;
+    assert!((200..300).contains(&ls), "LIST v2 failed: {} {}", ls, lb);
+    let items = lb["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        2,
+        "expected 2 items, got {}: {}",
+        items.len(),
+        lb
+    );
+    for item in items {
+        assert_eq!(
+            item["apiVersion"].as_str(),
+            Some("example.com/v2"),
+            "every listed item must have apiVersion=v2; got: {}",
+            item
+        );
+        assert!(
+            item.get("hostPort").is_none(),
+            "no v2 item may retain v1 hostPort; got: {}",
+            item
+        );
+        let host = item["host"].as_str().unwrap_or("");
+        let port = item["port"].as_str().unwrap_or("");
+        match item["metadata"]["name"].as_str() {
+            Some("from-v1") => {
+                assert_eq!(host, "alpha");
+                assert_eq!(port, "1000");
+            }
+            Some("from-v2") => {
+                assert_eq!(host, "beta");
+                assert_eq!(port, "2000");
+            }
+            other => panic!("unexpected item name {:?}: {}", other, item),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
