@@ -592,13 +592,24 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         let namespace = vpa.metadata.namespace.as_deref().unwrap_or("default");
         let name = &vpa.metadata.name;
 
-        let mut updated_vpa = vpa.clone();
-        updated_vpa.status = Some(VerticalPodAutoscalerStatus {
+        let new_status = VerticalPodAutoscalerStatus {
             recommendation: Some(RecommendedPodResources {
                 container_recommendations: Some(recommendations),
             }),
             conditions: None,
-        });
+        };
+
+        // Skip the write when nothing actually changed. Without this guard,
+        // a stable VPA would still emit a MODIFIED watch event every interval
+        // since recommendations get rebuilt unconditionally — controller churn.
+        let old_v = serde_json::to_value(vpa.status.as_ref()).ok();
+        let new_v = serde_json::to_value(Some(&new_status)).ok();
+        if old_v == new_v {
+            return Ok(());
+        }
+
+        let mut updated_vpa = vpa.clone();
+        updated_vpa.status = Some(new_status);
 
         let key = rusternetes_storage::build_key("verticalpodautoscalers", Some(namespace), name);
         self.storage.update(&key, &updated_vpa).await?;

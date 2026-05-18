@@ -66,6 +66,18 @@ pub struct Kubelet {
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
 // All fields are Send+Sync: Arc<StorageBackend>, Arc<ContainerRuntime>, Mutex<EvictionManager>
 
+/// Return true iff `a.status` and `b.status` are semantically equal.
+///
+/// Compares via canonical JSON to ignore field ordering and `None` vs
+/// `Some(default)` differences. Used to gate terminal-pod status writes
+/// in `sync_pod` so a Succeeded pod whose status hasn't actually changed
+/// doesn't get republished every reconcile cycle. Without this gate, the
+/// terminal-pod paths re-derive status from the runtime on every sync,
+/// write it back blindly, and emit a MODIFIED watch event — every cycle.
+pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
+    serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
+}
+
 impl Kubelet {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -1372,6 +1384,7 @@ impl Kubelet {
             if !has_finalizers {
                 // Don't delete — just update status to terminal phase
                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                    let original = p.clone();
                     if let Some(ref mut status) = p.status {
                         if status.phase != Some(Phase::Failed)
                             && status.phase != Some(Phase::Succeeded)
@@ -1414,7 +1427,9 @@ impl Kubelet {
                             status.container_statuses = Some(cs);
                         }
                     }
-                    let _ = self.storage.update(&key, &p).await;
+                    if !pod_status_equal(&original, &p) {
+                        let _ = self.storage.update(&key, &p).await;
+                    }
                 }
                 debug!(
                     "Pod {}/{} marked terminal (not deleted from storage)",
@@ -1423,6 +1438,7 @@ impl Kubelet {
             } else {
                 // Pod has finalizers — update status to Failed but don't delete
                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                    let original = p.clone();
                     if let Some(ref mut status) = p.status {
                         if status.phase != Some(Phase::Failed)
                             && status.phase != Some(Phase::Succeeded)
@@ -1430,7 +1446,9 @@ impl Kubelet {
                             status.phase = Some(Phase::Succeeded);
                         }
                     }
-                    let _ = self.storage.update(&key, &p).await;
+                    if !pod_status_equal(&original, &p) {
+                        let _ = self.storage.update(&key, &p).await;
+                    }
                 }
             }
             // Volumes are cleaned by stop_pod_for during TerminatingPod.
@@ -1474,6 +1492,7 @@ impl Kubelet {
             // K8s kubelet NEVER deletes pods from the API server.
             let key = build_key("pods", Some(namespace), pod_name);
             if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                let original = p.clone();
                 if let Some(ref mut status) = p.status {
                     if status.phase != Some(Phase::Failed) {
                         status.phase = Some(Phase::Succeeded);
@@ -1486,7 +1505,9 @@ impl Kubelet {
                         status.container_statuses = Some(cs);
                     }
                 }
-                let _ = self.storage.update(&key, &p).await;
+                if !pod_status_equal(&original, &p) {
+                    let _ = self.storage.update(&key, &p).await;
+                }
             }
             debug!(
                 "Pod {}/{} terminated (containers stopped, left for GC)",
@@ -2614,6 +2635,7 @@ impl Kubelet {
                                     Ok(p) => p,
                                     _ => pod.clone(),
                                 };
+                                let original = new_pod.clone();
                                 // Refresh init container statuses so completed init containers
                                 // have ready=true in the final pod status.
                                 // K8s ref: pkg/kubelet/prober/prober_manager.go — UpdatePodStatus
@@ -2638,7 +2660,9 @@ impl Kubelet {
                                         }
                                     }
                                 }
-                                let _ = self.storage.update(&key, &new_pod).await;
+                                if !pod_status_equal(&original, &new_pod) {
+                                    let _ = self.storage.update(&key, &new_pod).await;
+                                }
                                 return Ok(());
                             }
 
@@ -2654,6 +2678,7 @@ impl Kubelet {
                                         Ok(p) => p,
                                         _ => pod.clone(),
                                     };
+                                    let original = new_pod.clone();
                                     let init_container_statuses =
                                         self.runtime.get_init_container_statuses(&new_pod).await;
                                     if let Some(ref mut status) = new_pod.status {
@@ -2667,7 +2692,9 @@ impl Kubelet {
                                         }
                                         status.conditions = Some(Self::succeeded_pod_conditions());
                                     }
-                                    let _ = self.storage.update(&key, &new_pod).await;
+                                    if !pod_status_equal(&original, &new_pod) {
+                                        let _ = self.storage.update(&key, &new_pod).await;
+                                    }
                                     return Ok(());
                                 }
                             }
@@ -3186,6 +3213,7 @@ impl Kubelet {
                                     Ok(p) => p,
                                     _ => pod.clone(),
                                 };
+                                let original = new_pod.clone();
                                 // Refresh init container statuses for terminal pod
                                 let init_container_statuses =
                                     self.runtime.get_init_container_statuses(&new_pod).await;
@@ -3208,7 +3236,9 @@ impl Kubelet {
                                         }
                                     }
                                 }
-                                let _ = self.storage.update(&key, &new_pod).await;
+                                if !pod_status_equal(&original, &new_pod) {
+                                    let _ = self.storage.update(&key, &new_pod).await;
+                                }
                                 return Ok(());
                             }
 
@@ -3478,6 +3508,7 @@ impl Kubelet {
                                 Ok(p) => p,
                                 _ => pod.clone(),
                             };
+                            let original = fresh_pod.clone();
                             if let Some(ref mut status) = fresh_pod.status {
                                 if let Some(ref cs) = container_statuses {
                                     let updated_statuses: Vec<ContainerStatus> = cs.iter().map(|c| {
@@ -3496,7 +3527,9 @@ impl Kubelet {
                                     status.container_statuses = Some(updated_statuses);
                                 }
                             }
-                            let _ = self.storage.update(&key, &fresh_pod).await;
+                            if !pod_status_equal(&original, &fresh_pod) {
+                                let _ = self.storage.update(&key, &fresh_pod).await;
+                            }
 
                             if let Err(e) = self.runtime.start_pod(pod).await {
                                 error!("Failed to restart pod: {}", e);
@@ -3899,34 +3932,32 @@ impl Kubelet {
         reason: Option<&str>,
         message: Option<&str>,
     ) -> Result<()> {
-        let mut new_pod = pod.clone();
-
-        new_pod.status = Some(PodStatus {
-            phase: Some(phase),
-            message: message.map(|s| s.to_string()),
-            reason: reason.map(|s| s.to_string()),
-            host_ip: Some("127.0.0.1".to_string()),
-            pod_ip: None,
-            conditions: None,
-            container_statuses: None,
-            init_container_statuses: None,
-            ephemeral_container_statuses: None,
-            resize: None,
-            resource_claim_statuses: None,
-            observed_generation: None,
-            host_i_ps: None,
-            pod_i_ps: None,
-            nominated_node_name: None,
-            qos_class: None,
-            start_time: None,
-        });
-
         let key = build_key(
             "pods",
-            new_pod.metadata.namespace.as_deref(),
-            &new_pod.metadata.name,
+            pod.metadata.namespace.as_deref(),
+            &pod.metadata.name,
         );
-        self.storage.update(&key, &new_pod).await?;
+
+        // Read the fresh pod from storage so we preserve container_statuses,
+        // init_container_statuses, conditions, pod_ip, start_time, etc.
+        // Constructing a fresh PodStatus would WIPE those fields — destructive
+        // when called on a failure path of a previously-Running pod.
+        let mut new_pod = match self.storage.get::<Pod>(&key).await {
+            Ok(p) => p,
+            Err(_) => pod.clone(),
+        };
+        let original = new_pod.clone();
+
+        let mut status = new_pod.status.take().unwrap_or_default();
+        status.phase = Some(phase);
+        status.reason = reason.map(|s| s.to_string());
+        status.message = message.map(|s| s.to_string());
+        new_pod.status = Some(status);
+
+        // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
+        if !pod_status_equal(&original, &new_pod) {
+            self.storage.update(&key, &new_pod).await?;
+        }
 
         Ok(())
     }

@@ -217,10 +217,15 @@ impl<S: Storage + 'static> CronJobController<S> {
                     name,
                     active_jobs.len()
                 );
-                // Still update status with active jobs list
+                // Still update status with active jobs list.
+                // Sort by name + omit resource_version so the active list is
+                // stable across reconciles (otherwise comparisons in the
+                // skip-write guard below would flicker on every Job update).
+                let mut sorted_active: Vec<&Job> = active_jobs.iter().collect();
+                sorted_active.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
                 let active_refs: Vec<
                     rusternetes_common::resources::service_account::ObjectReference,
-                > = active_jobs
+                > = sorted_active
                     .iter()
                     .map(
                         |job| rusternetes_common::resources::service_account::ObjectReference {
@@ -229,7 +234,10 @@ impl<S: Storage + 'static> CronJobController<S> {
                             name: Some(job.metadata.name.clone()),
                             uid: Some(job.metadata.uid.clone()),
                             api_version: Some("batch/v1".to_string()),
-                            resource_version: job.metadata.resource_version.clone(),
+                            // Omitted: resource_version flickers on every Job
+                            // update and is not part of CronJob.status.active
+                            // identity in upstream K8s.
+                            resource_version: None,
                             field_path: None,
                         },
                     )
@@ -267,10 +275,14 @@ impl<S: Storage + 'static> CronJobController<S> {
         // Create new Job
         self.create_job(cronjob, namespace).await?;
 
-        // Build active job references from all active jobs for this cronjob
+        // Build active job references from all active jobs for this cronjob.
+        // Sort by name so the active list is deterministic across reconciles
+        // (MemoryStorage list iterates a HashMap in non-deterministic order).
         let active_refs: Vec<rusternetes_common::resources::service_account::ObjectReference> = {
             let job_prefix = format!("/registry/jobs/{}/", namespace);
-            let current_jobs: Vec<Job> = self.storage.list(&job_prefix).await.unwrap_or_default();
+            let mut current_jobs: Vec<Job> =
+                self.storage.list(&job_prefix).await.unwrap_or_default();
+            current_jobs.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
             current_jobs
                 .iter()
                 .filter(|job| {
@@ -298,7 +310,7 @@ impl<S: Storage + 'static> CronJobController<S> {
                         name: Some(job.metadata.name.clone()),
                         uid: Some(job.metadata.uid.clone()),
                         api_version: Some("batch/v1".to_string()),
-                        resource_version: job.metadata.resource_version.clone(),
+                        resource_version: None,
                         field_path: None,
                     },
                 )

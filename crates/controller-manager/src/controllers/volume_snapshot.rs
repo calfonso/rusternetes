@@ -333,15 +333,34 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         let namespace = vs.metadata.namespace.as_deref().unwrap_or("default");
         let vs_key = build_key("volumesnapshots", Some(namespace), &vs.metadata.name);
 
-        let mut updated_vs = vs.clone();
-        updated_vs.status = Some(VolumeSnapshotStatus {
+        // creation_time records when the snapshot was first taken and must
+        // NEVER advance once set. Preserve the prior value on every reconcile;
+        // otherwise we'd stamp Utc::now() at every interval and emit a
+        // MODIFIED watch event per cycle — a controller hot-loop.
+        let preserved_creation_time = vs
+            .status
+            .as_ref()
+            .and_then(|s| s.creation_time.clone())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+        let new_status = VolumeSnapshotStatus {
             bound_volume_snapshot_content_name: Some(content_name.to_string()),
-            creation_time: Some(chrono::Utc::now().to_rfc3339()),
+            creation_time: Some(preserved_creation_time),
             ready_to_use: Some(ready),
             restore_size: None,
             error: None,
-        });
+        };
 
+        // Skip the write when nothing actually changed. Compare via canonical
+        // JSON since VolumeSnapshotStatus doesn't derive PartialEq.
+        let old_v = serde_json::to_value(vs.status.as_ref()).ok();
+        let new_v = serde_json::to_value(Some(&new_status)).ok();
+        if old_v == new_v {
+            return Ok(());
+        }
+
+        let mut updated_vs = vs.clone();
+        updated_vs.status = Some(new_status);
         self.storage.update(&vs_key, &updated_vs).await?;
 
         info!(
