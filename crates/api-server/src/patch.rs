@@ -120,8 +120,12 @@ fn apply_merge_patch(original: &Value, patch: &Value) -> Result<Value, PatchErro
         json!({})
     };
 
-    let result_obj = result.as_object_mut().unwrap();
-    let patch_obj = patch.as_object().unwrap();
+    let result_obj = result
+        .as_object_mut()
+        .ok_or_else(|| PatchError::InvalidPatch("merge patch base is not an object".to_string()))?;
+    let patch_obj = patch
+        .as_object()
+        .ok_or_else(|| PatchError::InvalidPatch("merge patch is not an object".to_string()))?;
 
     for (key, value) in patch_obj {
         if value.is_null() {
@@ -156,10 +160,15 @@ fn apply_json_patch(original: &Value, patch: &Value) -> Result<Value, PatchError
 
 /// Apply a single JSON Patch operation
 fn apply_json_patch_operation(value: &Value, op: &JsonPatchOperation) -> Result<Value, PatchError> {
+    let require_value = |what: &str| -> Result<&Value, PatchError> {
+        op.value
+            .as_ref()
+            .ok_or_else(|| PatchError::InvalidPatch(format!("'value' required for {}", what)))
+    };
     match op.op {
-        JsonPatchOp::Add => add_operation(value, &op.path, op.value.as_ref().unwrap()),
+        JsonPatchOp::Add => add_operation(value, &op.path, require_value("add")?),
         JsonPatchOp::Remove => remove_operation(value, &op.path),
-        JsonPatchOp::Replace => replace_operation(value, &op.path, op.value.as_ref().unwrap()),
+        JsonPatchOp::Replace => replace_operation(value, &op.path, require_value("replace")?),
         JsonPatchOp::Move => {
             let from = op
                 .from
@@ -175,7 +184,7 @@ fn apply_json_patch_operation(value: &Value, op: &JsonPatchOperation) -> Result<
             copy_operation(value, from, &op.path)
         }
         JsonPatchOp::Test => {
-            test_operation(value, &op.path, op.value.as_ref().unwrap())?;
+            test_operation(value, &op.path, require_value("test")?)?;
             Ok(value.clone())
         }
     }
@@ -322,8 +331,12 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
         json!({})
     };
 
-    let result_obj = result.as_object_mut().unwrap();
-    let patch_obj = patch.as_object().unwrap();
+    let result_obj = result.as_object_mut().ok_or_else(|| {
+        PatchError::InvalidPatch("strategic merge base is not an object".to_string())
+    })?;
+    let patch_obj = patch.as_object().ok_or_else(|| {
+        PatchError::InvalidPatch("strategic merge patch is not an object".to_string())
+    })?;
 
     // Check for $patch directive
     let patch_strategy = patch_obj
@@ -404,15 +417,32 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
 
                     if let Some(to_delete) = delete_list {
                         // Remove specified values from the original array
-                        let mut original_array = result_obj[key].as_array().unwrap().clone();
+                        let mut original_array = result_obj[key]
+                            .as_array()
+                            .ok_or_else(|| {
+                                PatchError::InvalidPatch(format!(
+                                    "strategic merge: '{}' is not an array",
+                                    key
+                                ))
+                            })?
+                            .clone();
                         original_array.retain(|item| !to_delete.contains(item));
                         result_obj.insert(key.clone(), Value::Array(original_array));
                     } else {
                         // Strategic merge for arrays
-                        let merged_array = strategic_merge_arrays(
-                            result_obj[key].as_array().unwrap(),
-                            patch_value.as_array().unwrap(),
-                        )?;
+                        let orig_arr = result_obj[key].as_array().ok_or_else(|| {
+                            PatchError::InvalidPatch(format!(
+                                "strategic merge: '{}' is not an array",
+                                key
+                            ))
+                        })?;
+                        let patch_arr = patch_value.as_array().ok_or_else(|| {
+                            PatchError::InvalidPatch(format!(
+                                "strategic merge: patch for '{}' is not an array",
+                                key
+                            ))
+                        })?;
+                        let merged_array = strategic_merge_arrays(orig_arr, patch_arr)?;
                         result_obj.insert(key.clone(), Value::Array(merged_array));
                     }
                 } else if patch_value.is_object()
@@ -440,7 +470,7 @@ fn strategic_merge_arrays(original: &[Value], patch: &[Value]) -> Result<Vec<Val
     // Check if this is a named array (items have 'name' field)
     let is_named_array = patch
         .iter()
-        .all(|v| v.is_object() && v.as_object().unwrap().contains_key("name"));
+        .all(|v| v.as_object().is_some_and(|o| o.contains_key("name")));
 
     if is_named_array {
         // Merge by name
@@ -600,7 +630,9 @@ fn split_path(path: &str) -> Result<(&str, &str), PatchError> {
         ));
     }
 
-    let last_slash = path.rfind('/').unwrap();
+    let last_slash = path
+        .rfind('/')
+        .ok_or_else(|| PatchError::InvalidPatch(format!("Path missing '/': {}", path)))?;
     let parent = if last_slash == 0 {
         "/"
     } else {
@@ -891,6 +923,48 @@ mod tests {
 
         let result = apply_strategic_merge_patch(&original, &patch).unwrap();
         assert!(result["metadata"]["annotations"].is_null());
+    }
+
+    #[test]
+    fn test_json_patch_add_missing_value_returns_err() {
+        let original = json!({"a": 1});
+        let patch = json!([{ "op": "add", "path": "/b" }]);
+        let result = apply_patch(&original, &patch, PatchType::JsonPatch);
+        match result {
+            Err(PatchError::InvalidPatch(msg)) => assert!(msg.contains("add")),
+            other => panic!(
+                "expected InvalidPatch for add without value, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_json_patch_replace_missing_value_returns_err() {
+        let original = json!({"a": 1});
+        let patch = json!([{ "op": "replace", "path": "/a" }]);
+        let result = apply_patch(&original, &patch, PatchType::JsonPatch);
+        match result {
+            Err(PatchError::InvalidPatch(msg)) => assert!(msg.contains("replace")),
+            other => panic!(
+                "expected InvalidPatch for replace without value, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_json_patch_test_missing_value_returns_err() {
+        let original = json!({"a": 1});
+        let patch = json!([{ "op": "test", "path": "/a" }]);
+        let result = apply_patch(&original, &patch, PatchType::JsonPatch);
+        match result {
+            Err(PatchError::InvalidPatch(msg)) => assert!(msg.contains("test")),
+            other => panic!(
+                "expected InvalidPatch for test without value, got {:?}",
+                other
+            ),
+        }
     }
 }
 

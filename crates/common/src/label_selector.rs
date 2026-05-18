@@ -401,6 +401,19 @@ impl LabelRequirement {
     pub fn values(&self) -> Option<&[String]> {
         self.values.as_deref()
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        key: impl Into<String>,
+        operator: LabelOperator,
+        values: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            operator,
+            values,
+        }
+    }
 }
 
 /// Label selector operators
@@ -448,23 +461,28 @@ impl fmt::Display for LabelSelector {
         let parts: Vec<String> = self
             .requirements
             .iter()
-            .map(|req| match req.operator {
-                LabelOperator::Equals => format!("{}={}", req.key, req.values.as_ref().unwrap()[0]),
-                LabelOperator::NotEquals => {
-                    format!("{}!={}", req.key, req.values.as_ref().unwrap()[0])
+            .map(|req| {
+                let first_value = || {
+                    req.values
+                        .as_ref()
+                        .and_then(|v| v.first())
+                        .map(String::as_str)
+                        .unwrap_or("")
+                };
+                let joined_values = || {
+                    req.values
+                        .as_ref()
+                        .map(|v| v.join(", "))
+                        .unwrap_or_default()
+                };
+                match req.operator {
+                    LabelOperator::Equals => format!("{}={}", req.key, first_value()),
+                    LabelOperator::NotEquals => format!("{}!={}", req.key, first_value()),
+                    LabelOperator::In => format!("{} in ({})", req.key, joined_values()),
+                    LabelOperator::NotIn => format!("{} notin ({})", req.key, joined_values()),
+                    LabelOperator::Exists => req.key.clone(),
+                    LabelOperator::DoesNotExist => format!("!{}", req.key),
                 }
-                LabelOperator::In => format!(
-                    "{} in ({})",
-                    req.key,
-                    req.values.as_ref().unwrap().join(", ")
-                ),
-                LabelOperator::NotIn => format!(
-                    "{} notin ({})",
-                    req.key,
-                    req.values.as_ref().unwrap().join(", ")
-                ),
-                LabelOperator::Exists => req.key.clone(),
-                LabelOperator::DoesNotExist => format!("!{}", req.key),
             })
             .collect();
         write!(f, "{}", parts.join(","))
@@ -475,6 +493,25 @@ impl fmt::Display for LabelSelector {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_display_does_not_panic_on_missing_values() {
+        // A LabelRequirement built without values (e.g. via a code path that
+        // bypasses the parser) used to panic in the Display impl. Now it
+        // renders as an empty value string.
+        for op in [
+            LabelOperator::Equals,
+            LabelOperator::NotEquals,
+            LabelOperator::In,
+            LabelOperator::NotIn,
+        ] {
+            let req = LabelRequirement::new_for_test("app", op, None);
+            let sel = LabelSelector {
+                requirements: vec![req],
+            };
+            let _ = format!("{}", sel); // must not panic
+        }
+    }
 
     #[test]
     fn test_parse_equality_simple() {
