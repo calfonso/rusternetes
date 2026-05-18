@@ -77,7 +77,6 @@
 - **[Testing Guide](testing/TESTING.md)** — How to run tests
 - **[Test Status](testing/TEST_STATUS.md)** — Test coverage report
 - **[CONFORMANCE.md](CONFORMANCE.md)** — Kubernetes v1.35 conformance tracking (90.2% pass rate)
-- **[CONFORMANCE_FAILURES.md](CONFORMANCE_FAILURES.md)** — Active failure tracker
 
 ## Contributing
 

@@ -345,31 +345,11 @@ podman compose -f compose.yml exec e2e tail <span class="flag">-f</span> /tmp/so
         </tbody>
       </table>
 
-      <h2>Full Failure Tracker</h2>
+      <h2>Failure Tracking</h2>
       <p>
-        A detailed breakdown of every failing test, its root cause, and fix status is maintained in the
-        project repository:
+        Conformance failure tracking and root cause analysis is maintained in
+        <code>.work/CONFORMANCE_TRACKER.md</code> in the project repository.
       </p>
-
-      <pre>
-        <div class="code-header">
-          <span class="code-dot red"></span>
-          <span class="code-dot yellow"></span>
-          <span class="code-dot green"></span>
-          <span class="code-title">path</span>
-        </div>
-        <code>docs/CONFORMANCE_FAILURES.md</code>
-      </pre>
-
-      <p>
-        This file is updated after each conformance round and tracks:
-      </p>
-      <ul>
-        <li>Every failing test name</li>
-        <li>Root cause analysis</li>
-        <li>Fix status (coded, deployed, verified)</li>
-        <li>Related code changes</li>
-      </ul>
 
       <div class="doc-pager">
         <a href="api-reference.html" class="prev">
