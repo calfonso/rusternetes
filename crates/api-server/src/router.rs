@@ -1,6 +1,5 @@
 use crate::{handlers, middleware, state::ApiServerState};
 use axum::{
-    body::Body,
     extract::{Request, State},
     http::{Method, StatusCode, Uri},
     middleware as axum_middleware,
@@ -49,137 +48,34 @@ async fn custom_resource_fallback(
     if parts.len() >= 2 {
         let group = parts[0];
         let version = parts[1];
-        let apiservice_name = format!("{}.{}", version, group);
-        let apiservice_key = rusternetes_storage::build_key("apiservices", None, &apiservice_name);
-        if let Ok(apiservice) = state
-            .storage
-            .get::<serde_json::Value>(&apiservice_key)
-            .await
-        {
-            // Found a registered APIService — proxy to its backing service
-            if let (Some(svc_name), Some(svc_ns)) = (
-                apiservice
-                    .pointer("/spec/service/name")
-                    .and_then(|v| v.as_str()),
-                apiservice
-                    .pointer("/spec/service/namespace")
-                    .and_then(|v| v.as_str()),
-            ) {
-                debug!(
-                    "API aggregation: proxying {}/{} to service {}/{}",
-                    group, version, svc_ns, svc_name
-                );
-                // Resolve the service via ClusterIP (like K8s serviceresolver.go)
-                // This routes through kube-proxy iptables, matching real K8s behavior.
-                let svc_key = rusternetes_storage::build_key("services", Some(svc_ns), svc_name);
-                let svc_ip_and_port = if let Ok(svc) = state
-                    .storage
-                    .get::<rusternetes_common::resources::Service>(&svc_key)
-                    .await
-                {
-                    let cluster_ip = svc
-                        .spec
-                        .cluster_ip
-                        .clone()
-                        .filter(|ip| !ip.is_empty() && ip != "None");
-                    let port = svc.spec.ports.first().map(|p| p.port).unwrap_or(443u16);
-                    cluster_ip.map(|ip| (ip, port))
-                } else {
-                    // Fallback: try endpoints directly
-                    let ep_key =
-                        rusternetes_storage::build_key("endpoints", Some(svc_ns), svc_name);
-                    if let Ok(ep) = state
-                        .storage
-                        .get::<rusternetes_common::resources::Endpoints>(&ep_key)
-                        .await
-                    {
-                        ep.subsets
-                            .iter()
-                            .flat_map(|s| s.addresses.iter().flatten())
-                            .next()
-                            .map(|addr| {
-                                let port = ep
-                                    .subsets
-                                    .iter()
-                                    .flat_map(|s| s.ports.iter().flatten())
-                                    .next()
-                                    .map(|p| p.port)
-                                    .unwrap_or(443u16);
-                                (addr.ip.clone(), port)
-                            })
-                    } else {
-                        None
-                    }
+        match handlers::generic::resolve_aggregator_target(&state, group, version).await {
+            Ok(Some(target)) => {
+                let path_and_query = match uri.query() {
+                    Some(q) => format!("{}?{}", uri.path(), q),
+                    None => uri.path().to_string(),
                 };
-
-                if let Some((target_ip, port)) = svc_ip_and_port {
-                    {
-                        let target_url = format!("https://{}:{}{}", target_ip, port, path);
-                        info!("API aggregation proxy: {} -> {}", path, target_url);
-                        // Forward the request using reqwest with TLS cert verification disabled
-                        // (the APIService has a caBundle but we skip verification for simplicity)
-                        let client = reqwest::Client::builder()
-                            .danger_accept_invalid_certs(true)
-                            .timeout(std::time::Duration::from_secs(30))
-                            .build()
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-                            .await
-                            .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-                        let reqwest_method = match method {
-                            Method::GET => reqwest::Method::GET,
-                            Method::POST => reqwest::Method::POST,
-                            Method::PUT => reqwest::Method::PUT,
-                            Method::DELETE => reqwest::Method::DELETE,
-                            Method::PATCH => reqwest::Method::PATCH,
-                            _ => reqwest::Method::GET,
-                        };
-
-                        match client
-                            .request(reqwest_method, &target_url)
-                            .body(body_bytes.to_vec())
-                            .header("Content-Type", "application/json")
-                            .send()
-                            .await
-                        {
-                            Ok(resp) => {
-                                let status = StatusCode::from_u16(resp.status().as_u16())
-                                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                                let body = resp.bytes().await.unwrap_or_default();
-                                return Ok(Response::builder()
-                                    .status(status)
-                                    .header("Content-Type", "application/json")
-                                    .body(Body::from(body))
-                                    .unwrap());
-                            }
-                            Err(e) => {
-                                warn!("API aggregation proxy error: {}", e);
-                                return Ok(Response::builder()
-                                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                                    .body(Body::from(format!(
-                                        "{{\"message\":\"aggregated API server unavailable: {}\"}}",
-                                        e
-                                    )))
-                                    .unwrap());
-                            }
-                        }
-                    }
-                } else {
-                    // APIService exists but service is not available — return 503
-                    // K8s returns ServiceUnavailable when the backing service has no endpoints
-                    warn!(
-                        "API aggregation: service {}/{} not available for {}/{}",
-                        svc_ns, svc_name, group, version
-                    );
-                    return Ok(Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .header("Content-Type", "application/json")
-                        .body(Body::from("{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"message\":\"service unavailable\",\"reason\":\"ServiceUnavailable\",\"code\":503}".to_string()))
-                        .unwrap());
-                }
+                let headers = req.headers().clone();
+                let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+                    .await
+                    .map_err(|_| StatusCode::BAD_REQUEST)?
+                    .to_vec();
+                debug!(
+                    "API aggregation: proxying {}/{} -> {}:{}",
+                    group, version, target.host, target.port
+                );
+                let resp = handlers::generic::forward_to_aggregator(
+                    &target,
+                    &auth_ctx,
+                    method,
+                    &path_and_query,
+                    &headers,
+                    body_bytes,
+                )
+                .await;
+                return Ok(resp);
             }
+            Ok(None) => { /* not an aggregated group; continue to CRD logic */ }
+            Err(resp) => return Ok(resp),
         }
     }
 
