@@ -1096,13 +1096,21 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
+        // Stamp `pod.spec.subdomain` from `statefulset.spec.serviceName` so the
+        // headless governing Service generates per-pod DNS A records under
+        // `<pod>.<serviceName>.<ns>.svc.cluster.local`.
+        let mut pod_spec = template.spec.clone();
+        if !statefulset.spec.service_name.is_empty() {
+            pod_spec.subdomain = Some(statefulset.spec.service_name.clone());
+        }
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata,
-            spec: Some(template.spec.clone()),
+            spec: Some(pod_spec),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
                 message: None,
@@ -1181,13 +1189,21 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
+        // Stamp `pod.spec.subdomain` from `statefulset.spec.serviceName` so the
+        // headless governing Service generates per-pod DNS A records under
+        // `<pod>.<serviceName>.<ns>.svc.cluster.local`.
+        let mut pod_spec = template.spec.clone();
+        if !statefulset.spec.service_name.is_empty() {
+            pod_spec.subdomain = Some(statefulset.spec.service_name.clone());
+        }
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata,
-            spec: Some(template.spec.clone()),
+            spec: Some(pod_spec),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
                 message: None,
