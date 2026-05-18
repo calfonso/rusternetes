@@ -82,7 +82,7 @@ pub use crd::{
     CustomResourceDefinitionVersion, CustomResourceSubresourceScale,
     CustomResourceSubresourceStatus, CustomResourceSubresources, CustomResourceValidation,
     JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool, JSONSchemaPropsOrStringArray,
-    ResourceScope, ServiceReference, WebhookClientConfig, WebhookConversion,
+    ResourceScope, SelectableField, ServiceReference, WebhookClientConfig, WebhookConversion,
 };
 pub use csi::{
     CSIDriver, CSIDriverSpec, CSINode, CSINodeDriver, CSINodeSpec, CSIStorageCapacity,

@@ -741,17 +741,174 @@ async fn crd_watch_create_modify_delete() {
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_selectable_fields.go:174
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 ///
-/// The rusternetes api-server does not yet wire `x-kubernetes-selectable-fields`
-/// through to field-selector filtering on the dynamic CR fallback. The
-/// upstream test relies on a conversion webhook + selectable-fields plumbing
-/// we have not implemented yet. Tracked in
-/// `docs/conformance/apimachinery-crd-lifecycle.md`.
+/// Scope vs. upstream: the upstream test exercises a conversion webhook on
+/// top of selectable fields (v1 ↔ v2). We do not run a webhook in-process,
+/// so this mirror covers the single-version slice of the contract: declare
+/// `x-kubernetes-selectable-fields` on a CRD version, create CRs, then list
+/// with `?fieldSelector=<path>=<value>` and confirm the list is filtered by
+/// the path the CRD opted-in. Non-selectable paths must be rejected with a
+/// "field label not supported" 422. Watch is covered by the dedicated watch
+/// tests; this test verifies the list path only.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apimachinery-crd-lifecycle.md"]
 async fn crd_selectable_fields_list_watch_informer() {
-    // Intentionally empty body — the test is a tracker for the upstream
-    // selectable-fields feature; un-ignore once the dynamic CR list path
-    // honours field selectors driven by x-kubernetes-selectable-fields.
+    let (_mem, _state, router) = spawn_router();
+
+    // CRD with `.spec.color` declared as a selectable field.
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "widgets.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {
+                "plural": "widgets",
+                "singular": "widget",
+                "kind": "Widget",
+                "listKind": "WidgetList",
+            },
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object",
+                                "properties": {
+                                    "color": {"type": "string"},
+                                    "shape": {"type": "string"},
+                                }
+                            }
+                        }
+                    }
+                },
+                "selectableFields": [
+                    {"jsonPath": ".spec.color"},
+                    {"jsonPath": ".spec.shape"},
+                ],
+            }]
+        }
+    });
+    let (s, _) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert_eq!(s, 201);
+
+    // Reload the CRD and confirm `selectableFields` survives the round-trip
+    // through storage + serialisation.
+    let (_s, stored_crd) = get(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com",
+    )
+    .await;
+    let sf = &stored_crd["spec"]["versions"][0]["selectableFields"];
+    assert_eq!(sf[0]["jsonPath"], ".spec.color");
+    assert_eq!(sf[1]["jsonPath"], ".spec.shape");
+
+    // Create three CRs: two red, one blue.
+    for (name, color, shape) in [
+        ("w-red-1", "red", "square"),
+        ("w-red-2", "red", "circle"),
+        ("w-blue-1", "blue", "circle"),
+    ] {
+        let body = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"color": color, "shape": shape},
+        });
+        let (s, b) = post_json(
+            &router,
+            "/apis/example.com/v1/namespaces/default/widgets",
+            &body,
+        )
+        .await;
+        assert_eq!(s, 201, "creating {name} must succeed, body={b}");
+    }
+
+    // Sanity: list with no selector returns all three.
+    let (s, body) = get(&router, "/apis/example.com/v1/namespaces/default/widgets").await;
+    assert_eq!(s, 200);
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(3));
+
+    // ?fieldSelector=spec.color=red → two widgets, both red.
+    let (s, body) = get(
+        &router,
+        "/apis/example.com/v1/namespaces/default/widgets?fieldSelector=spec.color%3Dred",
+    )
+    .await;
+    assert_eq!(s, 200, "list with color=red must succeed, body={body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["metadata"]["name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 2, "expected 2 red widgets, got {names:?}");
+    assert!(names.contains(&"w-red-1"));
+    assert!(names.contains(&"w-red-2"));
+
+    // Compound selector: spec.color=red,spec.shape=circle → only w-red-2.
+    let (s, body) = get(
+        &router,
+        "/apis/example.com/v1/namespaces/default/widgets?fieldSelector=spec.color%3Dred%2Cspec.shape%3Dcircle",
+    )
+    .await;
+    assert_eq!(s, 200, "compound list must succeed, body={body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["metadata"]["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["w-red-2"]);
+
+    // Inequality on a selectable path: spec.color!=red → only w-blue-1.
+    let (s, body) = get(
+        &router,
+        "/apis/example.com/v1/namespaces/default/widgets?fieldSelector=spec.color%21%3Dred",
+    )
+    .await;
+    assert_eq!(s, 200, "not-equals list must succeed, body={body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["metadata"]["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["w-blue-1"]);
+
+    // metadata.name is always selectable.
+    let (s, body) = get(
+        &router,
+        "/apis/example.com/v1/namespaces/default/widgets?fieldSelector=metadata.name%3Dw-red-1",
+    )
+    .await;
+    assert_eq!(s, 200, "metadata.name list must succeed, body={body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["metadata"]["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["w-red-1"]);
+
+    // A path that is NOT in selectableFields must be rejected upfront.
+    let (s, body) = get(
+        &router,
+        "/apis/example.com/v1/namespaces/default/widgets?fieldSelector=spec.weight%3D10",
+    )
+    .await;
+    assert_eq!(
+        s, 422,
+        "non-selectable path must be rejected with 422, got status={s} body={body}"
+    );
 }
 
 // ---------------------------------------------------------------------------

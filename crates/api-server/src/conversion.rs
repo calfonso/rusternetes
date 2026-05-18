@@ -378,6 +378,7 @@ mod tests {
                         schema: None,
                         subresources: None,
                         additional_printer_columns: None,
+                        selectable_fields: None,
                     },
                     CustomResourceDefinitionVersion {
                         name: "v2".to_string(),
@@ -388,6 +389,7 @@ mod tests {
                         schema: None,
                         subresources: None,
                         additional_printer_columns: None,
+                        selectable_fields: None,
                     },
                 ],
                 conversion: Some(CustomResourceConversion {

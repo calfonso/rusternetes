@@ -359,6 +359,7 @@ pub async fn list_custom_resources(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((group, version, plural, namespace)): Path<(String, String, String, Option<String>)>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<List<CustomResource>>> {
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
 
@@ -382,6 +383,14 @@ pub async fn list_custom_resources(
         }
     }
 
+    // Reject field selectors that target paths the CRD version did not
+    // expose via `x-kubernetes-selectable-fields`. Upstream K8s only allows
+    // `metadata.name` / `metadata.namespace` plus the explicitly declared
+    // selectable paths.
+    if let Some(fs) = params.get("fieldSelector").filter(|s| !s.is_empty()) {
+        validate_field_selector_paths(&crd, &version, fs)?;
+    }
+
     // Build storage prefix
     let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
     let prefix = if let Some(ref ns) = namespace {
@@ -402,8 +411,59 @@ pub async fn list_custom_resources(
     // ConversionReview round-trip (mirrors upstream non-homogeneous list path).
     crs = crate::conversion::convert_custom_resources(&crd, crs, &version).await?;
 
+    // Filter by field selector (e.g. spec.color=red, driven by the version's
+    // x-kubernetes-selectable-fields) and label selector. The shared helper
+    // serialises each CR exactly once. Runs AFTER conversion so the selector
+    // sees the requested-version field layout.
+    crate::handlers::filtering::apply_selectors(&mut crs, &params)?;
+
     let list = List::new("List", "v1", crs);
     Ok(Json(list))
+}
+
+/// Reject `fieldSelector=<path>=<val>` when `<path>` is neither
+/// `metadata.name` / `metadata.namespace` nor declared in the CRD version's
+/// `x-kubernetes-selectable-fields`. Mirrors the upstream apiextensions
+/// validator that gates which CR paths the apiserver indexes.
+fn validate_field_selector_paths(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    field_selector: &str,
+) -> Result<()> {
+    // Built-in fields always selectable on any resource.
+    const BUILTIN: &[&str] = &["metadata.name", "metadata.namespace"];
+
+    // Selectable JSONPaths declared by this CRD version. Strip the leading
+    // `.` so `.spec.color` lines up with the dot-notation the FieldSelector
+    // parser uses internally.
+    let selectable: Vec<&str> = crd
+        .spec
+        .versions
+        .iter()
+        .find(|v| v.name == version)
+        .and_then(|v| v.selectable_fields.as_ref())
+        .map(|sf| {
+            sf.iter()
+                .map(|f| f.json_path.trim_start_matches('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let parsed =
+        rusternetes_common::field_selector::FieldSelector::parse(field_selector).map_err(|e| {
+            rusternetes_common::Error::InvalidResource(format!("Invalid field selector: {e}"))
+        })?;
+
+    for requirement in parsed.requirements() {
+        let path = requirement.field();
+        if BUILTIN.contains(&path) || selectable.contains(&path) {
+            continue;
+        }
+        return Err(rusternetes_common::Error::InvalidResource(format!(
+            "field label not supported: {path}"
+        )));
+    }
+    Ok(())
 }
 
 /// Update a custom resource instance
@@ -1933,6 +1993,7 @@ mod tests {
                     schema: None,
                     subresources: None,
                     additional_printer_columns: None,
+                    selectable_fields: None,
                 }],
                 conversion: None,
                 preserve_unknown_fields: None,

@@ -161,6 +161,25 @@ pub struct CustomResourceDefinitionVersion {
     /// AdditionalPrinterColumns specifies additional columns for kubectl get
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_printer_columns: Option<Vec<CustomResourceColumnDefinition>>,
+
+    /// SelectableFields lists the JSONPaths exposed to `?fieldSelector=...`
+    /// list/watch filtering, per `x-kubernetes-selectable-fields`.
+    /// JSONPath uses dot-notation rooted at the CR (e.g. `.spec.color`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "selectableFields")]
+    pub selectable_fields: Option<Vec<SelectableField>>,
+}
+
+/// SelectableField declares a JSONPath that may be used as a field selector
+/// in list/watch requests against custom resources of this CRD version.
+///
+/// See:
+/// https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#selectable-fields
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectableField {
+    /// JSONPath of the field, rooted at the custom resource. Must start
+    /// with `.` (e.g. `.spec.color`).
+    pub json_path: String,
 }
 
 /// CustomResourceValidation is a set of validation rules for a custom resource
@@ -576,6 +595,7 @@ mod tests {
             schema: None,
             subresources: None,
             additional_printer_columns: None,
+            selectable_fields: None,
         });
 
         assert_eq!(crd.spec.versions.len(), 1);
