@@ -10,6 +10,17 @@
 #
 # `--reuse-values` keeps githubConfigUrl + githubConfigSecret set at
 # install time so we don't have to re-pass them.
+#
+# `controllerServiceAccount` is set explicitly because the chart's
+# label-based auto-discovery of the gha-rs-controller deployment fails
+# on this cluster (--dry-run runs in --dry-run=client which skips the
+# lookup, and even in a live upgrade the discovery is fragile). The
+# controller lives in the arc-systems namespace with SA
+# arc-gha-rs-controller.
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
 template:
   spec:
     containers:
