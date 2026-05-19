@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_admissionregistration_v1(&mut schemas);
         Self::register_core_v1_status_networking(&mut schemas);
         Self::register_apimachinery_meta_v1(&mut schemas);
         Self::register_networking_v1(&mut schemas);
@@ -2390,6 +2391,553 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_admissionregistration_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // ----- Kinds -----
+
+        schemas.insert(
+            "MutatingWebhookConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "webhooks".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "MutatingWebhook".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ValidatingWebhookConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "webhooks".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ValidatingWebhook".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ValidatingAdmissionPolicy".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ValidatingAdmissionPolicySpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("ValidatingAdmissionPolicyStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ValidatingAdmissionPolicyBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ValidatingAdmissionPolicyBindingSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ----- Webhook descriptions -----
+
+        schemas.insert(
+            "MutatingWebhook".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "clientConfig".into(),
+                            FieldType::Message("WebhookClientConfig".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "RuleWithOperations".into(),
+                            ))),
+                        ),
+                    ),
+                    (4, ("failurePolicy".into(), FieldType::String)),
+                    (
+                        5,
+                        (
+                            "namespaceSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (6, ("sideEffects".into(), FieldType::String)),
+                    (7, ("timeoutSeconds".into(), FieldType::Int)),
+                    (
+                        8,
+                        (
+                            "admissionReviewVersions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (9, ("matchPolicy".into(), FieldType::String)),
+                    (10, ("reinvocationPolicy".into(), FieldType::String)),
+                    (
+                        11,
+                        (
+                            "objectSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        12,
+                        (
+                            "matchConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "MatchCondition".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ValidatingWebhook".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "clientConfig".into(),
+                            FieldType::Message("WebhookClientConfig".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "RuleWithOperations".into(),
+                            ))),
+                        ),
+                    ),
+                    (4, ("failurePolicy".into(), FieldType::String)),
+                    (
+                        5,
+                        (
+                            "namespaceSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (6, ("sideEffects".into(), FieldType::String)),
+                    (7, ("timeoutSeconds".into(), FieldType::Int)),
+                    (
+                        8,
+                        (
+                            "admissionReviewVersions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (9, ("matchPolicy".into(), FieldType::String)),
+                    (
+                        10,
+                        (
+                            "objectSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        11,
+                        (
+                            "matchConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "MatchCondition".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ----- Client configuration / service reference -----
+
+        schemas.insert(
+            "WebhookClientConfig".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "service".into(),
+                            FieldType::Message("ServiceReference".into()),
+                        ),
+                    ),
+                    (2, ("caBundle".into(), FieldType::Bytes)),
+                    (3, ("url".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ServiceReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("name".into(), FieldType::String)),
+                    (3, ("path".into(), FieldType::String)),
+                    (4, ("port".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // ----- Rules -----
+
+        schemas.insert(
+            "Rule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiVersions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (4, ("scope".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "RuleWithOperations".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "operations".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("rule".into(), FieldType::Message("Rule".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NamedRuleWithOperations".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "resourceNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "ruleWithOperations".into(),
+                            FieldType::Message("RuleWithOperations".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ----- Match criteria -----
+
+        schemas.insert(
+            "MatchCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("expression".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "MatchResources".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "namespaceSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "objectSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NamedRuleWithOperations".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "excludeResourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NamedRuleWithOperations".into(),
+                            ))),
+                        ),
+                    ),
+                    (7, ("matchPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ----- Policy parameters -----
+
+        schemas.insert(
+            "ParamKind".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("apiVersion".into(), FieldType::String)),
+                    (2, ("kind".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ParamRef".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("namespace".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "selector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (4, ("parameterNotFoundAction".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ----- Validation primitives -----
+
+        schemas.insert(
+            "Validation".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("expression".into(), FieldType::String)),
+                    (2, ("message".into(), FieldType::String)),
+                    (3, ("reason".into(), FieldType::String)),
+                    (4, ("messageExpression".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "Variable".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("expression".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "AuditAnnotation".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("valueExpression".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ----- Status / type checking -----
+
+        schemas.insert(
+            "TypeChecking".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "expressionWarnings".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "ExpressionWarning".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "ExpressionWarning".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (2, ("fieldRef".into(), FieldType::String)),
+                    (3, ("warning".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ----- Spec / status / binding-spec messages -----
+
+        schemas.insert(
+            "ValidatingAdmissionPolicySpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("paramKind".into(), FieldType::Message("ParamKind".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "matchConstraints".into(),
+                            FieldType::Message("MatchResources".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "validations".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Validation".into()))),
+                        ),
+                    ),
+                    (4, ("failurePolicy".into(), FieldType::String)),
+                    (
+                        5,
+                        (
+                            "auditAnnotations".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "AuditAnnotation".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "matchConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "MatchCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "variables".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Variable".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ValidatingAdmissionPolicyBindingSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("policyName".into(), FieldType::String)),
+                    (
+                        2,
+                        ("paramRef".into(), FieldType::Message("ParamRef".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "matchResources".into(),
+                            FieldType::Message("MatchResources".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "validationActions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ValidatingAdmissionPolicyStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("observedGeneration".into(), FieldType::Int)),
+                    (
+                        2,
+                        (
+                            "typeChecking".into(),
+                            FieldType::Message("TypeChecking".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                        ),
+                    ),
                 ]),
             },
         );
