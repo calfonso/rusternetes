@@ -63,7 +63,14 @@ jobs:
     # description for the helm-install one-liner that has to run
     # ONCE before this workflow can ever turn green.
     runs-on: arc-runner-set-conformance
-    timeout-minutes: 30
+    # 60 min not 30: the conformance tier is 3 cpu and each of the 5
+    # service Dockerfiles compiles its own copy of the workspace (no
+    # shared cargo-target cache across Dockerfile targets), so a cold
+    # build needs ~40-50 min. Run 26126002894 timed out at the 30-min
+    # ceiling on the scheduler build. Follow-up to collapse the five
+    # Dockerfiles into one shared builder stage will let us drop this
+    # back down — tracked separately.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
