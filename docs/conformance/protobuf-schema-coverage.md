@@ -15,7 +15,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 | networking/v1 | 0 / 30 | 0% |
 | apiextensions/v1 | 18 / 23 | 78% |
 | admissionregistration/v1 | 0 / 23 | 0% |
-| coordination/v1 | 0 / 2 | 0% |
+| coordination/v1 | 2 / 2 | 100% |
 | policy/v1 | 0 / 4 | 0% |
 | discovery/v1 | 7 / 7 | 100% |
 | autoscaling/v2 | 0 / 23 | 0% |
@@ -23,7 +23,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 | storage/v1 | 0 / 15 | 0% |
 | apiregistration/v1 | 0 / 5 | 0% |
 | apimachinery/meta/v1 | 8 / 15 | 53% |
-| **Total** | **164 / 405** | **40%** |
+| **Total** | **166 / 405** | **41%** |
 
 ## core/v1
 
@@ -418,11 +418,11 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 ### Kinds
 
-- [ ] `Lease`
+- [x] `Lease`
 
 ### Nested messages
 
-- [ ] `LeaseSpec`
+- [x] `LeaseSpec`
 
 ## policy/v1
 
