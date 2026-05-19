@@ -6,6 +6,7 @@ mod eviction;
 mod kubelet;
 mod lifecycle;
 mod runtime;
+mod server;
 
 use anyhow::Result;
 use axum::{
@@ -220,6 +221,10 @@ async fn main() -> Result<()> {
         metrics_addr
     );
 
+    let server_state = server::ServerState {
+        node_name: runtime_config.node_name.clone(),
+        storage: storage.clone(),
+    };
     tokio::spawn(async move {
         let app = Router::new()
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
@@ -227,7 +232,8 @@ async fn main() -> Result<()> {
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
-            .route("/exec/:container_id", post(handle_exec));
+            .route("/exec/:container_id", post(handle_exec))
+            .merge(server::read_only_router(server_state));
 
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
