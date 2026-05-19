@@ -13,25 +13,12 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of retry attempts for transient cloud-provider or storage
-/// failures while reconciling LoadBalancer status. Each retry uses
-/// exponential backoff (100ms, 200ms, 400ms, ...).
-const STATUS_PATCH_MAX_ATTEMPTS: u32 = 5;
-
-/// Initial backoff between retries; doubled on each subsequent attempt.
-const STATUS_PATCH_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-
 /// LoadBalancerController reconciles LoadBalancer-type Services with cloud provider load balancers
 pub struct LoadBalancerController<S: Storage> {
     storage: Arc<S>,
     cloud_provider: Option<Arc<dyn CloudProvider>>,
     cluster_name: String,
     sync_interval: Duration,
-    /// Maximum retry attempts for transient failures during status-patch.
-    /// Overrideable in tests via [`Self::with_retry_policy`].
-    max_attempts: u32,
-    /// Initial backoff between retries; doubled per attempt.
-    initial_backoff: Duration,
 }
 
 impl<S: Storage + 'static> LoadBalancerController<S> {
@@ -46,20 +33,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
             cloud_provider,
             cluster_name,
             sync_interval: Duration::from_secs(sync_interval_secs),
-            max_attempts: STATUS_PATCH_MAX_ATTEMPTS,
-            initial_backoff: STATUS_PATCH_INITIAL_BACKOFF,
         }
-    }
-
-    /// Override the retry policy (test-only escape hatch so unit tests can
-    /// drive transient-failure scenarios without sleeping for production
-    /// backoff durations).
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn with_retry_policy(mut self, max_attempts: u32, initial_backoff: Duration) -> Self {
-        self.max_attempts = max_attempts;
-        self.initial_backoff = initial_backoff;
-        self
     }
 
     /// Start the controller reconciliation loop
@@ -447,20 +421,30 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                 .unwrap_or_default(),
         };
 
-        // Ensure load balancer exists. Wrap in a retry loop so a transient
-        // cloud-provider failure (rate-limit, brief 5xx, DNS hiccup) does
-        // not leave status empty and the upstream e2e
-        // `service.go:3459`/`4291` lifecycle check stuck.
-        let lb_status = self
-            .ensure_load_balancer_with_retry(cloud_provider, &cloud_lb_service, namespace, name)
-            .await?;
+        // Single-attempt ensure. Matches upstream
+        // (k8s.io/cloud-provider/controllers/service/controller.go ~line 483):
+        // any failure is logged + a Warning Event is emitted, then the
+        // workqueue rate-limits the next attempt. No inline backoff — that
+        // would hold a worker for seconds and starve other Services under
+        // a region-wide cloud blip.
+        let lb_status = match cloud_provider.ensure_load_balancer(&cloud_lb_service).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.record_warning_event(
+                    service,
+                    "SyncLoadBalancerFailed",
+                    &format!("Error syncing load balancer: {e}"),
+                )
+                .await;
+                return Err(
+                    anyhow::anyhow!(e.to_string()).context("Failed to ensure load balancer")
+                );
+            }
+        };
 
-        // Update service status with load balancer information. Retry the
-        // storage patch separately — the cloud-provider call already
-        // succeeded so we must not call it again on a transient storage
-        // conflict.
-        self.update_service_status(namespace, name, lb_status)
-            .await?;
+        // Update service status with load balancer information. Read-modify-
+        // write on a single attempt; conflicts re-enqueue via the workqueue.
+        self.update_service_status(service, lb_status).await?;
 
         info!(
             "Successfully reconciled LoadBalancer service {}/{}",
@@ -470,64 +454,22 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
         Ok(())
     }
 
-    /// Call `ensure_load_balancer` with exponential-backoff retry. The
-    /// underlying `CloudProvider` trait does not distinguish transient from
-    /// terminal errors, so we treat every failure as transient up to
-    /// `max_attempts`. After the budget is exhausted we emit a Warning
-    /// `Event` against the Service and bubble the error so the workqueue
-    /// rate-limits the next attempt.
-    async fn ensure_load_balancer_with_retry(
-        &self,
-        cloud_provider: &dyn CloudProvider,
-        cloud_lb_service: &CloudLBService,
-        namespace: &str,
-        name: &str,
-    ) -> Result<rusternetes_common::cloud_provider::LoadBalancerStatus> {
-        let mut backoff = self.initial_backoff;
-        let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 1..=self.max_attempts {
-            match cloud_provider.ensure_load_balancer(cloud_lb_service).await {
-                Ok(status) => return Ok(status),
-                Err(e) => {
-                    warn!(
-                        "ensure_load_balancer attempt {}/{} for {}/{} failed: {}",
-                        attempt, self.max_attempts, namespace, name, e
-                    );
-                    last_err = Some(anyhow::anyhow!(e.to_string()));
-                    if attempt < self.max_attempts {
-                        time::sleep(backoff).await;
-                        backoff = backoff.saturating_mul(2);
-                    }
-                }
-            }
-        }
-        let err = last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("ensure_load_balancer exhausted retries with no recorded error")
-        });
-        self.record_warning_event(
-            namespace,
-            name,
-            "EnsuringLoadBalancerFailed",
-            &format!(
-                "Cloud provider failed after {} attempts: {}",
-                self.max_attempts, err
-            ),
-        )
-        .await;
-        Err(err.context("Failed to ensure load balancer"))
-    }
-
-    /// Update service status with load balancer information. Performs a
-    /// read-modify-write under a retry budget so transient storage failures
-    /// (lost-write conflicts, momentary backend hiccups) do not leave
-    /// `status.loadBalancer.ingress` empty after the cloud-provider call
-    /// already succeeded.
+    /// Update `service.status.loadBalancer` with the cloud-provider result.
+    /// Single read-modify-write — storage Conflict on concurrent writes
+    /// surfaces as an error and the workqueue re-enqueues us so the next
+    /// reconcile observes the latest version. Conditions set by other
+    /// controllers are preserved.
     async fn update_service_status(
         &self,
-        namespace: &str,
-        name: &str,
+        service: &Service,
         lb_status: rusternetes_common::cloud_provider::LoadBalancerStatus,
     ) -> Result<()> {
+        let namespace = service
+            .metadata
+            .namespace
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Service has no namespace"))?;
+        let name = &service.metadata.name;
         let key = rusternetes_storage::build_key("services", Some(namespace), name);
 
         let service_lb_status = LoadBalancerStatus {
@@ -543,87 +485,70 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                 .collect(),
         };
 
-        let mut backoff = self.initial_backoff;
-        let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 1..=self.max_attempts {
-            // Read-modify-write each attempt so we observe concurrent
-            // mutations (e.g. status.conditions appended by another
-            // controller) and don't clobber them.
-            let mut service: Service = match self.storage.get(&key).await {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(anyhow::anyhow!(e.to_string()));
-                    if attempt < self.max_attempts {
-                        time::sleep(backoff).await;
-                        backoff = backoff.saturating_mul(2);
-                    }
-                    continue;
-                }
-            };
-
-            // Preserve any existing conditions — only `load_balancer` is
-            // owned by this controller.
-            let existing_conditions = service.status.as_ref().and_then(|s| s.conditions.clone());
-            service.status = Some(ServiceStatus {
-                load_balancer: Some(service_lb_status.clone()),
-                conditions: existing_conditions,
-            });
-
-            match self.storage.update(&key, &service).await {
-                Ok(_) => {
-                    debug!(
-                        "Updated status for service {}/{} on attempt {}",
-                        namespace, name, attempt
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        "update_service_status attempt {}/{} for {}/{} failed: {}",
-                        attempt, self.max_attempts, namespace, name, e
-                    );
-                    last_err = Some(anyhow::anyhow!(e.to_string()));
-                    if attempt < self.max_attempts {
-                        time::sleep(backoff).await;
-                        backoff = backoff.saturating_mul(2);
-                    }
-                }
+        let mut current: Service = match self.storage.get(&key).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.record_warning_event(
+                    service,
+                    "SyncLoadBalancerFailed",
+                    &format!("Failed to read service for status update: {e}"),
+                )
+                .await;
+                return Err(
+                    anyhow::anyhow!(e.to_string()).context("Failed to read service for status")
+                );
             }
-        }
-        let err = last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("update_service_status exhausted retries with no recorded error")
+        };
+
+        // Only `load_balancer` is owned by this controller — preserve any
+        // `conditions` set by other controllers. Mirrors upstream's
+        // `updated.Status.LoadBalancer = *newStatus` over a DeepCopy.
+        let existing_conditions = current.status.as_ref().and_then(|s| s.conditions.clone());
+        current.status = Some(ServiceStatus {
+            load_balancer: Some(service_lb_status),
+            conditions: existing_conditions,
         });
-        self.record_warning_event(
-            namespace,
-            name,
-            "UpdateLoadBalancerStatusFailed",
-            &format!(
-                "Status PATCH failed after {} attempts: {}",
-                self.max_attempts, err
-            ),
-        )
-        .await;
-        Err(err.context("Failed to update service status"))
+
+        if let Err(e) = self.storage.update(&key, &current).await {
+            warn!(
+                "update_service_status for {}/{} failed: {} (workqueue will retry)",
+                namespace, name, e
+            );
+            self.record_warning_event(
+                service,
+                "SyncLoadBalancerFailed",
+                &format!("Error updating load balancer status: {e}"),
+            )
+            .await;
+            return Err(anyhow::anyhow!(e.to_string()).context("Failed to update service status"));
+        }
+        debug!("Updated status for service {}/{}", namespace, name);
+        Ok(())
     }
 
-    /// Record a Warning Event against a Service. Best-effort: failure to
-    /// write the event must not mask the underlying reconcile error, so we
-    /// only log on failure.
-    async fn record_warning_event(&self, namespace: &str, name: &str, reason: &str, message: &str) {
+    /// Record a Warning Event against a Service. Best-effort — failure to
+    /// write the event must not mask the underlying reconcile error.
+    /// Matches `EventsController::create_event_if_new`: same reason
+    /// produces one Event per Service to avoid log spam (upstream then
+    /// updates `count`/`lastTimestamp` via a separate aggregator we don't
+    /// have yet — see follow-up note in the PR body).
+    async fn record_warning_event(&self, service: &Service, reason: &str, message: &str) {
+        let namespace = service.metadata.namespace.as_deref().unwrap_or_default();
+        let name = service.metadata.name.clone();
         let involved = ObjectReference {
             kind: Some("Service".to_string()),
             namespace: Some(namespace.to_string()),
-            name: Some(name.to_string()),
+            name: Some(name),
             api_version: Some("v1".to_string()),
-            uid: None,
+            // Carry the Service UID so the event survives an object
+            // recreation cleanly (an `apply` that recreates the Service
+            // will mint a new UID; events stay scoped to the old one).
+            uid: Some(service.metadata.uid.clone()).filter(|u| !u.is_empty()),
             resource_version: None,
             field_path: None,
         };
         let event_name = Event::generate_name(&involved, reason);
         let key = format!("/registry/events/{}/{}", namespace, event_name);
-        // Deduplicate: if the same reason is already recorded, skip — the
-        // existing entry's last_timestamp will be refreshed by other
-        // tooling. This mirrors `EventsController::create_event_if_new`.
         if self.storage.get::<Event>(&key).await.is_ok() {
             return;
         }

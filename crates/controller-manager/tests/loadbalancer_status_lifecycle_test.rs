@@ -25,7 +25,6 @@ use rusternetes_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Mock cloud provider that records calls and can be programmed to fail a
 /// configurable number of times before succeeding.
@@ -209,55 +208,75 @@ async fn loadbalancer_status_populated_on_first_reconcile_with_cloud_provider() 
 }
 
 /// Sub-bug for upstream e2e `service.go:3459` — when the cloud-provider
-/// throws a transient error on first call, the controller must back off and
-/// retry rather than leaving `status.loadBalancer.ingress` empty (which is
-/// what the upstream test waits forever for).
+/// throws a transient error, the controller surfaces the failure and
+/// relies on the workqueue (or the next periodic resync) to re-enqueue.
+/// The status must populate on the second reconcile, not stay empty.
+///
+/// Matches upstream's design in
+/// `staging/src/k8s.io/cloud-provider/controllers/service/controller.go`
+/// where `EnsureLoadBalancer` failures return up to `processNextServiceItem`
+/// which calls `workqueue.AddRateLimited()`.
 #[tokio::test]
-async fn loadbalancer_status_retries_transient_cloud_provider_failures() {
+async fn loadbalancer_status_populates_on_workqueue_retry() {
     let storage = Arc::new(MemoryStorage::new());
-    // 2 transient failures, then success — must populate status after 3
-    // total ensure_load_balancer calls.
-    let provider = Arc::new(StubCloudProvider::new("203.0.113.99", 2));
+    // 1 transient failure, then success — first reconcile fails, second
+    // (simulating the workqueue re-enqueue) succeeds.
+    let provider = Arc::new(StubCloudProvider::new("203.0.113.99", 1));
 
-    // Use a tight retry policy so the test stays fast.
     let controller = LoadBalancerController::new(
         storage.clone(),
         Some(provider.clone() as Arc<dyn CloudProvider>),
         "test-cluster".to_string(),
         30,
-    )
-    .with_retry_policy(5, Duration::from_millis(1));
+    );
 
     let svc = lb_service("lb-transient", "default");
     let key = build_key("services", Some("default"), "lb-transient");
     storage.create(&key, &svc).await.unwrap();
 
+    // First reconcile: cloud provider fails → reconcile_all swallows the
+    // per-service error and logs (real workqueue would AddRateLimited).
+    let _ = controller.reconcile_all().await;
+    let after_first: Service = storage.get(&key).await.unwrap();
+    assert!(
+        after_first
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .map(|lb| lb.ingress.is_empty())
+            .unwrap_or(true),
+        "status.loadBalancer must NOT be populated after failed reconcile"
+    );
+
+    // Second reconcile (workqueue re-enqueue): cloud provider succeeds.
     controller
         .reconcile_all()
         .await
-        .expect("reconcile_all should succeed after retries");
+        .expect("second reconcile_all should succeed");
 
     let after: Service = storage.get(&key).await.unwrap();
     let lb = after
         .status
         .as_ref()
         .and_then(|s| s.load_balancer.as_ref())
-        .expect("status.loadBalancer populated after retry");
+        .expect("status.loadBalancer populated after workqueue retry");
     assert!(!lb.ingress.is_empty(), "ingress must be non-empty");
     assert_eq!(lb.ingress[0].ip.as_deref(), Some("203.0.113.99"));
     assert_eq!(
         provider.ensure_calls.load(Ordering::SeqCst),
-        3,
-        "must observe 2 failed + 1 successful ensure_load_balancer call"
+        2,
+        "must observe 1 failed + 1 successful ensure_load_balancer call"
     );
 }
 
-/// When the cloud provider keeps failing past the retry budget, reconcile
-/// must return an error AND emit a Warning Event so operators can see the
-/// failure. Previously the worker only `error!()`-logged it, hiding the
-/// state from `kubectl describe`.
+/// When the cloud provider fails, reconcile must emit a Warning Event so
+/// operators can see the failure via `kubectl describe svc`. Upstream
+/// doesn't emit this event; we keep it because the previous behaviour
+/// (`error!()`-only) was opaque to operators in production incident
+/// debriefs. The Event reason mirrors upstream's `SyncLoadBalancerFailed`
+/// wording so existing dashboards can match on it.
 #[tokio::test]
-async fn loadbalancer_status_emits_warning_event_on_terminal_failure() {
+async fn loadbalancer_status_emits_warning_event_on_failure() {
     let storage = Arc::new(MemoryStorage::new());
     let provider: Arc<dyn CloudProvider> = Arc::new(AlwaysFailCloudProvider);
 
@@ -266,8 +285,7 @@ async fn loadbalancer_status_emits_warning_event_on_terminal_failure() {
         Some(provider),
         "test-cluster".to_string(),
         30,
-    )
-    .with_retry_policy(3, Duration::from_millis(1));
+    );
 
     let svc = lb_service("lb-fail", "default");
     let key = build_key("services", Some("default"), "lb-fail");
@@ -285,12 +303,11 @@ async fn loadbalancer_status_emits_warning_event_on_terminal_failure() {
         .await
         .unwrap_or_default();
     let warning = events.iter().find(|e| {
-        e.involved_object.name.as_deref() == Some("lb-fail")
-            && e.reason == "EnsuringLoadBalancerFailed"
+        e.involved_object.name.as_deref() == Some("lb-fail") && e.reason == "SyncLoadBalancerFailed"
     });
     assert!(
         warning.is_some(),
-        "Warning Event 'EnsuringLoadBalancerFailed' must be recorded against Service lb-fail. Events: {:?}",
+        "Warning Event 'SyncLoadBalancerFailed' must be recorded against Service lb-fail. Events: {:?}",
         events.iter().map(|e| &e.reason).collect::<Vec<_>>()
     );
 }
@@ -310,8 +327,7 @@ async fn loadbalancer_status_handles_service_deleted_mid_reconcile() {
         Some(provider.clone() as Arc<dyn CloudProvider>),
         "test-cluster".to_string(),
         30,
-    )
-    .with_retry_policy(2, Duration::from_millis(1));
+    );
 
     let svc = lb_service("lb-deleted", "default");
     let key = build_key("services", Some("default"), "lb-deleted");
@@ -328,5 +344,87 @@ async fn loadbalancer_status_handles_service_deleted_mid_reconcile() {
     assert!(
         storage.get::<Service>(&key).await.is_err(),
         "deleted service must not be resurrected"
+    );
+}
+
+/// Pre-existing `status.conditions` set by another controller must survive
+/// our `status.loadBalancer` write. Mirrors upstream's "DeepCopy then mutate
+/// only LoadBalancer" pattern in
+/// `staging/src/k8s.io/cloud-provider/controllers/service/controller.go`.
+/// Also asserts the Warning Event we emit carries the Service UID so
+/// `kubectl describe svc` doesn't lose the audit trail across recreations.
+#[tokio::test]
+async fn loadbalancer_status_preserves_conditions_and_emits_uid_event() {
+    use rusternetes_common::types::Condition;
+    let storage = Arc::new(MemoryStorage::new());
+    let provider = Arc::new(StubCloudProvider::new("203.0.113.55", 0));
+    let controller = LoadBalancerController::new(
+        storage.clone(),
+        Some(provider.clone() as Arc<dyn CloudProvider>),
+        "test-cluster".to_string(),
+        30,
+    );
+
+    // Seed with a Service that already has a non-LB condition + a UID.
+    let mut svc = lb_service("lb-with-conditions", "default");
+    svc.metadata.uid = "uid-1234-5678".to_string();
+    svc.status = Some(rusternetes_common::resources::service::ServiceStatus {
+        load_balancer: None,
+        conditions: Some(vec![Condition {
+            condition_type: "OtherControllerOK".to_string(),
+            status: "True".to_string(),
+            last_transition_time: Some(chrono::Utc::now()),
+            reason: Some("Seeded".to_string()),
+            message: Some("set by another controller".to_string()),
+            observed_generation: None,
+        }]),
+    });
+    let key = build_key("services", Some("default"), "lb-with-conditions");
+    storage.create(&key, &svc).await.unwrap();
+
+    controller.reconcile_all().await.unwrap();
+
+    // status.loadBalancer populated AND pre-existing condition preserved.
+    let after: Service = storage.get(&key).await.unwrap();
+    let status = after.status.as_ref().expect("status must exist");
+    assert_eq!(
+        status
+            .load_balancer
+            .as_ref()
+            .and_then(|lb| lb.ingress.first())
+            .and_then(|ing| ing.ip.as_deref()),
+        Some("203.0.113.55")
+    );
+    let conditions = status.conditions.as_ref().expect("conditions preserved");
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c.condition_type == "OtherControllerOK"),
+        "pre-existing OtherControllerOK condition must survive LB status write; got {:?}",
+        conditions
+    );
+
+    // No event on success path — but if we re-trigger with a failing
+    // provider, the Warning Event must carry the UID we seeded.
+    let failing: Arc<dyn CloudProvider> = Arc::new(AlwaysFailCloudProvider);
+    let failing_controller = LoadBalancerController::new(
+        storage.clone(),
+        Some(failing),
+        "test-cluster".to_string(),
+        30,
+    );
+    let _ = failing_controller.reconcile_all().await;
+    let events: Vec<Event> = storage
+        .list("/registry/events/default/")
+        .await
+        .unwrap_or_default();
+    let event = events
+        .iter()
+        .find(|e| e.involved_object.name.as_deref() == Some("lb-with-conditions"))
+        .expect("Warning event recorded against the Service");
+    assert_eq!(
+        event.involved_object.uid.as_deref(),
+        Some("uid-1234-5678"),
+        "Warning event must carry the Service UID for audit-trail continuity"
     );
 }
