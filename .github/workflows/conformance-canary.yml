@@ -70,12 +70,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Clone rhino adjacent to repo
-        # Same pre-existing pattern as test.yml — the storage crate's
-        # Cargo.toml references `path = "../../../rhino"`. The dind
-        # daemon doesn't need it but the compose build context does.
-        run: |
-          git clone --depth 1 https://github.com/indyjonesnl/rhino.git ../rhino || \
-            echo "rhino already cloned"
+        # Same pre-existing pattern as test.yml / fmt.yml — the storage
+        # crate's Cargo.toml references `path = "../../../rhino"` and
+        # compose.yml exposes that path as a named build context
+        # (`additional_contexts: rhino: ../rhino`). The clone MUST land
+        # at $GITHUB_WORKSPACE/../rhino which on the ARC runner is
+        # /home/runner/_work/rusternetes/rhino.
+        #
+        # No `||` swallow: a failed clone here means the compose build
+        # later fails with a confusing `failed to get build context
+        # rhino: stat ... no such file or directory` — fail loud at the
+        # source.
+        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
 
       - name: Confirm Docker daemon
         run: |
