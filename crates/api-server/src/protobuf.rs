@@ -2375,6 +2375,7 @@ impl ProtoRegistry {
         Self::register_apiregistration_v1(&mut schemas);
         Self::register_storage_v1(&mut schemas);
         Self::register_coordination_v1(&mut schemas);
+        Self::register_policy_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -8288,6 +8289,101 @@ impl ProtoRegistry {
                     (5, ("leaseTransitions".into(), FieldType::Int)),
                     (6, ("strategy".into(), FieldType::String)),
                     (7, ("preferredHolder".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    /// Register protobuf schemas for the `policy/v1` API group.
+    ///
+    /// Covers `Eviction`, `PodDisruptionBudget`, `PodDisruptionBudgetSpec`, and
+    /// `PodDisruptionBudgetStatus`. Field numbers are taken from
+    /// `k8s.io/api/policy/v1/generated.proto` (Kubernetes release-1.35).
+    ///
+    /// `PodDisruptionBudgetSpec.minAvailable` and `maxUnavailable` are
+    /// `IntOrString`. `PodDisruptionBudgetStatus.disruptedPods` is a
+    /// `map<string, Time>` (decoded via `MessageMap`).
+    fn register_policy_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "Eviction".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "deleteOptions".into(),
+                            FieldType::Message("DeleteOptions".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodDisruptionBudget".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("PodDisruptionBudgetSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("PodDisruptionBudgetStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodDisruptionBudgetSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("minAvailable".into(), FieldType::IntOrString)),
+                    (
+                        2,
+                        (
+                            "selector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (3, ("maxUnavailable".into(), FieldType::IntOrString)),
+                    (4, ("unhealthyPodEvictionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodDisruptionBudgetStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("observedGeneration".into(), FieldType::Int)),
+                    (
+                        2,
+                        ("disruptedPods".into(), FieldType::MessageMap("Time".into())),
+                    ),
+                    (3, ("disruptionsAllowed".into(), FieldType::Int)),
+                    (4, ("currentHealthy".into(), FieldType::Int)),
+                    (5, ("desiredHealthy".into(), FieldType::Int)),
+                    (6, ("expectedPods".into(), FieldType::Int)),
+                    (
+                        7,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                        ),
+                    ),
                 ]),
             },
         );

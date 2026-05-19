@@ -16,14 +16,14 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 | apiextensions/v1 | 18 / 23 | 78% |
 | admissionregistration/v1 | 0 / 23 | 0% |
 | coordination/v1 | 2 / 2 | 100% |
-| policy/v1 | 0 / 4 | 0% |
+| policy/v1 | 4 / 4 | 100% |
 | discovery/v1 | 7 / 7 | 100% |
 | autoscaling/v2 | 0 / 23 | 0% |
 | scheduling/v1 | 1 / 1 | 100% |
 | storage/v1 | 0 / 15 | 0% |
 | apiregistration/v1 | 0 / 5 | 0% |
 | apimachinery/meta/v1 | 8 / 15 | 53% |
-| **Total** | **166 / 405** | **41%** |
+| **Total** | **170 / 405** | **42%** |
 
 ## core/v1
 
@@ -428,13 +428,13 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 ### Kinds
 
-- [ ] `Eviction`
-- [ ] `PodDisruptionBudget`
+- [x] `Eviction`
+- [x] `PodDisruptionBudget`
 
 ### Nested messages
 
-- [ ] `PodDisruptionBudgetSpec`
-- [ ] `PodDisruptionBudgetStatus`
+- [x] `PodDisruptionBudgetSpec`
+- [x] `PodDisruptionBudgetStatus`
 
 ## discovery/v1
 
