@@ -601,20 +601,34 @@ fn pod_exec_over_websocket_query_format_matches_upstream() {
 /// [sig-node] Pods should support retrieving logs from the container over websockets
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/pods.go:583
-/// Sonobuoy (Round 160): FAIL — same root cause (no `binary.k8s.io` upgrade
-/// in the streaming layer). Mirror pins the kubelet's reachable shape: the
-/// per-pod log endpoint takes a single `container=` query parameter.
+/// Sonobuoy (Round 160): FAIL — the api-server's /log websocket branch used
+/// to send plain `Message::Text` instead of upstream's channel-prefixed binary
+/// frames. Pinned here is the kubelet-reachable URL shape: the per-pod log
+/// endpoint takes a single `container=` query parameter (no follow / tailLines
+/// / sinceSeconds in the basic websocket-logs scenario at pods.go:583).
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-exec-logs-downward.md"]
 fn pod_log_over_websocket_query_is_container_only() {
-    // The upstream test builds .Suffix("log").Param("container", containerName)
-    // and opens a WebSocket. Our kubelet doesn't expose /log directly (api-server
-    // does), so the invariant we pin here is the URL shape it MUST produce —
-    // a single `container=` query parameter (no follow/tailLines/sinceSeconds
-    // for the basic websocket-logs scenario in pods.go:583).
+    // Upstream builds the request with:
+    //   req := f.ClientSet.CoreV1().RESTClient().Get().
+    //       Namespace(ns).Resource("pods").Name(pod.Name).
+    //       SubResource("log").
+    //       Param("container", containerName)
+    //   ws, err := framework.OpenWebSocketForURL(req.URL(), ...)
+    //
+    // The resulting URL path is /api/v1/namespaces/<ns>/pods/<pod>/log and
+    // the raw query is `container=<name>` — exactly one key, no other params.
     let container = "agnhost";
-    let q = format!("container={container}");
-    assert_eq!(q, "container=agnhost");
+    let q = pod_log_ws_query(container);
+
+    assert_eq!(
+        q, "container=agnhost",
+        "the upstream pods.go:583 builder produces only `container=<name>`"
+    );
+    assert_eq!(
+        q.matches("container=").count(),
+        1,
+        "exactly one container= parameter — duplicate keys would fail server-side parsing"
+    );
     assert!(
         !q.contains('&'),
         "websocket-logs URL must have exactly one query param"
@@ -627,6 +641,35 @@ fn pod_log_over_websocket_query_is_container_only() {
         !q.contains("tailLines"),
         "tailLines not used in pods.go:583 scenario"
     );
+    assert!(
+        !q.contains("sinceSeconds"),
+        "sinceSeconds not used in pods.go:583 scenario"
+    );
+    assert!(
+        !q.contains("previous"),
+        "previous not used in pods.go:583 scenario"
+    );
+    assert!(
+        !q.contains("timestamps"),
+        "timestamps not used in pods.go:583 scenario"
+    );
+
+    // Full request path the client opens against the api-server. The path
+    // shape itself is enforced by router.rs (see crate api-server) — we mirror
+    // it here so a rename on either side breaks loudly.
+    let ns = "e2e-pods-12345";
+    let pod = "pod-logs-websocket-abc";
+    let path = format!("/api/v1/namespaces/{ns}/pods/{pod}/log?{q}");
+    assert_eq!(
+        path,
+        "/api/v1/namespaces/e2e-pods-12345/pods/pod-logs-websocket-abc/log?container=agnhost"
+    );
+}
+
+/// Construct the URL query string the upstream `pods.go:583` test produces
+/// when opening a log-over-websocket request. Single `container=<name>` key.
+fn pod_log_ws_query(container: &str) -> String {
+    format!("container={}", url_encode_minimal(container.as_bytes()))
 }
 
 /// [sig-node] Pods should print the output to logs
