@@ -289,6 +289,37 @@ bash scripts/conformance-split-junit.sh --input path/to/junit_01.xml
 
 Output lands in `.rusternetes/volumes/conformance-per-test/` with an `INDEX.md` summary. Each file is self-contained: test name, status, failure message, system-out tail, and pointers to related `docs/conformance/*.md` matrices. Useful as the per-task input when dispatching a Claude Code worker to investigate a single failure.
 
+## Coordinator (per-test work tracking)
+
+`scripts/conformance-coordinator.sh` maintains a JSON state file over the per-test failures. It is the orchestration layer between the splitter (above) and the agent-driven fix loop.
+
+```bash
+# Ingest the per-test files into state. Re-runnable; preserves existing entries.
+bash scripts/conformance-coordinator.sh init
+
+# Claim the next unclaimed failure (prints "<safe_name>\n<per-test-file>").
+bash scripts/conformance-coordinator.sh next
+
+# Record a PR URL once a worker opens one (advances to status=pr_open).
+bash scripts/conformance-coordinator.sh claim <safe_name> --pr-url <url>
+
+# Poll GitHub for PR statuses (MERGED -> pr_merged; CLOSED -> fail + clear url).
+bash scripts/conformance-coordinator.sh update
+
+# Flip to verified after the shadow check (single-test hydrophone re-run) passes.
+bash scripts/conformance-coordinator.sh mark-done <safe_name>
+
+# Unclaim if a worker abandons.
+bash scripts/conformance-coordinator.sh release <safe_name>
+
+# Summary counts.
+bash scripts/conformance-coordinator.sh status
+```
+
+State file: `.rusternetes/volumes/conformance-coordinator-state.json` (gitignored alongside the per-test directory).
+
+The coordinator does NOT call any agent itself — the driver session does that. Designed so the same state file can be read by manual operators and automated drivers interchangeably.
+
 KUBECONFIG: `~/.kube/rusternetes-config`
 
 ## References
