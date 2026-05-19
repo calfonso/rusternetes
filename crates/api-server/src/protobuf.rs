@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_apimachinery_meta_v1(&mut schemas);
         Self::register_networking_v1(&mut schemas);
         Self::register_autoscaling_v2(&mut schemas);
         Self::register_batch_v1(&mut schemas);
@@ -2388,6 +2389,148 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_apimachinery_meta_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // Condition — generic status condition shared by most resources.
+        // `lastTransitionTime` is a `Time` message (already registered).
+        schemas.insert(
+            "Condition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (3, ("observedGeneration".into(), FieldType::Int)),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // FieldsV1 — opaque JSON blob carried as bytes. The Go side decodes
+        // the inner `Raw` field as a raw JSON document; treating it as
+        // `Bytes` mirrors the on-wire encoding (consumers re-parse the JSON
+        // separately, same as `ManagedFieldsEntry.fieldsV1`).
+        schemas.insert(
+            "FieldsV1".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("Raw".into(), FieldType::Bytes))]),
+            },
+        );
+
+        // ListMeta — pagination/continue metadata returned on every list.
+        schemas.insert(
+            "ListMeta".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("selfLink".into(), FieldType::String)),
+                    (2, ("resourceVersion".into(), FieldType::String)),
+                    (3, ("continue".into(), FieldType::String)),
+                    (4, ("remainingItemCount".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // MicroTime — microsecond-precision sibling of `Time`. Same wire
+        // layout (seconds + nanos), distinct message type.
+        schemas.insert(
+            "MicroTime".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("seconds".into(), FieldType::Int)),
+                    (2, ("nanos".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // Patch — empty message; PATCH request bodies are decoded by the
+        // patch handler, not via the proto registry. Registered for
+        // completeness so the decoder never reports "No schema found for
+        // kind 'Patch'".
+        schemas.insert(
+            "Patch".into(),
+            MessageSchema {
+                fields: HashMap::new(),
+            },
+        );
+
+        // Status — the error/result envelope returned by failing requests
+        // and by DELETE on collections.
+        schemas.insert(
+            "Status".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ListMeta".into())),
+                    ),
+                    (2, ("status".into(), FieldType::String)),
+                    (3, ("message".into(), FieldType::String)),
+                    (4, ("reason".into(), FieldType::String)),
+                    (
+                        5,
+                        ("details".into(), FieldType::Message("StatusDetails".into())),
+                    ),
+                    (6, ("code".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // StatusCause — leaf type for `StatusDetails.causes`. Not separately
+        // listed in the coverage doc, but required for `Status` to decode
+        // its nested `details.causes` array.
+        schemas.insert(
+            "StatusCause".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("reason".into(), FieldType::String)),
+                    (2, ("message".into(), FieldType::String)),
+                    (3, ("field".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // StatusDetails — populated alongside `Status` to give clients a
+        // structured handle on what failed. `uid` is field 6, not 4.
+        schemas.insert(
+            "StatusDetails".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("group".into(), FieldType::String)),
+                    (3, ("kind".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "causes".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("StatusCause".into()))),
+                        ),
+                    ),
+                    (5, ("retryAfterSeconds".into(), FieldType::Int)),
+                    (6, ("uid".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // TypeMeta — embedded inline in the protobuf `Unknown` envelope
+        // around every kind. Registered here so a bare `TypeMeta` body
+        // can also be decoded.
+        schemas.insert(
+            "TypeMeta".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("apiVersion".into(), FieldType::String)),
                 ]),
             },
         );
@@ -5942,5 +6085,83 @@ mod tests {
         let first = &containers.as_array().unwrap()[0];
         assert_eq!(first.get("name"), Some(&Value::String("test".into())));
         assert_eq!(first.get("image"), Some(&Value::String("nginx".into())));
+    }
+
+    #[test]
+    fn test_apimachinery_meta_v1_schemas_registered() {
+        // Every shared `apimachinery/pkg/apis/meta/v1` type listed in
+        // docs/conformance/protobuf-schema-coverage.md must be in the
+        // registry, plus the StatusCause / StatusDetails leaves that
+        // Status transitively requires.
+        let registry = ProtoRegistry::new();
+        for kind in [
+            "Condition",
+            "FieldsV1",
+            "ListMeta",
+            "MicroTime",
+            "Patch",
+            "Status",
+            "StatusCause",
+            "StatusDetails",
+            "TypeMeta",
+        ] {
+            assert!(
+                registry.schemas.contains_key(kind),
+                "missing apimachinery/meta/v1 schema: {kind}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_status_with_details_and_causes() {
+        let registry = ProtoRegistry::new();
+
+        // Build StatusCause { reason = "BadValue", field = "spec.replicas" }
+        let mut cause = Vec::new();
+        // field 1 (reason) length-delimited
+        cause.push(0x0a);
+        cause.push(8);
+        cause.extend_from_slice(b"BadValue");
+        // field 3 (field) length-delimited
+        cause.push(0x1a);
+        cause.push(13);
+        cause.extend_from_slice(b"spec.replicas");
+
+        // Build StatusDetails { name="x", causes=[cause] }
+        // field 1 (name) length-delimited: tag 0x0a, len 1, 'x'
+        // field 4 (causes) length-delimited: tag 0x22, len, cause bytes
+        let mut details = vec![0x0a, 1, b'x', 0x22, cause.len() as u8];
+        details.extend_from_slice(&cause);
+
+        // Build Status { status="Failure", code=422, details=details }
+        let mut status = Vec::new();
+        // field 2 (status) length-delimited
+        status.push(0x12);
+        status.push(7);
+        status.extend_from_slice(b"Failure");
+        // field 5 (details) length-delimited
+        status.push(0x2a);
+        status.push(details.len() as u8);
+        status.extend_from_slice(&details);
+        // field 6 (code) varint = 422 -> two bytes: 0xa6 0x03
+        status.push(0x30);
+        status.push(0xa6);
+        status.push(0x03);
+
+        let val = registry
+            .decode_message("Status", &status)
+            .expect("Status should decode");
+        assert_eq!(val.get("status"), Some(&Value::String("Failure".into())));
+        assert_eq!(val.get("code"), Some(&json!(422)));
+        let d = val.get("details").expect("details should decode");
+        assert_eq!(d.get("name"), Some(&Value::String("x".into())));
+        let causes = d.get("causes").expect("causes should be present");
+        assert!(causes.is_array());
+        let first = &causes.as_array().unwrap()[0];
+        assert_eq!(first.get("reason"), Some(&Value::String("BadValue".into())));
+        assert_eq!(
+            first.get("field"),
+            Some(&Value::String("spec.replicas".into())),
+        );
     }
 }
