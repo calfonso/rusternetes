@@ -2374,6 +2374,7 @@ impl ProtoRegistry {
         Self::register_core_v1_cloud_volume_sources(&mut schemas);
         Self::register_apiregistration_v1(&mut schemas);
         Self::register_storage_v1(&mut schemas);
+        Self::register_coordination_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -8250,6 +8251,43 @@ impl ProtoRegistry {
                     (1, ("time".into(), FieldType::Message("Time".into()))),
                     (2, ("message".into(), FieldType::String)),
                     (3, ("errorCode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+    }
+
+    /// Register coordination/v1 message schemas.
+    ///
+    /// Field numbers from
+    /// k8s.io/api/coordination/v1/generated.proto (release-1.35).
+    /// Covers the `Lease` top-level kind and its nested `LeaseSpec` —
+    /// every controller-manager + scheduler election cycle posts Lease
+    /// objects over protobuf, so without these schemas the api-server
+    /// rejects the write with `No schema found for kind 'Lease'`.
+    fn register_coordination_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "Lease".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("LeaseSpec".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LeaseSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("holderIdentity".into(), FieldType::String)),
+                    (2, ("leaseDurationSeconds".into(), FieldType::Int)),
+                    (3, ("acquireTime".into(), FieldType::Message("Time".into()))),
+                    (4, ("renewTime".into(), FieldType::Message("Time".into()))),
+                    (5, ("leaseTransitions".into(), FieldType::Int)),
+                    (6, ("strategy".into(), FieldType::String)),
+                    (7, ("preferredHolder".into(), FieldType::String)),
                 ]),
             },
         );
