@@ -1,0 +1,92 @@
+# Helm values for the gha-runner-scale-set release `arc-runner-set-conformance`.
+#
+# Purpose: a separate runner tier dedicated to Hydrophone / Sonobuoy
+# conformance jobs. These jobs need a working Docker daemon inside the
+# runner pod (to run `docker compose up` for the rusternetes cluster
+# under test). The cargo / nextest / clippy tiers do not need Docker;
+# pinning DinD onto them would waste ~3–4 GiB + privileged container
+# surface on every fast CI job. So this is its own release.
+#
+# Workflow jobs select it via `runs-on: arc-runner-set-conformance`.
+#
+# Apply with:
+#
+#   helm upgrade --install arc-runner-set-conformance \
+#     --namespace arc-runners \
+#     --version 0.14.1 \
+#     --set githubConfigSecret=arc-runner-set-gha-rs-github-secret \
+#     --values ci/arc-runner/values-conformance.yaml \
+#     --kube-context ukrinasoft-jones-cloudspace \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+#
+# Reuses the existing `arc-runner-set-gha-rs-github-secret` Secret —
+# no need to repass the GitHub PAT.
+
+githubConfigUrl: "https://github.com/indyjonesnl/rusternetes"
+
+# Bounded autoscaling: conformance runs are slow (~5–10 min for a
+# single focused test, longer for broader sweeps). Cap parallelism
+# at 1 so the rusternetes cluster brought up inside the pod doesn't
+# collide with itself across concurrent jobs. Bump later if we have
+# multiple independent focused-test workflows in flight.
+minRunners: 0
+maxRunners: 1
+
+# `controllerServiceAccount` is set explicitly for the same reason as
+# the large/small tiers — the chart's label-based auto-discovery of
+# the gha-rs-controller deployment is fragile.
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+# Docker-in-Docker mode: the gha-runner-scale-set chart automatically
+# adds a `docker:dind` sidecar (with privileged: true on the sidecar
+# only — the runner container itself stays unprivileged) and wires
+# DOCKER_HOST into the runner. This is what lets `docker compose up`
+# work inside the runner pod.
+#
+# If the NGPC tenant policy rejects privileged pods in arc-runners,
+# pod creation will fail with an admission webhook error — see
+# `.github/workflows/conformance-canary.yml` for the empirical test
+# path that surfaces that error early.
+containerMode:
+  type: "dind"
+
+template:
+  spec:
+    containers:
+      - name: runner
+        # Reuse the cargo/nextest pre-baked image. It already carries
+        # Rust + protoc + jq + curl. Adds nothing DinD-specific; the
+        # DinD sidecar provides the docker daemon.
+        image: ghcr.io/indyjonesnl/rusternetes-arc-runner:latest
+        command: ["/home/runner/run.sh"]
+        env:
+          # Conformance jobs don't compile much (image build is cached
+          # in the DinD layer), so the cargo parallelism cap can stay
+          # at the same conservative 2 the small tier uses.
+          - name: CARGO_BUILD_JOBS
+            value: "2"
+          # Tell rusternetes' compose / scripts where to find the docker
+          # daemon. The dind sidecar exposes it at the standard path;
+          # compose.dind.yml overrides every service's DOCKER_HOST to
+          # this value too.
+          - name: DOCKER_HOST
+            value: unix:///var/run/docker.sock
+        resources:
+          requests:
+            # Headroom analysis (rough):
+            #   - rusternetes cluster (api-server + scheduler + cm +
+            #     2 kubelets + kube-proxy + etcd):       ~3 GiB
+            #   - conformance image + test pod:          ~1 GiB
+            #   - dind image cache + container layers:   ~3 GiB
+            #   - docker compose build (kubelet image):  ~2 GiB peak
+            #   - hydrophone client + Go install:        ~0.5 GiB
+            #   - workspace target/ for any cargo step:  ~4 GiB peak
+            # Total observed peak should sit under 12 GiB; request 12 GiB
+            # so transient bursts above are allowed but the request
+            # matches steady-state.
+            memory: 12Gi
+            # 3 cores so the cluster's tokio runtimes + compose build
+            # don't contend with each other under load.
+            cpu: "3"
