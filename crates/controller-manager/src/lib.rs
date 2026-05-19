@@ -4,19 +4,35 @@ pub use controllers::*;
 
 use controllers::{
     apiservice::APIServiceAvailabilityController,
-    certificate_signing_request::CertificateSigningRequestController, crd::CRDController,
-    cronjob::CronJobController, daemonset::DaemonSetController, deployment::DeploymentController,
-    dynamic_provisioner::DynamicProvisionerController, endpoints::EndpointsController,
-    endpointslice::EndpointSliceController, events::EventsController,
-    garbage_collector::GarbageCollector, hpa::HorizontalPodAutoscalerController,
-    ingress::IngressController, job::JobController, loadbalancer::LoadBalancerController,
-    namespace::NamespaceController, network_policy::NetworkPolicyController, node::NodeController,
-    pod_disruption_budget::PodDisruptionBudgetController, pv_binder::PVBinderController,
-    replicaset::ReplicaSetController, replicationcontroller::ReplicationControllerController,
-    resource_quota::ResourceQuotaController, service::ServiceController,
-    serviceaccount::ServiceAccountController, statefulset::StatefulSetController,
-    ttl_controller::TTLController, volume_expansion::VolumeExpansionController,
-    volume_snapshot::VolumeSnapshotController, vpa::VerticalPodAutoscalerController,
+    certificate_signing_request::CertificateSigningRequestController,
+    crd::CRDController,
+    cronjob::CronJobController,
+    daemonset::DaemonSetController,
+    deployment::DeploymentController,
+    dynamic_provisioner::DynamicProvisionerController,
+    endpoints::EndpointsController,
+    endpointslice::EndpointSliceController,
+    events::EventsController,
+    garbage_collector::GarbageCollector,
+    hpa::HorizontalPodAutoscalerController,
+    ingress::IngressController,
+    job::JobController,
+    loadbalancer::LoadBalancerController,
+    namespace::NamespaceController,
+    network_policy::NetworkPolicyController,
+    node::NodeController,
+    pod_disruption_budget::{PodDisruptionBudgetController, StalePodDisruptionController},
+    pv_binder::PVBinderController,
+    replicaset::ReplicaSetController,
+    replicationcontroller::ReplicationControllerController,
+    resource_quota::ResourceQuotaController,
+    service::ServiceController,
+    serviceaccount::ServiceAccountController,
+    statefulset::StatefulSetController,
+    ttl_controller::TTLController,
+    volume_expansion::VolumeExpansionController,
+    volume_snapshot::VolumeSnapshotController,
+    vpa::VerticalPodAutoscalerController,
 };
 use rusternetes_storage::StorageBackend;
 use std::sync::Arc;
@@ -204,6 +220,14 @@ pub async fn run(
         let c = Arc::new(PodDisruptionBudgetController::new(s));
         if let Err(e) = c.run().await {
             error!("PodDisruptionBudget controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
+        let c = Arc::new(StalePodDisruptionController::new(s));
+        if let Err(e) = c.run().await {
+            error!("StalePodDisruption controller error: {}", e);
         }
     });
 
