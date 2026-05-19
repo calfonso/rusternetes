@@ -4685,39 +4685,19 @@ impl ContainerRuntime {
         //   is probed at startup. When false we give every app container its
         //   own UTS namespace and set `Config.hostname` explicitly — same
         //   end-user-visible hostname, just achieved without shared namespace.
+        // `share_uts_with_pause` is consumed below for `HostConfig.UTSMode`.
+        // The `Config.hostname` decision is extracted into a pure helper so
+        // the truth table is unit-testable without a live Docker daemon —
+        // see `compute_app_container_hostname` later in this file.
         let using_container_network = !self.use_cni && netns_path.is_none();
         let share_uts_with_pause = using_container_network && self.shared_uts_supported;
-        // Docker rejects `Config.hostname` whenever the container's network
-        // namespace is borrowed from another container (`HostConfig.NetworkMode
-        // = "container:<id>"`) — error: "conflicting options: hostname and the
-        // network mode". When the app container will join the pause container's
-        // network namespace (the only mode where we share pod IP), hostname
-        // must come from the pause container, not from `Config.hostname`.
-        //
-        // It also rejects `Config.hostname` when `HostConfig.UTSMode` is set
-        // (`container:<id>`), which is the pre-Docker-24 shared-UTS path.
-        //
-        // So `Config.hostname` is ONLY set when the app container has its OWN
-        // network namespace (CNI / netns path) AND its own UTS namespace —
-        // i.e. neither sharing is active.
-        let app_owns_network = !using_container_network;
-        let pod_hostname = if !share_uts_with_pause && app_owns_network {
-            let raw = pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.hostname.as_deref())
-                .unwrap_or(&pod.metadata.name);
-            let truncated = if raw.len() > 63 {
-                raw[..63].trim_end_matches('-').to_string()
-            } else {
-                raw.to_string()
-            };
-            Some(truncated)
-        } else {
-            // Either UTS or network namespace is borrowed from pause — pause
-            // already owns the hostname, so do not set it on the app container.
-            None
-        };
+        let pod_hostname = compute_app_container_hostname(
+            self.use_cni,
+            netns_path.is_some(),
+            self.shared_uts_supported,
+            &pod.metadata.name,
+            pod.spec.as_ref().and_then(|s| s.hostname.as_deref()),
+        );
 
         let mut config = Config {
             image: Some(container.image.clone()),
@@ -8454,6 +8434,63 @@ impl ContainerRuntime {
     }
 }
 
+/// Truncate a candidate hostname to Linux's 63-character limit (POSIX
+/// HOST_NAME_MAX - 1, same as K8s `pod.spec.hostname` validation), and
+/// strip any trailing `-` left over so the result is a valid DNS label.
+///
+/// Pulled out as a top-level helper so future work (e.g. an /etc/hostname
+/// bind-mount that runs whether or not `Config.hostname` is set) can
+/// reuse the exact same truncation logic.
+pub(crate) fn truncate_pod_hostname(raw: &str) -> String {
+    if raw.len() > 63 {
+        raw[..63].trim_end_matches('-').to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Decide whether to set `Config.hostname` on an app container, and what
+/// to set it to.
+///
+/// Docker rejects `Config.hostname` whenever the container's network
+/// namespace is borrowed from another container (`HostConfig.NetworkMode
+/// = "container:<id>"`) — `conflicting options: hostname and the network
+/// mode`. It also rejects `Config.hostname` when `HostConfig.UTSMode` is
+/// borrowed (`container:<id>`).
+///
+/// In rusternetes:
+///   * `use_cni=false && netns_path=None` ⇒ app container joins pause's
+///     network namespace via `network_mode: container:<pause>`. App does
+///     NOT own its network namespace.
+///   * `use_cni=true || netns_path=Some` ⇒ app container has its own
+///     network namespace (CNI plugin / netns path). App OWNS its network.
+///   * `shared_uts_supported=true` (pre-Docker-24) ⇒ app shares pause's
+///     UTS namespace. App does NOT own its UTS namespace.
+///   * `shared_uts_supported=false` (Docker 24+) ⇒ app gets its own UTS.
+///
+/// `Config.hostname` is set ONLY when the app owns BOTH namespaces.
+/// Otherwise pause owns the hostname (kernel `uname -n` inherits from
+/// the shared namespace; for split-network cases the user-visible
+/// hostname is set via the kubelet's `/etc/hosts` injection elsewhere).
+///
+/// Returns the truncated hostname or `None`.
+pub(crate) fn compute_app_container_hostname(
+    use_cni: bool,
+    netns_path_present: bool,
+    shared_uts_supported: bool,
+    pod_name: &str,
+    pod_spec_hostname: Option<&str>,
+) -> Option<String> {
+    let using_container_network = !use_cni && !netns_path_present;
+    let share_uts_with_pause = using_container_network && shared_uts_supported;
+    let app_owns_network = !using_container_network;
+    if !share_uts_with_pause && app_owns_network {
+        Some(truncate_pod_hostname(pod_spec_hostname.unwrap_or(pod_name)))
+    } else {
+        None
+    }
+}
+
 /// Parse a Kubernetes memory quantity string (e.g., "128Mi", "1Gi", "1000000") into bytes.
 pub fn parse_memory_quantity(s: &str) -> i64 {
     if s.ends_with("Gi") {
@@ -12102,6 +12139,187 @@ mod tests {
         fn podman_lowercase_in_platform_is_supported() {
             let v = version(Some("4.7.0"), Some("podman engine"), vec![]);
             assert!(runtime_supports_shared_uts(&v));
+        }
+    }
+
+    /// Regression coverage for the kubelet hostname-vs-network-mode conflict
+    /// (`docker: conflicting options: hostname and the network mode`).
+    ///
+    /// Pre-fix behaviour: on Docker 24+ (`shared_uts_supported=false`) with
+    /// the no-CNI / container-shared-network path, the kubelet set
+    /// `Config.hostname` AND `HostConfig.NetworkMode = container:<pause>`,
+    /// which Docker rejects with the error above. Every newly-created pod
+    /// failed at container create.
+    ///
+    /// Truth-table-style tests across `(use_cni, netns_path, shared_uts_supported)`
+    /// pin the decision so a future refactor cannot silently regress the
+    /// Docker 24+ path again.
+    mod hostname_decision_tests {
+        use super::super::{compute_app_container_hostname, truncate_pod_hostname};
+
+        // ----- Truncation helper -----
+
+        #[test]
+        fn truncate_short_name_is_unchanged() {
+            assert_eq!(truncate_pod_hostname("mypod"), "mypod");
+        }
+
+        #[test]
+        fn truncate_exact_63_is_unchanged() {
+            let s = "a".repeat(63);
+            assert_eq!(truncate_pod_hostname(&s), s);
+        }
+
+        #[test]
+        fn truncate_over_63_keeps_first_63() {
+            let s = "a".repeat(100);
+            let out = truncate_pod_hostname(&s);
+            assert_eq!(out.len(), 63);
+            assert!(out.chars().all(|c| c == 'a'));
+        }
+
+        #[test]
+        fn truncate_trims_trailing_dash_after_cut() {
+            // Original is 80 chars; bytes 64..80 happen to include a `-` at
+            // position 62 (0-indexed) of the truncated prefix.
+            let mut s = "a".repeat(62);
+            s.push('-');
+            s.push_str(&"b".repeat(17));
+            // s = 62*'a' + '-' + 17*'b' (length 80). Truncated to 63 ⇒
+            // 62*'a' + '-'. Then trim_end_matches('-') ⇒ 62*'a'.
+            assert_eq!(truncate_pod_hostname(&s), "a".repeat(62));
+        }
+
+        // ----- Decision helper: the truth table -----
+        //
+        // | # | use_cni | netns_path | shared_uts | hostname     | branch
+        // |---|---------|------------|------------|--------------|-------
+        // | 1 | false   | None       | false      | None         | <-- REGRESSION FIX:
+        // |   |         |            |            |              |     Docker 24+ no-CNI;
+        // |   |         |            |            |              |     pre-fix set Some -> Docker rejected
+        // | 2 | false   | None       | true       | None         | shared-UTS path (pre-Docker-24)
+        // | 3 | false   | Some(path) | false      | Some(name)   | netns-overridden net + own UTS
+        // | 4 | false   | Some(path) | true       | Some(name)   | netns-overridden net (UTS bool irrelevant)
+        // | 5 | true    | None       | false      | Some(name)   | CNI + own UTS
+        // | 6 | true    | None       | true       | Some(name)   | CNI (UTS bool irrelevant when net is own)
+        // | 7 | true    | Some(path) | false      | Some(name)   | CNI + netns + own UTS
+        // | 8 | true    | Some(path) | true       | Some(name)   | CNI + netns (UTS bool irrelevant)
+
+        /// REGRESSION GUARD: Docker 24+ host, no CNI, no netns path
+        /// (the rusternetes default compose setup). Must return None so the
+        /// kubelet does NOT set `Config.hostname` and Docker accepts the
+        /// `network_mode: container:<pause>` create call.
+        #[test]
+        fn no_cni_no_netns_docker_24plus_returns_none() {
+            assert_eq!(
+                compute_app_container_hostname(
+                    /* use_cni            */ false, /* netns_path_present */ false,
+                    /* shared_uts_support */ false, "mypod", None,
+                ),
+                None,
+            );
+        }
+
+        #[test]
+        fn no_cni_no_netns_pre_docker24_shared_uts_returns_none() {
+            // Pre-existing path: shared UTS via `uts: container:<pause>`.
+            // Docker rejects hostname when uts_mode is set, so None is correct.
+            assert_eq!(
+                compute_app_container_hostname(false, false, true, "mypod", None),
+                None,
+            );
+        }
+
+        #[test]
+        fn netns_path_present_returns_some_pod_name() {
+            // Caller passed an explicit netns path => app has its own
+            // network namespace, no shared UTS => hostname is set.
+            assert_eq!(
+                compute_app_container_hostname(false, true, false, "mypod", None),
+                Some("mypod".to_string()),
+            );
+        }
+
+        #[test]
+        fn netns_path_present_with_shared_uts_supported_still_returns_some() {
+            // With netns_path the app already owns its network namespace, so
+            // share_uts_with_pause evaluates to false regardless of the runtime
+            // capability bit. Hostname must still be set.
+            assert_eq!(
+                compute_app_container_hostname(false, true, true, "mypod", None),
+                Some("mypod".to_string()),
+            );
+        }
+
+        #[test]
+        fn use_cni_no_netns_returns_some_pod_name() {
+            assert_eq!(
+                compute_app_container_hostname(true, false, false, "mypod", None),
+                Some("mypod".to_string()),
+            );
+        }
+
+        #[test]
+        fn use_cni_no_netns_with_shared_uts_capability_still_returns_some() {
+            assert_eq!(
+                compute_app_container_hostname(true, false, true, "mypod", None),
+                Some("mypod".to_string()),
+            );
+        }
+
+        #[test]
+        fn use_cni_and_netns_returns_some() {
+            assert_eq!(
+                compute_app_container_hostname(true, true, false, "mypod", None),
+                Some("mypod".to_string()),
+            );
+        }
+
+        #[test]
+        fn use_cni_and_netns_with_shared_uts_capability_returns_some() {
+            assert_eq!(
+                compute_app_container_hostname(true, true, true, "mypod", None),
+                Some("mypod".to_string()),
+            );
+        }
+
+        // ----- spec.hostname override + truncation interplay -----
+
+        #[test]
+        fn pod_spec_hostname_overrides_metadata_name() {
+            assert_eq!(
+                compute_app_container_hostname(true, false, false, "mypod", Some("custom-host"),),
+                Some("custom-host".to_string()),
+            );
+        }
+
+        #[test]
+        fn long_metadata_name_is_truncated_to_63() {
+            let long = "a".repeat(80);
+            let out = compute_app_container_hostname(true, false, false, &long, None);
+            assert_eq!(out.as_deref().map(str::len), Some(63));
+        }
+
+        #[test]
+        fn long_pod_spec_hostname_is_truncated_to_63() {
+            let long = "b".repeat(80);
+            let out = compute_app_container_hostname(true, false, false, "mypod", Some(&long));
+            assert_eq!(out.as_deref().map(str::len), Some(63));
+            assert!(out.as_deref().unwrap().chars().all(|c| c == 'b'));
+        }
+
+        /// When the decision says None, the long-name truncation path is not
+        /// exercised — but the helper must still return None instead of
+        /// panicking on the byte slice. This guards against a future refactor
+        /// that pulls truncation outside the None branch and accidentally
+        /// indexes a multi-byte boundary or empty string in the wrong place.
+        #[test]
+        fn no_cni_long_pod_name_still_returns_none() {
+            let long = "a".repeat(80);
+            assert_eq!(
+                compute_app_container_hostname(false, false, false, &long, None),
+                None,
+            );
         }
     }
 }
