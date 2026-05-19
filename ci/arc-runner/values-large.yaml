@@ -26,12 +26,34 @@ controllerServiceAccount:
 
 template:
   spec:
+    # Pod-level security context. runAsNonRoot satisfies the
+    # `restricted` Pod Security Standard and matches the upstream
+    # actions/runner image, which runs as user `runner` (uid 1001).
+    securityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
     containers:
       - name: runner
         image: ghcr.io/indyjonesnl/rusternetes-arc-runner:latest
         # The default actions-runner image entrypoint runs the listener;
         # we keep that here so the custom image stays a drop-in replacement.
         command: ["/home/runner/run.sh"]
+        # Container-level security context — `restricted` PSS aligned.
+        # The runner image does not need to escalate privileges or any
+        # Linux capabilities: it runs Cargo + Rust toolchain + GitHub
+        # Actions runner agent, none of which require uid 0 or CAP_*.
+        # Drops the whole capability set and forbids setuid/setgid bits
+        # so a compromised job (e.g. a malicious fork PR) cannot pivot
+        # to root inside the container. See:
+        #   https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        # DinD-mode runners (e.g. the conformance tier) cannot use this
+        # block — the docker-in-docker sidecar requires privileged + a
+        # writable root FS. Keep this file scoped to the rootless tiers.
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         env:
           # Cap parallel rustc invocations per pod. Cargo defaults to
           # `nproc`, which on a 7.5-CPU node gives 7-8 concurrent rustc
