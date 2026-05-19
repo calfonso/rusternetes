@@ -2369,6 +2369,7 @@ impl ProtoRegistry {
         Self::register_core_v1_container_runtime(&mut schemas);
         Self::register_core_v1_kinds(&mut schemas);
         Self::register_apps_v1(&mut schemas);
+        Self::register_discovery_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -7015,6 +7016,142 @@ impl ProtoRegistry {
                     (2, ("data".into(), FieldType::JsonRaw)),
                     (3, ("revision".into(), FieldType::Int)),
                 ]),
+            },
+        );
+    }
+
+    /// Register all discovery/v1 protobuf schemas.
+    ///
+    /// Field numbers come from
+    /// k8s.io/api/discovery/v1/generated.proto (release-1.35). Covers the
+    /// `EndpointSlice` top-level kind and its nested messages so that
+    /// kube-proxy and every Service-aware conformance test that writes
+    /// EndpointSlices over protobuf decodes correctly.
+    fn register_discovery_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // EndpointSlice — top-level kind. `addressType` is a string enum
+        // ("IPv4" | "IPv6" | "FQDN") on the wire.
+        schemas.insert(
+            "EndpointSlice".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "endpoints".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Endpoint".into()))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EndpointPort".into(),
+                            ))),
+                        ),
+                    ),
+                    (4, ("addressType".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "Endpoint".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "addresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "conditions".into(),
+                            FieldType::Message("EndpointConditions".into()),
+                        ),
+                    ),
+                    (3, ("hostname".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "targetRef".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (5, ("deprecatedTopology".into(), FieldType::StringMap)),
+                    (6, ("nodeName".into(), FieldType::String)),
+                    (7, ("zone".into(), FieldType::String)),
+                    (
+                        8,
+                        ("hints".into(), FieldType::Message("EndpointHints".into())),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "EndpointConditions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("ready".into(), FieldType::Bool)),
+                    (2, ("serving".into(), FieldType::Bool)),
+                    (3, ("terminating".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "EndpointHints".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "forZones".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("ForZone".into()))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "forNodes".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("ForNode".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "EndpointPort".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("protocol".into(), FieldType::String)),
+                    (3, ("port".into(), FieldType::Int)),
+                    (4, ("appProtocol".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ForNode".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+
+        schemas.insert(
+            "ForZone".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
             },
         );
     }
