@@ -8,45 +8,45 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 | API group | Registered / Total | % |
 | --- | --- | --- |
-| core/v1 | 101 / 209 | 48% |
-| apps/v1 | 24 / 25 | 96% |
-| batch/v1 | 5 / 15 | 33% |
-| rbac/v1 | 0 / 8 | 0% |
-| networking/v1 | 0 / 30 | 0% |
-| apiextensions/v1 | 18 / 23 | 78% |
-| admissionregistration/v1 | 0 / 23 | 0% |
+| core/v1 | 209 / 209 | 100% |
+| apps/v1 | 25 / 25 | 100% |
+| batch/v1 | 15 / 15 | 100% |
+| rbac/v1 | 8 / 8 | 100% |
+| networking/v1 | 30 / 30 | 100% |
+| apiextensions/v1 | 23 / 23 | 100% |
+| admissionregistration/v1 | 23 / 23 | 100% |
 | coordination/v1 | 2 / 2 | 100% |
 | policy/v1 | 4 / 4 | 100% |
 | discovery/v1 | 7 / 7 | 100% |
-| autoscaling/v2 | 0 / 23 | 0% |
+| autoscaling/v2 | 23 / 23 | 100% |
 | scheduling/v1 | 1 / 1 | 100% |
-| storage/v1 | 0 / 15 | 0% |
-| apiregistration/v1 | 0 / 5 | 0% |
-| apimachinery/meta/v1 | 8 / 15 | 53% |
-| **Total** | **170 / 405** | **42%** |
+| storage/v1 | 15 / 15 | 100% |
+| apiregistration/v1 | 5 / 5 | 100% |
+| apimachinery/meta/v1 | 15 / 15 | 100% |
+| **Total** | **405 / 405** | **100%** |
 
 ## core/v1
 
 ### Kinds
 
-- [ ] `Binding`
-- [ ] `ComponentStatus`
+- [x] `Binding`
+- [x] `ComponentStatus`
 - [x] `ConfigMap`
 - [x] `Endpoints`
-- [ ] `Event`
-- [ ] `LimitRange`
+- [x] `Event`
+- [x] `LimitRange`
 - [x] `Namespace`
 - [x] `Node`
-- [ ] `PersistentVolume`
+- [x] `PersistentVolume`
 - [x] `PersistentVolumeClaim`
-- [ ] `PersistentVolumeClaimTemplate`
+- [x] `PersistentVolumeClaimTemplate`
 - [x] `Pod`
-- [ ] `PodStatusResult`
-- [ ] `PodTemplate`
+- [x] `PodStatusResult`
+- [x] `PodTemplate`
 - [x] `PodTemplateSpec`
-- [ ] `RangeAllocation`
+- [x] `RangeAllocation`
 - [x] `ReplicationController`
-- [ ] `ResourceQuota`
+- [x] `ResourceQuota`
 - [x] `Secret`
 - [x] `Service`
 - [x] `ServiceAccount`
@@ -56,7 +56,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `AWSElasticBlockStoreVolumeSource`
 - [x] `Affinity`
 - [x] `AppArmorProfile`
-- [ ] `AttachedVolume`
+- [x] `AttachedVolume`
 - [x] `AzureDiskVolumeSource`
 - [x] `AzureFilePersistentVolumeSource`
 - [x] `AzureFileVolumeSource`
@@ -67,46 +67,46 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `CephFSVolumeSource`
 - [x] `CinderPersistentVolumeSource`
 - [x] `CinderVolumeSource`
-- [ ] `ClientIPConfig`
-- [ ] `ClusterTrustBundleProjection`
-- [ ] `ComponentCondition`
-- [ ] `ConfigMapEnvSource`
+- [x] `ClientIPConfig`
+- [x] `ClusterTrustBundleProjection`
+- [x] `ComponentCondition`
+- [x] `ConfigMapEnvSource`
 - [x] `ConfigMapKeySelector`
-- [ ] `ConfigMapNodeConfigSource`
-- [ ] `ConfigMapProjection`
-- [ ] `ConfigMapVolumeSource`
+- [x] `ConfigMapNodeConfigSource`
+- [x] `ConfigMapProjection`
+- [x] `ConfigMapVolumeSource`
 - [x] `Container`
-- [ ] `ContainerExtendedResourceRequest`
-- [ ] `ContainerImage`
+- [x] `ContainerExtendedResourceRequest`
+- [x] `ContainerImage`
 - [x] `ContainerPort`
-- [ ] `ContainerResizePolicy`
-- [ ] `ContainerRestartRule`
-- [ ] `ContainerRestartRuleOnExitCodes`
-- [ ] `ContainerState`
-- [ ] `ContainerStateRunning`
-- [ ] `ContainerStateTerminated`
-- [ ] `ContainerStateWaiting`
-- [ ] `ContainerStatus`
-- [ ] `ContainerUser`
-- [ ] `DaemonEndpoint`
-- [ ] `DownwardAPIProjection`
-- [ ] `DownwardAPIVolumeFile`
-- [ ] `DownwardAPIVolumeSource`
-- [ ] `EmptyDirVolumeSource`
-- [ ] `EndpointAddress`
-- [ ] `EndpointPort`
+- [x] `ContainerResizePolicy`
+- [x] `ContainerRestartRule`
+- [x] `ContainerRestartRuleOnExitCodes`
+- [x] `ContainerState`
+- [x] `ContainerStateRunning`
+- [x] `ContainerStateTerminated`
+- [x] `ContainerStateWaiting`
+- [x] `ContainerStatus`
+- [x] `ContainerUser`
+- [x] `DaemonEndpoint`
+- [x] `DownwardAPIProjection`
+- [x] `DownwardAPIVolumeFile`
+- [x] `DownwardAPIVolumeSource`
+- [x] `EmptyDirVolumeSource`
+- [x] `EndpointAddress`
+- [x] `EndpointPort`
 - [x] `EndpointSubset`
-- [ ] `EnvFromSource`
+- [x] `EnvFromSource`
 - [x] `EnvVar`
 - [x] `EnvVarSource`
-- [ ] `EphemeralContainer`
-- [ ] `EphemeralContainerCommon`
+- [x] `EphemeralContainer`
+- [x] `EphemeralContainerCommon`
 - [x] `EphemeralVolumeSource`
-- [ ] `EventSeries`
-- [ ] `EventSource`
+- [x] `EventSeries`
+- [x] `EventSource`
 - [x] `ExecAction`
 - [x] `FCVolumeSource`
-- [ ] `FileKeySelector`
+- [x] `FileKeySelector`
 - [x] `FlexPersistentVolumeSource`
 - [x] `FlexVolumeSource`
 - [x] `FlockerVolumeSource`
@@ -117,102 +117,102 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `GlusterfsVolumeSource`
 - [x] `HTTPGetAction`
 - [x] `HTTPHeader`
-- [ ] `HostAlias`
-- [ ] `HostIP`
-- [ ] `HostPathVolumeSource`
+- [x] `HostAlias`
+- [x] `HostIP`
+- [x] `HostPathVolumeSource`
 - [x] `ISCSIPersistentVolumeSource`
 - [x] `ISCSIVolumeSource`
 - [x] `ImageVolumeSource`
-- [ ] `KeyToPath`
+- [x] `KeyToPath`
 - [x] `Lifecycle`
 - [x] `LifecycleHandler`
-- [ ] `LimitRangeItem`
-- [ ] `LimitRangeSpec`
-- [ ] `LinuxContainerUser`
-- [ ] `LoadBalancerIngress`
-- [ ] `LoadBalancerStatus`
+- [x] `LimitRangeItem`
+- [x] `LimitRangeSpec`
+- [x] `LinuxContainerUser`
+- [x] `LoadBalancerIngress`
+- [x] `LoadBalancerStatus`
 - [x] `LocalObjectReference`
-- [ ] `LocalVolumeSource`
-- [ ] `ModifyVolumeStatus`
+- [x] `LocalVolumeSource`
+- [x] `ModifyVolumeStatus`
 - [x] `NFSVolumeSource`
 - [x] `NamespaceCondition`
 - [x] `NamespaceSpec`
 - [x] `NamespaceStatus`
-- [ ] `NodeAddress`
+- [x] `NodeAddress`
 - [x] `NodeAffinity`
-- [ ] `NodeCondition`
-- [ ] `NodeConfigSource`
-- [ ] `NodeConfigStatus`
-- [ ] `NodeDaemonEndpoints`
-- [ ] `NodeFeatures`
-- [ ] `NodeRuntimeHandler`
-- [ ] `NodeRuntimeHandlerFeatures`
-- [ ] `NodeSelector`
-- [ ] `NodeSelectorRequirement`
-- [ ] `NodeSelectorTerm`
+- [x] `NodeCondition`
+- [x] `NodeConfigSource`
+- [x] `NodeConfigStatus`
+- [x] `NodeDaemonEndpoints`
+- [x] `NodeFeatures`
+- [x] `NodeRuntimeHandler`
+- [x] `NodeRuntimeHandlerFeatures`
+- [x] `NodeSelector`
+- [x] `NodeSelectorRequirement`
+- [x] `NodeSelectorTerm`
 - [x] `NodeSpec`
 - [x] `NodeStatus`
-- [ ] `NodeSwapStatus`
-- [ ] `NodeSystemInfo`
+- [x] `NodeSwapStatus`
+- [x] `NodeSystemInfo`
 - [x] `ObjectFieldSelector`
 - [x] `ObjectReference`
-- [ ] `PersistentVolumeClaimCondition`
+- [x] `PersistentVolumeClaimCondition`
 - [x] `PersistentVolumeClaimSpec`
 - [x] `PersistentVolumeClaimStatus`
-- [ ] `PersistentVolumeClaimVolumeSource`
-- [ ] `PersistentVolumeSource`
-- [ ] `PersistentVolumeSpec`
-- [ ] `PersistentVolumeStatus`
+- [x] `PersistentVolumeClaimVolumeSource`
+- [x] `PersistentVolumeSource`
+- [x] `PersistentVolumeSpec`
+- [x] `PersistentVolumeStatus`
 - [x] `PhotonPersistentDiskVolumeSource`
 - [x] `PodAffinity`
-- [ ] `PodAffinityTerm`
+- [x] `PodAffinityTerm`
 - [x] `PodAntiAffinity`
-- [ ] `PodCertificateProjection`
-- [ ] `PodCondition`
+- [x] `PodCertificateProjection`
+- [x] `PodCondition`
 - [x] `PodDNSConfig`
 - [x] `PodDNSConfigOption`
-- [ ] `PodExtendedResourceClaimStatus`
-- [ ] `PodIP`
-- [ ] `PodOS`
-- [ ] `PodReadinessGate`
-- [ ] `PodResourceClaim`
-- [ ] `PodResourceClaimStatus`
-- [ ] `PodSchedulingGate`
+- [x] `PodExtendedResourceClaimStatus`
+- [x] `PodIP`
+- [x] `PodOS`
+- [x] `PodReadinessGate`
+- [x] `PodResourceClaim`
+- [x] `PodResourceClaimStatus`
+- [x] `PodSchedulingGate`
 - [x] `PodSecurityContext`
 - [x] `PodSpec`
 - [x] `PodStatus`
-- [ ] `PortStatus`
+- [x] `PortStatus`
 - [x] `PortworxVolumeSource`
-- [ ] `PreferredSchedulingTerm`
+- [x] `PreferredSchedulingTerm`
 - [x] `Probe`
 - [x] `ProbeHandler`
-- [ ] `ProjectedVolumeSource`
+- [x] `ProjectedVolumeSource`
 - [x] `QuobyteVolumeSource`
 - [x] `RBDPersistentVolumeSource`
 - [x] `RBDVolumeSource`
-- [ ] `ReplicationControllerCondition`
+- [x] `ReplicationControllerCondition`
 - [x] `ReplicationControllerSpec`
 - [x] `ReplicationControllerStatus`
-- [ ] `ResourceClaim`
+- [x] `ResourceClaim`
 - [x] `ResourceFieldSelector`
-- [ ] `ResourceHealth`
-- [ ] `ResourceQuotaSpec`
-- [ ] `ResourceQuotaStatus`
+- [x] `ResourceHealth`
+- [x] `ResourceQuotaSpec`
+- [x] `ResourceQuotaStatus`
 - [x] `ResourceRequirements`
-- [ ] `ResourceStatus`
+- [x] `ResourceStatus`
 - [x] `SELinuxOptions`
 - [x] `ScaleIOPersistentVolumeSource`
 - [x] `ScaleIOVolumeSource`
-- [ ] `ScopeSelector`
-- [ ] `ScopedResourceSelectorRequirement`
+- [x] `ScopeSelector`
+- [x] `ScopedResourceSelectorRequirement`
 - [x] `SeccompProfile`
-- [ ] `SecretEnvSource`
+- [x] `SecretEnvSource`
 - [x] `SecretKeySelector`
-- [ ] `SecretProjection`
+- [x] `SecretProjection`
 - [x] `SecretReference`
-- [ ] `SecretVolumeSource`
+- [x] `SecretVolumeSource`
 - [x] `SecurityContext`
-- [ ] `ServiceAccountTokenProjection`
+- [x] `ServiceAccountTokenProjection`
 - [x] `ServicePort`
 - [x] `ServiceSpec`
 - [x] `ServiceStatus`
@@ -220,33 +220,33 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `SleepAction`
 - [x] `StorageOSPersistentVolumeSource`
 - [x] `StorageOSVolumeSource`
-- [ ] `Sysctl`
+- [x] `Sysctl`
 - [x] `TCPSocketAction`
-- [ ] `Taint`
+- [x] `Taint`
 - [x] `Toleration`
-- [ ] `TopologySelectorLabelRequirement`
-- [ ] `TopologySelectorTerm`
+- [x] `TopologySelectorLabelRequirement`
+- [x] `TopologySelectorTerm`
 - [x] `TopologySpreadConstraint`
 - [x] `TypedLocalObjectReference`
 - [x] `TypedObjectReference`
 - [x] `Volume`
-- [ ] `VolumeDevice`
+- [x] `VolumeDevice`
 - [x] `VolumeMount`
-- [ ] `VolumeMountStatus`
-- [ ] `VolumeNodeAffinity`
-- [ ] `VolumeProjection`
+- [x] `VolumeMountStatus`
+- [x] `VolumeNodeAffinity`
+- [x] `VolumeProjection`
 - [x] `VolumeResourceRequirements`
-- [ ] `VolumeSource`
+- [x] `VolumeSource`
 - [x] `VsphereVirtualDiskVolumeSource`
-- [ ] `WeightedPodAffinityTerm`
-- [ ] `WindowsSecurityContextOptions`
-- [ ] `WorkloadReference`
+- [x] `WeightedPodAffinityTerm`
+- [x] `WindowsSecurityContextOptions`
+- [x] `WorkloadReference`
 
 ## apps/v1
 
 ### Kinds
 
-- [ ] `ControllerRevision`
+- [x] `ControllerRevision`
 - [x] `DaemonSet`
 - [x] `Deployment`
 - [x] `ReplicaSet`
@@ -279,78 +279,78 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 ### Kinds
 
-- [ ] `CronJob`
+- [x] `CronJob`
 - [x] `Job`
-- [ ] `JobTemplateSpec`
+- [x] `JobTemplateSpec`
 
 ### Nested messages
 
-- [ ] `CronJobSpec`
-- [ ] `CronJobStatus`
-- [ ] `JobCondition`
+- [x] `CronJobSpec`
+- [x] `CronJobStatus`
+- [x] `JobCondition`
 - [x] `JobSpec`
 - [x] `JobStatus`
 - [x] `PodFailurePolicy`
-- [ ] `PodFailurePolicyOnExitCodesRequirement`
-- [ ] `PodFailurePolicyOnPodConditionsPattern`
-- [ ] `PodFailurePolicyRule`
+- [x] `PodFailurePolicyOnExitCodesRequirement`
+- [x] `PodFailurePolicyOnPodConditionsPattern`
+- [x] `PodFailurePolicyRule`
 - [x] `SuccessPolicy`
-- [ ] `SuccessPolicyRule`
-- [ ] `UncountedTerminatedPods`
+- [x] `SuccessPolicyRule`
+- [x] `UncountedTerminatedPods`
 
 ## rbac/v1
 
 ### Kinds
 
-- [ ] `ClusterRole`
-- [ ] `ClusterRoleBinding`
-- [ ] `Role`
-- [ ] `RoleBinding`
+- [x] `ClusterRole`
+- [x] `ClusterRoleBinding`
+- [x] `Role`
+- [x] `RoleBinding`
 
 ### Nested messages
 
-- [ ] `AggregationRule`
-- [ ] `PolicyRule`
-- [ ] `RoleRef`
-- [ ] `Subject`
+- [x] `AggregationRule`
+- [x] `PolicyRule`
+- [x] `RoleRef`
+- [x] `Subject`
 
 ## networking/v1
 
 ### Kinds
 
-- [ ] `IPAddress`
-- [ ] `Ingress`
-- [ ] `IngressClass`
-- [ ] `NetworkPolicy`
-- [ ] `ServiceCIDR`
+- [x] `IPAddress`
+- [x] `Ingress`
+- [x] `IngressClass`
+- [x] `NetworkPolicy`
+- [x] `ServiceCIDR`
 
 ### Nested messages
 
-- [ ] `HTTPIngressPath`
-- [ ] `HTTPIngressRuleValue`
-- [ ] `IPAddressSpec`
-- [ ] `IPBlock`
-- [ ] `IngressBackend`
-- [ ] `IngressClassParametersReference`
-- [ ] `IngressClassSpec`
-- [ ] `IngressLoadBalancerIngress`
-- [ ] `IngressLoadBalancerStatus`
-- [ ] `IngressPortStatus`
-- [ ] `IngressRule`
-- [ ] `IngressRuleValue`
-- [ ] `IngressServiceBackend`
-- [ ] `IngressSpec`
-- [ ] `IngressStatus`
-- [ ] `IngressTLS`
-- [ ] `NetworkPolicyEgressRule`
-- [ ] `NetworkPolicyIngressRule`
-- [ ] `NetworkPolicyPeer`
-- [ ] `NetworkPolicyPort`
-- [ ] `NetworkPolicySpec`
-- [ ] `ParentReference`
-- [ ] `ServiceBackendPort`
-- [ ] `ServiceCIDRSpec`
-- [ ] `ServiceCIDRStatus`
+- [x] `HTTPIngressPath`
+- [x] `HTTPIngressRuleValue`
+- [x] `IPAddressSpec`
+- [x] `IPBlock`
+- [x] `IngressBackend`
+- [x] `IngressClassParametersReference`
+- [x] `IngressClassSpec`
+- [x] `IngressLoadBalancerIngress`
+- [x] `IngressLoadBalancerStatus`
+- [x] `IngressPortStatus`
+- [x] `IngressRule`
+- [x] `IngressRuleValue`
+- [x] `IngressServiceBackend`
+- [x] `IngressSpec`
+- [x] `IngressStatus`
+- [x] `IngressTLS`
+- [x] `NetworkPolicyEgressRule`
+- [x] `NetworkPolicyIngressRule`
+- [x] `NetworkPolicyPeer`
+- [x] `NetworkPolicyPort`
+- [x] `NetworkPolicySpec`
+- [x] `ParentReference`
+- [x] `ServiceBackendPort`
+- [x] `ServiceCIDRSpec`
+- [x] `ServiceCIDRStatus`
 
 ## apiextensions/v1
 
@@ -371,48 +371,48 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `CustomResourceSubresourceStatus`
 - [x] `CustomResourceSubresources`
 - [x] `CustomResourceValidation`
-- [ ] `ExternalDocumentation`
-- [ ] `JSON`
+- [x] `ExternalDocumentation`
+- [x] `JSON`
 - [x] `JSONSchemaProps`
 - [x] `JSONSchemaPropsOrArray`
 - [x] `JSONSchemaPropsOrBool`
-- [ ] `JSONSchemaPropsOrStringArray`
+- [x] `JSONSchemaPropsOrStringArray`
 - [x] `SelectableField`
-- [ ] `ServiceReference`
+- [x] `ServiceReference`
 - [x] `ValidationRule`
-- [ ] `WebhookClientConfig`
+- [x] `WebhookClientConfig`
 - [x] `WebhookConversion`
 
 ## admissionregistration/v1
 
 ### Kinds
 
-- [ ] `MutatingWebhookConfiguration`
-- [ ] `ValidatingAdmissionPolicy`
-- [ ] `ValidatingAdmissionPolicyBinding`
-- [ ] `ValidatingWebhookConfiguration`
+- [x] `MutatingWebhookConfiguration`
+- [x] `ValidatingAdmissionPolicy`
+- [x] `ValidatingAdmissionPolicyBinding`
+- [x] `ValidatingWebhookConfiguration`
 
 ### Nested messages
 
-- [ ] `AuditAnnotation`
-- [ ] `ExpressionWarning`
-- [ ] `MatchCondition`
-- [ ] `MatchResources`
-- [ ] `MutatingWebhook`
-- [ ] `NamedRuleWithOperations`
-- [ ] `ParamKind`
-- [ ] `ParamRef`
-- [ ] `Rule`
-- [ ] `RuleWithOperations`
-- [ ] `ServiceReference`
-- [ ] `TypeChecking`
-- [ ] `ValidatingAdmissionPolicyBindingSpec`
-- [ ] `ValidatingAdmissionPolicySpec`
-- [ ] `ValidatingAdmissionPolicyStatus`
-- [ ] `ValidatingWebhook`
-- [ ] `Validation`
-- [ ] `Variable`
-- [ ] `WebhookClientConfig`
+- [x] `AuditAnnotation`
+- [x] `ExpressionWarning`
+- [x] `MatchCondition`
+- [x] `MatchResources`
+- [x] `MutatingWebhook`
+- [x] `NamedRuleWithOperations`
+- [x] `ParamKind`
+- [x] `ParamRef`
+- [x] `Rule`
+- [x] `RuleWithOperations`
+- [x] `ServiceReference`
+- [x] `TypeChecking`
+- [x] `ValidatingAdmissionPolicyBindingSpec`
+- [x] `ValidatingAdmissionPolicySpec`
+- [x] `ValidatingAdmissionPolicyStatus`
+- [x] `ValidatingWebhook`
+- [x] `Validation`
+- [x] `Variable`
+- [x] `WebhookClientConfig`
 
 ## coordination/v1
 
@@ -455,32 +455,32 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 ### Kinds
 
-- [ ] `HorizontalPodAutoscaler`
+- [x] `HorizontalPodAutoscaler`
 
 ### Nested messages
 
-- [ ] `ContainerResourceMetricSource`
-- [ ] `ContainerResourceMetricStatus`
-- [ ] `CrossVersionObjectReference`
-- [ ] `ExternalMetricSource`
-- [ ] `ExternalMetricStatus`
-- [ ] `HPAScalingPolicy`
-- [ ] `HPAScalingRules`
-- [ ] `HorizontalPodAutoscalerBehavior`
-- [ ] `HorizontalPodAutoscalerCondition`
-- [ ] `HorizontalPodAutoscalerSpec`
-- [ ] `HorizontalPodAutoscalerStatus`
-- [ ] `MetricIdentifier`
-- [ ] `MetricSpec`
-- [ ] `MetricStatus`
-- [ ] `MetricTarget`
-- [ ] `MetricValueStatus`
-- [ ] `ObjectMetricSource`
-- [ ] `ObjectMetricStatus`
-- [ ] `PodsMetricSource`
-- [ ] `PodsMetricStatus`
-- [ ] `ResourceMetricSource`
-- [ ] `ResourceMetricStatus`
+- [x] `ContainerResourceMetricSource`
+- [x] `ContainerResourceMetricStatus`
+- [x] `CrossVersionObjectReference`
+- [x] `ExternalMetricSource`
+- [x] `ExternalMetricStatus`
+- [x] `HPAScalingPolicy`
+- [x] `HPAScalingRules`
+- [x] `HorizontalPodAutoscalerBehavior`
+- [x] `HorizontalPodAutoscalerCondition`
+- [x] `HorizontalPodAutoscalerSpec`
+- [x] `HorizontalPodAutoscalerStatus`
+- [x] `MetricIdentifier`
+- [x] `MetricSpec`
+- [x] `MetricStatus`
+- [x] `MetricTarget`
+- [x] `MetricValueStatus`
+- [x] `ObjectMetricSource`
+- [x] `ObjectMetricStatus`
+- [x] `PodsMetricSource`
+- [x] `PodsMetricStatus`
+- [x] `ResourceMetricSource`
+- [x] `ResourceMetricStatus`
 
 ## scheduling/v1
 
@@ -496,57 +496,57 @@ _(none referenced from this group's kinds)_
 
 ### Kinds
 
-- [ ] `CSIDriver`
-- [ ] `CSINode`
-- [ ] `CSIStorageCapacity`
-- [ ] `StorageClass`
-- [ ] `VolumeAttachment`
-- [ ] `VolumeAttributesClass`
+- [x] `CSIDriver`
+- [x] `CSINode`
+- [x] `CSIStorageCapacity`
+- [x] `StorageClass`
+- [x] `VolumeAttachment`
+- [x] `VolumeAttributesClass`
 
 ### Nested messages
 
-- [ ] `CSIDriverSpec`
-- [ ] `CSINodeDriver`
-- [ ] `CSINodeSpec`
-- [ ] `TokenRequest`
-- [ ] `VolumeAttachmentSource`
-- [ ] `VolumeAttachmentSpec`
-- [ ] `VolumeAttachmentStatus`
-- [ ] `VolumeError`
-- [ ] `VolumeNodeResources`
+- [x] `CSIDriverSpec`
+- [x] `CSINodeDriver`
+- [x] `CSINodeSpec`
+- [x] `TokenRequest`
+- [x] `VolumeAttachmentSource`
+- [x] `VolumeAttachmentSpec`
+- [x] `VolumeAttachmentStatus`
+- [x] `VolumeError`
+- [x] `VolumeNodeResources`
 
 ## apiregistration/v1
 
 ### Kinds
 
-- [ ] `APIService`
+- [x] `APIService`
 
 ### Nested messages
 
-- [ ] `APIServiceCondition`
-- [ ] `APIServiceSpec`
-- [ ] `APIServiceStatus`
-- [ ] `ServiceReference`
+- [x] `APIServiceCondition`
+- [x] `APIServiceSpec`
+- [x] `APIServiceStatus`
+- [x] `ServiceReference`
 
 ## apimachinery/meta/v1
 
 Shared types referenced from one or more kinds in the 14 API groups above. `TypeMeta` (embedded inline in the protobuf `Unknown` envelope) and `Patch` (PATCH request body) are listed even though no field declaration references them directly.
 
-- [ ] `Condition`
+- [x] `Condition`
 - [x] `DeleteOptions`
-- [ ] `FieldsV1`
+- [x] `FieldsV1`
 - [x] `LabelSelector`
 - [x] `LabelSelectorRequirement`
-- [ ] `ListMeta`
+- [x] `ListMeta`
 - [x] `ManagedFieldsEntry`
-- [ ] `MicroTime`
+- [x] `MicroTime`
 - [x] `ObjectMeta`
 - [x] `OwnerReference`
-- [ ] `Patch`
+- [x] `Patch`
 - [x] `Preconditions`
-- [ ] `Status`
+- [x] `Status`
 - [x] `Time`
-- [ ] `TypeMeta`
+- [x] `TypeMeta`
 
 ## Notes
 
