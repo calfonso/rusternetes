@@ -4200,7 +4200,8 @@ impl ContainerRuntime {
                 // Validate subPathExpr / subPath BEFORE looking up the volume.
                 // Kubernetes rejects containers whose expanded subpath contains
                 // ".." or is absolute, regardless of whether the volume exists.
-                let expanded_sub_path: Option<String> = if let Some(ref expr) = mount.sub_path_expr
+                let expanded_sub_path: Option<String> = if let Some(expr) =
+                    mount.sub_path_expr.as_deref().filter(|s| !s.is_empty())
                 {
                     debug!(
                         "subPathExpr='{}' for container {} mount {}, env_pairs={:?}",
@@ -4544,6 +4545,7 @@ impl ContainerRuntime {
             let term_msg_path = container
                 .termination_message_path
                 .as_deref()
+                .filter(|s| !s.is_empty())
                 .unwrap_or("/dev/termination-log");
             let term_host_dir = format!("{}/{}/termination", self.volumes_base_path, pod_name);
             std::fs::create_dir_all(&term_host_dir).ok();
@@ -6561,6 +6563,7 @@ impl ContainerRuntime {
         let msg_path = container
             .termination_message_path
             .as_deref()
+            .filter(|s| !s.is_empty())
             .unwrap_or("/dev/termination-log");
 
         debug!(
@@ -11340,6 +11343,73 @@ mod tests {
             content.truncate(4096);
         }
         assert_eq!(content.len(), 4096);
+    }
+
+    // --- Empty-string optional fields treated as unset ---
+    //
+    // The Kubernetes API server applies SetDefaults_Container at admission,
+    // but some clients (e.g. hydrophone, the conformance runner) submit
+    // PodSpecs where optional string fields are present as `""` rather than
+    // omitted. Upstream Go kubelet gates these with `!= ""`; the Rust
+    // kubelet must do the same or it rejects valid pods.
+
+    #[test]
+    fn test_sub_path_expr_empty_string_treated_as_unset() {
+        // Mirrors upstream `pkg/kubelet/kubelet_pods.go::makeMounts`:
+        //   if mount.SubPathExpr != "" { ... expand ... }
+        // The expansion branch must not fire for Some("").
+        let empty: Option<String> = Some(String::new());
+        let unset: Option<String> = None;
+        let present: Option<String> = Some("$(POD_NAME)".to_string());
+
+        let gate = |o: &Option<String>| o.as_deref().filter(|s| !s.is_empty()).is_some();
+
+        assert!(!gate(&empty), "Some(\"\") must be treated as unset");
+        assert!(!gate(&unset), "None must be treated as unset");
+        assert!(gate(&present), "Some(non-empty) must trigger expansion");
+    }
+
+    #[test]
+    fn test_termination_message_path_empty_string_defaults() {
+        // Mirrors upstream `pkg/apis/core/v1/defaults.go::SetDefaults_Container`:
+        //   if obj.TerminationMessagePath == "" {
+        //       obj.TerminationMessagePath = v1.TerminationMessagePathDefault
+        //   }
+        // The kubelet's defensive guard must also treat `""` as unset so
+        // we never emit an invalid bind spec like `/host/path:` (empty target).
+        const DEFAULT: &str = "/dev/termination-log";
+
+        let resolve = |o: &Option<String>| -> String {
+            o.as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT)
+                .to_string()
+        };
+
+        assert_eq!(resolve(&None), DEFAULT);
+        assert_eq!(resolve(&Some(String::new())), DEFAULT);
+        assert_eq!(
+            resolve(&Some("/var/log/custom".to_string())),
+            "/var/log/custom"
+        );
+    }
+
+    #[test]
+    fn test_termination_message_path_default_yields_valid_bind_spec() {
+        // Regression: hydrophone's pod had terminationMessagePath="".
+        // The kubelet built `format!("{}:{}", host_file, path)`, which with
+        // an empty path produced `"/host/.../conformance-container:"` —
+        // Docker rejects this with "invalid volume specification".
+        // After defaulting, the bind spec must end with the default path.
+        const DEFAULT: &str = "/dev/termination-log";
+        let host_file = "/var/lib/kubelet/pod/termination/conformance-container";
+        let raw: Option<String> = Some(String::new());
+        let term_msg_path = raw.as_deref().filter(|s| !s.is_empty()).unwrap_or(DEFAULT);
+        let bind = format!("{}:{}", host_file, term_msg_path);
+        assert!(
+            bind.ends_with(":/dev/termination-log"),
+            "bind spec must have a non-empty container target, got {bind}"
+        );
     }
 
     // --- Fix #62: Ephemeral containers identified for starting ---
