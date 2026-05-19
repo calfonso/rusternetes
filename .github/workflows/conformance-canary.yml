@@ -82,6 +82,23 @@ jobs:
           docker version
           docker info --format '{{ .ServerVersion }}'
 
+      - name: Install docker-compose v2 plugin
+        # gha-runner-scale-set's stock DinD setup ships the docker CLI
+        # but not the v2 `compose` plugin. Without it, `docker compose -f
+        # …` is parsed as `docker -f …` and dies with
+        # `unknown shorthand flag: 'f' in -f`. Drop the v2 plugin binary
+        # into the user-local plugin dir (no root required, no apt). This
+        # keeps the ARC runner image lean and avoids a separate image rebuild
+        # cycle for a single binary.
+        run: |
+          set -euo pipefail
+          COMPOSE_VERSION="v2.30.3"
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+            -o "$HOME/.docker/cli-plugins/docker-compose"
+          chmod +x "$HOME/.docker/cli-plugins/docker-compose"
+          docker compose version
+
       - name: Generate TLS certs
         run: |
           bash scripts/generate-certs.sh
