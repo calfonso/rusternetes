@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_autoscaling_v2(&mut schemas);
         Self::register_batch_v1(&mut schemas);
         Self::register_core_v1_container_runtime(&mut schemas);
         Self::register_core_v1_kinds(&mut schemas);
@@ -2386,6 +2387,515 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_autoscaling_v2(schemas: &mut HashMap<String, MessageSchema>) {
+        // CrossVersionObjectReference
+        schemas.insert(
+            "CrossVersionObjectReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("name".into(), FieldType::String)),
+                    (3, ("apiVersion".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // MetricIdentifier
+        schemas.insert(
+            "MetricIdentifier".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "selector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // MetricTarget — value/averageValue are Quantity (skipped)
+        schemas.insert(
+            "MetricTarget".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (4, ("averageUtilization".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // MetricValueStatus — value/averageValue are Quantity (skipped)
+        schemas.insert(
+            "MetricValueStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(3, ("averageUtilization".into(), FieldType::Int))]),
+            },
+        );
+
+        // ContainerResourceMetricSource
+        schemas.insert(
+            "ContainerResourceMetricSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        ("target".into(), FieldType::Message("MetricTarget".into())),
+                    ),
+                    (3, ("container".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ContainerResourceMetricStatus
+        schemas.insert(
+            "ContainerResourceMetricStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "current".into(),
+                            FieldType::Message("MetricValueStatus".into()),
+                        ),
+                    ),
+                    (3, ("container".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ExternalMetricSource
+        schemas.insert(
+            "ExternalMetricSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "metric".into(),
+                            FieldType::Message("MetricIdentifier".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        ("target".into(), FieldType::Message("MetricTarget".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // ExternalMetricStatus
+        schemas.insert(
+            "ExternalMetricStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "metric".into(),
+                            FieldType::Message("MetricIdentifier".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "current".into(),
+                            FieldType::Message("MetricValueStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ObjectMetricSource
+        schemas.insert(
+            "ObjectMetricSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "describedObject".into(),
+                            FieldType::Message("CrossVersionObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        ("target".into(), FieldType::Message("MetricTarget".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "metric".into(),
+                            FieldType::Message("MetricIdentifier".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ObjectMetricStatus
+        schemas.insert(
+            "ObjectMetricStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "metric".into(),
+                            FieldType::Message("MetricIdentifier".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "current".into(),
+                            FieldType::Message("MetricValueStatus".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "describedObject".into(),
+                            FieldType::Message("CrossVersionObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // PodsMetricSource
+        schemas.insert(
+            "PodsMetricSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "metric".into(),
+                            FieldType::Message("MetricIdentifier".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        ("target".into(), FieldType::Message("MetricTarget".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // PodsMetricStatus
+        schemas.insert(
+            "PodsMetricStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "metric".into(),
+                            FieldType::Message("MetricIdentifier".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "current".into(),
+                            FieldType::Message("MetricValueStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ResourceMetricSource
+        schemas.insert(
+            "ResourceMetricSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        ("target".into(), FieldType::Message("MetricTarget".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // ResourceMetricStatus
+        schemas.insert(
+            "ResourceMetricStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "current".into(),
+                            FieldType::Message("MetricValueStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // MetricSpec
+        schemas.insert(
+            "MetricSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "object".into(),
+                            FieldType::Message("ObjectMetricSource".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        ("pods".into(), FieldType::Message("PodsMetricSource".into())),
+                    ),
+                    (
+                        4,
+                        (
+                            "resource".into(),
+                            FieldType::Message("ResourceMetricSource".into()),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "external".into(),
+                            FieldType::Message("ExternalMetricSource".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "containerResource".into(),
+                            FieldType::Message("ContainerResourceMetricSource".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // MetricStatus
+        schemas.insert(
+            "MetricStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "object".into(),
+                            FieldType::Message("ObjectMetricStatus".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        ("pods".into(), FieldType::Message("PodsMetricStatus".into())),
+                    ),
+                    (
+                        4,
+                        (
+                            "resource".into(),
+                            FieldType::Message("ResourceMetricStatus".into()),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "external".into(),
+                            FieldType::Message("ExternalMetricStatus".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "containerResource".into(),
+                            FieldType::Message("ContainerResourceMetricStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // HPAScalingPolicy
+        schemas.insert(
+            "HPAScalingPolicy".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("value".into(), FieldType::Int)),
+                    (3, ("periodSeconds".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // HPAScalingRules — tolerance is Quantity (skipped)
+        schemas.insert(
+            "HPAScalingRules".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("selectPolicy".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "policies".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "HPAScalingPolicy".into(),
+                            ))),
+                        ),
+                    ),
+                    (3, ("stabilizationWindowSeconds".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // HorizontalPodAutoscalerBehavior
+        schemas.insert(
+            "HorizontalPodAutoscalerBehavior".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "scaleUp".into(),
+                            FieldType::Message("HPAScalingRules".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "scaleDown".into(),
+                            FieldType::Message("HPAScalingRules".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // HorizontalPodAutoscalerCondition
+        schemas.insert(
+            "HorizontalPodAutoscalerCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (4, ("reason".into(), FieldType::String)),
+                    (5, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // HorizontalPodAutoscalerSpec
+        schemas.insert(
+            "HorizontalPodAutoscalerSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "scaleTargetRef".into(),
+                            FieldType::Message("CrossVersionObjectReference".into()),
+                        ),
+                    ),
+                    (2, ("minReplicas".into(), FieldType::Int)),
+                    (3, ("maxReplicas".into(), FieldType::Int)),
+                    (
+                        4,
+                        (
+                            "metrics".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("MetricSpec".into()))),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "behavior".into(),
+                            FieldType::Message("HorizontalPodAutoscalerBehavior".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // HorizontalPodAutoscalerStatus
+        schemas.insert(
+            "HorizontalPodAutoscalerStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("observedGeneration".into(), FieldType::Int)),
+                    (
+                        2,
+                        ("lastScaleTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (3, ("currentReplicas".into(), FieldType::Int)),
+                    (4, ("desiredReplicas".into(), FieldType::Int)),
+                    (
+                        5,
+                        (
+                            "currentMetrics".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "MetricStatus".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "HorizontalPodAutoscalerCondition".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // HorizontalPodAutoscaler (top-level kind)
+        schemas.insert(
+            "HorizontalPodAutoscaler".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("HorizontalPodAutoscalerSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("HorizontalPodAutoscalerStatus".into()),
+                        ),
+                    ),
                 ]),
             },
         );
