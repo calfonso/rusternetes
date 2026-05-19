@@ -4687,18 +4687,26 @@ impl ContainerRuntime {
         //   end-user-visible hostname, just achieved without shared namespace.
         let using_container_network = !self.use_cni && netns_path.is_none();
         let share_uts_with_pause = using_container_network && self.shared_uts_supported;
-        let pod_hostname = if !share_uts_with_pause {
-            // Own UTS namespace path: hostname must be set on Config so
-            // /etc/hostname + os.Hostname() report the pod name, not the
-            // container ID. Used when (a) CNI/netns gives the app container
-            // its own network namespace, or (b) Docker >=24 forbids the
-            // shared-UTS shortcut.
+        // Docker rejects `Config.hostname` whenever the container's network
+        // namespace is borrowed from another container (`HostConfig.NetworkMode
+        // = "container:<id>"`) — error: "conflicting options: hostname and the
+        // network mode". When the app container will join the pause container's
+        // network namespace (the only mode where we share pod IP), hostname
+        // must come from the pause container, not from `Config.hostname`.
+        //
+        // It also rejects `Config.hostname` when `HostConfig.UTSMode` is set
+        // (`container:<id>`), which is the pre-Docker-24 shared-UTS path.
+        //
+        // So `Config.hostname` is ONLY set when the app container has its OWN
+        // network namespace (CNI / netns path) AND its own UTS namespace —
+        // i.e. neither sharing is active.
+        let app_owns_network = !using_container_network;
+        let pod_hostname = if !share_uts_with_pause && app_owns_network {
             let raw = pod
                 .spec
                 .as_ref()
                 .and_then(|s| s.hostname.as_deref())
                 .unwrap_or(&pod.metadata.name);
-            // Linux hostnames limited to 63 chars
             let truncated = if raw.len() > 63 {
                 raw[..63].trim_end_matches('-').to_string()
             } else {
@@ -4706,7 +4714,9 @@ impl ContainerRuntime {
             };
             Some(truncated)
         } else {
-            None // Shared-UTS path: Docker rejects hostname + uts_mode combo
+            // Either UTS or network namespace is borrowed from pause — pause
+            // already owns the hostname, so do not set it on the app container.
+            None
         };
 
         let mut config = Config {
