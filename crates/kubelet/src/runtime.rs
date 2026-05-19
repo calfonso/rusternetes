@@ -184,6 +184,26 @@ pub fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Return the per-pod filesystem key used to compose host-side volume paths.
+///
+/// Mirrors upstream `pkg/kubelet/kubelet_getters.go::getPodDir`, which keys
+/// pod directories on `pod.metadata.uid`. Two pods that share a name but have
+/// distinct UIDs (the recreation case — e.g. hydrophone's `e2e-conformance-test`
+/// driver pod) must not collide on disk, or the new pod's container will read
+/// stale files written by the previous one.
+///
+/// Falls back to the pod's name when `uid` is empty. Real pods admitted through
+/// the api-server always have a non-empty UID (assigned at `BeforeCreate`), so
+/// the fallback only matters for in-process test fixtures that construct a Pod
+/// without going through the registry.
+pub(crate) fn pod_dir_key(pod: &Pod) -> &str {
+    if !pod.metadata.uid.is_empty() {
+        &pod.metadata.uid
+    } else {
+        &pod.metadata.name
+    }
+}
+
 /// Unix special-file kinds that HostPath validates separately from
 /// regular files / directories. Internal helper for `check_host_path_type`.
 #[derive(Debug, Clone, Copy)]
@@ -2510,7 +2530,13 @@ impl ContainerRuntime {
         // ensures the directory exists with mode 0o777 and idempotently re-chmods even
         // when the directory pre-exists from a prior run.
         if volume.empty_dir.is_some() {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            // Key the on-disk path on pod UID, not name, to mirror upstream
+            // pkg/kubelet/kubelet_getters.go::getPodVolumeDir +
+            // pkg/volume/emptydir/empty_dir.go::getPath. A recreated pod gets a
+            // new UID, so the new emptyDir is guaranteed fresh — kubelet never
+            // reads the previous pod's files.
+            let pod_key = pod_dir_key(pod);
+            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_key, volume.name);
             setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
             info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
             return Ok(volume_dir);
@@ -8524,6 +8550,7 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::pod_dir_key;
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
 
@@ -8782,6 +8809,40 @@ mod tests {
         let expected_path = format!("/volumes/{}/{}", pod_name, volume_name);
 
         assert_eq!(expected_path, "/volumes/test-pod-emptydir/test-volume");
+    }
+
+    // --- pod_dir_key: UID-keyed pod filesystem paths ---
+    //
+    // Mirrors upstream Kubernetes pkg/kubelet/kubelet_getters.go::getPodDir,
+    // which keys per-pod on-disk paths on `pod.metadata.uid`. Without this,
+    // a recreated pod with the same name (common in conformance test runners
+    // like hydrophone, which always names its driver pod "e2e-conformance-test")
+    // reuses the previous pod's host-side emptyDir directory and reads stale
+    // /tmp/results from the prior run.
+
+    #[test]
+    fn pod_dir_key_uses_uid_when_present() {
+        let mut pod = make_pod("p", "default", None, None);
+        pod.metadata.uid = "abc-123".to_string();
+        assert_eq!(pod_dir_key(&pod), "abc-123");
+    }
+
+    #[test]
+    fn pod_dir_key_falls_back_to_name_when_uid_empty() {
+        let mut pod = make_pod("static-pod", "kube-system", None, None);
+        pod.metadata.uid = String::new();
+        assert_eq!(pod_dir_key(&pod), "static-pod");
+    }
+
+    #[test]
+    fn pod_dir_key_isolates_recreated_pod_with_same_name() {
+        // Two pods with identical name but distinct UIDs (the recreation case
+        // that breaks emptyDir reuse) must yield distinct on-disk keys.
+        let mut a = make_pod("e2e-conformance-test", "conformance", None, None);
+        let mut b = make_pod("e2e-conformance-test", "conformance", None, None);
+        a.metadata.uid = "uid-a".to_string();
+        b.metadata.uid = "uid-b".to_string();
+        assert_ne!(pod_dir_key(&a), pod_dir_key(&b));
     }
 
     // --- EmptyDir mode bits regression tests (conformance [Conformance].*EmptyDir.*) ---
