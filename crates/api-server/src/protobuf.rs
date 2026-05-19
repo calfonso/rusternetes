@@ -2376,6 +2376,7 @@ impl ProtoRegistry {
         Self::register_storage_v1(&mut schemas);
         Self::register_coordination_v1(&mut schemas);
         Self::register_policy_v1(&mut schemas);
+        Self::register_core_v1_remaining_nested(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -8005,6 +8006,363 @@ impl ProtoRegistry {
                     (2, ("fsType".into(), FieldType::String)),
                     (3, ("storagePolicyName".into(), FieldType::String)),
                     (4, ("storagePolicyID".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    /// Register the last 14 core/v1 nested messages that previous PRs
+    /// left behind. None of these are top-level kinds; they're all leaf
+    /// messages reached only via specific feature paths (envFrom, DRA
+    /// alpha, node-config alpha, certificate projection, etc.). Closes
+    /// the entire core/v1 gap recorded in
+    /// docs/conformance/protobuf-schema-coverage.md after PR #184/#185.
+    ///
+    /// Field numbers verified against
+    /// k8s.io/api/core/v1/generated.proto (release-1.35).
+    fn register_core_v1_remaining_nested(schemas: &mut HashMap<String, MessageSchema>) {
+        // -- envFrom sources (same shape: LocalObjectReference + optional bool) ----
+
+        schemas.insert(
+            "ConfigMapEnvSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (2, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "SecretEnvSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (2, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        // -- ConfigMapNodeConfigSource: alpha NodeConfig (deprecated DynamicKubeletConfig)
+        schemas.insert(
+            "ConfigMapNodeConfigSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("name".into(), FieldType::String)),
+                    (3, ("uid".into(), FieldType::String)),
+                    (4, ("resourceVersion".into(), FieldType::String)),
+                    (5, ("kubeletConfigKey".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // -- DRA (Dynamic Resource Allocation) --
+
+        schemas.insert(
+            "ContainerExtendedResourceRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("containerName".into(), FieldType::String)),
+                    (2, ("resourceName".into(), FieldType::String)),
+                    (3, ("requestName".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "PodExtendedResourceClaimStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "requestMappings".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerExtendedResourceRequest".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("resourceClaimName".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // -- Node + Pod IP / endpoint leaf messages --
+
+        schemas.insert(
+            "DaemonEndpoint".into(),
+            // Upstream field name is the unusual capitalised `Port` (not
+            // `port`); preserve the JSON key.
+            MessageSchema {
+                fields: HashMap::from([(1, ("Port".into(), FieldType::Int))]),
+            },
+        );
+
+        schemas.insert(
+            "HostIP".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("ip".into(), FieldType::String))]),
+            },
+        );
+
+        // -- file-key selector (used by env from file) --
+        schemas.insert(
+            "FileKeySelector".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumeName".into(), FieldType::String)),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("key".into(), FieldType::String)),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        // -- volume status leaf messages --
+        schemas.insert(
+            "ModifyVolumeStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("targetVolumeAttributesClassName".into(), FieldType::String),
+                    ),
+                    (2, ("status".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "PersistentVolumeClaimCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        ("lastProbeTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // -- PersistentVolumeSource: the oneof-style holder over every
+        //    PV backend. Each sub-message is already registered (most by
+        //    register_core_v1_cloud_volume_sources). Field numbers below
+        //    are upstream-stable.
+        schemas.insert(
+            "PersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "gcePersistentDisk".into(),
+                            FieldType::Message("GCEPersistentDiskVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "awsElasticBlockStore".into(),
+                            FieldType::Message("AWSElasticBlockStoreVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "hostPath".into(),
+                            FieldType::Message("HostPathVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "glusterfs".into(),
+                            FieldType::Message("GlusterfsPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        5,
+                        ("nfs".into(), FieldType::Message("NFSVolumeSource".into())),
+                    ),
+                    (
+                        6,
+                        (
+                            "rbd".into(),
+                            FieldType::Message("RBDPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "iscsi".into(),
+                            FieldType::Message("ISCSIPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "cinder".into(),
+                            FieldType::Message("CinderPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "cephfs".into(),
+                            FieldType::Message("CephFSPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        10,
+                        ("fc".into(), FieldType::Message("FCVolumeSource".into())),
+                    ),
+                    (
+                        11,
+                        (
+                            "flocker".into(),
+                            FieldType::Message("FlockerVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        12,
+                        (
+                            "flexVolume".into(),
+                            FieldType::Message("FlexPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        13,
+                        (
+                            "azureFile".into(),
+                            FieldType::Message("AzureFilePersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        14,
+                        (
+                            "vsphereVolume".into(),
+                            FieldType::Message("VsphereVirtualDiskVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        15,
+                        (
+                            "quobyte".into(),
+                            FieldType::Message("QuobyteVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        16,
+                        (
+                            "azureDisk".into(),
+                            FieldType::Message("AzureDiskVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        17,
+                        (
+                            "photonPersistentDisk".into(),
+                            FieldType::Message("PhotonPersistentDiskVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        18,
+                        (
+                            "portworxVolume".into(),
+                            FieldType::Message("PortworxVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        19,
+                        (
+                            "scaleIO".into(),
+                            FieldType::Message("ScaleIOPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        20,
+                        (
+                            "local".into(),
+                            FieldType::Message("LocalVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        21,
+                        (
+                            "storageos".into(),
+                            FieldType::Message("StorageOSPersistentVolumeSource".into()),
+                        ),
+                    ),
+                    (
+                        22,
+                        (
+                            "csi".into(),
+                            FieldType::Message("CSIPersistentVolumeSource".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // -- PodCertificateProjection (alpha PodCertificate feature) --
+        schemas.insert(
+            "PodCertificateProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("signerName".into(), FieldType::String)),
+                    (2, ("keyType".into(), FieldType::String)),
+                    (3, ("maxExpirationSeconds".into(), FieldType::Int)),
+                    (4, ("credentialBundlePath".into(), FieldType::String)),
+                    (5, ("keyPath".into(), FieldType::String)),
+                    (6, ("certificateChainPath".into(), FieldType::String)),
+                    (7, ("userAnnotations".into(), FieldType::StringMap)),
+                ]),
+            },
+        );
+
+        // -- VolumeDevice: raw block volume mount --
+        schemas.insert(
+            "VolumeDevice".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("devicePath".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // -- WorkloadReference: PodGroup / Coscheduling --
+        schemas.insert(
+            "WorkloadReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("podGroup".into(), FieldType::String)),
+                    (3, ("podGroupReplicaKey".into(), FieldType::String)),
                 ]),
             },
         );
