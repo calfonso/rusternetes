@@ -43,3 +43,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 RUN curl -LsSf https://get.nexte.st/latest/linux \
       | tar zxf - -C /home/runner/.cargo/bin \
  && cargo nextest --version
+
+# docker-compose v2 plugin. gha-runner-scale-set's stock DinD bundle
+# ships the docker CLI but not the compose plugin, so the conformance
+# tier (which brings up the rusternetes cluster via `docker compose
+# up`) needs the binary on PATH. Drop it into the runner-user's local
+# plugin directory so no root and no global $PATH mutation is needed.
+# Pinned to a known release tag; bumps land here, not in workflow files.
+ENV DOCKER_COMPOSE_VERSION=v2.30.3
+RUN mkdir -p /home/runner/.docker/cli-plugins \
+ && curl -fsSL \
+      "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+      -o /home/runner/.docker/cli-plugins/docker-compose \
+ && chmod +x /home/runner/.docker/cli-plugins/docker-compose \
+ && /home/runner/.docker/cli-plugins/docker-compose version
