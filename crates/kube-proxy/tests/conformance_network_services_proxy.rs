@@ -508,23 +508,69 @@ async fn services_nodeport_load_balances_across_backends() {
 /// [sig-network] Services should complete a service status lifecycle [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/network/service.go:3246
-/// Sonobuoy (Round 160): FAIL — "failed to delete Service test-service-nxqt9
-/// in namespace services-766: timed out waiting for the condition"
-/// (failure observed at service.go:3459).
+/// Sonobuoy (Round 160): FAIL — controller-manager never populates
+/// `status.loadBalancer.ingress[]`, so the upstream delete step at
+/// `service.go:3459` times out.
 ///
-/// This test mirrors the LoadBalancer status-lifecycle expectation. The
-/// underlying delete-timeout bug lives in the api-server's status
-/// subresource path — kube-proxy itself must emit both SERVICES and
-/// NODEPORTS rules for a LoadBalancer-typed Service before status is
-/// populated. We ignore the test until the upstream failure is fixed,
-/// but verify the iptables surface stays correct.
+/// The kube-proxy half of this lifecycle is narrow: for an LB-typed
+/// Service kube-proxy must (a) emit ClusterIP + NodePort DNAT rules while
+/// the Service exists and (b) drop both classes of rule on the next sync
+/// after the Service is deleted. The status-population bug itself lives
+/// in `crates/controller-manager/src/controllers/loadbalancer.rs` and is
+/// exercised by `crates/controller-manager/tests/
+/// loadbalancer_status_lifecycle_test.rs` (the more authentic mirror — the
+/// kube-proxy crate cannot drive controller-manager status writes).
+///
+/// IGNORED_TESTS_PLAN.md item #10. Layer A (Sonobuoy) is fixed by the
+/// controller-manager retry-with-backoff added alongside this un-ignore.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/network-services-proxy.md"]
 async fn services_should_complete_service_status_lifecycle() {
-    // Status delete-timeout bug is api-server-side; kube-proxy correctly emits
-    // the LoadBalancer DNAT plumbing. This test stays ignored to mirror
-    // Sonobuoy until the underlying timeout is resolved.
-    panic!("placeholder for upstream delete-timeout failure (service.go:3459)");
+    // Phase 1 — Service exists: kube-proxy programs ClusterIP + NodePort.
+    let svc = loadbalancer_service("lblife", "default", "10.96.0.150", 80, 8080, 30150);
+    let slice = endpoint_slice("default", "lblife", &["10.244.5.5"], Some("http"), 8080);
+    let map = endpointslice_map(&[slice]);
+    let rules_present = test_iptables()
+        .build_nat_rules(std::slice::from_ref(&svc), &map, &[], "test-node")
+        .await;
+    assert!(
+        rules_present.contains("-A RUSTERNETES-SERVICES -d 10.96.0.150/32"),
+        "ClusterIP DNAT rule must exist while LB Service is present:\n{}",
+        rules_present
+    );
+    assert!(
+        rules_present.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30150"),
+        "NodePort DNAT rule must exist while LB Service is present:\n{}",
+        rules_present
+    );
+    assert!(
+        rules_present.contains("--to-destination 10.244.5.5:8080"),
+        "backend pod IP must be reachable via DNAT:\n{}",
+        rules_present
+    );
+
+    // Phase 2 — Service deleted: rebuild rules with no services. Both
+    // rule classes must disappear. This is the kube-proxy contract that
+    // upstream `service.go:3459` depends on after the controller-manager
+    // patches an empty status and the test deletes the Service.
+    let empty_map: HashMap<String, Vec<(String, Option<String>, u16)>> = HashMap::new();
+    let rules_after_delete = test_iptables()
+        .build_nat_rules(&[], &empty_map, &[], "test-node")
+        .await;
+    assert!(
+        !rules_after_delete.contains("10.96.0.150"),
+        "ClusterIP rule must be dropped after Service delete:\n{}",
+        rules_after_delete
+    );
+    assert!(
+        !rules_after_delete.contains("30150"),
+        "NodePort rule must be dropped after Service delete:\n{}",
+        rules_after_delete
+    );
+    assert!(
+        !rules_after_delete.contains("10.244.5.5"),
+        "backend pod IP must not leak in rules after Service delete:\n{}",
+        rules_after_delete
+    );
 }
 
 /// [sig-network] LoadBalancer services share SERVICES + NODEPORTS rules
