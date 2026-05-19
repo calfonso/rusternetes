@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_apiextensions_v1(&mut schemas);
         Self::register_admissionregistration_v1(&mut schemas);
         Self::register_core_v1_status_networking(&mut schemas);
         Self::register_apimachinery_meta_v1(&mut schemas);
@@ -2393,6 +2394,93 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_apiextensions_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // ExternalDocumentation — referenced from JSONSchemaProps.externalDocs (field 35).
+        schemas.insert(
+            "ExternalDocumentation".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("description".into(), FieldType::String)),
+                    (2, ("url".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // JSON — the K8s "raw JSON" wrapper. A single `raw` bytes field
+        // containing the JSON payload. Used in JSONSchemaProps for `default`,
+        // `enum`, and `example`. `FieldType::JsonRaw` already handles decoding
+        // at the field level; this schema entry exists so callers can look the
+        // type up by name and so the decoder's recursive walk has a defined
+        // shape if it ever lands here directly.
+        schemas.insert(
+            "JSON".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("raw".into(), FieldType::Bytes))]),
+            },
+        );
+
+        // JSONSchemaPropsOrStringArray — K8s oneof helper:
+        //   field 1: schema    (JSONSchemaProps, optional)
+        //   field 2: property  (repeated string)
+        // Encoded as a regular message with both fields optional; at most one
+        // is set in practice. Referenced from JSONSchemaProps.dependencies
+        // (field 32, map<string, JSONSchemaPropsOrStringArray>).
+        schemas.insert(
+            "JSONSchemaPropsOrStringArray".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "schema".into(),
+                            FieldType::Message("JSONSchemaProps".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "property".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ServiceReference — webhook service coordinates.
+        schemas.insert(
+            "ServiceReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("name".into(), FieldType::String)),
+                    (3, ("path".into(), FieldType::String)),
+                    (4, ("port".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // WebhookClientConfig — how the api-server reaches a conversion
+        // webhook. Either `service` (in-cluster Service reference) or `url`
+        // (direct URL) is set, plus an optional `caBundle` for TLS.
+        schemas.insert(
+            "WebhookClientConfig".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "service".into(),
+                            FieldType::Message("ServiceReference".into()),
+                        ),
+                    ),
+                    (2, ("caBundle".into(), FieldType::Bytes)),
+                    (3, ("url".into(), FieldType::String)),
                 ]),
             },
         );
