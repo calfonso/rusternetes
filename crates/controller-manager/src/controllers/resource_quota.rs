@@ -636,15 +636,20 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             usage.insert("count/services".to_string(), services.len().to_string());
             usage.insert("services".to_string(), services.len().to_string());
 
-            // Count NodePort services (NodePort + LoadBalancer both use NodePorts)
+            // Count NodePort-consuming services. Upstream
+            // `pkg/quota/v1/evaluator/core/services.go` counts the node-port slot for:
+            //   * Service type=NodePort       — always
+            //   * Service type=LoadBalancer   — only when allocateLoadBalancerNodePorts
+            //                                   is nil or true; an explicit `false`
+            //                                   means the LB has no node ports to count.
             let nodeport_count = services
                 .iter()
-                .filter(|s| {
-                    matches!(
-                        s.spec.service_type,
-                        Some(rusternetes_common::resources::ServiceType::NodePort)
-                            | Some(rusternetes_common::resources::ServiceType::LoadBalancer)
-                    )
+                .filter(|s| match s.spec.service_type {
+                    Some(rusternetes_common::resources::ServiceType::NodePort) => true,
+                    Some(rusternetes_common::resources::ServiceType::LoadBalancer) => {
+                        s.spec.allocate_load_balancer_node_ports.unwrap_or(true)
+                    }
+                    _ => false,
                 })
                 .count();
             usage.insert("services.nodeports".to_string(), nodeport_count.to_string());
