@@ -8,7 +8,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 | API group | Registered / Total | % |
 | --- | --- | --- |
-| core/v1 | 67 / 209 | 32% |
+| core/v1 | 101 / 209 | 48% |
 | apps/v1 | 24 / 25 | 96% |
 | batch/v1 | 5 / 15 | 33% |
 | rbac/v1 | 0 / 8 | 0% |
@@ -23,7 +23,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 | storage/v1 | 0 / 15 | 0% |
 | apiregistration/v1 | 0 / 5 | 0% |
 | apimachinery/meta/v1 | 8 / 15 | 53% |
-| **Total** | **130 / 405** | **32%** |
+| **Total** | **164 / 405** | **40%** |
 
 ## core/v1
 
@@ -53,20 +53,20 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 
 ### Nested messages
 
-- [ ] `AWSElasticBlockStoreVolumeSource`
+- [x] `AWSElasticBlockStoreVolumeSource`
 - [x] `Affinity`
 - [x] `AppArmorProfile`
 - [ ] `AttachedVolume`
-- [ ] `AzureDiskVolumeSource`
-- [ ] `AzureFilePersistentVolumeSource`
-- [ ] `AzureFileVolumeSource`
-- [ ] `CSIPersistentVolumeSource`
-- [ ] `CSIVolumeSource`
+- [x] `AzureDiskVolumeSource`
+- [x] `AzureFilePersistentVolumeSource`
+- [x] `AzureFileVolumeSource`
+- [x] `CSIPersistentVolumeSource`
+- [x] `CSIVolumeSource`
 - [x] `Capabilities`
-- [ ] `CephFSPersistentVolumeSource`
-- [ ] `CephFSVolumeSource`
-- [ ] `CinderPersistentVolumeSource`
-- [ ] `CinderVolumeSource`
+- [x] `CephFSPersistentVolumeSource`
+- [x] `CephFSVolumeSource`
+- [x] `CinderPersistentVolumeSource`
+- [x] `CinderVolumeSource`
 - [ ] `ClientIPConfig`
 - [ ] `ClusterTrustBundleProjection`
 - [ ] `ComponentCondition`
@@ -101,28 +101,28 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `EnvVarSource`
 - [ ] `EphemeralContainer`
 - [ ] `EphemeralContainerCommon`
-- [ ] `EphemeralVolumeSource`
+- [x] `EphemeralVolumeSource`
 - [ ] `EventSeries`
 - [ ] `EventSource`
 - [x] `ExecAction`
-- [ ] `FCVolumeSource`
+- [x] `FCVolumeSource`
 - [ ] `FileKeySelector`
-- [ ] `FlexPersistentVolumeSource`
-- [ ] `FlexVolumeSource`
-- [ ] `FlockerVolumeSource`
-- [ ] `GCEPersistentDiskVolumeSource`
+- [x] `FlexPersistentVolumeSource`
+- [x] `FlexVolumeSource`
+- [x] `FlockerVolumeSource`
+- [x] `GCEPersistentDiskVolumeSource`
 - [x] `GRPCAction`
-- [ ] `GitRepoVolumeSource`
-- [ ] `GlusterfsPersistentVolumeSource`
-- [ ] `GlusterfsVolumeSource`
+- [x] `GitRepoVolumeSource`
+- [x] `GlusterfsPersistentVolumeSource`
+- [x] `GlusterfsVolumeSource`
 - [x] `HTTPGetAction`
 - [x] `HTTPHeader`
 - [ ] `HostAlias`
 - [ ] `HostIP`
 - [ ] `HostPathVolumeSource`
-- [ ] `ISCSIPersistentVolumeSource`
-- [ ] `ISCSIVolumeSource`
-- [ ] `ImageVolumeSource`
+- [x] `ISCSIPersistentVolumeSource`
+- [x] `ISCSIVolumeSource`
+- [x] `ImageVolumeSource`
 - [ ] `KeyToPath`
 - [x] `Lifecycle`
 - [x] `LifecycleHandler`
@@ -134,7 +134,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `LocalObjectReference`
 - [ ] `LocalVolumeSource`
 - [ ] `ModifyVolumeStatus`
-- [ ] `NFSVolumeSource`
+- [x] `NFSVolumeSource`
 - [x] `NamespaceCondition`
 - [x] `NamespaceSpec`
 - [x] `NamespaceStatus`
@@ -163,7 +163,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [ ] `PersistentVolumeSource`
 - [ ] `PersistentVolumeSpec`
 - [ ] `PersistentVolumeStatus`
-- [ ] `PhotonPersistentDiskVolumeSource`
+- [x] `PhotonPersistentDiskVolumeSource`
 - [x] `PodAffinity`
 - [ ] `PodAffinityTerm`
 - [x] `PodAntiAffinity`
@@ -182,14 +182,14 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `PodSpec`
 - [x] `PodStatus`
 - [ ] `PortStatus`
-- [ ] `PortworxVolumeSource`
+- [x] `PortworxVolumeSource`
 - [ ] `PreferredSchedulingTerm`
 - [x] `Probe`
 - [x] `ProbeHandler`
 - [ ] `ProjectedVolumeSource`
-- [ ] `QuobyteVolumeSource`
-- [ ] `RBDPersistentVolumeSource`
-- [ ] `RBDVolumeSource`
+- [x] `QuobyteVolumeSource`
+- [x] `RBDPersistentVolumeSource`
+- [x] `RBDVolumeSource`
 - [ ] `ReplicationControllerCondition`
 - [x] `ReplicationControllerSpec`
 - [x] `ReplicationControllerStatus`
@@ -201,15 +201,15 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `ResourceRequirements`
 - [ ] `ResourceStatus`
 - [x] `SELinuxOptions`
-- [ ] `ScaleIOPersistentVolumeSource`
-- [ ] `ScaleIOVolumeSource`
+- [x] `ScaleIOPersistentVolumeSource`
+- [x] `ScaleIOVolumeSource`
 - [ ] `ScopeSelector`
 - [ ] `ScopedResourceSelectorRequirement`
 - [x] `SeccompProfile`
 - [ ] `SecretEnvSource`
 - [x] `SecretKeySelector`
 - [ ] `SecretProjection`
-- [ ] `SecretReference`
+- [x] `SecretReference`
 - [ ] `SecretVolumeSource`
 - [x] `SecurityContext`
 - [ ] `ServiceAccountTokenProjection`
@@ -218,8 +218,8 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [x] `ServiceStatus`
 - [x] `SessionAffinityConfig`
 - [x] `SleepAction`
-- [ ] `StorageOSPersistentVolumeSource`
-- [ ] `StorageOSVolumeSource`
+- [x] `StorageOSPersistentVolumeSource`
+- [x] `StorageOSVolumeSource`
 - [ ] `Sysctl`
 - [x] `TCPSocketAction`
 - [ ] `Taint`
@@ -237,7 +237,7 @@ Scope: the 14 API groups picked for the core conformance surface, plus the share
 - [ ] `VolumeProjection`
 - [x] `VolumeResourceRequirements`
 - [ ] `VolumeSource`
-- [ ] `VsphereVirtualDiskVolumeSource`
+- [x] `VsphereVirtualDiskVolumeSource`
 - [ ] `WeightedPodAffinityTerm`
 - [ ] `WindowsSecurityContextOptions`
 - [ ] `WorkloadReference`

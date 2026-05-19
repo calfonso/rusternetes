@@ -2370,6 +2370,7 @@ impl ProtoRegistry {
         Self::register_core_v1_kinds(&mut schemas);
         Self::register_apps_v1(&mut schemas);
         Self::register_discovery_v1(&mut schemas);
+        Self::register_core_v1_cloud_volume_sources(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -7152,6 +7153,636 @@ impl ProtoRegistry {
             "ForZone".into(),
             MessageSchema {
                 fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+    }
+
+    fn register_core_v1_cloud_volume_sources(schemas: &mut HashMap<String, MessageSchema>) {
+        // SecretReference — namespaced secret pointer referenced by several
+        // PersistentVolumeSource flavors (CSI, CephFS, Cinder, Flex, iSCSI,
+        // RBD, ScaleIO). Not yet registered elsewhere.
+        schemas.insert(
+            "SecretReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("namespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "AWSElasticBlockStoreVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumeID".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (3, ("partition".into(), FieldType::Int)),
+                    (4, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "AzureDiskVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("diskName".into(), FieldType::String)),
+                    (2, ("diskURI".into(), FieldType::String)),
+                    (3, ("cachingMode".into(), FieldType::String)),
+                    (4, ("fsType".into(), FieldType::String)),
+                    (5, ("readOnly".into(), FieldType::Bool)),
+                    (6, ("kind".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "AzureFilePersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("secretName".into(), FieldType::String)),
+                    (2, ("shareName".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                    (4, ("secretNamespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "AzureFileVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("secretName".into(), FieldType::String)),
+                    (2, ("shareName".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        // CSIPersistentVolumeSource — note: `capacity` Quantity field is not
+        // expressed in this proto (it lives on PersistentVolumeSpec, not the
+        // source), so no Quantity skip is required here.
+        schemas.insert(
+            "CSIPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("driver".into(), FieldType::String)),
+                    (2, ("volumeHandle".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                    (4, ("fsType".into(), FieldType::String)),
+                    (5, ("volumeAttributes".into(), FieldType::StringMap)),
+                    (
+                        6,
+                        (
+                            "controllerPublishSecretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "nodeStageSecretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "nodePublishSecretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "controllerExpandSecretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (
+                        10,
+                        (
+                            "nodeExpandSecretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CSIVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("driver".into(), FieldType::String)),
+                    (2, ("readOnly".into(), FieldType::Bool)),
+                    (3, ("fsType".into(), FieldType::String)),
+                    (4, ("volumeAttributes".into(), FieldType::StringMap)),
+                    (
+                        5,
+                        (
+                            "nodePublishSecretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CephFSPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "monitors".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("user".into(), FieldType::String)),
+                    (4, ("secretFile".into(), FieldType::String)),
+                    (
+                        5,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (6, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CephFSVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "monitors".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("user".into(), FieldType::String)),
+                    (4, ("secretFile".into(), FieldType::String)),
+                    (
+                        5,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (6, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CinderPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumeID".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                    (
+                        4,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CinderVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumeID".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                    (
+                        4,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // EphemeralVolumeSource — wraps a PersistentVolumeClaimTemplate.
+        // The PVC template schema is owned by other PRs; reference by name so
+        // the field is preserved as an opaque message if the template isn't
+        // registered yet, and decoded fully once it is.
+        schemas.insert(
+            "EphemeralVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "volumeClaimTemplate".into(),
+                        FieldType::Message("PersistentVolumeClaimTemplate".into()),
+                    ),
+                )]),
+            },
+        );
+
+        schemas.insert(
+            "FCVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "targetWWNs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("lun".into(), FieldType::Int)),
+                    (3, ("fsType".into(), FieldType::String)),
+                    (4, ("readOnly".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "wwids".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "FlexPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("driver".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (4, ("readOnly".into(), FieldType::Bool)),
+                    (5, ("options".into(), FieldType::StringMap)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "FlexVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("driver".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (4, ("readOnly".into(), FieldType::Bool)),
+                    (5, ("options".into(), FieldType::StringMap)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "FlockerVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("datasetName".into(), FieldType::String)),
+                    (2, ("datasetUUID".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "GCEPersistentDiskVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("pdName".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (3, ("partition".into(), FieldType::Int)),
+                    (4, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "GitRepoVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("repository".into(), FieldType::String)),
+                    (2, ("revision".into(), FieldType::String)),
+                    (3, ("directory".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "GlusterfsPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("endpoints".into(), FieldType::String)),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                    (4, ("endpointsNamespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "GlusterfsVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("endpoints".into(), FieldType::String)),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ISCSIPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("targetPortal".into(), FieldType::String)),
+                    (2, ("iqn".into(), FieldType::String)),
+                    (3, ("lun".into(), FieldType::Int)),
+                    (4, ("iscsiInterface".into(), FieldType::String)),
+                    (5, ("fsType".into(), FieldType::String)),
+                    (6, ("readOnly".into(), FieldType::Bool)),
+                    (
+                        7,
+                        (
+                            "portals".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (8, ("chapAuthDiscovery".into(), FieldType::Bool)),
+                    (
+                        10,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (11, ("chapAuthSession".into(), FieldType::Bool)),
+                    (12, ("initiatorName".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ISCSIVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("targetPortal".into(), FieldType::String)),
+                    (2, ("iqn".into(), FieldType::String)),
+                    (3, ("lun".into(), FieldType::Int)),
+                    (4, ("iscsiInterface".into(), FieldType::String)),
+                    (5, ("fsType".into(), FieldType::String)),
+                    (6, ("readOnly".into(), FieldType::Bool)),
+                    (
+                        7,
+                        (
+                            "portals".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (8, ("chapAuthDiscovery".into(), FieldType::Bool)),
+                    (
+                        10,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (11, ("chapAuthSession".into(), FieldType::Bool)),
+                    (12, ("initiatorName".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ImageVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("reference".into(), FieldType::String)),
+                    (2, ("pullPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "NFSVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("server".into(), FieldType::String)),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "PhotonPersistentDiskVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("pdID".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "PortworxVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumeID".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "QuobyteVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("registry".into(), FieldType::String)),
+                    (2, ("volume".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                    (4, ("user".into(), FieldType::String)),
+                    (5, ("group".into(), FieldType::String)),
+                    (6, ("tenant".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "RBDPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "monitors".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("image".into(), FieldType::String)),
+                    (3, ("fsType".into(), FieldType::String)),
+                    (4, ("pool".into(), FieldType::String)),
+                    (5, ("user".into(), FieldType::String)),
+                    (6, ("keyring".into(), FieldType::String)),
+                    (
+                        7,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (8, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "RBDVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "monitors".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("image".into(), FieldType::String)),
+                    (3, ("fsType".into(), FieldType::String)),
+                    (4, ("pool".into(), FieldType::String)),
+                    (5, ("user".into(), FieldType::String)),
+                    (6, ("keyring".into(), FieldType::String)),
+                    (
+                        7,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (8, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ScaleIOPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("gateway".into(), FieldType::String)),
+                    (2, ("system".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretReference".into()),
+                        ),
+                    ),
+                    (4, ("sslEnabled".into(), FieldType::Bool)),
+                    (5, ("protectionDomain".into(), FieldType::String)),
+                    (6, ("storagePool".into(), FieldType::String)),
+                    (7, ("storageMode".into(), FieldType::String)),
+                    (8, ("volumeName".into(), FieldType::String)),
+                    (9, ("fsType".into(), FieldType::String)),
+                    (10, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "ScaleIOVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("gateway".into(), FieldType::String)),
+                    (2, ("system".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (4, ("sslEnabled".into(), FieldType::Bool)),
+                    (5, ("protectionDomain".into(), FieldType::String)),
+                    (6, ("storagePool".into(), FieldType::String)),
+                    (7, ("storageMode".into(), FieldType::String)),
+                    (8, ("volumeName".into(), FieldType::String)),
+                    (9, ("fsType".into(), FieldType::String)),
+                    (10, ("readOnly".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "StorageOSPersistentVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumeName".into(), FieldType::String)),
+                    (2, ("volumeNamespace".into(), FieldType::String)),
+                    (3, ("fsType".into(), FieldType::String)),
+                    (4, ("readOnly".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "StorageOSVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumeName".into(), FieldType::String)),
+                    (2, ("volumeNamespace".into(), FieldType::String)),
+                    (3, ("fsType".into(), FieldType::String)),
+                    (4, ("readOnly".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("LocalObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VsphereVirtualDiskVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("volumePath".into(), FieldType::String)),
+                    (2, ("fsType".into(), FieldType::String)),
+                    (3, ("storagePolicyName".into(), FieldType::String)),
+                    (4, ("storagePolicyID".into(), FieldType::String)),
+                ]),
             },
         );
     }
