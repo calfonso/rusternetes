@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_batch_v1(&mut schemas);
         Self::register_core_v1_container_runtime(&mut schemas);
         Self::register_core_v1_kinds(&mut schemas);
         Self::register_apps_v1(&mut schemas);
@@ -2385,6 +2386,186 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_batch_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "CronJob".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("CronJobSpec".into()))),
+                    (
+                        3,
+                        ("status".into(), FieldType::Message("CronJobStatus".into())),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CronJobSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("schedule".into(), FieldType::String)),
+                    (2, ("startingDeadlineSeconds".into(), FieldType::Int)),
+                    (3, ("concurrencyPolicy".into(), FieldType::String)),
+                    (4, ("suspend".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "jobTemplate".into(),
+                            FieldType::Message("JobTemplateSpec".into()),
+                        ),
+                    ),
+                    (6, ("successfulJobsHistoryLimit".into(), FieldType::Int)),
+                    (7, ("failedJobsHistoryLimit".into(), FieldType::Int)),
+                    (8, ("timeZone".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CronJobStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "active".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ObjectReference".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        4,
+                        ("lastScheduleTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        5,
+                        (
+                            "lastSuccessfulTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "JobCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        ("lastProbeTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "JobTemplateSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("JobSpec".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodFailurePolicyOnExitCodesRequirement".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("containerName".into(), FieldType::String)),
+                    (2, ("operator".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "values".into(),
+                            FieldType::Repeated(Box::new(FieldType::Int)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodFailurePolicyOnPodConditionsPattern".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodFailurePolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("action".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "onExitCodes".into(),
+                            FieldType::Message("PodFailurePolicyOnExitCodesRequirement".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "onPodConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PodFailurePolicyOnPodConditionsPattern".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SuccessPolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("succeededIndexes".into(), FieldType::String)),
+                    (2, ("succeededCount".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "UncountedTerminatedPods".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "succeeded".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "failed".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
                 ]),
             },
         );
