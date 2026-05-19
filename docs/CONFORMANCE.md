@@ -277,6 +277,18 @@ E2E_CONTAINER=$(docker ps --filter name=e2e -q)
 docker cp "$E2E_CONTAINER:/tmp/sonobuoy/results/e2e.log" /tmp/e2e-results.log
 ```
 
+## Per-test failure files
+
+After `bash scripts/run-conformance.sh` finishes, extract one text file per failing test:
+
+```bash
+bash scripts/conformance-split-junit.sh                      # failures only
+bash scripts/conformance-split-junit.sh --all                # every testcase
+bash scripts/conformance-split-junit.sh --input path/to/junit_01.xml
+```
+
+Output lands in `.rusternetes/volumes/conformance-per-test/` with an `INDEX.md` summary. Each file is self-contained: test name, status, failure message, system-out tail, and pointers to related `docs/conformance/*.md` matrices. Useful as the per-task input when dispatching a Claude Code worker to investigate a single failure.
+
 KUBECONFIG: `~/.kube/rusternetes-config`
 
 ## References
