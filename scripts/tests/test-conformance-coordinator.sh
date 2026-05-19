@@ -27,7 +27,10 @@ assert_eq() {
         echo "  FAIL: $label"
         echo "    expected: $(printf '%q' "$expected")"
         echo "    actual:   $(printf '%q' "$actual")"
-        return 1
+        # `exit` (not `return`) so a failed assertion inside a test
+        # subshell kills that subshell and surfaces to the runner.
+        # `return 1` would only be swallowed by the next statement.
+        exit 1
     fi
 }
 
@@ -41,7 +44,7 @@ assert_contains() {
             echo "  FAIL: $label"
             echo "    expected substring: $(printf '%q' "$needle")"
             echo "    actual:             $(printf '%q' "$haystack")"
-            return 1
+            exit 1
             ;;
     esac
 }
@@ -276,6 +279,127 @@ test_update_releases_test_when_gh_reports_closed_unmerged() {
     assert_eq "null" "$pr_url" "pr_url cleared on close"
 }
 
+# Create a stub single-test-runner script that records its CLI args to
+# $STUB_LOG and exits with the configured code. The caller can read
+# $STUB_LOG afterward to assert what arguments the coordinator passed.
+with_single_test_stub() {
+    local exit_code="$1"
+    local stubdir
+    stubdir=$(mktemp -d)
+    STUB_LOG="$stubdir/args.log"
+    cat > "$stubdir/single-test-stub.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$STUB_LOG"
+exit $exit_code
+EOF
+    chmod +x "$stubdir/single-test-stub.sh"
+    SINGLE_TEST_STUB="$stubdir/single-test-stub.sh"
+    SINGLE_TEST_STUB_DIR="$stubdir"
+}
+
+cleanup_single_test_stub() {
+    [ -n "${SINGLE_TEST_STUB_DIR:-}" ] || return 0
+    rm -rf "$SINGLE_TEST_STUB_DIR"
+    SINGLE_TEST_STUB_DIR=""
+}
+
+test_verify_marks_verified_when_runner_exits_zero() {
+    make_per_test_dir "$PERTEST"
+    run_coordinator init >/dev/null
+    local name
+    name=$(run_coordinator next | head -n1)
+    run_coordinator claim "$name" --pr-url "https://github.com/x/y/pull/42" >/dev/null
+    with_single_test_stub 0
+    run_coordinator verify "$name" --single-test-script "$SINGLE_TEST_STUB" >/dev/null
+    local status
+    status=$(jq -r --arg n "$name" '.tests[$n].status' "$STATE")
+    assert_eq "verified" "$status" "verify -> verified on runner exit 0"
+    cleanup_single_test_stub
+}
+
+test_verify_passes_upstream_name_to_runner() {
+    make_per_test_dir "$PERTEST"
+    run_coordinator init >/dev/null
+    local name
+    name=$(run_coordinator next | head -n1)
+    local upstream
+    upstream=$(jq -r --arg n "$name" '.tests[$n].upstream_name' "$STATE")
+    with_single_test_stub 0
+    run_coordinator verify "$name" --single-test-script "$SINGLE_TEST_STUB" >/dev/null
+    local first_arg
+    first_arg=$(head -n1 "$STUB_LOG")
+    assert_eq "$upstream" "$first_arg" "runner invoked with upstream name"
+    cleanup_single_test_stub
+}
+
+test_verify_leaves_state_alone_when_runner_fails() {
+    make_per_test_dir "$PERTEST"
+    run_coordinator init >/dev/null
+    local name
+    name=$(run_coordinator next | head -n1)
+    run_coordinator claim "$name" --pr-url "https://github.com/x/y/pull/42" >/dev/null
+    local before
+    before=$(jq -r --arg n "$name" '.tests[$n].status' "$STATE")
+    assert_eq "pr_open" "$before" "precondition pr_open"
+
+    with_single_test_stub 1
+    if run_coordinator verify "$name" --single-test-script "$SINGLE_TEST_STUB" >/dev/null 2>&1; then
+        echo "  FAIL: verify exited 0 when runner failed"
+        cleanup_single_test_stub
+        return 1
+    fi
+    cleanup_single_test_stub
+
+    local after
+    after=$(jq -r --arg n "$name" '.tests[$n].status' "$STATE")
+    assert_eq "pr_open" "$after" "status unchanged on runner failure"
+}
+
+test_verify_errors_when_test_unknown() {
+    make_per_test_dir "$PERTEST"
+    run_coordinator init >/dev/null
+    with_single_test_stub 0
+    if run_coordinator verify "nonexistent-test-name" \
+        --single-test-script "$SINGLE_TEST_STUB" >/dev/null 2>&1; then
+        echo "  FAIL: verify accepted unknown test name"
+        cleanup_single_test_stub
+        return 1
+    fi
+    # Runner must NOT have been invoked.
+    [ ! -f "${STUB_LOG:-/dev/null}" ] || {
+        echo "  FAIL: runner was invoked for unknown test"
+        cleanup_single_test_stub
+        return 1
+    }
+    cleanup_single_test_stub
+}
+
+test_verify_errors_when_no_name_given() {
+    with_single_test_stub 0
+    if run_coordinator verify --single-test-script "$SINGLE_TEST_STUB" >/dev/null 2>&1; then
+        echo "  FAIL: verify with no NAME succeeded"
+        cleanup_single_test_stub
+        return 1
+    fi
+    cleanup_single_test_stub
+}
+
+test_verify_records_verified_at_timestamp() {
+    make_per_test_dir "$PERTEST"
+    run_coordinator init >/dev/null
+    local name
+    name=$(run_coordinator next | head -n1)
+    with_single_test_stub 0
+    run_coordinator verify "$name" --single-test-script "$SINGLE_TEST_STUB" >/dev/null
+    cleanup_single_test_stub
+    local verified_at
+    verified_at=$(jq -r --arg n "$name" '.tests[$n].verified_at // empty' "$STATE")
+    [ -n "$verified_at" ] || {
+        echo "  FAIL: verified_at not recorded"
+        return 1
+    }
+}
+
 # ----- Runner -----
 
 run_all_tests() {
@@ -288,7 +412,14 @@ run_all_tests() {
         STATE="$tmpdir/state.json"
         PERTEST="$tmpdir/per-test"
         echo "RUN  $t"
-        if (set -e; "$t"); then
+        # Run each test in its own subshell so that `exit 1` from a
+        # failed assertion kills only that test, not the runner. The
+        # subshell's exit code is captured into $rc separately from any
+        # surrounding `if`/`||` context, which keeps bash's errexit
+        # semantics intact inside the subshell.
+        local rc=0
+        ( "$t" ) || rc=$?
+        if [ "$rc" -eq 0 ]; then
             echo "PASS $t"
             PASS_COUNT=$((PASS_COUNT + 1))
         else

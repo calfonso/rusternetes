@@ -43,6 +43,15 @@ Subcommands:
   claim NAME --pr-url URL   Record a PR URL for NAME and flip status to "pr_open".
   release NAME              Flip NAME's status back to "fail".
   mark-done NAME            Flip NAME's status to "verified" (shadow check passed).
+  verify NAME [flags]       Run scripts/conformance-single-test.sh against the
+                            upstream test name from NAME's entry. Flips status
+                            to "verified" iff the runner exits 0; otherwise
+                            leaves state unchanged and exits non-zero.
+                            Flags:
+                              --single-test-script PATH  Override runner path
+                                                         (default: adjacent
+                                                         conformance-single-test.sh)
+                              --output-dir DIR           Forwarded to the runner
   update                    For each pr_open entry, query GitHub via 'gh pr view'
                             and advance status: MERGED -> pr_merged, CLOSED -> fail
                             (with pr_url cleared), OPEN -> unchanged.
@@ -274,6 +283,69 @@ cmd_mark_done() {
         --arg now "$(now_iso)"
 }
 
+cmd_verify() {
+    [ $# -ge 1 ] || { echo "error: verify requires NAME" >&2; exit 2; }
+    case "$1" in
+        -*) echo "error: verify requires NAME (got flag $1)" >&2; exit 2 ;;
+    esac
+    local name="$1"; shift
+    local script_path=""
+    local output_dir=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --single-test-script)
+                [ $# -ge 2 ] || { echo "error: --single-test-script requires a value" >&2; exit 2; }
+                script_path="$2"; shift 2 ;;
+            --output-dir)
+                [ $# -ge 2 ] || { echo "error: --output-dir requires a value" >&2; exit 2; }
+                output_dir="$2"; shift 2 ;;
+            *) echo "error: unknown arg to verify: $1" >&2; exit 2 ;;
+        esac
+    done
+    ensure_state_exists
+    jq -e --arg n "$name" '.tests | has($n)' "$STATE" >/dev/null || {
+        echo "error: no such test: $name" >&2
+        exit 1
+    }
+    local upstream
+    upstream=$(jq -r --arg n "$name" '.tests[$n].upstream_name' "$STATE")
+    [ -n "$upstream" ] && [ "$upstream" != "null" ] || {
+        echo "error: no upstream_name recorded for $name" >&2
+        exit 1
+    }
+    # Resolve runner script path: explicit flag wins, else look adjacent
+    # to this coordinator script.
+    if [ -z "$script_path" ]; then
+        local self_dir
+        self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+        script_path="$self_dir/conformance-single-test.sh"
+    fi
+    [ -x "$script_path" ] || [ -f "$script_path" ] || {
+        echo "error: single-test runner not found at $script_path" >&2
+        exit 1
+    }
+    # Run the shadow check. Disable errexit around the runner so we can
+    # capture the exit code and decide whether to advance state.
+    set +e
+    if [ -n "$output_dir" ]; then
+        bash "$script_path" "$upstream" --output-dir "$output_dir"
+    else
+        bash "$script_path" "$upstream"
+    fi
+    local runner_exit=$?
+    set -e
+    if [ "$runner_exit" -ne 0 ]; then
+        echo "verify: runner exited $runner_exit for $name — leaving state unchanged" >&2
+        exit 1
+    fi
+    update_state \
+        '.tests[$n].status = "verified"
+         | .tests[$n].verified_at = $now
+         | .tests[$n].updated_at = $now
+         | .updated_at = $now' \
+        --arg n "$name" --arg now "$(now_iso)"
+}
+
 cmd_update() {
     ensure_state_exists
     command -v gh >/dev/null 2>&1 || {
@@ -362,6 +434,7 @@ case "$SUBCOMMAND" in
     claim) cmd_claim "$@" ;;
     release) cmd_release "$@" ;;
     mark-done) cmd_mark_done "$@" ;;
+    verify) cmd_verify "$@" ;;
     update) cmd_update "$@" ;;
     status) cmd_status "$@" ;;
     list) cmd_list "$@" ;;
