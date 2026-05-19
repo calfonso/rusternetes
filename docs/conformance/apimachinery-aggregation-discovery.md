@@ -30,7 +30,7 @@ are exercised by the unignored tests and currently PASS.
 | `Aggregator — /apis/apiregistration.k8s.io/v1 exposes apiservices` (prereq) | aggregator.go:382 | PASS | `discovery_apiregistration_v1_lists_apiservices_resource` | mirrored, passing |
 | `Aggregated Discovery V2 — /apis negotiated via Accept` | discovery.go:149 (dynamic client) | PASS | `discovery_aggregated_v2_negotiated_via_accept_header` | mirrored, passing |
 | `Aggregated Discovery V2 — core /api leg` | discovery.go:149 (dynamic client) | PASS | `discovery_aggregated_v2_on_core_api` | mirrored, passing |
-| `Aggregator Should be able to support the 1.17 Sample API Server using the current Aggregator [LinuxOnly]` | aggregator.go:102 | **FAIL** ("deploying extension apiserver in namespace aggregator-...: error waiting for deployment ... to match expectation" — aggregator.go:359) | `aggregator_sample_apiserver_full_lifecycle` | mirrored, ignored (tracks failure) |
+| `Aggregator Should be able to support the 1.17 Sample API Server using the current Aggregator [LinuxOnly]` | aggregator.go:102 | **FAIL** ("deploying extension apiserver in namespace aggregator-...: error waiting for deployment ... to match expectation" — aggregator.go:359) | `aggregator_sample_apiserver_full_lifecycle` | mirrored, **passing** (Layer B); Sonobuoy/Layer A still FAIL on kubelet image pull |
 | `Aggregator — create local APIService seeds Available=True` | aggregator.go:382 | PASS | `aggregator_create_local_apiservice_returns_available_true` | mirrored, passing |
 | `Aggregator — create remote APIService seeds Available=Unknown` | aggregator.go:382 | PASS | `aggregator_create_remote_apiservice_seeds_available_unknown` | mirrored, passing |
 | `Aggregator — registered APIService appears in /apis discovery merge` | aggregator.go (implicit, dynamic client at ~348) | PASS | `aggregator_registered_apiservice_appears_in_discovery` | mirrored, passing |
@@ -38,24 +38,39 @@ are exercised by the unignored tests and currently PASS.
 
 ## Notes on the FAIL bucket
 
-The single ignored test (`aggregator_sample_apiserver_full_lifecycle`)
-corresponds to the upstream `TestSampleAPIServer` function (~19 sub-assertions
-spanning lines 285–541). The Sonobuoy failure observed in Round 160 is
+`aggregator_sample_apiserver_full_lifecycle` is the Layer B mirror of the
+upstream `TestSampleAPIServer` function (~19 sub-assertions spanning
+aggregator.go:285–541). The Sonobuoy failure observed in Round 160 is
 **not** a defect in the aggregator REST surface — it is the upstream test
 helper `SetUpSampleAPIServer()` waiting for the `sample-apiserver-deployment`
 Pod to reach `Ready`, which times out at `aggregator.go:359` because our
 kubelet cannot pull / start the upstream `registry.k8s.io/e2e-test-images/sample-apiserver`
-image in the test environment. The aggregator REST CRUD, discovery merge, and
-HTTP-level proxy primitives are covered by:
+image in the test environment.
 
-- the unignored aggregator tests in this file, and
-- `crates/api-server/tests/aggregator_test.rs` (proxy header forwarding, CA
-  bundle decode, target resolution, query-string fidelity, 503 on backend
-  down).
+The Layer B mirror ports the REST + discovery + proxy slice of those 19
+sub-assertions and runs against `MemoryStorage` + a warp mock backend.
+Sub-assertions covered:
 
-Once the kubelet image-pull / Pod readiness issue is fixed, the
-`aggregator_sample_apiserver_full_lifecycle` test will be unignored and
-fleshed out with the 19 sub-assertions enumerated above.
+1. APIService creation via `POST /apis/apiregistration.k8s.io/v1/apiservices` (201).
+2. Remote APIService status seed: `Available=Unknown,reason=Pending`.
+3. `PUT .../status` transitions Available → True (controller probe success).
+4. Discovery merge: registered group appears in `GET /apis`.
+5. Proxy: `forward_to_aggregator` against a warp mock preserves path, query
+   string, and `X-Remote-User` impersonation.
+6. 503 when the backing Service has no ClusterIP (resolver error path).
+7. APIService DELETE removes the group from `GET /apis`.
+
+Sub-assertions **skipped** in the mirror (require a real kubelet — Layer A):
+
+- Image pull / Pod-ready gating for `e2e-test-images/sample-apiserver`.
+- Deployment ready-replica count.
+- mTLS handshake against a CSR-signed backend cert.
+- Etcd-backed flunder CRUD persistence across api-server restarts.
+
+The aggregator REST CRUD, discovery merge, and HTTP-level proxy primitives
+are also exercised by `crates/api-server/tests/aggregator_test.rs` (proxy
+header forwarding, CA bundle decode, target resolution, query-string fidelity,
+503 on backend down) and `apiservices_routing_test.rs` (route wiring).
 
 ## Known side-issue uncovered while writing this suite
 
