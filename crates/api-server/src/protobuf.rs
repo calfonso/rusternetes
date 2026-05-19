@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_networking_v1(&mut schemas);
         Self::register_autoscaling_v2(&mut schemas);
         Self::register_batch_v1(&mut schemas);
         Self::register_core_v1_container_runtime(&mut schemas);
@@ -2388,6 +2389,575 @@ impl ProtoRegistry {
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
                 ]),
+            },
+        );
+    }
+
+    fn register_networking_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // ----- Kinds -----
+
+        // IPAddress
+        schemas.insert(
+            "IPAddress".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("IPAddressSpec".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // Ingress
+        schemas.insert(
+            "Ingress".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("IngressSpec".into()))),
+                    (
+                        3,
+                        ("status".into(), FieldType::Message("IngressStatus".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressClass
+        schemas.insert(
+            "IngressClass".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("IngressClassSpec".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // NetworkPolicy
+        schemas.insert(
+            "NetworkPolicy".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("NetworkPolicySpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ServiceCIDR
+        schemas.insert(
+            "ServiceCIDR".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("ServiceCIDRSpec".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("ServiceCIDRStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ----- Nested messages -----
+
+        // HTTPIngressPath
+        schemas.insert(
+            "HTTPIngressPath".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (3, ("pathType".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "backend".into(),
+                            FieldType::Message("IngressBackend".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // HTTPIngressRuleValue
+        schemas.insert(
+            "HTTPIngressRuleValue".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "paths".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("HTTPIngressPath".into()))),
+                    ),
+                )]),
+            },
+        );
+
+        // IPAddressSpec
+        schemas.insert(
+            "IPAddressSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "parentRef".into(),
+                        FieldType::Message("ParentReference".into()),
+                    ),
+                )]),
+            },
+        );
+
+        // IPBlock
+        schemas.insert(
+            "IPBlock".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("cidr".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "except".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressBackend
+        // `resource` references core/v1.TypedLocalObjectReference, which is
+        // already registered earlier in `new()`.
+        schemas.insert(
+            "IngressBackend".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        4,
+                        (
+                            "service".into(),
+                            FieldType::Message("IngressServiceBackend".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resource".into(),
+                            FieldType::Message("TypedLocalObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressClassParametersReference
+        schemas.insert(
+            "IngressClassParametersReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("apiGroup".into(), FieldType::String)),
+                    (2, ("kind".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                    (4, ("scope".into(), FieldType::String)),
+                    (5, ("namespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // IngressClassSpec
+        schemas.insert(
+            "IngressClassSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("controller".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "parameters".into(),
+                            FieldType::Message("IngressClassParametersReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressLoadBalancerIngress
+        schemas.insert(
+            "IngressLoadBalancerIngress".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("ip".into(), FieldType::String)),
+                    (2, ("hostname".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "IngressPortStatus".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressLoadBalancerStatus
+        schemas.insert(
+            "IngressLoadBalancerStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "ingress".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "IngressLoadBalancerIngress".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+
+        // IngressPortStatus
+        schemas.insert(
+            "IngressPortStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("port".into(), FieldType::Int)),
+                    (2, ("protocol".into(), FieldType::String)),
+                    (3, ("error".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // IngressRule
+        schemas.insert(
+            "IngressRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("host".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "ingressRuleValue".into(),
+                            FieldType::Message("IngressRuleValue".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressRuleValue
+        schemas.insert(
+            "IngressRuleValue".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "http".into(),
+                        FieldType::Message("HTTPIngressRuleValue".into()),
+                    ),
+                )]),
+            },
+        );
+
+        // IngressServiceBackend
+        schemas.insert(
+            "IngressServiceBackend".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "port".into(),
+                            FieldType::Message("ServiceBackendPort".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressSpec
+        schemas.insert(
+            "IngressSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (4, ("ingressClassName".into(), FieldType::String)),
+                    (
+                        1,
+                        (
+                            "defaultBackend".into(),
+                            FieldType::Message("IngressBackend".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "tls".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("IngressTLS".into()))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("IngressRule".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // IngressStatus
+        schemas.insert(
+            "IngressStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "loadBalancer".into(),
+                        FieldType::Message("IngressLoadBalancerStatus".into()),
+                    ),
+                )]),
+            },
+        );
+
+        // IngressTLS
+        schemas.insert(
+            "IngressTLS".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "hosts".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("secretName".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // NetworkPolicyEgressRule
+        schemas.insert(
+            "NetworkPolicyEgressRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NetworkPolicyPort".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "to".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NetworkPolicyPeer".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // NetworkPolicyIngressRule
+        schemas.insert(
+            "NetworkPolicyIngressRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NetworkPolicyPort".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "from".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NetworkPolicyPeer".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // NetworkPolicyPeer
+        // `podSelector` and `namespaceSelector` reference apimachinery
+        // LabelSelector, which is already registered in `new()`.
+        schemas.insert(
+            "NetworkPolicyPeer".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "podSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "namespaceSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (3, ("ipBlock".into(), FieldType::Message("IPBlock".into()))),
+                ]),
+            },
+        );
+
+        // NetworkPolicyPort
+        schemas.insert(
+            "NetworkPolicyPort".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("protocol".into(), FieldType::String)),
+                    (2, ("port".into(), FieldType::IntOrString)),
+                    (3, ("endPort".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // NetworkPolicySpec
+        schemas.insert(
+            "NetworkPolicySpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "podSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "ingress".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NetworkPolicyIngressRule".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "egress".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NetworkPolicyEgressRule".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "policyTypes".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ParentReference
+        schemas.insert(
+            "ParentReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("group".into(), FieldType::String)),
+                    (2, ("resource".into(), FieldType::String)),
+                    (3, ("namespace".into(), FieldType::String)),
+                    (4, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ServiceBackendPort
+        // The proto defines `number: int32` and `name: string` as two
+        // separate (mutually-exclusive) fields — not a oneof / IntOrString.
+        schemas.insert(
+            "ServiceBackendPort".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("number".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // ServiceCIDRSpec
+        schemas.insert(
+            "ServiceCIDRSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "cidrs".into(),
+                        FieldType::Repeated(Box::new(FieldType::String)),
+                    ),
+                )]),
+            },
+        );
+
+        // ServiceCIDRStatus
+        // `conditions` references apimachinery `Condition`. That type is
+        // not yet registered in the registry; it will decode to `{}` until
+        // a future apimachinery/meta/v1 pass registers it.
+        schemas.insert(
+            "ServiceCIDRStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "conditions".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                    ),
+                )]),
             },
         );
     }
