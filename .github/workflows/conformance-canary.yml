@@ -43,8 +43,10 @@ env:
   # compose.dind.yml override makes every rusternetes service use it.
   DOCKER_HOST: unix:///var/run/docker.sock
   # The conformance image is small (~270 MiB) and pinning the version
-  # avoids surprise upgrades. v1.32 matches docs/CONFORMANCE.md.
-  CONFORMANCE_IMAGE: registry.k8s.io/conformance:v1.32.0
+  # avoids surprise upgrades. v1.35 is the rusternetes target line —
+  # keep this in sync with KUBECTL_VERSION below and any docs that
+  # quote the conformance minor.
+  CONFORMANCE_IMAGE: registry.k8s.io/conformance:v1.35.0
   # Pin Hydrophone to a known release so a tag-rename upstream doesn't
   # silently break the workflow.
   HYDROPHONE_VERSION: v0.7.0
@@ -164,13 +166,13 @@ jobs:
         # The ARC runner image (ci/arc-runner/Dockerfile) bakes Rust + protoc
         # + docker-compose but not kubectl, so `kubectl ... 2>/dev/null`
         # silently 127's and any wait-loop spins forever (run 26127584434
-        # timed out for exactly this reason). Pin to v1.32 to match the
+        # timed out for exactly this reason). Pin to v1.35 to match the
         # conformance image so kubectl never lags the cluster API surface.
         # Drop into the runner user's local bin and append to GITHUB_PATH
         # — no sudo (the runner image's sudo config is not guaranteed).
         run: |
           set -euo pipefail
-          KUBECTL_VERSION="v1.32.0"
+          KUBECTL_VERSION="v1.35.0"
           mkdir -p "$HOME/.local/bin"
           curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
             "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \

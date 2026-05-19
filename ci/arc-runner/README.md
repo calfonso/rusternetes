@@ -76,7 +76,7 @@ multi-week refactor; DinD is the pragmatic path until then.
 
 ## Build cache + image pull
 
-The conformance image (`registry.k8s.io/conformance:v1.32.0`, ~270 MiB)
+The conformance image (`registry.k8s.io/conformance:v1.35.0`, ~270 MiB)
 and the rusternetes layer set get pulled fresh on each cold runner.
 First runs take ~5 minutes longer than steady-state. Baking the
 conformance image into the DinD daemon at startup is a known follow-up.
