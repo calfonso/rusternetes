@@ -5318,6 +5318,137 @@ impl ProtoRegistry {
                 ]),
             },
         );
+
+        // ContainerState — the per-container state holder. Wire-format is
+        // a normal protobuf message with three optional sub-state fields;
+        // upstream's "+optional" semantics mean at most one is populated
+        // at any time, but the registry only cares about the field
+        // numbers + types. PR #141 added the three sub-state messages
+        // (ContainerStateRunning/Waiting/Terminated) but explicitly
+        // deferred this holder; without it, anything decoding a parent
+        // that embeds `state` (most notably `ContainerStatus.state` at
+        // field 2 below) gets `{}` for that field.
+        //
+        // K8s ref: k8s.io/api/core/v1/generated.proto:1083 (release-1.35).
+        schemas.insert(
+            "ContainerState".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "waiting".into(),
+                            FieldType::Message("ContainerStateWaiting".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "running".into(),
+                            FieldType::Message("ContainerStateRunning".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "terminated".into(),
+                            FieldType::Message("ContainerStateTerminated".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ContainerStatus — the per-container status surface that the
+        // kubelet writes on every Pod sync. Without this schema,
+        // pod.status.containerStatuses entries decode as `{}` over
+        // protobuf; today this is masked by the kubelet running with
+        // `--kube-api-content-type=application/json` (see
+        // scripts/run-conformance.sh) but any client that ignores the
+        // override (or any future flip to protobuf-by-default) would
+        // lose every container status field.
+        //
+        // Field 10 (allocatedResources) is `map<string, Quantity>`;
+        // omitted because the registry has no `FieldType::Quantity`
+        // variant yet (consistent with how PR #141 treats Quantity
+        // fields elsewhere).
+        //
+        // K8s ref: k8s.io/api/core/v1/generated.proto:1095 (release-1.35).
+        schemas.insert(
+            "ContainerStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        ("state".into(), FieldType::Message("ContainerState".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "lastState".into(),
+                            FieldType::Message("ContainerState".into()),
+                        ),
+                    ),
+                    (4, ("ready".into(), FieldType::Bool)),
+                    (5, ("restartCount".into(), FieldType::Int)),
+                    (6, ("image".into(), FieldType::String)),
+                    (7, ("imageID".into(), FieldType::String)),
+                    (8, ("containerID".into(), FieldType::String)),
+                    (9, ("started".into(), FieldType::Bool)),
+                    // 10: allocatedResources — map<string, Quantity>, not
+                    //     representable; intentionally skipped.
+                    (
+                        11,
+                        (
+                            "resources".into(),
+                            FieldType::Message("ResourceRequirements".into()),
+                        ),
+                    ),
+                    (
+                        12,
+                        (
+                            "volumeMounts".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "VolumeMountStatus".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        13,
+                        ("user".into(), FieldType::Message("ContainerUser".into())),
+                    ),
+                    (
+                        14,
+                        (
+                            "allocatedResourcesStatus".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ResourceStatus".into(),
+                            ))),
+                        ),
+                    ),
+                    (15, ("stopSignal".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // VolumeMountStatus — referenced by ContainerStatus.volumeMounts
+        // at field 12 above. Four scalar fields; trivial to register and
+        // closes the only nested-message gap that ContainerStatus would
+        // otherwise leave decoded as `{}`.
+        //
+        // K8s ref: k8s.io/api/core/v1/generated.proto (release-1.35).
+        schemas.insert(
+            "VolumeMountStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("mountPath".into(), FieldType::String)),
+                    (3, ("readOnly".into(), FieldType::Bool)),
+                    (4, ("recursiveReadOnly".into(), FieldType::String)),
+                ]),
+            },
+        );
     }
 
     fn register_core_v1_kinds(schemas: &mut HashMap<String, MessageSchema>) {
