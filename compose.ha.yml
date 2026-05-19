@@ -120,7 +120,8 @@ services:
   api-server-1:
     build:
       context: .
-      dockerfile: Dockerfile.api-server
+      dockerfile: Dockerfile.services
+      target: api-server
     container_name: rusternetes-api-server-1
     ports:
       - "6444:6443"
@@ -151,7 +152,8 @@ services:
   api-server-2:
     build:
       context: .
-      dockerfile: Dockerfile.api-server
+      dockerfile: Dockerfile.services
+      target: api-server
     container_name: rusternetes-api-server-2
     ports:
       - "6445:6443"
@@ -182,7 +184,8 @@ services:
   api-server-3:
     build:
       context: .
-      dockerfile: Dockerfile.api-server
+      dockerfile: Dockerfile.services
+      target: api-server
     container_name: rusternetes-api-server-3
     ports:
       - "6446:6443"
@@ -214,7 +217,8 @@ services:
   scheduler-1:
     build:
       context: .
-      dockerfile: Dockerfile.scheduler
+      dockerfile: Dockerfile.services
+      target: scheduler
     container_name: rusternetes-scheduler-1
     depends_on:
       - etcd-1
@@ -234,7 +238,8 @@ services:
   scheduler-2:
     build:
       context: .
-      dockerfile: Dockerfile.scheduler
+      dockerfile: Dockerfile.services
+      target: scheduler
     container_name: rusternetes-scheduler-2
     depends_on:
       - etcd-1
@@ -255,7 +260,8 @@ services:
   controller-manager-1:
     build:
       context: .
-      dockerfile: Dockerfile.controller-manager
+      dockerfile: Dockerfile.services
+      target: controller-manager
     container_name: rusternetes-controller-manager-1
     depends_on:
       - etcd-1
@@ -275,7 +281,8 @@ services:
   controller-manager-2:
     build:
       context: .
-      dockerfile: Dockerfile.controller-manager
+      dockerfile: Dockerfile.services
+      target: controller-manager
     container_name: rusternetes-controller-manager-2
     depends_on:
       - etcd-1
@@ -296,7 +303,8 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.kubelet
+      dockerfile: Dockerfile.services
+      target: kubelet
     container_name: rusternetes-kubelet
     privileged: true
     depends_on:
@@ -321,7 +329,8 @@ services:
   kube-proxy:
     build:
       context: .
-      dockerfile: Dockerfile.kube-proxy
+      dockerfile: Dockerfile.services
+      target: kube-proxy
     container_name: rusternetes-kube-proxy
     privileged: true
     depends_on:

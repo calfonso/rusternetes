@@ -145,13 +145,12 @@ See ARCHITECTURE.md for the system overview. Priority items:
 
 ```
 rusternetes/
-├── Dockerfile                    # Base multi-component Dockerfile
-├── Dockerfile.api-server         # API Server image
-├── Dockerfile.scheduler          # Scheduler image
-├── Dockerfile.controller-manager # Controller Manager image
-├── Dockerfile.kubelet           # Kubelet image
-├── Dockerfile.kube-proxy        # Kube-proxy image
-├── Dockerfile.kubectl           # kubectl CLI image
+├── Dockerfile                    # Generic builder (--build-arg COMPONENT=<bin>)
+├── Dockerfile.services           # Shared multi-stage build for api-server,
+│                                 # kubelet, scheduler, controller-manager,
+│                                 # kube-proxy (single cargo invocation)
+├── Dockerfile.kubectl            # kubectl CLI image
+├── Dockerfile.all-in-one         # Single-binary rusternetes image
 ├── docker-compose.yml           # Orchestration configuration
 ├── .dockerignore                # Docker build exclusions
 ├── scripts/

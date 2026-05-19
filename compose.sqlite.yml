@@ -44,7 +44,8 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.api-server
+      dockerfile: Dockerfile.services
+      target: api-server
     container_name: rusternetes-api-server
     ports:
       - "6443:6443"
@@ -81,7 +82,8 @@ services:
   scheduler:
     build:
       context: .
-      dockerfile: Dockerfile.scheduler
+      dockerfile: Dockerfile.services
+      target: scheduler
     container_name: rusternetes-scheduler
     depends_on:
       - rhino
@@ -96,7 +98,8 @@ services:
   controller-manager:
     build:
       context: .
-      dockerfile: Dockerfile.controller-manager
+      dockerfile: Dockerfile.services
+      target: controller-manager
     container_name: rusternetes-controller-manager
     depends_on:
       - rhino
@@ -113,7 +116,8 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.kubelet
+      dockerfile: Dockerfile.services
+      target: kubelet
     container_name: rusternetes-kubelet
     privileged: true
     depends_on:
@@ -137,7 +141,8 @@ services:
   kubelet2:
     build:
       context: .
-      dockerfile: Dockerfile.kubelet
+      dockerfile: Dockerfile.services
+      target: kubelet
     container_name: rusternetes-kubelet2
     privileged: true
     depends_on:
@@ -161,7 +166,8 @@ services:
   kube-proxy:
     build:
       context: .
-      dockerfile: Dockerfile.kube-proxy
+      dockerfile: Dockerfile.services
+      target: kube-proxy
     container_name: rusternetes-kube-proxy
     privileged: true
     network_mode: host
