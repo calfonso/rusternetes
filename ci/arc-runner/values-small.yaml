@@ -30,10 +30,25 @@ controllerServiceAccount:
 
 template:
   spec:
+    # Pod-level security context. Same as values-large.yaml — runAsNonRoot
+    # satisfies the `restricted` Pod Security Standard; the upstream
+    # actions/runner image runs as user `runner` (uid 1001).
+    securityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
     containers:
       - name: runner
         image: ghcr.io/indyjonesnl/rusternetes-arc-runner:latest
         command: ["/home/runner/run.sh"]
+        # Container-level security context — see values-large.yaml for
+        # the full rationale. Identical block here so the small tier
+        # gets the same hardening; both tiers run the same image and
+        # neither needs Linux capabilities or privilege escalation.
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         env:
           # Clippy / fmt don't fan out wide enough for this to matter,
           # but keep the same cap as the large tier for consistency so
