@@ -2360,6 +2360,7 @@ impl ProtoRegistry {
         );
 
         Self::register_scheduling_v1(&mut schemas);
+        Self::register_core_v1_status_networking(&mut schemas);
         Self::register_apimachinery_meta_v1(&mut schemas);
         Self::register_networking_v1(&mut schemas);
         Self::register_autoscaling_v2(&mut schemas);
@@ -2389,6 +2390,496 @@ impl ProtoRegistry {
                     (3, ("globalDefault".into(), FieldType::Bool)),
                     (4, ("description".into(), FieldType::String)),
                     (5, ("preemptionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_core_v1_status_networking(schemas: &mut HashMap<String, MessageSchema>) {
+        // ---------- node-level status sub-messages ----------
+
+        schemas.insert(
+            "AttachedVolume".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("devicePath".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeAddress".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("address".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "lastHeartbeatTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeConfigSource".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    2,
+                    (
+                        "configMap".into(),
+                        FieldType::Message("ConfigMapNodeConfigSource".into()),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "NodeConfigStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "assigned".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "active".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "lastKnownGood".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (4, ("error".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeDaemonEndpoints".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "kubeletEndpoint".into(),
+                        FieldType::Message("DaemonEndpoint".into()),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "NodeFeatures".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("supplementalGroupsPolicy".into(), FieldType::Bool))]),
+            },
+        );
+        schemas.insert(
+            "NodeRuntimeHandler".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "features".into(),
+                            FieldType::Message("NodeRuntimeHandlerFeatures".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeRuntimeHandlerFeatures".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("recursiveReadOnlyMounts".into(), FieldType::Bool)),
+                    (2, ("userNamespaces".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeSwapStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("capacity".into(), FieldType::Int))]),
+            },
+        );
+        schemas.insert(
+            "NodeSystemInfo".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("machineID".into(), FieldType::String)),
+                    (2, ("systemUUID".into(), FieldType::String)),
+                    (3, ("bootID".into(), FieldType::String)),
+                    (4, ("kernelVersion".into(), FieldType::String)),
+                    (5, ("osImage".into(), FieldType::String)),
+                    (6, ("containerRuntimeVersion".into(), FieldType::String)),
+                    (7, ("kubeletVersion".into(), FieldType::String)),
+                    (8, ("kubeProxyVersion".into(), FieldType::String)),
+                    (9, ("operatingSystem".into(), FieldType::String)),
+                    (10, ("architecture".into(), FieldType::String)),
+                    (
+                        11,
+                        ("swap".into(), FieldType::Message("NodeSwapStatus".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // ---------- scheduling sub-messages ----------
+
+        schemas.insert(
+            "NodeSelector".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "nodeSelectorTerms".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "NodeSelectorTerm".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "NodeSelectorRequirement".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("operator".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "values".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeSelectorTerm".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "matchExpressions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeSelectorRequirement".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "matchFields".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeSelectorRequirement".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodAffinityTerm".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "labelSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "namespaces".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (3, ("topologyKey".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "namespaceSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "matchLabelKeys".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "mismatchLabelKeys".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "Taint".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("value".into(), FieldType::String)),
+                    (3, ("effect".into(), FieldType::String)),
+                    (4, ("timeAdded".into(), FieldType::Message("Time".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "TopologySelectorLabelRequirement".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "values".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "TopologySelectorTerm".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "matchLabelExpressions".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "TopologySelectorLabelRequirement".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+
+        // ---------- pod / replication-controller condition + identity ----------
+
+        schemas.insert(
+            "PodCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        ("lastProbeTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                    (7, ("observedGeneration".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodIP".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("ip".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "PodOS".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "PodReadinessGate".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("conditionType".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "ReplicationControllerCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (4, ("reason".into(), FieldType::String)),
+                    (5, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ---------- service / endpoint / load-balancer networking ----------
+
+        schemas.insert(
+            "ClientIPConfig".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("timeoutSeconds".into(), FieldType::Int))]),
+            },
+        );
+        schemas.insert(
+            "EndpointAddress".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("ip".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "targetRef".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (3, ("hostname".into(), FieldType::String)),
+                    (4, ("nodeName".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EndpointPort".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("port".into(), FieldType::Int)),
+                    (3, ("protocol".into(), FieldType::String)),
+                    (4, ("appProtocol".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "HostAlias".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("ip".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "hostnames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "IPBlock".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("cidr".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "except".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LoadBalancerIngress".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("ip".into(), FieldType::String)),
+                    (2, ("hostname".into(), FieldType::String)),
+                    (3, ("ipMode".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PortStatus".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LoadBalancerStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "ingress".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "LoadBalancerIngress".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "PortStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("port".into(), FieldType::Int)),
+                    (2, ("protocol".into(), FieldType::String)),
+                    (3, ("error".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ---------- volume projection ----------
+
+        schemas.insert(
+            "ClusterTrustBundleProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("signerName".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "labelSelector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (4, ("path".into(), FieldType::String)),
+                    (5, ("optional".into(), FieldType::Bool)),
                 ]),
             },
         );
