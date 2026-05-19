@@ -2373,6 +2373,7 @@ impl ProtoRegistry {
         Self::register_discovery_v1(&mut schemas);
         Self::register_core_v1_cloud_volume_sources(&mut schemas);
         Self::register_apiregistration_v1(&mut schemas);
+        Self::register_storage_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -7962,6 +7963,293 @@ impl ProtoRegistry {
                     (1, ("namespace".into(), FieldType::String)),
                     (2, ("name".into(), FieldType::String)),
                     (3, ("port".into(), FieldType::Int)),
+                ]),
+            },
+        );
+    }
+
+    fn register_storage_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // ----- Kinds -----
+
+        schemas.insert(
+            "StorageClass".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("provisioner".into(), FieldType::String)),
+                    (3, ("parameters".into(), FieldType::StringMap)),
+                    (4, ("reclaimPolicy".into(), FieldType::String)),
+                    (
+                        5,
+                        (
+                            "mountOptions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (6, ("allowVolumeExpansion".into(), FieldType::Bool)),
+                    (7, ("volumeBindingMode".into(), FieldType::String)),
+                    (
+                        8,
+                        (
+                            "allowedTopologies".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "TopologySelectorTerm".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VolumeAttachment".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("VolumeAttachmentSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("VolumeAttachmentStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VolumeAttributesClass".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("driverName".into(), FieldType::String)),
+                    (3, ("parameters".into(), FieldType::StringMap)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CSIDriver".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("CSIDriverSpec".into())),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CSINode".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("CSINodeSpec".into()))),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CSIStorageCapacity".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "nodeTopology".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
+                    (3, ("storageClassName".into(), FieldType::String)),
+                    // field 4 = capacity (Quantity) — skipped; see fn doc
+                    // field 5 = maximumVolumeSize (Quantity) — skipped; see fn doc
+                ]),
+            },
+        );
+
+        // ----- Nested messages -----
+
+        schemas.insert(
+            "CSIDriverSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("attachRequired".into(), FieldType::Bool)),
+                    (2, ("podInfoOnMount".into(), FieldType::Bool)),
+                    (
+                        3,
+                        (
+                            "volumeLifecycleModes".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (4, ("storageCapacity".into(), FieldType::Bool)),
+                    (5, ("fsGroupPolicy".into(), FieldType::String)),
+                    (
+                        6,
+                        (
+                            "tokenRequests".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "TokenRequest".into(),
+                            ))),
+                        ),
+                    ),
+                    (7, ("requiresRepublish".into(), FieldType::Bool)),
+                    (8, ("seLinuxMount".into(), FieldType::Bool)),
+                    (
+                        9,
+                        ("nodeAllocatableUpdatePeriodSeconds".into(), FieldType::Int),
+                    ),
+                    (10, ("serviceAccountTokenInSecrets".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "CSINodeSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "drivers".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("CSINodeDriver".into()))),
+                    ),
+                )]),
+            },
+        );
+
+        schemas.insert(
+            "CSINodeDriver".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("nodeID".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "topologyKeys".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "allocatable".into(),
+                            FieldType::Message("VolumeNodeResources".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VolumeNodeResources".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("count".into(), FieldType::Int))]),
+            },
+        );
+
+        schemas.insert(
+            "TokenRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("audience".into(), FieldType::String)),
+                    (2, ("expirationSeconds".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VolumeAttachmentSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("attacher".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "source".into(),
+                            FieldType::Message("VolumeAttachmentSource".into()),
+                        ),
+                    ),
+                    (3, ("nodeName".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VolumeAttachmentSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("persistentVolumeName".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "inlineVolumeSpec".into(),
+                            FieldType::Message("PersistentVolumeSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VolumeAttachmentStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("attached".into(), FieldType::Bool)),
+                    (2, ("attachmentMetadata".into(), FieldType::StringMap)),
+                    (
+                        3,
+                        (
+                            "attachError".into(),
+                            FieldType::Message("VolumeError".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "detachError".into(),
+                            FieldType::Message("VolumeError".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "VolumeError".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("time".into(), FieldType::Message("Time".into()))),
+                    (2, ("message".into(), FieldType::String)),
+                    (3, ("errorCode".into(), FieldType::Int)),
                 ]),
             },
         );
