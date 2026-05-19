@@ -160,6 +160,25 @@ jobs:
           EOF
           echo "KUBECONFIG=$HOME/.kube/rusternetes-config" >> "$GITHUB_ENV"
 
+      - name: Install kubectl
+        # The ARC runner image (ci/arc-runner/Dockerfile) bakes Rust + protoc
+        # + docker-compose but not kubectl, so `kubectl ... 2>/dev/null`
+        # silently 127's and any wait-loop spins forever (run 26127584434
+        # timed out for exactly this reason). Pin to v1.32 to match the
+        # conformance image so kubectl never lags the cluster API surface.
+        # Drop into the runner user's local bin and append to GITHUB_PATH
+        # — no sudo (the runner image's sudo config is not guaranteed).
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION="v1.32.0"
+          mkdir -p "$HOME/.local/bin"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+            -o "$HOME/.local/bin/kubectl"
+          chmod +x "$HOME/.local/bin/kubectl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/kubectl" version --client
+
       - name: Build images
         # Build before `up -d` so the up step is a fast container-start
         # rather than a slow build. Parallel build keeps wall time
@@ -175,7 +194,10 @@ jobs:
       - name: Wait for api-server health
         timeout-minutes: 3
         run: |
-          until kubectl get --raw=/healthz 2>/dev/null | grep -q ok; do
+          # Don't swallow kubectl stderr — if kubectl errors (missing
+          # binary, bad kubeconfig, connection refused) the loop must
+          # surface that in the workflow log instead of silently spinning.
+          until kubectl get --raw=/healthz 2>&1 | grep -q ok; do
             echo "waiting for api-server..."
             sleep 2
           done
