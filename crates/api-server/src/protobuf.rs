@@ -2372,6 +2372,7 @@ impl ProtoRegistry {
         Self::register_apps_v1(&mut schemas);
         Self::register_discovery_v1(&mut schemas);
         Self::register_core_v1_cloud_volume_sources(&mut schemas);
+        Self::register_apiregistration_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -7870,6 +7871,97 @@ impl ProtoRegistry {
                     (2, ("fsType".into(), FieldType::String)),
                     (3, ("storagePolicyName".into(), FieldType::String)),
                     (4, ("storagePolicyID".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    fn register_apiregistration_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "APIService".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("APIServiceSpec".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("APIServiceStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "APIServiceSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "service".into(),
+                            FieldType::Message("ServiceReference".into()),
+                        ),
+                    ),
+                    (2, ("group".into(), FieldType::String)),
+                    (3, ("version".into(), FieldType::String)),
+                    (4, ("insecureSkipTLSVerify".into(), FieldType::Bool)),
+                    (5, ("caBundle".into(), FieldType::Bytes)),
+                    (7, ("groupPriorityMinimum".into(), FieldType::Int)),
+                    (8, ("versionPriority".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "APIServiceStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "conditions".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "APIServiceCondition".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "APIServiceCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (4, ("reason".into(), FieldType::String)),
+                    (5, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+        // ServiceReference (apiregistration/v1) — separate proto from
+        // admissionregistration/v1.ServiceReference (which has `path` at
+        // field 3 instead of `port`). No conflict today; if admissionregistration
+        // registers its own ServiceReference, prefix one with the group.
+        schemas.insert(
+            "ServiceReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("name".into(), FieldType::String)),
+                    (3, ("port".into(), FieldType::Int)),
                 ]),
             },
         );
