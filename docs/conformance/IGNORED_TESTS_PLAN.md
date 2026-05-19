@@ -136,24 +136,34 @@ Complexity: **small–medium**.
 - Upstream: `[sig-network] Services should be able to switch session affinity for NodePort [LinuxOnly] [Conformance]` (`service.go:2287`, fails at 4291)
 - Sonobuoy Round 160: **FAIL** — NodePort affinity reachability check times out.
 
-**[ ] Layer A**
-1. Audit `crates/kube-proxy/src/iptables.rs::emit_nodeport_rules` (~lines 1273–1340). When `session_affinity=ClientIP` and `recent_available=true`, confirm `KUBE-SEP-*` chains are inserted before direct DNAT in the NODEPORTS chain (iptables matches first hit).
-2. Confirm `xt_recent --rcheck` is configured with the right table size; tune `RECENT_NAME` so multiple Services don't collide.
-3. Run conformance again; if still failing, capture the iptables-save output and diff against upstream kube-proxy.
+**[x] Layer A** — production code already correct: `build_nat_rules`'s NodePort
+branch emits `--rcheck` SEP-chain jumps before the probability fallback, sharing
+`KUBE-SEP-*` chains with the ClusterIP path so ClientIP affinity state is
+consistent across both traffic classes. No code change required.
 
-**[ ] Layer B**
-- Build `svc_none` (no affinity) and `svc_clientip` (ClientIP) NodePort Services; call `build_nat_rules` for both; assert `assert_ne!(rules_none, rules_aff)` and that the affinity variant contains `KUBE-SEP-*` references referenced before direct DNAT. Mirror the diffing pattern used by the passing ClusterIP test (line 598).
+**[x] Layer B** — mirror test built on the ClusterIP diff pattern: builds
+`svc_none` and `svc_clientip` NodePort Services with 2 EndpointSlice endpoints
+each, asserts `assert_ne!(r_none, r_aff)`, asserts `KUBE-SEP-*` chain
+references appear in the NODEPORTS chain with `--rcheck` BEFORE the probability
+fallback, asserts no direct `-j DNAT` in the affinity NODEPORTS chain, and
+round-trips `svc_none` to confirm switching back produces an identical rule
+set. `#[ignore]` dropped.
 
-Complexity: **small** (machinery exists; mostly diagnosis + test scaffolding).
+Complexity: **small** (machinery existed; needed test scaffolding only).
 
 ### 12. `services_should_have_session_affinity_for_nodeport`
 - File: `…proxy.rs:652`
 - Upstream: `[sig-network] Services should have session affinity work for NodePort [LinuxOnly] [Conformance]` (`service.go:2265`)
 - Sonobuoy Round 160: **FAIL** — same root path as #11.
 
-**[ ] Layer A**: covered by the #11 fix (same iptables path).
+**[x] Layer A**: covered by the #11 audit (same iptables path).
 
-**[ ] Layer B**: build a NodePort Service with `sessionAffinity: ClientIP` and 2+ EndpointSlice endpoints; assert `KUBE-SEP-*` references appear when `recent_available=true` and direct-DNAT fallback when `recent_available=false`.
+**[x] Layer B**: NodePort Service with `sessionAffinity: ClientIP` and 2
+EndpointSlice endpoints. With `IptablesManager::for_testing(true)` we assert
+both `KUBE-SEP-{ip}-{port}-0` and `…-1` SEP chains and `--rcheck` rules
+appear; with `for_testing(false)` we assert the NODEPORTS chain emits no
+`KUBE-SEP-*` references but still DNATs to both backends. `#[ignore]`
+dropped.
 
 Complexity: **small**.
 

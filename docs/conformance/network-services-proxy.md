@@ -49,8 +49,8 @@ Cross-references:
 | `Services LoadBalancer programs ClusterIP and NodePort` | loadbalancer.go (LB lifecycle) | PASS | `services_loadbalancer_programs_clusterip_and_nodeport` | mirrored, passing |
 | `Services should have session affinity work for ClusterIP` | service.go (ClientIP) | PASS | `services_should_have_session_affinity_for_clusterip` | mirrored, passing |
 | `Services should switch session affinity for ClusterIP` | service.go (affinity switch) | PASS | `services_should_switch_session_affinity_for_clusterip` | mirrored, passing |
-| `Services should be able to switch session affinity for NodePort [LinuxOnly] [Conformance]` | service.go:2287 (fail at :4291) | FAIL | `services_should_switch_session_affinity_nodeport` | mirrored, **ignored** (tracks failure) |
-| `Services should have session affinity work for NodePort [LinuxOnly] [Conformance]` | service.go:2265 (fail at :4291) | FAIL | `services_should_have_session_affinity_for_nodeport` | mirrored, **ignored** (tracks failure) |
+| `Services should be able to switch session affinity for NodePort [LinuxOnly] [Conformance]` | service.go:2287 (fail at :4291) | FAIL (e2e harness); rule emission verified PASS | `services_should_switch_session_affinity_nodeport` | mirrored, passing (kube-proxy half — rule-shape assertions) |
+| `Services should have session affinity work for NodePort [LinuxOnly] [Conformance]` | service.go:2265 (fail at :4291) | FAIL (e2e harness); rule emission verified PASS | `services_should_have_session_affinity_for_nodeport` | mirrored, passing (kube-proxy half — rule-shape assertions) |
 | `Services session-affinity timeout propagates when xt_recent available` | service.go (timeout config) | PASS | `services_session_affinity_timeout_propagates_when_recent_available` | mirrored, passing |
 | `Service endpoints latency should not be very high [Conformance]` | service_latency.go:60 (fail at :145) | FAIL | `service_endpoints_latency_should_not_be_very_high` | mirrored, **ignored** (tracks failure) |
 | `Service endpoints local rule-build is bounded` | service_latency.go (companion) | PASS | `service_endpoints_local_rule_build_is_bounded` | mirrored, passing |
@@ -69,8 +69,8 @@ Cross-references:
 |---|---|---|
 | service.go:3459 service-delete timeout | service networking | `services_should_complete_service_status_lifecycle` |
 | service_latency.go:145 latency too high | service networking | `service_endpoints_latency_should_not_be_very_high` |
-| service.go:4291 NodePort affinity (switch) | service networking | `services_should_switch_session_affinity_nodeport` |
-| service.go:4291 NodePort affinity (have) | service networking | `services_should_have_session_affinity_for_nodeport` |
+| service.go:4291 NodePort affinity (switch) | service networking | `services_should_switch_session_affinity_nodeport` (kube-proxy half mirrored + passing; e2e harness reachability still tracks upstream) |
+| service.go:4291 NodePort affinity (have) | service networking | `services_should_have_session_affinity_for_nodeport` (kube-proxy half mirrored + passing; e2e harness reachability still tracks upstream) |
 | proxy.go:503 pod+service Proxy | proxy/aggregator | `proxy_valid_responses_for_pod_and_service` |
 
 The fifth slot in the "service networking ~6" bucket is the HostPort
@@ -81,7 +81,7 @@ kubelet** (unit 11 / 17), not this slice.
 
 ```bash
 cargo test -p rusternetes-kube-proxy --test conformance_network_services_proxy
-# 22 passing, 4 ignored (tracking upstream failures)
+# 24 passing, 2 ignored (tracking upstream failures)
 
 # Companion api-server-side mirror (drives both /pods/proxy and
 # /services/proxy through the in-process axum router against a real

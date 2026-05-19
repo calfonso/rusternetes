@@ -632,13 +632,111 @@ async fn services_should_switch_session_affinity_for_clusterip() {
 /// at service.go:4291 (Round 160 failure bucket: "service networking").
 ///
 /// kube-proxy half: verify the SEP chain emission for a NodePort Service
-/// when ClientIP affinity is configured. The upstream failure is in the
-/// runtime test harness's reachability check, not the rule emission —
-/// rules themselves must still be correct.
+/// when ClientIP affinity is configured, then verify the rules return to a
+/// direct-DNAT shape when affinity is toggled back to `None`. The upstream
+/// failure is in the e2e harness's reachability probe, not the rule
+/// emission — the rules themselves must still be correct.
+///
+/// Mirrors the diff pattern used by the passing ClusterIP affinity-switch
+/// test (`services_should_switch_session_affinity_for_clusterip`).
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/network-services-proxy.md"]
 async fn services_should_switch_session_affinity_nodeport() {
-    panic!("placeholder for upstream affinity-switch NodePort failure (service.go:4291)");
+    let svc_none = nodeport_service("npswitch", "default", "10.96.0.130", 80, 8080, 30130);
+    let mut svc_clientip = svc_none.clone();
+    svc_clientip.spec.session_affinity = Some("ClientIP".to_string());
+    svc_clientip.spec.session_affinity_config = Some(SessionAffinityConfig {
+        client_ip: Some(ClientIPConfig {
+            timeout_seconds: Some(10800),
+        }),
+    });
+    let slice = endpoint_slice(
+        "default",
+        "npswitch",
+        &["10.244.4.1", "10.244.4.2"],
+        Some("http"),
+        8080,
+    );
+    let map = endpointslice_map(&[slice]);
+    let ipt = test_iptables();
+
+    let r_none = ipt
+        .build_nat_rules(std::slice::from_ref(&svc_none), &map, &[], "test-node")
+        .await;
+    let r_aff = ipt
+        .build_nat_rules(&[svc_clientip], &map, &[], "test-node")
+        .await;
+
+    // Sanity: both rule sets touch the NODEPORTS chain on the right dport.
+    assert!(
+        r_none.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30130"),
+        "no-affinity rules missing NODEPORTS dport entry:\n{}",
+        r_none
+    );
+    assert!(
+        r_aff.contains("--dport 30130"),
+        "affinity rules missing NODEPORTS dport entry:\n{}",
+        r_aff
+    );
+
+    // The two rule sets must differ — the affinity toggle must change the
+    // emitted iptables-restore blob.
+    assert_ne!(
+        r_none, r_aff,
+        "affinity toggle must change emitted NodePort rules"
+    );
+
+    // Affinity variant: SEP-chain references for both backends in the
+    // NODEPORTS chain, and per-endpoint --rcheck rules emitted BEFORE the
+    // probability fallback `-j KUBE-SEP-*` rules. iptables matches
+    // top-down, so the rcheck must precede the load-balancing fallback.
+    let sep_prefix = "KUBE-SEP-10960130-80";
+    assert!(
+        r_aff.contains(&format!("{}-0", sep_prefix)),
+        "affinity variant missing SEP chain for endpoint 0:\n{}",
+        r_aff
+    );
+    assert!(
+        r_aff.contains(&format!("{}-1", sep_prefix)),
+        "affinity variant missing SEP chain for endpoint 1:\n{}",
+        r_aff
+    );
+    let first_rcheck = r_aff
+        .find("--rcheck")
+        .expect("affinity variant must contain --rcheck rule");
+    let first_fallback_jump = r_aff
+        .find(&format!(
+            "-A RUSTERNETES-NODEPORTS -p tcp --dport 30130 -j {}-",
+            sep_prefix
+        ))
+        .or_else(|| r_aff.find("-A RUSTERNETES-NODEPORTS -p tcp --dport 30130 -m statistic"))
+        .expect("affinity variant must contain probability fallback rule");
+    assert!(
+        first_rcheck < first_fallback_jump,
+        "--rcheck rule must appear before the probability fallback in the NODEPORTS chain:\n{}",
+        r_aff
+    );
+
+    // Affinity variant must NOT emit a direct `-j DNAT --to-destination`
+    // line in the NODEPORTS chain — backends are reached via SEP chains.
+    for line in r_aff.lines() {
+        if line.contains("RUSTERNETES-NODEPORTS") && line.contains("--dport 30130") {
+            assert!(
+                !line.contains("-j DNAT"),
+                "affinity NODEPORTS chain must not contain direct DNAT:\n{}",
+                line
+            );
+        }
+    }
+
+    // Switching back to `None` must produce the same shape as the original
+    // no-affinity rules (we round-trip through clone+build to confirm).
+    let r_round_trip = ipt
+        .build_nat_rules(&[svc_none], &map, &[], "test-node")
+        .await;
+    assert_eq!(
+        r_none, r_round_trip,
+        "round-trip to None affinity must produce identical rules"
+    );
 }
 
 /// [sig-network] Services should have session affinity work for NodePort
@@ -647,10 +745,78 @@ async fn services_should_switch_session_affinity_nodeport() {
 /// Upstream: k8s.io/kubernetes/test/e2e/network/service.go:2265
 /// Sonobuoy (Round 160): FAIL — NodePort affinity timed out at
 /// service.go:4291 (same failure path as the switch test).
+///
+/// kube-proxy half: when `recent_available=true`, NodePort affinity rules
+/// must reference `KUBE-SEP-*` chains. When `xt_recent` is unavailable,
+/// kube-proxy falls back to direct DNAT — same backends, no SEP chains.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/network-services-proxy.md"]
 async fn services_should_have_session_affinity_for_nodeport() {
-    panic!("placeholder for upstream NodePort affinity failure (service.go:4291)");
+    let mut svc = nodeport_service("npaff", "default", "10.96.0.140", 80, 8080, 30140);
+    svc.spec.session_affinity = Some("ClientIP".to_string());
+    svc.spec.session_affinity_config = Some(SessionAffinityConfig {
+        client_ip: Some(ClientIPConfig {
+            timeout_seconds: Some(3600),
+        }),
+    });
+    let slice = endpoint_slice(
+        "default",
+        "npaff",
+        &["10.244.5.1", "10.244.5.2"],
+        Some("http"),
+        8080,
+    );
+    let map = endpointslice_map(&[slice]);
+
+    // `recent_available=true`: SEP chains must appear in the rule set.
+    let rules_with_recent = IptablesManager::for_testing(true)
+        .build_nat_rules(std::slice::from_ref(&svc), &map, &[], "test-node")
+        .await;
+    assert!(
+        rules_with_recent.contains("KUBE-SEP-10960140-80-0"),
+        "recent_available=true must emit SEP chain 0:\n{}",
+        rules_with_recent
+    );
+    assert!(
+        rules_with_recent.contains("KUBE-SEP-10960140-80-1"),
+        "recent_available=true must emit SEP chain 1:\n{}",
+        rules_with_recent
+    );
+    assert!(
+        rules_with_recent.contains("--rcheck"),
+        "recent_available=true must emit --rcheck affinity rules:\n{}",
+        rules_with_recent
+    );
+
+    // `recent_available=false`: direct-DNAT fallback. NodePort traffic is
+    // DNATed straight to the backends — no `KUBE-SEP-*` references in the
+    // NODEPORTS chain, but the same two backends must still be reachable.
+    let rules_no_recent = IptablesManager::for_testing(false)
+        .build_nat_rules(&[svc], &map, &[], "test-node")
+        .await;
+    for line in rules_no_recent.lines() {
+        if line.contains("RUSTERNETES-NODEPORTS") && line.contains("--dport 30140") {
+            assert!(
+                !line.contains("KUBE-SEP-"),
+                "recent_available=false NODEPORTS chain must not reference SEP chains:\n{}",
+                line
+            );
+        }
+    }
+    assert!(
+        rules_no_recent.contains("--to-destination 10.244.5.1:8080"),
+        "direct-DNAT fallback missing backend 1:\n{}",
+        rules_no_recent
+    );
+    assert!(
+        rules_no_recent.contains("--to-destination 10.244.5.2:8080"),
+        "direct-DNAT fallback missing backend 2:\n{}",
+        rules_no_recent
+    );
+    assert!(
+        rules_no_recent.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30140"),
+        "direct-DNAT fallback missing NODEPORTS dport rule:\n{}",
+        rules_no_recent
+    );
 }
 
 /// [sig-network] Services should respect session-affinity timeout config
