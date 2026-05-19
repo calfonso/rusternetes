@@ -309,6 +309,13 @@ bash scripts/conformance-coordinator.sh update
 # Flip to verified after the shadow check (single-test hydrophone re-run) passes.
 bash scripts/conformance-coordinator.sh mark-done <safe_name>
 
+# Run the shadow check automatically and gate the verified flip on the
+# runner's exit code. Wraps scripts/conformance-single-test.sh; passes the
+# upstream test name from state. Exits non-zero if the test still fails,
+# leaving the entry's status unchanged so the next `update`/`verify` cycle
+# can retry.
+bash scripts/conformance-coordinator.sh verify <safe_name>
+
 # Unclaim if a worker abandons.
 bash scripts/conformance-coordinator.sh release <safe_name>
 
