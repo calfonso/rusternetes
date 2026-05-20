@@ -1,0 +1,29 @@
+# Known-green upstream Kubernetes conformance tests.
+#
+# Each non-comment, non-blank line is a substring of the Ginkgo test
+# description (the `It(...)` string, with surrounding Describe blocks
+# concatenated). The substring must be specific enough to match exactly
+# one upstream test in the conformance image referenced below.
+#
+# Pinned conformance image: registry.k8s.io/conformance:v1.35.0
+#   Test names drift between minor releases (e.g. `Services should
+#   provide secure master service` was renamed to `API Server should
+#   provide secure master service` between 1.32 and 1.35). Whenever
+#   this pin changes, every entry in this file must be re-verified
+#   against the new image.
+#
+# Ratchet rule: append a line only after a test has been verified
+# green for >= 2 rounds against the pinned image. CI runs hydrophone
+# with --focus = (union of every line below, regex-escaped + joined
+# with `|`) and FAILS if any expected-green test does not pass.
+#
+# Local verification of an individual line:
+#
+#   bash scripts/conformance-canary-run.sh
+#
+# The runner script consumes this file directly.
+
+[sig-node] Container Runtime blackbox test on terminated container should report termination message from log output if TerminationMessagePolicy FallbackToLogsOnError is set
+[sig-node] Container Runtime blackbox test on terminated container should report termination message as empty when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
+[sig-node] Container Runtime blackbox test on terminated container should report termination message from file when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
+[sig-node] Container Runtime blackbox test on terminated container should report termination message if TerminationMessagePath is set
