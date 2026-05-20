@@ -45,7 +45,8 @@ Flags:
   --conformance-image <img>   Conformance image (default:
                               registry.k8s.io/conformance:v1.32.0).
   --no-anchor                 Treat <test-name-or-regex> as a raw regex
-                              (skip regex escaping + ^…$ anchoring).
+                              (skip regex escaping). Default already
+                              uses substring match (no ^…$ anchors).
   -h, --help                  Show this help.
 EOF
 }
@@ -120,14 +121,14 @@ else
     # Escape regex metachars common in K8s test names. Sed handles each char
     # in one pass; the leading backslash escapes the backslash itself in the
     # output, so '[Conformance]' becomes '\[Conformance\]'.
-    escaped="$(printf '%s' "$TEST_NAME" \
-        | sed -e 's/\\/\\\\/g' \
-              -e 's/\./\\./g' \
-              -e 's/\[/\\[/g' \
-              -e 's/\]/\\]/g' \
-              -e 's/(/\\(/g' \
-              -e 's/)/\\)/g')"
-    FOCUS_REGEX="^${escaped}\$"
+    # Escape regex metacharacters so the user can pass a literal test
+    # description. Match the canary runner exactly so a line that works
+    # in known-green.txt also works here. Substring match (no ^…$
+    # anchors) — Ginkgo's `--focus` is regex-anchorless, and real
+    # testcase names carry `[NodeConformance] [Conformance]` suffixes
+    # that anchoring would reject.
+    escaped="$(printf '%s' "$TEST_NAME" | sed -e 's/[][\\.^$(){}*+?|]/\\&/g')"
+    FOCUS_REGEX="$escaped"
 fi
 
 # ---------- output dir ----------
@@ -215,7 +216,7 @@ HYDROPHONE_ARGS=(
     --output-dir "$OUTPUT_DIR"
     --kubeconfig "$KUBECONFIG_PATH"
     --conformance-image "$IMAGE"
-    --skip-preflight
+    --skip-preflight conformance
 )
 
 info "invoking hydrophone (output streamed to $RUN_LOG)"
@@ -229,7 +230,7 @@ if [[ "$DOCKER_FALLBACK" -eq 1 ]]; then
         --output-dir /tmp/results \
         --kubeconfig /root/.kube/config \
         --conformance-image "$IMAGE" \
-        --skip-preflight \
+        --skip-preflight conformance \
         2>&1 | tee -a "$RUN_LOG"
     HYDROPHONE_EXIT=${PIPESTATUS[0]}
 else

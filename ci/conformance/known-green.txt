@@ -26,4 +26,4 @@
 [sig-node] Container Runtime blackbox test on terminated container should report termination message from log output if TerminationMessagePolicy FallbackToLogsOnError is set
 [sig-node] Container Runtime blackbox test on terminated container should report termination message as empty when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
 [sig-node] Container Runtime blackbox test on terminated container should report termination message from file when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
-[sig-node] Container Runtime blackbox test on terminated container should report termination message if TerminationMessagePath is set
+[sig-node] Container Runtime blackbox test on terminated container should report termination message if TerminationMessagePath is set [NodeConformance]
