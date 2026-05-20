@@ -229,8 +229,6 @@ async fn test_field_validation_strict_deployment_unknown_field_rejected() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: Service handler does not call validate_strict_fields; \
-            unknown fields are silently dropped instead of rejected"]
 async fn test_field_validation_strict_service_unknown_field_rejected() {
     let (_mem, router) = spawn_router();
     let mut stub = service_stub("svc-strict-unknown");

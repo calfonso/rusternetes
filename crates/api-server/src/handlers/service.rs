@@ -1,5 +1,6 @@
 use crate::{handlers::watch::WatchParams, middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -60,9 +61,37 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut service): Json<Service>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<Service>)> {
+    // Parse the body manually so we can do strict field validation against the raw bytes.
+    // Mirrors the deployment handler: on duplicate-field errors in strict mode, fall back
+    // through Value -> from_value so validate_strict_fields can report all issues.
+    let is_strict = params.get("fieldValidation").map(|v| v.as_str()) == Some("Strict");
+    let mut service: Service = match serde_json::from_slice(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_strict && msg.contains("duplicate field") {
+                let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e2| {
+                    rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e2))
+                })?;
+                serde_json::from_value(value).map_err(|e2| {
+                    rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e2))
+                })?
+            } else {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "failed to decode: {}",
+                    msg
+                )));
+            }
+        }
+    };
+
     info!("Creating service: {}/{}", namespace, service.metadata.name);
+
+    // Strict field validation: reject unknown / duplicate fields when requested.
+    // Mirrors crates/api-server/src/handlers/pod.rs:38.
+    crate::handlers::validation::validate_strict_fields(&params, &body, &service)?;
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -420,8 +449,47 @@ pub async fn update(
     // the stored object matches the K8s API contract.
     apply_session_affinity_defaults(&mut service.spec, true);
 
+    let key = build_key("services", Some(&namespace), &name);
+
+    // Get the old service for concurrency control, generation tracking, and
+    // ClusterIP immutability checks.
+    let old_service: Service = state.storage.get(&key).await?;
+
+    // ClusterIP immutability — upstream pkg/apis/core/validation/validation.go
+    // ValidateServiceUpdate. Once a Service has a ClusterIP assigned, it cannot
+    // be changed (either to a different IP, cleared, or toggled to/from the
+    // headless sentinel "None"). The sole legal exception is the transition to
+    // ExternalName, which clears the ClusterIP below.
+    let new_is_external_name = matches!(service.spec.service_type, Some(ServiceType::ExternalName));
+    let old_was_external_name = matches!(
+        old_service.spec.service_type,
+        Some(ServiceType::ExternalName)
+    );
+    let old_cip = old_service.spec.cluster_ip.as_deref().unwrap_or("");
+    if !old_cip.is_empty() && !new_is_external_name {
+        let new_cip = service.spec.cluster_ip.as_deref().unwrap_or("");
+        if new_cip != old_cip {
+            return Err(rusternetes_common::Error::InvalidResource(format!(
+                "spec.clusterIP: Invalid value: {:?}: field is immutable",
+                new_cip
+            )));
+        }
+        // Cross-check clusterIPs[0] when present — upstream rejects a mismatched
+        // primary entry alongside the immutable clusterIP.
+        if let Some(new_ips) = &service.spec.cluster_ips {
+            if let Some(first) = new_ips.first() {
+                if first != old_cip {
+                    return Err(rusternetes_common::Error::InvalidResource(format!(
+                        "spec.clusterIPs[0]: Invalid value: {:?}: field is immutable",
+                        first
+                    )));
+                }
+            }
+        }
+    }
+
     // When service type changes to ExternalName, clear ClusterIP and NodePorts
-    if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
+    if new_is_external_name {
         service.spec.cluster_ip = Some("".to_string());
         service.spec.cluster_ips = None;
         for port in &mut service.spec.ports {
@@ -429,18 +497,30 @@ pub async fn update(
         }
         service.spec.health_check_node_port = None;
     }
-    // When changing FROM ExternalName TO ClusterIP/NodePort/LoadBalancer, allocate ClusterIP
-    else if !matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
+    // When changing FROM ExternalName TO ClusterIP/NodePort/LoadBalancer,
+    // allocate a ClusterIP only on that genuine transition. Do NOT re-allocate
+    // on a plain update — that would silently mask the immutability violation
+    // we just rejected above.
+    else {
         let needs_ip = service
             .spec
             .cluster_ip
             .as_ref()
             .is_none_or(|ip| ip.is_empty());
-        if needs_ip {
+        if needs_ip && old_was_external_name {
             if let Some(ip) = state.ip_allocator.allocate() {
                 service.spec.cluster_ip = Some(ip.clone());
                 service.spec.cluster_ips = Some(vec![ip]);
             }
+        } else if needs_ip {
+            // Old service had a ClusterIP (handled by the immutability fence
+            // above), or this is some other inconsistent state. Restore the
+            // stored ClusterIP rather than allocating a new one. The
+            // immutability check above will reject mismatches before we get
+            // here; this branch covers the case where the new spec simply
+            // omits clusterIP/clusterIPs (PATCH-style partials).
+            service.spec.cluster_ip = old_service.spec.cluster_ip.clone();
+            service.spec.cluster_ips = old_service.spec.cluster_ips.clone();
         }
         // Allocate NodePorts for NodePort/LoadBalancer services
         if matches!(
@@ -454,11 +534,6 @@ pub async fn update(
             }
         }
     }
-
-    let key = build_key("services", Some(&namespace), &name);
-
-    // Get the old service for concurrency control and generation tracking
-    let old_service: Service = state.storage.get(&key).await?;
 
     // Check resourceVersion for optimistic concurrency control
     crate::handlers::lifecycle::check_resource_version(
