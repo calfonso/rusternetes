@@ -173,7 +173,8 @@ while IFS=$'\t' read -r name status; do
     JUNIT_NAMES+=("$name")
     JUNIT_STATUSES+=("$status")
 done < <(grep -oE '<testcase name="[^"]+"[^>]*status="[^"]+"' "$JUNIT" \
-    | sed -E 's|<testcase name="([^"]+)"[^>]*status="([^"]+)"|\1\t\2|')
+    | sed -E 's|<testcase name="([^"]+)"[^>]*status="([^"]+)"|\1\t\2|' \
+    | sed -e 's/&#39;/'"'"'/g' -e 's/&amp;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g')
 
 REGRESS=()
 PASS=()
