@@ -4,9 +4,78 @@ use futures::StreamExt;
 use rusternetes_common::resources::{Namespace, NamespaceCondition, NamespaceStatus, Pod};
 use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+/// Map an internal resource-type slug (the segment used in the `/registry/...`
+/// storage prefix) to its canonical Kubernetes `<resource>.<group>` label, as
+/// used in upstream's `NamespaceContentRemaining` condition message.
+///
+/// Mirrors how upstream's `deleteAllContent` formats remaining resources via
+/// `fmt.Sprintf("%s.%s has %d resource instances", gvr.Resource, gvr.Group, ...)`
+/// in `pkg/controller/namespace/deletion/status_condition_utils.go` —
+/// `pods` becomes `"pods."` (empty group), `deployments` becomes
+/// `"deployments.apps"`, etc.
+fn resource_type_to_gvr_label(resource_type: &str) -> String {
+    let group = match resource_type {
+        // Core (group "")
+        "pods"
+        | "replicationcontrollers"
+        | "configmaps"
+        | "secrets"
+        | "serviceaccounts"
+        | "services"
+        | "endpoints"
+        | "persistentvolumeclaims"
+        | "resourcequotas"
+        | "limitranges"
+        | "events"
+        | "podtemplates" => "",
+        // apps
+        "replicasets" | "deployments" | "statefulsets" | "daemonsets" | "controllerrevisions" => {
+            "apps"
+        }
+        // batch
+        "jobs" | "cronjobs" => "batch",
+        // discovery.k8s.io
+        "endpointslices" => "discovery.k8s.io",
+        // networking.k8s.io
+        "ingresses" | "networkpolicies" => "networking.k8s.io",
+        // policy
+        "poddisruptionbudgets" => "policy",
+        // rbac.authorization.k8s.io
+        "roles" | "rolebindings" => "rbac.authorization.k8s.io",
+        // autoscaling
+        "horizontalpodautoscalers" => "autoscaling",
+        // coordination.k8s.io
+        "leases" => "coordination.k8s.io",
+        // resource.k8s.io (DRA)
+        "resourceclaims" | "resourceclaimtemplates" => "resource.k8s.io",
+        // storage.k8s.io
+        "csistoragecapacities" => "storage.k8s.io",
+        // Unknown: fall back to no group; mirrors upstream's empty Group
+        _ => "",
+    };
+    format!("{}.{}", resource_type, group)
+}
+
+/// Per-resource-type cleanup outcome.
+///
+/// Mirrors upstream's `gvrDeletionMetadata` from
+/// `pkg/controller/namespace/deletion/namespaced_resources_deleter.go`
+/// (release-1.35) — used to accumulate "how many of this GVR are still
+/// stuck, and which finalizers are blocking them" so we can render
+/// `NamespaceContentRemaining` / `NamespaceFinalizersRemaining` messages
+/// byte-for-byte compatible with upstream.
+#[derive(Debug, Default)]
+struct GvrDeletionMetadata {
+    /// How many instances of this resource type still live in storage.
+    num_remaining: usize,
+    /// finalizer-token -> # of resources of this type stuck on it.
+    finalizers_to_num_remaining: BTreeMap<String, usize>,
+}
 
 /// NamespaceController handles namespace lifecycle and finalization.
 /// When a namespace is marked for deletion, it:
@@ -206,84 +275,172 @@ impl<S: Storage + 'static> NamespaceController<S> {
 
     /// Build the standard set of namespace deletion conditions.
     /// These conditions indicate the namespace controller has processed the namespace.
+    ///
+    /// Backward-compatible shim that derives the detailed-totals form below
+    /// without per-GVR / per-finalizer breakdowns. Only used by the existing
+    /// unit tests in this file, which assert the *bool-summary* shape — the
+    /// production finalizer path goes through
+    /// [`Self::build_deletion_conditions_with_totals`] directly.
+    #[cfg(test)]
     fn build_deletion_conditions(
         content_remaining: bool,
         finalizers_remaining: bool,
     ) -> Vec<NamespaceCondition> {
+        let mut gvr_remaining: BTreeMap<String, usize> = BTreeMap::new();
+        if content_remaining {
+            // Generic placeholder so the "ContentRemaining" branch fires with
+            // a stable message in the legacy callers/unit tests.
+            gvr_remaining.insert("resources.".to_string(), 1);
+        }
+        let mut finalizers: BTreeMap<String, usize> = BTreeMap::new();
+        if finalizers_remaining {
+            finalizers.insert("kubernetes.io/finalizer".to_string(), 1);
+        }
+        Self::build_deletion_conditions_with_totals(&gvr_remaining, &finalizers, &[])
+    }
+
+    /// Upstream-faithful variant of [`Self::build_deletion_conditions`]:
+    /// renders the per-GVR remaining count and per-finalizer breakdown into
+    /// the exact message format produced by
+    /// `pkg/controller/namespace/deletion/status_condition_utils.go`
+    /// (release-1.35) so integration tests can byte-compare.
+    ///
+    /// `gvr_remaining` keys are `"<resource>.<group>"` strings (see
+    /// [`resource_type_to_gvr_label`]); the function preserves insertion order
+    /// by relying on `BTreeMap`'s sorted iteration — matching upstream's
+    /// `sort.Strings` on the rendered entries.
+    ///
+    /// `content_delete_errors` lists *transport / API-level* errors the
+    /// deleter hit while removing content (NOT "items still remain because of
+    /// finalizers"). When empty, `NamespaceDeletionContentFailure` stays at
+    /// its "ok" message — this is the upstream invariant the integration
+    /// test pins.
+    fn build_deletion_conditions_with_totals(
+        gvr_remaining: &BTreeMap<String, usize>,
+        finalizers_to_num_remaining: &BTreeMap<String, usize>,
+        content_delete_errors: &[String],
+    ) -> Vec<NamespaceCondition> {
         let now = Utc::now();
-        vec![
-            NamespaceCondition {
-                condition_type: "NamespaceDeletionDiscoveryFailure".to_string(),
-                status: "False".to_string(),
-                last_transition_time: Some(now),
-                reason: Some("ResourcesDiscovered".to_string()),
-                message: Some("All resources successfully discovered".to_string()),
-            },
-            NamespaceCondition {
-                condition_type: "NamespaceDeletionGroupVersionParsingFailure".to_string(),
-                status: "False".to_string(),
-                last_transition_time: Some(now),
-                reason: Some("ParsedGroupVersions".to_string()),
-                message: Some("All legacy kube types successfully parsed".to_string()),
-            },
+
+        // NamespaceDeletionDiscoveryFailure — always "ok" since we do not
+        // perform discovery (no aggregated API). Mirrors upstream's
+        // `newSuccessfulCondition` branch.
+        let discovery_failure = NamespaceCondition {
+            condition_type: "NamespaceDeletionDiscoveryFailure".to_string(),
+            status: "False".to_string(),
+            last_transition_time: Some(now),
+            reason: Some("ResourcesDiscovered".to_string()),
+            message: Some("All resources successfully discovered".to_string()),
+        };
+
+        // NamespaceDeletionGroupVersionParsingFailure — same: no upstream-style
+        // GroupVersion parsing happens, so always "ok".
+        let gv_parsing_failure = NamespaceCondition {
+            condition_type: "NamespaceDeletionGroupVersionParsingFailure".to_string(),
+            status: "False".to_string(),
+            last_transition_time: Some(now),
+            reason: Some("ParsedGroupVersions".to_string()),
+            message: Some("All legacy kube types successfully parsed".to_string()),
+        };
+
+        // NamespaceDeletionContentFailure — "ok" unless we recorded a real
+        // delete error. Items remaining because of finalizers do NOT flip
+        // this condition (upstream: `makeDeleteContentCondition` only fires
+        // when `deleteContentErrors` is non-empty).
+        let content_failure = if content_delete_errors.is_empty() {
             NamespaceCondition {
                 condition_type: "NamespaceDeletionContentFailure".to_string(),
-                status: if finalizers_remaining {
-                    "True"
-                } else {
-                    "False"
-                }
-                .to_string(),
+                status: "False".to_string(),
                 last_transition_time: Some(now),
-                reason: if finalizers_remaining {
-                    Some("ContentDeletionFailed".to_string())
-                } else {
-                    Some("ContentDeleted".to_string())
-                },
-                message: if finalizers_remaining {
-                    Some("Some content in the namespace has finalizers remaining".to_string())
-                } else {
-                    Some(
-                        "All content successfully deleted, may be waiting for finalization"
-                            .to_string(),
-                    )
-                },
-            },
+                reason: Some("ContentDeleted".to_string()),
+                message: Some(
+                    "All content successfully deleted, may be waiting on finalization".to_string(),
+                ),
+            }
+        } else {
+            let mut sorted = content_delete_errors.to_vec();
+            sorted.sort();
+            NamespaceCondition {
+                condition_type: "NamespaceDeletionContentFailure".to_string(),
+                status: "True".to_string(),
+                last_transition_time: Some(now),
+                reason: Some("ContentDeletionFailed".to_string()),
+                message: Some(format!(
+                    "Failed to delete all resource types, {} remaining: {}",
+                    sorted.len(),
+                    sorted.join(", ")
+                )),
+            }
+        };
+
+        // NamespaceContentRemaining — only "True" with detailed message when
+        // we still have at least one remaining instance of any GVR.
+        let content_remaining = if gvr_remaining.is_empty() {
             NamespaceCondition {
                 condition_type: "NamespaceContentRemaining".to_string(),
-                status: if content_remaining { "True" } else { "False" }.to_string(),
+                status: "False".to_string(),
                 last_transition_time: Some(now),
-                reason: if content_remaining {
-                    Some("SomeResourcesRemain".to_string())
-                } else {
-                    Some("ContentRemoved".to_string())
-                },
-                message: if content_remaining {
-                    Some("Some resources are still present in the namespace".to_string())
-                } else {
-                    Some("All content successfully removed".to_string())
-                },
-            },
+                reason: Some("ContentRemoved".to_string()),
+                message: Some("All content successfully removed".to_string()),
+            }
+        } else {
+            // upstream sorts the rendered fragments. BTreeMap iteration is
+            // already sorted by key, but the rendered string includes the
+            // count too, so we collect-then-sort to mirror that exactly.
+            let mut parts: Vec<String> = gvr_remaining
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(gvr, n)| format!("{} has {} resource instances", gvr, n))
+                .collect();
+            parts.sort();
+            NamespaceCondition {
+                condition_type: "NamespaceContentRemaining".to_string(),
+                status: "True".to_string(),
+                last_transition_time: Some(now),
+                reason: Some("SomeResourcesRemain".to_string()),
+                message: Some(format!(
+                    "Some resources are remaining: {}",
+                    parts.join(", ")
+                )),
+            }
+        };
+
+        // NamespaceFinalizersRemaining — likewise. Upstream message format:
+        // `"Some content in the namespace has finalizers remaining: %s in %d resource instances, ..."`
+        let finalizers_remaining = if finalizers_to_num_remaining.is_empty() {
             NamespaceCondition {
                 condition_type: "NamespaceFinalizersRemaining".to_string(),
-                status: if finalizers_remaining {
-                    "True"
-                } else {
-                    "False"
-                }
-                .to_string(),
+                status: "False".to_string(),
                 last_transition_time: Some(now),
-                reason: if finalizers_remaining {
-                    Some("SomeFinalizersRemain".to_string())
-                } else {
-                    Some("ContentHasNoFinalizers".to_string())
-                },
-                message: if finalizers_remaining {
-                    Some("Some content in the namespace has finalizers remaining".to_string())
-                } else {
-                    Some("All content-preserving finalizers finished".to_string())
-                },
-            },
+                reason: Some("ContentHasNoFinalizers".to_string()),
+                message: Some("All content-preserving finalizers finished".to_string()),
+            }
+        } else {
+            let mut parts: Vec<String> = finalizers_to_num_remaining
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(fin, n)| format!("{} in {} resource instances", fin, n))
+                .collect();
+            parts.sort();
+            NamespaceCondition {
+                condition_type: "NamespaceFinalizersRemaining".to_string(),
+                status: "True".to_string(),
+                last_transition_time: Some(now),
+                reason: Some("SomeFinalizersRemain".to_string()),
+                message: Some(format!(
+                    "Some content in the namespace has finalizers remaining: {}",
+                    parts.join(", ")
+                )),
+            }
+        };
+
+        // Order matches upstream's `conditionTypes` slice for stable output.
+        vec![
+            discovery_failure,
+            gv_parsing_failure,
+            content_failure,
+            content_remaining,
+            finalizers_remaining,
         ]
     }
 
@@ -361,14 +518,27 @@ impl<S: Storage + 'static> NamespaceController<S> {
         }
 
         // Delete resources in the namespace in TWO phases to match K8s ordering.
-        // Phase 1: Delete pods (set deletionTimestamp for those with finalizers).
-        // K8s deletes pods before other resources so pods can access configmaps/secrets
-        // during shutdown. The conformance test checks this ordering explicitly.
+        // Phase 1: Delete pods. K8s deletes pods before other resources so
+        // pods can access configmaps/secrets during shutdown.
         // K8s ref: pkg/controller/namespace/deletion/namespaced_resources_deleter.go
+        let mut gvr_to_num_remaining: BTreeMap<String, usize> = BTreeMap::new();
+        let mut finalizers_to_num_remaining: BTreeMap<String, usize> = BTreeMap::new();
+        // Per-resource-type *delete* errors (API/transport-level), separate
+        // from "items still remain because of finalizers". Mirrors
+        // upstream's `deleteContentErrors` slice that powers
+        // `NamespaceDeletionContentFailure`. We currently log-and-continue
+        // inside `delete_all_resources_with_metadata`, so this stays empty.
+        let content_delete_errors: Vec<String> = Vec::new();
+
         let mut any_finalizers_remaining = false;
-        match self.delete_all_resources(name, "pods").await {
-            Ok(had_finalizers) => {
-                if had_finalizers {
+        match self.delete_all_resources_with_metadata(name, "pods").await {
+            Ok(meta) => {
+                if meta.num_remaining > 0 {
+                    gvr_to_num_remaining
+                        .insert(resource_type_to_gvr_label("pods"), meta.num_remaining);
+                    for (f, c) in &meta.finalizers_to_num_remaining {
+                        *finalizers_to_num_remaining.entry(f.clone()).or_insert(0) += *c;
+                    }
                     any_finalizers_remaining = true;
                 }
             }
@@ -389,8 +559,11 @@ impl<S: Storage + 'static> NamespaceController<S> {
             })
             .unwrap_or(false);
         if any_finalizers_remaining && !conditions_already_set {
-            let remaining_count = self.count_remaining_resources(name).await?;
-            let conditions = Self::build_deletion_conditions(remaining_count > 0, true);
+            let conditions = Self::build_deletion_conditions_with_totals(
+                &gvr_to_num_remaining,
+                &finalizers_to_num_remaining,
+                &content_delete_errors,
+            );
             let key = build_key("namespaces", None, name);
             if let Ok(mut ns) = self.storage.get::<Namespace>(&key).await {
                 ns.status = Some(NamespaceStatus {
@@ -406,15 +579,27 @@ impl<S: Storage + 'static> NamespaceController<S> {
             return Ok(());
         }
 
-        // Phase 2: Delete remaining resources (configmaps, secrets, etc.)
+        // Phase 2: Delete every other resource type. For each, accumulate
+        // per-GVR remaining count and per-finalizer breakdown into totals,
+        // mirroring upstream's `numRemainingTotals` aggregation.
         for resource_type in &resource_types {
             if *resource_type == "pods" {
                 continue; // Already processed
             }
-            match self.delete_all_resources(name, resource_type).await {
-                Ok(had_finalizers) => {
-                    if had_finalizers {
+            match self
+                .delete_all_resources_with_metadata(name, resource_type)
+                .await
+            {
+                Ok(meta) => {
+                    if meta.num_remaining > 0 {
+                        gvr_to_num_remaining.insert(
+                            resource_type_to_gvr_label(resource_type),
+                            meta.num_remaining,
+                        );
                         any_finalizers_remaining = true;
+                        for (f, c) in &meta.finalizers_to_num_remaining {
+                            *finalizers_to_num_remaining.entry(f.clone()).or_insert(0) += *c;
+                        }
                     }
                 }
                 Err(e) => {
@@ -440,8 +625,11 @@ impl<S: Storage + 'static> NamespaceController<S> {
             let key = build_key("namespaces", None, name);
             let mut ns: Namespace = self.storage.get(&key).await?;
 
-            let conditions =
-                Self::build_deletion_conditions(remaining_count > 0, any_finalizers_remaining);
+            let conditions = Self::build_deletion_conditions_with_totals(
+                &gvr_to_num_remaining,
+                &finalizers_to_num_remaining,
+                &content_delete_errors,
+            );
 
             ns.status = Some(NamespaceStatus {
                 phase: Some(Phase::Terminating),
@@ -465,9 +653,10 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 };
                 match fresh_ns_result {
                     Ok(mut fresh_ns) => {
-                        let conditions = Self::build_deletion_conditions(
-                            remaining_count > 0,
-                            any_finalizers_remaining,
+                        let conditions = Self::build_deletion_conditions_with_totals(
+                            &gvr_to_num_remaining,
+                            &finalizers_to_num_remaining,
+                            &content_delete_errors,
                         );
                         fresh_ns.status = Some(NamespaceStatus {
                             phase: Some(Phase::Terminating),
@@ -627,118 +816,101 @@ impl<S: Storage + 'static> NamespaceController<S> {
         }
     }
 
-    /// Delete all resources of a given type in a namespace.
-    /// Returns `true` if any resources had finalizers and could not be fully deleted.
-    /// Resources with finalizers get a deletionTimestamp set but remain in storage
-    /// until their finalizers are removed (matching real K8s behavior).
-    async fn delete_all_resources(&self, namespace: &str, resource_type: &str) -> Result<bool> {
+    /// Per-resource-type cleanup outcome, mirroring upstream's
+    /// `gvrDeletionMetadata` from
+    /// `pkg/controller/namespace/deletion/namespaced_resources_deleter.go`.
+    /// Used to drive the upstream-faithful condition messages.
+    async fn delete_all_resources_with_metadata(
+        &self,
+        namespace: &str,
+        resource_type: &str,
+    ) -> Result<GvrDeletionMetadata> {
         let prefix = build_prefix(resource_type, Some(namespace));
-
-        // List all resources
         let resources: Vec<serde_json::Value> =
             self.storage.list(&prefix).await.unwrap_or_default();
-
         if resources.is_empty() {
-            return Ok(false);
+            return Ok(GvrDeletionMetadata::default());
         }
 
-        debug!(
-            "Deleting {} {} resources in namespace {}",
-            resources.len(),
-            resource_type,
-            namespace
-        );
+        let mut finalizers_to_num_remaining: BTreeMap<String, usize> = BTreeMap::new();
+        let mut num_remaining = 0usize;
 
-        let mut had_finalizers = false;
-
-        // Delete each resource
         for resource in resources {
-            if let Some(metadata) = resource.get("metadata") {
-                if let Some(name) = metadata.get("name").and_then(|n| n.as_str()) {
-                    let key = build_key(resource_type, Some(namespace), name);
+            let Some(metadata) = resource.get("metadata") else {
+                continue;
+            };
+            let Some(name) = metadata.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let key = build_key(resource_type, Some(namespace), name);
 
-                    // For pods: terminal pods (Succeeded/Failed) should be hard-deleted
-                    // from storage regardless of finalizers. They are already done
-                    // executing and will never process their finalizers. Leaving them
-                    // in storage blocks namespace deletion indefinitely.
-                    if resource_type == "pods" {
-                        let phase = resource.pointer("/status/phase").and_then(|p| p.as_str());
-                        if matches!(phase, Some("Succeeded") | Some("Failed")) {
-                            match self.storage.delete(&key).await {
-                                Ok(_) => {
-                                    debug!(
-                                        "Hard-deleted terminal pod {}/{} (phase: {})",
-                                        namespace,
-                                        name,
-                                        phase.unwrap_or("unknown")
-                                    );
-                                }
-                                Err(rusternetes_common::Error::NotFound(_)) => {}
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to delete terminal pod {}/{}: {}",
-                                        namespace, name, e
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                    }
+            // For pods: terminal pods (Succeeded/Failed) should be hard-deleted
+            // from storage regardless of finalizers — mirrors upstream's
+            // graceful-termination short-circuit for pods that have already
+            // finished executing.
+            if resource_type == "pods" {
+                let phase = resource.pointer("/status/phase").and_then(|p| p.as_str());
+                if matches!(phase, Some("Succeeded") | Some("Failed")) {
+                    let _ = self.storage.delete(&key).await;
+                    continue;
+                }
+            }
 
-                    // Check if the resource has finalizers
-                    let has_finalizers = metadata
-                        .get("finalizers")
-                        .and_then(|f| f.as_array())
-                        .map(|f| !f.is_empty())
-                        .unwrap_or(false);
+            let finalizers = metadata
+                .get("finalizers")
+                .and_then(|f| f.as_array())
+                .map(|f| {
+                    f.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
-                    if has_finalizers {
-                        // Resource has finalizers: set deletionTimestamp but don't remove.
-                        // The finalizer controller/owner must remove the finalizer first.
-                        had_finalizers = true;
-                        let already_terminating = metadata
-                            .get("deletionTimestamp")
-                            .and_then(|d| d.as_str())
-                            .is_some();
-                        if !already_terminating {
-                            let mut updated = resource.clone();
-                            if let Some(meta) = updated.get_mut("metadata") {
-                                meta.as_object_mut().map(|m| {
-                                    m.insert(
-                                        "deletionTimestamp".to_string(),
-                                        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-                                    )
-                                });
-                            }
-                            let _ = self.storage.update(&key, &updated).await;
-                            debug!(
-                                "Set deletionTimestamp on {}/{}/{} (has finalizers)",
-                                resource_type, namespace, name
+            if !finalizers.is_empty() {
+                // Stays in storage; stamp deletionTimestamp if not already set.
+                num_remaining += 1;
+                for f in &finalizers {
+                    *finalizers_to_num_remaining.entry(f.clone()).or_insert(0) += 1;
+                }
+                let already_terminating = metadata
+                    .get("deletionTimestamp")
+                    .and_then(|d| d.as_str())
+                    .is_some();
+                if !already_terminating {
+                    let mut updated = resource.clone();
+                    if let Some(meta) = updated.get_mut("metadata") {
+                        if let Some(m) = meta.as_object_mut() {
+                            m.insert(
+                                "deletionTimestamp".to_string(),
+                                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
                             );
                         }
-                    } else {
-                        // No finalizers — hard delete from storage
-                        match self.storage.delete(&key).await {
-                            Ok(_) => {
-                                debug!("Deleted {}/{}/{}", resource_type, namespace, name)
-                            }
-                            Err(rusternetes_common::Error::NotFound(_)) => {
-                                // Already deleted, that's fine
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to delete {}/{}/{}: {}",
-                                    resource_type, namespace, name, e
-                                );
-                            }
-                        }
+                    }
+                    let _ = self.storage.update(&key, &updated).await;
+                }
+            } else {
+                // No finalizers — hard delete from storage.
+                if let Err(e) = self.storage.delete(&key).await {
+                    if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                        warn!(
+                            "Failed to delete {}/{}/{}: {}",
+                            resource_type, namespace, name, e
+                        );
                     }
                 }
             }
         }
 
-        Ok(had_finalizers)
+        Ok(GvrDeletionMetadata {
+            num_remaining,
+            finalizers_to_num_remaining,
+        })
     }
+
+    // Note: the original `delete_all_resources` helper has been replaced by
+    // `delete_all_resources_with_metadata` above, which returns a
+    // `GvrDeletionMetadata` so the controller can produce upstream-faithful
+    // condition messages (per-GVR remaining count + finalizer breakdown).
 
     /// Count remaining resources in a namespace.
     /// Checks all resource types that are deleted during finalization.
@@ -872,18 +1044,22 @@ mod tests {
             .unwrap();
         assert_eq!(finalizers.status, "True");
 
-        // When finalizers remain, NamespaceDeletionContentFailure should be True
+        // Upstream contract (pkg/controller/namespace/deletion/status_condition_utils.go):
+        // `NamespaceDeletionContentFailure` only flips True on an actual delete
+        // *error*. Items lingering because of a finalizer leave this condition
+        // at its "ok" message and only flip `NamespaceFinalizersRemaining`.
         let content_failure = conditions
             .iter()
             .find(|c| c.condition_type == "NamespaceDeletionContentFailure")
             .unwrap();
         assert_eq!(
-            content_failure.status, "True",
-            "ContentFailure should be True when finalizers prevent deletion"
+            content_failure.status, "False",
+            "ContentFailure must stay False when only finalizers prevent deletion"
         );
+        assert_eq!(content_failure.reason.as_deref(), Some("ContentDeleted"));
         assert_eq!(
-            content_failure.reason.as_deref(),
-            Some("ContentDeletionFailed")
+            content_failure.message.as_deref(),
+            Some("All content successfully deleted, may be waiting on finalization")
         );
     }
 
@@ -1088,8 +1264,11 @@ mod tests {
             "ConfigMap without finalizer should be deleted after second reconcile"
         );
 
-        // The namespace should have NamespaceDeletionContentFailure condition set to True
-        // because the pod's finalizer prevents full cleanup
+        // Upstream contract: only `NamespaceFinalizersRemaining` (and the
+        // associated `NamespaceContentRemaining`) should flip when items
+        // linger because of a resource-level finalizer. The deletion
+        // *content failure* condition must stay at its "ok" message —
+        // it only flips when the deleter encountered an actual API error.
         let updated_ns: Namespace = storage.get(&ns_key).await.unwrap();
         let conditions = updated_ns
             .status
@@ -1102,8 +1281,8 @@ mod tests {
             .find(|c| c.condition_type == "NamespaceDeletionContentFailure")
             .expect("Should have NamespaceDeletionContentFailure condition");
         assert_eq!(
-            content_failure.status, "True",
-            "NamespaceDeletionContentFailure should be True when pod has finalizer"
+            content_failure.status, "False",
+            "NamespaceDeletionContentFailure must stay False when only finalizers block deletion"
         );
 
         let finalizers_remaining = conditions

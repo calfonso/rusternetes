@@ -39,9 +39,22 @@ pub async fn create(
         }
     }
 
-    // Enrich metadata with system fields
+    // Enrich metadata with system fields. `ensure_uid()` also resolves
+    // `generateName` -> `metadata.name` (via `ensure_name()`).
     namespace.metadata.ensure_uid();
     namespace.metadata.ensure_creation_timestamp();
+
+    // Auto-attach the `kubernetes.io/metadata.name=<name>` label.
+    // Required by upstream PR kubernetes/kubernetes#96968: every namespace
+    // must carry this label so cluster-scoped selectors (e.g. NetworkPolicies)
+    // can target a namespace by name without relying on user-set labels.
+    // Mirrors the constant `corev1.LabelMetadataName` and the registry-level
+    // mutator that stamps it on every create.
+    {
+        let ns_name = namespace.metadata.name.clone();
+        let labels = namespace.metadata.labels.get_or_insert_with(HashMap::new);
+        labels.insert("kubernetes.io/metadata.name".to_string(), ns_name);
+    }
 
     // Ensure namespace has Active status (always set phase even if status exists but phase is None)
     match &mut namespace.status {
