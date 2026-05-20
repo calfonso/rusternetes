@@ -161,7 +161,6 @@ async fn test_service_strategy_cluster_ip_allocated_on_create() {
 /// Updating a service with a *different* clusterIP must be rejected
 /// (upstream returns `clusterIP: field is immutable`).
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ValidateServiceUpdate does not enforce ClusterIP immutability"]
 async fn test_service_strategy_cluster_ip_immutable_change() {
     let (_mem, router) = spawn_router();
 
@@ -188,7 +187,6 @@ async fn test_service_strategy_cluster_ip_immutable_change() {
 /// Updating a service to clear the assigned ClusterIP (set to "") must be
 /// rejected — upstream `ValidateServiceUpdate` flags this as immutable.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: handler re-allocates a new ClusterIP on update instead of rejecting empty"]
 async fn test_service_strategy_cluster_ip_immutable_clear() {
     let (mem, router) = spawn_router();
 
@@ -217,7 +215,6 @@ async fn test_service_strategy_cluster_ip_immutable_clear() {
 /// Headless services (`clusterIP: "None"`) cannot transition to a real IP,
 /// and a real-IP service cannot transition to headless.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: headless <-> non-headless ClusterIP transition not validated"]
 async fn test_service_strategy_cluster_ip_headless_immutable() {
     let (_mem, router) = spawn_router();
 
