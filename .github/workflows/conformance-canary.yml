@@ -12,27 +12,14 @@ name: Conformance canary
 #
 # Triggers:
 #   * workflow_dispatch — manual button on the Actions tab.
-#   * pull_request, BUT only when files this workflow actually depends
-#     on change (the workflow file itself, the helm values for the
-#     conformance scale set, the compose override, the bootstrap +
-#     run-conformance scripts). Keeps Actions minutes bounded — see
-#     CLAUDE.local.md "GH Actions minute budget tight" — yet still
-#     gives us an empirical test of the runner the first time this PR
-#     lands.
+#   * push to main — post-merge smoke test. PR-trigger removed because
+#     a full hydrophone run blocks PRs for 30–60 min on cold caches
+#     and the canary's value (catching ratchet regressions before they
+#     reach main) is preserved by the post-merge run plus operator-
+#     driven manual dispatches when warranted.
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - '.github/workflows/conformance-canary.yml'
-      - 'ci/conformance/known-green.txt'
-      - 'scripts/conformance-canary-run.sh'
-      - 'scripts/bootstrap-cluster.sh'
-      - 'scripts/generate-certs.sh'
-      - 'compose.dind.yml'
-      - 'compose.yml'
-      - 'Dockerfile.services'
-      - 'crates/**'
   push:
     branches: [main]
     paths:

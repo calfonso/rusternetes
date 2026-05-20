@@ -9,6 +9,66 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error};
 
+/// Upstream `pkg/controller/endpoint/endpoints_controller.go::maxCapacity`.
+/// Endpoints objects with more than this many addresses won't be routed
+/// correctly by kube-proxy, so the controller truncates and emits the
+/// `endpoints.kubernetes.io/over-capacity=truncated` annotation.
+pub const MAX_ENDPOINTS_CAPACITY: usize = 1000;
+
+/// Annotation key the controller sets on a truncated Endpoints object.
+/// Upstream constant: `corev1.EndpointsOverCapacity` ("endpoints.kubernetes.io/over-capacity").
+const ENDPOINTS_OVER_CAPACITY_ANNOTATION: &str = "endpoints.kubernetes.io/over-capacity";
+
+/// Truncate `subsets` in place so the total address count (ready +
+/// notReady) does not exceed `cap`. Removes addresses proportionally
+/// across subsets, mirroring upstream `truncateEndpoints`: ready
+/// addresses are dropped before notReady ones because routable endpoints
+/// are more valuable than placeholders.
+///
+/// Returns `true` if any addresses were dropped, so the caller can set the
+/// `endpoints.kubernetes.io/over-capacity=truncated` annotation.
+fn truncate_endpoint_subsets(subsets: &mut [EndpointSubset], cap: usize) -> bool {
+    let total: usize = subsets
+        .iter()
+        .map(|s| {
+            s.addresses.as_ref().map(|a| a.len()).unwrap_or(0)
+                + s.not_ready_addresses.as_ref().map(|a| a.len()).unwrap_or(0)
+        })
+        .sum();
+    if total <= cap {
+        return false;
+    }
+
+    let mut to_drop = total - cap;
+
+    // Drop from `addresses` first (ready), proportionally across subsets.
+    // For deterministic output and assertion stability we drop from the tail.
+    for s in subsets.iter_mut() {
+        if to_drop == 0 {
+            break;
+        }
+        if let Some(addrs) = s.addresses.as_mut() {
+            let drop_here = to_drop.min(addrs.len());
+            addrs.truncate(addrs.len() - drop_here);
+            to_drop -= drop_here;
+        }
+    }
+
+    // Then notReady if still over cap.
+    for s in subsets.iter_mut() {
+        if to_drop == 0 {
+            break;
+        }
+        if let Some(addrs) = s.not_ready_addresses.as_mut() {
+            let drop_here = to_drop.min(addrs.len());
+            addrs.truncate(addrs.len() - drop_here);
+            to_drop -= drop_here;
+        }
+    }
+
+    true
+}
+
 /// EndpointsController watches Services and Pods to automatically maintain Endpoints resources.
 /// It creates/updates Endpoints based on:
 /// 1. Service selector matching pod labels
@@ -283,6 +343,21 @@ impl<S: Storage + 'static> EndpointsController<S> {
             namespace, service_name
         );
 
+        // Skip ExternalName services. Upstream
+        // `pkg/controller/endpoint/endpoints_controller.go` (syncService) returns
+        // early for `ServiceTypeExternalName` — DNS resolution is the data path,
+        // there is no Endpoints object to publish even when a selector is set.
+        if matches!(
+            service.spec.service_type,
+            Some(rusternetes_common::resources::ServiceType::ExternalName)
+        ) {
+            debug!(
+                "Service {}/{} is ExternalName, skipping endpoint creation",
+                namespace, service_name
+            );
+            return Ok(());
+        }
+
         // Skip services without selectors (headless services without selector)
         let selector = match &service.spec.selector {
             Some(s) if !s.is_empty() => s,
@@ -314,8 +389,33 @@ impl<S: Storage + 'static> EndpointsController<S> {
 
         // Build endpoint subsets from matching pods
         let publish_not_ready = service.spec.publish_not_ready_addresses.unwrap_or(false);
-        let subsets =
+        let mut subsets =
             self.build_endpoint_subsets(&matching_pods, &service.spec.ports, publish_not_ready);
+
+        // Enforce the upstream 1000-address Endpoints capacity cap and emit
+        // the `endpoints.kubernetes.io/over-capacity=truncated` annotation
+        // when truncation actually fires. Mirrors
+        // `pkg/controller/endpoint/endpoints_controller.go::truncateEndpoints`
+        // (`maxCapacity = 1000`). Endpoints with > 1000 addresses won't
+        // route correctly via kube-proxy, so this is a hard cap.
+        let truncated = truncate_endpoint_subsets(&mut subsets, MAX_ENDPOINTS_CAPACITY);
+
+        // Derive annotations: copy from the service, then set/clear the
+        // over-capacity marker based on whether we truncated this reconcile.
+        let mut annotations = service.metadata.annotations.clone().unwrap_or_default();
+        if truncated {
+            annotations.insert(
+                ENDPOINTS_OVER_CAPACITY_ANNOTATION.to_string(),
+                "truncated".to_string(),
+            );
+        } else {
+            annotations.remove(ENDPOINTS_OVER_CAPACITY_ANNOTATION);
+        }
+        let annotations = if annotations.is_empty() {
+            None
+        } else {
+            Some(annotations)
+        };
 
         // Create or update endpoints
         let mut endpoints = Endpoints {
@@ -344,7 +444,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
                 creation_timestamp: None,
                 deletion_timestamp: None,
                 labels: service.metadata.labels.clone(),
-                annotations: service.metadata.annotations.clone(),
+                annotations,
             },
             subsets,
         };
