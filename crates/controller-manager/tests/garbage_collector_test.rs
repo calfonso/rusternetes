@@ -383,7 +383,6 @@ async fn test_metadata_finalizer_helpers() {
 mod garbage_collector_integration {
     use super::*;
     use chrono::Utc;
-    use rusternetes_common::resources::namespace::Namespace;
     use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
 
     #[tokio::test]
@@ -448,67 +447,6 @@ mod garbage_collector_integration {
         // Children should be deleted
         let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
         assert_eq!(pods_after.len(), 0);
-    }
-
-    // Namespace cascade is no longer the GC's responsibility — it was removed
-    // because force-deleting namespaced resources from the GC ignored
-    // finalizers and raced with NamespaceController, breaking conformance
-    // ordering tests (see garbage_collector.rs around the deleted_namespaces
-    // no-op loop). Cascade behavior belongs in namespace_controller_test.
-    #[tokio::test]
-    #[ignore = "moved to namespace_controller_test; GC no longer cascades namespaces"]
-    async fn test_gc_namespace_cascade_deletion() {
-        let storage = setup_test().await;
-        let gc = GarbageCollector::new(storage.clone());
-
-        // Create namespace
-        let mut namespace_meta = ObjectMeta::new("test-cascade-ns");
-        namespace_meta.uid = uuid::Uuid::new_v4().to_string();
-
-        let namespace = Namespace {
-            type_meta: TypeMeta {
-                kind: "Namespace".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: namespace_meta,
-            spec: None,
-            status: None,
-        };
-
-        let ns_key = build_key("namespaces", None, "test-cascade-ns");
-        storage.create(&ns_key, &namespace).await.unwrap();
-
-        // Create resources in namespace
-        for i in 0..3 {
-            let pod = create_test_pod(&format!("pod-{}", i), "test-cascade-ns", None);
-            let pod_key = build_key("pods", Some("test-cascade-ns"), &format!("pod-{}", i));
-            storage.create(&pod_key, &pod).await.unwrap();
-        }
-
-        // Verify resources exist
-        let pods_before: Vec<Pod> = storage
-            .list("/registry/pods/test-cascade-ns/")
-            .await
-            .unwrap();
-        assert_eq!(pods_before.len(), 3);
-
-        // Mark namespace for deletion
-        let mut namespace = storage.get::<Namespace>(&ns_key).await.unwrap();
-        namespace.metadata.deletion_timestamp = Some(Utc::now());
-        storage.update(&ns_key, &namespace).await.unwrap();
-
-        // Run GC
-        gc.scan_and_collect().await.unwrap();
-
-        // All resources in namespace should be deleted
-        let pods_after: Vec<Pod> = storage
-            .list("/registry/pods/test-cascade-ns/")
-            .await
-            .unwrap();
-        assert_eq!(pods_after.len(), 0);
-
-        // Namespace should be deleted
-        assert!(storage.get::<Namespace>(&ns_key).await.is_err());
     }
 
     #[tokio::test]
