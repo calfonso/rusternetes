@@ -1,3 +1,4 @@
+use crate::resources::serde_helpers::empty_string_as_none;
 use crate::resources::service_account::ObjectReference;
 use crate::types::{ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
@@ -26,7 +27,11 @@ pub struct PersistentVolumeSpec {
     pub access_modes: Vec<PersistentVolumeAccessMode>,
 
     /// Reclaim policy
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub persistent_volume_reclaim_policy: Option<PersistentVolumeReclaimPolicy>,
 
     /// Storage class name
@@ -38,7 +43,11 @@ pub struct PersistentVolumeSpec {
     pub mount_options: Option<Vec<String>>,
 
     /// Volume mode
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub volume_mode: Option<PersistentVolumeMode>,
 
     /// Node affinity
@@ -74,7 +83,11 @@ pub struct PersistentVolumeSpec {
 #[serde(rename_all = "camelCase")]
 pub struct HostPathVolumeSource {
     pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub r#type: Option<HostPathType>,
 }
 
@@ -240,7 +253,11 @@ pub struct PersistentVolumeClaimSpec {
     pub storage_class_name: Option<String>,
 
     /// Volume mode
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub volume_mode: Option<PersistentVolumeMode>,
 
     /// Selector for PV
@@ -408,11 +425,19 @@ pub struct StorageClass {
     pub parameters: Option<HashMap<String, String>>,
 
     /// Reclaim policy
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub reclaim_policy: Option<PersistentVolumeReclaimPolicy>,
 
     /// Volume binding mode
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub volume_binding_mode: Option<VolumeBindingMode>,
 
     /// Allowed topologies

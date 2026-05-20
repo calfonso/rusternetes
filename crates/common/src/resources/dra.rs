@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use super::serde_helpers::empty_string_as_none;
 use super::NodeSelector;
 
 // =============================================================================
@@ -95,7 +96,8 @@ pub struct ExactDeviceRequest {
     #[serde(
         rename = "allocationMode",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
     )]
     pub allocation_mode: Option<DeviceAllocationMode>,
 
@@ -167,7 +169,11 @@ pub struct DeviceToleration {
     pub effect: DeviceTaintEffect,
 
     /// Operator represents a key's relationship to the value
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub operator: Option<TolerationOperator>,
 }
 

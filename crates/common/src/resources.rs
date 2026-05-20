@@ -28,6 +28,7 @@ pub mod pod;
 pub mod policy;
 pub mod rbac;
 pub mod runtimeclass;
+pub mod serde_helpers;
 pub mod service;
 pub mod service_account;
 pub mod servicecidr;
