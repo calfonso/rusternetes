@@ -40,7 +40,7 @@ Built-in web console with real-time topology visualization and live metrics.
 |  |  Storage (pluggable)      |                                     |
 |  |  /registry/{type}/...     |                                     |
 |  |  CAS via mod_revision     |                                     |
-|  |  etcd | SQLite (rhino)    |                                     |
+|  |  etcd | SQLite | Redis    |                                     |
 |  +---------------------------+                                     |
 +--------------------------------------------------------------------+
         |                              |
@@ -59,8 +59,10 @@ Built-in web console with real-time topology visualization and live metrics.
 ```
 
 All components communicate exclusively through the storage backend. The
-storage layer is pluggable: etcd (production), SQLite via rhino gRPC
-(lighter alternative), or embedded SQLite (all-in-one single binary).
+storage layer is pluggable: etcd (production), SQLite or Redis via rhino
+gRPC (lighter alternatives), or embedded SQLite/Redis (all-in-one single
+binary). Rhino is an etcd-compatible gRPC server that can be backed by
+SQLite, Redis, PostgreSQL, or MySQL.
 See [Storage Backends](storage/STORAGE_BACKENDS.md) for details.
 
 ---
@@ -72,7 +74,7 @@ rusternetes/
   crates/
     common/                # Shared types, 36 resource files in src/resources/
     api-server/            # Axum HTTPS API, 75 handler files, router.rs (2,135 lines)
-    storage/               # Storage trait, etcd/SQLite (rhino) + in-memory backends
+    storage/               # Storage trait, etcd/SQLite/Redis (rhino) + in-memory backends
     controller-manager/    # 31 controllers in src/controllers/
     scheduler/             # Filter/Score plugin architecture
     kubelet/               # Node agent, Docker runtime via bollard, CNI framework
@@ -84,6 +86,9 @@ rusternetes/
   docs/                    # Architecture, conformance, development guides
   docker-compose.yml       # Full cluster with etcd
   docker-compose.sqlite.yml # Full cluster with rhino/SQLite (no etcd)
+  compose.redis.yml        # Full cluster with rhino/Redis (no etcd)
+  compose.all-in-one.yml   # Single container with embedded SQLite
+  compose.all-in-one-redis.yml # Single container + Redis
   Dockerfile.rhino         # Builds rhino gRPC server
 ```
 
@@ -167,10 +172,13 @@ ClusterIP allocator, webhook manager, and watch event cache.
 
 ### storage
 
-The `Storage` trait (`src/lib.rs`) with two backends:
+The `Storage` trait (`src/lib.rs`) with multiple backends:
 
 - **EtcdStorage** (`src/etcd.rs`) -- Production backend. Resource versions map
   to etcd `mod_revision`. Watch support via etcd's native watch API.
+- **RhinoStorage** (`src/rhino.rs`) -- SQLite or Redis via [Rhino](https://github.com/calfonso/rhino).
+  Behind `sqlite` and `redis` feature flags. Rhino is an etcd-compatible gRPC
+  server that can also be embedded in-process.
 - **MemoryStorage** (`src/memory.rs`) -- In-memory backend for unit tests.
 
 **Key pattern:** `/registry/{resource_type}/{namespace}/{name}` for namespaced

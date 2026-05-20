@@ -53,7 +53,7 @@ Based on Round 147 analysis (43 failures):
 - **Init containers (~2)**: RestartNever invoke, RestartAlways failure handling.
 - **Other (~8)**: GC orphan pods, ResourceQuota pod lifecycle, chunking compaction, DaemonSet rolling update, StatefulSet eviction, HostPort conflicts, preemption running path, service endpoints latency.
 
-Detailed tracking in `docs/CONFORMANCE_FAILURES.md`.
+Detailed tracking in `.work/CONFORMANCE_TRACKER.md`.
 
 ## API Resources Implemented
 

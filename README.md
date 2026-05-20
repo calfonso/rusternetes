@@ -254,8 +254,6 @@ bash scripts/run-conformance.sh
 bash scripts/conformance-progress.sh
 ```
 
-See [CONFORMANCE_FAILURES.md](docs/CONFORMANCE_FAILURES.md) for the full fix tracker.
-
 ## Project Structure
 
 ```
