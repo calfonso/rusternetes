@@ -1,3 +1,4 @@
+use crate::resources::serde_helpers::empty_string_as_none;
 use crate::resources::service_account::ObjectReference;
 use crate::resources::volume::LabelSelector;
 use crate::types::{ObjectMeta, TypeMeta};
@@ -26,7 +27,11 @@ pub struct CSIDriverSpec {
     pub pod_info_on_mount: Option<bool>,
 
     /// fsGroupPolicy defines if the volume supports changing ownership and permission of the volume
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub fs_group_policy: Option<FSGroupPolicy>,
 
     /// storageCapacity indicates that the CSI volume driver wants pod scheduling to consider storage capacity

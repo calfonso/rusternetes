@@ -1,4 +1,5 @@
 use crate::resources::policy::IntOrString;
+use crate::resources::serde_helpers::empty_string_as_none;
 use crate::types::{Condition, ObjectMeta, TypeMeta};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,7 +40,12 @@ pub struct ServiceSpec {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ports: Vec<ServicePort>,
 
-    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    #[serde(
+        default,
+        rename = "type",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub service_type: Option<ServiceType>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "clusterIP")]
@@ -68,18 +74,30 @@ pub struct ServiceSpec {
 
     /// IPFamilyPolicy represents the dual-stack-ness requested or required by this Service.
     /// Can be SingleStack, PreferDualStack, or RequireDualStack.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub ip_family_policy: Option<IPFamilyPolicy>,
 
     /// InternalTrafficPolicy specifies if the cluster internal traffic should be routed to all endpoints
     /// or node-local endpoints only. "Cluster" routes to all endpoints. "Local" routes to node-local endpoints.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub internal_traffic_policy: Option<ServiceInternalTrafficPolicy>,
 
     /// ExternalTrafficPolicy denotes if this Service desires to route external traffic to node-local or
     /// cluster-wide endpoints. "Local" preserves the client source IP and avoids a second hop for LoadBalancer
     /// and Nodeport type services, but risks potentially imbalanced traffic spreading.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub external_traffic_policy: Option<ServiceExternalTrafficPolicy>,
 
     /// HealthCheckNodePort specifies the healthcheck nodePort for the service (when type=LoadBalancer and externalTrafficPolicy=Local)
@@ -424,5 +442,80 @@ mod tests {
         }"#;
         let svc: Service = serde_json::from_str(json).unwrap();
         assert!(svc.spec.selector.is_none());
+    }
+
+    /// Regression: upstream e2e (and client-go in general) serialize unset
+    /// enum-typed Option<_> fields as the empty string instead of omitting
+    /// them. Without empty_string_as_none, strict serde rejects "" with
+    /// `unknown variant ''` and the api-server returns 422 before any
+    /// handler runs, breaking `[sig-node] Pods should contain environment
+    /// variables for services` and every other test that builds a Service
+    /// via framework helpers.
+    #[test]
+    fn service_spec_accepts_empty_enum_strings() {
+        let json = r#"{
+            "type": "",
+            "ipFamilyPolicy": "",
+            "internalTrafficPolicy": "",
+            "externalTrafficPolicy": ""
+        }"#;
+        let spec: ServiceSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.service_type.is_none());
+        assert!(spec.ip_family_policy.is_none());
+        assert!(spec.internal_traffic_policy.is_none());
+        assert!(spec.external_traffic_policy.is_none());
+    }
+
+    #[test]
+    fn service_spec_still_accepts_named_enum_variants() {
+        let json = r#"{
+            "type": "ClusterIP",
+            "ipFamilyPolicy": "SingleStack",
+            "internalTrafficPolicy": "Cluster",
+            "externalTrafficPolicy": "Local"
+        }"#;
+        let spec: ServiceSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.service_type, Some(ServiceType::ClusterIP));
+        assert_eq!(spec.ip_family_policy, Some(IPFamilyPolicy::SingleStack));
+        assert_eq!(
+            spec.internal_traffic_policy,
+            Some(ServiceInternalTrafficPolicy::Cluster)
+        );
+        assert_eq!(
+            spec.external_traffic_policy,
+            Some(ServiceExternalTrafficPolicy::Local)
+        );
+    }
+
+    #[test]
+    fn service_spec_rejects_genuinely_bogus_enum_strings() {
+        let json = r#"{ "externalTrafficPolicy": "NotARealPolicy" }"#;
+        let r: Result<ServiceSpec, _> = serde_json::from_str(json);
+        assert!(r.is_err(), "unknown non-empty variant must still error");
+    }
+
+    /// The e2e payload that triggered the bug, captured verbatim from the
+    /// `[sig-node] Pods should contain environment variables for services`
+    /// failure on node-1.
+    #[test]
+    fn service_e2e_envvars_payload_deserializes() {
+        let json = r#"{
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "fooservice"},
+            "spec": {
+                "selector": {"name": "server-envvars"},
+                "ports": [{"port": 8765, "targetPort": 8080}],
+                "type": "",
+                "internalTrafficPolicy": "",
+                "externalTrafficPolicy": "",
+                "ipFamilyPolicy": ""
+            }
+        }"#;
+        let svc: Service = serde_json::from_str(json).unwrap();
+        assert!(svc.spec.service_type.is_none());
+        assert!(svc.spec.internal_traffic_policy.is_none());
+        assert!(svc.spec.external_traffic_policy.is_none());
+        assert!(svc.spec.ip_family_policy.is_none());
     }
 }
