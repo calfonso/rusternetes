@@ -258,7 +258,7 @@ pub struct PodOS {
 }
 
 /// PodSchedulingGate is associated to a Pod to guard its scheduling
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodSchedulingGate {
     pub name: String,

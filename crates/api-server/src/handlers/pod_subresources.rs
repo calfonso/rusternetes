@@ -1039,6 +1039,23 @@ pub async fn create_binding(
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
     let mut pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
+    // K8s ref: pkg/registry/core/pod/storage/storage.go BindingREST.Create —
+    // a Pod can only be bound once. A second POST /binding against an
+    // already-bound Pod returns 409 Conflict
+    // ("pod ... is already assigned to node ..."). Without this check the
+    // handler silently overwrites spec.nodeName.
+    if let Some(existing) = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        return Err(Error::Conflict(format!(
+            "pod {} is already assigned to node \"{}\"",
+            name, existing
+        )));
+    }
+
     // Set the nodeName in spec
     if let Some(ref mut spec) = pod.spec {
         spec.node_name = Some(node_name.to_string());

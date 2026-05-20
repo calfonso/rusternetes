@@ -564,8 +564,6 @@ async fn test_field_validation_default_pod_unknown_field_rejected_k8s_1_35() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: pod update handler does not call validate_strict_fields \
-            (see crates/api-server/src/handlers/pod.rs:642 — no strict check on PUT path)"]
 async fn test_field_validation_strict_pod_update_unknown_field_rejected() {
     let (_mem, router) = spawn_router();
 
