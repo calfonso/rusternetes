@@ -175,6 +175,11 @@ impl From<&[String]> for BadValue {
         ))
     }
 }
+impl From<serde_json::Value> for BadValue {
+    fn from(v: serde_json::Value) -> Self {
+        BadValue::Json(v)
+    }
+}
 
 /// Structured validation error. Mirrors upstream `field.Error`.
 #[derive(Debug, Clone, PartialEq)]
