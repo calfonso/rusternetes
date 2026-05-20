@@ -31,6 +31,11 @@ const LABEL_VALUE_ERR_MSG: &str =
     "a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character";
 const LABEL_VALUE_MAX_LENGTH: usize = 63;
 
+const DNS1123_LABEL_FMT: &str = "[a-z0-9]([-a-z0-9]*[a-z0-9])?";
+const DNS1123_LABEL_ERR_MSG: &str =
+    "a lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character";
+const DNS1123_LABEL_MAX_LENGTH: usize = 63;
+
 const DNS1123_SUBDOMAIN_FMT: &str =
     "[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*";
 const DNS1123_SUBDOMAIN_ERR_MSG: &str =
@@ -42,6 +47,8 @@ static LABEL_KEY_RE: Lazy<Regex> =
 // Label value upstream is `(labelKeyFmt)?` — i.e. either empty or a label-key.
 static LABEL_VALUE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(&format!("^({LABEL_KEY_FMT})?$")).expect("label value regex"));
+static DNS1123_LABEL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(&format!("^{DNS1123_LABEL_FMT}$")).expect("dns1123 label regex"));
 static DNS1123_SUBDOMAIN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!("^{DNS1123_SUBDOMAIN_FMT}$")).expect("dns1123 subdomain regex")
 });
@@ -86,7 +93,7 @@ fn empty_error() -> &'static str {
 }
 
 /// Upstream `validation.IsDNS1123Subdomain`.
-fn is_dns1123_subdomain(value: &str) -> Vec<String> {
+pub fn is_dns1123_subdomain(value: &str) -> Vec<String> {
     let mut errs = Vec::new();
     if value.len() > DNS1123_SUBDOMAIN_MAX_LENGTH {
         errs.push(max_len_error(DNS1123_SUBDOMAIN_MAX_LENGTH));
@@ -101,8 +108,30 @@ fn is_dns1123_subdomain(value: &str) -> Vec<String> {
     errs
 }
 
+/// Upstream `validation.IsDNS1123Label`.
+pub fn is_dns1123_label(value: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    if value.len() > DNS1123_LABEL_MAX_LENGTH {
+        errs.push(max_len_error(DNS1123_LABEL_MAX_LENGTH));
+    }
+    if !DNS1123_LABEL_RE.is_match(value) {
+        if DNS1123_SUBDOMAIN_RE.is_match(value) {
+            // It was a valid subdomain and not a valid label.  Since we
+            // already checked length, it must be dots.
+            errs.push("must not contain dots".to_string());
+        } else {
+            errs.push(regex_error(
+                DNS1123_LABEL_ERR_MSG,
+                DNS1123_LABEL_FMT,
+                &["my-name", "123-abc"],
+            ));
+        }
+    }
+    errs
+}
+
 /// Upstream `content.IsLabelKey` (a.k.a. `IsQualifiedName`).
-fn is_qualified_name(value: &str) -> Vec<String> {
+pub fn is_qualified_name(value: &str) -> Vec<String> {
     let mut errs = Vec::new();
     let parts: Vec<&str> = value.split('/').collect();
     let name: &str;
