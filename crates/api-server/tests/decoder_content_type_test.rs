@@ -167,6 +167,40 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) -> String {
     key
 }
 
+/// Seed a Deployment carrying the same TWO containers (`c1`, `c2`) inside
+/// `spec.template.spec.containers`. Deployments are NOT covered by
+/// `ValidatePodUpdate`'s immutability fence, so they remain the right
+/// vehicle for proving SMP-vs-RFC7396-vs-RFC6902 array semantics
+/// observably diverge. (Pods reject container add/remove on update, so
+/// the same patch bodies against a Pod would 422 before the decoder
+/// difference becomes visible.)
+async fn seed_deployment(mem: &Arc<MemoryStorage>, name: &str) -> String {
+    let dep = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": name,
+            "namespace": TEST_NS,
+            "labels": {"original": "true"}
+        },
+        "spec": {
+            "selector": {"matchLabels": {"app": name}},
+            "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {
+                    "containers": [
+                        {"name": "c1", "image": "busybox:1.0"},
+                        {"name": "c2", "image": "nginx:1.0"}
+                    ]
+                }
+            }
+        }
+    });
+    let key = build_key("deployments", Some(TEST_NS), name);
+    mem.create(&key, &dep).await.expect("seed deployment");
+    key
+}
+
 // ---------------------------------------------------------------------------
 // POST /pods — request decoder dispatch
 // ---------------------------------------------------------------------------
@@ -357,23 +391,27 @@ async fn test_content_type_missing_defaults_to_json() {
 #[tokio::test]
 async fn test_content_type_strategic_merge_patch_merges_arrays_by_name() {
     let (mem, router) = spawn_router();
-    seed_pod(&mem, "smp-pod").await;
+    seed_deployment(&mem, "smp-dep").await;
 
     // SMP body: same array shape as the original; merge happens by `name`.
     // Updates c1, adds c3, omits c2 (which should be preserved).
     let smp = json!({
         "spec": {
-            "containers": [
-                {"name": "c1", "image": "busybox:2.0"},
-                {"name": "c3", "image": "alpine:3.20"}
-            ]
+            "template": {
+                "spec": {
+                    "containers": [
+                        {"name": "c1", "image": "busybox:2.0"},
+                        {"name": "c3", "image": "alpine:3.20"}
+                    ]
+                }
+            }
         }
     });
 
     let (status, response_body) = send_with_ct(
         router,
         Method::PATCH,
-        "/api/v1/namespaces/default/pods/smp-pod",
+        "/apis/apps/v1/namespaces/default/deployments/smp-dep",
         "application/strategic-merge-patch+json",
         serde_json::to_vec(&smp).unwrap(),
     )
@@ -386,8 +424,8 @@ async fn test_content_type_strategic_merge_patch_merges_arrays_by_name() {
         response_body
     );
 
-    let stored = read_stored(&mem, &build_key("pods", Some(TEST_NS), "smp-pod")).await;
-    let containers = stored["spec"]["containers"]
+    let stored = read_stored(&mem, &build_key("deployments", Some(TEST_NS), "smp-dep")).await;
+    let containers = stored["spec"]["template"]["spec"]["containers"]
         .as_array()
         .expect("containers must be an array");
     assert_eq!(
@@ -422,21 +460,25 @@ async fn test_content_type_strategic_merge_patch_merges_arrays_by_name() {
 #[tokio::test]
 async fn test_content_type_merge_patch_replaces_arrays() {
     let (mem, router) = spawn_router();
-    seed_pod(&mem, "mp-pod").await;
+    seed_deployment(&mem, "mp-dep").await;
 
     let mp = json!({
         "spec": {
-            "containers": [
-                {"name": "c1", "image": "busybox:2.0"},
-                {"name": "c3", "image": "alpine:3.20"}
-            ]
+            "template": {
+                "spec": {
+                    "containers": [
+                        {"name": "c1", "image": "busybox:2.0"},
+                        {"name": "c3", "image": "alpine:3.20"}
+                    ]
+                }
+            }
         }
     });
 
     let (status, response_body) = send_with_ct(
         router,
         Method::PATCH,
-        "/api/v1/namespaces/default/pods/mp-pod",
+        "/apis/apps/v1/namespaces/default/deployments/mp-dep",
         "application/merge-patch+json",
         serde_json::to_vec(&mp).unwrap(),
     )
@@ -449,8 +491,8 @@ async fn test_content_type_merge_patch_replaces_arrays() {
         response_body
     );
 
-    let stored = read_stored(&mem, &build_key("pods", Some(TEST_NS), "mp-pod")).await;
-    let containers = stored["spec"]["containers"]
+    let stored = read_stored(&mem, &build_key("deployments", Some(TEST_NS), "mp-dep")).await;
+    let containers = stored["spec"]["template"]["spec"]["containers"]
         .as_array()
         .expect("containers must be an array");
     assert_eq!(
@@ -473,18 +515,18 @@ async fn test_content_type_merge_patch_replaces_arrays() {
 #[tokio::test]
 async fn test_content_type_json_patch_applies_ops_array() {
     let (mem, router) = spawn_router();
-    seed_pod(&mem, "jp-pod").await;
+    seed_deployment(&mem, "jp-dep").await;
 
     // RFC 6902 ops. `-` appends to an array.
     let jp = json!([
-        {"op": "replace", "path": "/spec/containers/0/image", "value": "busybox:2.0"},
-        {"op": "add", "path": "/spec/containers/-", "value": {"name": "c3", "image": "alpine:3.20"}}
+        {"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "busybox:2.0"},
+        {"op": "add", "path": "/spec/template/spec/containers/-", "value": {"name": "c3", "image": "alpine:3.20"}}
     ]);
 
     let (status, response_body) = send_with_ct(
         router,
         Method::PATCH,
-        "/api/v1/namespaces/default/pods/jp-pod",
+        "/apis/apps/v1/namespaces/default/deployments/jp-dep",
         "application/json-patch+json",
         serde_json::to_vec(&jp).unwrap(),
     )
@@ -497,8 +539,8 @@ async fn test_content_type_json_patch_applies_ops_array() {
         response_body
     );
 
-    let stored = read_stored(&mem, &build_key("pods", Some(TEST_NS), "jp-pod")).await;
-    let containers = stored["spec"]["containers"]
+    let stored = read_stored(&mem, &build_key("deployments", Some(TEST_NS), "jp-dep")).await;
+    let containers = stored["spec"]["template"]["spec"]["containers"]
         .as_array()
         .expect("containers must be an array");
     assert_eq!(
