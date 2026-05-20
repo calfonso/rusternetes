@@ -34,3 +34,5 @@
 [sig-node] Containers should be able to override the image's default command (container entrypoint) [NodeConformance]
 # closes #449
 [sig-node] Containers should use the image defaults if command and args are blank [NodeConformance]
+# closes #452
+[sig-node] Downward API should provide host IP as an env var [NodeConformance]

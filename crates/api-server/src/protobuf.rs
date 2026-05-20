@@ -52,6 +52,13 @@ pub enum FieldType {
     MessageMap(String),
     /// K8s JSON type — a message with a single `raw` bytes field containing JSON
     JsonRaw,
+    /// K8s Quantity — protobuf message with field 1 (string) = canonical string form.
+    /// Decodes to the string value directly (e.g. "100m", "32M", "1").
+    /// Used for `resourceFieldRef.divisor` and any standalone Quantity field.
+    Quantity,
+    /// map<string, Quantity> — repeated MapEntry where value is a Quantity message.
+    /// Used for ResourceRequirements.limits and ResourceRequirements.requests.
+    QuantityMap,
 }
 
 /// Schema for a single protobuf message type
@@ -601,7 +608,8 @@ impl ProtoRegistry {
                 fields: HashMap::from([
                     (1, ("containerName".into(), FieldType::String)),
                     (2, ("resource".into(), FieldType::String)),
-                    (3, ("divisor".into(), FieldType::String)),
+                    // divisor is resource.Quantity in proto — decode via Quantity message parser
+                    (3, ("divisor".into(), FieldType::Quantity)),
                 ]),
             },
         );
@@ -1346,8 +1354,9 @@ impl ProtoRegistry {
             "VolumeResourceRequirements".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("limits".into(), FieldType::StringMap)),
-                    (2, ("requests".into(), FieldType::StringMap)),
+                    // limits/requests are map<string, Quantity> — use QuantityMap decoder
+                    (1, ("limits".into(), FieldType::QuantityMap)),
+                    (2, ("requests".into(), FieldType::QuantityMap)),
                 ]),
             },
         );
@@ -5612,13 +5621,18 @@ impl ProtoRegistry {
                 )]),
             },
         );
-        // LimitRangeItem: max/min/default/defaultRequest/maxLimitRequestRatio are
-        // map<string, Quantity> — Quantity is a leaf scalar with no schema entry,
-        // so we skip those fields silently. Only `type` is registered.
         schemas.insert(
             "LimitRangeItem".into(),
             MessageSchema {
-                fields: HashMap::from([(1, ("type".into(), FieldType::String))]),
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    // max/min/default/defaultRequest/maxLimitRequestRatio are map<string, Quantity>
+                    (2, ("max".into(), FieldType::QuantityMap)),
+                    (3, ("min".into(), FieldType::QuantityMap)),
+                    (4, ("default".into(), FieldType::QuantityMap)),
+                    (5, ("defaultRequest".into(), FieldType::QuantityMap)),
+                    (6, ("maxLimitRequestRatio".into(), FieldType::QuantityMap)),
+                ]),
             },
         );
 
@@ -6377,8 +6391,9 @@ impl ProtoRegistry {
     fn resource_requirements_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("limits".into(), FieldType::StringMap)),
-                (2, ("requests".into(), FieldType::StringMap)),
+                // limits/requests are map<string, Quantity> — use QuantityMap decoder
+                (1, ("limits".into(), FieldType::QuantityMap)),
+                (2, ("requests".into(), FieldType::QuantityMap)),
                 (
                     3,
                     (
@@ -6732,6 +6747,20 @@ impl ProtoRegistry {
                                     m.insert(key, Value::String(val));
                                 }
                             }
+                            FieldType::QuantityMap => {
+                                // map<string, Quantity> — each MapEntry has field 1 (key string)
+                                // and field 2 (Quantity message). Decode the Quantity message to
+                                // extract its string representation (field 1 of Quantity).
+                                let (key, val) = decode_quantity_map_entry(field_data);
+                                if !key.is_empty() {
+                                    let map = obj
+                                        .entry(name.clone())
+                                        .or_insert_with(|| Value::Object(Map::new()));
+                                    if let Value::Object(ref mut m) = map {
+                                        m.insert(key, Value::String(val));
+                                    }
+                                }
+                            }
                             FieldType::MessageMap(ref msg_type) => {
                                 // map<string, Message> — decode MapEntry with message value
                                 let (key, val) =
@@ -6741,6 +6770,18 @@ impl ProtoRegistry {
                                     .or_insert_with(|| Value::Object(Map::new()));
                                 if let Value::Object(ref mut m) = map {
                                     m.insert(key, val);
+                                }
+                            }
+                            FieldType::String => {
+                                // proto2 optional string: skip when empty so that an
+                                // absent field (zero-length wire encoding) is not
+                                // confused with a present-but-empty value.  This
+                                // prevents `"value": ""` from appearing in an EnvVar
+                                // that only has valueFrom set, which would otherwise
+                                // shadow the valueFrom path in the kubelet.
+                                if !field_data.is_empty() {
+                                    let s = String::from_utf8_lossy(field_data).to_string();
+                                    obj.insert(name.clone(), Value::String(s));
                                 }
                             }
                             _ => {
@@ -6828,6 +6869,15 @@ impl ProtoRegistry {
                 // K8s IntOrString: in protobuf, encoded as a message with
                 // field 1 (type: int32), field 2 (intVal: int32), field 3 (strVal: string)
                 decode_int_or_string(data)
+            }
+            FieldType::Quantity => {
+                // K8s Quantity: protobuf message with field 1 = canonical string.
+                let s = decode_quantity(data);
+                Value::String(s)
+            }
+            FieldType::QuantityMap => {
+                // Should be handled at the caller level as QuantityMapEntry
+                Value::Object(Map::new())
             }
             FieldType::JsonRaw => {
                 // K8s JSON type: a message with field 1 = bytes containing raw JSON.
@@ -7078,6 +7128,100 @@ fn read_varint(data: &[u8], mut pos: usize) -> Option<(u64, usize)> {
 }
 
 /// Decode a protobuf map entry (field 1 = key, field 2 = value, both strings)
+/// Decode a K8s `resource.Quantity` protobuf message to its canonical string form.
+///
+/// The Quantity message (from `k8s.io/apimachinery/pkg/api/resource/generated.proto`):
+///   field 1 (string): the canonical string representation, e.g. "100m", "32M", "1"
+///   field 2 (SuffixedValue): internal binary representation (we ignore this)
+///
+/// We extract field 1. If not found, return an empty string (caller's responsibility
+/// to handle the fallback case).
+fn decode_quantity(data: &[u8]) -> String {
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, new_pos) = match read_varint(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        if wire_type == WIRE_LENGTH_DELIMITED {
+            let (len, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+            let len = len as usize;
+            if pos + len > data.len() {
+                break;
+            }
+            if field_num == 1 {
+                // Field 1 is the canonical string form of the quantity
+                return String::from_utf8_lossy(&data[pos..pos + len]).to_string();
+            }
+            pos += len;
+        } else if wire_type == WIRE_VARINT {
+            let (_, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+        } else {
+            break;
+        }
+    }
+    String::new()
+}
+
+/// Decode a protobuf map entry where the value is a Quantity message.
+/// Returns (key_string, quantity_string).
+fn decode_quantity_map_entry(data: &[u8]) -> (String, String) {
+    let mut key = String::new();
+    let mut val = String::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, new_pos) = match read_varint(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        if wire_type == WIRE_LENGTH_DELIMITED {
+            let (len, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+            let len = len as usize;
+            if pos + len > data.len() {
+                break;
+            }
+            match field_num {
+                1 => {
+                    key = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
+                }
+                2 => {
+                    // Value is a Quantity protobuf message — decode field 1 of that message
+                    val = decode_quantity(&data[pos..pos + len]);
+                }
+                _ => {}
+            }
+            pos += len;
+        } else if wire_type == WIRE_VARINT {
+            let (_, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+        } else {
+            break;
+        }
+    }
+    (key, val)
+}
+
 fn decode_map_entry(data: &[u8]) -> (String, String) {
     let mut key = String::new();
     let mut val = String::new();
