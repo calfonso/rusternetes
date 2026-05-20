@@ -49,6 +49,7 @@ pub async fn create(
     statefulset.metadata.namespace = Some(namespace.clone());
     statefulset.metadata.ensure_uid();
     statefulset.metadata.ensure_creation_timestamp();
+    crate::handlers::lifecycle::set_initial_generation(&mut statefulset.metadata);
 
     // Apply K8s defaults (SetDefaults_StatefulSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_statefulset_defaults(&mut statefulset);
@@ -124,24 +125,53 @@ pub async fn update(
 
     statefulset.metadata.name = name.clone();
     statefulset.metadata.namespace = Some(namespace.clone());
+    if statefulset.type_meta.kind.is_empty() {
+        statefulset.type_meta.kind = "StatefulSet".to_string();
+    }
+    if statefulset.type_meta.api_version.is_empty() {
+        statefulset.type_meta.api_version = "apps/v1".to_string();
+    }
 
     // Apply K8s defaults (SetDefaults_StatefulSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_statefulset_defaults(&mut statefulset);
 
-    // If dry-run, skip storage operation but return the validated resource
-    if is_dry_run {
-        info!(
-            "Dry-run: StatefulSet {}/{} validated successfully (not updated)",
-            namespace, name
-        );
-        return Ok(Json(statefulset));
-    }
-
     let key = build_key("statefulsets", Some(&namespace), &name);
+
+    // Load stored object so we can enforce upstream Strategy.PrepareForUpdate
+    // (status reset + selector immutability) and ValidateStatefulSetUpdate.
+    let old_statefulset: StatefulSet = state.storage.get(&key).await?;
+
+    crate::handlers::lifecycle::check_resource_version(
+        old_statefulset.metadata.resource_version.as_deref(),
+        statefulset.metadata.resource_version.as_deref(),
+        &name,
+    )?;
+
+    crate::handlers::lifecycle::validate_selector_immutable(
+        &old_statefulset.spec.selector,
+        &statefulset.spec.selector,
+        "StatefulSet",
+    )?;
+
+    // Status only mutates via /status; mirror upstream PrepareForUpdate.
+    statefulset.status = old_statefulset.status.clone();
+
+    // Increment generation if spec changed
+    let old_value = serde_json::to_value(&old_statefulset)
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    let new_value = serde_json::to_value(&statefulset)
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    crate::handlers::lifecycle::maybe_increment_generation(
+        &old_value,
+        &new_value,
+        &mut statefulset.metadata,
+    );
 
     // Compute the updateRevision from the new template. If the template changed,
     // this produces a different hash. K8s conformance tests expect updateRevision
     // to be set immediately after an update, not on the next controller cycle.
+    // This runs AFTER the upstream-mirroring status reset above, so it layers a
+    // synthetic updateRevision onto the preserved old status.
     {
         use sha2::{Digest, Sha256};
         let tmpl_value = serde_json::to_value(&statefulset.spec.template).unwrap_or_default();
@@ -176,6 +206,15 @@ pub async fn update(
             "StatefulSet {}/{} update: old_updateRevision={:?}, new_updateRevision={:?}",
             namespace, name, old_update_rev, status.update_revision
         );
+    }
+
+    // If dry-run, skip storage operation but return the validated resource
+    if is_dry_run {
+        info!(
+            "Dry-run: StatefulSet {}/{} validated successfully (not updated)",
+            namespace, name
+        );
+        return Ok(Json(statefulset));
     }
 
     // Try to update first, if not found then create (upsert behavior)

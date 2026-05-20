@@ -49,6 +49,7 @@ pub async fn create(
     replicaset.metadata.namespace = Some(namespace.clone());
     replicaset.metadata.ensure_uid();
     replicaset.metadata.ensure_creation_timestamp();
+    crate::handlers::lifecycle::set_initial_generation(&mut replicaset.metadata);
 
     // Apply K8s defaults (SetDefaults_ReplicaSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_replicaset_defaults(&mut replicaset);
@@ -137,9 +138,47 @@ pub async fn update(
 
     replicaset.metadata.name = name.clone();
     replicaset.metadata.namespace = Some(namespace.clone());
+    if replicaset.type_meta.kind.is_empty() {
+        replicaset.type_meta.kind = "ReplicaSet".to_string();
+    }
+    if replicaset.type_meta.api_version.is_empty() {
+        replicaset.type_meta.api_version = "apps/v1".to_string();
+    }
 
     // Apply K8s defaults (SetDefaults_ReplicaSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_replicaset_defaults(&mut replicaset);
+
+    let key = build_key("replicasets", Some(&namespace), &name);
+
+    // Load stored object so we can enforce upstream Strategy.PrepareForUpdate
+    // (status reset + selector immutability) and ValidateReplicaSetUpdate.
+    let old_replicaset: ReplicaSet = state.storage.get(&key).await?;
+
+    crate::handlers::lifecycle::check_resource_version(
+        old_replicaset.metadata.resource_version.as_deref(),
+        replicaset.metadata.resource_version.as_deref(),
+        &name,
+    )?;
+
+    crate::handlers::lifecycle::validate_selector_immutable(
+        &old_replicaset.spec.selector,
+        &replicaset.spec.selector,
+        "ReplicaSet",
+    )?;
+
+    // Status only mutates via /status; mirror upstream PrepareForUpdate.
+    replicaset.status = old_replicaset.status.clone();
+
+    // Increment generation if spec changed
+    let old_value = serde_json::to_value(&old_replicaset)
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    let new_value = serde_json::to_value(&replicaset)
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    crate::handlers::lifecycle::maybe_increment_generation(
+        &old_value,
+        &new_value,
+        &mut replicaset.metadata,
+    );
 
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
@@ -149,8 +188,6 @@ pub async fn update(
         );
         return Ok(Json(replicaset));
     }
-
-    let key = build_key("replicasets", Some(&namespace), &name);
 
     // Try to update first, if not found then create (upsert behavior)
     let result = match state.storage.update(&key, &replicaset).await {

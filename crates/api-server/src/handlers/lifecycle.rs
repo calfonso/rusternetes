@@ -1,10 +1,11 @@
 //! Resource lifecycle helpers for generation tracking and optimistic concurrency control.
 //!
-//! These helpers implement two critical Kubernetes conformance behaviors:
+//! These helpers implement three critical Kubernetes conformance behaviors:
 //! 1. `metadata.generation` tracking: incremented when spec changes, not on status-only updates
 //! 2. `metadata.resourceVersion` conflict detection: 409 Conflict on stale updates
+//! 3. `spec.selector` immutability: 422 Invalid on selector changes for apps/v1 workloads
 
-use rusternetes_common::types::ObjectMeta;
+use rusternetes_common::types::{LabelSelector, ObjectMeta};
 
 /// Set generation to 1 on newly created resources.
 ///
@@ -37,6 +38,27 @@ pub fn maybe_increment_generation(
         let current = metadata.generation.unwrap_or(0);
         metadata.generation = Some(current + 1);
     }
+}
+
+/// Validate that `spec.selector` has not changed between the stored object and the
+/// incoming update. Mirrors upstream `ValidateDeploymentUpdate` /
+/// `ValidateReplicaSetUpdate` / `ValidateStatefulSetUpdate` / `ValidateDaemonSetUpdate`,
+/// each of which calls `ValidateImmutableField(new.Spec.Selector, old.Spec.Selector,
+/// field.NewPath("spec").Child("selector"))`.
+///
+/// Returns `Err(InvalidResource)` (HTTP 422) when the selector differs.
+pub fn validate_selector_immutable(
+    old_selector: &LabelSelector,
+    new_selector: &LabelSelector,
+    kind: &str,
+) -> rusternetes_common::Result<()> {
+    if old_selector != new_selector {
+        return Err(rusternetes_common::Error::InvalidResource(format!(
+            "{}.spec.selector: Invalid value: field is immutable",
+            kind
+        )));
+    }
+    Ok(())
 }
 
 /// Check resourceVersion for optimistic concurrency control.
@@ -265,5 +287,45 @@ mod tests {
         let body = br#"{"preconditions":{"uid":"u-stale"}}"#;
         let err = check_delete_preconditions(body, &meta, "test").unwrap_err();
         assert!(matches!(err, rusternetes_common::Error::Conflict(_)));
+    }
+
+    #[test]
+    fn test_validate_selector_immutable_unchanged() {
+        let mut ml = std::collections::HashMap::new();
+        ml.insert("app".to_string(), "foo".to_string());
+        let a = LabelSelector {
+            match_labels: Some(ml.clone()),
+            match_expressions: None,
+        };
+        let b = LabelSelector {
+            match_labels: Some(ml),
+            match_expressions: None,
+        };
+        assert!(validate_selector_immutable(&a, &b, "Deployment").is_ok());
+    }
+
+    #[test]
+    fn test_validate_selector_immutable_changed_is_invalid_resource() {
+        let mut ml_a = std::collections::HashMap::new();
+        ml_a.insert("app".to_string(), "foo".to_string());
+        let mut ml_b = std::collections::HashMap::new();
+        ml_b.insert("app".to_string(), "bar".to_string());
+        let a = LabelSelector {
+            match_labels: Some(ml_a),
+            match_expressions: None,
+        };
+        let b = LabelSelector {
+            match_labels: Some(ml_b),
+            match_expressions: None,
+        };
+        let err =
+            validate_selector_immutable(&a, &b, "Deployment").expect_err("must reject the change");
+        assert!(
+            matches!(err, rusternetes_common::Error::InvalidResource(_)),
+            "expected Invalid (422), got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Deployment.spec.selector"), "msg: {msg}");
+        assert!(msg.contains("immutable"), "msg: {msg}");
     }
 }

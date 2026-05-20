@@ -12,11 +12,10 @@
 //! * **Status update isolation** — PUT against the main resource path
 //!   does NOT touch `status`; PUT `/status` does NOT touch `spec`.
 //!   (Upstream `StatusStrategy.PrepareForUpdate` resets the orthogonal field.)
-//! * **Selector immutability** — `spec.selector` is supposed to be immutable
-//!   post-create per upstream `ValidateXUpdate`. The router does not currently
-//!   enforce this on the apps/v1 workloads, so those tests are pinned with
-//!   `#[ignore]` until `Validate{Deployment,ReplicaSet,StatefulSet,DaemonSet}
-//!   Update` is wired into the handler chain.
+//! * **Selector immutability** — `spec.selector` is immutable post-create per
+//!   upstream `ValidateXUpdate`. Enforced in our handler chain via
+//!   `handlers::lifecycle::validate_selector_immutable`, which returns 422
+//!   Invalid when `old.spec.selector != new.spec.selector`.
 //! * **Replicas defaulting** — Deployment / StatefulSet default missing
 //!   `spec.replicas` to 1 via `apply_*_defaults`. ReplicaSet defaults to 1
 //!   via serde `default = "default_one_replica"`. DaemonSet has no
@@ -26,22 +25,18 @@
 //!   list → delete roundtrip covers the basic strategy contract since the
 //!   resource is immutable apart from `metadata.labels`.
 //!
-//! Tests marked `#[ignore = "blocked on issue #TBD: ..."]` are RED-state
-//! pins for handler-side parity gaps discovered while authoring this file:
+//! Handler parity gaps fixed in `fix(api-server): apps/v1 strategy parity`:
 //!
-//!   * ReplicaSet / StatefulSet / DaemonSet handlers omit
-//!     `set_initial_generation` and `maybe_increment_generation` (only the
-//!     Deployment handler wires them up). Once those calls are added in
-//!     `handlers::{replicaset,statefulset,daemonset}::{create,update}`, the
-//!     generation tests turn green.
-//!   * The main-PUT path on every apps/v1 workload accepts status from
-//!     the request body. Upstream `Strategy.PrepareForUpdate` copies the
-//!     stored object's status onto the incoming object so status only
-//!     mutates via the `/status` subresource. Adding that pass in the
-//!     update handlers turns the status-isolation tests green.
-//!   * Selector immutability is not enforced on any apps/v1 workload
-//!     update path. Mirroring `ValidateXUpdate`'s selector fence turns
-//!     the immutability tests green.
+//!   * ReplicaSet / StatefulSet / DaemonSet handlers now call
+//!     `set_initial_generation` on create and `maybe_increment_generation`
+//!     on update, matching the Deployment handler.
+//!   * The main-PUT path on every apps/v1 workload now copies the stored
+//!     object's status onto the incoming body before persisting, mirroring
+//!     upstream `Strategy.PrepareForUpdate`. Status mutates only via the
+//!     `/status` subresource.
+//!   * Selector immutability is enforced via
+//!     `handlers::lifecycle::validate_selector_immutable`, called from each
+//!     apps/v1 workload update handler.
 //!
 //! Convention: in-process Axum router wrapped around `MemoryStorage`; HTTP
 //! verbs driven via `tower::ServiceExt::oneshot`; assertions check BOTH the
@@ -278,7 +273,6 @@ async fn test_deployment_strategy_generation_bump_on_spec_change() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: Deployment main PUT does not strip incoming status (upstream Strategy.PrepareForUpdate copies old status onto new body)"]
 async fn test_deployment_strategy_status_update_isolation() {
     let (_mem, router) = spawn_router();
     let name = "deploy-status-iso";
@@ -363,7 +357,6 @@ async fn test_deployment_strategy_status_update_isolation() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ValidateDeploymentUpdate selector immutability fence not wired into apps/v1 handler chain"]
 async fn test_deployment_strategy_selector_immutability() {
     let (_mem, router) = spawn_router();
     let name = "deploy-sel-immut";
@@ -412,7 +405,6 @@ async fn test_deployment_strategy_replicas_default_to_one() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ReplicaSet handler does not set_initial_generation/maybe_increment_generation; needs to mirror Deployment handler"]
 async fn test_replicaset_strategy_generation_bump_on_spec_change() {
     let (_mem, router) = spawn_router();
     let name = "rs-gen-bump";
@@ -450,7 +442,6 @@ async fn test_replicaset_strategy_generation_bump_on_spec_change() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ReplicaSet main PUT does not strip incoming status (upstream Strategy.PrepareForUpdate copies old status onto new body)"]
 async fn test_replicaset_strategy_status_update_isolation() {
     let (_mem, router) = spawn_router();
     let name = "rs-status-iso";
@@ -509,7 +500,6 @@ async fn test_replicaset_strategy_status_update_isolation() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ValidateReplicaSetUpdate selector immutability fence not wired into apps/v1 handler chain"]
 async fn test_replicaset_strategy_selector_immutability() {
     let (_mem, router) = spawn_router();
     let name = "rs-sel-immut";
@@ -552,7 +542,6 @@ async fn test_replicaset_strategy_replicas_default_to_one() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: StatefulSet handler does not set_initial_generation/maybe_increment_generation; needs to mirror Deployment handler"]
 async fn test_statefulset_strategy_generation_bump_on_spec_change() {
     let (_mem, router) = spawn_router();
     let name = "ss-gen-bump";
@@ -586,7 +575,6 @@ async fn test_statefulset_strategy_generation_bump_on_spec_change() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: StatefulSet main PUT does not strip incoming status (upstream Strategy.PrepareForUpdate copies old status onto new body)"]
 async fn test_statefulset_strategy_status_update_isolation() {
     let (_mem, router) = spawn_router();
     let name = "ss-status-iso";
@@ -642,7 +630,6 @@ async fn test_statefulset_strategy_status_update_isolation() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ValidateStatefulSetUpdate selector immutability fence not wired into apps/v1 handler chain"]
 async fn test_statefulset_strategy_selector_immutability() {
     let (_mem, router) = spawn_router();
     let name = "ss-sel-immut";
@@ -685,7 +672,6 @@ async fn test_statefulset_strategy_replicas_default_to_one() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: DaemonSet handler does not set_initial_generation/maybe_increment_generation; needs to mirror Deployment handler"]
 async fn test_daemonset_strategy_generation_bump_on_spec_change() {
     let (_mem, router) = spawn_router();
     let name = "ds-gen-bump";
@@ -715,7 +701,6 @@ async fn test_daemonset_strategy_generation_bump_on_spec_change() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: DaemonSet main PUT does not strip incoming status (upstream Strategy.PrepareForUpdate copies old status onto new body)"]
 async fn test_daemonset_strategy_status_update_isolation() {
     let (_mem, router) = spawn_router();
     let name = "ds-status-iso";
@@ -775,7 +760,6 @@ async fn test_daemonset_strategy_status_update_isolation() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ValidateDaemonSetUpdate selector immutability fence not wired into apps/v1 handler chain"]
 async fn test_daemonset_strategy_selector_immutability() {
     let (_mem, router) = spawn_router();
     let name = "ds-sel-immut";
