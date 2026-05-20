@@ -80,6 +80,42 @@ pub async fn create(
                 )));
             }
         }
+        // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec —
+        // container names must be unique across containers + initContainers
+        // + ephemeralContainers. The upstream test
+        // `TestValidatePodSpec/duplicate_container_names` pins the exact
+        // error path: `spec.containers[1].name: Duplicate value: "ctr-a"`.
+        {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (i, c) in spec.containers.iter().enumerate() {
+                if !seen.insert(c.name.as_str()) {
+                    return Err(rusternetes_common::Error::InvalidResource(format!(
+                        "spec.containers[{}].name: Duplicate value: \"{}\"",
+                        i, c.name
+                    )));
+                }
+            }
+            if let Some(ref inits) = spec.init_containers {
+                for (i, c) in inits.iter().enumerate() {
+                    if !seen.insert(c.name.as_str()) {
+                        return Err(rusternetes_common::Error::InvalidResource(format!(
+                            "spec.initContainers[{}].name: Duplicate value: \"{}\"",
+                            i, c.name
+                        )));
+                    }
+                }
+            }
+            if let Some(ref ecs) = spec.ephemeral_containers {
+                for (i, ec) in ecs.iter().enumerate() {
+                    if !seen.insert(ec.name.as_str()) {
+                        return Err(rusternetes_common::Error::InvalidResource(format!(
+                            "spec.ephemeralContainers[{}].name: Duplicate value: \"{}\"",
+                            i, ec.name
+                        )));
+                    }
+                }
+            }
+        }
         // K8s ref: pkg/registry/core/pod/strategy.go Strategy.PrepareForCreate +
         // pkg/apis/core/validation/validation.go ValidatePodSpec — ephemeral
         // containers may NEVER be set on Pod create. They can only be added
@@ -656,6 +692,12 @@ pub async fn update(
 
     info!("Updating pod: {}/{}", namespace, name);
 
+    // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/update.go —
+    // strict field validation also fires on the UPDATE path (PUT). The
+    // create handler already calls this; the parity gap on PUT meant
+    // `fieldValidation=Strict` was effectively ignored for updates.
+    crate::handlers::validation::validate_strict_fields(&params, &body, &pod)?;
+
     // K8s ref: pkg/registry/core/pod/strategy.go — the /ephemeralcontainers
     // subresource has its own dedicated Strategy that scopes admission to the
     // ephemeralContainers slice and forbids removing existing entries. The
@@ -782,6 +824,50 @@ pub async fn update(
             }
             // Other valid combos: (None, None) and (None, Some(positive)).
             _ => {}
+        }
+    }
+
+    // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpecUpdate —
+    // once `spec.nodeName` is set (typically via the /binding subresource),
+    // the main PUT path may not change it. Upstream returns
+    // `spec.nodeName: Invalid value: ...: field is immutable`.
+    {
+        let old_node = old_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .unwrap_or("");
+        let new_node = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .unwrap_or("");
+        if !old_node.is_empty() && new_node != old_node {
+            return Err(rusternetes_common::Error::InvalidResource(format!(
+                "spec.nodeName: Invalid value: \"{}\": field is immutable",
+                new_node
+            )));
+        }
+    }
+
+    // K8s ref: pkg/registry/core/pod/strategy.go podStrategy.PrepareForUpdate
+    // — main resource PUT may not mutate `status`. The status subresource is
+    // the only path that may mutate it. Upstream resets
+    // `newPod.Status = oldPod.Status` before persisting.
+    pod.status = old_pod.status.clone();
+
+    // K8s ref: pkg/apis/core/validation/validation.go ValidatePodUpdate —
+    // immutability fence. Only specific spec fields are mutable on a PUT
+    // (containers[*].image, initContainers[*].image, activeDeadlineSeconds,
+    // terminationGracePeriodSeconds, tolerations (add-only),
+    // schedulingGates (delete-only)). Everything else is forbidden.
+    if let (Some(old_spec), Some(new_spec)) = (old_pod.spec.as_ref(), pod.spec.as_ref()) {
+        if let Err(msg) = rusternetes_common::validation::pod::validate_pod_spec_update(
+            old_spec,
+            new_spec,
+            is_ephemeral_subresource,
+        ) {
+            return Err(rusternetes_common::Error::InvalidResource(msg));
         }
     }
 

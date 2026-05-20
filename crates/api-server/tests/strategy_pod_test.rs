@@ -370,7 +370,6 @@ async fn test_pod_strategy_default_termination_grace_period_seconds() {
 /// rejects pods with two containers sharing the same name with
 /// `spec.containers[1].name: Duplicate value: "ctr-a"`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: container name uniqueness not validated in pod create handler"]
 async fn test_pod_strategy_create_rejects_duplicate_container_names() {
     let (_, router) = spawn_router();
     create_namespace(&router).await;
@@ -458,7 +457,6 @@ async fn test_pod_strategy_update_containers_image_mutable() {
 /// changing any non-image container field — here, `command` — is rejected by
 /// `ValidatePodUpdate`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: spec immutability fence (only image mutable) not enforced"]
 async fn test_pod_strategy_update_containers_command_immutable() {
     let (mem, router) = spawn_router();
     create_namespace(&router).await;
@@ -490,7 +488,6 @@ async fn test_pod_strategy_update_containers_command_immutable() {
 /// once `spec.nodeName` is set (typically via Binding), the regular PUT path
 /// may not change it.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: nodeName immutability on PUT not enforced once set"]
 async fn test_pod_strategy_update_node_name_immutable_once_set() {
     let (mem, router) = spawn_router();
     create_namespace(&router).await;
@@ -679,7 +676,6 @@ async fn test_pod_strategy_status_subresource_does_not_mutate_spec() {
 /// `newPod.Status = oldPod.Status` before persisting; rusternetes' main
 /// pod update handler currently accepts whatever status the client sends.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: pod main UPDATE handler does not strip client-supplied status (upstream podStrategy.PrepareForUpdate sets newPod.Status = oldPod.Status)"]
 async fn test_pod_strategy_main_resource_does_not_mutate_status() {
     let (mem, router) = spawn_router();
     create_namespace(&router).await;
@@ -810,7 +806,6 @@ async fn test_pod_strategy_binding_sets_node_name() {
 /// current rusternetes handler overwrites silently, so this test is
 /// `#[ignore]`d until binding-once parity ships.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: pod binding may currently be repeated; upstream rejects with Conflict"]
 async fn test_pod_strategy_binding_can_only_be_done_once() {
     let (mem, router) = spawn_router();
     create_namespace(&router).await;

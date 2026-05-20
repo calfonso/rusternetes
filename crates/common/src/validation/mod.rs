@@ -8,3 +8,4 @@
 pub mod field;
 pub mod metav1;
 pub mod objectmeta;
+pub mod pod;
