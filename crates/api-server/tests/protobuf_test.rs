@@ -127,9 +127,7 @@ fn test_protobuf_with_list() {
     assert_eq!(decoded_list.items.len(), 2);
 }
 
-// TODO: Re-enable when encode_response is implemented
 #[test]
-#[ignore]
 fn test_content_negotiation() {
     use axum::http::{header, HeaderMap};
     use rusternetes_api_server::response::{negotiate_content_type, ContentType};
