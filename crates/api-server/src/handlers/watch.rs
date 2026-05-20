@@ -184,6 +184,25 @@ where
         .and_then(|rv| rv.parse::<i64>().ok())
         .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
 
+    // If the requested resourceVersion has been compacted, return 410 Gone with
+    // reason=Expired. Upstream: staging/src/k8s.io/apiserver/pkg/storage/cacher/
+    // cacher.go::Watch returns errs.NewResourceExpired when the requested RV is
+    // below the cacher's earliest available revision; kube-apiserver maps this
+    // to HTTP 410 with Status{Reason:"Expired"}.
+    if let Some(since_rev) = replay_revision {
+        if state
+            .storage
+            .is_revision_compacted(since_rev)
+            .await
+            .unwrap_or(false)
+        {
+            return Err(Error::Gone(format!(
+                "too old resource version: {} (current: {})",
+                since_rev, current_rev
+            )));
+        }
+    }
+
     // Subscribe to watch events.
     // If a specific resourceVersion was given, use etcd's watch_from_revision
     // directly to replay ALL events since that revision from etcd's history.
@@ -671,6 +690,25 @@ where
         .filter(|rv| !rv.is_empty() && *rv != "0" && *rv != "1")
         .and_then(|rv| rv.parse::<i64>().ok())
         .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
+
+    // If the requested resourceVersion has been compacted, return 410 Gone with
+    // reason=Expired. Upstream: staging/src/k8s.io/apiserver/pkg/storage/cacher/
+    // cacher.go::Watch returns errs.NewResourceExpired when the requested RV is
+    // below the cacher's earliest available revision; kube-apiserver maps this
+    // to HTTP 410 with Status{Reason:"Expired"}.
+    if let Some(since_rev) = replay_revision {
+        if state
+            .storage
+            .is_revision_compacted(since_rev)
+            .await
+            .unwrap_or(false)
+        {
+            return Err(Error::Gone(format!(
+                "too old resource version: {} (current: {})",
+                since_rev, current_rev
+            )));
+        }
+    }
 
     // Subscribe to watch events.
     // If a specific resourceVersion was given, use etcd's watch_from_revision

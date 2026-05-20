@@ -30,11 +30,6 @@
 //!
 //! ## What this file does NOT pin (yet)
 //!
-//! - `Storage::is_revision_compacted` exists, but the watch handler does not
-//!   yet translate compacted-RV requests into HTTP 410 Gone. Pinned with
-//!   `#[ignore]` below.
-//! - The pod / configmap DELETE handlers do not honor
-//!   `deleteOptions.preconditions.resourceVersion`. Pinned with `#[ignore]`.
 //! - `Bookmark` events: the handler emits them every ~1s when
 //!   `allowWatchBookmarks=true`. We assert the wire shape but do not exercise
 //!   the interval cadence (would slow the suite without surfacing a regression
@@ -531,7 +526,7 @@ async fn test_resource_version_delete_missing_returns_404() {
 }
 
 // ---------------------------------------------------------------------------
-// Known gaps — pinned with `#[ignore]` so they don't block CI while we fix.
+// Compacted-RV 410 Gone + DELETE preconditions.resourceVersion
 // ---------------------------------------------------------------------------
 
 /// Watch with a compacted `resourceVersion` must return HTTP 410 Gone.
@@ -539,7 +534,6 @@ async fn test_resource_version_delete_missing_returns_404() {
 /// requested RV, kube-apiserver responds with `Status{Reason: "Expired",
 /// Code: 410}`. `Storage::is_revision_compacted` already exists in the
 /// memory backend (`compact_to`), but the watch handler does not consult it.
-#[ignore = "blocked on issue #TBD: watch handler does not translate compacted RV to 410 Gone"]
 #[tokio::test]
 async fn test_watch_resource_version_stale_returns_410() {
     let (mem, router) = spawn_router();
@@ -569,7 +563,6 @@ async fn test_watch_resource_version_stale_returns_410() {
 /// store.go::Delete` calls `preconditions.Check` before invoking the storage
 /// delete. Our pod and configmap handlers currently ignore the body's
 /// `deleteOptions.preconditions`.
-#[ignore = "blocked on issue #TBD: delete handlers do not honor deleteOptions.preconditions.resourceVersion"]
 #[tokio::test]
 async fn test_delete_with_mismatched_precondition_rv_returns_409() {
     let (mem, router) = spawn_router();

@@ -337,6 +337,7 @@ pub async fn delete_configmap(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
 ) -> Result<Json<ConfigMap>> {
     info!("Deleting configmap: {} in namespace: {}", name, namespace);
 
@@ -360,6 +361,12 @@ pub async fn delete_configmap(
 
     // Get the resource to check if it exists
     let configmap: ConfigMap = state.storage.get(&key).await?;
+
+    // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
+    // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls
+    // preconditions.Check() before invoking storage.Delete; a mismatch returns
+    // 409 Conflict with reason `Conflict`.
+    crate::handlers::lifecycle::check_delete_preconditions(&body, &configmap.metadata, &name)?;
 
     // If dry-run, skip delete operation
     if is_dry_run {

@@ -1032,6 +1032,12 @@ pub async fn delete_pod(
         return Ok(Json(pod));
     }
 
+    // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
+    // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls
+    // preconditions.Check() before invoking storage.Delete; a mismatch returns
+    // 409 Conflict with reason `Conflict`.
+    crate::handlers::lifecycle::check_delete_preconditions(&body, &pod.metadata, &name)?;
+
     // Parse DeleteOptions from request body (gracePeriodSeconds, propagationPolicy, etc.)
     let body_delete_options: Option<serde_json::Value> = if !body.is_empty() {
         serde_json::from_slice(&body).ok()
