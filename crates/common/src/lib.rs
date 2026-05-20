@@ -19,6 +19,7 @@ pub mod server_side_apply;
 pub mod tls;
 pub mod tracing;
 pub mod types;
+pub mod validation;
 
 pub use cel::{CELContext, CELEvaluator};
 pub use error::{Error, Result};

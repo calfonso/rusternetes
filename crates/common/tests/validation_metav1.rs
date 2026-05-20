@@ -1,23 +1,14 @@
-//! RED-state mirror of upstream `metav1` validation tests for `rusternetes-common`.
+//! Mirror of upstream `metav1` validation tests for `rusternetes-common`.
 //!
 //! Source (release-1.35): <https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/validation/validation_test.go>
 //!
-//! Each `#[test]` mirrors one `func Test*` from the upstream Go file and keeps
-//! the original name so the table of contents lines up 1:1. The bodies build
-//! the exact fixtures the upstream cases exercise, then call the rusternetes
-//! equivalents of the upstream validators (`ValidateLabels`, `ValidateDryRun`,
-//! `ValidatePatchOptions`, `ValidateFieldManager`, `ValidateManagedFields`,
-//! `ValidateConditions`, `ValidateLabelSelector`, `ValidateDeleteOptions`).
+//! Each `#[test]` mirrors one `func Test*` from the upstream Go file and
+//! keeps the original name so the table of contents lines up 1:1. The
+//! validator entry points live in `rusternetes_common::validation::metav1`
+//! and the field-path / error types in `rusternetes_common::validation::field`.
 //!
-//! None of those entry points exist in `rusternetes-common` today, so the
-//! tests that depend on them are marked `#[ignore = "upstream-mirror: TODO
-//! when <function> exists"]`. The fixture construction itself stays compiled
-//! and clippy-clean so any drift in the `types`/`deletion`/`server_side_apply`
-//! shapes is caught immediately. When a validator lands, drop the matching
-//! `#[ignore]` and the assertion becomes a live red-or-green pin.
-//!
-//! Part of the /batch landing upstream integration-test mirrors as RED-state
-//! TDD pins.
+//! Originally landed RED (see PR #168). Flipped GREEN once the validators
+//! arrived under `crates/common/src/validation/`.
 
 // The fixtures intentionally mirror the upstream Go literal style: every test
 // builds a `vec![...]` of cases (even single-entry ones) so that, when the
@@ -33,11 +24,18 @@ use rusternetes_common::deletion::{DeleteOptions, Preconditions};
 use rusternetes_common::types::{
     Condition, DeletionPropagation, LabelSelector, LabelSelectorRequirement, ManagedFieldsEntry,
 };
+use rusternetes_common::validation::field::Path;
+use rusternetes_common::validation::metav1::{
+    validate_conditions, validate_delete_options, validate_dry_run, validate_field_manager,
+    validate_label_selector, validate_labels, validate_managed_fields, validate_patch_options,
+    LabelSelectorValidationOptions, PatchOptions, APPLY_CBOR_PATCH_TYPE, APPLY_YAML_PATCH_TYPE,
+};
+
+const MERGE_PATCH_TYPE: &str = "application/merge-patch+json";
 
 // -- upstream Go: TestValidateLabels (line 33) --------------------------------
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_labels exists"]
 fn test_validate_labels() {
     let success_cases: Vec<HashMap<&'static str, &'static str>> = vec![
         [("simple", "bar")].into_iter().collect(),
@@ -59,12 +57,18 @@ fn test_validate_labels() {
         [("UpperCaseAreOK123", "bar")].into_iter().collect(),
         [("goodvalue", "123_-.BaR")].into_iter().collect(),
     ];
+    for case in &success_cases {
+        let labels: HashMap<String, String> = case
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let errs = validate_labels(&labels, &Path::new("field"));
+        assert!(
+            errs.is_empty(),
+            "expected no errors for {case:?}, got: {errs:?}",
+        );
+    }
 
-    // Upstream pins (label-name error cases):
-    //   {"nospecialchars^=@": "bar"}     -> "name part must consist of"
-    //   {"cantendwithadash-": "bar"}     -> "name part must consist of"
-    //   {"only/one/slash": "bar"}        -> "a valid label key must consist of"
-    //   {strings.Repeat("a", 254): "bar"}-> "must be no more than"
     let too_long_key = "a".repeat(254);
     let label_name_error_cases: Vec<(HashMap<String, String>, &'static str)> = vec![
         (
@@ -90,12 +94,14 @@ fn test_validate_labels() {
             "must be no more than",
         ),
     ];
+    for (labels, needle) in &label_name_error_cases {
+        let errs = validate_labels(labels, &Path::new("field"));
+        assert!(
+            errs.iter().any(|e| e.to_string().contains(needle)),
+            "expected an error containing {needle:?} for {labels:?}, got: {errs:?}",
+        );
+    }
 
-    // Upstream pins (label-value error cases):
-    //   {"toolongvalue": strings.Repeat("a", 64)} -> "must be no more than"
-    //   {"backslashesinvalue": "some\\bad\\value"} -> "a valid label must be ..."
-    //   {"nocommasallowed": "bad,value"}           -> "a valid label must be ..."
-    //   {"strangecharsinvalue": "?#$notsogood"}    -> "a valid label must be ..."
     let too_long_value = "a".repeat(64);
     let label_value_error_cases: Vec<(HashMap<String, String>, &'static str)> = vec![
         (
@@ -129,60 +135,60 @@ fn test_validate_labels() {
             "a valid label must be an empty string or consist of",
         ),
     ];
-
-    // TODO: call `rusternetes_common::validation::validate_labels(&case, "field")`
-    // and assert success/failure. The function does not exist yet, so this test
-    // is `#[ignore]` and only the fixtures are exercised here.
-    assert!(!success_cases.is_empty());
-    assert_eq!(label_name_error_cases.len(), 4);
-    assert_eq!(label_value_error_cases.len(), 4);
+    for (labels, needle) in &label_value_error_cases {
+        let errs = validate_labels(labels, &Path::new("field"));
+        assert!(
+            errs.iter().any(|e| e.to_string().contains(needle)),
+            "expected an error containing {needle:?} for {labels:?}, got: {errs:?}",
+        );
+    }
 }
 
 // -- upstream Go: TestValidDryRun (line 103) ----------------------------------
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_dry_run exists"]
 fn test_valid_dry_run() {
-    // Upstream cases: {}, {"All"}, {"All", "All"} — all must be valid dry-run values.
     let tests: Vec<Vec<&'static str>> = vec![vec![], vec!["All"], vec!["All", "All"]];
     for case in &tests {
-        // TODO: assert validate_dry_run(case).is_empty()
-        assert!(case.iter().all(|s| *s == "All"));
+        let dr: Vec<String> = case.iter().map(|s| (*s).to_string()).collect();
+        let errs = validate_dry_run(&Path::new("dryRun"), &dr);
+        assert!(
+            errs.is_empty(),
+            "expected no errors for {case:?}, got: {errs:?}"
+        );
     }
 }
 
 // -- upstream Go: TestInvalidDryRun (line 119) --------------------------------
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_dry_run exists"]
 fn test_invalid_dry_run() {
-    // Upstream cases: {"False"}, {"All", "False"} — both must FAIL validation.
     let tests: Vec<Vec<&'static str>> = vec![vec!["False"], vec!["All", "False"]];
     for case in &tests {
-        // TODO: assert !validate_dry_run(case).is_empty()
-        assert!(case.contains(&"False"));
+        let dr: Vec<String> = case.iter().map(|s| (*s).to_string()).collect();
+        let errs = validate_dry_run(&Path::new("dryRun"), &dr);
+        assert!(!errs.is_empty(), "expected errors for {case:?}, got none");
     }
 }
 
 // -- upstream Go: TestValidateDeleteOptionsWithIgnoreStoreReadError (line 135)
-// The upstream `metav1.DeleteOptions.IgnoreStoreReadErrorWithClusterBreakingPotential`
-// field is not modelled by `rusternetes_common::deletion::DeleteOptions` yet, so
-// the cases that depend on it are pinned for when the field lands.
 
 #[test]
-#[ignore = "upstream-mirror: TODO when DeleteOptions.ignore_store_read_error_with_cluster_breaking_potential exists"]
 fn test_validate_delete_options_with_ignore_store_read_error() {
     // Case 1: option is nil — DryRun set, expect no errors.
-    let _opts_nil = DeleteOptions {
+    let opts_nil = DeleteOptions {
         propagation_policy: None,
         grace_period_seconds: None,
         preconditions: None,
         orphan_dependents: None,
         dry_run: Some(vec!["All".to_string()]),
+        ignore_store_read_error_with_cluster_breaking_potential: None,
     };
+    let errs = validate_delete_options(&opts_nil);
+    assert!(errs.is_empty(), "case 1: expected no errors, got: {errs:?}");
 
     // Case 2: option is false, PropagationPolicy is set — expect no errors.
-    let _opts_false_propagation = DeleteOptions {
+    let opts_false_propagation = DeleteOptions {
         propagation_policy: Some(DeletionPropagation::Background),
         grace_period_seconds: Some(0),
         preconditions: Some(Preconditions {
@@ -191,10 +197,13 @@ fn test_validate_delete_options_with_ignore_store_read_error() {
         }),
         orphan_dependents: None,
         dry_run: Some(vec!["All".to_string()]),
+        ignore_store_read_error_with_cluster_breaking_potential: Some(false),
     };
+    let errs = validate_delete_options(&opts_false_propagation);
+    assert!(errs.is_empty(), "case 2: expected no errors, got: {errs:?}");
 
     // Case 3: option is false, OrphanDependents is set — expect no errors.
-    let _opts_false_orphan = DeleteOptions {
+    let opts_false_orphan = DeleteOptions {
         propagation_policy: None,
         grace_period_seconds: Some(0),
         preconditions: Some(Preconditions {
@@ -203,14 +212,17 @@ fn test_validate_delete_options_with_ignore_store_read_error() {
         }),
         orphan_dependents: Some(true),
         dry_run: Some(vec!["All".to_string()]),
+        ignore_store_read_error_with_cluster_breaking_potential: Some(false),
     };
+    let errs = validate_delete_options(&opts_false_orphan);
+    assert!(errs.is_empty(), "case 3: expected no errors, got: {errs:?}");
 
     // Case 4: option is true, PropagationPolicy is set — expect 4 errors:
     //   - cannot be set together with .dryRun
     //   - cannot be set together with .propagationPolicy
     //   - cannot be set together with .gracePeriodSeconds
     //   - cannot be set together with .preconditions
-    let _opts_true_propagation = DeleteOptions {
+    let opts_true_propagation = DeleteOptions {
         propagation_policy: Some(DeletionPropagation::Background),
         grace_period_seconds: Some(0),
         preconditions: Some(Preconditions {
@@ -219,14 +231,28 @@ fn test_validate_delete_options_with_ignore_store_read_error() {
         }),
         orphan_dependents: None,
         dry_run: Some(vec!["All".to_string()]),
+        ignore_store_read_error_with_cluster_breaking_potential: Some(true),
     };
+    let errs = validate_delete_options(&opts_true_propagation);
+    let needles = [
+        "cannot be set together with .dryRun",
+        "cannot be set together with .propagationPolicy",
+        "cannot be set together with .gracePeriodSeconds",
+        "cannot be set together with .preconditions",
+    ];
+    for needle in needles {
+        assert!(
+            errs.iter().any(|e| e.to_string().contains(needle)),
+            "case 4: missing {needle:?} in {errs:?}",
+        );
+    }
 
     // Case 5: option is true, OrphanDependents is set — expect 4 errors:
     //   - cannot be set together with .dryRun
     //   - cannot be set together with .orphanDependents
     //   - cannot be set together with .gracePeriodSeconds
     //   - cannot be set together with .preconditions
-    let _opts_true_orphan = DeleteOptions {
+    let opts_true_orphan = DeleteOptions {
         propagation_policy: None,
         grace_period_seconds: Some(0),
         preconditions: Some(Preconditions {
@@ -235,108 +261,116 @@ fn test_validate_delete_options_with_ignore_store_read_error() {
         }),
         orphan_dependents: Some(true),
         dry_run: Some(vec!["All".to_string()]),
+        ignore_store_read_error_with_cluster_breaking_potential: Some(true),
     };
+    let errs = validate_delete_options(&opts_true_orphan);
+    let needles = [
+        "cannot be set together with .dryRun",
+        "cannot be set together with .orphanDependents",
+        "cannot be set together with .gracePeriodSeconds",
+        "cannot be set together with .preconditions",
+    ];
+    for needle in needles {
+        assert!(
+            errs.iter().any(|e| e.to_string().contains(needle)),
+            "case 5: missing {needle:?} in {errs:?}",
+        );
+    }
 
     // Case 6: option is true, no other option set — expect no errors.
-    let _opts_true_only = DeleteOptions {
+    let opts_true_only = DeleteOptions {
         propagation_policy: None,
         grace_period_seconds: None,
         preconditions: None,
         orphan_dependents: None,
         dry_run: None,
+        ignore_store_read_error_with_cluster_breaking_potential: Some(false),
     };
-
-    // TODO: when validate_delete_options exists, drive every case above through
-    // it and assert the error list matches the upstream expectations.
+    let errs = validate_delete_options(&opts_true_only);
+    assert!(errs.is_empty(), "case 6: expected no errors, got: {errs:?}");
 }
 
 // -- upstream Go: TestValidPatchOptions (line 225) ----------------------------
-// `rusternetes_common` has no `PatchOptions` struct nor `validate_patch_options`
-// function yet; this test pins the fixtures from the upstream success table.
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common PatchOptions + validate_patch_options exist"]
 fn test_valid_patch_options() {
-    // Upstream success cases (opts, patchType):
-    //   {Force: true, FieldManager: "kubectl"}, ApplyYAMLPatchType
-    //   {FieldManager: "kubectl"},              ApplyYAMLPatchType
-    //   {Force: true, FieldManager: "kubectl"}, ApplyCBORPatchType
-    //   {FieldManager: "kubectl"},              ApplyCBORPatchType
-    //   {},                                     MergePatchType
-    //   {FieldManager: "patcher"},              MergePatchType
-    let _cases: Vec<(Option<&'static str>, Option<bool>, &'static str)> = vec![
-        (Some("kubectl"), Some(true), "application/apply-patch+yaml"),
-        (Some("kubectl"), None, "application/apply-patch+yaml"),
-        (Some("kubectl"), Some(true), "application/apply-patch+cbor"),
-        (Some("kubectl"), None, "application/apply-patch+cbor"),
-        (None, None, "application/merge-patch+json"),
-        (Some("patcher"), None, "application/merge-patch+json"),
+    // Upstream success cases (fieldManager, force, patchType):
+    let cases: Vec<(Option<&'static str>, Option<bool>, &'static str)> = vec![
+        (Some("kubectl"), Some(true), APPLY_YAML_PATCH_TYPE),
+        (Some("kubectl"), None, APPLY_YAML_PATCH_TYPE),
+        (Some("kubectl"), Some(true), APPLY_CBOR_PATCH_TYPE),
+        (Some("kubectl"), None, APPLY_CBOR_PATCH_TYPE),
+        (None, None, MERGE_PATCH_TYPE),
+        (Some("patcher"), None, MERGE_PATCH_TYPE),
     ];
-    // TODO: when PatchOptions + validate_patch_options exist, replace the
-    // sentinel tuples with real fixtures and assert no errors.
+    for (field_manager, force, patch_type) in cases {
+        let opts = PatchOptions {
+            field_manager: field_manager.map(str::to_string),
+            force,
+            dry_run: None,
+            field_validation: None,
+        };
+        let errs = validate_patch_options(&opts, patch_type);
+        assert!(
+            errs.is_empty(),
+            "expected no errors for ({field_manager:?}, {force:?}, {patch_type}), got: {errs:?}",
+        );
+    }
 }
 
 // -- upstream Go: TestInvalidPatchOptions (line 271) --------------------------
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common PatchOptions + validate_patch_options exist"]
 fn test_invalid_patch_options() {
-    // Upstream failure cases (opts, patchType):
-    //   {},                                       ApplyYAMLPatchType  (missing manager)
-    //   {},                                       ApplyCBORPatchType  (missing manager)
-    //   {Force: true},                            MergePatchType      (force on non-apply)
-    //   {FieldManager: "kubectl", Force: false},  MergePatchType      (force on non-apply)
-    let _cases: Vec<(Option<&'static str>, Option<bool>, &'static str)> = vec![
-        (None, None, "application/apply-patch+yaml"),
-        (None, None, "application/apply-patch+cbor"),
-        (None, Some(true), "application/merge-patch+json"),
-        (Some("kubectl"), Some(false), "application/merge-patch+json"),
+    let cases: Vec<(Option<&'static str>, Option<bool>, &'static str)> = vec![
+        (None, None, APPLY_YAML_PATCH_TYPE),
+        (None, None, APPLY_CBOR_PATCH_TYPE),
+        (None, Some(true), MERGE_PATCH_TYPE),
+        (Some("kubectl"), Some(false), MERGE_PATCH_TYPE),
     ];
-    // TODO: when PatchOptions + validate_patch_options exist, replace the
-    // sentinel tuples with real fixtures and assert at least one error.
+    for (field_manager, force, patch_type) in cases {
+        let opts = PatchOptions {
+            field_manager: field_manager.map(str::to_string),
+            force,
+            dry_run: None,
+            field_validation: None,
+        };
+        let errs = validate_patch_options(&opts, patch_type);
+        assert!(
+            !errs.is_empty(),
+            "expected at least one error for ({field_manager:?}, {force:?}, {patch_type})",
+        );
+    }
 }
 
 // -- upstream Go: TestValidateFieldManagerValid (line 313) --------------------
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_field_manager exists"]
 fn test_validate_field_manager_valid() {
-    // Upstream: "filedManager", "你好" (Hello), "🍔" — all valid.
     let valid: Vec<&'static str> = vec!["filedManager", "你好", "🍔"];
     for name in &valid {
-        // TODO: assert validate_field_manager(name, "fieldManager").is_empty()
-        assert!(!name.is_empty());
+        let errs = validate_field_manager(name, &Path::new("fieldManager"));
+        assert!(errs.is_empty(), "expected {name:?} valid, got: {errs:?}");
     }
 }
 
 // -- upstream Go: TestValidateFieldManagerInvalid (line 330) ------------------
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_field_manager exists"]
 fn test_validate_field_manager_invalid() {
-    // Upstream: "field\nmanager" (newline), 129-char "f...f" (too long).
     let invalid: Vec<String> = vec!["field\nmanager".to_string(), "f".repeat(129)];
     for name in &invalid {
-        // TODO: assert !validate_field_manager(name, "fieldManager").is_empty()
-        assert!(!name.is_empty());
+        let errs = validate_field_manager(name, &Path::new("fieldManager"));
+        assert!(!errs.is_empty(), "expected {name:?} invalid, got no errors");
     }
 }
 
 // -- upstream Go: TestValidateManagedFieldsInvalid (line 346) -----------------
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_managed_fields exists"]
 fn test_validate_managed_fields_invalid() {
-    // Upstream invalid entries (each individually should fail validation):
-    //   { Operation: Update,  FieldsType: "RandomVersion", APIVersion: "v1" }
-    //   { Operation: "RandomOperation", FieldsType: "FieldsV1", APIVersion: "v1" }
-    //   { /* missing operation */ FieldsType: "FieldsV1", APIVersion: "v1" }
-    //   { Operation: Update, FieldsType: "FieldsV1", APIVersion: "v1",
-    //     Manager: "field\nmanager" }
-    //   { Operation: Apply, FieldsType: "FieldsV1", APIVersion: "v1",
-    //     Subresource: <256-char string> }
     let too_long_subresource = "TooLong".repeat(40);
-    let _cases: Vec<ManagedFieldsEntry> = vec![
+    let cases: Vec<ManagedFieldsEntry> = vec![
         ManagedFieldsEntry {
             manager: None,
             operation: Some("Update".to_string()),
@@ -383,24 +417,22 @@ fn test_validate_managed_fields_invalid() {
             subresource: Some(too_long_subresource),
         },
     ];
-    // TODO: when validate_managed_fields exists, run each case through it and
-    // assert at least one error.
+    for case in cases {
+        let errs =
+            validate_managed_fields(std::slice::from_ref(&case), &Path::new("managedFields"));
+        assert!(
+            !errs.is_empty(),
+            "expected at least one error for {case:?}, got none",
+        );
+    }
 }
 
 // -- upstream Go: TestValidateMangedFieldsValid (line 382) --------------------
 // Note: upstream typo preserved ("Manged"). Renamed to the corrected form here.
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_managed_fields exists"]
 fn test_validate_managed_fields_valid() {
-    // Upstream valid entries:
-    //   { Operation: Update, APIVersion: "v1" /* FieldsType missing OK */ }
-    //   { Operation: Update, FieldsType: "FieldsV1", APIVersion: "v1" }
-    //   { Operation: Apply,  FieldsType: "FieldsV1", APIVersion: "v1",
-    //     Subresource: "scale" }
-    //   { Operation: Apply,  FieldsType: "FieldsV1", APIVersion: "v1",
-    //     Manager: "🍔" }
-    let _cases: Vec<ManagedFieldsEntry> = vec![
+    let cases: Vec<ManagedFieldsEntry> = vec![
         ManagedFieldsEntry {
             manager: None,
             operation: Some("Update".to_string()),
@@ -438,26 +470,25 @@ fn test_validate_managed_fields_valid() {
             subresource: None,
         },
     ];
-    // TODO: when validate_managed_fields exists, run each case through it and
-    // assert no errors.
+    for case in cases {
+        let errs =
+            validate_managed_fields(std::slice::from_ref(&case), &Path::new("managedFields"));
+        assert!(
+            errs.is_empty(),
+            "expected no errors for {case:?}, got: {errs:?}",
+        );
+    }
 }
 
 // -- upstream Go: TestValidateConditions (line 413) ---------------------------
-// Split per upstream subtest for finer-grained RED pinning.
+
+fn conditions_path() -> Path {
+    Path::new("status").child("conditions")
+}
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_conditions exists"]
 fn test_validate_conditions_bunch_of_invalid_fields() {
-    // Upstream invalid condition (one entry):
-    //   Type: ":invalid", Status: "unknown", ObservedGeneration: -1,
-    //   LastTransitionTime: <zero>, Reason: "invalid;val", Message: ""
-    // Expected error needles:
-    //   status.conditions[0].type: Invalid value ":invalid"
-    //   status.conditions[0].status: Unsupported value "unknown"
-    //   status.conditions[0].observedGeneration: Invalid value -1
-    //   status.conditions[0].lastTransitionTime: Required value
-    //   status.conditions[0].reason: Invalid value "invalid;val"
-    let _conditions = vec![Condition {
+    let conditions = vec![Condition {
         condition_type: ":invalid".to_string(),
         status: "unknown".to_string(),
         observed_generation: Some(-1),
@@ -465,16 +496,25 @@ fn test_validate_conditions_bunch_of_invalid_fields() {
         reason: Some("invalid;val".to_string()),
         message: Some(String::new()),
     }];
-    // TODO: assert validate_conditions(_conditions, "status.conditions") emits
-    // all five upstream error needles.
+    let errs = validate_conditions(&conditions, &conditions_path());
+    let needles = [
+        "status.conditions[0].type: Invalid value: \":invalid\"",
+        "status.conditions[0].status: Unsupported value: \"unknown\"",
+        "status.conditions[0].observedGeneration: Invalid value: -1",
+        "status.conditions[0].lastTransitionTime: Required value",
+        "status.conditions[0].reason: Invalid value: \"invalid;val\"",
+    ];
+    for needle in needles {
+        assert!(
+            errs.iter().any(|e| e.to_string().contains(needle)),
+            "missing {needle:?} in {errs:?}",
+        );
+    }
 }
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_conditions exists"]
 fn test_validate_conditions_duplicates() {
-    // Upstream: ["First", "Second", "First"] — error at index 2 must contain
-    //   `status.conditions[2].type: Duplicate value: "First"`
-    let _conditions = vec![
+    let conditions = vec![
         Condition {
             condition_type: "First".to_string(),
             status: String::new(),
@@ -500,14 +540,17 @@ fn test_validate_conditions_duplicates() {
             message: None,
         },
     ];
-    // TODO: assert validate_conditions emits the Duplicate value error at [2].
+    let errs = validate_conditions(&conditions, &conditions_path());
+    let needle = "status.conditions[2].type: Duplicate value: \"First\"";
+    assert!(
+        errs.iter().any(|e| e.to_string().contains(needle)),
+        "missing {needle:?} in {errs:?}",
+    );
 }
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_conditions exists"]
 fn test_validate_conditions_colon_allowed_in_reason() {
-    // Upstream: reason "valid:val" must NOT produce a `.reason` error.
-    let _conditions = vec![Condition {
+    let conditions = vec![Condition {
         condition_type: "First".to_string(),
         status: String::new(),
         observed_generation: None,
@@ -515,14 +558,17 @@ fn test_validate_conditions_colon_allowed_in_reason() {
         reason: Some("valid:val".to_string()),
         message: None,
     }];
-    // TODO: assert no error whose prefix is `status.conditions[0].reason`.
+    let errs = validate_conditions(&conditions, &conditions_path());
+    let prefix = "status.conditions[0].reason";
+    assert!(
+        !errs.iter().any(|e| e.to_string().starts_with(prefix)),
+        "expected no error with prefix {prefix:?} in {errs:?}",
+    );
 }
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_conditions exists"]
 fn test_validate_conditions_comma_allowed_in_reason() {
-    // Upstream: reason "valid,val" must NOT produce a `.reason` error.
-    let _conditions = vec![Condition {
+    let conditions = vec![Condition {
         condition_type: "First".to_string(),
         status: String::new(),
         observed_generation: None,
@@ -530,15 +576,17 @@ fn test_validate_conditions_comma_allowed_in_reason() {
         reason: Some("valid,val".to_string()),
         message: None,
     }];
-    // TODO: assert no error whose prefix is `status.conditions[0].reason`.
+    let errs = validate_conditions(&conditions, &conditions_path());
+    let prefix = "status.conditions[0].reason";
+    assert!(
+        !errs.iter().any(|e| e.to_string().starts_with(prefix)),
+        "expected no error with prefix {prefix:?} in {errs:?}",
+    );
 }
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_conditions exists"]
 fn test_validate_conditions_reason_does_not_end_in_delimiter() {
-    // Upstream: reason "valid,val:" MUST produce
-    //   `status.conditions[0].reason: Invalid value: "valid,val:"`
-    let _conditions = vec![Condition {
+    let conditions = vec![Condition {
         condition_type: "First".to_string(),
         status: String::new(),
         observed_generation: None,
@@ -546,17 +594,19 @@ fn test_validate_conditions_reason_does_not_end_in_delimiter() {
         reason: Some("valid,val:".to_string()),
         message: None,
     }];
-    // TODO: assert validate_conditions emits the invalid-reason error.
+    let errs = validate_conditions(&conditions, &conditions_path());
+    let needle = "status.conditions[0].reason: Invalid value: \"valid,val:\"";
+    assert!(
+        errs.iter().any(|e| e.to_string().contains(needle)),
+        "missing {needle:?} in {errs:?}",
+    );
 }
 
 // -- upstream Go: TestLabelSelectorMatchExpression (line 511) -----------------
-// Upstream uses a single test with subtests; mirror each as its own #[test].
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_label_selector exists"]
 fn test_label_selector_match_expression_valid() {
-    // Upstream: valid selector — Key "key", Operator In, Values ["value"].
-    let _sel = LabelSelector {
+    let sel = LabelSelector {
         match_labels: None,
         match_expressions: Some(vec![LabelSelectorRequirement {
             key: "key".to_string(),
@@ -564,16 +614,17 @@ fn test_label_selector_match_expression_valid() {
             values: Some(vec!["value".to_string()]),
         }]),
     };
-    // TODO: assert validate_label_selector(_sel, opts{AllowInvalidLabelValueInSelector: false},
-    //   "labelSelector").is_empty()
+    let errs = validate_label_selector(
+        &sel,
+        LabelSelectorValidationOptions::default(),
+        &Path::new("labelSelector"),
+    );
+    assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
 }
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_label_selector exists"]
 fn test_label_selector_match_expression_invalid_key() {
-    // Upstream: Key "-key" — expect 1 error containing
-    //   "name part must consist of alphanumeric characters".
-    let _sel = LabelSelector {
+    let sel = LabelSelector {
         match_labels: None,
         match_expressions: Some(vec![LabelSelectorRequirement {
             key: "-key".to_string(),
@@ -581,15 +632,22 @@ fn test_label_selector_match_expression_invalid_key() {
             values: Some(vec!["value".to_string()]),
         }]),
     };
-    // TODO: assert single error containing the upstream message.
+    let errs = validate_label_selector(
+        &sel,
+        LabelSelectorValidationOptions::default(),
+        &Path::new("labelSelector"),
+    );
+    let needle = "name part must consist of alphanumeric characters";
+    assert!(
+        errs.iter().any(|e| e.to_string().contains(needle)),
+        "missing {needle:?} in {errs:?}",
+    );
+    assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
 }
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_label_selector exists"]
 fn test_label_selector_match_expression_invalid_operator() {
-    // Upstream: Operator "abc" — expect 1 error containing
-    //   "not a valid selector operator".
-    let _sel = LabelSelector {
+    let sel = LabelSelector {
         match_labels: None,
         match_expressions: Some(vec![LabelSelectorRequirement {
             key: "key".to_string(),
@@ -597,15 +655,22 @@ fn test_label_selector_match_expression_invalid_operator() {
             values: Some(vec!["value".to_string()]),
         }]),
     };
-    // TODO: assert single error containing the upstream message.
+    let errs = validate_label_selector(
+        &sel,
+        LabelSelectorValidationOptions::default(),
+        &Path::new("labelSelector"),
+    );
+    let needle = "not a valid selector operator";
+    assert!(
+        errs.iter().any(|e| e.to_string().contains(needle)),
+        "missing {needle:?} in {errs:?}",
+    );
+    assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
 }
 
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common::validation::validate_label_selector exists"]
 fn test_label_selector_match_expression_invalid_value() {
-    // Upstream: Values ["-value"] — expect 1 error containing
-    //   "a valid label must be an empty string or consist of".
-    let _sel = LabelSelector {
+    let sel = LabelSelector {
         match_labels: None,
         match_expressions: Some(vec![LabelSelectorRequirement {
             key: "key".to_string(),
@@ -613,5 +678,15 @@ fn test_label_selector_match_expression_invalid_value() {
             values: Some(vec!["-value".to_string()]),
         }]),
     };
-    // TODO: assert single error containing the upstream message.
+    let errs = validate_label_selector(
+        &sel,
+        LabelSelectorValidationOptions::default(),
+        &Path::new("labelSelector"),
+    );
+    let needle = "a valid label must be an empty string or consist of";
+    assert!(
+        errs.iter().any(|e| e.to_string().contains(needle)),
+        "missing {needle:?} in {errs:?}",
+    );
+    assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
 }
