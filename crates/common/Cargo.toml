@@ -28,14 +28,6 @@ base64 = "0.22"
 regex = "1.10"
 once_cell = "1.19"
 etcd-client.workspace = true
-
-# OpenTelemetry dependencies
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-jaeger = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry-stdout = { version = "0.3", optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
 sha2 = "0.10.9"
 reqwest = { workspace = true }
 cel.workspace = true
@@ -45,9 +37,6 @@ prost-types.workspace = true
 [features]
 default = []
 axum-support = ["axum"]
-jaeger = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-jaeger", "tracing-opentelemetry"]
-otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
-tracing-full = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-stdout", "tracing-opentelemetry"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
