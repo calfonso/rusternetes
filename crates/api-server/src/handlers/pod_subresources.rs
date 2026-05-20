@@ -1059,7 +1059,26 @@ pub async fn create_binding(
 }
 
 /// POST /api/v1/namespaces/{namespace}/pods/{name}/eviction
-/// Evict a pod
+///
+/// Evict a pod, mirroring upstream
+/// `pkg/registry/core/pod/storage/eviction.go` at release-1.35:
+///
+///   1. Validate the body's `apiVersion` (accept `policy/v1` and
+///      `policy/v1beta1`, reject other `policy/*` shapes with 400).
+///   2. Honor `deleteOptions.preconditions.uid` — a UID mismatch returns
+///      409 Conflict and the pod is **not** deleted.
+///   3. `canIgnorePDB`: pods in a terminal phase (`Succeeded`, `Failed`,
+///      `Pending`) or already carrying a `deletionTimestamp` bypass the
+///      PDB check entirely. For these pods we proceed straight to the
+///      condition-update + delete path.
+///   4. For healthy (Running) pods, check matching PDB(s) and return 429
+///      Too Many Requests with `Retry-After: 10` if the disruption budget
+///      would be violated. The error message wording mirrors upstream's
+///      `createTooManyRequestsError` byte-for-byte.
+///   5. Append a `DisruptionTarget=True` condition to `pod.status.conditions`
+///      via a storage update (skipped if `deleteOptions.dryRun == ["All"]`).
+///   6. Delete the pod through `handle_delete_with_finalizers` so finalizers
+///      hold the pod (deletion_timestamp set, pod still readable).
 pub async fn create_eviction(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -1068,7 +1087,7 @@ pub async fn create_eviction(
 ) -> Result<Response> {
     info!("Creating eviction for pod {}/{}", namespace, name);
 
-    // Check authorization - eviction requires special permission
+    // ----------------------------------------------------------------- authz
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "pods")
         .with_namespace(&namespace)
         .with_name(&name)
@@ -1081,44 +1100,92 @@ pub async fn create_eviction(
         }
     }
 
-    // Parse eviction request
+    // ----------------------------------------------------------------- parse
     let eviction: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| Error::InvalidResource(format!("Invalid eviction format: {}", e)))?;
 
-    // Check if pod exists
+    // Validate apiVersion. Upstream `AcceptsGroupVersion` accepts only
+    // policy/v1 and policy/v1beta1. An empty/missing apiVersion is permitted
+    // (treated as the canonical policy/v1 shape) since the body name+ns alone
+    // is enough to identify the target.
+    if let Some(av) = eviction.get("apiVersion").and_then(|v| v.as_str()) {
+        if !av.is_empty() && av != "policy/v1" && av != "policy/v1beta1" {
+            return Err(Error::InvalidResource(format!(
+                "unsupported Eviction apiVersion {:?}; expected policy/v1 or policy/v1beta1",
+                av
+            )));
+        }
+    }
+
+    // Parse deleteOptions (UID precondition, dryRun) from the body.
+    let delete_opts = eviction.get("deleteOptions");
+    let precond_uid = delete_opts
+        .and_then(|o| o.get("preconditions"))
+        .and_then(|p| p.get("uid"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+    let dry_run_all = delete_opts
+        .and_then(|o| o.get("dryRun"))
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().any(|v| v.as_str() == Some("All")))
+        .unwrap_or(false);
+    let grace_period_seconds = delete_opts
+        .and_then(|opts| opts.get("gracePeriodSeconds"))
+        .and_then(|gp| gp.as_i64());
+
+    // ----------------------------------------------------------------- fetch
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
-    // Check PodDisruptionBudget constraints
-    let pdb_prefix = rusternetes_storage::build_prefix("poddisruptionbudgets", Some(&namespace));
-    let pdbs: Vec<rusternetes_common::resources::PodDisruptionBudget> =
-        state.storage.list(&pdb_prefix).await.unwrap_or_default();
+    // ----------------------------------------------------------- precondition
+    // UID precondition check mirrors upstream's `addConditionAndDeletePod`
+    // getLatestPod hook. Mismatch returns 409 Conflict.
+    if let Some(ref want_uid) = precond_uid {
+        if !want_uid.is_empty() && *want_uid != pod.metadata.uid {
+            return Err(Error::Conflict(format!(
+                "the UID in the precondition ({}) does not match the UID in record ({}). \
+                 The object might have been deleted and then recreated",
+                want_uid, pod.metadata.uid
+            )));
+        }
+    }
 
-    // Get pod labels for matching
-    let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
+    // ----------------------------------------------------------- canIgnorePDB
+    // Upstream `canIgnorePDB`: terminal pods (Succeeded/Failed/Pending) and
+    // pods already mid-deletion bypass the PDB check entirely.
+    let bypass_pdb = pod_can_ignore_pdb(&pod);
 
-    // Check if any PDB applies to this pod
-    for pdb in &pdbs {
-        // Check if PDB selector matches the pod
-        let selector = &pdb.spec.selector;
+    if !bypass_pdb {
+        // Healthy pod — evaluate matching PDBs.
+        let pdb_prefix =
+            rusternetes_storage::build_prefix("poddisruptionbudgets", Some(&namespace));
+        let pdbs: Vec<rusternetes_common::resources::PodDisruptionBudget> =
+            state.storage.list(&pdb_prefix).await.unwrap_or_default();
+        let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
 
-        // Check if all match_labels are present in pod labels
-        let matches = if let Some(ref match_labels) = selector.match_labels {
-            match_labels
-                .iter()
-                .all(|(k, v)| pod_labels.get(k).map(|pv| pv == v).unwrap_or(false))
-        } else if selector.match_expressions.is_some() {
-            // TODO: Implement match_expressions support for more complex selectors
-            // For now, treat match_expressions as non-matching
-            false
-        } else {
-            // Empty selector (no match_labels or match_expressions) matches nothing
-            false
-        };
+        for pdb in &pdbs {
+            let selector = &pdb.spec.selector;
 
-        if matches {
-            // This PDB applies to our pod - compute disruptions_allowed inline
-            // by counting matching healthy pods (don't rely solely on pre-computed status)
+            let matches = if let Some(ref match_labels) = selector.match_labels {
+                match_labels
+                    .iter()
+                    .all(|(k, v)| pod_labels.get(k).map(|pv| pv == v).unwrap_or(false))
+            } else if selector.match_expressions.is_some() {
+                // TODO: Implement match_expressions support for more complex selectors
+                false
+            } else {
+                false
+            };
+
+            if !matches {
+                continue;
+            }
+
+            // This PDB applies. Compute disruptions_allowed inline rather
+            // than trusting the cached status — the PDB controller may not
+            // have observed the latest pods yet (matches upstream's
+            // observedGeneration<generation gate, which would also return
+            // 429 in that case).
             let disruptions_allowed =
                 compute_pdb_disruptions_allowed(state.storage.as_ref(), pdb, &namespace).await;
 
@@ -1126,27 +1193,27 @@ pub async fn create_eviction(
                 let current_healthy =
                     compute_pdb_healthy_count(state.storage.as_ref(), pdb, &namespace).await;
                 let desired_healthy = compute_pdb_desired_healthy(pdb, current_healthy);
-                let detail_msg = format!(
-                    "Cannot evict pod as it would violate the pod's disruption budget. \
-                    The disruption budget {} needs {} healthy pods and has {}, but we can only tolerate {} pod disruptions",
-                    pdb.metadata.name,
-                    desired_healthy,
-                    current_healthy,
-                    disruptions_allowed.max(0)
+                // Upstream wording from `createTooManyRequestsError` +
+                // `checkAndDecrement`'s detail message.
+                let summary =
+                    "Cannot evict pod as it would violate the pod's disruption budget.".to_string();
+                let detail = format!(
+                    "The disruption budget {} needs {} healthy pods and has {} currently",
+                    pdb.metadata.name, desired_healthy, current_healthy
                 );
-                // Return 429 with details.causes containing DisruptionBudget
                 let status_body = serde_json::json!({
                     "kind": "Status",
                     "apiVersion": "v1",
                     "metadata": {},
                     "status": "Failure",
-                    "message": detail_msg,
+                    "message": summary,
                     "reason": "TooManyRequests",
                     "details": {
                         "causes": [{
                             "reason": "DisruptionBudget",
-                            "message": detail_msg
-                        }]
+                            "message": detail
+                        }],
+                        "retryAfterSeconds": 10
                     },
                     "code": 429
                 });
@@ -1166,49 +1233,65 @@ pub async fn create_eviction(
                 namespace, name, pdb.metadata.name, disruptions_allowed
             );
 
-            // Update PDB's disruptedPods to record this eviction
-            let mut updated_pdb = pdb.clone();
-            let disrupted_pods = updated_pdb
-                .status
-                .get_or_insert(rusternetes_common::resources::PodDisruptionBudgetStatus {
-                    current_healthy: 0,
-                    desired_healthy: 0,
-                    disruptions_allowed: 0,
-                    expected_pods: 0,
-                    observed_generation: None,
-                    conditions: None,
-                    disrupted_pods: None,
-                })
-                .disrupted_pods
-                .get_or_insert_with(std::collections::HashMap::new);
-            disrupted_pods.insert(name.clone(), chrono::Utc::now());
+            // Bookkeep the disruption on the PDB status (skip on dryRun, as
+            // upstream does in `checkAndDecrement`).
+            if !dry_run_all {
+                let mut updated_pdb = pdb.clone();
+                let disrupted_pods = updated_pdb
+                    .status
+                    .get_or_insert(rusternetes_common::resources::PodDisruptionBudgetStatus {
+                        current_healthy: 0,
+                        desired_healthy: 0,
+                        disruptions_allowed: 0,
+                        expected_pods: 0,
+                        observed_generation: None,
+                        conditions: None,
+                        disrupted_pods: None,
+                    })
+                    .disrupted_pods
+                    .get_or_insert_with(std::collections::HashMap::new);
+                disrupted_pods.insert(name.clone(), chrono::Utc::now());
 
-            // Also update disruptions_allowed in status
-            if let Some(ref mut status) = updated_pdb.status {
-                status.disruptions_allowed = disruptions_allowed - 1;
+                if let Some(ref mut status) = updated_pdb.status {
+                    status.disruptions_allowed = disruptions_allowed - 1;
+                }
+
+                let pdb_key = rusternetes_storage::build_key(
+                    "poddisruptionbudgets",
+                    Some(&namespace),
+                    &pdb.metadata.name,
+                );
+                let _ = state.storage.update(&pdb_key, &updated_pdb).await;
             }
-
-            let pdb_key = rusternetes_storage::build_key(
-                "poddisruptionbudgets",
-                Some(&namespace),
-                &pdb.metadata.name,
-            );
-            let _ = state.storage.update(&pdb_key, &updated_pdb).await;
         }
     }
 
-    // Extract grace period if specified
-    let grace_period_seconds = eviction
-        .get("deleteOptions")
-        .and_then(|opts: &serde_json::Value| opts.get("gracePeriodSeconds"))
-        .and_then(|gp: &serde_json::Value| gp.as_i64());
+    // -------------------------------------------------- DisruptionTarget cond
+    // Skip both the condition update and the delete on dryRun (mirrors
+    // upstream's `if !dryrun.IsDryRun(options.DryRun) { ... }` gate).
+    if !dry_run_all {
+        // The condition update is best-effort relative to the delete;
+        // upstream surfaces errors, so we do too.
+        append_disruption_target_condition(state.storage.as_ref(), &pod_key).await?;
 
-    // Delete the pod (eviction is essentially a controlled delete)
-    state.storage.delete(&pod_key).await?;
+        // Re-read the pod after the condition update so that finalizer
+        // handling sees the freshest copy.
+        let fresh_pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+
+        // Delete the pod through the finalizer-aware helper. If the pod
+        // carries finalizers, this sets `deletionTimestamp` and writes it
+        // back instead of removing it from storage.
+        crate::handlers::finalizers::handle_delete_with_finalizers(
+            state.storage.as_ref(),
+            &pod_key,
+            &fresh_pod,
+        )
+        .await?;
+    }
 
     info!(
-        "Evicted pod {}/{} with grace period {:?}",
-        namespace, name, grace_period_seconds
+        "Evicted pod {}/{} (dryRun={}, gracePeriod={:?})",
+        namespace, name, dry_run_all, grace_period_seconds
     );
 
     Ok(Response::builder()
@@ -1226,6 +1309,64 @@ pub async fn create_eviction(
             .to_string(),
         ))
         .unwrap())
+}
+
+/// Upstream `canIgnorePDB`: a pod is freely evictable (no PDB check needed)
+/// if it is in a terminal phase (Succeeded, Failed), Pending, or already
+/// carries a deletionTimestamp.
+fn pod_can_ignore_pdb(pod: &rusternetes_common::resources::Pod) -> bool {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return true;
+    }
+    matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+        Some(
+            rusternetes_common::types::Phase::Succeeded
+                | rusternetes_common::types::Phase::Failed
+                | rusternetes_common::types::Phase::Pending
+        )
+    )
+}
+
+/// Append the `DisruptionTarget=True` condition (reason `EvictionByEvictionAPI`)
+/// to `pod.status.conditions`. Mirrors upstream's `conditionAppender` in
+/// `addConditionAndDeletePod`. No-op (Ok) if the condition is already
+/// present with the same status/reason.
+async fn append_disruption_target_condition<S: Storage>(storage: &S, pod_key: &str) -> Result<()> {
+    let mut pod: rusternetes_common::resources::Pod = storage.get(pod_key).await?;
+    let status = pod.status.get_or_insert_with(Default::default);
+    let conditions = status.conditions.get_or_insert_with(Vec::new);
+
+    let now = chrono::Utc::now();
+    let new_cond = rusternetes_common::resources::PodCondition {
+        condition_type: "DisruptionTarget".to_string(),
+        status: "True".to_string(),
+        reason: Some("EvictionByEvictionAPI".to_string()),
+        message: Some("Eviction API: evicting".to_string()),
+        last_transition_time: Some(now),
+        observed_generation: None,
+    };
+
+    if let Some(existing) = conditions
+        .iter_mut()
+        .find(|c| c.condition_type == "DisruptionTarget")
+    {
+        if existing.status == new_cond.status && existing.reason == new_cond.reason {
+            // No change — skip the write to mirror upstream's
+            // UpdatePodCondition which only bumps lastTransitionTime when
+            // the status flips.
+            return Ok(());
+        }
+        existing.status = new_cond.status;
+        existing.reason = new_cond.reason;
+        existing.message = new_cond.message;
+        existing.last_transition_time = new_cond.last_transition_time;
+    } else {
+        conditions.push(new_cond);
+    }
+
+    storage.update(pod_key, &pod).await?;
+    Ok(())
 }
 
 /// Check if a pod matches a PDB's label selector
