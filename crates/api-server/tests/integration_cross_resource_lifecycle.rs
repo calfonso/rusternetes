@@ -20,10 +20,13 @@
 //! flows (validation, finalizer fence, deletionTimestamp stamping,
 //! propagation-policy finalizer addition, namespace isolation). The
 //! **eventual** cleanup half (cascade deletion, garbage-collected dependents)
-//! is owned by the namespace and garbage-collector controllers, which do not
-//! run in-process for these tests. Scenarios that require those controllers
-//! are pinned with `#[ignore = "blocked on issue #TBD: ..."]` and noted in
-//! the PR body.
+//! is owned by the namespace and garbage-collector controllers. Scenarios
+//! that depend on those controllers wire them in-process by sharing the
+//! underlying `Arc<MemoryStorage>` with the router (the router talks to it
+//! through `StorageBackend::Memory(mem)`, the controllers talk to it
+//! directly via the `Storage` trait), then tick `reconcile_all()` /
+//! `scan_and_collect()` between request phases. This mirrors the pattern
+//! in `crates/api-server/tests/e2e_inprocess_smoke_test.rs`.
 
 use axum::{
     body::Body,
@@ -32,6 +35,9 @@ use axum::{
 use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
     auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
+};
+use rusternetes_controller_manager::controllers::{
+    garbage_collector::GarbageCollector, namespace::NamespaceController,
 };
 use rusternetes_storage::{
     build_key, build_prefix, memory::MemoryStorage, Storage, StorageBackend,
@@ -469,20 +475,108 @@ async fn test_lifecycle_namespace_delete_marks_terminating_and_keeps_children() 
 /// `test/integration/namespace/ns_conditions_test.go` cascade assertion:
 /// after the namespace controller observes a terminating namespace, every
 /// namespaced child resource is GC'd. The rusternetes namespace controller
-/// does this in `crates/controller-manager/src/controllers/namespace.rs`, but
-/// it does NOT run in-process for these tests. Spinning it up would require
-/// wiring the controller-manager into the test harness and giving it shared
-/// `Arc<StorageBackend>` — out of scope for this RED-state pin.
+/// does this in `crates/controller-manager/src/controllers/namespace.rs`.
+///
+/// In-process wiring (mirrors the pattern in `e2e_inprocess_smoke_test.rs`):
+/// the router writes through `StorageBackend::Memory(mem)` while
+/// `NamespaceController` drives the same `Arc<MemoryStorage>` directly via
+/// the `Storage` trait. Calling `reconcile_all()` ticks the controller once
+/// against the in-memory store. The controller defers finalization across
+/// reconciles (sets conditions first, removes the `kubernetes` finalizer
+/// the next cycle — see `finalize_namespace` in
+/// `crates/controller-manager/src/controllers/namespace.rs`), so we tick
+/// it multiple times until either the namespace is fully reaped or a small
+/// upper bound is reached.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: namespace cascade is handled by the namespace controller in controller-manager, not by the api-server handler — needs controller-manager spun up in-process"]
 async fn test_lifecycle_namespace_cascade_deletes_children() {
-    // Expected GREEN behavior (once the controller runs in-process):
-    //   1. POST /api/v1/namespaces { name: "ns-c" }
-    //   2. POST /api/v1/namespaces/ns-c/pods { name: "p" }
-    //   3. DELETE /api/v1/namespaces/ns-c
-    //   4. <wait for namespace controller to observe deletionTimestamp>
-    //   5. GET /api/v1/namespaces/ns-c/pods/p → 404
-    //   6. GET /api/v1/namespaces/ns-c → 404 (finalizer removed after cleanup)
+    let (mem, router) = spawn_router();
+
+    // 1. POST namespace + 2. POST children (pod + configmap).
+    let (s, b) = send_json(
+        router.clone(),
+        Method::POST,
+        "/api/v1/namespaces",
+        &namespace_stub("ns-c"),
+    )
+    .await;
+    assert_success("namespace POST", s, &b);
+
+    let (s, b) = send_json(
+        router.clone(),
+        Method::POST,
+        "/api/v1/namespaces/ns-c/pods",
+        &pod_stub("ns-c", "p", json!({})),
+    )
+    .await;
+    assert_success("pod POST", s, &b);
+
+    let (s, b) = send_json(
+        router.clone(),
+        Method::POST,
+        "/api/v1/namespaces/ns-c/configmaps",
+        &configmap_stub("ns-c", "c", json!({})),
+    )
+    .await;
+    assert_success("configmap POST", s, &b);
+
+    // 3. DELETE namespace — api-server stamps deletionTimestamp +
+    //    Terminating phase and keeps the `kubernetes` finalizer in place.
+    let (status, body) = send_delete(router.clone(), "/api/v1/namespaces/ns-c").await;
+    assert_success("namespace DELETE", status, &body);
+
+    // 4. Tick the namespace controller. The controller's `reconcile_namespace`
+    //    spreads work across multiple cycles (sets conditions first, then
+    //    finalizes), so we drive `reconcile_all` repeatedly until the
+    //    namespace is gone or we hit a sane upper bound.
+    let ns_ctrl = NamespaceController::new(mem.clone());
+    let mut ticks = 0;
+    loop {
+        ns_ctrl
+            .reconcile_all()
+            .await
+            .expect("namespace reconcile_all");
+        ticks += 1;
+        let ns_gone = snapshot(&mem, &build_key("namespaces", None, "ns-c"))
+            .await
+            .is_none();
+        if ns_gone {
+            break;
+        }
+        assert!(
+            ticks < 10,
+            "namespace controller failed to finalize ns-c within 10 ticks",
+        );
+    }
+
+    // 5. Children GET → 404.
+    for (kind, uri) in [
+        ("pod", "/api/v1/namespaces/ns-c/pods/p"),
+        ("configmap", "/api/v1/namespaces/ns-c/configmaps/c"),
+    ] {
+        let (status, _) = send_get(router.clone(), uri).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{kind} at {uri} should be 404 after namespace cascade",
+        );
+    }
+    // And in the storage layer too.
+    for (resource, name) in [("pods", "p"), ("configmaps", "c")] {
+        assert!(
+            snapshot(&mem, &build_key(resource, Some("ns-c"), name))
+                .await
+                .is_none(),
+            "{resource}/{name} should be gone from storage after cascade",
+        );
+    }
+
+    // 6. Namespace itself is gone.
+    let (status, _) = send_get(router.clone(), "/api/v1/namespaces/ns-c").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "namespace ns-c should be 404 once finalizer is cleared",
+    );
 }
 
 /// DELETE a ReplicaSet with `?propagationPolicy=Foreground`. The api-server
@@ -615,19 +709,110 @@ async fn test_lifecycle_owner_background_deletion_removes_owner() {
 /// finalizer, after which the owner is removed.
 ///
 /// Rusternetes implements this in
-/// `crates/controller-manager/src/controllers/garbagecollector.rs` but that
-/// controller does not run in-process for these tests. Pinned for tracking.
+/// `crates/controller-manager/src/controllers/garbage_collector.rs`. This
+/// test wires it in-process the same way `e2e_inprocess_smoke_test.rs` does:
+/// the GC drives `Arc<MemoryStorage>` directly via `Storage`, while the
+/// router shares the same map through `StorageBackend::Memory`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ownerReference cascade reaping requires the garbage-collector controller running in-process — out of scope for this api-server-only integration test"]
 async fn test_lifecycle_owner_foreground_eventual_dependent_deletion() {
-    // Expected GREEN behavior:
-    //   1. POST owner (ReplicaSet) + dependent pods with controller=true.
-    //   2. DELETE owner?propagationPolicy=Foreground.
-    //   3. <wait for GC controller to observe foregroundDeletion finalizer>
-    //   4. Each dependent pod has metadata.deletionTimestamp set (and is
-    //      eventually removed once its own finalizers clear).
-    //   5. Once all dependents are gone, the GC clears foregroundDeletion
-    //      from the owner; the owner is then removed from storage.
+    let (mem, router) = spawn_router();
+
+    // 1. POST namespace + owner ReplicaSet + dependent pods with
+    //    controller=true.
+    let (s, b) = send_json(
+        router.clone(),
+        Method::POST,
+        "/api/v1/namespaces",
+        &namespace_stub("gc-cascade"),
+    )
+    .await;
+    assert_success("namespace POST", s, &b);
+
+    let (s, rs_body) = send_json(
+        router.clone(),
+        Method::POST,
+        "/apis/apps/v1/namespaces/gc-cascade/replicasets",
+        &replicaset_stub("gc-cascade", "rs1"),
+    )
+    .await;
+    assert_success("replicaset POST", s, &rs_body);
+    let owner_uid = rs_body["metadata"]["uid"]
+        .as_str()
+        .expect("ReplicaSet must have a UID")
+        .to_string();
+
+    for pod_name in ["pod-x", "pod-y"] {
+        let (s, b) = send_json(
+            router.clone(),
+            Method::POST,
+            "/api/v1/namespaces/gc-cascade/pods",
+            &owned_pod_stub("gc-cascade", pod_name, "ReplicaSet", "rs1", &owner_uid),
+        )
+        .await;
+        assert_success(&format!("owned pod {pod_name} POST"), s, &b);
+    }
+
+    // 2. DELETE owner with Foreground propagation. The api-server attaches
+    //    the foregroundDeletion finalizer + deletionTimestamp; nothing is
+    //    actually removed yet.
+    let (status, body) = send_delete(
+        router.clone(),
+        "/apis/apps/v1/namespaces/gc-cascade/replicasets/rs1?propagationPolicy=Foreground",
+    )
+    .await;
+    assert_success("rs1 DELETE Foreground", status, &body);
+
+    let stored_rs = snapshot(&mem, &build_key("replicasets", Some("gc-cascade"), "rs1"))
+        .await
+        .expect("ReplicaSet must remain in storage while finalizers are pending");
+    let finalizers: Vec<&str> = stored_rs["metadata"]["finalizers"]
+        .as_array()
+        .expect("finalizers array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        finalizers.contains(&"foregroundDeletion"),
+        "Foreground propagation must add the foregroundDeletion finalizer, got {finalizers:?}",
+    );
+
+    // 3. Tick the GC. `scan_and_collect` deletes dependents (Pods with
+    //    `controller=true` ownerReferences pointing at the dying owner),
+    //    strips the foregroundDeletion finalizer, then re-reads and deletes
+    //    the now-unblocked ReplicaSet in the same pass (see
+    //    `process_deletion` in
+    //    `crates/controller-manager/src/controllers/garbage_collector.rs`).
+    let gc = GarbageCollector::new(mem.clone());
+    gc.scan_and_collect().await.expect("gc scan");
+
+    // 4. Dependents are gone.
+    for pod_name in ["pod-x", "pod-y"] {
+        assert!(
+            snapshot(&mem, &build_key("pods", Some("gc-cascade"), pod_name))
+                .await
+                .is_none(),
+            "owned pod {pod_name} must be GC'd after foreground cascade",
+        );
+    }
+
+    // 5. Owner is gone (foregroundDeletion was the only finalizer and the
+    //    GC clears it once dependents are reaped).
+    assert!(
+        snapshot(&mem, &build_key("replicasets", Some("gc-cascade"), "rs1"))
+            .await
+            .is_none(),
+        "ReplicaSet rs1 must be removed once GC clears foregroundDeletion",
+    );
+    let (status, _) = send_get(
+        router.clone(),
+        "/apis/apps/v1/namespaces/gc-cascade/replicasets/rs1",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "ReplicaSet GET must be 404 after foreground cascade",
+    );
 }
 
 /// Sanity test: list with a label selector must never bleed objects across
