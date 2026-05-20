@@ -537,6 +537,56 @@ async fn test_update_container_body_except_image_rejected() {
     );
 }
 
+/// Direct mirror of the upstream `[Conformance]` step at
+/// `test/e2e/apimachinery/resource_quota.go:544` —
+/// `framework.ConformanceIt("should create a ResourceQuota and capture
+/// the life of a pod.")` includes the assertion:
+///
+/// > "Ensuring a pod cannot update its resource requirements" — a pod
+/// > cannot dynamically update its resource requirements.
+///
+/// Plain PUT mutation of `containers[*].resources` must be rejected by
+/// the immutability fence. (Legitimate in-place resize goes via the
+/// `/resize` subresource, covered by
+/// `resource_quota_captures_full_pod_lifecycle` in
+/// `conformance_apimachinery_namespaces_quota_limits.rs`.)
+#[tokio::test]
+async fn test_update_container_resources_via_plain_put_rejected() {
+    use rusternetes_common::types::ResourceRequirements;
+    use std::collections::HashMap;
+
+    let mem = Arc::new(MemoryStorage::new());
+    let state = make_state(mem);
+    let mut pod = baseline_pod();
+    let mut req = HashMap::new();
+    req.insert("cpu".to_string(), "100m".to_string());
+    req.insert("memory".to_string(), "100Mi".to_string());
+    pod.spec.as_mut().unwrap().containers[0].resources = Some(ResourceRequirements {
+        requests: Some(req),
+        limits: None,
+        claims: None,
+    });
+    seed(&state, &pod).await;
+
+    // Mutate the requests — bump CPU. Upstream rejects with the
+    // "may not change fields other than ..." error from ValidatePodUpdate.
+    let mut new_pod = pod.clone();
+    let mut new_req = HashMap::new();
+    new_req.insert("cpu".to_string(), "200m".to_string());
+    new_req.insert("memory".to_string(), "100Mi".to_string());
+    new_pod.spec.as_mut().unwrap().containers[0].resources = Some(ResourceRequirements {
+        requests: Some(new_req),
+        limits: None,
+        claims: None,
+    });
+    let (status, body) = put_pod(state, &new_pod).await;
+    assert_rejected(
+        status,
+        &body,
+        "pod updates may not change fields other than",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Ephemeral containers — subresource semantics
 // ---------------------------------------------------------------------------
