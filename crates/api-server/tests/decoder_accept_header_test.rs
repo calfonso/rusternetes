@@ -1,0 +1,551 @@
+//! Accept-header content-negotiation matrix for GET requests.
+//!
+//! Mirrors the upstream Kubernetes negotiation tests in
+//! `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/negotiated_codec_factory_test.go`
+//! and `negotiate_test.go`. Upstream apiserver uses the Accept header to pick
+//! a Serializer / MediaType (JSON, YAML, Protobuf, Table, PartialObjectMetadata)
+//! and falls back through the quality-value list before returning
+//! 406 Not Acceptable.
+//!
+//! Rusternetes' current negotiation surface:
+//! - `crates/api-server/src/response.rs::negotiate_content_type` recognizes
+//!   `application/vnd.kubernetes.protobuf` and returns `ContentType::Protobuf`,
+//!   but the routes never use this helper directly — handlers always emit
+//!   JSON via `axum::Json<T>`.
+//! - `crates/api-server/src/middleware.rs` (the response wrapping branch at
+//!   line 353) has `wants_protobuf = false` hardcoded — the comment cites
+//!   `scripts/run-conformance.sh:78-80`: K8s protobuf requires native protobuf
+//!   bytes which Rusternetes cannot produce, so the server forces JSON even
+//!   when the client requests protobuf. Real client-go always sends
+//!   `Accept: application/vnd.kubernetes.protobuf, application/json` and
+//!   falls back to JSON when protobuf is unavailable.
+//! - Neither `Accept-Encoding` nor `as=Table` / `as=PartialObjectMetadata`
+//!   is implemented — the router has no `tower_http::compression` layer
+//!   and no Table conversion code path.
+//!
+//! These tests pin the ACTUAL behavior — they do NOT force upstream contract
+//! when Rusternetes diverges intentionally. Divergences are documented in
+//! per-test docstrings. Gaps that block conformance get `#[ignore]` with a
+//! one-liner pointing at the missing feature.
+//!
+//! Harness: in-process axum router over `StorageBackend::Memory`, driven via
+//! `tower::ServiceExt::oneshot`. Same shape as
+//! `decoder_content_type_test.rs` and the `conformance_apimachinery_*` files.
+
+use axum::{
+    body::Body,
+    http::{Method, Request, StatusCode},
+};
+use rusternetes_api_server::{router::build_router, state::ApiServerState};
+use rusternetes_common::{
+    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
+};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tower::ServiceExt;
+
+const TEST_NS: &str = "default";
+
+// ---------------------------------------------------------------------------
+// HTTP harness — inline, same pattern as `decoder_content_type_test.rs`.
+// ---------------------------------------------------------------------------
+
+fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
+    let backend = Arc::new(StorageBackend::Memory(mem));
+    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
+    let authorizer = Arc::new(AlwaysAllowAuthorizer);
+    let metrics = Arc::new(MetricsRegistry::new());
+    Arc::new(ApiServerState::new(
+        backend,
+        token_manager,
+        authorizer,
+        metrics,
+        true, // skip_auth
+    ))
+}
+
+fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
+    let mem = Arc::new(MemoryStorage::new());
+    let router = build_router(make_state(mem.clone()), None);
+    (mem, router)
+}
+
+/// GET helper with an arbitrary list of request headers.
+async fn get_with_headers(
+    router: axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String, Vec<u8>) {
+    let mut req = Request::builder().method(Method::GET).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let response = router
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, content_type, bytes.to_vec())
+}
+
+/// Convenience wrapper for the most common case: a single `Accept` header.
+async fn get_with_accept(
+    router: axum::Router,
+    uri: &str,
+    accept: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    get_with_headers(router, uri, &[("accept", accept)]).await
+}
+
+/// Seed a Pod into memory storage so we have a concrete GET target with a
+/// stable JSON shape.
+async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) {
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": TEST_NS,
+        },
+        "spec": {
+            "containers": [{"name": "c", "image": "busybox"}]
+        }
+    });
+    let key = build_key("pods", Some(TEST_NS), name);
+    mem.create(&key, &pod).await.expect("seed pod");
+}
+
+/// Parse the body as JSON and assert it looks like the seeded Pod.
+fn assert_pod_body(name: &str, body: &[u8]) {
+    let v: Value = serde_json::from_slice(body).unwrap_or_else(|e| {
+        panic!(
+            "body must parse as JSON for {}: {:?}; raw={:?}",
+            name, e, body
+        )
+    });
+    assert_eq!(v["kind"], "Pod", "kind must be Pod; got {}", v);
+    assert_eq!(
+        v["metadata"]["name"], name,
+        "metadata.name mismatch; got {}",
+        v
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 1-3. Default JSON path: explicit application/json, */*, and no Accept header
+// ---------------------------------------------------------------------------
+
+/// `Accept: application/json` is the canonical client-go default. Server must
+/// answer with `Content-Type: application/json` and a JSON-decodable Pod.
+#[tokio::test]
+async fn accept_application_json_returns_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-json").await;
+
+    let (status, ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-json",
+        "application/json",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "status={} body={:?}", status, body);
+    assert!(
+        ct.starts_with("application/json"),
+        "Content-Type must be application/json; got {}",
+        ct
+    );
+    assert_pod_body("p-json", &body);
+}
+
+/// `Accept: */*` — RFC 7231 wildcard. Server picks its default representation.
+/// In Rusternetes the only available representation is JSON.
+#[tokio::test]
+async fn accept_wildcard_falls_back_to_default_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-wild").await;
+
+    let (status, ct, body) =
+        get_with_accept(router, "/api/v1/namespaces/default/pods/p-wild", "*/*").await;
+
+    assert_eq!(status, StatusCode::OK, "status={} body={:?}", status, body);
+    assert!(
+        ct.starts_with("application/json"),
+        "Accept: */* must default to application/json; got {}",
+        ct
+    );
+    assert_pod_body("p-wild", &body);
+}
+
+/// No Accept header at all. RFC 7231 §5.3.2 says missing Accept is
+/// equivalent to `*/*`. Server must serve the default representation.
+#[tokio::test]
+async fn no_accept_header_defaults_to_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-none").await;
+
+    // No headers — `get_with_headers` passes an empty slice.
+    let (status, ct, body) =
+        get_with_headers(router, "/api/v1/namespaces/default/pods/p-none", &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "status={} body={:?}", status, body);
+    assert!(
+        ct.starts_with("application/json"),
+        "missing Accept must default to application/json; got {}",
+        ct
+    );
+    assert_pod_body("p-none", &body);
+}
+
+// ---------------------------------------------------------------------------
+// 4. application/yaml — unsupported in Rusternetes
+// ---------------------------------------------------------------------------
+
+/// `Accept: application/yaml`. Upstream apiserver registers a YAML serializer
+/// and emits a YAML document. Rusternetes' router has no YAML response
+/// serializer — handlers always produce JSON via `axum::Json<T>`. Per RFC
+/// 7231 §5.3.2 a non-matching Accept should produce 406 Not Acceptable, but
+/// Rusternetes ignores the header and returns JSON regardless.
+///
+/// Pin the actual behavior: 200 + Content-Type: application/json, no 406.
+/// This is a divergence from upstream; flip the assertion if a YAML
+/// serializer ever lands.
+#[tokio::test]
+async fn accept_application_yaml_falls_back_to_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-yaml").await;
+
+    let (status, ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-yaml",
+        "application/yaml",
+    )
+    .await;
+
+    // Rusternetes does NOT honor application/yaml — it serves JSON anyway.
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rusternetes serves JSON for application/yaml (no 406); status={} body={:?}",
+        status,
+        body
+    );
+    assert!(
+        ct.starts_with("application/json"),
+        "Rusternetes does not implement YAML; falls back to JSON; got {}",
+        ct
+    );
+    assert_pod_body("p-yaml", &body);
+}
+
+// ---------------------------------------------------------------------------
+// 5. application/vnd.kubernetes.protobuf — forced JSON fallback
+// ---------------------------------------------------------------------------
+
+/// `Accept: application/vnd.kubernetes.protobuf`. Real K8s wraps the JSON in
+/// the `k8s\0`-prefixed Unknown envelope and returns
+/// `Content-Type: application/vnd.kubernetes.protobuf`. Rusternetes cannot
+/// produce native protobuf bytes for K8s types (see comment in
+/// `crates/api-server/src/middleware.rs` line 348-353 — `wants_protobuf` is
+/// hardcoded to `false`). Per `scripts/run-conformance.sh:78-80` the server
+/// is expected to fall back to JSON; client-go always sends
+/// `Accept: application/vnd.kubernetes.protobuf, application/json` so the
+/// JSON fallback is exercised in practice.
+///
+/// Pin: 200 + JSON Content-Type, body is the JSON Pod (no protobuf envelope).
+#[tokio::test]
+async fn accept_protobuf_forces_json_fallback() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-pb").await;
+
+    let (status, ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-pb",
+        "application/vnd.kubernetes.protobuf",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rusternetes must fall back to JSON when protobuf is requested; status={} body={:?}",
+        status,
+        body
+    );
+    assert!(
+        ct.starts_with("application/json"),
+        "Rusternetes forces JSON regardless of protobuf Accept; got {}",
+        ct
+    );
+    // Body must NOT be wrapped in the k8s\0 protobuf envelope — verify the
+    // raw bytes parse as JSON, not as a binary envelope.
+    assert!(
+        !body.starts_with(b"k8s\0"),
+        "body must not be a protobuf envelope; first bytes={:?}",
+        &body[..body.len().min(16)]
+    );
+    assert_pod_body("p-pb", &body);
+}
+
+// ---------------------------------------------------------------------------
+// 6-7. Quality values
+// ---------------------------------------------------------------------------
+
+/// `Accept: application/vnd.kubernetes.protobuf;q=0.9, application/json;q=1.0`.
+/// Per RFC 7231 §5.3.1 the higher q value wins, so JSON should be picked.
+/// Rusternetes happens to always pick JSON regardless of q (it ignores q
+/// entirely and always returns JSON), so the outcome matches upstream
+/// contract here even though the reasoning differs.
+#[tokio::test]
+async fn accept_q_values_prefer_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-q1").await;
+
+    let (status, ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-q1",
+        "application/vnd.kubernetes.protobuf;q=0.9, application/json;q=1.0",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ct.starts_with("application/json"),
+        "JSON has higher q; must be picked; got {}",
+        ct
+    );
+    assert_pod_body("p-q1", &body);
+}
+
+/// `Accept: application/vnd.kubernetes.protobuf;q=1.0, application/json;q=0.5`.
+/// Upstream RFC 7231 contract: protobuf has higher q AND is supported by
+/// upstream, so protobuf wins. If protobuf were unsupported (Rusternetes'
+/// case) the next candidate (JSON at q=0.5) must be served — NOT a 406,
+/// because at least one media type in the list matches an available
+/// representation. Rusternetes' behavior again happens to converge with the
+/// fallback contract: JSON is always picked.
+#[tokio::test]
+async fn accept_q_values_protobuf_first_falls_back_to_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-q2").await;
+
+    let (status, ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-q2",
+        "application/vnd.kubernetes.protobuf;q=1.0, application/json;q=0.5",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "must downgrade to JSON, not 406; status={} body={:?}",
+        status,
+        body
+    );
+    assert!(
+        ct.starts_with("application/json"),
+        "protobuf unsupported, must fall back to JSON; got {}",
+        ct
+    );
+    assert_pod_body("p-q2", &body);
+}
+
+// ---------------------------------------------------------------------------
+// 8-9. Table & PartialObjectMetadata conversions (NOT implemented)
+// ---------------------------------------------------------------------------
+
+/// `Accept: application/json;as=Table;v=v1;g=meta.k8s.io`. Upstream
+/// converts the resource into a `meta.k8s.io/v1.Table` for kubectl's
+/// columnar output. Rusternetes has no Table conversion path; it
+/// ignores the `as=` parameter and returns the underlying Pod JSON.
+///
+/// This blocks `[sig-cli] Kubectl get` conformance scenarios that depend
+/// on Table responses. Marked as `ignore` with a note pointing at the
+/// missing feature.
+#[tokio::test]
+#[ignore = "blocked on issue #TBD: meta.k8s.io/v1 Table conversion not implemented"]
+async fn accept_as_table_returns_table() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-table").await;
+
+    let (status, ct, _body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-table",
+        "application/json;as=Table;v=v1;g=meta.k8s.io",
+    )
+    .await;
+
+    // When implemented, the response should be a Table with `columnDefinitions`
+    // and `rows`. Until then this assertion will fail with the underlying Pod
+    // body — exactly why the test is ignored.
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ct.contains("as=Table") || ct.contains("Table"),
+        "expected Table Content-Type; got {}",
+        ct
+    );
+}
+
+/// `Accept: application/json;as=PartialObjectMetadata;v=v1;g=meta.k8s.io`.
+/// Upstream strips `spec` and `status`, returning just TypeMeta + ObjectMeta
+/// to keep watch traffic light. Rusternetes returns the full Pod regardless.
+///
+/// `kubectl get -o name` and the informer-cache layer rely on this.
+#[tokio::test]
+#[ignore = "blocked on issue #TBD: PartialObjectMetadata conversion not implemented"]
+async fn accept_as_partial_object_metadata_strips_spec_status() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-pom").await;
+
+    let (status, ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-pom",
+        "application/json;as=PartialObjectMetadata;v=v1;g=meta.k8s.io",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ct.contains("PartialObjectMetadata"),
+        "expected PartialObjectMetadata Content-Type; got {}",
+        ct
+    );
+    let v: Value = serde_json::from_slice(&body).expect("JSON");
+    assert!(
+        v.get("spec").is_none(),
+        "PartialObjectMetadata must strip spec; got {}",
+        v
+    );
+    assert!(
+        v.get("status").is_none(),
+        "PartialObjectMetadata must strip status; got {}",
+        v
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10-11. Accept-Encoding (compression)
+// ---------------------------------------------------------------------------
+
+/// `Accept-Encoding: gzip`. RFC 7231 §5.3.4 permits the server to send
+/// the response uncompressed (no Content-Encoding) or compressed (with
+/// `Content-Encoding: gzip`). Rusternetes wires no `tower_http::compression`
+/// layer into the router, so the server returns identity-encoded JSON
+/// (no Content-Encoding header). Pin that contract — gzip request must
+/// still produce a valid uncompressed JSON Pod.
+#[tokio::test]
+async fn accept_encoding_gzip_returns_identity() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-gz").await;
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/namespaces/default/pods/p-gz");
+    req = req.header("accept", "application/json");
+    req = req.header("accept-encoding", "gzip");
+    let response = router
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_encoding = response
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    // Rusternetes does not compress; Content-Encoding header is either
+    // absent or set to "identity". RFC 7231 permits either.
+    assert!(
+        content_encoding.is_empty() || content_encoding.eq_ignore_ascii_case("identity"),
+        "rusternetes must not compress (no compression layer); got Content-Encoding={:?}",
+        content_encoding
+    );
+    // Body must be plain (uncompressed) JSON. Gzip magic is 1f 8b.
+    assert!(
+        !(bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b),
+        "body must not be gzip-encoded; first bytes={:?}",
+        &bytes[..bytes.len().min(8)]
+    );
+    assert_pod_body("p-gz", &bytes);
+}
+
+/// `Accept-Encoding: br` (Brotli). Even less likely to be supported than
+/// gzip — pin identity encoding.
+#[tokio::test]
+async fn accept_encoding_brotli_returns_identity() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-br").await;
+
+    let (status, ct, bytes) = get_with_headers(
+        router,
+        "/api/v1/namespaces/default/pods/p-br",
+        &[("accept", "application/json"), ("accept-encoding", "br")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ct.starts_with("application/json"),
+        "Content-Type still JSON; got {}",
+        ct
+    );
+    // Body must NOT be Brotli — there's no Brotli magic number but the body
+    // must parse as JSON.
+    assert_pod_body("p-br", &bytes);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Garbage / unsupported types
+// ---------------------------------------------------------------------------
+
+/// `Accept: application/garbage`. Per RFC 7231 §5.3.2 + §6.5.6 the server
+/// should return 406 Not Acceptable when none of the requested media types
+/// can be served. Rusternetes ignores Accept entirely and always returns
+/// JSON, so a garbage Accept still yields a JSON response.
+///
+/// Pin actual: 200 + Content-Type: application/json. Divergence from
+/// upstream RFC contract; flip the assertion when negotiation is wired up.
+#[tokio::test]
+async fn accept_garbage_falls_back_to_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "p-garbage").await;
+
+    let (status, ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods/p-garbage",
+        "application/garbage",
+    )
+    .await;
+
+    // Upstream contract would be 406 here; Rusternetes ignores Accept.
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rusternetes ignores Accept and serves JSON for any value; status={} body={:?}",
+        status,
+        body
+    );
+    assert!(
+        ct.starts_with("application/json"),
+        "rusternetes always returns JSON regardless of Accept; got {}",
+        ct
+    );
+    assert_pod_body("p-garbage", &body);
+}
