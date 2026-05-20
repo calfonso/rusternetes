@@ -628,7 +628,6 @@ async fn test_pod_create_ephemeral_containers() {
 /// strategic/merge/JSON variations all reduce to the same handler call in
 /// our codebase.
 #[tokio::test]
-#[ignore = "ephemeralcontainers subresource admission not implemented; see docstring"]
 async fn test_pod_patch_ephemeral_containers() {
     let (_, router) = spawn_router();
     let ns = "pod-patch-ephemeral-containers";
@@ -688,7 +687,6 @@ async fn test_pod_patch_ephemeral_containers() {
 /// from `spec.ephemeralContainers`; only the `/ephemeralcontainers`
 /// subresource may. Without admission this currently passes silently.
 #[tokio::test]
-#[ignore = "ephemeralcontainers subresource admission not implemented; see docstring"]
 async fn test_pod_update_ephemeral_containers() {
     let (_, router) = spawn_router();
     let ns = "pod-update-ephemeral-containers";
