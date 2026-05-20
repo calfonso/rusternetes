@@ -126,12 +126,35 @@ pub async fn proxy_node(
     let suffix = extract_proxy_suffix(original_uri.path(), "nodes");
     info!("Proxying request to node: {}, path: /{}", node_name, suffix);
 
+    // Parse node id — Kubernetes proxy subresource format:
+    //   "name", "name:port", or "scheme:name:port"
+    // K8s ref: pkg/registry/core/node/strategy.go::ResourceLocation calls
+    // `utilnet.SplitSchemeNamePort(id)` and uses `name` for the storage
+    // lookup, `port` as the kubelet-endpoint override. The upstream e2e
+    // framework constructs URLs of the form `<node>:10250` so the raw
+    // path parameter from axum (`node_name`) is the *id*, not the name.
+    let (scheme, actual_node_name, port_str) =
+        split_scheme_name_port(&node_name).unwrap_or(("", node_name.as_str(), ""));
+
+    // Rusternetes kubelet only serves plain HTTP today (see PR #188 note
+    // below); reject `https` requests early rather than 502-ing on the
+    // TLS handshake, matching the explicit-scheme contract upstream
+    // sets in `SplitSchemeNamePort`.
+    if scheme == "https" {
+        return Err(rusternetes_common::Error::InvalidResource(format!(
+            "invalid node request {:?}: https scheme not supported by rusternetes kubelet yet",
+            node_name
+        )));
+    }
+
     // Check authorization - requires permission to proxy to nodes.
     // Verb derives from the HTTP method (matches K8s RBAC semantics).
+    // The RBAC name field carries the *node name*, not the raw id, so
+    // policies that bind on `nodes/proxy` with a `resourceName` match.
     let verb = http_method_to_verb(&method);
     let attrs = RequestAttributes::new(auth_ctx.user, verb, "nodes/proxy")
         .with_api_group("")
-        .with_name(&node_name);
+        .with_name(actual_node_name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -140,8 +163,10 @@ pub async fn proxy_node(
         }
     }
 
-    // Get the node to find its address
-    let node_key = rusternetes_storage::build_key("nodes", None, &node_name);
+    // Get the node to find its address. Storage lookup uses the parsed
+    // name; the raw `node_name` may carry a `:port` suffix the upstream
+    // e2e framework appended.
+    let node_key = rusternetes_storage::build_key("nodes", None, actual_node_name);
     let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
 
     // Extract node address (prefer InternalIP, fallback to ExternalIP)
@@ -157,12 +182,19 @@ pub async fn proxy_node(
         })
         .map(|a| a.address.clone())
         .ok_or_else(|| {
-            rusternetes_common::Error::NotFound(format!("No address found for node {}", node_name))
+            rusternetes_common::Error::NotFound(format!(
+                "No address found for node {}",
+                actual_node_name
+            ))
         })?;
 
-    // Build target URL. Prefer the port advertised by the node itself
-    // (`status.daemonEndpoints.kubeletEndpoint.port`) — upstream uses the
-    // same field. Fall back to the upstream default 10250 when absent.
+    // Build target URL. Port-fallback order matches
+    // `pkg/registry/core/node/strategy.go::ResourceLocation`:
+    //   1. Explicit port from the URL id (`<name>:<port>`) — used when
+    //      numeric.
+    //   2. The port the node advertises via
+    //      `status.daemonEndpoints.kubeletEndpoint.port`.
+    //   3. Upstream default 10250 when neither is available.
     //
     // NOTE: rusternetes kubelet serves its API over plain HTTP today (see
     // `crates/kubelet/src/main.rs` — no TLS layer on the metrics listener).
@@ -170,13 +202,19 @@ pub async fn proxy_node(
     // HTTPS here requires generating per-kubelet certs and wiring an
     // `axum_server::tls_rustls` listener. Until then, use `http://` so the
     // node-proxy actually reaches the kubelet (was 502'ing on TLS handshake).
-    let kubelet_port: u16 = node
-        .status
-        .as_ref()
-        .and_then(|s| s.daemon_endpoints.as_ref())
-        .and_then(|d| d.kubelet_endpoint.as_ref())
-        .map(|e| e.port as u16)
-        .unwrap_or(10250);
+    let port_override: Option<u16> = if port_str.is_empty() {
+        None
+    } else {
+        port_str.parse::<u16>().ok()
+    };
+    let kubelet_port: u16 = port_override.unwrap_or_else(|| {
+        node.status
+            .as_ref()
+            .and_then(|s| s.daemon_endpoints.as_ref())
+            .and_then(|d| d.kubelet_endpoint.as_ref())
+            .map(|e| e.port as u16)
+            .unwrap_or(10250)
+    });
     let target_url = format!("http://{}:{}/{}", node_address, kubelet_port, suffix);
 
     // Forward the request to the kubelet, including the original query string.
@@ -923,6 +961,38 @@ mod tests {
     fn test_extract_proxy_suffix_node() {
         let suffix = extract_proxy_suffix("/api/v1/nodes/node-1/proxy/stats/summary", "nodes");
         assert_eq!(suffix, "stats/summary");
+    }
+
+    /// Regression: node-proxy URLs that embed the kubelet port in the
+    /// resource id must still surface the path suffix unchanged. The
+    /// upstream e2e framework constructs URLs of the form
+    /// `/api/v1/nodes/<name>:<port>/proxy/<path>`; `extract_proxy_suffix`
+    /// is invoked with the verbatim path so the `:<port>` segment must
+    /// not bleed into the returned suffix.
+    /// K8s ref: test/e2e/framework/node/wait.go uses `node.Name + ":<port>"`.
+    #[test]
+    fn test_extract_proxy_suffix_node_name_with_port() {
+        let suffix = extract_proxy_suffix("/api/v1/nodes/node-1:10250/proxy/pods", "nodes");
+        assert_eq!(suffix, "pods");
+    }
+
+    /// Regression: when the port segment of a `<name>:<port>` resource id
+    /// is non-numeric, `proxy_node` must fall back to the node-advertised
+    /// kubelet port rather than crashing or proxying to port 0. We assert
+    /// the parse step here so the fallback chain in `proxy_node` is
+    /// driven by the same `port.parse::<u16>().ok()` contract used by
+    /// `proxy_service` / `proxy_pod`.
+    /// K8s ref: pkg/registry/core/node/strategy.go ResourceLocation —
+    /// portReq carries the raw string; numeric validation is implicit
+    /// in the downstream URL build.
+    #[test]
+    fn test_split_scheme_name_port_invalid_port_string() {
+        let parsed = split_scheme_name_port("node-1:invalid-port");
+        assert_eq!(parsed, Some(("", "node-1", "invalid-port")));
+        // ...and the port-numeric guard the handler uses to gate the
+        // override falls back to None.
+        let override_port: Option<u16> = parsed.and_then(|(_, _, p)| p.parse::<u16>().ok());
+        assert!(override_port.is_none());
     }
 
     #[test]
