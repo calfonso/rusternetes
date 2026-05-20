@@ -160,10 +160,24 @@ pub async fn proxy_node(
             rusternetes_common::Error::NotFound(format!("No address found for node {}", node_name))
         })?;
 
-    // Build target URL (kubelet typically runs on port 10250).
-    // Preserve the original suffix verbatim, including any trailing slash.
-    let kubelet_port = 10250;
-    let target_url = format!("https://{}:{}/{}", node_address, kubelet_port, suffix);
+    // Build target URL. Prefer the port advertised by the node itself
+    // (`status.daemonEndpoints.kubeletEndpoint.port`) — upstream uses the
+    // same field. Fall back to the upstream default 10250 when absent.
+    //
+    // NOTE: rusternetes kubelet serves its API over plain HTTP today (see
+    // `crates/kubelet/src/main.rs` — no TLS layer on the metrics listener).
+    // Upstream kubelet uses HTTPS with self-signed certs; switching to
+    // HTTPS here requires generating per-kubelet certs and wiring an
+    // `axum_server::tls_rustls` listener. Until then, use `http://` so the
+    // node-proxy actually reaches the kubelet (was 502'ing on TLS handshake).
+    let kubelet_port: u16 = node
+        .status
+        .as_ref()
+        .and_then(|s| s.daemon_endpoints.as_ref())
+        .and_then(|d| d.kubelet_endpoint.as_ref())
+        .map(|e| e.port as u16)
+        .unwrap_or(10250);
+    let target_url = format!("http://{}:{}/{}", node_address, kubelet_port, suffix);
 
     // Forward the request to the kubelet, including the original query string.
     proxy_request(target_url, &original_uri, method, headers, body).await
