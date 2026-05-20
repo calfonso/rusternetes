@@ -33,3 +33,6 @@ etcd-data/
 
 # Work tracking (local only)
 .work/
+
+# Node conformance harness
+.bin/
