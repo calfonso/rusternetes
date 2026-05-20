@@ -1,4 +1,4 @@
-//! RED-state TDD mirror of the Kubernetes v1.35 integration test suite for
+//! Integration mirror of the Kubernetes v1.35 integration test suite for
 //! ServiceAccount token autocreation, automount, and authentication.
 //!
 //! Upstream source (release-1.35):
@@ -24,26 +24,20 @@
 //!
 //! Harness
 //! -------
-//! Tests drive the production routes through an inline `spawn_state()`
-//! helper that wires `rusternetes_api_server::router::build_router` over an
-//! in-memory storage with `AlwaysAllowAuthorizer` and `skip_auth = true`
-//! (same pattern as `conformance_apimachinery_admission_webhooks.rs` and the
-//! sibling `conformance_auth_rbac_serviceaccount.rs`). Requests go through
-//! tower's `oneshot` so no live socket is required.
+//! Two harnesses are used:
+//!   * `spawn_state()` — `skip_auth = true` + `AlwaysAllowAuthorizer`, drives
+//!     the namespace POST / pod POST paths only.
+//!   * `spawn_authn_state()` — `skip_auth = false` + `RBACAuthorizer`,
+//!     exercises the real bearer-token auth pipeline and per-SA RBAC.
 //!
-//! RED-state policy
-//! ----------------
-//! Tests that exercise surface that exists today (namespace POST creating the
-//! default SA, pod admission injecting the `kube-api-access` projected
-//! volume) are left ungated — they will pass and serve as regression pins.
-//! Tests that depend on surface that is **not yet implemented in the
-//! api-server alone** (the SA controller recreating a deleted `default` SA
-//! without the controller-manager loop, and TokenRequest + bearer-token
-//! authentication wired through the auth middleware) are `#[ignore]`d with a
-//! comment naming the missing surface, per the batch RED-state template.
+//! Test 1 drives the production
+//! `rusternetes_controller_manager::controllers::ServiceAccountController`
+//! reconcile loop as a tokio task. The controller's `reconcile_all()` walks
+//! every namespace and re-creates the `default` SA if missing — that is the
+//! upstream "watch + workqueue + requeue-not-retry" surface, condensed into a
+//! periodic ticker so the integration test can assert the recreate.
 //!
-//! Part of the /batch landing upstream integration-test mirrors as
-//! RED-state TDD pins.
+//! Part of the /batch landing upstream integration-test mirrors.
 
 use axum::{
     body::Body,
@@ -51,9 +45,13 @@ use axum::{
 };
 use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
+    authz::{AlwaysAllowAuthorizer, RBACAuthorizer},
+    observability::MetricsRegistry,
+    resources::{ClusterRole, Namespace, PolicyRule, RoleRef, ServiceAccount, Subject},
+    types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_controller_manager::controllers::serviceaccount::ServiceAccountController;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -62,12 +60,13 @@ use tower::ServiceExt;
 // HTTP harness
 // ---------------------------------------------------------------------------
 
-/// Build a fully-wired `ApiServerState` backed by an in-memory storage. The
-/// authorizer is `AlwaysAllow` and `skip_auth = true` so the router uses
-/// `skip_auth_middleware` and no token is required.
+/// Build a fully-wired `ApiServerState` backed by an in-memory storage with
+/// `skip_auth = true` and `AlwaysAllow` authorizer. Used by tests 1 and 2.
 fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
     let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"integration-sa-token-secret"));
+    let token_manager = Arc::new(rusternetes_common::auth::TokenManager::new(
+        b"integration-sa-token-secret",
+    ));
     let authorizer = Arc::new(AlwaysAllowAuthorizer);
     let metrics = Arc::new(MetricsRegistry::new());
     Arc::new(ApiServerState::new(
@@ -79,11 +78,28 @@ fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
     ))
 }
 
-/// State factory used by every HTTP-driven test. The router is rebuilt per
-/// request because `axum::Router::oneshot` consumes the router.
 fn spawn_state() -> Arc<ApiServerState> {
     let mem = Arc::new(MemoryStorage::new());
     make_state(mem)
+}
+
+/// Build a wired `ApiServerState` with `skip_auth = false` and an RBAC
+/// authorizer. Used by test 3 to exercise the real bearer-token pipeline.
+fn spawn_authn_state() -> Arc<ApiServerState> {
+    let mem = Arc::new(MemoryStorage::new());
+    let backend = Arc::new(StorageBackend::Memory(mem));
+    let token_manager = Arc::new(rusternetes_common::auth::TokenManager::new(
+        b"integration-sa-token-secret",
+    ));
+    let authorizer = Arc::new(RBACAuthorizer::new(backend.clone()));
+    let metrics = Arc::new(MetricsRegistry::new());
+    Arc::new(ApiServerState::new(
+        backend,
+        token_manager,
+        authorizer,
+        metrics,
+        false, // skip_auth — exercise real auth middleware
+    ))
 }
 
 /// POST JSON, return `(status, body)`.
@@ -135,9 +151,7 @@ async fn delete(router: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, v)
 }
 
-/// POST JSON with a bearer token, return `(status, body)`. Used by the
-/// authentication test once `skip_auth` is disabled.
-#[allow(dead_code)]
+/// POST JSON with a bearer token, return `(status, body)`.
 async fn post_json_bearer(
     router: axum::Router,
     uri: &str,
@@ -161,7 +175,6 @@ async fn post_json_bearer(
 }
 
 /// GET with a bearer token, return `(status, body)`.
-#[allow(dead_code)]
 async fn get_json_bearer(router: axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("GET")
@@ -203,22 +216,33 @@ async fn create_namespace(state: &Arc<ApiServerState>, name: &str) -> (StatusCod
 ///    different UID. Upstream message:
 ///    "Expected different UID with recreated serviceaccount."
 ///
-/// RED-state notes:
-///   * Step 2 already works in the api-server: the `POST /api/v1/namespaces`
-///     handler synchronously creates the `default` ServiceAccount before
-///     returning (see `crates/api-server/src/handlers/namespace.rs`).
-///   * Step 4 is the assertion that fails today. In production, recreation
-///     is performed by the **ServiceAccount controller** loop in the
-///     controller-manager
-///     (`crates/controller-manager/src/controllers/serviceaccount.rs`), which
-///     is **not** running inside this api-server-only test harness. The
-///     test mirror therefore stays RED until the SA controller is wired
-///     into the integration harness (or an api-server-side guard
-///     synchronously recreates the default SA on demand).
+/// Step 2 is satisfied by the synchronous default-SA creation in
+/// `crates/api-server/src/handlers/namespace.rs`. Step 4 is driven by the
+/// production `ServiceAccountController::reconcile_all` loop (same code
+/// path the controller-manager runs in production) spawned as a tokio task
+/// inside the test. Mirrors upstream — controller does the work, test polls.
 #[tokio::test]
-#[ignore = "RED: ServiceAccount controller (controller-manager) is not driven by this api-server-only harness; default SA is not recreated after delete"]
 async fn test_service_account_auto_create() {
     let state = spawn_state();
+
+    // Drive the production SA controller as a background reconcile task.
+    // We poll `reconcile_all()` rather than the watch-based `run()` because
+    // MemoryStorage's watch stream isn't deterministic in this short-lived
+    // harness — but `reconcile_all` is the same upstream code path the
+    // controller's workqueue worker eventually executes per namespace.
+    // Requeue-not-retry: any reconcile error is logged inside
+    // `ensure_default_serviceaccount` and the next tick retries naturally,
+    // mirroring upstream `workqueue.RateLimitingInterface` semantics.
+    let storage = state.storage.clone();
+    let controller = Arc::new(ServiceAccountController::new(storage));
+    let controller_handle = controller.clone();
+    let reconcile_task = tokio::spawn(async move {
+        loop {
+            let _ = controller_handle.reconcile_all().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+
     let ns = "test-service-account-creation";
 
     // (1) Create the namespace.
@@ -230,7 +254,6 @@ async fn test_service_account_auto_create() {
     );
 
     // (2) The `default` ServiceAccount must exist in the new namespace.
-    //     Upstream asserts via Core().ServiceAccounts(ns).Get("default").
     let router = build_router(state.clone(), None);
     let (status, default_sa) = get_json(
         router,
@@ -263,22 +286,30 @@ async fn test_service_account_auto_create() {
         "DELETE of default SA must return 200: {body}"
     );
 
-    // (4) **RED**: the SA controller must recreate the default SA with a
-    //     different UID. This is the assertion that fails today and the
-    //     reason this whole test is `#[ignore]`d.
-    let router = build_router(state.clone(), None);
-    let (status, recreated) = get_json(
-        router,
-        &format!("/api/v1/namespaces/{ns}/serviceaccounts/default"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "default SA must be auto-recreated after deletion: {recreated}"
-    );
-    let new_uid = recreated["metadata"]["uid"].as_str().unwrap_or("");
-    assert!(!new_uid.is_empty(), "recreated SA must have a UID");
+    // (4) Poll until the controller recreates the default SA with a fresh
+    // UID. Bound at ~2s to keep the test snappy; the controller ticks every
+    // 50ms above so a healthy recreation lands within 2–3 ticks.
+    let mut recreated_uid: Option<String> = None;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let router = build_router(state.clone(), None);
+        let (status, recreated) = get_json(
+            router,
+            &format!("/api/v1/namespaces/{ns}/serviceaccounts/default"),
+        )
+        .await;
+        if status == StatusCode::OK {
+            let new_uid = recreated["metadata"]["uid"].as_str().unwrap_or("");
+            if !new_uid.is_empty() && new_uid != original_uid {
+                recreated_uid = Some(new_uid.to_string());
+                break;
+            }
+        }
+    }
+
+    reconcile_task.abort();
+
+    let new_uid = recreated_uid.expect("controller did not recreate default SA within 2s");
     assert_ne!(
         new_uid, original_uid,
         "Expected different UID with recreated serviceaccount"
@@ -291,19 +322,6 @@ async fn test_service_account_auto_create() {
 
 /// Upstream: `TestServiceAccountTokenAutoMount` — release-1.35
 /// `test/integration/serviceaccount/service_account_test.go:89-120`.
-///
-/// Steps:
-///   1. Create a namespace.
-///   2. POST a pod that omits `spec.serviceAccountName`.
-///   3. The created pod must have `serviceAccountName == "default"`.
-///   4. The created pod's `spec.volumes` must contain a **projected** volume
-///      that holds a `serviceAccountToken` projection.
-///
-/// In the api-server this defaulting + injection is performed in
-/// `crates/api-server/src/admission.rs::inject_service_account_token`, called
-/// from the pod POST handler. The volume name today is `kube-api-access` and
-/// the projection source array contains a `ServiceAccountToken` projection
-/// (path `token`, expiration ~3607s).
 #[tokio::test]
 async fn test_service_account_token_auto_mount() {
     let state = spawn_state();
@@ -335,15 +353,13 @@ async fn test_service_account_token_auto_mount() {
     );
 
     // (3) The created pod must default to the "default" ServiceAccount.
-    //     Upstream upstream: `pod.Spec.ServiceAccountName == DefaultServiceAccountName`.
     assert_eq!(
         created["spec"]["serviceAccountName"], "default",
         "pod must default ServiceAccountName to \"default\": {created}"
     );
 
     // (4) The pod must have a projected volume carrying a
-    //     ServiceAccountToken projection. Upstream message:
-    //     "Expected projected volume for service account token inserted".
+    //     ServiceAccountToken projection.
     let volumes = created["spec"]["volumes"].as_array().cloned();
     let volumes = volumes
         .expect("Expected projected volume for service account token inserted (no volumes at all)");
@@ -364,91 +380,197 @@ async fn test_service_account_token_auto_mount() {
 // TestServiceAccountTokenAuthentication
 // ---------------------------------------------------------------------------
 
+/// Seed a ClusterRole + namespaced RoleBinding so the given SA gets the
+/// listed verbs on pods in `namespace`. Mirrors the upstream "read-only
+/// kubelet client" pattern used by the integration test, but consolidated
+/// to ClusterRole + RoleBinding because rusternetes' RBAC checker walks
+/// both surfaces.
+async fn grant_sa_pods_verbs(
+    state: &Arc<ApiServerState>,
+    role_name: &str,
+    namespace: &str,
+    sa_name: &str,
+    verbs: &[&str],
+) {
+    let cluster_role = ClusterRole {
+        type_meta: TypeMeta {
+            api_version: "rbac.authorization.k8s.io/v1".to_string(),
+            kind: "ClusterRole".to_string(),
+        },
+        metadata: ObjectMeta {
+            name: role_name.to_string(),
+            ..Default::default()
+        },
+        rules: vec![PolicyRule {
+            verbs: verbs.iter().map(|v| (*v).to_string()).collect(),
+            api_groups: Some(vec!["".to_string()]),
+            resources: Some(vec!["pods".to_string()]),
+            resource_names: None,
+            non_resource_urls: None,
+        }],
+        aggregation_rule: None,
+    };
+    let key = build_key("clusterroles", None::<&str>, role_name);
+    state.storage.create(&key, &cluster_role).await.unwrap();
+
+    let binding = rusternetes_common::resources::RoleBinding {
+        type_meta: TypeMeta {
+            api_version: "rbac.authorization.k8s.io/v1".to_string(),
+            kind: "RoleBinding".to_string(),
+        },
+        metadata: ObjectMeta {
+            name: format!("{role_name}-bind"),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        subjects: vec![Subject::service_account(sa_name, namespace)],
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: role_name.to_string(),
+        },
+    };
+    let key = build_key(
+        "rolebindings",
+        Some(namespace),
+        &format!("{role_name}-bind"),
+    );
+    state.storage.create(&key, &binding).await.unwrap();
+}
+
+/// Seed a Namespace directly through storage (used by tests that disable
+/// `skip_auth` and have no privileged client to talk through the HTTP API).
+async fn seed_namespace(state: &Arc<ApiServerState>, name: &str) {
+    let ns = Namespace {
+        type_meta: TypeMeta {
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+        },
+        metadata: ObjectMeta {
+            name: name.to_string(),
+            uid: uuid::Uuid::new_v4().to_string(),
+            ..Default::default()
+        },
+        spec: None,
+        status: None,
+    };
+    let key = build_key("namespaces", None::<&str>, name);
+    state.storage.create(&key, &ns).await.unwrap();
+}
+
+/// Seed a ServiceAccount directly through storage and return the assigned UID.
+async fn seed_service_account(state: &Arc<ApiServerState>, namespace: &str, name: &str) -> String {
+    let uid = uuid::Uuid::new_v4().to_string();
+    let sa = ServiceAccount {
+        type_meta: TypeMeta {
+            api_version: "v1".to_string(),
+            kind: "ServiceAccount".to_string(),
+        },
+        metadata: ObjectMeta {
+            name: name.to_string(),
+            namespace: Some(namespace.to_string()),
+            uid: uid.clone(),
+            ..Default::default()
+        },
+        secrets: None,
+        image_pull_secrets: None,
+        automount_service_account_token: None,
+    };
+    let key = build_key("serviceaccounts", Some(namespace), name);
+    state.storage.create(&key, &sa).await.unwrap();
+    uid
+}
+
+/// Mint a bearer token for a ServiceAccount directly through the
+/// `TokenManager`. Mirrors what the TokenRequest handler does, but
+/// bypasses RBAC so the setup step itself doesn't require an
+/// already-authorized identity. Claim shape matches upstream
+/// `pkg/serviceaccount/claims.go`:
+///   sub: "system:serviceaccount:<ns>:<name>"
+///   iss: "https://kubernetes.default.svc.cluster.local"
+///   aud: ["https://kubernetes.default.svc"]
+///   kubernetes.io: {namespace, serviceaccount: {name, uid}}
+fn mint_sa_token(state: &Arc<ApiServerState>, namespace: &str, sa_name: &str, uid: &str) -> String {
+    let now = chrono::Utc::now();
+    let claims = rusternetes_common::auth::ServiceAccountClaims {
+        sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
+        namespace: namespace.to_string(),
+        uid: uid.to_string(),
+        iat: now.timestamp(),
+        exp: (now + chrono::Duration::hours(1)).timestamp(),
+        iss: "https://kubernetes.default.svc.cluster.local".to_string(),
+        aud: vec!["https://kubernetes.default.svc".to_string()],
+        kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+            namespace: namespace.to_string(),
+            svcacct: rusternetes_common::auth::KubeRef {
+                name: sa_name.to_string(),
+                uid: uid.to_string(),
+            },
+            pod: None,
+            node: None,
+        }),
+        pod_name: None,
+        pod_uid: None,
+        node_name: None,
+        node_uid: None,
+    };
+    state.token_manager.generate_token(claims).unwrap()
+}
+
 /// Upstream: `TestServiceAccountTokenAuthentication` — release-1.35
 /// `test/integration/serviceaccount/service_account_test.go:122-187`.
 ///
-/// Steps:
-///   1. Create two namespaces (`auth-ns`, `other-ns`).
-///   2. Create a read-only SA (`ro`) and a read-write SA (`rw`) in `auth-ns`.
-///   3. Mint a bearer token for each via the legacy Secret-with-annotation
-///      flow or the modern TokenRequest flow.
-///   4. Authorize via the custom authorizer: `ro` may list pods in `auth-ns`
-///      but may not create them; `rw` may both.
-///   5. Cross-namespace access is denied for both.
-///   6. Deleting the `ro` SA's token invalidates the token: subsequent
-///      requests must return 401 Unauthorized.
+/// 1. Create `auth-ns` and `other-ns`.
+/// 2. Create SAs `ro` and `rw` in `auth-ns`.
+/// 3. Mint a bearer token for each (upstream uses
+///    `serviceaccount.JWTTokenAuthenticator`; we drive `TokenManager`
+///    directly, same claim shape — see `mint_sa_token`).
+/// 4. `ro` may list pods in `auth-ns` but not create them; `rw` may both.
+/// 5. Cross-namespace access is denied.
+/// 6. Deleting the `ro` SA invalidates the token (401 — upstream parity
+///    with `pkg/serviceaccount/legacy.go` which re-checks SA Getter on
+///    every authenticate call).
 ///
-/// RED-state notes:
-///   * This file's harness is `skip_auth = true` with `AlwaysAllowAuthorizer`,
-///     so bearer-token validation is bypassed and the per-SA authorization
-///     verdict is unobservable. The mirror is `#[ignore]`d until the auth
-///     pipeline can be exercised end-to-end from an integration test:
-///       - a router built with `skip_auth = false`,
-///       - an authorizer that honours per-SA RBAC bindings,
-///       - and a way to **invalidate** a token after deletion (today's
-///         `TokenManager` issues stateless JWTs; deletion of the SA secret
-///         does not currently revoke them).
-///   * Compare with the GREEN-on-Sonobuoy
-///     `service_account_token_request_then_token_review_authenticates` in
-///     `conformance_auth_rbac_serviceaccount.rs`, which only checks the
-///     TokenRequest → TokenReview round-trip and does not exercise per-SA
-///     authorization or token revocation.
+/// Setup uses direct storage writes (namespaces, SAs, RBAC bindings) so the
+/// authn-enabled harness doesn't need a privileged kubeconfig — the upstream
+/// integration test uses the kubeapiserver's internal admin loopback for
+/// the same reason.
 #[tokio::test]
-#[ignore = "RED: requires skip_auth=false harness, per-SA RBAC enforcement, and token revocation on SA/secret delete; only stateless JWTs exist today"]
 async fn test_service_account_token_authentication() {
-    let state = spawn_state();
+    let state = spawn_authn_state();
     let auth_ns = "auth-ns";
     let other_ns = "other-ns";
 
-    // (1) Two namespaces.
-    for ns in [auth_ns, other_ns] {
-        let (status, body) = create_namespace(&state, ns).await;
-        assert_eq!(status, StatusCode::CREATED, "ns {ns}: {body}");
-    }
+    // (1) Two namespaces (direct storage write — no privileged client).
+    seed_namespace(&state, auth_ns).await;
+    seed_namespace(&state, other_ns).await;
 
     // (2) Two ServiceAccounts in auth-ns.
-    for name in ["ro", "rw"] {
-        let sa_body = json!({
-            "apiVersion": "v1",
-            "kind": "ServiceAccount",
-            "metadata": {"name": name},
-        });
-        let router = build_router(state.clone(), None);
-        let (status, body) = post_json(
-            router,
-            &format!("/api/v1/namespaces/{auth_ns}/serviceaccounts"),
-            &sa_body,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "create sa {name}: {body}");
-    }
+    let ro_uid = seed_service_account(&state, auth_ns, "ro").await;
+    let rw_uid = seed_service_account(&state, auth_ns, "rw").await;
 
-    // (3) Mint a TokenRequest for each. Upstream does this via the legacy
-    //     Secret with `kubernetes.io/service-account.name` annotation; the
-    //     v1.35 modern equivalent is the TokenRequest subresource.
+    // (3) Mint a bearer token for each.
     let mut tokens: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
-    for name in ["ro", "rw"] {
-        let req = json!({
-            "apiVersion": "authentication.k8s.io/v1",
-            "kind": "TokenRequest",
-            "metadata": {},
-            "spec": {"audiences": ["https://kubernetes.default.svc"]},
-        });
-        let router = build_router(state.clone(), None);
-        let (status, body) = post_json(
-            router,
-            &format!("/api/v1/namespaces/{auth_ns}/serviceaccounts/{name}/token"),
-            &req,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "TokenRequest for {name}: {body}");
-        let token = body["status"]["token"]
-            .as_str()
-            .filter(|t| !t.is_empty())
-            .expect("token must be present")
-            .to_string();
-        tokens.insert(name, token);
-    }
+    tokens.insert("ro", mint_sa_token(&state, auth_ns, "ro", &ro_uid));
+    tokens.insert("rw", mint_sa_token(&state, auth_ns, "rw", &rw_uid));
+
+    // Seed RBAC: ro can get/list/watch pods in auth-ns; rw can do everything.
+    grant_sa_pods_verbs(
+        &state,
+        "pod-reader",
+        auth_ns,
+        "ro",
+        &["get", "list", "watch"],
+    )
+    .await;
+    grant_sa_pods_verbs(
+        &state,
+        "pod-writer",
+        auth_ns,
+        "rw",
+        &["get", "list", "watch", "create", "update", "delete"],
+    )
+    .await;
 
     // (4) ro may list pods in auth-ns but not create them.
     let router = build_router(state.clone(), None);
@@ -515,17 +637,13 @@ async fn test_service_account_token_authentication() {
         "rw must not be able to list pods cross-namespace: {body}"
     );
 
-    // (6) Revoke ro's token by deleting the SA. Upstream deletes the
-    //     legacy Secret holding the token; with TokenRequest the equivalent
-    //     is deleting the bound SA (or rotating the signing key). Either
-    //     way, subsequent ro requests must return 401.
-    let router = build_router(state.clone(), None);
-    let (status, body) = delete(
-        router,
-        &format!("/api/v1/namespaces/{auth_ns}/serviceaccounts/ro"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "delete ro SA: {body}");
+    // (6) Revoke ro's token by deleting the SA. The auth middleware
+    //     re-checks SA existence on every authenticate (upstream parity with
+    //     `pkg/serviceaccount/legacy.go`), so subsequent ro requests must 401.
+    //     Direct storage delete because the authn-enabled harness has no
+    //     privileged HTTP identity (mirrors upstream loopback admin).
+    let ro_key = build_key("serviceaccounts", Some(auth_ns), "ro");
+    state.storage.delete(&ro_key).await.unwrap();
 
     let router = build_router(state.clone(), None);
     let (status, body) = get_json_bearer(
@@ -540,3 +658,8 @@ async fn test_service_account_token_authentication() {
         "ro token must be invalidated after SA delete (unauthorized error): {body}"
     );
 }
+
+// Belt-and-braces: keep the helpers in the file even if a future refactor
+// removes one of the bearer-token tests, so the test surface still compiles.
+#[allow(dead_code)]
+fn _bind_helpers(_a: &dyn Fn() -> StatusCode) {}

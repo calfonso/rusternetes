@@ -278,23 +278,26 @@ impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
     {
         use crate::build_key;
         // Mirror the EtcdStorage pattern: derive a full /registry path from type name.
+        // IMPORTANT: order matters — `type_name::<RoleBinding>()` also matches
+        // `contains("Role")`, so the more-specific `RoleBinding`/`ClusterRoleBinding`
+        // checks must come first or they get shadowed.
         let full_key = match namespace {
             Some(ns) => {
                 let tn = std::any::type_name::<T>();
-                if tn.contains("Role") && !tn.contains("Cluster") {
-                    format!("/registry/roles/{}/{}", ns, key)
-                } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
+                if tn.contains("RoleBinding") && !tn.contains("Cluster") {
                     format!("/registry/rolebindings/{}/{}", ns, key)
+                } else if tn.contains("Role") && !tn.contains("Cluster") {
+                    format!("/registry/roles/{}/{}", ns, key)
                 } else {
                     build_key("unknown", Some(ns), key)
                 }
             }
             None => {
                 let tn = std::any::type_name::<T>();
-                if tn.contains("ClusterRole") && !tn.contains("Binding") {
-                    format!("/registry/clusterroles/{}", key)
-                } else if tn.contains("ClusterRoleBinding") {
+                if tn.contains("ClusterRoleBinding") {
                     format!("/registry/clusterrolebindings/{}", key)
+                } else if tn.contains("ClusterRole") && !tn.contains("Binding") {
+                    format!("/registry/clusterroles/{}", key)
                 } else {
                     format!("/registry/unknown/{}", key)
                 }
@@ -307,23 +310,26 @@ impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
+        // IMPORTANT: order matters — `type_name::<RoleBinding>()` also matches
+        // `contains("Role")`, so the more-specific `RoleBinding`/`ClusterRoleBinding`
+        // checks must come first or they get shadowed.
         let prefix = match namespace {
             Some(ns) => {
                 let tn = std::any::type_name::<T>();
-                if tn.contains("Role") && !tn.contains("Cluster") {
-                    format!("/registry/roles/{}/", ns)
-                } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
+                if tn.contains("RoleBinding") && !tn.contains("Cluster") {
                     format!("/registry/rolebindings/{}/", ns)
+                } else if tn.contains("Role") && !tn.contains("Cluster") {
+                    format!("/registry/roles/{}/", ns)
                 } else {
                     format!("/registry/unknown/{}/", ns)
                 }
             }
             None => {
                 let tn = std::any::type_name::<T>();
-                if tn.contains("ClusterRole") && !tn.contains("Binding") {
-                    "/registry/clusterroles/".to_string()
-                } else if tn.contains("ClusterRoleBinding") {
+                if tn.contains("ClusterRoleBinding") {
                     "/registry/clusterrolebindings/".to_string()
+                } else if tn.contains("ClusterRole") && !tn.contains("Binding") {
+                    "/registry/clusterroles/".to_string()
                 } else {
                     "/registry/unknown/".to_string()
                 }

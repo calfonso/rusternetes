@@ -592,28 +592,31 @@ impl AuthzStorage for EtcdStorage {
     where
         T: DeserializeOwned + Send + Sync,
     {
-        // Build the full key based on the resource type and namespace
+        // Build the full key based on the resource type and namespace.
+        // IMPORTANT: order matters — `type_name::<RoleBinding>()` also matches
+        // `contains("Role")`, so the more-specific `RoleBinding`/`ClusterRoleBinding`
+        // checks must come first or they get shadowed.
         let full_key = match namespace {
             Some(ns) => {
-                if std::any::type_name::<T>().contains("Role")
-                    && !std::any::type_name::<T>().contains("Cluster")
-                {
-                    format!("/registry/roles/{}/{}", ns, key)
-                } else if std::any::type_name::<T>().contains("RoleBinding")
+                if std::any::type_name::<T>().contains("RoleBinding")
                     && !std::any::type_name::<T>().contains("Cluster")
                 {
                     format!("/registry/rolebindings/{}/{}", ns, key)
+                } else if std::any::type_name::<T>().contains("Role")
+                    && !std::any::type_name::<T>().contains("Cluster")
+                {
+                    format!("/registry/roles/{}/{}", ns, key)
                 } else {
                     format!("/registry/unknown/{}/{}", ns, key)
                 }
             }
             None => {
-                if std::any::type_name::<T>().contains("ClusterRole")
+                if std::any::type_name::<T>().contains("ClusterRoleBinding") {
+                    format!("/registry/clusterrolebindings/{}", key)
+                } else if std::any::type_name::<T>().contains("ClusterRole")
                     && !std::any::type_name::<T>().contains("Binding")
                 {
                     format!("/registry/clusterroles/{}", key)
-                } else if std::any::type_name::<T>().contains("ClusterRoleBinding") {
-                    format!("/registry/clusterrolebindings/{}", key)
                 } else {
                     format!("/registry/unknown/{}", key)
                 }
@@ -627,27 +630,30 @@ impl AuthzStorage for EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        // IMPORTANT: order matters — `type_name::<RoleBinding>()` also matches
+        // `contains("Role")`, so the more-specific `RoleBinding`/`ClusterRoleBinding`
+        // checks must come first or they get shadowed.
         let prefix = match namespace {
             Some(ns) => {
-                if std::any::type_name::<T>().contains("Role")
-                    && !std::any::type_name::<T>().contains("Cluster")
-                {
-                    format!("/registry/roles/{}/", ns)
-                } else if std::any::type_name::<T>().contains("RoleBinding")
+                if std::any::type_name::<T>().contains("RoleBinding")
                     && !std::any::type_name::<T>().contains("Cluster")
                 {
                     format!("/registry/rolebindings/{}/", ns)
+                } else if std::any::type_name::<T>().contains("Role")
+                    && !std::any::type_name::<T>().contains("Cluster")
+                {
+                    format!("/registry/roles/{}/", ns)
                 } else {
                     format!("/registry/unknown/{}/", ns)
                 }
             }
             None => {
-                if std::any::type_name::<T>().contains("ClusterRole")
+                if std::any::type_name::<T>().contains("ClusterRoleBinding") {
+                    "/registry/clusterrolebindings/".to_string()
+                } else if std::any::type_name::<T>().contains("ClusterRole")
                     && !std::any::type_name::<T>().contains("Binding")
                 {
                     "/registry/clusterroles/".to_string()
-                } else if std::any::type_name::<T>().contains("ClusterRoleBinding") {
-                    "/registry/clusterrolebindings/".to_string()
                 } else {
                     "/registry/unknown/".to_string()
                 }

@@ -7,6 +7,7 @@ use axum::{
     Extension,
 };
 use rusternetes_common::auth::{BootstrapTokenManager, TokenManager, UserInfo};
+use rusternetes_storage::{build_key, Storage, StorageBackend};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
 
@@ -46,10 +47,17 @@ pub async fn skip_auth_middleware(mut request: Request, next: Next) -> Result<Re
     Ok(next.run(request).await)
 }
 
-/// Authentication middleware that extracts and validates JWT tokens
+/// Authentication middleware that extracts and validates JWT tokens.
+///
+/// Mirrors upstream `pkg/serviceaccount/legacy.go` / `bound.go`: after a JWT
+/// decodes successfully, we additionally verify that the ServiceAccount it
+/// names still exists. Deleting the SA therefore invalidates outstanding
+/// tokens (a stateless JWT cannot be "revoked" cryptographically — upstream
+/// achieves this by re-checking the SA Getter on every authenticate call).
 pub async fn auth_middleware(
     Extension(token_manager): Extension<Arc<TokenManager>>,
     Extension(bootstrap_token_manager): Extension<Arc<BootstrapTokenManager>>,
+    Extension(storage): Extension<Arc<StorageBackend>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, Response> {
@@ -65,6 +73,51 @@ pub async fn auth_middleware(
 
         // Try to validate as a service account token first
         if let Ok(claims) = token_manager.validate_token(token) {
+            // Upstream parity: a JWT that decodes is not sufficient; the
+            // ServiceAccount it references must also still exist. This is
+            // how upstream invalidates tokens after SA deletion.
+            let sa_name = claims
+                .kubernetes
+                .as_ref()
+                .map(|k| k.svcacct.name.clone())
+                .unwrap_or_else(|| {
+                    // Fallback: parse from `sub` ("system:serviceaccount:<ns>:<name>")
+                    claims
+                        .sub
+                        .strip_prefix("system:serviceaccount:")
+                        .and_then(|s| s.split(':').nth(1))
+                        .unwrap_or("")
+                        .to_string()
+                });
+            if !sa_name.is_empty() && !claims.namespace.is_empty() {
+                let sa_key = build_key("serviceaccounts", Some(&claims.namespace), &sa_name);
+                match storage
+                    .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
+                    .await
+                {
+                    Ok(sa) => {
+                        // Also verify UID matches — upstream checks this to
+                        // detect "same-name, different-instance" cases.
+                        if !claims.uid.is_empty()
+                            && !sa.metadata.uid.is_empty()
+                            && sa.metadata.uid != claims.uid
+                        {
+                            warn!(
+                                "ServiceAccount {}/{} UID mismatch: token uid={} current uid={}",
+                                claims.namespace, sa_name, claims.uid, sa.metadata.uid
+                            );
+                            return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            "ServiceAccount {}/{} no longer exists; rejecting token",
+                            claims.namespace, sa_name
+                        );
+                        return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
+                    }
+                }
+            }
             let user_info = UserInfo::from_service_account_claims(&claims);
             debug!(
                 "Authenticated user (service account): {}",
