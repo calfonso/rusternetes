@@ -428,10 +428,12 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
-    /// Add not-ready and unreachable taints to a NotReady node.
-    /// K8s node lifecycle controller adds these taints so that:
-    /// 1. New pods aren't scheduled on NotReady nodes (NoSchedule)
-    /// 2. The conformance framework can distinguish real vs fake/dead nodes
+    /// Add the not-ready taint to a NotReady node.
+    ///
+    /// Upstream `pkg/controller/nodelifecycle/node_lifecycle_controller.go` applies
+    /// `node.kubernetes.io/not-ready` with effect `NoExecute` (see `TaintNodeNotReady`),
+    /// which both prevents new scheduling and activates `TaintEvictionController` for
+    /// non-tolerating pods on the node.
     async fn add_not_ready_taint(&self, node: &Node) -> Result<()> {
         let node_name = &node.metadata.name;
         let key = build_key("nodes", None, node_name);
@@ -440,7 +442,7 @@ impl<S: Storage + 'static> NodeController<S> {
         let not_ready_taint = rusternetes_common::resources::node::Taint {
             key: "node.kubernetes.io/not-ready".to_string(),
             value: Some("".to_string()),
-            effect: "NoSchedule".to_string(),
+            effect: "NoExecute".to_string(),
             time_added: None,
         };
 
