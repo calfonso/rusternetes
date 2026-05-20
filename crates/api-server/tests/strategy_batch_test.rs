@@ -361,7 +361,6 @@ async fn test_job_strategy_update_allows_parallelism_change() {
 /// the stored object. We pin the upstream semantics here as `#[ignore]`d
 /// so the test becomes the regression gate once immutability lands.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ValidateJobUpdate immutability fence not implemented (completions/completionMode/selector/template)"]
 async fn test_job_strategy_update_rejects_immutable_field_change() {
     let (mem, router) = spawn_router();
     let create_body = minimal_job_stub("immutable-fields");

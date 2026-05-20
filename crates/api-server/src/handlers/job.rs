@@ -143,6 +143,51 @@ pub async fn update(
     // Apply K8s defaults (SetDefaults_Job + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_job_defaults(&mut job);
 
+    let key = build_key("jobs", Some(&namespace), &name);
+
+    // ValidateJobUpdate immutability fence — mirrors upstream
+    // pkg/registry/batch/job/strategy.go ValidateUpdate. Only
+    // `spec.parallelism`, `spec.activeDeadlineSeconds`, `spec.suspend`, and
+    // `spec.ttlSecondsAfterFinished` are mutable. Mutating any of:
+    //   * spec.completions
+    //   * spec.completionMode
+    //   * spec.selector
+    //   * spec.template
+    // is rejected with Invalid.
+    if let Ok(mut existing) = state.storage.get::<Job>(&key).await {
+        // Mirror upstream: defaulting runs on every request, and the
+        // immutability comparison is between post-default specs. Without
+        // symmetric defaulting, partial UPDATE bodies + objects seeded via
+        // direct storage writes (tests, raw etcd writes) trip the fence on
+        // server-defaulted fields that the client never echoed.
+        crate::handlers::defaults::apply_job_defaults(&mut existing);
+
+        if existing.spec.completions != job.spec.completions {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "Job.spec.completions: Invalid value: field is immutable".to_string(),
+            ));
+        }
+        if existing.spec.completion_mode != job.spec.completion_mode {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "Job.spec.completionMode: Invalid value: field is immutable".to_string(),
+            ));
+        }
+        if existing.spec.selector != job.spec.selector {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "Job.spec.selector: Invalid value: field is immutable".to_string(),
+            ));
+        }
+        // PodTemplateSpec does not derive PartialEq; compare via canonical
+        // JSON like upstream's apiequality.Semantic.DeepEqual.
+        let old_template = serde_json::to_value(&existing.spec.template).unwrap_or_default();
+        let new_template = serde_json::to_value(&job.spec.template).unwrap_or_default();
+        if old_template != new_template {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "Job.spec.template: Invalid value: field is immutable".to_string(),
+            ));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
@@ -151,7 +196,6 @@ pub async fn update(
         );
         return Ok(Json(job));
     }
-    let key = build_key("jobs", Some(&namespace), &name);
     let updated = state.storage.update(&key, &job).await?;
 
     Ok(Json(updated))
