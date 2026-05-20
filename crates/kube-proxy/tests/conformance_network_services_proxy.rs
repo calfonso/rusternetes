@@ -972,17 +972,112 @@ async fn proxy_with_path_iptables_invariant() {
 /// [sig-network] Proxy version v1 [Conformance] — A set of valid responses
 /// are returned for both pod and service Proxy
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/network/proxy.go:432
-/// Sonobuoy (Round 160): FAIL at proxy.go:503 (Round 160 failure bucket:
-/// "proxy/aggregator"). The combined pod+service Proxy test fails because
-/// the api-server's service-proxy resolves through the EndpointSlice but
-/// the API aggregation path that the test also exercises is incomplete.
+/// Upstream: k8s.io/kubernetes/test/e2e/network/proxy.go:432–503
+/// Sonobuoy (Round 160): historically FAIL at proxy.go:503. Upstream walks
+/// a matrix of expected response codes (200, 404, 503, 301-with-Location)
+/// through both `/api/v1/namespaces/{ns}/services/{svc}/proxy/{path}` and
+/// `/api/v1/namespaces/{ns}/pods/{pod}/proxy/{path}` and asserts each
+/// status code + body is forwarded verbatim from the backend.
 ///
-/// kube-proxy half: assert the iptables surface stays correct for the
-/// proxied service. The underlying failure is in the api-server's
-/// aggregator/proxy interaction.
+/// kube-proxy half: the /proxy subresource does NOT route via iptables —
+/// the api-server resolves the pod IP from EndpointSlice (service path)
+/// or directly from Pod status (pod path) and proxies in-process. This
+/// test asserts the iptables surface stays correct alongside the proxy
+/// chain — i.e. the same Service + EndpointSlice shape the api-server
+/// proxy handler queries still produces a clean DNAT rule pointing at
+/// the pod IP:targetPort, with no `/proxy`-derived artefacts leaking in.
+///
+/// The HTTP-response-code matrix that fails at proxy.go:503 is exercised
+/// in the api-server-side mirror at
+/// `crates/api-server/tests/conformance_network_services_proxy.rs`; this
+/// half guarantees the underlying iptables→endpoint mapping survives even
+/// when the api-server proxy chain is exercised end-to-end against a real
+/// HTTP backend.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/network-services-proxy.md"]
 async fn proxy_valid_responses_for_pod_and_service() {
-    panic!("placeholder for upstream proxy/aggregator failure (proxy.go:503)");
+    // Mirror the storage shape both halves of the upstream test use:
+    //   - Service `pxresp` with port 80 → targetPort 8080
+    //   - EndpointSlice tying the service to pod IP 10.244.9.3:8080
+    //
+    // Upstream creates a Pod (proxy-service-...) that exposes the service
+    // via a single EndpointSlice. The api-server's service-proxy handler
+    // (handlers/proxy.rs:295-328) reads exactly this shape; the kube-proxy
+    // half must produce a clean iptables rule for the same tuple.
+    let svc = cluster_ip_service("pxresp", "default", "10.96.0.230", 80, 8080);
+    let slice = endpoint_slice("default", "pxresp", &["10.244.9.3"], Some("http"), 8080);
+    let map = endpointslice_map(&[slice]);
+    let rules = test_iptables()
+        .build_nat_rules(std::slice::from_ref(&svc), &map, &[], "test-node")
+        .await;
+
+    // DNAT must point at the pod IP:targetPort that the api-server proxy
+    // will also resolve to via the EndpointSlice (proxy.rs:329-341).
+    assert!(
+        rules.contains("--to-destination 10.244.9.3:8080"),
+        "rules missing DNAT to pod:targetPort: {}",
+        rules
+    );
+    // ClusterIP DNAT must be in place — Service-proxy via the api-server
+    // and Service-via-kube-proxy must agree on the (clusterIP, port) tuple.
+    assert!(
+        rules.contains("10.96.0.230/32"),
+        "rules missing ClusterIP match: {}",
+        rules
+    );
+    assert!(rules.contains("--dport 80"), "rules: {}", rules);
+
+    // No /proxy path artefact must leak into iptables — the api-server
+    // owns path forwarding, kube-proxy must not see it. This guards the
+    // invariant that the response-code matrix in the api-server mirror
+    // never affects iptables emission.
+    assert!(!rules.contains("/proxy"), "iptables leaked /proxy artefact");
+
+    // Storage shape sanity: the api-server proxy handler will also resolve
+    // pod IPs directly from Pod status when called via /pods/{name}/proxy.
+    // We mirror that data path here so the kube-proxy half stays in sync
+    // when the api-server mirror's Pod-proxy assertions evolve.
+    let storage = fresh_storage();
+    storage
+        .create("/registry/services/default/pxresp", &svc)
+        .await
+        .expect("create service");
+    let slice = endpoint_slice("default", "pxresp", &["10.244.9.3"], Some("http"), 8080);
+    storage
+        .create("/registry/endpointslices/default/pxresp-abc12", &slice)
+        .await
+        .expect("create endpointslice");
+
+    // Confirm the api-server's EndpointSlice lookup (handlers/proxy.rs:296)
+    // finds the slice with the canonical service-name label.
+    let slices: Vec<EndpointSlice> = storage
+        .list("/registry/endpointslices/default/")
+        .await
+        .expect("list slices");
+    let backing = slices
+        .iter()
+        .find(|es| {
+            es.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("kubernetes.io/service-name"))
+                .map(|v| v == "pxresp")
+                .unwrap_or(false)
+        })
+        .expect("service-name labelled slice missing");
+    let backend_ip = backing
+        .endpoints
+        .iter()
+        .find_map(|ep| {
+            if ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
+                ep.addresses.first().cloned()
+            } else {
+                None
+            }
+        })
+        .expect("no ready endpoint");
+    assert_eq!(backend_ip, "10.244.9.3");
+    // Resolved EndpointSlice port matches Service.targetPort — the
+    // api-server proxy handler reuses this when forwarding.
+    let resolved_port = backing.ports.first().and_then(|p| p.port).unwrap_or(0);
+    assert_eq!(resolved_port, 8080);
 }

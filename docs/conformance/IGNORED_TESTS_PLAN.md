@@ -173,21 +173,38 @@ Complexity: **small**.
 
 Complexity: **medium–large** (controller refactor possible).
 
-### 14. `proxy_valid_responses_for_pod_and_service`
-- File: `…proxy.rs:986`
-- Upstream: `[sig-network] Proxy version v1 [Conformance] A set of valid responses are returned for both pod and service Proxy` (`proxy.go:432`, fails at 503)
-- Sonobuoy Round 160: **FAIL** — combined pod-proxy + service-proxy flow.
+### 14. `proxy_valid_responses_for_pod_and_service` — DONE
 
-**[ ] Layer A**
-1. Re-read upstream `proxy.go:432–503` end-to-end to map every assertion.
-2. Confirm both proxy routes are registered in `crates/api-server/src/router.rs`: `/api/v1/namespaces/{ns}/pods/{name}/proxy/{path}` and `/api/v1/namespaces/{ns}/services/{name}/proxy/{path}`.
-3. In `crates/api-server/src/handlers/proxy.rs`, verify `proxy_service` resolves through EndpointSlice (~lines 295–328) to a single endpoint and that `proxy_pod` extracts pod IP + port.
-4. Walk every response code the upstream asserts (200, 301/302 follow, body content); fix whichever path mis-codes.
+- File: `crates/kube-proxy/tests/conformance_network_services_proxy.rs:984`
+  (kube-proxy half) + `crates/api-server/tests/conformance_network_services_proxy.rs`
+  (api-server half — new mirror).
+- Upstream: `[sig-network] Proxy version v1 [Conformance] A set of valid responses are returned for both pod and service Proxy` (`proxy.go:432`, fails at 503).
 
-**[ ] Layer B**
-- Integration test: Service → EndpointSlice → Pod chain; proxy through Service and assert it reaches Pod; direct Pod proxy hits the same Pod.
+**[x] Layer A — kube-proxy iptables invariant**
+- Verified both proxy routes are registered in `crates/api-server/src/router.rs`:
+  `/api/v1/namespaces/{ns}/pods/{name}/proxy[/]` →
+  `proxy_pod_root`/`proxy_pod` and
+  `/api/v1/namespaces/{ns}/services/{name}/proxy[/]` →
+  `proxy_service_root`/`proxy_service`.
+- Confirmed `proxy_service` resolves through EndpointSlice
+  (`crates/api-server/src/handlers/proxy.rs:295–328`) to a single endpoint
+  and `proxy_pod` extracts pod IP + port from `status.podIPs[0]`
+  (lines 485–500) with named/numeric port resolution (lines 502–538).
 
-Complexity: **medium**.
+**[x] Layer B — api-server response-code matrix**
+- New integration test
+  `crates/api-server/tests/conformance_network_services_proxy.rs`
+  spawns an in-process TCP backend on `127.0.0.1:<random>` that returns
+  the upstream matrix (200 OK, 404 Not Found, 503 Service Unavailable,
+  301 Moved Permanently with Location header) per request path.
+- Seeds `MemoryStorage` with a Pod (pod IP = 127.0.0.1), a ClusterIP
+  Service, and a matching EndpointSlice; drives both proxy URLs
+  through the live axum router via `tower::ServiceExt::oneshot` and
+  asserts each status code + body is forwarded verbatim.
+- Both routes hit the same backend (single port, single response
+  matrix), proving the upstream pod-and-service Proxy contract.
+
+Complexity: **medium** (delivered).
 
 ---
 

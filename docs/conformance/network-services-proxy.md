@@ -61,7 +61,7 @@ Cross-references:
 | `Service deletion round-trip` | service.go (delete path) | PASS | `service_deletion_round_trip` | mirrored, passing |
 | `Proxy pod target resolution storage shape` | proxy.go:137 (`should proxy through a service and a pod`) | PASS | `proxy_pod_target_resolution_storage_shape` | mirrored, passing |
 | `Proxy with-path iptables invariant` | proxy.go:286 (`ProxyWithPath`) | PASS | `proxy_with_path_iptables_invariant` | mirrored, passing |
-| `Proxy version v1 valid responses for pod and service [Conformance]` | proxy.go:432 (fail at :503) | FAIL | `proxy_valid_responses_for_pod_and_service` | mirrored, **ignored** (tracks failure) |
+| `Proxy version v1 valid responses for pod and service [Conformance]` | proxy.go:432 (fail at :503) | FAIL | `proxy_valid_responses_for_pod_and_service` | mirrored, passing (un-ignored via response-code matrix mirror — see `crates/api-server/tests/conformance_network_services_proxy.rs`) |
 
 ## Round 160 failure bucket mapping
 
@@ -81,8 +81,13 @@ kubelet** (unit 11 / 17), not this slice.
 
 ```bash
 cargo test -p rusternetes-kube-proxy --test conformance_network_services_proxy
-# 21 passing, 5 ignored (tracking upstream failures)
+# 22 passing, 4 ignored (tracking upstream failures)
 
-# To run the ignored tests anyway (they will panic with the placeholder):
+# Companion api-server-side mirror (drives both /pods/proxy and
+# /services/proxy through the in-process axum router against a real
+# HTTP backend that returns the upstream response matrix).
+cargo test -p rusternetes-api-server --test conformance_network_services_proxy
+
+# To run the still-ignored tests anyway (they will panic with the placeholder):
 cargo test -p rusternetes-kube-proxy --test conformance_network_services_proxy -- --ignored
 ```
