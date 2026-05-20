@@ -11,8 +11,11 @@ use rusternetes_common::{
 use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend, WatchEvent};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -61,6 +64,12 @@ pub struct Kubelet {
     /// When a watch event arrives for a pod, we signal its channel to
     /// trigger an immediate reconciliation without a full sync_loop.
     pod_workers: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
+    /// Unix-seconds timestamp of the most recent successful `sync_loop`
+    /// completion. Exposed via [`Kubelet::healthy`] so the HTTP
+    /// `/healthz` endpoint can answer 200 only when the reconciler has
+    /// ticked recently. Mirrors upstream `pkg/kubelet/kubelet.go`'s
+    /// `syncLoopMonitor`. 0 = no successful sync yet.
+    last_sync: AtomicU64,
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -110,7 +119,26 @@ impl Kubelet {
             pod_sync_locks: Mutex::new(HashSet::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
+            last_sync: AtomicU64::new(0),
         })
+    }
+
+    /// Liveness probe — true iff `sync_loop` completed inside the
+    /// stale-sync window (`max(6, 2 × sync_interval)` seconds, mirroring
+    /// upstream's `syncLoopHealthCheck` constants in
+    /// `pkg/kubelet/kubelet.go`). Backs the HTTP `/healthz` endpoint.
+    /// Returns `false` until the first successful sync_loop tick.
+    pub fn healthy(&self) -> bool {
+        let last = self.last_sync.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stale_after = self.sync_interval.as_secs().saturating_mul(2).max(6);
+        now.saturating_sub(last) <= stale_after
     }
 
     pub async fn run(self: &Arc<Self>) -> Result<()> {
@@ -889,6 +917,13 @@ impl Kubelet {
         // periodically cleans up terminal pods. This prevents accumulation of
         // stale pod records that block namespace deletion.
         self.cleanup_terminal_pods(&node_pods).await;
+
+        // Record completion for the /healthz liveness probe.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_sync.store(now, Ordering::Relaxed);
 
         Ok(())
     }

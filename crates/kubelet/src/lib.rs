@@ -97,9 +97,24 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_addr
     );
 
+    let k = Arc::new(
+        kubelet::Kubelet::new(
+            config.node_name.clone(),
+            storage.clone(),
+            config.sync_interval,
+            config.volume_dir,
+            cluster_dns,
+            config.cluster_domain,
+            config.network,
+            config.kubernetes_service_host,
+        )
+        .await?,
+    );
+
     let server_state = server::ServerState {
         node_name: config.node_name.clone(),
         storage: storage.clone(),
+        kubelet: Some(k.clone()),
     };
     tokio::spawn(async move {
         use axum::{routing::get, Json, Router};
@@ -114,19 +129,6 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         axum::serve(listener, app).await.unwrap();
     });
 
-    let k = Arc::new(
-        kubelet::Kubelet::new(
-            config.node_name,
-            storage,
-            config.sync_interval,
-            config.volume_dir,
-            cluster_dns,
-            config.cluster_domain,
-            config.network,
-            config.kubernetes_service_host,
-        )
-        .await?,
-    );
     k.run().await?;
 
     Ok(())
