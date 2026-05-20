@@ -45,3 +45,5 @@ sysinfo = "0.32"
 tempfile = "3"
 async-trait = { workspace = true }
 url = "2.5"
+tower = { workspace = true }
+http-body-util = "0.1"
