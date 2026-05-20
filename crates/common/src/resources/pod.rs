@@ -140,7 +140,11 @@ pub struct PodSpec {
     pub topology_spread_constraints: Option<Vec<TopologySpreadConstraint>>,
 
     /// Overhead represents the resource overhead associated with running a pod
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub overhead: Option<HashMap<String, String>>,
 
     /// SchedulerName is the name of the scheduler to be used to schedule this pod
@@ -1294,7 +1298,11 @@ pub struct ContainerStatus {
     pub started: Option<bool>,
 
     /// Resources allocated to this container by the node
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub allocated_resources: Option<HashMap<String, String>>,
 
     /// Detailed status of allocated resources for this container
