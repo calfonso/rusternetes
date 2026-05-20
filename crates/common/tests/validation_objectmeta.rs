@@ -26,7 +26,20 @@
 #![allow(clippy::never_loop)]
 
 use rusternetes_common::types::{ObjectMeta, OwnerReference};
+use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
+use rusternetes_common::validation::objectmeta::{
+    name_is_dns_subdomain, validate_annotations, validate_object_meta,
+    validate_object_meta_accessor_with_opts_common, validate_object_meta_update,
+    validate_object_meta_with_opts,
+};
 use std::collections::HashMap;
+
+fn aggregate(errs: &ErrorList) -> String {
+    errs.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 // ---------------------------------------------------------------------------
 // Fixture helpers — these mirror metav1.ObjectMeta{...} composite literals.
@@ -82,7 +95,6 @@ fn owner_ref(api_version: &str, kind: &str, uid: &str, controller: Option<bool>)
 // through the validator, so an "invalid"/"invalid" pair produces 2 errors.
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when rusternetes_common exposes ValidateObjectMeta(meta, requires_namespace, name_fn, field_path)"]
 fn test_validate_object_meta_custom_name() {
     // Table of (input, expected_n_errs, expected_err_substr).
     let cases: Vec<(ObjectMeta, usize, &'static str)> = vec![
@@ -93,15 +105,30 @@ fn test_validate_object_meta_custom_name() {
         (meta_named_gen("invalid", "invalid"), 2, "wrong value"),
     ];
 
-    for (_meta, _n_errs, _substr) in cases {
-        // TODO: call rusternetes_common::validation::validate_object_meta(
-        //   &meta, /*requires_namespace=*/ false, &|s, _prefix| if s == "test" { vec![] } else { vec!["wrong value".into()] },
-        //   FieldPath::new("field"),
-        // ) and assert error count + substring.
-        panic!(
-            "validate_object_meta is not implemented in rusternetes-common yet \
-             (upstream: ValidateObjectMeta with custom NameGenerator)"
-        );
+    fn name_fn(s: &str, _prefix: bool) -> Vec<String> {
+        if s == "test" {
+            Vec::new()
+        } else {
+            vec!["wrong value".to_string()]
+        }
+    }
+
+    for (meta, n_errs, substr) in cases {
+        let errs = validate_object_meta(&meta, false, name_fn, &Path::new("field"));
+        if substr.is_empty() {
+            assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+        } else {
+            assert_eq!(
+                errs.len(),
+                n_errs,
+                "expected {n_errs} errors, got: {errs:?}"
+            );
+            assert!(
+                errs[0].to_string().contains(substr),
+                "expected substring {substr:?} in first error, got: {}",
+                errs[0]
+            );
+        }
     }
 }
 
@@ -113,7 +140,6 @@ fn test_validate_object_meta_custom_name() {
 // generateName errors when name itself is already invalid.
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when ValidateObjectMetaWithOpts (errlist-returning name fn) lands"]
 fn test_validate_object_meta_with_opts_name() {
     let cases: Vec<(ObjectMeta, &'static str)> = vec![
         (meta_named_gen("test", ""), ""),
@@ -123,13 +149,31 @@ fn test_validate_object_meta_with_opts_name() {
         (meta_named_gen("invalid", "invalid"), "wrong value"),
     ];
 
-    for (_meta, _expected_substr) in cases {
-        // TODO: drive ValidateObjectMetaWithOpts. For non-empty expected_substr
-        // expect exactly 1 error whose Display contains the substring.
-        panic!(
-            "validate_object_meta_with_opts is not implemented in \
-             rusternetes-common yet"
-        );
+    fn name_fn(fld_path: &Path, s: &str) -> ErrorList {
+        if s == "test" {
+            Vec::new()
+        } else {
+            vec![FieldError::invalid(fld_path, s.to_string(), "wrong value")]
+        }
+    }
+
+    for (meta, expected_substr) in cases {
+        let errs = validate_object_meta_with_opts(&meta, false, name_fn, &Path::new("field"));
+        if expected_substr.is_empty() {
+            assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+        } else {
+            assert_eq!(
+                errs.len(),
+                1,
+                "expected exactly 1 error, got {}: {errs:?}",
+                errs.len()
+            );
+            assert!(
+                errs[0].to_string().contains(expected_substr),
+                "expected substring {expected_substr:?} in error, got: {}",
+                errs[0]
+            );
+        }
     }
 }
 
@@ -142,10 +186,16 @@ fn test_validate_object_meta_with_opts_name() {
 //     containing "Invalid value"
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when validate_object_meta_accessor_with_opts_common (namespace DNS-label rules) exists"]
 fn test_validate_object_meta_namespaces() {
     // Case 1: a dot in the namespace is forbidden for DNS-label namespaces.
-    let _bad_dot = meta_with_ns("test", "foo.bar");
+    let bad_dot = meta_with_ns("test", "foo.bar");
+    let errs = validate_object_meta_accessor_with_opts_common(&bad_dot, true, &Path::new("field"));
+    assert_eq!(errs.len(), 1, "unexpected errors: {errs:?}");
+    assert!(
+        errs[0].to_string().contains(r#"Invalid value: "foo.bar""#),
+        "unexpected error message: {}",
+        aggregate(&errs)
+    );
 
     // Case 2: namespace longer than 63 chars (DNS-label max).
     const MAX_LENGTH: usize = 63;
@@ -157,13 +207,14 @@ fn test_validate_object_meta_namespaces() {
     let long_ns: String = (0..MAX_LENGTH + 1)
         .map(|i| letters[i % letters.len()])
         .collect();
-    let _bad_long = meta_with_ns("test", &long_ns);
-
-    // TODO: call validate_object_meta_accessor_with_opts_common(meta, /*requires_namespace=*/ true, ...).
-    // Assert error counts (1 and 2 respectively) and substring "Invalid value".
-    panic!(
-        "validate_object_meta_accessor_with_opts_common is not implemented in \
-         rusternetes-common yet"
+    let bad_long = meta_with_ns("test", &long_ns);
+    let errs = validate_object_meta_accessor_with_opts_common(&bad_long, true, &Path::new("field"));
+    assert_eq!(errs.len(), 2, "unexpected errors: {errs:?}");
+    assert!(
+        errs[0].to_string().contains("Invalid value")
+            && errs[1].to_string().contains("Invalid value"),
+        "unexpected error message: {}",
+        aggregate(&errs)
     );
 }
 
@@ -177,7 +228,6 @@ fn test_validate_object_meta_namespaces() {
 //   4. two refs with Controller=true → "Only one reference can have Controller set to true..."
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when owner-reference validation (Event blacklist + single-controller rule) exists"]
 fn test_validate_object_meta_owner_references() {
     let cases: Vec<(&'static str, ObjectMeta, bool, &'static str)> = vec![
         (
@@ -222,9 +272,20 @@ fn test_validate_object_meta_owner_references() {
         ),
     ];
 
-    for (_desc, _meta, _expect_err, _err_substr) in cases {
-        // TODO: drive owner-reference validation.
-        panic!("owner-reference validation is not implemented in rusternetes-common yet");
+    for (desc, meta, expect_err, err_substr) in cases {
+        let errs = validate_object_meta_accessor_with_opts_common(&meta, true, &Path::new("field"));
+        if !errs.is_empty() && !expect_err {
+            panic!("unexpected error: {errs:?} in test case {desc}");
+        }
+        if errs.is_empty() && expect_err {
+            panic!("expected error in test case {desc}");
+        }
+        if !errs.is_empty() && !errs[0].to_string().contains(err_substr) {
+            panic!(
+                "unexpected error message: {} in test case {desc}",
+                aggregate(&errs)
+            );
+        }
     }
 }
 
@@ -238,7 +299,6 @@ fn test_validate_object_meta_owner_references() {
 // add/clear/change scenarios).
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when validate_object_meta_update (immutability checks) exists"]
 fn test_validate_object_meta_update_ignores_creation_timestamp() {
     let old_no_ts = ObjectMeta {
         name: "test".into(),
@@ -265,10 +325,9 @@ fn test_validate_object_meta_update_ignores_creation_timestamp() {
         (old_with_ts, new_with_ts11),
     ];
 
-    for (_old, _new) in cases {
-        // TODO: call validate_object_meta_update(&new, &old, FieldPath::new("field"))
-        // and assert exactly 1 error.
-        panic!("validate_object_meta_update is not implemented in rusternetes-common yet");
+    for (old, new) in cases {
+        let errs = validate_object_meta_update(&new, &old, &Path::new("field"));
+        assert_eq!(errs.len(), 1, "unexpected errors: {errs:?}");
     }
 }
 
@@ -280,7 +339,6 @@ fn test_validate_object_meta_update_ignores_creation_timestamp() {
 // progress is also allowed.
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when validate_object_meta_update enforces finalizer-during-deletion rules"]
 fn test_validate_finalizers_update() {
     let deletion_ts = Some(chrono::DateTime::from_timestamp(0, 0).unwrap());
 
@@ -319,13 +377,20 @@ fn test_validate_finalizers_update() {
         ),
     ];
 
-    for (_name, _old, _new, _expected_substr) in cases {
-        // TODO: call validate_object_meta_update(&new, &old, FieldPath::new("field"))
-        // and check whether expected_substr appears in the aggregated error.
-        panic!(
-            "validate_object_meta_update finalizer-during-deletion check is \
-             not implemented in rusternetes-common yet"
-        );
+    for (name, old, new, expected_substr) in cases {
+        let errs = validate_object_meta_update(&new, &old, &Path::new("field"));
+        let agg = aggregate(&errs);
+        if errs.is_empty() {
+            assert!(
+                expected_substr.is_empty(),
+                "case {name}: expected error to contain {expected_substr:?}",
+            );
+        } else {
+            assert!(
+                agg.contains(expected_substr),
+                "case {name}: expected error to contain {expected_substr:?}, got {agg:?}",
+            );
+        }
     }
 }
 
@@ -337,21 +402,19 @@ fn test_validate_finalizers_update() {
 // with "cannot be both set".
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when conflicting-finalizer detection lands"]
 fn test_validate_finalizers_prevent_conflicting_finalizers() {
     // Upstream uses metav1.FinalizerOrphanDependents + metav1.FinalizerDeleteDependents.
-    let _meta = ObjectMeta {
+    let meta = ObjectMeta {
         name: "test".into(),
         resource_version: Some("1".into()),
         finalizers: Some(vec!["orphan".into(), "foregroundDeletion".into()]),
         ..ObjectMeta::default()
     };
-
-    // TODO: call validate_object_meta_accessor_with_opts_common(&meta, false, ...)
-    // and assert error contains "cannot be both set".
-    panic!(
-        "conflicting-finalizer detection (orphan + foregroundDeletion) is not \
-         implemented in rusternetes-common yet"
+    let errs = validate_object_meta_accessor_with_opts_common(&meta, false, &Path::new("field"));
+    let agg = aggregate(&errs);
+    assert!(
+        agg.contains("cannot be both set"),
+        "expected error containing 'cannot be both set', got: {agg}"
     );
 }
 
@@ -362,7 +425,6 @@ fn test_validate_finalizers_prevent_conflicting_finalizers() {
 // Eight test cases covering set/clear/change for each field.
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when validate_object_meta_update treats deletion fields as immutable"]
 fn test_validate_object_meta_update_prevents_deletion_field_mutation() {
     let now = chrono::DateTime::from_timestamp(1000, 0).unwrap();
     let later = chrono::DateTime::from_timestamp(2000, 0).unwrap();
@@ -438,12 +500,22 @@ fn test_validate_object_meta_update_prevents_deletion_field_mutation() {
         ),
     ];
 
-    for (_name, _old, _new, _expected) in cases {
-        // TODO: drive validate_object_meta_update and compare errors element-wise.
-        panic!(
-            "deletion-field immutability checks are not implemented in \
-             rusternetes-common yet"
+    for (name, old, new, expected) in cases {
+        let errs = validate_object_meta_update(&new, &old, &Path::new("field"));
+        assert_eq!(
+            errs.len(),
+            expected.len(),
+            "case {name}: expected {} errors, got {}: {errs:?}",
+            expected.len(),
+            errs.len()
         );
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(
+                errs[i].to_string(),
+                *want,
+                "case {name}: error #{i} mismatch"
+            );
+        }
     }
 }
 
@@ -454,7 +526,6 @@ fn test_validate_object_meta_update_prevents_deletion_field_mutation() {
 // allowed.
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when generation-monotonicity check lands in validate_object_meta_update"]
 fn test_object_meta_generation_update() {
     let mk = |gen_val: i64| ObjectMeta {
         name: "test".into(),
@@ -479,12 +550,22 @@ fn test_object_meta_generation_update() {
         ("valid generation field - not updated", mk(5), mk(5), vec![]),
     ];
 
-    for (_name, _old, _new, _expected) in cases {
-        // TODO: drive validate_object_meta_update; assert error list equality.
-        panic!(
-            "generation monotonicity check is not implemented in \
-             rusternetes-common yet"
+    for (name, old, new, expected) in cases {
+        let errs = validate_object_meta_update(&new, &old, &Path::new("field"));
+        assert_eq!(
+            errs.len(),
+            expected.len(),
+            "case {name}: expected {} errors, got {}: {errs:?}",
+            expected.len(),
+            errs.len()
         );
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(
+                errs[i].to_string(),
+                *want,
+                "case {name}: error #{i} mismatch"
+            );
+        }
     }
 }
 
@@ -495,21 +576,14 @@ fn test_object_meta_generation_update() {
 // random suffix before persisting — the dash never reaches the name validator.
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when ValidateObjectMeta + NameIsDNSSubdomain accept trailing-dash generateName"]
 fn test_validate_object_meta_trims_trailing_dash() {
-    let _meta = ObjectMeta {
+    let meta = ObjectMeta {
         name: "test".into(),
         generate_name: Some("foo-".into()),
         ..ObjectMeta::default()
     };
-
-    // TODO: call validate_object_meta(&meta, /*requires_namespace=*/ false,
-    //   NameIsDNSSubdomain, FieldPath::new("field"))
-    // and assert zero errors.
-    panic!(
-        "ValidateObjectMeta + NameIsDNSSubdomain (with trailing-dash trim) is \
-         not implemented in rusternetes-common yet"
-    );
+    let errs = validate_object_meta(&meta, false, name_is_dns_subdomain, &Path::new("field"));
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 }
 
 // ===========================================================================
@@ -521,7 +595,6 @@ fn test_validate_object_meta_trims_trailing_dash() {
 // TotalAnnotationSizeLimitB.
 // ===========================================================================
 #[test]
-#[ignore = "upstream-mirror: TODO when validate_annotations + TotalAnnotationSizeLimitB exist in rusternetes-common"]
 fn test_validate_annotations() {
     // Upstream constant value — declared here so the fixture compiles even
     // though rusternetes-common does not yet expose the symbol.
@@ -536,7 +609,7 @@ fn test_validate_annotations() {
     let mk_owned =
         |pairs: Vec<(String, String)>| -> HashMap<String, String> { pairs.into_iter().collect() };
 
-    let _success_cases: Vec<HashMap<String, String>> = vec![
+    let success_cases: Vec<HashMap<String, String>> = vec![
         mk(&[("simple", "bar".into())]),
         mk(&[("now-with-dashes", "bar".into())]),
         mk(&[("1-starts-with-num", "bar".into())]),
@@ -561,7 +634,7 @@ fn test_validate_annotations() {
     let name_err = "a valid label key must consist of";
     let max_length_err = "must be no more than";
 
-    let _name_error_cases: Vec<(HashMap<String, String>, &'static str)> = vec![
+    let name_error_cases: Vec<(HashMap<String, String>, &'static str)> = vec![
         (mk(&[("nospecialchars^=@", "bar".into())]), name_part_err),
         (mk(&[("cantendwithadash-", "bar".into())]), name_part_err),
         (mk(&[("only/one/slash", "bar".into())]), name_err),
@@ -573,7 +646,7 @@ fn test_validate_annotations() {
         ),
     ];
 
-    let _size_error_cases: Vec<HashMap<String, String>> = vec![
+    let size_error_cases: Vec<HashMap<String, String>> = vec![
         mk(&[("a", "b".repeat(TOTAL_ANNOTATION_SIZE_LIMIT_B))]),
         mk(&[
             ("a", "b".repeat(TOTAL_ANNOTATION_SIZE_LIMIT_B / 2)),
@@ -581,14 +654,23 @@ fn test_validate_annotations() {
         ]),
     ];
 
-    // TODO: call validate_annotations(&annotations, FieldPath::new("field"))
-    // and assert zero errors on success cases, exactly 1 error containing the
-    // matching substring on the name error cases, and exactly 1 error on the
-    // size error cases.
-    panic!(
-        "validate_annotations + TotalAnnotationSizeLimitB are not implemented \
-         in rusternetes-common yet"
-    );
+    for (i, annotations) in success_cases.iter().enumerate() {
+        let errs = validate_annotations(annotations, &Path::new("field"));
+        assert!(errs.is_empty(), "case[{i}] expected success, got {errs:?}");
+    }
+    for (i, (annotations, expect)) in name_error_cases.iter().enumerate() {
+        let errs = validate_annotations(annotations, &Path::new("field"));
+        assert_eq!(errs.len(), 1, "case[{i}]: expected failure, got {errs:?}");
+        assert!(
+            errs[0].detail.contains(expect),
+            "case[{i}]: error detail does not include {expect:?}: {:?}",
+            errs[0].detail
+        );
+    }
+    for (i, annotations) in size_error_cases.iter().enumerate() {
+        let errs = validate_annotations(annotations, &Path::new("field"));
+        assert_eq!(errs.len(), 1, "case[{i}] expected failure, got {errs:?}");
+    }
 }
 
 // ===========================================================================
