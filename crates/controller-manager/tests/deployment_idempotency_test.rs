@@ -468,7 +468,7 @@ async fn test_deployment_annotation_refresh_skipped_when_values_match() {
 // require simulating live status convergence, which is out of scope here.
 // Tracked as a separate concern: rolling-update progression should be more
 // defensive about stale or test-only status fields.
-#[ignore]
+#[ignore = "rolling-update progression scales the old RS on the second reconcile because MemoryStorage cannot simulate live pod->RS status convergence; needs a status-driving fixture"]
 #[tokio::test]
 async fn test_proportional_scaling_converges_no_oscillation() {
     let storage = setup().await;
