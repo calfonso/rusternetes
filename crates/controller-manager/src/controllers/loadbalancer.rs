@@ -3,7 +3,7 @@ use rusternetes_common::{
     cloud_provider::{CloudProvider, LoadBalancerPort, LoadBalancerService as CloudLBService},
     resources::{
         service::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus},
-        Node, Service, ServiceType,
+        Event, EventType, Node, ObjectReference, Service, ServiceType,
     },
 };
 use rusternetes_storage::{extract_key, Storage, WorkQueue};
@@ -421,15 +421,30 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                 .unwrap_or_default(),
         };
 
-        // Ensure load balancer exists
-        let lb_status = cloud_provider
-            .ensure_load_balancer(&cloud_lb_service)
-            .await
-            .context("Failed to ensure load balancer")?;
+        // Single-attempt ensure. Matches upstream
+        // (k8s.io/cloud-provider/controllers/service/controller.go ~line 483):
+        // any failure is logged + a Warning Event is emitted, then the
+        // workqueue rate-limits the next attempt. No inline backoff — that
+        // would hold a worker for seconds and starve other Services under
+        // a region-wide cloud blip.
+        let lb_status = match cloud_provider.ensure_load_balancer(&cloud_lb_service).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.record_warning_event(
+                    service,
+                    "SyncLoadBalancerFailed",
+                    &format!("Error syncing load balancer: {e}"),
+                )
+                .await;
+                return Err(
+                    anyhow::anyhow!(e.to_string()).context("Failed to ensure load balancer")
+                );
+            }
+        };
 
-        // Update service status with load balancer information
-        self.update_service_status(namespace, name, lb_status)
-            .await?;
+        // Update service status with load balancer information. Read-modify-
+        // write on a single attempt; conflicts re-enqueue via the workqueue.
+        self.update_service_status(service, lb_status).await?;
 
         info!(
             "Successfully reconciled LoadBalancer service {}/{}",
@@ -439,23 +454,24 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
         Ok(())
     }
 
-    /// Update service status with load balancer information
+    /// Update `service.status.loadBalancer` with the cloud-provider result.
+    /// Single read-modify-write — storage Conflict on concurrent writes
+    /// surfaces as an error and the workqueue re-enqueues us so the next
+    /// reconcile observes the latest version. Conditions set by other
+    /// controllers are preserved.
     async fn update_service_status(
         &self,
-        namespace: &str,
-        name: &str,
+        service: &Service,
         lb_status: rusternetes_common::cloud_provider::LoadBalancerStatus,
     ) -> Result<()> {
+        let namespace = service
+            .metadata
+            .namespace
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Service has no namespace"))?;
+        let name = &service.metadata.name;
         let key = rusternetes_storage::build_key("services", Some(namespace), name);
 
-        // Get current service
-        let mut service: Service = self
-            .storage
-            .get(&key)
-            .await
-            .context("Failed to get service")?;
-
-        // Convert cloud provider status to service status
         let service_lb_status = LoadBalancerStatus {
             ingress: lb_status
                 .ingress
@@ -469,21 +485,87 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                 .collect(),
         };
 
-        // Update status
-        service.status = Some(ServiceStatus {
+        let mut current: Service = match self.storage.get(&key).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.record_warning_event(
+                    service,
+                    "SyncLoadBalancerFailed",
+                    &format!("Failed to read service for status update: {e}"),
+                )
+                .await;
+                return Err(
+                    anyhow::anyhow!(e.to_string()).context("Failed to read service for status")
+                );
+            }
+        };
+
+        // Only `load_balancer` is owned by this controller — preserve any
+        // `conditions` set by other controllers. Mirrors upstream's
+        // `updated.Status.LoadBalancer = *newStatus` over a DeepCopy.
+        let existing_conditions = current.status.as_ref().and_then(|s| s.conditions.clone());
+        current.status = Some(ServiceStatus {
             load_balancer: Some(service_lb_status),
-            conditions: None,
+            conditions: existing_conditions,
         });
 
-        // Save updated service
-        self.storage
-            .update(&key, &service)
-            .await
-            .context("Failed to update service status")?;
-
+        if let Err(e) = self.storage.update(&key, &current).await {
+            warn!(
+                "update_service_status for {}/{} failed: {} (workqueue will retry)",
+                namespace, name, e
+            );
+            self.record_warning_event(
+                service,
+                "SyncLoadBalancerFailed",
+                &format!("Error updating load balancer status: {e}"),
+            )
+            .await;
+            return Err(anyhow::anyhow!(e.to_string()).context("Failed to update service status"));
+        }
         debug!("Updated status for service {}/{}", namespace, name);
-
         Ok(())
+    }
+
+    /// Record a Warning Event against a Service. Best-effort — failure to
+    /// write the event must not mask the underlying reconcile error.
+    /// Matches `EventsController::create_event_if_new`: same reason
+    /// produces one Event per Service to avoid log spam (upstream then
+    /// updates `count`/`lastTimestamp` via a separate aggregator we don't
+    /// have yet — see follow-up note in the PR body).
+    async fn record_warning_event(&self, service: &Service, reason: &str, message: &str) {
+        let namespace = service.metadata.namespace.as_deref().unwrap_or_default();
+        let name = service.metadata.name.clone();
+        let involved = ObjectReference {
+            kind: Some("Service".to_string()),
+            namespace: Some(namespace.to_string()),
+            name: Some(name),
+            api_version: Some("v1".to_string()),
+            // Carry the Service UID so the event survives an object
+            // recreation cleanly (an `apply` that recreates the Service
+            // will mint a new UID; events stay scoped to the old one).
+            uid: Some(service.metadata.uid.clone()).filter(|u| !u.is_empty()),
+            resource_version: None,
+            field_path: None,
+        };
+        let event_name = Event::generate_name(&involved, reason);
+        let key = format!("/registry/events/{}/{}", namespace, event_name);
+        if self.storage.get::<Event>(&key).await.is_ok() {
+            return;
+        }
+        let event = Event::new(
+            event_name,
+            namespace.to_string(),
+            involved,
+            reason.to_string(),
+            message.to_string(),
+            EventType::Warning,
+        );
+        if let Err(e) = self.storage.create(&key, &event).await {
+            warn!(
+                "Failed to record Warning event {}/{}: {}",
+                namespace, reason, e
+            );
+        }
     }
 
     /// Delete load balancer for a service (called when service is deleted)
