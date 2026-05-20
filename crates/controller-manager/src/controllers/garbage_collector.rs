@@ -319,43 +319,78 @@ impl<S: Storage + 'static> GarbageCollector<S> {
 
     /// Find orphaned resources — resources where ALL owner references point to
     /// non-existent owners. A resource with at least one valid owner is NOT an orphan.
+    ///
+    /// Owner resolution is **namespace-scoped**, matching upstream
+    /// `pkg/controller/garbagecollector/garbagecollector.go` (`classifyReferences`):
+    ///
+    ///   * A namespaced dependent's owner ref resolves only against resources
+    ///     in the same namespace *or* cluster-scoped resources. A UID that
+    ///     happens to exist in a different namespace is treated as
+    ///     unresolvable — cross-namespace owner refs are invalid by K8s API
+    ///     contract, so they MUST orphan the dependent regardless of UID
+    ///     collisions elsewhere in the cluster.
+    ///   * A cluster-scoped dependent's owner ref must resolve to another
+    ///     cluster-scoped resource (cluster → namespaced refs are illegal).
+    ///
+    /// Resources with `deletionTimestamp` are still treated as "existing"
+    /// here — they're only truly gone once removed from storage, and their
+    /// dependents are handled by the foreground/orphan finalizer paths.
     fn find_orphans(
         &self,
         resources: &[ResourceInfo],
         _owner_map: &HashMap<String, Vec<String>>,
     ) -> Vec<ResourceInfo> {
-        // Include ALL resources in existing_uids, even those being deleted.
-        // A resource is only truly "gone" when it's removed from storage entirely.
-        // Resources with deletionTimestamp are still in storage and their dependents
-        // should not be flagged as orphans yet — the finalizer handlers (foreground,
-        // orphan) or background cascade will handle them properly.
-        // K8s GC uses informer caches where a resource is "existing" until the
-        // DELETE event fires (i.e., it's removed from etcd).
-        let existing_uids: HashSet<_> = resources.iter().map(|r| r.metadata.uid.as_str()).collect();
+        // Bucket existing UIDs by namespace (`None` = cluster-scoped).
+        let mut uids_by_namespace: HashMap<Option<&str>, HashSet<&str>> = HashMap::new();
+        for r in resources {
+            let ns = r.metadata.namespace.as_deref();
+            uids_by_namespace
+                .entry(ns)
+                .or_default()
+                .insert(r.metadata.uid.as_str());
+        }
+        let cluster_scoped_uids: &HashSet<&str> = uids_by_namespace
+            .get(&None)
+            .map(|s| s as &HashSet<&str>)
+            .unwrap_or({
+                static EMPTY: std::sync::OnceLock<HashSet<&str>> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(HashSet::new)
+            });
+
         let mut orphans = Vec::new();
-
         for resource in resources {
-            if let Some(owner_refs) = &resource.metadata.owner_references {
-                if owner_refs.is_empty() {
-                    continue;
-                }
-                // Only orphan if ALL owners are gone
-                let all_owners_missing = owner_refs
-                    .iter()
-                    .all(|owner_ref| !existing_uids.contains(owner_ref.uid.as_str()));
+            let owner_refs = match &resource.metadata.owner_references {
+                Some(refs) if !refs.is_empty() => refs,
+                _ => continue,
+            };
+            let dep_ns = resource.metadata.namespace.as_deref();
+            let same_ns_uids = uids_by_namespace.get(&dep_ns);
 
-                if all_owners_missing {
-                    debug!(
-                        "GC: orphan {} — ownerRef UIDs {:?} not in existing_uids ({} entries)",
-                        resource.key,
-                        owner_refs
-                            .iter()
-                            .map(|r| r.uid.as_str())
-                            .collect::<Vec<_>>(),
-                        existing_uids.len(),
-                    );
-                    orphans.push(resource.clone());
+            let all_owners_missing = owner_refs.iter().all(|owner_ref| {
+                let uid = owner_ref.uid.as_str();
+                let in_same_ns = same_ns_uids.map(|s| s.contains(uid)).unwrap_or(false);
+                let in_cluster_scope = cluster_scoped_uids.contains(uid);
+                // A namespaced dependent accepts same-namespace OR cluster-scoped
+                // owners; a cluster-scoped dependent accepts only cluster-scoped
+                // owners. Either way, an owner sitting in some *other* namespace
+                // is unresolvable.
+                match dep_ns {
+                    Some(_) => !(in_same_ns || in_cluster_scope),
+                    None => !in_cluster_scope,
                 }
+            });
+
+            if all_owners_missing {
+                debug!(
+                    "GC: orphan {} — ownerRef UIDs {:?} unresolvable in namespace {:?}",
+                    resource.key,
+                    owner_refs
+                        .iter()
+                        .map(|r| r.uid.as_str())
+                        .collect::<Vec<_>>(),
+                    dep_ns,
+                );
+                orphans.push(resource.clone());
             }
         }
 
