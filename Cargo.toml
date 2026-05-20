@@ -49,12 +49,6 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] } # TLS support with aws-l
 tokio-rustls = "0.26" # Tokio integration for rustls
 rcgen = "0.13" # Certificate generation
 prometheus = "0.14" # Prometheus metrics
-opentelemetry = "0.22" # Distributed tracing
-opentelemetry-prometheus = "0.15" # Prometheus exporter for OpenTelemetry
-opentelemetry-jaeger = "0.21" # Jaeger exporter for OpenTelemetry
-opentelemetry-otlp = "0.32" # OTLP exporter for OpenTelemetry
-opentelemetry_sdk = { version = "0.22", features = ["rt-tokio", "trace"] } # OpenTelemetry SDK
-tracing-opentelemetry = "0.23" # OpenTelemetry integration with tracing
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false } # HTTP client
 cel = "0.13" # Common Expression Language (CEL) interpreter
 x509-parser = "0.16" # X.509 certificate parsing
