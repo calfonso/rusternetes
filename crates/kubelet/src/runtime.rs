@@ -184,6 +184,51 @@ pub fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create the host-side termination-log file with world-writable permissions so
+/// a container running as a non-root UID can write its termination message
+/// through the bind mount.
+///
+/// Mirrors upstream `pkg/kubelet/kuberuntime/kuberuntime_container.go::makeMounts`
+/// in release-1.35 (around lines 502-531), which does:
+///
+/// ```text
+/// fs, err := m.osInterface.Create(containerLogPath)
+/// ...
+/// fs.Close()
+/// // Chmod is needed because os.Create() ends up calling open(2) to create
+/// // the file, so the final mode used is "mode & ~umask". But we want to
+/// // make sure the specified mode is used in the file no matter what the
+/// // umask is.
+/// if err := m.osInterface.Chmod(containerLogPath, 0666); err != nil { ... }
+/// ```
+///
+/// Without the explicit chmod, `std::fs::write` (which calls `open(2)` with
+/// the default `0o666` requested mode) yields `0o664` on typical hosts after
+/// the process umask (`0o002`) is applied — root-owned, group-writable only.
+/// The conformance test
+/// `[sig-node] Container Runtime blackbox test on terminated container
+/// should report termination message if TerminationMessagePath is set as
+/// non-root user and at a non-default path` runs the container as UID 10000
+/// and shells `echo -n DONE > /dev/termination-custom-log`. With a `0o664`
+/// root-owned file the redirect fails (`Permission denied`), the container
+/// exits non-zero, and the pod is reported `Failed` instead of `Succeeded`.
+///
+/// Idempotent: the chmod runs whether the file was just created or already
+/// existed (e.g. from a prior pod incarnation), and `std::fs::write("")`
+/// truncates a pre-existing file so we never read back a stale message.
+pub fn setup_termination_message_file(path: &str) -> std::io::Result<()> {
+    std::fs::write(path, "")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 0o666 mirrors upstream's `os.Chmod(containerLogPath, 0666)`. Do not
+        // narrow this — the container's RunAsUser is arbitrary (any non-root
+        // UID upstream chooses to test with).
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    }
+    Ok(())
+}
+
 /// Return the per-pod filesystem key used to compose host-side volume paths.
 ///
 /// Mirrors upstream `pkg/kubelet/kubelet_getters.go::getPodDir`, which keys
@@ -4576,8 +4621,15 @@ impl ContainerRuntime {
             let term_host_dir = format!("{}/{}/termination", self.volumes_base_path, pod_name);
             std::fs::create_dir_all(&term_host_dir).ok();
             let term_host_file = format!("{}/{}", term_host_dir, container.name);
-            // Create an empty file
-            std::fs::write(&term_host_file, "").ok();
+            // Create the file with world-writable mode so a non-root container
+            // user (e.g. RunAsUser=10000) can write its termination message.
+            // See `setup_termination_message_file` for the upstream reference.
+            if let Err(e) = setup_termination_message_file(&term_host_file) {
+                warn!(
+                    "Failed to setup termination message file {}: {}",
+                    term_host_file, e
+                );
+            }
             binds.push(format!("{}:{}", term_host_file, term_msg_path));
         }
 
