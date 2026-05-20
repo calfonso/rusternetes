@@ -153,39 +153,94 @@ if [[ ! -f "$JUNIT" ]]; then
 fi
 
 # ---------- verify each entry passed ----------
+#
+# Each known-green line is a substring of the Ginkgo It-description.
+# Junit @name attributes look like `[It] <description> [tags...]`. For
+# the canary to actually catch regressions, every entry must satisfy:
+#
+#   1. resolve to exactly one matching testcase (no entry too loose)
+#   2. that testcase passed
+#
+# Additionally — and this is what the old version missed — any failed
+# testcase in the junit must be accounted for by some entry. A loose
+# entry that incidentally pulls in a sibling test which then fails is
+# a regression even if every listed entry's primary match passed.
+
+# Collect every testcase name + status from the junit. Use a tab to
+# delimit so the name (which contains spaces / brackets) survives.
+declare -a JUNIT_NAMES JUNIT_STATUSES
+while IFS=$'\t' read -r name status; do
+    JUNIT_NAMES+=("$name")
+    JUNIT_STATUSES+=("$status")
+done < <(grep -oE '<testcase name="[^"]+"[^>]*status="[^"]+"' "$JUNIT" \
+    | sed -E 's|<testcase name="([^"]+)"[^>]*status="([^"]+)"|\1\t\2|')
 
 REGRESS=()
 PASS=()
+# Index of which junit testcases were claimed by some entry. Used to
+# detect orphan failures below.
+declare -a CLAIMED
+for ((i = 0; i < ${#JUNIT_NAMES[@]}; i++)); do CLAIMED[i]=0; done
+
 for entry in "${ENTRIES[@]}"; do
-    # Build a literal-match line that uniquely identifies the testcase.
-    # Junit testcase names are `<sig> ... [It] <It-string> [Conformance]` —
-    # the entry from the file matches as a substring of the @name attribute.
-    line=$(grep -F "name=\"[It] ${entry}" "$JUNIT" | head -1 || true)
-    if [[ -z "$line" ]]; then
-        REGRESS+=("$entry  (no matching testcase in junit)")
-        continue
-    fi
-    if [[ "$line" == *'status="passed"'* ]]; then
-        PASS+=("$entry")
-    elif [[ "$line" == *'status="failed"'* ]]; then
-        REGRESS+=("$entry  (status=failed)")
-    elif [[ "$line" == *'status="skipped"'* ]]; then
-        REGRESS+=("$entry  (status=skipped — focus regex didn't include it)")
-    else
-        REGRESS+=("$entry  (unknown status in: ${line:0:120})")
-    fi
+    needle="[It] ${entry}"
+    matches=()
+    match_idxs=()
+    for ((i = 0; i < ${#JUNIT_NAMES[@]}; i++)); do
+        if [[ "${JUNIT_NAMES[i]}" == *"$needle"* ]]; then
+            matches+=("${JUNIT_STATUSES[i]}")
+            match_idxs+=("$i")
+        fi
+    done
+    case "${#matches[@]}" in
+        0)
+            REGRESS+=("$entry  (no matching testcase in junit)")
+            ;;
+        1)
+            for idx in "${match_idxs[@]}"; do CLAIMED[idx]=1; done
+            case "${matches[0]}" in
+                passed)  PASS+=("$entry") ;;
+                failed)  REGRESS+=("$entry  (status=failed)") ;;
+                skipped) REGRESS+=("$entry  (status=skipped — focus regex didn't include it)") ;;
+                *)       REGRESS+=("$entry  (unknown status: ${matches[0]})") ;;
+            esac
+            ;;
+        *)
+            # Ambiguous match — entry is too loose. Even if all matches
+            # passed, demand a tighter entry so the canary cannot silently
+            # absorb a future sibling-test regression.
+            for idx in "${match_idxs[@]}"; do CLAIMED[idx]=1; done
+            REGRESS+=("$entry  (matched ${#matches[@]} testcases; tighten the entry)")
+            ;;
+    esac
+done
+
+# Orphan failures — any failed testcase not claimed by an entry above.
+ORPHANS=()
+for ((i = 0; i < ${#JUNIT_NAMES[@]}; i++)); do
+    [[ "${JUNIT_STATUSES[i]}" == "failed" ]] || continue
+    [[ "${CLAIMED[i]}" -eq 1 ]] && continue
+    ORPHANS+=("${JUNIT_NAMES[i]}")
 done
 
 echo
 info "=== summary ==="
-info "expected green : ${#ENTRIES[@]}"
-info "actually green : ${#PASS[@]}"
-info "regressions    : ${#REGRESS[@]}"
+info "expected green     : ${#ENTRIES[@]}"
+info "actually green     : ${#PASS[@]}"
+info "regressions        : ${#REGRESS[@]}"
+info "orphan failures    : ${#ORPHANS[@]}"
 
-if [[ ${#REGRESS[@]} -gt 0 ]]; then
-    echo
-    info "REGRESSIONS:"
-    printf '  - %s\n' "${REGRESS[@]}"
+if [[ ${#REGRESS[@]} -gt 0 || ${#ORPHANS[@]} -gt 0 ]]; then
+    if [[ ${#REGRESS[@]} -gt 0 ]]; then
+        echo
+        info "REGRESSIONS:"
+        printf '  - %s\n' "${REGRESS[@]}"
+    fi
+    if [[ ${#ORPHANS[@]} -gt 0 ]]; then
+        echo
+        info "ORPHAN FAILURES (focus regex pulled these in; tighten the entry that matched them):"
+        printf '  - %s\n' "${ORPHANS[@]}"
+    fi
     info "artifacts: $OUTPUT_DIR"
     exit 1
 fi
