@@ -54,15 +54,16 @@ methods, so the conformance test does not need to spin up a Docker runtime.
 | `Downward API volume should provide container's memory limit` | downwardapi_volume.go:206 | PASS | `downward_api_volume_provides_container_memory_limit` | mirrored, passing |
 | `Downward API volume should provide container's cpu/memory request` | downwardapi_volume.go:219,232 | PASS | `downward_api_volume_provides_container_cpu_and_memory_requests` | mirrored, passing |
 | `Downward API volume default cpu limit from node allocatable` | downwardapi_volume.go:245 | PASS | `downward_api_volume_defaults_cpu_to_node_allocatable_when_no_limit` | mirrored, passing |
-| `Pods should support remote command execution over websockets` | pods.go:517 | FAIL | `pod_exec_over_websocket_query_format_matches_upstream` | mirrored, ignored (tracks failure) |
+| `Pods should support remote command execution over websockets` | pods.go:517 | FAIL | `pod_exec_over_websocket_query_format_matches_upstream` | mirrored, passing (query-format pin; e2e round-trip still FAIL — separate issue: websocket subprotocol negotiation + bollard wiring) |
 | `Pods should support retrieving logs from the container over websockets` | pods.go:583 | FAIL | `pod_log_over_websocket_query_is_container_only` | mirrored, passing (api-server now sends channel-1 binary frames) |
 | `Pods should print the output to logs` | kubelet.go:58 | PASS | `pod_terminated_state_for_log_lookup_propagates_exit_code` | mirrored, passing |
 | `Pods should have a terminated reason` | kubelet.go:90 | PASS | `pod_terminated_state_surfaces_nonzero_exit_with_error_reason` | mirrored, passing |
 
-24 tests total; 22 mirror passing upstream tests and run green; 2 are
-`#[ignore]`d as conformance failure trackers (WebSocket exec, WebSocket logs).
-The kubelet has the helpers in place — the remaining failures are in
-api-server's streaming layer.
+24 tests total; all 24 run green (exec websocket query-format pin
++ log websocket channel-1 binary framer both un-ignored).
+The kubelet has the helpers in place; the remaining e2e exec round-trip
+failure in Sonobuoy is in api-server's streaming layer (websocket
+subprotocol negotiation), not in this test surface.
 
 ## Helpers introduced
 

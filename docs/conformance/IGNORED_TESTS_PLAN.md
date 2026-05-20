@@ -220,18 +220,14 @@ Complexity: **medium** (delivered).
 
 ## Area 4 — node-exec-logs-downward (2 tests)
 
-### 15. `pod_exec_over_websocket_query_format_matches_upstream`
+### 15. `pod_exec_over_websocket_query_format_matches_upstream` — DONE (Layer B)
 - File: `crates/kubelet/tests/conformance_node_exec_logs_downward.rs:590`
 - Upstream: `[sig-node] Pods should support remote command execution over websockets` (`pods.go:517`)
-- Sonobuoy Round 160: **FAIL** — end-to-end exec-over-websocket round-trip.
+- Sonobuoy Round 160: **FAIL** — end-to-end exec-over-websocket round-trip still fails.
 
-**[ ] Layer A**
-1. Audit the full path: client → api-server `/exec` (`pod_subresources.rs:129`) → `handle_exec_websocket_with_protocol` (line 592) → `streaming.rs::handle_ws_exec` → kubelet exec endpoint (bollard exec → container).
-2. Confirm `v4.channel.k8s.io` and `v5.channel.k8s.io` subprotocols are negotiated and that channel bytes (0=stdin, 1=stdout, 2=stderr, 3=err, 4=resize for v5) are wired through bollard.
-3. Walk through with a manual `kubectl exec -it` against a real pod; capture failure point.
+**[x] Layer B** — Query-format unit test landed: builds the URL via `url::Url`/`form_urlencoded` and asserts byte-for-byte against the upstream `url.Values.Encode()` output (`command=%2Fbin%2Fsh&command=-c&container=agnhost&stderr=true&stdout=true`). `#[ignore]` dropped.
 
-**[ ] Layer B**
-- Pure query-format unit test (the file name suggests this). Build the expected URL via `url::form_urlencoded`, assert byte-for-byte match with the upstream constructor. Drop `#[ignore]` once it passes.
+**[ ] Layer A** — Still open: the e2e round-trip failure is a separate issue (websocket subprotocol negotiation + bollard channel wiring), tracked in `docs/conformance/node-exec-logs-downward.md`. The query-format pin guards against drift while that work continues.
 
 Complexity: **small–medium**.
 
