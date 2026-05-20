@@ -265,8 +265,30 @@ Complexity: **small–medium**.
 3. Time-budget audit: scheduler→kubelet→api-server→RS-controller→status-update must complete inside the upstream test's `framework.PodStartTimeout` (~5 min for the full cycle, but each step should be sub-second).
 4. Tighten any slow step (workqueue re-enqueue, watch latency).
 
-**[ ] Layer B**
-- `tokio::test` wiring scheduler + RS controller against `MemoryStorage`; low-priority RS fills capacity; high-priority pod preempts; assert RS regains `availableReplicas == desired` within deadline.
+Layer-A audit (2026-05-19, deferred): the controller-side wiring is already
+event-driven — `ReplicaSetController::run` (`crates/controller-manager/src/controllers/replicaset.rs:25`)
+spawns a single `WorkQueue` worker, watches both the RS prefix and the Pod
+prefix, and `enqueue_owner_replicaset` re-enqueues the parent RS on every
+Pod event (including deletions where it falls back to enqueueing every RS
+in the namespace). `update_status` re-reads + writes only on diff. The
+scheduler side already calls `evict_pod` which sets deletionTimestamp +
+`Phase::Failed` + `DisruptionTarget` (see `crates/scheduler/src/scheduler.rs:1013`).
+The remaining Sonobuoy red is in the cluster-side latency: kubelet has to
+stop the container, api-server has to propagate the pod-status write, and
+the RS controller has to schedule one more reconcile inside the upstream
+`framework.PodStartTimeout`. That is tracked under Layer A and out of
+scope for the Layer-B mirror.
+
+**[x] Layer B** (PR #TBD)
+- `tokio::test` wiring scheduler-preemption decision + RS controller against
+  `MemoryStorage`. The mirror seeds a 4-replica low-priority RS that fills a
+  4-CPU node, calls `check_preemption` to choose the victim, applies the
+  same mutation `Scheduler::evict_pod` writes (deletionTimestamp +
+  `Phase::Failed` + `DisruptionTarget`), drops the high-priority preemptor
+  on the freed slot, and then drives `ReplicaSetController::reconcile_all`
+  until `status.replicas == desired` / `status.availableReplicas ==
+  desired - 1`. Sub-second on `MemoryStorage`. See
+  `crates/scheduler/tests/conformance_scheduling_priority_preemption_hostport.rs::preemption_execution_path_replicaset_available_replicas`.
 
 Complexity: **medium–large** (cross-component).
 

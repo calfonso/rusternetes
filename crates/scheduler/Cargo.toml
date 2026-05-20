@@ -36,3 +36,9 @@ chrono.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true
+# Cross-cutting integration tests (e.g. preemption -> ReplicaSet status
+# recovery, item #17 in docs/conformance/IGNORED_TESTS_PLAN.md) drive the
+# `ReplicaSetController` reconcile loop against the same `MemoryStorage`
+# the scheduler mutates. Listed dev-only so the production scheduler binary
+# stays decoupled from the controller-manager crate.
+rusternetes-controller-manager = { path = "../controller-manager" }

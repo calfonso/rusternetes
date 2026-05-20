@@ -3841,6 +3841,7 @@ dependencies = [
  "clap",
  "futures",
  "rusternetes-common",
+ "rusternetes-controller-manager",
  "rusternetes-storage",
  "serde",
  "serde_json",

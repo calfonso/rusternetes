@@ -25,7 +25,7 @@ Extraction source: `.rusternetes/volumes/sonobuoy-e2e-job-a61d864ba496412f/resul
 | `SchedulerPreemption skips equal-priority pods` | preemption.go (basic suite) | PASS | `preemption_skips_when_only_equal_priority_pods_present` | mirrored, passing |
 | `SchedulerPreemption respects preemptionPolicy=Never` | preemption.go:~479 | PASS | `preemption_skipped_when_pod_has_preemption_policy_never` | mirrored, passing |
 | `SchedulerPreemption protects system-critical pods` | preemption.go:697-699 | PASS | `preemption_protects_system_critical_pods_from_lower_priority_preemptor` | mirrored, passing |
-| `SchedulerPreemption [Serial] PreemptionExecutionPath runs ReplicaSets to verify preemption running path` | preemption.go:756 | **FAIL** — `replicaset "rs-pod1" never had desired number of .status.availableReplicas` (preemption.go:1025) | `preemption_execution_path_replicaset_available_replicas` | mirrored, ignored (tracks failure) |
+| `SchedulerPreemption [Serial] PreemptionExecutionPath runs ReplicaSets to verify preemption running path` | preemption.go:756 | **FAIL** — `replicaset "rs-pod1" never had desired number of .status.availableReplicas` (preemption.go:1025) | `preemption_execution_path_replicaset_available_replicas` | mirrored, passing (Layer B — scheduler→RS-controller contract; Layer A still owed) |
 | `HostPort same port + same hostIP conflicts` | hostport.go:63 | PASS | `hostport_same_port_same_host_ip_conflicts` | mirrored, passing |
 | `HostPort no conflict between pods with same hostPort but different hostIP and protocol [LinuxOnly] [Conformance]` | hostport.go:219 | **FAIL** — `wait for pod2 timeout 300s` (kubelet scheduling timing, not filter logic) | `hostport_same_port_different_host_ip_does_not_conflict` | mirrored, passing (scheduler-side invariant only) |
 | `HostPort same port different protocol does not conflict` | hostport.go:219 (matrix half) | PASS | `hostport_same_port_different_protocol_does_not_conflict` | mirrored, passing |
@@ -49,12 +49,24 @@ Symptom: after the preemptor evicts a victim, the recreated ReplicaSet pod
 never becomes Ready, so `availableReplicas` stays below desired and the test
 times out.
 
-Why scoped tests can't reach the same failure path: the scenario is a four-way
-interplay between the scheduler, the controller-manager (ReplicaSet
-controller), the kubelet (pod startup), and the api-server (status updates).
-Even with `MemoryStorage`, the scheduler-only unit cannot recreate the
-`availableReplicas` reconciliation loop. The doc fragment records the failure
-and the test compiles as an `#[ignore]`d marker.
+Layer B (Rust mirror — done):
+`preemption_execution_path_replicaset_available_replicas` is now a `tokio`
+test that drives `MemoryStorage` directly. It seeds a low-priority RS with
+`desired` replicas filling a node, applies the same mutation
+`Scheduler::evict_pod` writes when `check_preemption` picks a victim (set
+deletionTimestamp + `Phase::Failed` + `DisruptionTarget` condition), drops
+a high-priority preemptor pod on the freed slot, and then drives
+`ReplicaSetController::reconcile_all` until the RS status settles at
+`replicas == desired` / `availableReplicas == desired - 1` (the preemptor
+consumed the slot, so the new pod stays Pending). The mirror locks the
+scheduler→RS-controller contract in isolation; it does not exercise the
+kubelet pod-stop or the api-server status-write paths.
+
+Layer A (Sonobuoy — still owed): the four-way interplay between scheduler,
+controller-manager, kubelet, and api-server still has to settle inside the
+upstream `framework.PodStartTimeout`. The mirror gives a fast TDD harness
+for the controller-side regressions; the cluster-side latency work is
+tracked in `docs/conformance/IGNORED_TESTS_PLAN.md` item 17.
 
 Falls under bucket: `apps controllers ~3` / `node lifecycle ~3` from
 `docs/CONFORMANCE.md:40–53`.

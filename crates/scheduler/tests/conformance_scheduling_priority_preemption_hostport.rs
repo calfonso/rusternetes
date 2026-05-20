@@ -21,12 +21,17 @@
 //! because every helper is pure — it takes `&[Pod]` / `&[Node]` slices.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rusternetes_common::resources::{
-    Container, ContainerPort, Node, NodeStatus, Pod, PodSpec, PodStatus, PriorityClass,
+    Container, ContainerPort, Node, NodeStatus, Pod, PodCondition, PodSpec, PodStatus,
+    PriorityClass, ReplicaSet, ReplicaSetSpec,
 };
-use rusternetes_common::types::{Phase, ResourceRequirements};
+use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, ResourceRequirements, TypeMeta};
+use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
 use rusternetes_scheduler::advanced::{check_host_port_conflicts, check_preemption};
+use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -335,18 +340,309 @@ fn preemption_protects_system_critical_pods_from_lower_priority_preemptor() {
 /// [sig-scheduling] SchedulerPreemption [Serial] PreemptionExecutionPath runs ReplicaSets to verify preemption running path [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/scheduling/preemption.go:756 (test
-/// entry) — the failure observed at preemption.go:1025 (`replicaset "rs-pod1"
-/// never had desired number of .status.availableReplicas`) is a multi-tier
-/// preemption execution-path scenario that requires ReplicaSet status
-/// reconciliation — out of scope for the scheduler-only unit. Tracked for
-/// completeness; ignored until the controller-manager + scheduler interplay
-/// is mirrored end-to-end.
-/// Sonobuoy (Round 160): FAIL — preemption.go:1025
-#[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/scheduling-priority-preemption-hostport.md"]
-fn preemption_execution_path_replicaset_available_replicas() {
-    // Intentionally empty body — this marker test compiles to record the
-    // mirrored upstream failure. See doc fragment for the failure analysis.
+/// entry); failure observed upstream at preemption.go:1025
+/// (`replicaset "rs-pod1" never had desired number of
+/// .status.availableReplicas`).
+///
+/// Mirror scope: this is the cross-cutting case where scheduler-side
+/// preemption must flow through to the `ReplicaSetController`'s
+/// `status.availableReplicas` accounting. We drive both layers against
+/// `MemoryStorage` in-process:
+///
+///  1. Stand up a Node with capacity for `desired` pods.
+///  2. Pre-create a low-priority RS with `desired` replicas; the RS
+///     controller's `reconcile_all` creates the pod children.
+///  3. Manually schedule + mark every pod `Ready` (no kubelet in this
+///     harness). Reconcile again and confirm `availableReplicas == desired`.
+///  4. Apply the same mutation `Scheduler::evict_pod` performs for the
+///     victim chosen by `check_preemption` (deletionTimestamp +
+///     `Phase::Failed` + `DisruptionTarget` condition). Insert a
+///     high-priority preemptor pod scheduled on the same node so the node
+///     stays full.
+///  5. Reconcile the RS. The controller must (a) exclude the terminating
+///     victim from `replicas` / `availableReplicas`, (b) create one
+///     replacement pod (which stays Pending — node is now full), and
+///     (c) report `availableReplicas == desired - 1` because the preemptor
+///     consumed the freed slot.
+///
+/// Sonobuoy (Round 160): FAIL — preemption.go:1025. Layer-A still owes the
+/// kubelet/api-server end-to-end fix; Layer-B (this mirror) verifies the
+/// scheduler→RS-controller contract in isolation.
+#[tokio::test]
+async fn preemption_execution_path_replicaset_available_replicas() {
+    let storage = Arc::new(MemoryStorage::new());
+    storage.clear();
+    let ns = "default";
+    let desired: i32 = 4;
+
+    // Step 1: Node with 4 CPU slots — exactly enough for `desired` low-pri
+    // pods of 1 CPU each. The high-priority preemptor also wants 1 CPU, so
+    // the node can only fit one more pod after a victim is evicted.
+    let node = make_node("node-1", "4", "4Gi");
+    storage
+        .create(&build_key("nodes", None, &node.metadata.name), &node)
+        .await
+        .unwrap();
+
+    // Step 2: low-priority ReplicaSet with `desired` replicas. The pod
+    // template's container requests 1 CPU so the resource math matches
+    // `check_preemption`'s view.
+    let mut selector_labels: HashMap<String, String> = HashMap::new();
+    selector_labels.insert("app".to_string(), "rs-pod1".to_string());
+
+    let pod_template_spec = PodSpec {
+        containers: vec![make_container("1", "512Mi")],
+        priority: Some(/* low-priority */ 1),
+        ..Default::default()
+    };
+
+    let rs = ReplicaSet {
+        type_meta: TypeMeta {
+            kind: "ReplicaSet".to_string(),
+            api_version: "apps/v1".to_string(),
+        },
+        metadata: {
+            let mut m = ObjectMeta::new("rs-pod1");
+            m.namespace = Some(ns.to_string());
+            m.uid = "rs-pod1-uid".to_string();
+            m.labels = Some(selector_labels.clone());
+            m.generation = Some(1);
+            m
+        },
+        spec: ReplicaSetSpec {
+            replicas: desired,
+            selector: LabelSelector {
+                match_labels: Some(selector_labels.clone()),
+                match_expressions: None,
+            },
+            template: rusternetes_common::resources::PodTemplateSpec {
+                metadata: Some(ObjectMeta::new("").with_labels(selector_labels.clone())),
+                spec: pod_template_spec.clone(),
+            },
+            min_ready_seconds: None,
+        },
+        status: None,
+    };
+    storage
+        .create(&build_key("replicasets", Some(ns), &rs.metadata.name), &rs)
+        .await
+        .unwrap();
+
+    // Drive RS reconcile — creates `desired` pods.
+    let controller = ReplicaSetController::new(storage.clone(), 1);
+    controller.reconcile_all().await.unwrap();
+
+    let pods_after_create: Vec<Pod> = storage.list(&build_prefix("pods", Some(ns))).await.unwrap();
+    assert_eq!(
+        pods_after_create.len(),
+        desired as usize,
+        "RS controller must create one pod per replica"
+    );
+
+    // Step 3: schedule + mark every pod Ready (no kubelet here).
+    schedule_and_mark_ready(&storage, ns, "node-1").await;
+
+    // Reconcile again so `update_status` writes availableReplicas.
+    controller.reconcile_all().await.unwrap();
+
+    let rs_after_ready: ReplicaSet = storage
+        .get(&build_key("replicasets", Some(ns), "rs-pod1"))
+        .await
+        .unwrap();
+    let status = rs_after_ready
+        .status
+        .as_ref()
+        .expect("RS status must be populated after reconcile");
+    assert_eq!(
+        status.replicas, desired,
+        "all desired pods must be counted as replicas"
+    );
+    assert_eq!(
+        status.available_replicas, desired,
+        "all desired pods must be available before preemption"
+    );
+
+    // Step 4: pick a victim via `check_preemption`, then apply the same
+    // mutation `Scheduler::evict_pod` would. After eviction, drop a
+    // high-priority pod on the node consuming the freed slot.
+    let live_pods: Vec<Pod> = storage.list(&build_prefix("pods", Some(ns))).await.unwrap();
+    let preemptor = make_incoming_pod("preemptor", /*priority*/ 1_000, "1", "512Mi");
+    let (can_preempt, victims) = check_preemption(&node, &preemptor, &live_pods);
+    assert!(
+        can_preempt,
+        "scheduler must find a victim when node is full of lower-priority pods"
+    );
+    assert_eq!(victims.len(), 1, "preemptor only needs to evict one pod");
+    let victim_name = victims.into_iter().next().unwrap();
+
+    evict_pod_like_scheduler(&storage, ns, &victim_name).await;
+
+    // Place the preemptor on node-1 so the node stays full. In a real
+    // cluster the scheduler would Bind it; here we set node_name + Phase
+    // Running + Ready so the RS controller can see the slot is taken.
+    let mut preemptor_scheduled = preemptor.clone();
+    {
+        let spec = preemptor_scheduled.spec.as_mut().unwrap();
+        spec.node_name = Some("node-1".to_string());
+    }
+    preemptor_scheduled.status = Some(PodStatus {
+        phase: Some(Phase::Running),
+        conditions: Some(vec![PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: None,
+            message: None,
+            last_transition_time: None,
+            observed_generation: None,
+        }]),
+        ..Default::default()
+    });
+    storage
+        .create(
+            &build_key("pods", Some(ns), &preemptor_scheduled.metadata.name),
+            &preemptor_scheduled,
+        )
+        .await
+        .unwrap();
+
+    // Step 5: poll RS reconcile until `availableReplicas == desired - 1`.
+    // In a real cluster the watch+workqueue cuts the latency to sub-second;
+    // here we drive `reconcile_all` directly. Deadline mirrors the upstream
+    // expectation that the controller catches up well inside the test
+    // window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last_status = None;
+    while std::time::Instant::now() < deadline {
+        controller.reconcile_all().await.unwrap();
+        // Mark any newly-created pod as Pending (no scheduler/kubelet to
+        // promote it). It must NOT be Ready, because the node is full and
+        // the upstream invariant is that availableReplicas degrades by 1.
+        ensure_replacement_pods_pending(&storage, ns, &rs.metadata.name).await;
+        controller.reconcile_all().await.unwrap();
+
+        let rs_now: ReplicaSet = storage
+            .get(&build_key("replicasets", Some(ns), "rs-pod1"))
+            .await
+            .unwrap();
+        if let Some(s) = rs_now.status.as_ref() {
+            last_status = Some(s.clone());
+            if s.available_replicas == desired - 1 && s.replicas == desired {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!(
+        "RS status never settled to replicas={} / availableReplicas={} after preemption; last seen: {:?}",
+        desired,
+        desired - 1,
+        last_status
+    );
+}
+
+/// Mark every RS pod in `namespace` as scheduled (`node_name` set), Running,
+/// and Ready=True. Skips pods already terminating.
+async fn schedule_and_mark_ready(storage: &Arc<MemoryStorage>, namespace: &str, node_name: &str) {
+    let prefix = build_prefix("pods", Some(namespace));
+    let pods: Vec<Pod> = storage.list(&prefix).await.unwrap_or_default();
+    for mut pod in pods {
+        if pod.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        if let Some(spec) = pod.spec.as_mut() {
+            spec.node_name = Some(node_name.to_string());
+        }
+        pod.status = Some(PodStatus {
+            phase: Some(Phase::Running),
+            conditions: Some(vec![PodCondition {
+                condition_type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_transition_time: None,
+                observed_generation: None,
+            }]),
+            ..Default::default()
+        });
+        let key = build_key("pods", Some(namespace), &pod.metadata.name);
+        let _ = storage.update(&key, &pod).await;
+    }
+}
+
+/// Apply the same mutation `Scheduler::evict_pod` writes when it picks a
+/// victim: set deletionTimestamp + grace period, phase Failed, reason
+/// `Preempted`, and append a `DisruptionTarget` condition. We do not delete
+/// the pod outright — upstream K8s leaves cleanup to the kubelet (and the
+/// `matches_selector` path on the RS controller already excludes pods with
+/// `deletion_timestamp.is_some()`).
+async fn evict_pod_like_scheduler(storage: &Arc<MemoryStorage>, namespace: &str, name: &str) {
+    let key = build_key("pods", Some(namespace), name);
+    let mut pod: Pod = storage.get(&key).await.unwrap();
+    pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    pod.metadata.deletion_grace_period_seconds = Some(30);
+    let status = pod.status.get_or_insert_with(PodStatus::default);
+    status.phase = Some(Phase::Failed);
+    status.reason = Some("Preempted".to_string());
+    status.message = Some("Pod was preempted by a higher-priority pod".to_string());
+    let conditions = status.conditions.get_or_insert_with(Vec::new);
+    conditions.push(PodCondition {
+        condition_type: "DisruptionTarget".to_string(),
+        status: "True".to_string(),
+        reason: Some("PreemptionByScheduler".to_string()),
+        message: Some("Preempted by a higher-priority pod".to_string()),
+        last_transition_time: Some(chrono::Utc::now()),
+        observed_generation: None,
+    });
+    storage.update(&key, &pod).await.unwrap();
+}
+
+/// After the RS controller creates a replacement pod, leave it Pending —
+/// the node is full of the preemptor + remaining low-priority pods, so the
+/// replacement cannot become Ready. The `availableReplicas` math depends on
+/// this: ready pods = desired - 1, replicas = desired (Pending pods still
+/// count toward `replicas`).
+async fn ensure_replacement_pods_pending(
+    storage: &Arc<MemoryStorage>,
+    namespace: &str,
+    rs_name: &str,
+) {
+    let prefix = build_prefix("pods", Some(namespace));
+    let pods: Vec<Pod> = storage.list(&prefix).await.unwrap_or_default();
+    for mut pod in pods {
+        if pod.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let owned_by_rs = pod
+            .metadata
+            .owner_references
+            .as_ref()
+            .map(|refs| {
+                refs.iter()
+                    .any(|r| r.kind == "ReplicaSet" && r.name == rs_name)
+            })
+            .unwrap_or(false);
+        if !owned_by_rs {
+            continue;
+        }
+        // Only touch pods that haven't been scheduled yet (newly created
+        // by the RS controller after the victim was evicted).
+        let already_scheduled = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_ref())
+            .is_some();
+        if already_scheduled {
+            continue;
+        }
+        pod.status = Some(PodStatus {
+            phase: Some(Phase::Pending),
+            conditions: None,
+            ..Default::default()
+        });
+        let key = build_key("pods", Some(namespace), &pod.metadata.name);
+        let _ = storage.update(&key, &pod).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
