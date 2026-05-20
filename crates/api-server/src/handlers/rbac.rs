@@ -360,6 +360,19 @@ pub async fn update_rolebinding(
     rolebinding.metadata.name = name.clone();
     rolebinding.metadata.namespace = Some(namespace.clone());
 
+    let key = build_key("rolebindings", Some(&namespace), &name);
+
+    // Validate immutable roleRef — mirrors upstream
+    // `pkg/registry/rbac/rolebinding/strategy.go::ValidateUpdate` which calls
+    // `apivalidation.ValidateImmutableField(newRoleBinding.RoleRef, …)`.
+    if let Ok(existing) = state.storage.get::<RoleBinding>(&key).await {
+        if existing.role_ref != rolebinding.role_ref {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "RoleBinding.roleRef: Invalid value: field is immutable".to_string(),
+            ));
+        }
+    }
+
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
@@ -367,7 +380,6 @@ pub async fn update_rolebinding(
         return Ok(Json(rolebinding));
     }
 
-    let key = build_key("rolebindings", Some(&namespace), &name);
     let updated = state.storage.update(&key, &rolebinding).await?;
 
     Ok(Json(updated))
@@ -804,6 +816,19 @@ pub async fn update_clusterrolebinding(
 
     clusterrolebinding.metadata.name = name.clone();
 
+    let key = build_key("clusterrolebindings", None, &name);
+
+    // Validate immutable roleRef — mirrors upstream
+    // `pkg/registry/rbac/clusterrolebinding/strategy.go::ValidateUpdate` which
+    // calls `apivalidation.ValidateImmutableField(newCRB.RoleRef, …)`.
+    if let Ok(existing) = state.storage.get::<ClusterRoleBinding>(&key).await {
+        if existing.role_ref != clusterrolebinding.role_ref {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "ClusterRoleBinding.roleRef: Invalid value: field is immutable".to_string(),
+            ));
+        }
+    }
+
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
@@ -811,7 +836,6 @@ pub async fn update_clusterrolebinding(
         return Ok(Json(clusterrolebinding));
     }
 
-    let key = build_key("clusterrolebindings", None, &name);
     let updated = state.storage.update(&key, &clusterrolebinding).await?;
 
     Ok(Json(updated))
