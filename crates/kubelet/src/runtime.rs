@@ -4083,31 +4083,39 @@ impl ContainerRuntime {
         // Add user-defined environment variables
         if let Some(env_vars) = &container.env {
             for env_var in env_vars {
-                // Direct value — expand $(VAR) references using previously set env vars
+                // Direct value — expand $(VAR) references using previously set env vars.
+                // Skip when the value is empty and valueFrom is present: an empty string
+                // in the proto2 encoding means the field was absent (not explicitly ""),
+                // so we must fall through to valueFrom in that case.
+                let has_value_from = env_var.value_from.is_some();
                 if let Some(value) = &env_var.value {
-                    let mut expanded = value.clone();
-                    while let Some(start) = expanded.find("$(") {
-                        let end = match expanded[start..].find(')') {
-                            Some(e) => start + e,
-                            None => break,
-                        };
-                        let var_name = &expanded[start + 2..end];
-                        let replacement = env_list
-                            .iter()
-                            .find_map(|entry| {
-                                let (k, v) = entry.split_once('=')?;
+                    if value.is_empty() && has_value_from {
+                        // Treat as absent; fall through to valueFrom below.
+                    } else {
+                        let mut expanded = value.clone();
+                        while let Some(start) = expanded.find("$(") {
+                            let end = match expanded[start..].find(')') {
+                                Some(e) => start + e,
+                                None => break,
+                            };
+                            let var_name = &expanded[start + 2..end];
+                            let replacement = env_list
+                                .iter()
+                                .find_map(|entry| {
+                                    let (k, v) = entry.split_once('=')?;
 
-                                if k == var_name {
-                                    Some(v.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        expanded.replace_range(start..end + 1, &replacement);
-                    }
-                    env_list.push(format!("{}={}", env_var.name, expanded));
-                    continue;
+                                    if k == var_name {
+                                        Some(v.to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_default();
+                            expanded.replace_range(start..end + 1, &replacement);
+                        }
+                        env_list.push(format!("{}={}", env_var.name, expanded));
+                        continue;
+                    } // end else (non-empty value or no valueFrom)
                 }
 
                 // Value from ConfigMap, Secret, or Downward API
@@ -4155,6 +4163,12 @@ impl ContainerRuntime {
                                 let resolved =
                                     if value.is_empty() && field_ref.field_path == "status.podIP" {
                                         pod_ip.unwrap_or("").to_string()
+                                    } else if value.is_empty()
+                                        && field_ref.field_path == "status.hostIP"
+                                    {
+                                        // Fall back to node IP when pod status hasn't been
+                                        // written to etcd yet (first container creation).
+                                        "127.0.0.1".to_string()
                                     } else {
                                         value
                                     };
