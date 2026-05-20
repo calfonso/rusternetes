@@ -25,7 +25,7 @@ pub async fn create(
     info!("Creating cronjob: {}/{}", namespace, cronjob.metadata.name);
 
     // Check if this is a dry-run request
-    let _is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "cronjobs")
         .with_namespace(&namespace)
@@ -46,6 +46,15 @@ pub async fn create(
 
     // Apply K8s defaults (SetDefaults_PodSpec + SetDefaults_Container for job template)
     crate::handlers::defaults::apply_cronjob_defaults(&mut cronjob);
+
+    // If dry-run, skip storage operation but return the validated resource
+    if is_dry_run {
+        info!(
+            "Dry-run: CronJob {}/{} validated successfully (not created)",
+            namespace, cronjob.metadata.name
+        );
+        return Ok((StatusCode::CREATED, Json(cronjob)));
+    }
 
     let key = build_key("cronjobs", Some(&namespace), &cronjob.metadata.name);
     let created = state.storage.create(&key, &cronjob).await?;
