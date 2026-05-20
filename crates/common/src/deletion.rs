@@ -33,6 +33,14 @@ pub struct DeleteOptions {
     /// Whether to perform a dry run
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<Vec<String>>,
+
+    /// IgnoreStoreReadErrorWithClusterBreakingPotential allows the API server
+    /// to bypass the storage read step during deletion. This is only intended
+    /// for break-glass recovery (cluster-breaking scenarios) and is mutually
+    /// exclusive with every other DeleteOptions field. Mirrors upstream
+    /// `metav1.DeleteOptions.IgnoreStoreReadErrorWithClusterBreakingPotential`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_store_read_error_with_cluster_breaking_potential: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +63,7 @@ impl Default for DeleteOptions {
             preconditions: None,
             orphan_dependents: None,
             dry_run: None,
+            ignore_store_read_error_with_cluster_breaking_potential: None,
         }
     }
 }
