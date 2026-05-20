@@ -718,29 +718,6 @@ async fn test_pod_update_ephemeral_containers() {
 }
 
 // ---------------------------------------------------------------------------
-// Upstream: TestPodResizeRBAC (pods_test.go:853) — already covered by
-// crates/api-server/tests/pod_resize_cas_test.rs. Mirrored as ignored stub.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[ignore = "covered by crates/api-server/tests/pod_resize_cas_test.rs (CAS-retry harness)"]
-async fn test_pod_resize_rbac() {
-    // Intentionally empty — see pod_resize_cas_test.rs for the in-place
-    // resize subresource coverage including RBAC scoping by subresource.
-}
-
-// ---------------------------------------------------------------------------
-// Upstream: TestPodResize (pods_test.go:957) — also covered by
-// pod_resize_cas_test.rs. Mirrored as ignored stub.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[ignore = "covered by crates/api-server/tests/pod_resize_cas_test.rs (CAS-retry harness)"]
-async fn test_pod_resize() {
-    // Intentionally empty — see pod_resize_cas_test.rs.
-}
-
-// ---------------------------------------------------------------------------
 // Upstream: TestMutablePodSchedulingDirectives (pods_test.go:1204)
 // ---------------------------------------------------------------------------
 
