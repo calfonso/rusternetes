@@ -821,3 +821,173 @@ async fn test_node_declared_feature_admission() {
     //   - resize allowed when feature present,
     //   - label-only update allowed regardless of declared features.
 }
+
+// ---------------------------------------------------------------------------
+// Upstream conformance mirrors — [Conformance] tests that exercise
+// ValidatePodUpdate. All three are gated by f.WithNodeConformance() in
+// test/e2e/common/node/pods.go and listed in
+// test/conformance/testdata/conformance.yaml.
+// ---------------------------------------------------------------------------
+
+/// Mirrors upstream `framework.ConformanceIt("should be updated", ...)` at
+/// `test/e2e/common/node/pods.go:340`. Creates a pod with a label,
+/// updates the label via PUT, then GETs the pod list with a label
+/// selector and confirms the updated pod is returned.
+#[tokio::test]
+async fn test_pod_should_be_updated_conformance() {
+    let (_, router) = spawn_router();
+    let ns = "pod-should-be-updated";
+    create_namespace(&router, ns).await;
+
+    let mut pod = prototype_pod("pod-update");
+    pod["metadata"]["labels"] = json!({"time": "v1"});
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{}/pods", ns), &pod).await;
+    assert!(
+        st == 201 || st == 200,
+        "create pod must succeed: status={} body={}",
+        st,
+        body
+    );
+
+    // Label update via full PUT — the immutability fence allows label
+    // mutations (they live in metadata, not spec).
+    let mut updated = pod.clone();
+    updated["metadata"]["labels"] = json!({"time": "v2"});
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/pod-update", ns),
+        &updated,
+    )
+    .await;
+    assert!(
+        st == 200 || st == 201,
+        "label-only update must be accepted: status={} body={}",
+        st,
+        body
+    );
+
+    // List with label selector — updated pod must be returned.
+    let (st, body) = get(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods?labelSelector=time=v2", ns),
+    )
+    .await;
+    assert_eq!(
+        st, 200,
+        "list with label selector must succeed: body={}",
+        body
+    );
+    let items = body
+        .get("items")
+        .and_then(|i| i.as_array())
+        .expect("items array");
+    assert_eq!(
+        items.len(),
+        1,
+        "label selector time=v2 must match exactly one pod, got: {}",
+        body
+    );
+    assert_eq!(items[0]["metadata"]["name"], "pod-update");
+}
+
+/// Mirrors upstream `framework.ConformanceIt("should run through the
+/// lifecycle of Pods and PodStatus", ...)` at
+/// `test/e2e/common/node/pods.go:1160` — the patch portion. Creates a
+/// pod, patches a metadata label + the container image via merge-patch.
+/// Both deltas are individually allowed by the fence; this test confirms
+/// they pass when bundled in a single PATCH call (the same handler path
+/// kubectl uses).
+///
+/// NOTE: upstream's lifecycle test also flips `terminationGracePeriodSeconds`
+/// to 1 here, but only because the upstream pod is created with TGPS=-1
+/// (negative→1 is the one allowed mutation). Defaulting in our test
+/// harness sets TGPS=30, which the fence correctly treats as immutable
+/// per `validation.go:5780-5783`. Covered by
+/// `test_update_tgps_negative_to_one_accepted` /
+/// `test_update_tgps_arbitrary_change_rejected` in
+/// `pod_update_immutability_test.rs`.
+#[tokio::test]
+async fn test_pod_lifecycle_combined_patch_conformance() {
+    let (_, router) = spawn_router();
+    let ns = "pod-lifecycle-patch";
+    create_namespace(&router, ns).await;
+
+    let mut pod = prototype_pod("pod-podstatus");
+    pod["metadata"]["labels"] = json!({"test-pod-static": "true"});
+    let (st, _body) = post_json(&router, &format!("/api/v1/namespaces/{}/pods", ns), &pod).await;
+    assert!(st == 201 || st == 200);
+
+    // Single merge-patch bundling label + image deltas.
+    let patch = json!({
+        "metadata": { "labels": { "test-pod": "patched" } },
+        "spec": {
+            "containers": [{ "name": "fake-name", "image": "image2" }]
+        }
+    });
+    let (st, body) = patch_merge(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/pod-podstatus", ns),
+        &patch,
+    )
+    .await;
+    assert!(
+        st == 200 || st == 201,
+        "combined patch (label + image) must be accepted: status={} body={}",
+        st,
+        body
+    );
+
+    let (st, body) = get(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/pod-podstatus", ns),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(body["metadata"]["labels"]["test-pod"], "patched");
+    assert_eq!(body["spec"]["containers"][0]["image"], "image2");
+}
+
+/// Mirrors upstream `[sig-node] Pods Extended (pod generation)` at
+/// `test/conformance/testdata/conformance.yaml:2519-2538`. After
+/// create, `metadata.generation == 1`. Each accepted spec mutation
+/// (image change) must bump generation by 1.
+#[tokio::test]
+async fn test_pod_generation_increments_per_update_conformance() {
+    let (_, router) = spawn_router();
+    let ns = "pod-generation";
+    create_namespace(&router, ns).await;
+
+    let pod = prototype_pod("pod-gen");
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{}/pods", ns), &pod).await;
+    assert!(st == 201 || st == 200);
+    assert_eq!(
+        body["metadata"]["generation"], 1,
+        "create must produce generation=1, got body={}",
+        body
+    );
+
+    for (i, image) in ["image-v2", "image-v3", "image-v4"].iter().enumerate() {
+        let mut updated = pod.clone();
+        updated["spec"]["containers"][0]["image"] = json!(*image);
+        let (st, body) = put_json(
+            &router,
+            &format!("/api/v1/namespaces/{}/pods/pod-gen", ns),
+            &updated,
+        )
+        .await;
+        assert!(
+            st == 200 || st == 201,
+            "image-change PUT #{} must be accepted: status={} body={}",
+            i + 1,
+            st,
+            body
+        );
+        let expected_gen = (i + 2) as i64;
+        let got = body["metadata"]["generation"].as_i64().unwrap_or(0);
+        assert_eq!(
+            got, expected_gen,
+            "generation must increment by 1 per spec change; expected {}, got {} body={}",
+            expected_gen, got, body
+        );
+    }
+}
