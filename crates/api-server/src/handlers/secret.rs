@@ -253,6 +253,7 @@ pub async fn delete_secret(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Secret>> {
     info!("Deleting secret: {} in namespace: {}", name, namespace);
 
@@ -276,6 +277,12 @@ pub async fn delete_secret(
 
     // Get the resource to check if it exists
     let secret: Secret = state.storage.get(&key).await?;
+
+    // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
+    // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls
+    // preconditions.Check() before invoking storage.Delete; a mismatch returns
+    // 409 Conflict with reason `Conflict`.
+    crate::handlers::lifecycle::check_delete_preconditions(&body, &secret.metadata, &name)?;
 
     // If dry-run, skip delete operation
     if is_dry_run {

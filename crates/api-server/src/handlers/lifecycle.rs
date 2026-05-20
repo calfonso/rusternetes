@@ -59,6 +59,61 @@ pub fn check_resource_version(
     }
 }
 
+/// Parse a `DeleteOptions` body and enforce `preconditions.resourceVersion` /
+/// `preconditions.uid` against the stored object's metadata.
+///
+/// Upstream contract:
+/// `staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go::Delete`
+/// invokes `preconditions.Check(qualifiedKind, obj)` before calling the storage
+/// delete; a mismatch returns 409 Conflict with reason `Conflict`.
+///
+/// `body` is the raw request bytes. An empty body or a body that doesn't parse
+/// as JSON is treated as no preconditions (Kubernetes is lenient here — clients
+/// frequently send empty DELETE bodies). When a `preconditions` block is
+/// present, each declared field MUST match the stored object.
+pub fn check_delete_preconditions(
+    body: &[u8],
+    stored_meta: &ObjectMeta,
+    resource_name: &str,
+) -> rusternetes_common::Result<()> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let preconditions = match parsed.get("preconditions") {
+        Some(p) if p.is_object() => p,
+        _ => return Ok(()),
+    };
+
+    if let Some(expected_rv) = preconditions
+        .get("resourceVersion")
+        .and_then(|v| v.as_str())
+    {
+        let stored_rv = stored_meta.resource_version.as_deref().unwrap_or("");
+        if stored_rv != expected_rv {
+            return Err(rusternetes_common::Error::Conflict(format!(
+                "Precondition failed: ResourceVersion in precondition: {}, ResourceVersion in object meta: {} on resource {}",
+                expected_rv, stored_rv, resource_name
+            )));
+        }
+    }
+
+    if let Some(expected_uid) = preconditions.get("uid").and_then(|v| v.as_str()) {
+        let stored_uid = stored_meta.uid.as_str();
+        if stored_uid != expected_uid {
+            return Err(rusternetes_common::Error::Conflict(format!(
+                "Precondition failed: UID in precondition: {}, UID in object meta: {} on resource {}",
+                expected_uid, stored_uid, resource_name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +198,72 @@ mod tests {
     fn test_check_resource_version_none_provided() {
         let result = check_resource_version(Some("5"), None, "test-pod");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_delete_preconditions_empty_body_allows_delete() {
+        let meta = ObjectMeta {
+            resource_version: Some("9".to_string()),
+            uid: "u-1".to_string(),
+            ..Default::default()
+        };
+        assert!(check_delete_preconditions(b"", &meta, "test").is_ok());
+    }
+
+    #[test]
+    fn test_check_delete_preconditions_invalid_json_is_lenient() {
+        let meta = ObjectMeta {
+            resource_version: Some("9".to_string()),
+            ..Default::default()
+        };
+        assert!(check_delete_preconditions(b"not-json", &meta, "test").is_ok());
+    }
+
+    #[test]
+    fn test_check_delete_preconditions_no_preconditions_field_allows_delete() {
+        let meta = ObjectMeta {
+            resource_version: Some("9".to_string()),
+            ..Default::default()
+        };
+        let body = br#"{"kind":"DeleteOptions","apiVersion":"v1"}"#;
+        assert!(check_delete_preconditions(body, &meta, "test").is_ok());
+    }
+
+    #[test]
+    fn test_check_delete_preconditions_matching_rv_passes() {
+        let meta = ObjectMeta {
+            resource_version: Some("9".to_string()),
+            ..Default::default()
+        };
+        let body = br#"{"preconditions":{"resourceVersion":"9"}}"#;
+        assert!(check_delete_preconditions(body, &meta, "test").is_ok());
+    }
+
+    #[test]
+    fn test_check_delete_preconditions_mismatched_rv_returns_conflict() {
+        let meta = ObjectMeta {
+            resource_version: Some("9".to_string()),
+            ..Default::default()
+        };
+        let body = br#"{"preconditions":{"resourceVersion":"1"}}"#;
+        let err = check_delete_preconditions(body, &meta, "test").unwrap_err();
+        match err {
+            rusternetes_common::Error::Conflict(msg) => {
+                assert!(msg.contains("ResourceVersion"));
+            }
+            other => panic!("expected Conflict, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_delete_preconditions_mismatched_uid_returns_conflict() {
+        let meta = ObjectMeta {
+            resource_version: Some("9".to_string()),
+            uid: "u-current".to_string(),
+            ..Default::default()
+        };
+        let body = br#"{"preconditions":{"uid":"u-stale"}}"#;
+        let err = check_delete_preconditions(body, &meta, "test").unwrap_err();
+        assert!(matches!(err, rusternetes_common::Error::Conflict(_)));
     }
 }
