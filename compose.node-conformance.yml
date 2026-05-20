@@ -1,0 +1,103 @@
+# Single-node compose for kubelet-scoped conformance testing.
+# Brings up only etcd + api-server + one kubelet — no scheduler,
+# no controller-manager, no kube-proxy, no second kubelet.
+#
+# Used by scripts/run-node-conformance.sh.
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    container_name: rusternetes-nc-etcd
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+    ports:
+      - "2379:2379"
+    networks:
+      - nc-net
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      - ETCDCTL_API=3
+
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.api-server
+      additional_contexts:
+        rhino: ../rhino
+    container_name: rusternetes-nc-api-server
+    privileged: true
+    ports:
+      - "6443:6443"
+    depends_on:
+      etcd:
+        condition: service_healthy
+    networks:
+      nc-net:
+        aliases:
+          - api-server
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///run/podman/podman.sock
+    command:
+      - "--bind-address"
+      - "0.0.0.0:6443"
+      - "--etcd-servers"
+      - "http://etcd:2379"
+      - "--tls"
+      - "--tls-cert-file"
+      - "/etc/kubernetes/pki/api-server.crt"
+      - "--tls-key-file"
+      - "/etc/kubernetes/pki/api-server.key"
+      - "--skip-auth"
+      - "--console-dir"
+      - "/app/console"
+      - "--log-level"
+      - "info"
+
+  kubelet:
+    build:
+      context: .
+      dockerfile: Dockerfile.kubelet
+      additional_contexts:
+        rhino: ../rhino
+    container_name: rusternetes-nc-kubelet
+    privileged: true
+    depends_on:
+      - etcd
+      - api-server
+    networks:
+      - nc-net
+    ports:
+      # 10250: kubelet HTTP server (lands in PR2 of node-conformance work)
+      # 10249: kubelet metrics — used by run-node-conformance.sh readiness probe in PR1
+      - "10250:10250"
+      - "10249:10249"
+    volumes:
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw
+      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}
+      - RUSTERNETES_KUBELET_SERVER_PORT=10250
+    # metrics-port intentionally on 10249 so the new kubelet HTTP server (port 10250) doesn't collide.
+    command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10249", "--sync-interval", "3"]
+
+networks:
+  nc-net:
+    driver: bridge
