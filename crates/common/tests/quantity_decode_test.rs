@@ -11,10 +11,10 @@
 //!   `invalid type: integer 0, expected a string`
 //! which in turn blocks five `[Conformance]`-labelled tests.
 
-use rusternetes_common::resources::Pod;
-use rusternetes_common::resources::PersistentVolumeClaim;
-use rusternetes_common::resources::ResourceQuota;
 use rusternetes_common::resources::LimitRange;
+use rusternetes_common::resources::PersistentVolumeClaim;
+use rusternetes_common::resources::Pod;
+use rusternetes_common::resources::ResourceQuota;
 use serde_json::json;
 
 #[test]
@@ -37,11 +37,7 @@ fn pod_decodes_integer_zero_request_quantity() {
         }
     });
     let pod: Pod = serde_json::from_value(body).expect("decode pod");
-    let reqs = pod
-        .spec
-        .as_ref()
-        .unwrap()
-        .containers[0]
+    let reqs = pod.spec.as_ref().unwrap().containers[0]
         .resources
         .as_ref()
         .unwrap()
@@ -70,11 +66,7 @@ fn pod_decodes_float_quantity() {
         }
     });
     let pod: Pod = serde_json::from_value(body).expect("decode pod with float quantity");
-    let limits = pod
-        .spec
-        .as_ref()
-        .unwrap()
-        .containers[0]
+    let limits = pod.spec.as_ref().unwrap().containers[0]
         .resources
         .as_ref()
         .unwrap()
@@ -103,11 +95,7 @@ fn pod_decodes_canonical_string_quantity() {
         }
     });
     let pod: Pod = serde_json::from_value(body).expect("decode pod with string quantity");
-    let reqs = pod
-        .spec
-        .as_ref()
-        .unwrap()
-        .containers[0]
+    let reqs = pod.spec.as_ref().unwrap().containers[0]
         .resources
         .as_ref()
         .unwrap()
@@ -156,9 +144,22 @@ fn limitrange_decodes_integer_max_min() {
     });
     let lr: LimitRange = serde_json::from_value(body).expect("decode LimitRange");
     let item = &lr.spec.limits[0];
-    assert_eq!(item.max.as_ref().unwrap().get("cpu").map(String::as_str), Some("2"));
-    assert_eq!(item.min.as_ref().unwrap().get("cpu").map(String::as_str), Some("0"));
-    assert_eq!(item.default.as_ref().unwrap().get("cpu").map(String::as_str), Some("500m"));
+    assert_eq!(
+        item.max.as_ref().unwrap().get("cpu").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        item.min.as_ref().unwrap().get("cpu").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        item.default
+            .as_ref()
+            .unwrap()
+            .get("cpu")
+            .map(String::as_str),
+        Some("500m")
+    );
 }
 
 #[test]
@@ -180,11 +181,21 @@ fn pvc_status_decodes_integer_capacity() {
     let pvc: PersistentVolumeClaim = serde_json::from_value(body).expect("decode PVC");
     let status = pvc.status.as_ref().unwrap();
     assert_eq!(
-        status.capacity.as_ref().unwrap().get("storage").map(String::as_str),
+        status
+            .capacity
+            .as_ref()
+            .unwrap()
+            .get("storage")
+            .map(String::as_str),
         Some("0")
     );
     assert_eq!(
-        status.allocated_resources.as_ref().unwrap().get("storage").map(String::as_str),
+        status
+            .allocated_resources
+            .as_ref()
+            .unwrap()
+            .get("storage")
+            .map(String::as_str),
         Some("0")
     );
 }
