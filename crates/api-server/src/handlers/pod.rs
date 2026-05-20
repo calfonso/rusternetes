@@ -5,7 +5,7 @@ use crate::{
 };
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{OriginalUri, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
@@ -77,6 +77,27 @@ pub async fn create(
                 return Err(rusternetes_common::Error::InvalidResource(format!(
                     "spec.containers[{}].name: Required value",
                     i
+                )));
+            }
+        }
+        // K8s ref: pkg/registry/core/pod/strategy.go Strategy.PrepareForCreate +
+        // pkg/apis/core/validation/validation.go ValidatePodSpec — ephemeral
+        // containers may NEVER be set on Pod create. They can only be added
+        // through the `/ephemeralcontainers` subresource.
+        if let Some(ref ec) = spec.ephemeral_containers {
+            if !ec.is_empty() {
+                return Err(rusternetes_common::Error::InvalidResource(
+                    "spec.ephemeralContainers: Forbidden: cannot be set on create".to_string(),
+                ));
+            }
+        }
+        // K8s ref: pkg/apis/core/validation/validation.go validateActiveDeadlineSeconds —
+        // on create, activeDeadlineSeconds (when set) must be a positive integer.
+        if let Some(v) = spec.active_deadline_seconds {
+            if v <= 0 {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "spec.activeDeadlineSeconds: Invalid value: {}: must be greater than 0",
+                    v
                 )));
             }
         }
@@ -622,6 +643,7 @@ pub async fn update(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<Pod>> {
@@ -633,6 +655,17 @@ pub async fn update(
     })?;
 
     info!("Updating pod: {}/{}", namespace, name);
+
+    // K8s ref: pkg/registry/core/pod/strategy.go — the /ephemeralcontainers
+    // subresource has its own dedicated Strategy that scopes admission to the
+    // ephemeralContainers slice and forbids removing existing entries. The
+    // regular PUT path on /pods/{name} must reject any ephemeralContainers
+    // mutation (add OR remove). We use the original request URI to tell which
+    // path we are on.
+    let is_ephemeral_subresource = original_uri
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/ephemeralcontainers");
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -671,6 +704,86 @@ pub async fn update(
         pod.metadata.resource_version.as_deref(),
         &name,
     )?;
+
+    // K8s ref: pkg/registry/core/pod/strategy.go statusStrategy +
+    // ephemeralContainersStrategy. Ephemeral containers can only ever be ADDED
+    // through the dedicated /ephemeralcontainers subresource; the regular
+    // /pods/{name} PUT path must reject any mutation. Even on the subresource
+    // path, removing an existing entry is forbidden.
+    {
+        let old_ec_count = old_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.ephemeral_containers.as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let new_ec_count = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.ephemeral_containers.as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if is_ephemeral_subresource {
+            // Subresource: only addition is permitted; removing any existing
+            // entry must be rejected. Matches upstream Forbidden response.
+            if new_ec_count < old_ec_count {
+                return Err(rusternetes_common::Error::Forbidden(
+                    "spec.ephemeralContainers: Forbidden: existing ephemeral containers may not be removed".to_string(),
+                ));
+            }
+        } else if new_ec_count != old_ec_count {
+            // Main path: any structural change to ephemeralContainers is
+            // forbidden. Use the subresource instead.
+            return Err(rusternetes_common::Error::Forbidden(
+                "spec.ephemeralContainers: Forbidden: may not be updated outside of the ephemeralcontainers subresource".to_string(),
+            ));
+        }
+    }
+
+    // K8s ref: pkg/apis/core/validation/validation.go validateActiveDeadlineSeconds +
+    // ValidatePodSpecUpdate — once set, activeDeadlineSeconds may only be reduced;
+    // it can never be unset, increased, or made zero/negative.
+    {
+        let old_ads = old_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.active_deadline_seconds);
+        let new_ads = pod.spec.as_ref().and_then(|s| s.active_deadline_seconds);
+        match (old_ads, new_ads) {
+            // Setting from unset: allowed if positive.
+            (None, Some(v)) if v <= 0 => {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "spec.activeDeadlineSeconds: Invalid value: {}: must be greater than 0",
+                    v
+                )));
+            }
+            // Reducing or unchanged: allowed.
+            (Some(o), Some(n)) if n > 0 && n <= o => {}
+            // Increase: forbidden.
+            (Some(o), Some(n)) if n > o => {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "spec.activeDeadlineSeconds: Invalid value: {}: must be less than or equal to {}",
+                    n, o
+                )));
+            }
+            // Zero or negative when previously set: forbidden.
+            (Some(_), Some(n)) if n <= 0 => {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "spec.activeDeadlineSeconds: Invalid value: {}: must be greater than 0",
+                    n
+                )));
+            }
+            // Unsetting after it was set: forbidden.
+            (Some(_), None) => {
+                return Err(rusternetes_common::Error::InvalidResource(
+                    "spec.activeDeadlineSeconds: Invalid value: nil: must not be removed"
+                        .to_string(),
+                ));
+            }
+            // Other valid combos: (None, None) and (None, Some(positive)).
+            _ => {}
+        }
+    }
 
     let old_pod_value = serde_json::to_value(&old_pod)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
@@ -1159,11 +1272,20 @@ pub async fn patch(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Pod>> {
     info!("Patching pod: {}/{}", namespace, name);
+
+    // K8s ref: pkg/registry/core/pod/strategy.go — see update() for context.
+    // PATCH may not change ephemeralContainers outside of the dedicated
+    // subresource; even on the subresource it may only add entries.
+    let is_ephemeral_subresource = original_uri
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/ephemeralcontainers");
 
     // Check authorization - use 'patch' verb for RBAC
     let attrs = RequestAttributes::new(auth_ctx.user, "patch", "pods")
@@ -1343,6 +1465,36 @@ pub async fn patch(
     // Ensure metadata matches URL (prevent changing name/namespace via patch)
     patched_pod.metadata.name = name.clone();
     patched_pod.metadata.namespace = Some(namespace.clone());
+
+    // K8s ref: pkg/registry/core/pod/strategy.go — see update() for context.
+    // ephemeralContainers may only be ADDED through the dedicated subresource;
+    // remove is forbidden, and any change at all is forbidden through the
+    // regular /pods/{name} patch endpoint.
+    {
+        let old_ec_count = current_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.ephemeral_containers.as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let new_ec_count = patched_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.ephemeral_containers.as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if is_ephemeral_subresource {
+            if new_ec_count < old_ec_count {
+                return Err(rusternetes_common::Error::Forbidden(
+                    "spec.ephemeralContainers: Forbidden: existing ephemeral containers may not be removed".to_string(),
+                ));
+            }
+        } else if new_ec_count != old_ec_count {
+            return Err(rusternetes_common::Error::Forbidden(
+                "spec.ephemeralContainers: Forbidden: may not be updated outside of the ephemeralcontainers subresource".to_string(),
+            ));
+        }
+    }
 
     // Detect in-place pod resize: if spec.containers[].resources changed,
     // set status.resize = "Proposed" so the kubelet picks it up (KEP-1287).
