@@ -649,10 +649,15 @@ async fn resource_quota_captures_full_pod_lifecycle() {
         .await
         .unwrap();
 
-    // 4. UPDATE the pod with resource requests that would exceed the
+    // 4. RESIZE the pod with resource requests that would exceed the
     //    quota (cpu=2 > 1). Expect 403 Forbidden / "exceeded quota".
-    //    Without delta-usage admission on UPDATE, this would silently
-    //    succeed (the Round-160 failure).
+    //    Without delta-usage admission, this would silently succeed
+    //    (the Round-160 failure).
+    //
+    //    NOTE: Resource mutations go via the /resize subresource (KEP-1287),
+    //    not plain PUT. Plain PUT now rejects any container body change
+    //    other than image, matching upstream ValidatePodUpdate
+    //    (pkg/apis/core/validation/validation.go:5695).
     let over_quota_body = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -670,17 +675,17 @@ async fn resource_quota_captures_full_pod_lifecycle() {
     let (s, body) = send_json(
         router.clone(),
         "PUT",
-        &format!("/api/v1/namespaces/{}/pods/p1", ns),
+        &format!("/api/v1/namespaces/{}/pods/p1/resize", ns),
         Some(&over_quota_body),
     )
     .await;
     assert_eq!(
         s, 403,
-        "UPDATE that pushes requests.cpu past quota must be 403: body={}",
+        "RESIZE that pushes requests.cpu past quota must be 403: body={}",
         body
     );
 
-    // 5. An in-budget UPDATE (cpu=500m: delta = 500m − 300m = +200m,
+    // 5. An in-budget RESIZE (cpu=500m: delta = 500m − 300m = +200m,
     //    new total = 500m ≤ 1000m) must still succeed — delta-usage
     //    semantics, not a flat reject.
     let in_budget_body = json!({
@@ -700,19 +705,23 @@ async fn resource_quota_captures_full_pod_lifecycle() {
     let (s, body) = send_json(
         router.clone(),
         "PUT",
-        &format!("/api/v1/namespaces/{}/pods/p1", ns),
+        &format!("/api/v1/namespaces/{}/pods/p1/resize", ns),
         Some(&in_budget_body),
     )
     .await;
     assert_eq!(
         s, 200,
-        "in-budget UPDATE (delta within remaining quota) must succeed: body={}",
+        "in-budget RESIZE (delta within remaining quota) must succeed: body={}",
         body
     );
 
-    // 6. PATCH path: same delta semantics. A PATCH that pushes memory
-    //    past the quota (memory=600Mi > 500Mi) must be rejected.
-    let over_quota_patch = json!({
+    // 6. RESIZE path: same delta semantics for over-budget memory.
+    //    A RESIZE that pushes memory past the quota (memory=600Mi >
+    //    500Mi) must be rejected.
+    let over_quota_mem_body = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "p1", "namespace": ns },
         "spec": {
             "containers": [{
                 "name": "c",
@@ -723,16 +732,16 @@ async fn resource_quota_captures_full_pod_lifecycle() {
             }]
         }
     });
-    let (s, body) = send_patch(
+    let (s, body) = send_json(
         router,
-        &format!("/api/v1/namespaces/{}/pods/p1", ns),
-        &over_quota_patch,
-        "application/merge-patch+json",
+        "PUT",
+        &format!("/api/v1/namespaces/{}/pods/p1/resize", ns),
+        Some(&over_quota_mem_body),
     )
     .await;
     assert_eq!(
         s, 403,
-        "PATCH that pushes requests.memory past quota must be 403: body={}",
+        "RESIZE that pushes requests.memory past quota must be 403: body={}",
         body
     );
 }

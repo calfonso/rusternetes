@@ -172,6 +172,9 @@ fn ns_body(name: &str) -> Value {
 /// Single-container pod fixture matching upstream's `prototypePod()` —
 /// `Image: "fakeimage"`, container `Name: "fake-name"`, no other fields.
 fn prototype_pod(name: &str) -> Value {
+    // Round-trip terminationGracePeriodSeconds explicitly so update bodies
+    // don't trip the immutability fence (we don't run server-side defaulting
+    // on UPDATE; old pod has the K8s default of 30 after create).
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -181,6 +184,7 @@ fn prototype_pod(name: &str) -> Value {
                 "name":  "fake-name",
                 "image": "fakeimage",
             }],
+            "terminationGracePeriodSeconds": 30,
         },
     })
 }
@@ -726,8 +730,13 @@ async fn test_pod_update_ephemeral_containers() {
 /// `spec.affinity.nodeAffinity` are mutable in this state. Once the gates
 /// are removed (and the pod scheduled), the same fields become immutable.
 ///
-/// RED: the generic pod update handler currently rejects any spec mutation
-/// outside the documented "tolerations/activeDeadlineSeconds/labels" subset.
+/// Upstream `pkg/apis/core/validation/validation.go:5786-5828` implements
+/// this gated-pod nodeSelector / nodeAffinity mutation surface. We have
+/// not yet ported it — see `TODO(rusternetes)` in
+/// `crates/common/src/validation/pod.rs::validate_pod_spec_update`. The
+/// broader immutability fence in this PR is strict (rejects all gated-pod
+/// scheduling-directive mutations), which is the safer default until the
+/// gated-pod relaxation lands.
 #[tokio::test]
 #[ignore = "gated-pod nodeSelector/nodeAffinity mutation relaxation \
             (validation.go:5786-5828) deferred until rusternetes ships a \
