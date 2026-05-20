@@ -33,7 +33,8 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.api-server
+      dockerfile: Dockerfile.services
+      target: api-server
       additional_contexts:
         # crates/storage/Cargo.toml declares rhino as `path = "../../../rhino"`,
         # which resolves outside the rusternetes build context. Expose the
@@ -80,7 +81,8 @@ services:
   scheduler:
     build:
       context: .
-      dockerfile: Dockerfile.scheduler
+      dockerfile: Dockerfile.services
+      target: scheduler
       additional_contexts:
         rhino: ../rhino
     container_name: rusternetes-scheduler
@@ -97,7 +99,8 @@ services:
   controller-manager:
     build:
       context: .
-      dockerfile: Dockerfile.controller-manager
+      dockerfile: Dockerfile.services
+      target: controller-manager
       additional_contexts:
         rhino: ../rhino
     container_name: rusternetes-controller-manager
@@ -117,7 +120,8 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.kubelet
+      dockerfile: Dockerfile.services
+      target: kubelet
       additional_contexts:
         rhino: ../rhino
     container_name: rusternetes-kubelet
@@ -145,7 +149,8 @@ services:
   kubelet2:
     build:
       context: .
-      dockerfile: Dockerfile.kubelet
+      dockerfile: Dockerfile.services
+      target: kubelet
       additional_contexts:
         rhino: ../rhino
     container_name: rusternetes-kubelet2
@@ -170,7 +175,8 @@ services:
   kube-proxy:
     build:
       context: .
-      dockerfile: Dockerfile.kube-proxy
+      dockerfile: Dockerfile.services
+      target: kube-proxy
       additional_contexts:
         rhino: ../rhino
     container_name: rusternetes-kube-proxy

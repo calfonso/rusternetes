@@ -262,9 +262,10 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.api-server
+      dockerfile: Dockerfile.services
+      target: api-server
       args:
-        CARGO_FEATURES: "jaeger"
+        CARGO_FEATURES: "--features jaeger"
     environment:
       - RUSTERNETES_TRACING_EXPORTER=jaeger
       - JAEGER_ENDPOINT=http://jaeger:14268/api/traces

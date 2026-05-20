@@ -1,0 +1,195 @@
+# syntax=docker/dockerfile:1.6
+#
+# Combined Dockerfile for all five long-running rusternetes service
+# components: api-server, kubelet, scheduler, controller-manager,
+# kube-proxy.
+#
+# Why a single file instead of one per service:
+#
+# The five legacy Dockerfile.{api-server,kubelet,scheduler,
+# controller-manager,kube-proxy} files were 90% identical, and each
+# kicked off its own `cargo build --release --bin <name>` against the
+# whole workspace. Because BuildKit cache mounts are scoped per
+# Dockerfile *target*, the cargo registry / git / target caches were
+# not shared across the five images either — a cold `docker compose
+# build` therefore compiled the same dependency graph 5x, blowing the
+# 30-min conformance-canary timeout (run 26126002894).
+#
+# Collapsing into one `cargo-builder` stage that produces all five
+# binaries in a single `cargo build` invocation lets BuildKit dedupe
+# the work: one compile, five thin runtime images that each `COPY
+# --from=cargo-builder` the binary they need. The runtime stages
+# differ only in their apt-package set and ENTRYPOINT/CMD.
+#
+# Compose selects the target stage via `build.target: <name>`.
+# Cargo features can be plumbed through with `--build-arg
+# CARGO_FEATURES=...` (e.g. `--features rusternetes-storage/sqlite`).
+
+# ---------------------------------------------------------------------
+# Stage 1: console SPA build (only api-server uses the output, but
+# defining it here keeps the file self-contained).
+# ---------------------------------------------------------------------
+FROM node:26-slim AS console-builder
+WORKDIR /console
+COPY console/package.json console/package-lock.json* ./
+RUN npm ci --ignore-scripts
+COPY console/ ./
+RUN npm run build
+
+# ---------------------------------------------------------------------
+# Stage 2: shared cargo builder — compiles ALL service binaries in a
+# single cargo invocation so dependency compile time is paid once.
+# ---------------------------------------------------------------------
+FROM rust:latest AS cargo-builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Pull in the adjacent rhino crate (named build context in compose.yml).
+# crates/storage/Cargo.toml declares `rhino = { path = "../../../rhino", ... }`
+# which from /app/crates/storage resolves to /rhino, so land it there.
+COPY --from=rhino . /rhino
+
+COPY Cargo.toml Cargo.lock* ./
+COPY crates ./crates
+
+ARG CARGO_FEATURES=""
+# One build, all five binaries. BuildKit cache mounts persist registry +
+# git checkouts + the workspace target/ across rebuilds; the binaries
+# are copied out of the cache-mounted target/ into /out so the runtime
+# stages can pick them up (cache-mount contents disappear after the
+# RUN finishes).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release $CARGO_FEATURES \
+        --bin api-server \
+        --bin kubelet \
+        --bin scheduler \
+        --bin controller-manager \
+        --bin kube-proxy \
+ && mkdir -p /out \
+ && cp target/release/api-server         /out/api-server \
+ && cp target/release/kubelet            /out/kubelet \
+ && cp target/release/scheduler          /out/scheduler \
+ && cp target/release/controller-manager /out/controller-manager \
+ && cp target/release/kube-proxy         /out/kube-proxy
+
+# ---------------------------------------------------------------------
+# Stage 3: api-server runtime.
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS api-server
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=cargo-builder /out/api-server /app/api-server
+COPY --from=console-builder /console/dist /app/console
+
+EXPOSE 6443
+
+ENTRYPOINT ["/app/api-server"]
+CMD ["--bind-address", "0.0.0.0:6443", "--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# Stage 4: kubelet runtime. Needs CNI plugins on /opt/cni/bin and the
+# rusternetes CNI conflist on /etc/cni/net.d/.
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS kubelet
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    iproute2 \
+    iptables \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install CNI plugins. Use `--retry` to survive transient GitHub
+# download resets — an earlier canary build hit `curl: (35) Recv
+# failure: Connection reset by peer` 150s into this URL because plain
+# `curl -L` does not retry on connection-level errors. Download to a
+# temp file rather than piping to tar so curl's non-zero exit is not
+# masked by tar's success on a truncated stream.
+RUN mkdir -p /opt/cni/bin && \
+    ARCH=$(dpkg --print-architecture) && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+        https://github.com/containernetworking/plugins/releases/download/v1.4.0/cni-plugins-linux-${ARCH}-v1.4.0.tgz \
+        -o /tmp/cni-plugins.tgz && \
+    tar -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz && \
+    rm /tmp/cni-plugins.tgz
+
+RUN mkdir -p /etc/cni/net.d
+COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
+
+COPY --from=cargo-builder /out/kubelet /app/kubelet
+
+# Kubelet needs access to container runtime socket
+VOLUME ["/var/run"]
+
+ENTRYPOINT ["/app/kubelet"]
+CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# Stage 5: scheduler runtime.
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS scheduler
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=cargo-builder /out/scheduler /app/scheduler
+
+ENTRYPOINT ["/app/scheduler"]
+CMD ["--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# Stage 6: controller-manager runtime.
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS controller-manager
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=cargo-builder /out/controller-manager /app/controller-manager
+
+ENTRYPOINT ["/app/controller-manager"]
+CMD ["--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# Stage 7: kube-proxy runtime. Needs iptables for service routing.
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS kube-proxy
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    iptables \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=cargo-builder /out/kube-proxy /app/kube-proxy
+
+ENTRYPOINT ["/app/kube-proxy"]
+CMD ["--node-name", "node-1"]
