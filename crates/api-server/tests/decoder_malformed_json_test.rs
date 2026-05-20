@@ -195,7 +195,6 @@ async fn test_malformed_wrong_type_active_deadline() {
 // only validates containers when `spec` is `Some`. Result: 201 with an empty
 // Pod instead of 422 Invalid + Status.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: Pod create accepts `spec: null` and persists an empty Pod (201) instead of 422 Invalid — Pod.spec is Option<PodSpec> and the container check is gated on Some(spec)"]
 async fn test_malformed_spec_null() {
     let router = spawn_router();
     let body = br#"{"metadata":{"name":"p"},"spec":null}"#.to_vec();
