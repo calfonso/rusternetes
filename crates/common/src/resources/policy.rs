@@ -41,7 +41,11 @@ impl ResourceQuota {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceQuotaSpec {
     /// Hard is the set of desired hard limits for each named resource
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub hard: Option<HashMap<String, String>>,
 
     /// A collection of filters that must match each object tracked by a quota
@@ -81,11 +85,19 @@ pub struct ScopedResourceSelectorRequirement {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceQuotaStatus {
     /// Hard is the set of enforced hard limits for each named resource
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub hard: Option<HashMap<String, String>>,
 
     /// Used is the current observed total usage of the resource in the namespace
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub used: Option<HashMap<String, String>>,
 }
 
@@ -136,23 +148,43 @@ pub struct LimitRangeItem {
     pub item_type: String,
 
     /// Max usage constraints on this kind by resource name
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub max: Option<HashMap<String, String>>,
 
     /// Min usage constraints on this kind by resource name
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub min: Option<HashMap<String, String>>,
 
     /// Default resource requirement limit value by resource name if not specified
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub default: Option<HashMap<String, String>>,
 
     /// DefaultRequest is the default resource requirement request value by resource name if not specified
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub default_request: Option<HashMap<String, String>>,
 
     /// MaxLimitRequestRatio represents the max burst value for the named resource
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub max_limit_request_ratio: Option<HashMap<String, String>>,
 }
 

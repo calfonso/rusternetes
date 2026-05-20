@@ -235,14 +235,107 @@ pub struct LabelSelectorRequirement {
     pub values: Option<Vec<String>>,
 }
 
+/// Tolerant deserializer for `HashMap<String, String>` maps whose
+/// values represent Kubernetes `resource.Quantity` wire-form values.
+///
+/// Upstream `Quantity` round-trips as a JSON string (`"100m"`, `"1Gi"`),
+/// but the Go marshaller routes values through `inf.Dec` and several
+/// code paths emit a bare JSON number rather than a quoted string —
+/// notably zero-valued quantities defaulted from `int64` fields, and
+/// some legacy clients. K8s' Go deserialiser tolerates all three forms
+/// (`UnmarshalJSON` in `pkg/api/resource/quantity.go`).
+///
+/// Our previous plain `HashMap<String, String>` deserialiser rejected
+/// every pod-update body that carried a numeric `0` in
+/// `containers[*].resources.{requests,limits}` (column 942 of the
+/// canonical service-account-injected pod body). This function accepts
+/// `String`, integer, and float JSON values and renders each into the
+/// canonical string form so existing string-typed maps round-trip
+/// without forcing every caller to switch to a newtype.
+pub fn deserialize_quantity_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct OuterVisitor;
+    impl<'de> Visitor<'de> for OuterVisitor {
+        type Value = Option<HashMap<String, String>>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("null or a map<string, Quantity>")
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2>(self, d: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            d.deserialize_map(InnerVisitor).map(Some)
+        }
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            InnerVisitor.visit_map(map).map(Some)
+        }
+    }
+
+    struct InnerVisitor;
+    impl<'de> Visitor<'de> for InnerVisitor {
+        type Value = HashMap<String, String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map<string, Quantity>")
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = HashMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let v: serde_json::Value = map.next_value()?;
+                let s = match v {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Null => continue,
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "Quantity value must be a string or number, got {}",
+                            other
+                        )));
+                    }
+                };
+                out.insert(key, s);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_option(OuterVisitor)
+}
+
 /// Resource requirements for compute resources
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRequirements {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_quantity_map"
+    )]
     pub limits: Option<HashMap<String, String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_quantity_map"
+    )]
     pub requests: Option<HashMap<String, String>>,
 
     /// Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container
