@@ -109,10 +109,10 @@ pub struct PodSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "hostPID", skip_serializing_if = "Option::is_none")]
     pub host_pid: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "hostIPC", skip_serializing_if = "Option::is_none")]
     pub host_ipc: Option<bool>,
 
     /// Affinity rules for pod scheduling

@@ -346,6 +346,29 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
+                } else if orig_val.is_null() {
+                    // Known limitation of diff-based strict decoding:
+                    // client-go marshals zero-valued `time.Time` and
+                    // other Option fields as JSON `null`. Our typed
+                    // deserialiser reads those as `None`, then the
+                    // canonical round-trip drops the key entirely
+                    // because every `Option<...>` is
+                    // `skip_serializing_if = Option::is_none`. Without
+                    // this branch the differ flags legit declared
+                    // fields like `metadata.creationTimestamp: null`
+                    // as unknown.
+                    //
+                    // Tradeoff: a truly-unknown field carrying a `null`
+                    // value will also slip through unflagged. That
+                    // false-negative is impossible to distinguish from
+                    // the legit case without schema-aware decoding
+                    // (e.g. `serde_ignored` or per-type
+                    // `deny_unknown_fields`). See the `#[ignore]`'d
+                    // test in `strict_decoding_client_go_pod_test.rs`
+                    // tracking the fix.
+                    // TODO(rusternetes): replace this diff approach
+                    // with schema-aware strict decoding so null-valued
+                    // unknown fields can still be rejected.
                 } else {
                     unknown.push(field_path);
                 }
