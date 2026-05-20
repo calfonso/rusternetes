@@ -71,10 +71,18 @@ pub struct Taint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatus {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub capacity: Option<HashMap<String, String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub allocatable: Option<HashMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
