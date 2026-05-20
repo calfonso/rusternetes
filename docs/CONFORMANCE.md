@@ -2,6 +2,8 @@
 
 Rusternetes is a from-scratch Rust reimplementation of Kubernetes. This document tracks conformance testing progress against the official Kubernetes v1.35 e2e conformance suite.
 
+> **Faster signal for kubelet-only regressions:** see [`docs/NODE_CONFORMANCE.md`](NODE_CONFORMANCE.md) — a single-kubelet harness that runs the `[NodeConformance]`-tagged subset in minutes, scoped to catch kubelet bugs without scheduler / controller-manager / kube-proxy noise.
+
 ## Conformance Test Results
 
 We run the official Kubernetes conformance test suite (441 tests) via Sonobuoy against a Rusternetes cluster running on Docker Desktop.

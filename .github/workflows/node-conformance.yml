@@ -1,0 +1,73 @@
+name: Node Conformance
+
+# Kubelet-scoped conformance harness. Runs upstream e2e.test with the
+# [NodeConformance] focus against a single-node compose stack.
+# See docs/NODE_CONFORMANCE.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: "Ginkgo focus expression"
+        required: false
+        default: '\[NodeConformance\]'
+      k8s_version:
+        description: "Upstream Kubernetes test tarball version"
+        required: false
+        default: "v1.35.0"
+  schedule:
+    # 03:00 UTC nightly. Self-hosted runner; respects the project's GH Actions
+    # minute budget (see project memory `project_github_actions_minute_budget`).
+    - cron: "0 3 * * *"
+
+jobs:
+  node-conformance:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Tool prereqs (fail fast on missing — no apt-get install)
+        # Per project convention: self-hosted runner does not get sudo / apt-get
+        # access. Surface missing tools immediately with a clear error.
+        run: |
+          set -euo pipefail
+          for t in docker jq curl tar; do
+              command -v "$t" >/dev/null 2>&1 || { echo "missing required tool: $t"; exit 1; }
+          done
+
+      - name: Clone rhino adjacent to repo
+        # rusternetes/Cargo.toml's `sqlite` feature pulls rhino in as a path
+        # dep at ../../../rhino. Without it `cargo metadata` (used by the
+        # runner script's build step) fails.
+        run: |
+          if [ ! -d ../rhino ]; then
+            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+          else
+            echo "rhino already present at ../rhino"
+          fi
+
+      - name: Generate TLS certificates
+        run: bash scripts/generate-certs.sh
+
+      - name: Run node conformance
+        env:
+          CONTAINER_RUNTIME: docker
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
+          FOCUS: ${{ github.event.inputs.focus || '\[NodeConformance\]' }}
+          K8S_VERSION: ${{ github.event.inputs.k8s_version || 'v1.35.0' }}
+        run: bash scripts/run-node-conformance.sh
+
+      - name: Upload ginkgo log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-conformance-log-${{ github.run_id }}
+          path: /tmp/node-conformance/ginkgo.log
+          if-no-files-found: warn
+
+      - name: Tear down stack
+        if: always()
+        run: |
+          docker compose -f compose.node-conformance.yml down -v --remove-orphans || true
