@@ -189,14 +189,27 @@ jobs:
       - name: Wait for api-server health
         timeout-minutes: 3
         run: |
-          # Don't swallow kubectl stderr — if kubectl errors (missing
-          # binary, bad kubeconfig, connection refused) the loop must
-          # surface that in the workflow log instead of silently spinning.
-          until kubectl get --raw=/healthz 2>&1 | grep -q ok; do
-            echo "waiting for api-server..."
+          # Earlier loop piped kubectl through `grep -q ok`, which swallowed
+          # every stderr line (run 26147385703 — 3 min of "waiting" with no
+          # diagnostic). Surface the actual kubectl output each iteration so
+          # the failure mode (TLS, refused, no route) is visible in the log.
+          for i in $(seq 1 90); do
+            OUT=$(kubectl get --raw=/healthz 2>&1)
+            RC=$?
+            if [ "$RC" -eq 0 ] && echo "$OUT" | grep -q ok; then
+              echo "api-server healthy after ${i} attempts: $OUT"
+              kubectl get nodes
+              exit 0
+            fi
+            printf '[%02d] kubectl rc=%d: %s\n' "$i" "$RC" "$OUT"
             sleep 2
           done
-          kubectl get nodes
+          echo "api-server never became healthy — dumping diagnostics:"
+          docker compose -f compose.yml -f compose.dind.yml ps || true
+          docker compose -f compose.yml -f compose.dind.yml logs --tail=50 api-server || true
+          curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
+          curl -kv --max-time 5 https://localhost:6443/healthz || true
+          exit 1
 
       - name: Bootstrap cluster (CoreDNS, services, SA tokens)
         run: bash scripts/bootstrap-cluster.sh
