@@ -756,7 +756,6 @@ async fn test_rolebinding_strategy_subjects_update_allowed() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: RoleBinding roleRef immutability not enforced on update"]
 async fn test_rolebinding_strategy_role_ref_immutable() {
     // Upstream `pkg/registry/rbac/rolebinding/strategy.go::ValidateUpdate`
     // checks `apivalidation.ValidateImmutableField(newRoleBinding.RoleRef, …)`.
@@ -810,7 +809,6 @@ async fn test_rolebinding_strategy_role_ref_immutable() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ClusterRoleBinding roleRef immutability not enforced on update"]
 async fn test_clusterrolebinding_strategy_role_ref_immutable() {
     let (_mem, router) = spawn_router();
 
