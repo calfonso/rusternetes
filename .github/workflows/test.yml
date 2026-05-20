@@ -13,19 +13,18 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Both jobs run on the custom ARC image (ci/arc-runner/Dockerfile),
-# which ships the Rust toolchain (clippy + rustfmt), cargo-nextest, and
-# the system build deps (protoc + libprotobuf-dev, mold + clang,
-# pkg-config + libssl-dev). They share an anchor block so the
-# repeated setup (checkout, rhino clone, mold enable, rust-cache) stays
-# in lock-step.
+# Both jobs run on self-hosted ARC scale sets that ship the Rust
+# toolchain (clippy + rustfmt), cargo-nextest, and the system build
+# deps (protoc + libprotobuf-dev, mold + clang, pkg-config + libssl-dev).
+# They share an anchor block so the repeated setup (checkout, rhino
+# clone, mold enable, rust-cache) stays in lock-step.
 #
 # Memory budget differs per job, so each picks a differently-sized ARC
 # scale set:
-#   - `arc-runner-set`       — 8Gi/2cpu, for nextest (peaks near 8 GiB)
-#   - `arc-runner-set-small` — 512Mi/500m, for clippy (~250 MiB peak)
+#   - `arc-runner-set`       — large tier, for nextest (peaks near 8 GiB)
+#   - `arc-runner-set-small` — light tier, for clippy (~250 MiB peak)
 # Both scale sets share one runner image; only the pod resource
-# requests differ. See ci/arc-runner/values-{large,small}.yaml.
+# requests differ. The cluster + helm values are maintained out-of-tree.
 jobs:
   nextest:
     name: cargo nextest
@@ -78,9 +77,8 @@ jobs:
   clippy:
     name: cargo clippy
     # Clippy peaks at ~250 MiB resident, so it runs on the light-tier
-    # scale set (512Mi/500m request) defined by
-    # ci/arc-runner/values-small.yaml. Nextest stays on `arc-runner-set`
-    # (8Gi/2cpu) because its workspace test peaks hit ~8 GiB.
+    # `arc-runner-set-small` scale set. Nextest stays on `arc-runner-set`
+    # because its workspace test peaks hit ~8 GiB.
     runs-on: arc-runner-set-small
     steps:
       - name: Checkout repository
