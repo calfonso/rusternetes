@@ -26,16 +26,56 @@ pub async fn create(
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, Json<Pod>)> {
-    // Parse the body manually so we can do strict field validation against the raw bytes
-    let mut pod: Pod = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+) -> Result<(StatusCode, HeaderMap, Json<Pod>)> {
+    // Parse the body manually so we can do strict field validation against the
+    // raw bytes. In strict mode (now the K8s 1.25+ default) serde_json will
+    // reject duplicate keys outright — fall back to a lenient Value parse so
+    // validate_strict_fields can report the duplicate in the canonical
+    // `strict decoding error: duplicate field "..."` shape rather than a raw
+    // serde error.
+    let is_lenient = matches!(
+        crate::handlers::validation::FieldValidationMode::from_query(&params),
+        crate::handlers::validation::FieldValidationMode::Warn
+            | crate::handlers::validation::FieldValidationMode::Ignore
+    );
+    let mut pod: Pod = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("duplicate field") {
+                // Re-parse via Value (lenient — takes last duplicate) so the
+                // strict-decode error path can synthesize a parity-shaped
+                // message that names every duplicate.
+                let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e2| {
+                    rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
+                })?;
+                serde_json::from_value(value).map_err(|e2| {
+                    rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
+                })?
+            } else if is_lenient {
+                // Warn / Ignore mode: even ordinary decode failures shouldn't
+                // mask the user's intent — but if the body is unparseable we
+                // can't continue at all, so still error.
+                return Err(rusternetes_common::Error::BadRequest(format!(
+                    "failed to decode: {}",
+                    msg
+                )));
+            } else {
+                return Err(rusternetes_common::Error::BadRequest(format!(
+                    "failed to decode: {}",
+                    msg
+                )));
+            }
+        }
+    };
 
     info!("Creating pod: {}/{}", namespace, pod.metadata.name);
 
-    // Strict field validation: reject unknown fields when requested
-    crate::handlers::validation::validate_strict_fields(&params, &body, &pod)?;
+    // Strict field validation: reject unknown fields when requested. Warn
+    // mode returns one warning string per unknown field; the handler turns
+    // those into `Warning: 299 - "..."` response headers below.
+    let warnings = crate::handlers::validation::validate_strict_fields(&params, &body, &pod)?;
+    let response_headers = build_warning_headers(&warnings);
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -592,7 +632,7 @@ pub async fn create(
             "Dry-run: Pod {}/{} validated successfully (not created)",
             namespace, pod.metadata.name
         );
-        return Ok((StatusCode::CREATED, Json(pod)));
+        return Ok((StatusCode::CREATED, response_headers, Json(pod)));
     }
 
     match state.storage.create(&key, &pod).await {
@@ -601,7 +641,7 @@ pub async fn create(
                 "Pod created successfully: {}/{}",
                 namespace, pod.metadata.name
             );
-            Ok((StatusCode::CREATED, Json(created)))
+            Ok((StatusCode::CREATED, response_headers, Json(created)))
         }
         Err(e) => {
             warn!(
@@ -611,6 +651,20 @@ pub async fn create(
             Err(e)
         }
     }
+}
+
+/// Convert the `validate_strict_fields` warning strings into a `HeaderMap`
+/// holding RFC 7234 `Warning: 299 - "..."` entries. Empty input → empty map,
+/// which keeps response shape identical for non-Warn callers.
+fn build_warning_headers(warnings: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for warning in warnings {
+        let value = crate::handlers::validation::format_warning_header(warning);
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&value) {
+            headers.append(axum::http::header::WARNING, hv);
+        }
+    }
+    headers
 }
 
 pub async fn get(

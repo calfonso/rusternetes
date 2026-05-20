@@ -340,11 +340,9 @@ async fn test_field_validation_strict_deployment_duplicate_field_rejected() {
 
 #[tokio::test]
 async fn test_field_validation_strict_status_body_reason_invalid() {
-    // Upstream returns a Status object with reason = "BadRequest" (HTTP 400).
-    // Rusternetes routes strict-decode errors through `Error::InvalidResource`
-    // which produces reason = "Invalid" (HTTP 422). Pin the *actual* contract
-    // so any future change is intentional — and document the upstream-parity
-    // gap explicitly inline.
+    // After unit #7 fixed the strict-decode status mapping, rusternetes now
+    // matches upstream: HTTP 400 with reason=BadRequest. Test name preserved
+    // for blame history; behaviour asserts the post-fix contract.
     let (_mem, router) = spawn_router();
     let mut stub = pod_stub("pod-status-shape");
     stub["spec"]["bogus"] = json!("x");
@@ -354,22 +352,17 @@ async fn test_field_validation_strict_status_body_reason_invalid() {
 
     assert_eq!(
         status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "rusternetes currently returns 422 for strict decode failures"
+        StatusCode::BAD_REQUEST,
+        "strict decode failures must map to HTTP 400 per upstream parity"
     );
     assert_eq!(body["kind"], "Status");
     assert_eq!(body["apiVersion"], "v1");
     assert_eq!(body["status"], "Failure");
-    assert_eq!(
-        body["reason"], "Invalid",
-        "rusternetes uses reason=Invalid; upstream uses BadRequest (issue #TBD)"
-    );
-    assert_eq!(body["code"], 422);
+    assert_eq!(body["reason"], "BadRequest");
+    assert_eq!(body["code"], 400);
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: rusternetes returns HTTP 422 reason=Invalid for strict \
-            decode failures; upstream k8s 1.35 returns HTTP 400 reason=BadRequest"]
 async fn test_field_validation_strict_returns_400_badrequest_upstream_parity() {
     let (_mem, router) = spawn_router();
     let mut stub = pod_stub("pod-upstream-parity");
@@ -415,8 +408,6 @@ async fn test_field_validation_warn_pod_unknown_field_accepted() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: Warn mode does not emit Warning: 299 headers \
-            (validate_strict_fields short-circuits for non-Strict modes)"]
 async fn test_field_validation_warn_pod_emits_warning_header() {
     let (_mem, router) = spawn_router();
     let mut stub = pod_stub("pod-warn-header");
@@ -526,35 +517,27 @@ async fn test_field_validation_ignore_deployment_unknown_field_silently_accepted
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_field_validation_default_pod_unknown_field_currently_accepted() {
-    // Pin rusternetes's *current* default behaviour: with no fieldValidation
-    // query param, the validator short-circuits at validation.rs:378-380 and
-    // unknown fields are silently dropped. This matches kubectl pre-1.25 and
-    // upstream's `Ignore` mode, NOT the modern server-side default of Strict.
+async fn test_field_validation_default_pod_clean_body_accepted() {
+    // After unit #7 flipped the default to Strict, the no-param + clean-body
+    // path must still succeed. This is the regression guard for the default
+    // change: only *unknown* fields should be rejected, valid bodies pass
+    // through.
     let (_mem, router) = spawn_router();
-    let mut stub = pod_stub("pod-default");
-    stub["spec"]["bogusField"] = json!("nope");
+    let stub = pod_stub("pod-default-clean");
     let uri = pod_uri();
 
     let (status, _hdrs, body) = send_json(router, Method::POST, &uri, &stub).await;
 
     assert!(
         status.is_success(),
-        "current default is non-strict; expected 2xx, got {}: body={}",
+        "clean body must succeed under default-Strict; got {}: body={}",
         status,
         body
     );
-    assert!(
-        body["spec"].get("bogusField").is_none(),
-        "unknown field is dropped: {}",
-        body["spec"]
-    );
+    assert_eq!(body["metadata"]["name"], "pod-default-clean");
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: default fieldValidation should be Strict per K8s 1.35; \
-            rusternetes currently defaults to Ignore (validate_strict_fields short-circuits \
-            on missing param)"]
 async fn test_field_validation_default_pod_unknown_field_rejected_k8s_1_35() {
     let (_mem, router) = spawn_router();
     let mut stub = pod_stub("pod-default-strict");

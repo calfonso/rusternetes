@@ -11,6 +11,15 @@ pub enum Error {
     #[error("Invalid resource: {0}")]
     InvalidResource(String),
 
+    /// Generic bad-request error mapped to HTTP 400 / reason=BadRequest.
+    ///
+    /// Upstream Kubernetes uses 400/BadRequest for strict-decode errors and
+    /// other "client supplied a syntactically malformed request" cases. Use
+    /// `InvalidResource` instead when the request parses cleanly but fails a
+    /// field-level validator (that maps to 422/Invalid).
+    #[error("Bad request: {0}")]
+    BadRequest(String),
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
@@ -55,6 +64,7 @@ impl Error {
             Error::NotFound(_) => "NotFound",
             Error::AlreadyExists(_) => "AlreadyExists",
             Error::InvalidResource(_) => "Invalid",
+            Error::BadRequest(_) => "BadRequest",
             Error::Serialization(_) => "BadRequest",
             Error::Storage(_) => "InternalError",
             Error::Network(_) => "ServiceUnavailable",
@@ -106,6 +116,11 @@ impl axum::response::IntoResponse for Error {
                 let details = extract_resource_details_for_invalid(&msg);
                 (StatusCode::UNPROCESSABLE_ENTITY, msg, "Invalid", details)
             }
+            // Mirrors upstream k8s apimachinery/pkg/api/errors/errors.go:
+            // strict decoding errors and other syntactic / client-malformed
+            // requests return HTTP 400 with reason=BadRequest (NOT 422/Invalid,
+            // which is reserved for semantic field-validation errors).
+            Error::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg, "BadRequest", None),
             Error::Authentication(msg) => (StatusCode::UNAUTHORIZED, msg, "Unauthorized", None),
             Error::Authorization(msg) => (StatusCode::FORBIDDEN, msg, "Forbidden", None),
             Error::Forbidden(msg) => (StatusCode::FORBIDDEN, msg, "Forbidden", None),
