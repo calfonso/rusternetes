@@ -8,10 +8,8 @@
 #           git worktree of rusternetes).
 #
 # Layout:
-#   /tmp/rusternetes-agent-N/sock/docker.sock   ← dind's dockerd sock
-#   /tmp/rusternetes-agent-N/data/              ← dind's /var/lib/docker
 #   ${AGENT_WORKDIR}/.rusternetes/agents/N/     ← kubeconfig, logs, results
-#   127.0.0.1:1644N                             ← agent's api-server
+#   127.0.0.1:1644N                             ← agent's api-server (host-published)
 #
 # Re-running for an already-up agent is a no-op (idempotent).
 
@@ -25,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=conformance-agent-common.sh
 source "${SCRIPT_DIR}/conformance-agent-common.sh"
 
-mkdir -p "$AGENT_ARTIFACT_DIR" "$AGENT_RESULTS_DIR" "$DIND_SOCK_DIR" "$DIND_DATA_DIR"
+mkdir -p "$AGENT_ARTIFACT_DIR" "$AGENT_RESULTS_DIR"
 exec > >(tee -a "$AGENT_LOG") 2>&1
 
 agent_banner "workdir=${AGENT_WORKDIR} host-port=${API_HOST_PORT} dind=${DIND_NAME}"
@@ -45,8 +43,6 @@ else
     --name "$DIND_NAME" \
     --privileged \
     -p "127.0.0.1:${API_HOST_PORT}:6443" \
-    -v "${DIND_SOCK_DIR}:/var/run" \
-    -v "${DIND_DATA_DIR}:/var/lib/docker" \
     -v "${AGENT_WORKDIR}:/workspace" \
     -v "${AGENT_IMAGES_TAR}:/images.tar:ro" \
     "$DIND_IMAGE" \
@@ -96,27 +92,38 @@ agent_banner "generating TLS certs"
 docker exec -w /workspace "$DIND_NAME" bash scripts/generate-certs.sh
 
 # --- bring up the cluster ----------------------------------------------------
+# Pin COMPOSE_PROJECT_NAME=rusternetes so compose looks up the loaded
+# image tags as `rusternetes-<service>:latest`. Without it, compose
+# falls back to the workdir basename (`workspace-…`) and "no such image"
+# fails the up step.
 agent_banner "compose up"
 docker exec -w /workspace \
-  -e KUBELET_VOLUMES_PATH=/workspace/.rusternetes/volumes \
+  -e COMPOSE_PROJECT_NAME=rusternetes \
+  -e KUBELET_VOLUMES_PATH=/workspace/.rusternetes/agents/${AGENT_ID}/kubelet-volumes \
   "$DIND_NAME" \
   docker compose -f compose.yml -f compose.dind.yml up -d --no-build
 
 # --- wait for api-server healthz ---------------------------------------------
-# Inside dind, api-server is reachable on its compose service alias.
+# Check the HTTP status code, not the body. PRE-#182 api-server returns
+# 200 with content-length: 0 on /healthz; after #182 it returns "ok".
+# Either is fine for "is the server listening and serving"; status code
+# alone is the durable contract.
 agent_banner "waiting for api-server healthz"
 for i in $(seq 1 90); do
-  out=$(docker exec "$DIND_NAME" \
-    curl -ks --max-time 3 https://localhost:6443/healthz 2>&1 || true)
-  if [[ "$out" == "ok" ]]; then
-    agent_banner "api-server healthy after ${i} attempts"
+  code=$(docker exec "$DIND_NAME" \
+    curl -ks --max-time 3 -o /dev/null -w '%{http_code}' \
+    https://localhost:6443/healthz 2>/dev/null || echo 000)
+  if [[ "$code" == "200" ]]; then
+    agent_banner "api-server healthy after ${i} attempts (HTTP ${code})"
     break
   fi
   if [[ $i -eq 90 ]]; then
-    echo "api-server never returned 'ok' on /healthz" >&2
-    docker exec -w /workspace "$DIND_NAME" \
+    echo "api-server never returned 200 on /healthz (last: ${code})" >&2
+    docker exec -w /workspace \
+      -e COMPOSE_PROJECT_NAME=rusternetes "$DIND_NAME" \
       docker compose -f compose.yml -f compose.dind.yml ps >&2 || true
-    docker exec -w /workspace "$DIND_NAME" \
+    docker exec -w /workspace \
+      -e COMPOSE_PROJECT_NAME=rusternetes "$DIND_NAME" \
       docker compose -f compose.yml -f compose.dind.yml logs --tail=80 api-server >&2 || true
     exit 1
   fi

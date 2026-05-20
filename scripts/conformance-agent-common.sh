@@ -34,11 +34,12 @@ fi
 AGENT_CACHE_DIR="${AGENT_CACHE_DIR:-${HOME}/.cache/rusternetes-conformance-agents}"
 AGENT_IMAGES_TAR="${AGENT_CACHE_DIR}/images.tar"
 
-# Per-agent runtime state on the host.
-AGENT_RUNTIME_DIR="/tmp/rusternetes-agent-${AGENT_ID}"
-DIND_SOCK_DIR="${AGENT_RUNTIME_DIR}/sock"
-DIND_DATA_DIR="${AGENT_RUNTIME_DIR}/data"
-DIND_SOCK="${DIND_SOCK_DIR}/docker.sock"
+# dind keeps its dockerd state (/var/lib/docker) and runtime sockets
+# (/var/run/{docker,containerd}.sock) INSIDE the container. We don't
+# bind-mount either: the image tarball is reloaded every up so caching
+# /var/lib/docker buys nothing, and root-owned sockets in a /tmp bind
+# mount can only be cleaned with sudo. All host-side interaction goes
+# through `docker exec ${DIND_NAME} ...` instead of a bind-mounted sock.
 
 # Per-agent artefacts inside the workdir (so /batch worktrees pick them up).
 AGENT_ARTIFACT_DIR="${AGENT_WORKDIR}/.rusternetes/agents/${AGENT_ID}"
@@ -49,11 +50,6 @@ AGENT_LOG="${AGENT_ARTIFACT_DIR}/up.log"
 DIND_NAME="rusternetes-agent-${AGENT_ID}-dind"
 DIND_IMAGE="docker:28-dind"
 API_HOST_PORT=$((16443 + AGENT_ID))
-
-# Run a command inside this agent's dind via its sock.
-agent_docker() {
-  docker --host "unix://${DIND_SOCK}" "$@"
-}
 
 # Run an arbitrary shell command inside the dind container (not inside
 # a container the dind has launched — inside the dind itself).
@@ -68,6 +64,5 @@ agent_banner() {
 }
 
 export AGENT_ID AGENT_WORKDIR AGENT_CACHE_DIR AGENT_IMAGES_TAR
-export AGENT_RUNTIME_DIR DIND_SOCK_DIR DIND_DATA_DIR DIND_SOCK
 export AGENT_ARTIFACT_DIR AGENT_KUBECONFIG AGENT_RESULTS_DIR AGENT_LOG
 export DIND_NAME DIND_IMAGE API_HOST_PORT
