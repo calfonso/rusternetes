@@ -1,9 +1,36 @@
 use crate::auth::UserInfo;
 use crate::error::Result;
-use crate::resources::rbac::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding};
+use crate::resources::rbac::{
+    ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject,
+};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
+
+/// Subject ↔ user matcher mirroring upstream
+/// `pkg/registry/rbac/validation/rule.go` `appliesTo`:
+///   * `User`           — `subject.name == user.username`
+///   * `Group`          — `user.groups.contains(subject.name)`
+///   * `ServiceAccount` — `user.username == "system:serviceaccount:<ns>:<name>"`,
+///     where `<ns>` is `subject.namespace` and `<name>` is `subject.name`.
+///
+/// Defensive default for unknown `kind`: plain-name equality so existing
+/// integration tests that synthesize subjects without a `kind` keep working.
+fn subject_matches(subject: &Subject, user: &UserInfo) -> bool {
+    match subject.kind.as_str() {
+        "User" => subject.name == user.username,
+        "Group" => user.groups.contains(&subject.name),
+        "ServiceAccount" => {
+            let ns = subject.namespace.as_deref().unwrap_or("");
+            if ns.is_empty() {
+                return false;
+            }
+            let expected = format!("system:serviceaccount:{}:{}", ns, subject.name);
+            user.username == expected
+        }
+        _ => subject.name == user.username || user.groups.contains(&subject.name),
+    }
+}
 
 /// Minimal storage trait for authorization (to avoid circular dependency)
 #[async_trait]
@@ -194,7 +221,13 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         ))
     }
 
-    /// Get all RoleBindings that apply to the user
+    /// Get all RoleBindings that apply to the user.
+    ///
+    /// Subject matching mirrors upstream `pkg/registry/rbac/validation/rule.go`:
+    ///   * `User`            — `subject.name == user.username`
+    ///   * `Group`           — `user.groups.contains(subject.name)`
+    ///   * `ServiceAccount`  — `user.username == "system:serviceaccount:<ns>:<name>"`
+    ///     where `<ns>` is `subject.namespace` and `<name>` is `subject.name`.
     async fn get_user_role_bindings(&self, attrs: &RequestAttributes) -> Result<Vec<RoleBinding>> {
         let all_bindings = match &attrs.namespace {
             Some(ns) => self.storage.list::<RoleBinding>(Some(ns)).await?,
@@ -204,9 +237,10 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         Ok(all_bindings
             .into_iter()
             .filter(|binding| {
-                binding.subjects.iter().any(|subject| {
-                    subject.name == attrs.user.username || attrs.user.groups.contains(&subject.name)
-                })
+                binding
+                    .subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, &attrs.user))
             })
             .collect())
     }
@@ -221,9 +255,10 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         Ok(all_bindings
             .into_iter()
             .filter(|binding| {
-                binding.subjects.iter().any(|subject| {
-                    subject.name == attrs.user.username || attrs.user.groups.contains(&subject.name)
-                })
+                binding
+                    .subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, &attrs.user))
             })
             .collect())
     }
@@ -310,9 +345,10 @@ impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
         // Process namespace-scoped role bindings
         for binding in role_bindings {
             // Check if this binding applies to the user
-            let applies = binding.subjects.iter().any(|subject| {
-                subject.name == user.username || user.groups.contains(&subject.name)
-            });
+            let applies = binding
+                .subjects
+                .iter()
+                .any(|subject| subject_matches(subject, user));
 
             if !applies {
                 continue;
@@ -363,9 +399,10 @@ impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
 
         // Process cluster-scoped role bindings
         for binding in cluster_role_bindings {
-            let applies = binding.subjects.iter().any(|subject| {
-                subject.name == user.username || user.groups.contains(&subject.name)
-            });
+            let applies = binding
+                .subjects
+                .iter()
+                .any(|subject| subject_matches(subject, user));
 
             if !applies {
                 continue;

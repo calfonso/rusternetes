@@ -2395,7 +2395,8 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             ))
             .layer(axum_middleware::from_fn(middleware::auth_middleware))
             .layer(Extension(state.token_manager.clone()))
-            .layer(Extension(state.bootstrap_token_manager.clone()));
+            .layer(Extension(state.bootstrap_token_manager.clone()))
+            .layer(Extension(state.storage.clone()));
     }
 
     // Combine routes and add shared state.
