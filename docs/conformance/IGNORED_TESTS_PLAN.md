@@ -240,13 +240,13 @@ Complexity: **small–medium**.
 - Upstream: `[sig-node] Pods should support retrieving logs from the container over websockets` (`pods.go:583`)
 - Sonobuoy Round 160: **FAIL** — log endpoint sends plain text instead of channel-prefixed binary frames.
 
-**[ ] Layer A**
-1. Generalise the binary framer in `crates/api-server/src/streaming.rs` (currently exec-specific) so it can wrap log output with channel 1 = stdout.
-2. Switch the `get_logs()` websocket branch in `pod_subresources.rs:204–214` to the new framer.
-3. Verify the `binary.k8s.io` (or equivalent) subprotocol is negotiated.
+**[x] Layer A** (landed)
+1. Added `streaming::frame_channel(channel, payload)` and `streaming::handle_ws_logs(socket, logs)` in `crates/api-server/src/streaming.rs`. The framer prepends a single channel byte (1 = stdout) to the payload, matching the same wire format the exec handler already uses for output frames.
+2. `get_logs()` (`pod_subresources.rs:204`) now calls `handle_ws_logs` instead of `Message::Text`, and offers `v4.channel.k8s.io` / `v5.channel.k8s.io` / `channel.k8s.io` / `binary.k8s.io` subprotocols on the upgrade.
+3. Verified end-to-end by `handle_ws_logs_sends_channel_one_binary_frame` in `crates/api-server/tests/exec_websocket_test.rs` — round-trips a real WebSocket and asserts `data[0] == 1`, payload equality, no `Message::Text` emitted, clean 1000 close.
 
-**[ ] Layer B**
-- Assert the query string contains `container=<name>` exactly once and that the websocket emits framed binary output on channel 1.
+**[x] Layer B** (landed)
+- `pod_log_over_websocket_query_is_container_only` now asserts the upstream URL shape: exactly one `container=<name>` query parameter, no extras (`follow` / `tailLines` / `sinceSeconds` / `previous` / `timestamps`). `#[ignore]` dropped.
 
 Complexity: **small–medium**.
 

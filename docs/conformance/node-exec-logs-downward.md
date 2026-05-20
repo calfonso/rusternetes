@@ -55,7 +55,7 @@ methods, so the conformance test does not need to spin up a Docker runtime.
 | `Downward API volume should provide container's cpu/memory request` | downwardapi_volume.go:219,232 | PASS | `downward_api_volume_provides_container_cpu_and_memory_requests` | mirrored, passing |
 | `Downward API volume default cpu limit from node allocatable` | downwardapi_volume.go:245 | PASS | `downward_api_volume_defaults_cpu_to_node_allocatable_when_no_limit` | mirrored, passing |
 | `Pods should support remote command execution over websockets` | pods.go:517 | FAIL | `pod_exec_over_websocket_query_format_matches_upstream` | mirrored, ignored (tracks failure) |
-| `Pods should support retrieving logs from the container over websockets` | pods.go:583 | FAIL | `pod_log_over_websocket_query_is_container_only` | mirrored, ignored (tracks failure) |
+| `Pods should support retrieving logs from the container over websockets` | pods.go:583 | FAIL | `pod_log_over_websocket_query_is_container_only` | mirrored, passing (api-server now sends channel-1 binary frames) |
 | `Pods should print the output to logs` | kubelet.go:58 | PASS | `pod_terminated_state_for_log_lookup_propagates_exit_code` | mirrored, passing |
 | `Pods should have a terminated reason` | kubelet.go:90 | PASS | `pod_terminated_state_surfaces_nonzero_exit_with_error_reason` | mirrored, passing |
 

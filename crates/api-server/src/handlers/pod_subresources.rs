@@ -200,18 +200,30 @@ pub async fn get_logs(
         }
     };
 
-    // If WebSocket upgrade requested, send logs over WebSocket
+    // If WebSocket upgrade requested, send logs as the upstream Kubernetes
+    // log-subresource websocket subprotocols expect.
+    //
+    // Logs are a single read-only byte stream, so the canonical subprotocols
+    // are `binary.k8s.io` (raw bytes — the exact bytes written to the stream,
+    // no channel byte prefix) and `base64.binary.k8s.io` (base64-encoded raw).
+    // The multi-stream `channel.k8s.io` / `v4.channel.k8s.io` /
+    // `v5.channel.k8s.io` family is reserved for exec / attach, where
+    // stdin/stdout/stderr/err/resize need to be multiplexed onto one socket.
+    //
+    // Upstream's `Pods should support retrieving logs from the container over
+    // websockets` test (pods.go:583) negotiates ONLY `binary.k8s.io` and
+    // asserts the accumulated bytes equal the raw log payload — a channel-1
+    // prefix would corrupt the first byte and fail the assertion.
+    //
+    // K8s ref: pkg/registry/core/pod/rest/log.go (LogREST) +
+    //          staging/.../wsstream/stream.go (binaryWebSocketProtocol).
     if let Some(ws) = ws {
         let logs_clone = logs.clone();
-        Ok(ws.on_upgrade(move |mut socket| async move {
-            use axum::extract::ws::Message;
-            // Send logs as a text message
-            if let Err(e) = socket.send(Message::Text(logs_clone)).await {
-                info!("Failed to send logs over WebSocket: {}", e);
-            }
-            // Close the WebSocket
-            let _ = socket.close().await;
-        }))
+        Ok(ws
+            .protocols(["binary.k8s.io", "base64.binary.k8s.io"])
+            .on_upgrade(move |socket| async move {
+                streaming::handle_ws_logs(socket, logs_clone).await;
+            }))
     } else {
         Ok(Response::builder()
             .status(StatusCode::OK)
