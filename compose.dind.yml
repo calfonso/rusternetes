@@ -1,0 +1,46 @@
+# Compose override that points every container-runtime consumer at
+# /var/run/docker.sock (the standard docker daemon socket) instead of
+# /run/podman/podman.sock.
+#
+# Apply alongside compose.yml when running on a host whose container
+# runtime is Docker (not Podman) — most notably the GitHub Actions
+# self-hosted runners in ARC + the gha-runner-scale-set DinD sidecar,
+# which exposes its daemon at /var/run/docker.sock.
+#
+# Usage:
+#   docker compose -f compose.yml -f compose.dind.yml up -d
+#
+# When this file is loaded, compose merges its keys on top of compose.yml.
+# Both `volumes` and `environment` are list-typed: docker compose treats
+# list merges as concatenation, so the override entries take precedence
+# at the bollard / Docker SDK lookup level (last-wins for env vars,
+# duplicate volume targets resolve to the last-specified source).
+#
+# This is intentionally additive — nothing in the override is host-podman-
+# specific, so the file is safe to keep checked in and apply in any
+# docker-daemon environment.
+
+services:
+  api-server:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+  kubelet:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+  kubelet2:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+  kube-proxy:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock

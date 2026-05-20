@@ -1,0 +1,251 @@
+name: Conformance canary
+
+# A single focused Hydrophone conformance test run against a clean
+# rusternetes cluster brought up via `docker compose` inside the
+# `arc-runner-set-conformance` scale set (DinD-enabled).
+#
+# Purpose: prove the ARC → DinD → compose → bootstrap → hydrophone
+# pipeline end-to-end, and produce a per-PR regression signal for the
+# simplest known-passing upstream conformance test
+# (`[sig-node] Pods should be submitted and removed [NodeConformance]
+# [Conformance]` — Sonobuoy Round 160 PASS).
+#
+# Triggers:
+#   * workflow_dispatch — manual button on the Actions tab.
+#   * pull_request, BUT only when files this workflow actually depends
+#     on change (the workflow file itself, the helm values for the
+#     conformance scale set, the compose override, the bootstrap +
+#     run-conformance scripts). Keeps Actions minutes bounded — see
+#     CLAUDE.local.md "GH Actions minute budget tight" — yet still
+#     gives us an empirical test of the runner the first time this PR
+#     lands.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/conformance-canary.yml'
+      - 'ci/conformance/known-green.txt'
+      - 'scripts/conformance-canary-run.sh'
+      - 'scripts/bootstrap-cluster.sh'
+      - 'scripts/generate-certs.sh'
+      - 'compose.dind.yml'
+      - 'compose.yml'
+      - 'Dockerfile.services'
+      - 'crates/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/conformance-canary.yml'
+      - 'ci/conformance/known-green.txt'
+      - 'scripts/conformance-canary-run.sh'
+      - 'compose.dind.yml'
+
+env:
+  # The dind sidecar exposes the daemon at this canonical path; the
+  # compose.dind.yml override makes every rusternetes service use it.
+  DOCKER_HOST: unix:///var/run/docker.sock
+  # Pin Hydrophone to a known release so a tag-rename upstream doesn't
+  # silently break the workflow. The conformance image itself is pinned
+  # by `scripts/conformance-canary-run.sh` (defaults to v1.35.0).
+  HYDROPHONE_VERSION: v0.7.0
+
+jobs:
+  hydrophone:
+    name: hydrophone (focused canary)
+    # Targets the DinD-enabled scale set. If the scale set isn't
+    # deployed on the operator's cluster, this job will sit "queued"
+    # forever — operator install of the helm release is a manual
+    # one-off (not in this repo by design; see PR #191 policy).
+    runs-on: arc-runner-set-conformance
+    # 60 min from prior measurements: pre-#190 the conformance tier
+    # (3 cpu) compiled each of the five service Dockerfiles separately,
+    # ~40-50 min cold. Run 26126002894 timed out at the 30-min ceiling
+    # on the scheduler build. PR #190 (Dockerfile.services) consolidated
+    # those into one shared builder stage; the new steady-state cold
+    # build hasn't been measured yet, so keep 60 until we have a
+    # measurement to ratchet down to.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone rhino adjacent to repo
+        # Same pre-existing pattern as test.yml / fmt.yml — the storage
+        # crate's Cargo.toml references `path = "../../../rhino"` and
+        # compose.yml exposes that path as a named build context
+        # (`additional_contexts: rhino: ../rhino`). The clone MUST land
+        # at $GITHUB_WORKSPACE/../rhino which on the ARC runner is
+        # /home/runner/_work/rusternetes/rhino.
+        #
+        # No `||` swallow: a failed clone here means the compose build
+        # later fails with a confusing `failed to get build context
+        # rhino: stat ... no such file or directory` — fail loud at the
+        # source.
+        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+
+      - name: Confirm Docker daemon
+        run: |
+          docker version
+          docker info --format '{{ .ServerVersion }}'
+
+      - name: Ensure docker-compose v2 plugin
+        # The custom ARC runner image (ci/arc-runner/Dockerfile) bakes
+        # this plugin in, so on an up-to-date runner this step is a
+        # no-op (`docker compose version` succeeds). The fallback only
+        # exists for the chicken-and-egg window where this PR ships
+        # both the Dockerfile change AND the conformance workflow — if
+        # the runner pod is still on an older image (build-runner-image
+        # workflow hasn't published yet), download the plugin into the
+        # user-local plugin dir so the workflow still works. Once the
+        # new image lands and rolls out, this whole step can be deleted.
+        run: |
+          set -euo pipefail
+          if docker compose version >/dev/null 2>&1; then
+            echo "docker compose plugin already present:"
+            docker compose version
+            exit 0
+          fi
+          echo "docker compose plugin missing — installing fallback"
+          COMPOSE_VERSION="v2.30.3"
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+            -o "$HOME/.docker/cli-plugins/docker-compose"
+          chmod +x "$HOME/.docker/cli-plugins/docker-compose"
+          docker compose version
+
+      - name: Generate TLS certs
+        run: |
+          bash scripts/generate-certs.sh
+
+      - name: Set KUBELET_VOLUMES_PATH
+        run: |
+          echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/.rusternetes/volumes"
+
+      - name: Write kubeconfig
+        # The repo doesn't ship a kubeconfig — it's user-maintained
+        # locally at ~/.kube/rusternetes-config. Construct a minimal
+        # one for the runner. Inside the runner pod (which shares its
+        # network namespace with the dind sidecar), the api-server's
+        # published port 6443 is reachable on localhost. `--skip-auth`
+        # on the api-server (compose.yml) means any bearer token is
+        # accepted, so the placeholder works.
+        run: |
+          mkdir -p "$HOME/.kube"
+          cat > "$HOME/.kube/rusternetes-config" <<'EOF'
+          apiVersion: v1
+          kind: Config
+          clusters:
+            - name: rusternetes
+              cluster:
+                insecure-skip-tls-verify: true
+                server: https://localhost:6443
+          contexts:
+            - name: rusternetes
+              context:
+                cluster: rusternetes
+                user: admin
+          current-context: rusternetes
+          users:
+            - name: admin
+              user:
+                token: anonymous
+          EOF
+          echo "KUBECONFIG=$HOME/.kube/rusternetes-config" >> "$GITHUB_ENV"
+
+      - name: Install kubectl
+        # The ARC runner image (ci/arc-runner/Dockerfile) bakes Rust + protoc
+        # + docker-compose but not kubectl, so `kubectl ... 2>/dev/null`
+        # silently 127's and any wait-loop spins forever (run 26127584434
+        # timed out for exactly this reason). Pin to v1.35 to match the
+        # conformance image so kubectl never lags the cluster API surface.
+        # Drop into the runner user's local bin and append to GITHUB_PATH
+        # — no sudo (the runner image's sudo config is not guaranteed).
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION="v1.35.0"
+          mkdir -p "$HOME/.local/bin"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+            -o "$HOME/.local/bin/kubectl"
+          chmod +x "$HOME/.local/bin/kubectl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/kubectl" version --client
+
+      - name: Build images
+        # Build before `up -d` so the up step is a fast container-start
+        # rather than a slow build. Parallel build keeps wall time
+        # reasonable on the 3-core conformance tier.
+        run: |
+          docker compose -f compose.yml -f compose.dind.yml build --parallel
+
+      - name: Bring up cluster
+        run: |
+          docker compose -f compose.yml -f compose.dind.yml up -d
+          docker compose -f compose.yml -f compose.dind.yml ps
+
+      - name: Wait for api-server health
+        timeout-minutes: 3
+        run: |
+          # Earlier loop piped kubectl through `grep -q ok`, which swallowed
+          # every stderr line (run 26147385703 — 3 min of "waiting" with no
+          # diagnostic). Surface the actual kubectl output each iteration so
+          # the failure mode (TLS, refused, no route) is visible in the log.
+          for i in $(seq 1 90); do
+            OUT=$(kubectl get --raw=/healthz 2>&1)
+            RC=$?
+            if [ "$RC" -eq 0 ] && echo "$OUT" | grep -q ok; then
+              echo "api-server healthy after ${i} attempts: $OUT"
+              kubectl get nodes
+              exit 0
+            fi
+            printf '[%02d] kubectl rc=%d: %s\n' "$i" "$RC" "$OUT"
+            sleep 2
+          done
+          echo "api-server never became healthy — dumping diagnostics:"
+          docker compose -f compose.yml -f compose.dind.yml ps || true
+          docker compose -f compose.yml -f compose.dind.yml logs --tail=50 api-server || true
+          curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
+          curl -kv --max-time 5 https://localhost:6443/healthz || true
+          exit 1
+
+      - name: Bootstrap cluster (CoreDNS, services, SA tokens)
+        run: bash scripts/bootstrap-cluster.sh
+
+      - name: Install Hydrophone
+        # Pinned binary; the canary script (next step) expects it on PATH.
+        run: |
+          set -e
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o /tmp/hydrophone.tar.gz \
+            "https://github.com/kubernetes-sigs/hydrophone/releases/download/${HYDROPHONE_VERSION}/hydrophone_Linux_x86_64.tar.gz"
+          tar -xzf /tmp/hydrophone.tar.gz -C "$HOME/.local/bin" hydrophone
+          chmod +x "$HOME/.local/bin/hydrophone"
+          hydrophone --help | head -5
+
+      - name: Run conformance canary
+        # `scripts/conformance-canary-run.sh` reads ci/conformance/known-green.txt,
+        # builds a single hydrophone --focus regex (alternation of all entries,
+        # regex-escaped per entry), runs hydrophone, parses the junit, and
+        # exits non-zero if any expected-green test does not pass. Pins the
+        # conformance image to v1.35.0 by default — see the script's --help.
+        timeout-minutes: 15
+        run: |
+          bash scripts/conformance-canary-run.sh \
+            --output-dir conformance-out
+
+      - name: Upload conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-out
+          path: conformance-out/
+          retention-days: 14
+
+      - name: Tear down cluster
+        if: always()
+        run: |
+          docker compose -f compose.yml -f compose.dind.yml logs --tail=200 || true
+          docker compose -f compose.yml -f compose.dind.yml down -v || true

@@ -17,9 +17,11 @@ pub struct ComponentHealth {
 }
 
 /// Health check endpoint - liveness probe
-/// Returns OK if the server is running
-pub async fn healthz() -> StatusCode {
-    StatusCode::OK
+/// Matches upstream k8s `pkg/server/healthz/healthz.go`: 200 with body `ok`.
+/// Clients (kubectl wait loops, hydrophone, probes) grep stdout for `ok`,
+/// so an empty body silently fails the check.
+pub async fn healthz() -> (StatusCode, &'static str) {
+    (StatusCode::OK, "ok")
 }
 
 /// Readiness check endpoint - readiness probe
