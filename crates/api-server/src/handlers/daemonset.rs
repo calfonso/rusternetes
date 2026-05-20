@@ -49,6 +49,7 @@ pub async fn create(
     daemonset.metadata.namespace = Some(namespace.clone());
     daemonset.metadata.ensure_uid();
     daemonset.metadata.ensure_creation_timestamp();
+    crate::handlers::lifecycle::set_initial_generation(&mut daemonset.metadata);
 
     // Apply K8s defaults (SetDefaults_DaemonSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_daemonset_defaults(&mut daemonset);
@@ -124,9 +125,47 @@ pub async fn update(
 
     daemonset.metadata.name = name.clone();
     daemonset.metadata.namespace = Some(namespace.clone());
+    if daemonset.type_meta.kind.is_empty() {
+        daemonset.type_meta.kind = "DaemonSet".to_string();
+    }
+    if daemonset.type_meta.api_version.is_empty() {
+        daemonset.type_meta.api_version = "apps/v1".to_string();
+    }
 
     // Apply K8s defaults (SetDefaults_DaemonSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_daemonset_defaults(&mut daemonset);
+
+    let key = build_key("daemonsets", Some(&namespace), &name);
+
+    // Load stored object so we can enforce upstream Strategy.PrepareForUpdate
+    // (status reset + selector immutability) and ValidateDaemonSetUpdate.
+    let old_daemonset: DaemonSet = state.storage.get(&key).await?;
+
+    crate::handlers::lifecycle::check_resource_version(
+        old_daemonset.metadata.resource_version.as_deref(),
+        daemonset.metadata.resource_version.as_deref(),
+        &name,
+    )?;
+
+    crate::handlers::lifecycle::validate_selector_immutable(
+        &old_daemonset.spec.selector,
+        &daemonset.spec.selector,
+        "DaemonSet",
+    )?;
+
+    // Status only mutates via /status; mirror upstream PrepareForUpdate.
+    daemonset.status = old_daemonset.status.clone();
+
+    // Increment generation if spec changed
+    let old_value = serde_json::to_value(&old_daemonset)
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    let new_value = serde_json::to_value(&daemonset)
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    crate::handlers::lifecycle::maybe_increment_generation(
+        &old_value,
+        &new_value,
+        &mut daemonset.metadata,
+    );
 
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
@@ -136,8 +175,6 @@ pub async fn update(
         );
         return Ok(Json(daemonset));
     }
-
-    let key = build_key("daemonsets", Some(&namespace), &name);
 
     // Try to update first, if not found then create (upsert behavior)
     let result = match state.storage.update(&key, &daemonset).await {

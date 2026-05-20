@@ -221,6 +221,18 @@ pub async fn update(
         &name,
     )?;
 
+    // Selector is immutable post-create (upstream ValidateDeploymentUpdate).
+    crate::handlers::lifecycle::validate_selector_immutable(
+        &old_deployment.spec.selector,
+        &deployment.spec.selector,
+        "Deployment",
+    )?;
+
+    // Upstream Strategy.PrepareForUpdate copies the stored object's status
+    // onto the incoming object so status only mutates via the /status
+    // subresource. Mirror that here so main PUT cannot leak status fields.
+    deployment.status = old_deployment.status.clone();
+
     // Increment generation if spec changed
     let old_value = serde_json::to_value(&old_deployment)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;

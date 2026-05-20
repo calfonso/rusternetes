@@ -497,15 +497,19 @@ pub struct RollingUpdateDaemonSet {
 #[serde(rename_all = "camelCase")]
 pub struct DaemonSetStatus {
     /// Number of nodes that should be running the daemon pod
+    #[serde(default)]
     pub desired_number_scheduled: i32,
 
     /// Number of nodes running at least one daemon pod
+    #[serde(default)]
     pub current_number_scheduled: i32,
 
     /// Number of nodes with ready daemon pods
+    #[serde(default)]
     pub number_ready: i32,
 
     /// Number of nodes that should be running but aren't
+    #[serde(default)]
     pub number_misscheduled: i32,
 
     /// Number of nodes running an available daemon pod (ready for at least minReadySeconds)
