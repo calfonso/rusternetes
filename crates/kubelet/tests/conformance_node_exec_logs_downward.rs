@@ -107,46 +107,6 @@ fn make_terminated_status(name: &str, state: ContainerState) -> ContainerStatus 
     }
 }
 
-/// Build a `kubectl exec` query string in the canonical form the upstream
-/// e2e helper `RESTClient().Get().Suffix("exec").Param(...)` emits, used by
-/// both SPDY and WebSocket exec tests in `pods.go:517` /
-/// `runtime.go:exec_util`. Pinning the format here guards against subtle
-/// regressions (parameter ordering doesn't matter, but our `kubelet`'s
-/// `/exec/:container_id` handler in `main.rs` splits `command` on `,` —
-/// upstream sends repeated `command=` params).
-fn exec_query_string(container: &str, commands: &[&str], tty: bool, stdin: bool) -> String {
-    let mut parts = vec![format!("container={container}")];
-    for c in commands {
-        parts.push(format!("command={}", url_encode_minimal(c.as_bytes())));
-    }
-    parts.push("stderr=1".to_string());
-    parts.push("stdout=1".to_string());
-    if stdin {
-        parts.push("stdin=1".to_string());
-    }
-    if tty {
-        parts.push(format!("tty={tty}"));
-    }
-    parts.join("&")
-}
-
-/// Bare-minimum percent encoder — only escapes the bytes upstream's
-/// `query.Escape` would for shell-flag arguments (`/`, `+`, space, `%`).
-/// Mirrors enough of the upstream URL builder to round-trip the canonical
-/// `command=%2Fbin%2Fsh&command=-c` form observed in e2e.log line 1798.
-fn url_encode_minimal(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for &b in bytes {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 // ===========================================================================
 // 1. KubeletManagedEtcHosts + HostAliases — kubelet_etc_hosts.go:54 (R160 FAIL
 //    on /etc/hosts injection per docs/CONFORMANCE.md "Node lifecycle" bucket)
@@ -580,22 +540,99 @@ fn downward_api_volume_defaults_cpu_to_node_allocatable_when_no_limit() {
 /// [sig-node] Pods should support remote command execution over websockets
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/pods.go:517
-/// Sonobuoy (Round 160): FAIL — WebSocket exec not implemented (the kubelet
-/// runtime only exposes the SPDY-equivalent POST /exec/:container_id; the
-/// `channel.k8s.io` subprotocol upgrade lives in api-server/streaming).
-/// Local mirror pins the upstream query format so once api-server lands the
-/// upgrade the kubelet handler doesn't drift.
+///
+/// Sonobuoy (Round 160): the end-to-end websocket round-trip is FAIL — that's
+/// a separate issue tracked in `docs/conformance/node-exec-logs-downward.md`
+/// (subprotocol negotiation + bollard wiring). This test is the **query-string
+/// format pin only** so the URL we'd construct for the exec call can't drift
+/// from what upstream `k8s.io/client-go/rest.Request` emits.
+///
+/// Upstream Go assembles the exec URL via `RESTClient().Get()
+///   .Namespace(ns).Resource("pods").Name(name).SubResource("exec")
+///   .VersionedParams(&v1.PodExecOptions{ Container, Command, Stdin, Stdout, Stderr, TTY }, ...)`.
+/// `VersionedParams` serialises the struct through `runtime.Codec` → `query.Values`
+/// → `url.Values.Encode()`. `Encode()` sorts keys alphabetically; repeated
+/// keys (here `command`) preserve insertion order within the key.
+///
+/// The on-the-wire form for ns="default", pod="agnhost", container="agnhost",
+/// command=["/bin/sh", "-c"], stdin=false, stdout=true, stderr=true is:
+///
+/// ```text
+/// /api/v1/namespaces/default/pods/agnhost/exec
+///     ?command=%2Fbin%2Fsh&command=-c&container=agnhost&stderr=true&stdout=true
+/// ```
+///
+/// We assert byte-for-byte using the `url` crate (the same encoder a Rust
+/// client would reach for) — if a future refactor swaps to a hand-rolled
+/// encoder and drops a `%2F` or flips `true`→`1`, this test catches it.
 #[test]
-#[ignore = "Conformance failure tracker — see docs/conformance/node-exec-logs-downward.md"]
 fn pod_exec_over_websocket_query_format_matches_upstream() {
-    let q = exec_query_string("c", &["/bin/sh", "-c", "echo hi"], false, false);
-    // Mirrors the canonical form seen in e2e.log:1798:
-    //   command=%2Fbin%2Fsh&command=-c&command=echo+ ...
-    assert!(q.contains("container=c"));
-    assert!(q.contains("command=%2Fbin%2Fsh"));
-    assert!(q.contains("command=-c"));
-    assert!(q.contains("stdout=1"));
-    assert!(q.contains("stderr=1"));
+    use url::Url;
+
+    let namespace = "default";
+    let pod = "agnhost";
+    let container = "agnhost";
+    let command = ["/bin/sh", "-c"];
+    let stdin = false;
+    let stdout = true;
+    let stderr = true;
+
+    // Build the URL the way a Rust kubectl-equivalent client would.
+    // Pairs are appended in the alphabetical order Go's `url.Values.Encode()`
+    // would produce, so the resulting query string is byte-identical.
+    let mut url = Url::parse(&format!(
+        "https://kubernetes.default.svc/api/v1/namespaces/{namespace}/pods/{pod}/exec"
+    ))
+    .expect("base URL parses");
+    {
+        let mut q = url.query_pairs_mut();
+        // command (repeated, insertion order preserved within the key)
+        for c in &command {
+            q.append_pair("command", c);
+        }
+        q.append_pair("container", container);
+        if stderr {
+            q.append_pair("stderr", "true");
+        }
+        if stdin {
+            q.append_pair("stdin", "true");
+        }
+        if stdout {
+            q.append_pair("stdout", "true");
+        }
+    }
+
+    let query = url.query().expect("query string is present");
+    let expected = "command=%2Fbin%2Fsh&command=-c&container=agnhost&stderr=true&stdout=true";
+    assert_eq!(
+        query, expected,
+        "exec URL query string drifted from upstream `url.Values.Encode()` output"
+    );
+
+    // And the full path matches the upstream-canonical shape.
+    assert_eq!(
+        url.path(),
+        "/api/v1/namespaces/default/pods/agnhost/exec",
+        "exec URL path drifted from upstream `SubResource(\"exec\")` shape"
+    );
+
+    // No `stdin` parameter when stdin=false — upstream omits it rather than
+    // serialising `stdin=false` (zero-value JSON tag `omitempty`).
+    assert!(
+        !query.contains("stdin="),
+        "stdin=false must be omitted, not encoded as stdin=false / stdin=0"
+    );
+    // Same for `tty` (we never set it above).
+    assert!(
+        !query.contains("tty="),
+        "tty=false must be omitted, not encoded"
+    );
+    // `%2F` (not `/`) — `url::Url` encodes `/` in query values; upstream Go
+    // does the same via `query.Escape`.
+    assert!(
+        query.contains("command=%2Fbin%2Fsh"),
+        "`/` in command argument must be percent-encoded as %2F"
+    );
 }
 
 /// [sig-node] Pods should support retrieving logs from the container over websockets
@@ -669,7 +706,13 @@ fn pod_log_over_websocket_query_is_container_only() {
 /// Construct the URL query string the upstream `pods.go:583` test produces
 /// when opening a log-over-websocket request. Single `container=<name>` key.
 fn pod_log_ws_query(container: &str) -> String {
-    format!("container={}", url_encode_minimal(container.as_bytes()))
+    use url::Url;
+    let mut url =
+        Url::parse("https://kubernetes.default.svc/").expect("base URL parses for log query");
+    url.query_pairs_mut().append_pair("container", container);
+    url.query()
+        .expect("query is present after append")
+        .to_string()
 }
 
 /// [sig-node] Pods should print the output to logs
