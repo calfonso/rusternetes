@@ -1,11 +1,18 @@
 /// Concurrency control module for optimistic locking with resourceVersion
 use rusternetes_common::Error;
 
-/// Extract resourceVersion from metadata
+/// Extract resourceVersion from metadata.
+///
+/// Returns `None` when the field is absent *or* when it is an empty string.
+/// Kubernetes treats `resourceVersion: ""` identically to an absent
+/// resourceVersion (no optimistic-concurrency check). Callers that
+/// previously received `Some("")` would have tried to parse it as an i64
+/// and failed with "Invalid resourceVersion: ".
 pub fn extract_resource_version(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("resourceVersion")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -63,6 +70,10 @@ mod tests {
 
         let no_rv = json!({"name": "test"});
         assert_eq!(extract_resource_version(&no_rv), None);
+
+        // Empty string must be treated as absent (same as K8s semantics).
+        let empty_rv = json!({"name": "test", "resourceVersion": ""});
+        assert_eq!(extract_resource_version(&empty_rv), None);
     }
 
     #[test]
