@@ -29,6 +29,10 @@ pub enum FieldType {
     String,
     /// Scalar integer field (int32, int64, uint32, uint64)
     Int,
+    /// Scalar 64-bit floating-point field (proto `double`). Wire type 1
+    /// (fixed64). Used by `JSONSchemaProps.maximum`/`minimum`/
+    /// `multipleOf` and similar numeric-tolerance fields.
+    Double,
     /// Scalar boolean field
     Bool,
     /// Nested message — value is the message type name for schema lookup
@@ -1772,9 +1776,9 @@ impl ProtoRegistry {
                     (6, ("format".into(), FieldType::String)),
                     (7, ("title".into(), FieldType::String)),
                     (8, ("default".into(), FieldType::JsonRaw)),
-                    (9, ("maximum".into(), FieldType::Int)),
+                    (9, ("maximum".into(), FieldType::Double)),
                     (10, ("exclusiveMaximum".into(), FieldType::Bool)),
-                    (11, ("minimum".into(), FieldType::Int)),
+                    (11, ("minimum".into(), FieldType::Double)),
                     (12, ("exclusiveMinimum".into(), FieldType::Bool)),
                     (13, ("maxLength".into(), FieldType::Int)),
                     (14, ("minLength".into(), FieldType::Int)),
@@ -1782,7 +1786,7 @@ impl ProtoRegistry {
                     (16, ("maxItems".into(), FieldType::Int)),
                     (17, ("minItems".into(), FieldType::Int)),
                     (18, ("uniqueItems".into(), FieldType::Bool)),
-                    (19, ("multipleOf".into(), FieldType::Int)), // double, but Int works for decode
+                    (19, ("multipleOf".into(), FieldType::Double)),
                     (
                         20,
                         (
@@ -2055,14 +2059,20 @@ impl ProtoRegistry {
         );
         schemas.insert(
             "ValidationRule".into(),
+            // Upstream apiextensions-apiserver/pkg/apis/apiextensions/v1
+            // generated.proto: rule=1, message=2, messageExpression=3,
+            // reason=4, fieldPath=5, optionalOldSelf=6. The historical
+            // registry numbered messageExpression onwards starting at 4 —
+            // wire-incompatible with every CRD that ships
+            // x-kubernetes-validations.
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("rule".into(), FieldType::String)),
                     (2, ("message".into(), FieldType::String)),
-                    (4, ("messageExpression".into(), FieldType::String)),
-                    (5, ("reason".into(), FieldType::String)),
-                    (6, ("fieldPath".into(), FieldType::String)),
-                    (7, ("optionalOldSelf".into(), FieldType::Bool)),
+                    (3, ("messageExpression".into(), FieldType::String)),
+                    (4, ("reason".into(), FieldType::String)),
+                    (5, ("fieldPath".into(), FieldType::String)),
+                    (6, ("optionalOldSelf".into(), FieldType::Bool)),
                 ]),
             },
         );
@@ -6886,10 +6896,19 @@ impl ProtoRegistry {
                     if pos + 8 > data.len() {
                         break;
                     }
-                    let value = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    let bits = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                     pos += 8;
-                    if let Some((name, _)) = schema.fields.get(&field_num) {
-                        obj.insert(name.clone(), json!(value));
+                    if let Some((name, field_type)) = schema.fields.get(&field_num) {
+                        let json_val = match field_type {
+                            FieldType::Double => {
+                                match serde_json::Number::from_f64(f64::from_bits(bits)) {
+                                    Some(n) => Value::Number(n),
+                                    None => Value::Null,
+                                }
+                            }
+                            _ => json!(bits),
+                        };
+                        obj.insert(name.clone(), json_val);
                     }
                 }
                 WIRE_LENGTH_DELIMITED => {
@@ -7049,6 +7068,19 @@ impl ProtoRegistry {
                 // Length-delimited int is unusual — treat as a submessage or packed repeated
                 if let Some((val, _)) = read_varint(data, 0) {
                     json!(val as i64)
+                } else {
+                    Value::Null
+                }
+            }
+            FieldType::Double => {
+                // Length-delimited 8-byte double is unusual outside of
+                // packed-repeated. Decode the first 8 bytes if present.
+                if data.len() >= 8 {
+                    let bits = u64::from_le_bytes(data[..8].try_into().unwrap());
+                    match serde_json::Number::from_f64(f64::from_bits(bits)) {
+                        Some(n) => Value::Number(n),
+                        None => Value::Null,
+                    }
                 } else {
                     Value::Null
                 }
@@ -9178,8 +9210,14 @@ impl ProtoRegistry {
                 fields: HashMap::from([
                     (1, ("holderIdentity".into(), FieldType::String)),
                     (2, ("leaseDurationSeconds".into(), FieldType::Int)),
-                    (3, ("acquireTime".into(), FieldType::Message("Time".into()))),
-                    (4, ("renewTime".into(), FieldType::Message("Time".into()))),
+                    (
+                        3,
+                        ("acquireTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (
+                        4,
+                        ("renewTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
                     (5, ("leaseTransitions".into(), FieldType::Int)),
                     (6, ("strategy".into(), FieldType::String)),
                     (7, ("preferredHolder".into(), FieldType::String)),
