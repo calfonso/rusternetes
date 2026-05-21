@@ -1878,12 +1878,31 @@ fn detect_container_resource_change(old_pod: &Pod, new_pod: &Pod) -> bool {
     let old_containers = old_pod.spec.as_ref().map(|s| &s.containers);
     let new_containers = new_pod.spec.as_ref().map(|s| &s.containers);
 
+    // Normalise `Some(ResourceRequirements { requests: None, limits: None })`
+    // to `None`. Go's `corev1.Container.Resources` is a value-typed
+    // `ResourceRequirements` (not a pointer) with `omitempty`, but Go's
+    // `omitempty` does NOT detect zero-valued structs, so a no-op
+    // GET→re-marshal→PUT cycle always emits `"resources":{}` on every
+    // container. Without this normalisation the very first "empty update"
+    // sub-test of the [Conformance] pod-generation suite would incorrectly
+    // trip the resize detector and flip `status.resize` to `Proposed` on a
+    // no-op PUT. Upstream relies on `apiequality.Semantic.DeepEqual`
+    // which already handles this — we have to do it explicitly.
+    fn resources_meaningful(
+        r: Option<&rusternetes_common::types::ResourceRequirements>,
+    ) -> Option<&rusternetes_common::types::ResourceRequirements> {
+        r.filter(|rr| {
+            rr.requests.as_ref().is_some_and(|m| !m.is_empty())
+                || rr.limits.as_ref().is_some_and(|m| !m.is_empty())
+        })
+    }
+
     match (old_containers, new_containers) {
         (Some(old_cs), Some(new_cs)) => {
             for new_c in new_cs {
                 if let Some(old_c) = old_cs.iter().find(|c| c.name == new_c.name) {
-                    let old_res = old_c.resources.as_ref();
-                    let new_res = new_c.resources.as_ref();
+                    let old_res = resources_meaningful(old_c.resources.as_ref());
+                    let new_res = resources_meaningful(new_c.resources.as_ref());
                     match (old_res, new_res) {
                         (Some(old_r), Some(new_r)) => {
                             if old_r.requests != new_r.requests || old_r.limits != new_r.limits {

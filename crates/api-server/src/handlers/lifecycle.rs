@@ -19,6 +19,14 @@ pub fn set_initial_generation(metadata: &mut ObjectMeta) {
 /// Increment generation if spec has changed (by comparing old vs new JSON, ignoring metadata and status).
 ///
 /// This should be called during resource updates (PUT), but NOT during status-only updates.
+///
+/// The comparison is performed after normalising empty `{}` objects to
+/// absent on both sides (via `validation::pod::strip_empty_objects`) so a
+/// no-op Go round-trip — which always emits `"resources":{}` on every
+/// container because Go's `omitempty` does not detect zero-valued struct
+/// values — does NOT trip a false-positive generation bump. This mirrors
+/// upstream's `apiequality.Semantic.DeepEqual` semantics used by the same
+/// strategy hook in `pkg/registry/core/pod/strategy.go::PrepareForUpdate`.
 pub fn maybe_increment_generation(
     old_json: &serde_json::Value,
     new_json: &serde_json::Value,
@@ -34,6 +42,8 @@ pub fn maybe_increment_generation(
         obj.remove("metadata");
         obj.remove("status");
     }
+    rusternetes_common::validation::pod::strip_empty_objects(&mut old_spec);
+    rusternetes_common::validation::pod::strip_empty_objects(&mut new_spec);
     if old_spec != new_spec {
         let current = metadata.generation.unwrap_or(0);
         metadata.generation = Some(current + 1);
