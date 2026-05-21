@@ -327,6 +327,15 @@ pub fn find_duplicate_json_key_public(json_str: &str) -> Option<String> {
     find_duplicate_json_key(json_str)
 }
 
+/// Returns true if the JSON value is an object containing no entries.
+/// Mirrors the empty-Go-struct shape (`{}`) that client-go emits when a
+/// nested message has all zero-valued fields — our typed deserialiser
+/// collapses these to `None` and the round-trip drops the key, so the
+/// strict differ must treat them the same as `null`.
+fn is_empty_object(value: &serde_json::Value) -> bool {
+    matches!(value, serde_json::Value::Object(map) if map.is_empty())
+}
+
 /// Recursively find fields in `original` that are not present in `canonical`.
 /// Returns a list of dotted field paths for unknown fields.
 fn find_unknown_fields_recursive(
@@ -346,29 +355,39 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
-                } else if orig_val.is_null() {
+                } else if orig_val.is_null() || is_empty_object(orig_val) {
                     // Known limitation of diff-based strict decoding:
-                    // client-go marshals zero-valued `time.Time` and
-                    // other Option fields as JSON `null`. Our typed
-                    // deserialiser reads those as `None`, then the
-                    // canonical round-trip drops the key entirely
-                    // because every `Option<...>` is
-                    // `skip_serializing_if = Option::is_none`. Without
-                    // this branch the differ flags legit declared
-                    // fields like `metadata.creationTimestamp: null`
+                    // client-go marshals zero-valued Go structs in two
+                    // forms that our typed deserialiser collapses to
+                    // `None`:
+                    //   - JSON `null` (e.g. `metadata.creationTimestamp:
+                    //     null` from a zero `time.Time` — fixed in
+                    //     PR #687).
+                    //   - JSON `{}` empty object (e.g.
+                    //     `status.containerStatuses[N].lastState: {}`
+                    //     when the container has no prior state — fixed
+                    //     in this branch).
+                    //
+                    // In both cases the canonical round-trip drops the
+                    // key because every `Option<...>` is
+                    // `skip_serializing_if = Option::is_none` and our
+                    // custom `deserialize_*_option` helpers treat both
+                    // null and empty-object as `None`. Without this
+                    // branch the differ flags legit declared fields
                     // as unknown.
                     //
-                    // Tradeoff: a truly-unknown field carrying a `null`
-                    // value will also slip through unflagged. That
-                    // false-negative is impossible to distinguish from
-                    // the legit case without schema-aware decoding
+                    // Tradeoff: a truly-unknown field whose value is
+                    // null or `{}` will also slip through unflagged.
+                    // That false-negative is impossible to distinguish
+                    // from the legit case without schema-aware decoding
                     // (e.g. `serde_ignored` or per-type
                     // `deny_unknown_fields`). See the `#[ignore]`'d
                     // test in `strict_decoding_client_go_pod_test.rs`
                     // tracking the fix.
                     // TODO(rusternetes): replace this diff approach
-                    // with schema-aware strict decoding so null-valued
-                    // unknown fields can still be rejected.
+                    // with schema-aware strict decoding so null- or
+                    // empty-object-valued unknown fields can still
+                    // be rejected.
                 } else {
                     unknown.push(field_path);
                 }
