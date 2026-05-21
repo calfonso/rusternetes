@@ -1075,17 +1075,17 @@ impl ProtoRegistry {
                     (8, ("ttlSecondsAfterFinished".into(), FieldType::Int)),
                     (9, ("completionMode".into(), FieldType::String)),
                     (10, ("suspend".into(), FieldType::Bool)),
-                    (11, ("podReplacementPolicy".into(), FieldType::String)),
-                    (12, ("managedBy".into(), FieldType::String)),
-                    (13, ("backoffLimitPerIndex".into(), FieldType::Int)),
-                    (14, ("maxFailedIndexes".into(), FieldType::Int)),
                     (
-                        15,
+                        11,
                         (
                             "podFailurePolicy".into(),
                             FieldType::Message("PodFailurePolicy".into()),
                         ),
                     ),
+                    (12, ("backoffLimitPerIndex".into(), FieldType::Int)),
+                    (13, ("maxFailedIndexes".into(), FieldType::Int)),
+                    (14, ("podReplacementPolicy".into(), FieldType::String)),
+                    (15, ("managedBy".into(), FieldType::String)),
                     (
                         16,
                         (
@@ -6131,8 +6131,8 @@ impl ProtoRegistry {
                 (1, ("observedGeneration".into(), FieldType::Int)),
                 (2, ("replicas".into(), FieldType::Int)),
                 (3, ("updatedReplicas".into(), FieldType::Int)),
-                (4, ("unavailableReplicas".into(), FieldType::Int)),
-                (5, ("availableReplicas".into(), FieldType::Int)),
+                (4, ("availableReplicas".into(), FieldType::Int)),
+                (5, ("unavailableReplicas".into(), FieldType::Int)),
                 (
                     6,
                     (
