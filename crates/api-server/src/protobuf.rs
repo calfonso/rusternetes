@@ -985,27 +985,27 @@ impl ProtoRegistry {
                             FieldType::Message("SessionAffinityConfig".into()),
                         ),
                     ),
+                    (17, ("ipFamilyPolicy".into(), FieldType::String)),
                     (
-                        17,
-                        (
-                            "ipFamilies".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                    (18, ("ipFamilyPolicy".into(), FieldType::String)),
-                    (
-                        19,
+                        18,
                         (
                             "clusterIPs".into(),
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
-                    (20, ("internalTrafficPolicy".into(), FieldType::String)),
                     (
-                        21,
+                        19,
+                        (
+                            "ipFamilies".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        20,
                         ("allocateLoadBalancerNodePorts".into(), FieldType::Bool),
                     ),
-                    (22, ("loadBalancerClass".into(), FieldType::String)),
+                    (21, ("loadBalancerClass".into(), FieldType::String)),
+                    (22, ("internalTrafficPolicy".into(), FieldType::String)),
                     (23, ("trafficDistribution".into(), FieldType::String)),
                 ]),
             },
@@ -6392,18 +6392,18 @@ impl ProtoRegistry {
                 ),
                 (20, ("terminationMessagePolicy".into(), FieldType::String)),
                 (
-                    22,
-                    ("startupProbe".into(), FieldType::Message("Probe".into())),
-                ),
-                (
-                    23,
+                    21,
                     (
                         "volumeDevices".into(),
                         FieldType::Repeated(Box::new(FieldType::Message("VolumeDevice".into()))),
                     ),
                 ),
                 (
-                    24,
+                    22,
+                    ("startupProbe".into(), FieldType::Message("Probe".into())),
+                ),
+                (
+                    23,
                     (
                         "resizePolicy".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -6411,7 +6411,16 @@ impl ProtoRegistry {
                         ))),
                     ),
                 ),
-                (25, ("restartPolicy".into(), FieldType::String)),
+                (24, ("restartPolicy".into(), FieldType::String)),
+                (
+                    25,
+                    (
+                        "restartPolicyRules".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "ContainerRestartRule".into(),
+                        ))),
+                    ),
+                ),
             ]),
         }
     }
