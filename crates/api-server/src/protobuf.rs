@@ -6722,6 +6722,18 @@ impl ProtoRegistry {
         }
     }
 
+    /// Iterate over all registered `(message_name, schema)` pairs.
+    /// Intended for tests that compare the registry against upstream `.proto`
+    /// definitions. Not part of any runtime path.
+    pub fn iter_schemas(&self) -> impl Iterator<Item = (&str, &MessageSchema)> {
+        self.schemas.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Number of schemas registered.
+    pub fn schema_count(&self) -> usize {
+        self.schemas.len()
+    }
+
     /// Decode a protobuf message to JSON using the schema for the given message type.
     /// Returns None if the message type is not in the registry.
     pub fn decode_message(&self, msg_type: &str, data: &[u8]) -> Option<Value> {
