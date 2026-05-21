@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1.6
-# Dockerfile for kubectl CLI tool
-FROM rust:latest AS builder
+# Dockerfile for kubectl CLI tool.
+#
+# Pin the rust toolchain — see Dockerfile.services for the cache-mount
+# rationale. Keep this version in lock-step with the other Dockerfiles
+# so a shared rustc populates the same /app/target BuildKit cache.
+FROM rust:1.95 AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
