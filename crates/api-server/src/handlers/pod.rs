@@ -99,92 +99,130 @@ pub async fn create(
         }
     }
 
-    // Validate pod spec
-    // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec — `spec.containers`
-    // is required. Upstream uses `field.Required(field.NewPath("spec").Child("containers"), "")`
-    // when spec is missing/null. Reject `spec: null` (and an absent spec) with 422 Invalid
-    // here so we do not persist an empty Pod.
-    if pod.spec.is_none() {
-        return Err(rusternetes_common::Error::InvalidResource(
-            "spec.containers: Required value".to_string(),
-        ));
-    }
-    if let Some(ref spec) = pod.spec {
-        if spec.containers.is_empty() {
-            return Err(rusternetes_common::Error::InvalidResource(
-                "spec.containers: Required value: must have at least one container".to_string(),
-            ));
-        }
-        for (i, container) in spec.containers.iter().enumerate() {
-            if container.image.is_empty() {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "spec.containers[{}].image: Required value",
-                    i
-                )));
-            }
-            if container.name.is_empty() {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "spec.containers[{}].name: Required value",
-                    i
-                )));
-            }
-        }
-        // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec —
-        // container names must be unique across containers + initContainers
-        // + ephemeralContainers. The upstream test
-        // `TestValidatePodSpec/duplicate_container_names` pins the exact
-        // error path: `spec.containers[1].name: Duplicate value: "ctr-a"`.
-        {
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for (i, c) in spec.containers.iter().enumerate() {
-                if !seen.insert(c.name.as_str()) {
-                    return Err(rusternetes_common::Error::InvalidResource(format!(
-                        "spec.containers[{}].name: Duplicate value: \"{}\"",
-                        i, c.name
-                    )));
-                }
-            }
-            if let Some(ref inits) = spec.init_containers {
-                for (i, c) in inits.iter().enumerate() {
-                    if !seen.insert(c.name.as_str()) {
-                        return Err(rusternetes_common::Error::InvalidResource(format!(
-                            "spec.initContainers[{}].name: Duplicate value: \"{}\"",
-                            i, c.name
-                        )));
-                    }
-                }
-            }
-            if let Some(ref ecs) = spec.ephemeral_containers {
-                for (i, ec) in ecs.iter().enumerate() {
-                    if !seen.insert(ec.name.as_str()) {
-                        return Err(rusternetes_common::Error::InvalidResource(format!(
-                            "spec.ephemeralContainers[{}].name: Duplicate value: \"{}\"",
-                            i, ec.name
-                        )));
-                    }
-                }
-            }
-        }
-        // K8s ref: pkg/registry/core/pod/strategy.go Strategy.PrepareForCreate +
-        // pkg/apis/core/validation/validation.go ValidatePodSpec — ephemeral
-        // containers may NEVER be set on Pod create. They can only be added
-        // through the `/ephemeralcontainers` subresource.
-        if let Some(ref ec) = spec.ephemeral_containers {
-            if !ec.is_empty() {
-                return Err(rusternetes_common::Error::InvalidResource(
-                    "spec.ephemeralContainers: Forbidden: cannot be set on create".to_string(),
+    // Validate pod spec — accumulate every violation into a `field::ErrorList`
+    // so the 422 response carries one `Status.details.causes[]` entry per
+    // failure, matching upstream `NewInvalid`. Short-circuiting on the first
+    // error would collapse multi-violation requests to a single cause and
+    // break parity with `TestNewInvalidMulti`.
+    //
+    // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec.
+    {
+        use rusternetes_common::validation::field::{Error as FErr, ErrorList, Path as FPath};
+        let mut errs: ErrorList = Vec::new();
+        let spec_path = FPath::new("spec");
+        let containers_path = spec_path.child("containers");
+
+        if pod.spec.is_none() {
+            errs.push(FErr::required(&containers_path, ""));
+        } else if let Some(ref spec) = pod.spec {
+            if spec.containers.is_empty() {
+                errs.push(FErr::required(
+                    &containers_path,
+                    "must have at least one container",
                 ));
             }
-        }
-        // K8s ref: pkg/apis/core/validation/validation.go validateActiveDeadlineSeconds —
-        // on create, activeDeadlineSeconds (when set) must be a positive integer.
-        if let Some(v) = spec.active_deadline_seconds {
-            if v <= 0 {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "spec.activeDeadlineSeconds: Invalid value: {}: must be greater than 0",
-                    v
-                )));
+            for (i, container) in spec.containers.iter().enumerate() {
+                let cpath = containers_path.index(i);
+                if container.image.is_empty() {
+                    errs.push(FErr::required(&cpath.child("image"), ""));
+                }
+                if container.name.is_empty() {
+                    errs.push(FErr::required(&cpath.child("name"), ""));
+                } else {
+                    // K8s ref: validation.go::validateContainerName — names must
+                    // be a DNS-1123 label (lower-case, dashes, etc.).
+                    let dns_errs =
+                        rusternetes_common::validation::metav1::is_dns1123_label(&container.name);
+                    for msg in dns_errs {
+                        errs.push(FErr::invalid(
+                            &cpath.child("name"),
+                            container.name.clone(),
+                            msg,
+                        ));
+                    }
+                }
             }
+            // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec —
+            // container names must be unique across containers + initContainers
+            // + ephemeralContainers. The upstream test
+            // `TestValidatePodSpec/duplicate_container_names` pins the exact
+            // error path: `spec.containers[1].name: Duplicate value: "ctr-a"`.
+            {
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for (i, c) in spec.containers.iter().enumerate() {
+                    if !c.name.is_empty() && !seen.insert(c.name.as_str()) {
+                        errs.push(FErr::duplicate(
+                            &containers_path.index(i).child("name"),
+                            c.name.clone(),
+                        ));
+                    }
+                }
+                if let Some(ref inits) = spec.init_containers {
+                    for (i, c) in inits.iter().enumerate() {
+                        if !c.name.is_empty() && !seen.insert(c.name.as_str()) {
+                            errs.push(FErr::duplicate(
+                                &spec_path.child("initContainers").index(i).child("name"),
+                                c.name.clone(),
+                            ));
+                        }
+                    }
+                }
+                if let Some(ref ecs) = spec.ephemeral_containers {
+                    for (i, ec) in ecs.iter().enumerate() {
+                        if !ec.name.is_empty() && !seen.insert(ec.name.as_str()) {
+                            errs.push(FErr::duplicate(
+                                &spec_path
+                                    .child("ephemeralContainers")
+                                    .index(i)
+                                    .child("name"),
+                                ec.name.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            // K8s ref: pkg/registry/core/pod/strategy.go Strategy.PrepareForCreate +
+            // pkg/apis/core/validation/validation.go ValidatePodSpec — ephemeral
+            // containers may NEVER be set on Pod create. They can only be added
+            // through the `/ephemeralcontainers` subresource.
+            if let Some(ref ec) = spec.ephemeral_containers {
+                if !ec.is_empty() {
+                    errs.push(FErr::forbidden(
+                        &spec_path.child("ephemeralContainers"),
+                        "cannot be set on create",
+                    ));
+                }
+            }
+            // K8s ref: pkg/apis/core/validation/validation.go validateActiveDeadlineSeconds —
+            // on create, activeDeadlineSeconds (when set) must be a positive integer.
+            if let Some(v) = spec.active_deadline_seconds {
+                if v <= 0 {
+                    errs.push(FErr::invalid(
+                        &spec_path.child("activeDeadlineSeconds"),
+                        v,
+                        "must be greater than 0",
+                    ));
+                }
+            }
+            // K8s ref: pkg/apis/core/validation/validation.go validateRestartPolicy
+            // — restartPolicy must be one of Always / OnFailure / Never (case-
+            // sensitive). Empty is allowed at this layer because the defaulter
+            // (`apply_pod_spec_defaults`) backfills it to "Always".
+            if let Some(ref policy) = spec.restart_policy {
+                if !policy.is_empty()
+                    && !matches!(policy.as_str(), "Always" | "OnFailure" | "Never")
+                {
+                    errs.push(FErr::not_supported(
+                        &spec_path.child("restartPolicy"),
+                        policy.clone(),
+                        &["Always", "OnFailure", "Never"],
+                    ));
+                }
+            }
+        }
+
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
@@ -892,8 +930,9 @@ pub async fn update(
 
     // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpecUpdate —
     // once `spec.nodeName` is set (typically via the /binding subresource),
-    // the main PUT path may not change it. Upstream returns
-    // `spec.nodeName: Invalid value: ...: field is immutable`.
+    // the main PUT path may not change it. Upstream emits
+    // `field.Forbidden(spec.nodeName, "field is immutable")` which maps to
+    // `causes[].reason = FieldValueForbidden`.
     {
         let old_node = old_pod
             .spec
@@ -906,10 +945,11 @@ pub async fn update(
             .and_then(|s| s.node_name.as_deref())
             .unwrap_or("");
         if !old_node.is_empty() && new_node != old_node {
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "spec.nodeName: Invalid value: \"{}\": field is immutable",
-                new_node
-            )));
+            use rusternetes_common::validation::field::{Error as FErr, Path as FPath};
+            return Err(rusternetes_common::Error::Invalid(vec![FErr::forbidden(
+                &FPath::new("spec").child("nodeName"),
+                "field is immutable",
+            )]));
         }
     }
 
@@ -1597,9 +1637,32 @@ pub async fn patch(
     let patch_json: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e)))?;
 
-    // Apply patch
-    let mut patched_json = apply_patch(&current_json, &patch_json, patch_type)
-        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+    // Apply patch.
+    //
+    // RFC 6902 §4.2 mandates that the target of a `remove` (and friends)
+    // exists; we surface the upstream-shaped `field.NotFound(<path>, "")`
+    // cause when it does not, so the 422 response carries
+    // `causes[].reason = FieldValueNotFound` with the real field path.
+    let mut patched_json =
+        apply_patch(&current_json, &patch_json, patch_type).map_err(|e| match e {
+            crate::patch::PatchError::PathNotFound(field_path) => {
+                use rusternetes_common::validation::field::{
+                    BadValue, Error as FErr, ErrorType as FType,
+                };
+                // Build a NotFound entry whose `field` is the dotted upstream
+                // path (e.g. `spec.doesNotExist`) and whose value is omitted —
+                // matches `field.NotFound(path, "")`.
+                let fe = FErr {
+                    error_type: FType::NotFound,
+                    field: field_path,
+                    bad_value: BadValue::Omit,
+                    detail: String::new(),
+                    origin: String::new(),
+                };
+                rusternetes_common::Error::Invalid(vec![fe])
+            }
+            other => rusternetes_common::Error::InvalidResource(other.to_string()),
+        })?;
 
     // Ensure metadata.name and metadata.namespace are set before deserializing.
     // Merge patches may omit metadata.name, causing it to be null in the result.

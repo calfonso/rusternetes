@@ -239,27 +239,24 @@ fn good_container() -> Value {
 }
 
 // ===========================================================================
-// Baseline: the current — wrong — shape, locked down so the IntoResponse
-// builder cannot silently regress while we wait for the upstream-parity fix.
-// This test runs (no `#[ignore]`) and documents the gap.
+// Baseline (post-fix): emptying `spec.containers` produces the upstream-shaped
+// single-cause `FieldValueRequired` / `spec.containers` response. Pre-fix this
+// test pinned the *wrong* shape (`FieldValueInvalid` / `metadata.name`) so
+// the granular per-reason tests below could stay `#[ignore]`d; once the
+// upstream-parity `field::ErrorList`-aware builder shipped the assertions
+// were inverted to lock down the new — correct — contract.
 // ===========================================================================
 
-/// Today every 422 Invalid response has a single hardcoded cause with
-/// `reason="FieldValueInvalid"` and `field="metadata.name"`, regardless of
-/// the real validation error type. See
-/// `crates/common/src/error.rs::extract_resource_details_for_invalid`.
-///
-/// This pin will FAIL the day rusternetes starts populating `causes[]` from
-/// the real `field::ErrorList`. When it does, replace this assertion with
-/// the upstream parity assertions below (and un-`#[ignore]` them).
+/// Single-cause smoke test: empty `spec.containers` → 422 Invalid with a
+/// single `Status.details.causes[]` entry, reason `FieldValueRequired`,
+/// field `spec.containers`. Mirrors upstream `field.Required` →
+/// `metav1.CauseTypeFieldValueRequired` mapping in
+/// `apimachinery/pkg/api/errors/errors.go::NewInvalid`.
 #[tokio::test]
-async fn current_invalid_shape_is_single_hardcoded_cause() {
+async fn invalid_shape_is_single_required_cause_for_empty_containers() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
 
-    // Empty containers list — upstream emits `FieldValueRequired` /
-    // `spec.containers`. Rusternetes today emits `FieldValueInvalid` /
-    // `metadata.name`.
     let pod = pod_with_spec("p0", json!({ "containers": [] }));
     let (status, body) = post_json(&router, "/api/v1/namespaces/default/pods", &pod).await;
     assert_eq!(status, 422, "expected 422 Invalid: body={body}");
@@ -272,24 +269,23 @@ async fn current_invalid_shape_is_single_hardcoded_cause() {
     assert_eq!(
         causes.len(),
         1,
-        "current builder emits exactly one cause: body={body}"
+        "exactly one violation → one cause: body={body}"
     );
     let c0 = &causes[0];
     assert_eq!(
         c0.get("reason").and_then(|v| v.as_str()),
-        Some("FieldValueInvalid"),
-        "current builder hardcodes reason=FieldValueInvalid: cause={c0}"
+        Some("FieldValueRequired"),
+        "empty containers → FieldValueRequired: cause={c0}"
     );
     assert_eq!(
         c0.get("field").and_then(|v| v.as_str()),
-        Some("metadata.name"),
-        "current builder hardcodes field=metadata.name: cause={c0}"
+        Some("spec.containers"),
+        "field path is the real upstream breadcrumb: cause={c0}"
     );
-    // The real field path leaks through `message` only.
     let msg = c0.get("message").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         msg.contains("spec.containers"),
-        "real field path is preserved in cause.message: cause={c0}"
+        "cause.message carries the upstream `<field>: <ErrorType>: <detail>` rendering: cause={c0}"
     );
 }
 
@@ -308,7 +304,6 @@ async fn current_invalid_shape_is_single_hardcoded_cause() {
 /// the IntoResponse builder collapses it to `FieldValueInvalid` /
 /// `metadata.name`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: Status.details.causes[] reason hardcoded to FieldValueInvalid (Required variant)"]
 async fn invalid_pod_empty_containers_emits_field_value_required() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
@@ -329,7 +324,6 @@ async fn invalid_pod_empty_containers_emits_field_value_required() {
 /// emptiness), so this test is doubly blocked: validation is missing AND the
 /// builder hardcodes the field path.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: container-name format validation + causes[].field not populated"]
 async fn invalid_container_name_emits_field_value_invalid() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
@@ -354,7 +348,6 @@ async fn invalid_container_name_emits_field_value_invalid() {
 /// Duplicate value: \"...\""`) but the cause `reason` is again hardcoded to
 /// `FieldValueInvalid`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: Status.details.causes[] reason hardcoded to FieldValueInvalid (Duplicate variant)"]
 async fn duplicate_container_names_emit_field_value_duplicate() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
@@ -382,7 +375,6 @@ async fn duplicate_container_names_emit_field_value_duplicate() {
 /// immutable` instead of `Forbidden: field is immutable`), so this pin is
 /// blocked on both the validator and the builder.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: spec.nodeName immutability uses ErrorType Invalid, should be Forbidden"]
 async fn pod_update_changing_node_name_emits_field_value_forbidden() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
@@ -425,7 +417,6 @@ async fn pod_update_changing_node_name_emits_field_value_forbidden() {
 /// `Error::InvalidResource(e.to_string())`), but the builder still emits a
 /// hardcoded `FieldValueInvalid` / `metadata.name` cause.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: JSON-Patch remove-missing-path not mapped to FieldValueNotFound cause"]
 async fn json_patch_remove_missing_field_emits_field_value_not_found() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
@@ -462,7 +453,6 @@ async fn json_patch_remove_missing_field_emits_field_value_not_found() {
 /// the value passes through into storage. So this pin is blocked on both the
 /// validator and the cause builder.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: spec.restartPolicy enum not validated; cause reason not FieldValueNotSupported"]
 async fn invalid_restart_policy_emits_field_value_not_supported() {
     let router = spawn_router();
     create_namespace(&router, "default").await;
@@ -490,7 +480,6 @@ async fn invalid_restart_policy_emits_field_value_not_supported() {
 /// Upstream returns `causes.len() == 2`. Rust handlers short-circuit on the
 /// first failure, so we only see one cause today.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: validators short-circuit, causes[] has length 1 instead of N"]
 async fn multi_violation_request_emits_one_cause_per_violation() {
     let router = spawn_router();
     create_namespace(&router, "default").await;

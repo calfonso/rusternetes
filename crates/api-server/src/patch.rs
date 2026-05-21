@@ -56,11 +56,46 @@ pub enum PatchError {
     #[error("Patch operation failed: {0}")]
     OperationFailed(String),
 
+    /// JSON-Patch targeted a path that does not exist on the object.
+    ///
+    /// Carries the resolved dotted field path (e.g. `spec.doesNotExist`) so
+    /// the caller can emit a `Status.details.causes[]` entry with reason
+    /// `FieldValueNotFound` and that exact field.
+    #[error("Path not found: {0}")]
+    PathNotFound(String),
+
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
 
     #[error("Resource version conflict")]
     ResourceVersionConflict,
+}
+
+/// Translate a JSON Pointer (RFC 6901) to upstream dotted field path —
+/// `/spec/doesNotExist` becomes `spec.doesNotExist`,
+/// `/spec/containers/0/name` becomes `spec.containers[0].name`. Numeric
+/// segments are emitted as `[i]` so the result mirrors the breadcrumbs
+/// upstream `field.Path` produces.
+pub fn json_pointer_to_field_path(ptr: &str) -> String {
+    if ptr.is_empty() || ptr == "/" {
+        return String::new();
+    }
+    let parts: Vec<&str> = ptr.trim_start_matches('/').split('/').collect();
+    let mut out = String::new();
+    for part in parts {
+        let unescaped = part.replace("~1", "/").replace("~0", "~");
+        if unescaped.parse::<usize>().is_ok() {
+            out.push('[');
+            out.push_str(&unescaped);
+            out.push(']');
+        } else {
+            if !out.is_empty() {
+                out.push('.');
+            }
+            out.push_str(&unescaped);
+        }
+    }
+    out
 }
 
 /// JSON Patch operation (RFC 6902)
@@ -222,7 +257,12 @@ fn add_operation(value: &Value, path: &str, new_value: &Value) -> Result<Value, 
     Ok(result)
 }
 
-/// Remove operation - removes a value at the specified path
+/// Remove operation - removes a value at the specified path.
+///
+/// Per RFC 6902 §4.2 the target location MUST exist; we emit
+/// [`PatchError::PathNotFound`] (carrying the upstream-style dotted field
+/// path) when the key/index is missing so the api-server can map it to a
+/// `FieldValueNotFound` cause.
 fn remove_operation(value: &Value, path: &str) -> Result<Value, PatchError> {
     let mut result = value.clone();
     let (parent_path, key) = split_path(path)?;
@@ -230,16 +270,15 @@ fn remove_operation(value: &Value, path: &str) -> Result<Value, PatchError> {
     let parent = get_mut_value(&mut result, parent_path)?;
 
     if let Some(obj) = parent.as_object_mut() {
-        obj.remove(key);
+        if obj.remove(key).is_none() {
+            return Err(PatchError::PathNotFound(json_pointer_to_field_path(path)));
+        }
     } else if let Some(arr) = parent.as_array_mut() {
         let index: usize = key
             .parse()
             .map_err(|_| PatchError::InvalidPatch(format!("Invalid array index: {}", key)))?;
         if index >= arr.len() {
-            return Err(PatchError::OperationFailed(format!(
-                "Array index out of bounds: {}",
-                index
-            )));
+            return Err(PatchError::PathNotFound(json_pointer_to_field_path(path)));
         }
         arr.remove(index);
     } else {

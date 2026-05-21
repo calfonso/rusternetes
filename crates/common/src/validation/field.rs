@@ -115,6 +115,26 @@ impl ErrorType {
             ErrorType::TypeInvalid => "Invalid value",
         }
     }
+
+    /// Upstream `Status.details.causes[].reason` string for this error type.
+    ///
+    /// Mirrors `apimachinery/pkg/api/errors/errors.go::NewInvalid` which maps
+    /// every `field.ErrorType` to a `metav1.CauseType` string.
+    pub fn cause_reason(self) -> &'static str {
+        match self {
+            ErrorType::NotFound => "FieldValueNotFound",
+            ErrorType::Required => "FieldValueRequired",
+            ErrorType::Duplicate => "FieldValueDuplicate",
+            ErrorType::Invalid => "FieldValueInvalid",
+            ErrorType::NotSupported => "FieldValueNotSupported",
+            ErrorType::Forbidden => "FieldValueForbidden",
+            ErrorType::TooLong => "FieldValueTooLong",
+            ErrorType::TooMany => "FieldValueTooMany",
+            // Upstream NewInvalid collapses Internal into FieldValueInvalid.
+            ErrorType::Internal => "FieldValueInvalid",
+            ErrorType::TypeInvalid => "FieldValueInvalid",
+        }
+    }
 }
 
 /// A `BadValue` payload that knows how to render itself the way upstream
@@ -249,6 +269,17 @@ impl Error {
     pub fn duplicate(path: &Path, value: impl Into<BadValue>) -> Self {
         Self {
             error_type: ErrorType::Duplicate,
+            field: path.to_string(),
+            bad_value: value.into(),
+            detail: String::new(),
+            origin: String::new(),
+        }
+    }
+
+    /// `field.NotFound` — value rendered, no detail by default.
+    pub fn not_found(path: &Path, value: impl Into<BadValue>) -> Self {
+        Self {
+            error_type: ErrorType::NotFound,
             field: path.to_string(),
             bad_value: value.into(),
             detail: String::new(),

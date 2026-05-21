@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::validation::field::ErrorList;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Resource not found: {0}")]
@@ -8,8 +10,23 @@ pub enum Error {
     #[error("Resource already exists: {0}")]
     AlreadyExists(String),
 
+    /// Legacy 422 Invalid error carrying only a flat string. Used by handler
+    /// paths that have not yet been refactored to thread a structured
+    /// `field::ErrorList`. The IntoResponse impl parses the upstream-style
+    /// `"<field>: <ErrorType>: <detail>"` wording back into a single
+    /// `StatusCause` so the response body still matches upstream shape.
     #[error("Invalid resource: {0}")]
     InvalidResource(String),
+
+    /// Structured 422 Invalid error carrying a `field::ErrorList`. Each entry
+    /// maps to one `Status.details.causes[]` entry with the upstream
+    /// `FieldValueXxx` reason taxonomy — mirrors `NewInvalid` upstream.
+    ///
+    /// Validators should accumulate ALL violations into the list rather than
+    /// short-circuiting on the first failure; the IntoResponse impl emits
+    /// one cause per error in field-path order.
+    #[error("Invalid resource: {causes}", causes = format_error_list(.0))]
+    Invalid(ErrorList),
 
     /// Generic bad-request error mapped to HTTP 400 / reason=BadRequest.
     ///
@@ -57,6 +74,14 @@ pub enum Error {
     Internal(String),
 }
 
+/// Render an `ErrorList` upstream-style: one error per line joined by `; `.
+fn format_error_list(errs: &ErrorList) -> String {
+    errs.iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 impl Error {
     /// Returns the machine-readable reason string matching Kubernetes StatusReason values
     pub fn reason(&self) -> &str {
@@ -64,6 +89,7 @@ impl Error {
             Error::NotFound(_) => "NotFound",
             Error::AlreadyExists(_) => "AlreadyExists",
             Error::InvalidResource(_) => "Invalid",
+            Error::Invalid(_) => "Invalid",
             Error::BadRequest(_) => "BadRequest",
             Error::Serialization(_) => "BadRequest",
             Error::Storage(_) => "InternalError",
@@ -115,6 +141,16 @@ impl axum::response::IntoResponse for Error {
             Error::InvalidResource(msg) => {
                 let details = extract_resource_details_for_invalid(&msg);
                 (StatusCode::UNPROCESSABLE_ENTITY, msg, "Invalid", details)
+            }
+            Error::Invalid(errs) => {
+                let msg = format_error_list(&errs);
+                let details = build_invalid_details_from_errors(&errs);
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    msg,
+                    "Invalid",
+                    Some(details),
+                )
             }
             // Mirrors upstream k8s apimachinery/pkg/api/errors/errors.go:
             // strict decoding errors and other syntactic / client-malformed
@@ -197,19 +233,168 @@ fn extract_resource_details(msg: &str) -> Option<crate::types::StatusDetails> {
     })
 }
 
+/// Build `Status.details` from a structured `field::ErrorList`, mirroring
+/// upstream `apimachinery/pkg/api/errors/errors.go::NewInvalid`. Each
+/// `field::Error` becomes one `StatusCause` whose `reason` is the upstream
+/// `FieldValueXxx` mapping of the underlying `ErrorType`, `field` is the
+/// real field path, and `message` is the full upstream-style error line
+/// (`<field>: <ErrorType>: <detail>`).
+#[cfg(feature = "axum-support")]
+fn build_invalid_details_from_errors(errs: &ErrorList) -> crate::types::StatusDetails {
+    let causes: Vec<crate::types::StatusCause> = errs
+        .iter()
+        .map(|e| crate::types::StatusCause {
+            reason: Some(e.error_type.cause_reason().to_string()),
+            message: Some(e.to_string()),
+            field: Some(e.field.clone()),
+        })
+        .collect();
+    crate::types::StatusDetails {
+        name: None,
+        group: None,
+        kind: None,
+        uid: None,
+        causes: if causes.is_empty() {
+            None
+        } else {
+            Some(causes)
+        },
+        retry_after_seconds: None,
+    }
+}
+
+/// Best-effort parser for legacy `Error::InvalidResource(String)` messages
+/// that follow upstream's `"<field>: <ErrorType>: <detail>"` shape (e.g.
+/// `"spec.containers: Required value"`,
+/// `"spec.containers[1].name: Duplicate value: \"ctr-a\""`,
+/// `"spec.nodeName: Invalid value: \"node-2\": field is immutable"`).
+///
+/// Returns `None` if the message does not look like a field error — callers
+/// fall back to a minimal hardcoded cause in that case.
+#[cfg(feature = "axum-support")]
+fn parse_legacy_field_error(msg: &str) -> Option<(crate::validation::field::ErrorType, String)> {
+    use crate::validation::field::ErrorType;
+
+    // Split into `<field>: <rest>` — `rest` carries the ErrorType label and
+    // (optionally) the bad value and detail. We only need the type label here.
+    let (field, rest) = msg.split_once(": ")?;
+    if field.is_empty() || field.contains(' ') {
+        return None;
+    }
+    // Each ErrorType has a canonical leading label (see `ErrorType::as_str`).
+    // Match longest-prefix first so `"Invalid value"` is not matched as
+    // `"Invalid"` (which is not actually one of upstream's labels).
+    let labels: &[(&str, ErrorType)] = &[
+        ("Required value", ErrorType::Required),
+        ("Duplicate value", ErrorType::Duplicate),
+        ("Unsupported value", ErrorType::NotSupported),
+        ("Forbidden", ErrorType::Forbidden),
+        ("Invalid value", ErrorType::Invalid),
+        ("Not found", ErrorType::NotFound),
+        ("Too long", ErrorType::TooLong),
+        ("Too many", ErrorType::TooMany),
+        ("Internal error", ErrorType::Internal),
+    ];
+    for (label, ty) in labels {
+        if rest == *label || rest.starts_with(&format!("{label}:")) {
+            return Some((*ty, field.to_string()));
+        }
+    }
+    None
+}
+
 /// Extract resource details for Invalid errors, including causes.
 #[cfg(feature = "axum-support")]
 fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::StatusDetails> {
+    // Try to parse upstream-shaped legacy messages into a structured cause.
+    // Falls back to the previous hardcoded shape only when parsing fails so
+    // that older callers that emit free-form text don't suddenly 500.
+    let (reason, field) = match parse_legacy_field_error(msg) {
+        Some((ty, field)) => (ty.cause_reason().to_string(), field),
+        None => ("FieldValueInvalid".to_string(), "metadata.name".to_string()),
+    };
     Some(crate::types::StatusDetails {
         name: None,
         group: None,
         kind: None,
         uid: None,
         causes: Some(vec![crate::types::StatusCause {
-            reason: Some("FieldValueInvalid".to_string()),
+            reason: Some(reason),
             message: Some(msg.to_string()),
-            field: Some("metadata.name".to_string()),
+            field: Some(field),
         }]),
         retry_after_seconds: None,
     })
+}
+
+#[cfg(all(test, feature = "axum-support"))]
+mod tests {
+    use super::*;
+    use crate::validation::field::{ErrorType, Path};
+
+    #[test]
+    fn parse_legacy_required() {
+        let (ty, field) = parse_legacy_field_error("spec.containers: Required value").unwrap();
+        assert_eq!(ty, ErrorType::Required);
+        assert_eq!(field, "spec.containers");
+    }
+
+    #[test]
+    fn parse_legacy_duplicate_with_value() {
+        let (ty, field) =
+            parse_legacy_field_error("spec.containers[1].name: Duplicate value: \"ctr-a\"")
+                .unwrap();
+        assert_eq!(ty, ErrorType::Duplicate);
+        assert_eq!(field, "spec.containers[1].name");
+    }
+
+    #[test]
+    fn parse_legacy_forbidden() {
+        let (ty, field) = parse_legacy_field_error(
+            "spec.ephemeralContainers: Forbidden: cannot be set on create",
+        )
+        .unwrap();
+        assert_eq!(ty, ErrorType::Forbidden);
+        assert_eq!(field, "spec.ephemeralContainers");
+    }
+
+    #[test]
+    fn parse_legacy_invalid_with_detail() {
+        let (ty, field) = parse_legacy_field_error(
+            "spec.nodeName: Invalid value: \"node-2\": field is immutable",
+        )
+        .unwrap();
+        assert_eq!(ty, ErrorType::Invalid);
+        assert_eq!(field, "spec.nodeName");
+    }
+
+    #[test]
+    fn parse_legacy_unsupported() {
+        let (ty, field) = parse_legacy_field_error(
+            "spec.restartPolicy: Unsupported value: \"InvalidPolicy\": supported values: \"Always\", \"OnFailure\", \"Never\"",
+        )
+        .unwrap();
+        assert_eq!(ty, ErrorType::NotSupported);
+        assert_eq!(field, "spec.restartPolicy");
+    }
+
+    #[test]
+    fn build_details_from_error_list_one_cause_per_error() {
+        let p = Path::new("spec");
+        let errs = vec![
+            crate::validation::field::Error::required(&p.child("containers"), ""),
+            crate::validation::field::Error::not_supported(
+                &p.child("restartPolicy"),
+                "InvalidPolicy",
+                &["Always", "OnFailure", "Never"],
+            ),
+        ];
+        let details = build_invalid_details_from_errors(&errs);
+        let causes = details.causes.unwrap();
+        assert_eq!(causes.len(), 2);
+        assert_eq!(causes[0].reason.as_deref(), Some("FieldValueRequired"));
+        assert_eq!(causes[0].field.as_deref(), Some("spec.containers"));
+        assert_eq!(causes[1].reason.as_deref(), Some("FieldValueNotSupported"));
+        assert_eq!(causes[1].field.as_deref(), Some("spec.restartPolicy"));
+    }
 }
