@@ -302,7 +302,6 @@ async fn test_json_patch_remove_array_element() {
 /// we accept any 4xx and additionally pin that storage is unchanged
 /// (atomicity).
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: remove of non-existent path silently succeeds (RFC 6902 §4.2 violation)"]
 async fn test_json_patch_remove_nonexistent_path_fails() {
     let (mem, router) = spawn_router();
     let key = seed_pod(&mem, "rm-missing").await;
@@ -354,7 +353,6 @@ async fn test_json_patch_replace_existing_field() {
 /// target to exist. This distinguishes `replace` from `add` (which can
 /// create).
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: replace on non-existent path silently inserts (RFC 6902 §4.3 violation)"]
 async fn test_json_patch_replace_nonexistent_path_fails() {
     let (mem, router) = spawn_router();
     let key = seed_pod(&mem, "replace-missing").await;
@@ -447,7 +445,6 @@ async fn test_json_patch_move_nonexistent_from_fails() {
 /// detect this case (it just performs remove + add, and the post-remove
 /// add fails for a different reason).
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: move into descendant of from is not rejected per RFC 6902 §4.4"]
 async fn test_json_patch_move_into_descendant_fails() {
     let (mem, router) = spawn_router();
     let key = seed_pod(&mem, "mv-descendant").await;
@@ -605,7 +602,6 @@ async fn test_json_patch_test_unequal_fails_entire_patch() {
 /// Annotation key containing `/` is addressed via `~1`. Common in
 /// Kubernetes (e.g. `kubernetes.io/foo`-style annotations).
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: split_path returns raw last segment; ~1 not unescaped before object insert (RFC 6901 §3)"]
 async fn test_json_patch_path_escape_slash() {
     let (mem, router) = spawn_router();
     let key = seed_pod(&mem, "esc-slash").await;
@@ -634,7 +630,6 @@ async fn test_json_patch_path_escape_slash() {
 
 /// Annotation key containing `~` is addressed via `~0`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: split_path returns raw last segment; ~0 not unescaped before object insert (RFC 6901 §3)"]
 async fn test_json_patch_path_escape_tilde() {
     let (mem, router) = spawn_router();
     let key = seed_pod(&mem, "esc-tilde").await;
@@ -730,7 +725,6 @@ async fn test_json_patch_path_dash_means_end_of_array() {
 /// If a later op fails, the whole patch is rejected. Earlier ops must
 /// NOT be observable in storage.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: atomicity cannot be observed because remove of non-existent path silently succeeds; depends on remove-fix above"]
 async fn test_json_patch_atomicity_failed_op_rolls_back() {
     let (mem, router) = spawn_router();
     let key = seed_pod(&mem, "atomic").await;

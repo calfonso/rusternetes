@@ -238,7 +238,7 @@ fn add_operation(value: &Value, path: &str, new_value: &Value) -> Result<Value, 
     let parent = get_mut_value(&mut result, parent_path)?;
 
     if let Some(obj) = parent.as_object_mut() {
-        obj.insert(key.to_string(), new_value.clone());
+        obj.insert(key, new_value.clone());
     } else if let Some(arr) = parent.as_array_mut() {
         let index = if key == "-" {
             arr.len()
@@ -270,7 +270,7 @@ fn remove_operation(value: &Value, path: &str) -> Result<Value, PatchError> {
     let parent = get_mut_value(&mut result, parent_path)?;
 
     if let Some(obj) = parent.as_object_mut() {
-        if obj.remove(key).is_none() {
+        if obj.remove(&key).is_none() {
             return Err(PatchError::PathNotFound(json_pointer_to_field_path(path)));
         }
     } else if let Some(arr) = parent.as_array_mut() {
@@ -291,7 +291,12 @@ fn remove_operation(value: &Value, path: &str) -> Result<Value, PatchError> {
     Ok(result)
 }
 
-/// Replace operation - replaces a value at the specified path
+/// Replace operation - replaces a value at the specified path.
+///
+/// Per RFC 6902 §4.3 the target location MUST exist; we emit
+/// [`PatchError::PathNotFound`] (carrying the upstream-style dotted field
+/// path) when the key/index is missing — equivalent to remove + add where
+/// the remove must succeed.
 fn replace_operation(value: &Value, path: &str, new_value: &Value) -> Result<Value, PatchError> {
     let mut result = value.clone();
 
@@ -303,25 +308,38 @@ fn replace_operation(value: &Value, path: &str, new_value: &Value) -> Result<Val
     let parent = get_mut_value(&mut result, parent_path)?;
 
     if let Some(obj) = parent.as_object_mut() {
-        obj.insert(key.to_string(), new_value.clone());
+        if !obj.contains_key(&key) {
+            return Err(PatchError::PathNotFound(json_pointer_to_field_path(path)));
+        }
+        obj.insert(key, new_value.clone());
     } else if let Some(arr) = parent.as_array_mut() {
         let index: usize = key
             .parse()
             .map_err(|_| PatchError::InvalidPatch(format!("Invalid array index: {}", key)))?;
         if index >= arr.len() {
-            return Err(PatchError::OperationFailed(format!(
-                "Array index out of bounds: {}",
-                index
-            )));
+            return Err(PatchError::PathNotFound(json_pointer_to_field_path(path)));
         }
         arr[index] = new_value.clone();
+    } else {
+        return Err(PatchError::OperationFailed(format!(
+            "Cannot replace in non-object/array at path: {}",
+            parent_path
+        )));
     }
 
     Ok(result)
 }
 
-/// Move operation - moves a value from one path to another
+/// Move operation - moves a value from one path to another. RFC 6902 §4.4
+/// forbids `from` being a proper prefix of `path` (a location cannot be
+/// moved into one of its own children).
 fn move_operation(value: &Value, from: &str, to: &str) -> Result<Value, PatchError> {
+    if is_proper_prefix(from, to) {
+        return Err(PatchError::InvalidPatch(format!(
+            "move: 'from' location ({}) must not be a proper prefix of 'path' ({}) per RFC 6902 §4.4",
+            from, to
+        )));
+    }
     // Get the value at 'from'
     let moved_value = get_value(value, from)?;
     // Remove from 'from' location
@@ -329,6 +347,17 @@ fn move_operation(value: &Value, from: &str, to: &str) -> Result<Value, PatchErr
     // Add to 'to' location
     result = add_operation(&result, to, &moved_value)?;
     Ok(result)
+}
+
+/// `from` is a proper prefix of `to` when `to == from` or `to` begins with
+/// `from` followed by a `/` (so `/a/b` is a prefix of `/a/b/c` but not of
+/// `/a/bb`). Comparison is on the raw escaped pointer per RFC 6901.
+fn is_proper_prefix(from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    to.strip_prefix(from)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Copy operation - copies a value from one path to another
@@ -778,25 +807,38 @@ fn parse_path(path: &str) -> Result<Vec<String>, PatchError> {
         .collect())
 }
 
-/// Split a path into parent path and final key
-fn split_path(path: &str) -> Result<(&str, &str), PatchError> {
-    if path.is_empty() || path == "/" {
+/// Split a path into parent path and final key. The returned key is
+/// unescaped per RFC 6901 §3 (`~1` → `/`, `~0` → `~`); the parent path
+/// is returned raw because `get_mut_value` re-splits and unescapes it.
+fn split_path(path: &str) -> Result<(&str, String), PatchError> {
+    if !path.starts_with('/') {
+        return Err(PatchError::InvalidPatch(format!(
+            "Path must start with '/': {}",
+            path
+        )));
+    }
+    if path == "/" {
         return Err(PatchError::InvalidPatch(
             "Cannot split root path".to_string(),
         ));
     }
 
-    let last_slash = path
-        .rfind('/')
-        .ok_or_else(|| PatchError::InvalidPatch(format!("Path missing '/': {}", path)))?;
+    let last_slash = path.rfind('/').expect("path starts with '/'");
     let parent = if last_slash == 0 {
         "/"
     } else {
         &path[..last_slash]
     };
-    let key = &path[last_slash + 1..];
+    let key = unescape_token(&path[last_slash + 1..]);
 
     Ok((parent, key))
+}
+
+/// Unescape a single JSON Pointer reference token (RFC 6901 §3): `~1`
+/// decodes to `/`, `~0` decodes to `~`. Order matters — `~1` must be
+/// decoded first so that `~01` round-trips to `~1` rather than `/`.
+fn unescape_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
 }
 
 #[cfg(test)]
