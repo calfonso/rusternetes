@@ -6176,7 +6176,10 @@ impl ProtoRegistry {
     }
 
     fn pod_spec_schema() -> MessageSchema {
-        // From core/v1/generated.proto — PodSpec has MANY fields
+        // From core/v1/generated.proto — PodSpec has MANY fields.
+        // Field numbers must match upstream k8s.io/api/core/v1 v1.35 verbatim;
+        // protobuf dispatch is number-based, so any drift silently mis-decodes
+        // typed-client traffic into adjacent fields.
         MessageSchema {
             fields: HashMap::from([
                 (
@@ -6243,24 +6246,24 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
-                    24,
+                    23,
                     (
                         "hostAliases".into(),
                         FieldType::Repeated(Box::new(FieldType::Message("HostAlias".into()))),
                     ),
                 ),
-                (25, ("priorityClassName".into(), FieldType::String)),
-                (26, ("priority".into(), FieldType::Int)),
+                (24, ("priorityClassName".into(), FieldType::String)),
+                (25, ("priority".into(), FieldType::Int)),
                 (
-                    27,
+                    26,
                     (
                         "dnsConfig".into(),
                         FieldType::Message("PodDNSConfig".into()),
                     ),
                 ),
-                (28, ("shareProcessNamespace".into(), FieldType::Bool)),
+                (27, ("shareProcessNamespace".into(), FieldType::Bool)),
                 (
-                    29,
+                    28,
                     (
                         "readinessGates".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -6268,18 +6271,12 @@ impl ProtoRegistry {
                         ))),
                     ),
                 ),
-                (30, ("runtimeClassName".into(), FieldType::String)),
-                (32, ("overhead".into(), FieldType::StringMap)),
-                (33, ("enableServiceLinks".into(), FieldType::Bool)),
+                (29, ("runtimeClassName".into(), FieldType::String)),
+                (30, ("enableServiceLinks".into(), FieldType::Bool)),
+                (31, ("preemptionPolicy".into(), FieldType::String)),
+                (32, ("overhead".into(), FieldType::QuantityMap)),
                 (
-                    34,
-                    (
-                        "ephemeralContainers".into(),
-                        FieldType::Repeated(Box::new(FieldType::Message("Container".into()))),
-                    ),
-                ),
-                (
-                    35,
+                    33,
                     (
                         "topologySpreadConstraints".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -6287,8 +6284,27 @@ impl ProtoRegistry {
                         ))),
                     ),
                 ),
-                (36, ("setHostnameAsFQDN".into(), FieldType::Bool)),
-                (37, ("os".into(), FieldType::Message("PodOS".into()))),
+                (
+                    34,
+                    (
+                        "ephemeralContainers".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "EphemeralContainer".into(),
+                        ))),
+                    ),
+                ),
+                (35, ("setHostnameAsFQDN".into(), FieldType::Bool)),
+                (36, ("os".into(), FieldType::Message("PodOS".into()))),
+                (37, ("hostUsers".into(), FieldType::Bool)),
+                (
+                    38,
+                    (
+                        "schedulingGates".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "PodSchedulingGate".into(),
+                        ))),
+                    ),
+                ),
                 (
                     39,
                     (
@@ -6301,10 +6317,16 @@ impl ProtoRegistry {
                 (
                     40,
                     (
-                        "schedulingGates".into(),
-                        FieldType::Repeated(Box::new(FieldType::Message(
-                            "PodSchedulingGate".into(),
-                        ))),
+                        "resources".into(),
+                        FieldType::Message("ResourceRequirements".into()),
+                    ),
+                ),
+                (41, ("hostnameOverride".into(), FieldType::String)),
+                (
+                    42,
+                    (
+                        "workloadRef".into(),
+                        FieldType::Message("WorkloadReference".into()),
                     ),
                 ),
             ]),
