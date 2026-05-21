@@ -163,12 +163,22 @@ pub fn validate_pod_spec_update(
     }
 
     let mut munged_json = serde_json::to_value(&munged).unwrap_or_default();
-    let old_json = serde_json::to_value(old).unwrap_or_default();
+    let mut old_json = serde_json::to_value(old).unwrap_or_default();
     // Backfill null/missing fields in `new` with the corresponding value
     // from `old` before DeepEqual. Implements partial-update semantics
     // matching K8s' defaulting + admission pipeline re-running on every
     // request (so a client may omit server-managed fields).
     fill_nulls_from(&mut munged_json, &old_json);
+    // Normalize empty `{}` objects to absent on both sides. This mirrors
+    // Go's `apiequality.Semantic.DeepEqual` behaviour, which treats a
+    // zero-valued struct as equal to a nil pointer. Without this, a
+    // round-trip through Go's typed `corev1.Pod` (which marshals
+    // `Resources ResourceRequirements` with `omitempty` but still emits
+    // `"resources":{}` because Go's `omitempty` does not detect empty
+    // structs) would falsely trip the immutability fence even on an
+    // empty client-side update.
+    strip_empty_objects(&mut munged_json);
+    strip_empty_objects(&mut old_json);
     if munged_json != old_json {
         return Err("pod updates may not change fields other than \
              `spec.containers[*].image`, `spec.initContainers[*].image`, \
@@ -178,6 +188,47 @@ pub fn validate_pod_spec_update(
     }
 
     Ok(())
+}
+
+/// Recursively remove empty `{}` objects from a JSON value tree. Mirrors
+/// Go's `apiequality.Semantic.DeepEqual` treatment of zero-valued structs
+/// as equal to `nil` pointers. Without this, an empty `"resources":{}`
+/// emitted by a Go client (because `omitempty` on a struct value type
+/// does not detect zero-valued structs) would falsely trip our diff
+/// fence on an empty update.
+///
+/// Applies post-order so a key whose value becomes empty after recursing
+/// is itself stripped (e.g. `{"a":{"b":{}}}` → `{}`).
+///
+/// Exported for shared use by other DeepEqual-style spec comparators
+/// (notably `crates/api-server/src/handlers/lifecycle.rs::
+/// maybe_increment_generation`).
+pub fn strip_empty_objects(v: &mut serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                if let Some(child) = map.get_mut(&k) {
+                    strip_empty_objects(child);
+                    let drop = match child {
+                        Value::Object(m) => m.is_empty(),
+                        Value::Null => true,
+                        _ => false,
+                    };
+                    if drop {
+                        map.remove(&k);
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                strip_empty_objects(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively backfill `null`/missing keys in `dst` with the corresponding
