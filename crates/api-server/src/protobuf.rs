@@ -1129,12 +1129,94 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // PodStatus — field numbers from k8s.io/api/core/v1/generated.proto
+        // (release-1.35). Critically, *every* field the typed kubernetes client
+        // round-trips through Pods().UpdateStatus(...) must be enumerated here:
+        // any unknown field is silently dropped by the protobuf decoder, which
+        // wipes the status (including .conditions) — breaking the
+        // `[sig-node] Pods should run through the lifecycle of Pods and
+        // PodStatus` conformance test (and any other PodStatus PATCH/PUT).
         schemas.insert(
             "PodStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("phase".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PodCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (3, ("message".into(), FieldType::String)),
+                    (4, ("reason".into(), FieldType::String)),
+                    (5, ("hostIP".into(), FieldType::String)),
+                    (6, ("podIP".into(), FieldType::String)),
+                    (7, ("startTime".into(), FieldType::Message("Time".into()))),
+                    (
+                        8,
+                        (
+                            "containerStatuses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerStatus".into(),
+                            ))),
+                        ),
+                    ),
+                    (9, ("qosClass".into(), FieldType::String)),
+                    (
+                        10,
+                        (
+                            "initContainerStatuses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerStatus".into(),
+                            ))),
+                        ),
+                    ),
+                    (11, ("nominatedNodeName".into(), FieldType::String)),
+                    (
+                        12,
+                        (
+                            "podIPs".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PodIP".into()))),
+                        ),
+                    ),
+                    (
+                        13,
+                        (
+                            "ephemeralContainerStatuses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerStatus".into(),
+                            ))),
+                        ),
+                    ),
+                    (14, ("resize".into(), FieldType::String)),
+                    (
+                        15,
+                        (
+                            "resourceClaimStatuses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PodResourceClaimStatus".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        16,
+                        (
+                            "hostIPs".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("HostIP".into()))),
+                        ),
+                    ),
+                    (17, ("observedGeneration".into(), FieldType::Int)),
+                ]),
             },
         );
+        // PodCondition / HostIP / PodIP / ContainerStatus / PodResourceClaimStatus
+        // are defined further down in this same function; the PodStatus
+        // schema above references them by name, so they only need to exist
+        // somewhere in this registry (HashMap insertion order doesn't matter
+        // for lookup).
 
         // ConfigMap & Secret
         schemas.insert(
@@ -9064,6 +9146,191 @@ mod tests {
         assert_eq!(
             val.pointer("/matchLabels/app"),
             Some(&Value::String("nginx".into()))
+        );
+    }
+
+    /// Regression test for the upstream conformance test
+    /// `[sig-node] Pods should run through the lifecycle of Pods and PodStatus`
+    /// (k8s.io/kubernetes/test/e2e/common/node/pods.go:1044).
+    ///
+    /// The typed Kubernetes client (`clientset.CoreV1().Pods(ns).UpdateStatus`)
+    /// transmits Pod bodies as `application/vnd.kubernetes.protobuf`. Our
+    /// `normalize_content_type_middleware` decodes those via
+    /// `ProtoRegistry::decode_message`. If the `PodStatus` (or `PodCondition`)
+    /// schema is missing fields, the decoder silently drops them — so
+    /// `status.conditions` arrives at the handler as an empty array (or status
+    /// becomes `{}` entirely) and the conformance test's
+    /// "failed to update PodStatus - field patch count doesn't match the total"
+    /// fires.
+    ///
+    /// This test builds a minimal PodStatus on the wire (phase=Running, two
+    /// conditions with status=False) and asserts the registry decodes them
+    /// faithfully to JSON.
+    #[test]
+    fn test_decode_pod_status_preserves_conditions() {
+        let registry = ProtoRegistry::new();
+
+        // PodCondition #1 — type=Ready, status=False
+        let mut cond1 = Vec::new();
+        cond1.push(0x0a); // field 1 (type), length-delimited
+        cond1.push(b"Ready".len() as u8);
+        cond1.extend_from_slice(b"Ready");
+        cond1.push(0x12); // field 2 (status), length-delimited
+        cond1.push(b"False".len() as u8);
+        cond1.extend_from_slice(b"False");
+
+        // PodCondition #2 — type=ContainersReady, status=False
+        let mut cond2 = Vec::new();
+        cond2.push(0x0a);
+        cond2.push(b"ContainersReady".len() as u8);
+        cond2.extend_from_slice(b"ContainersReady");
+        cond2.push(0x12);
+        cond2.push(b"False".len() as u8);
+        cond2.extend_from_slice(b"False");
+
+        let mut status = Vec::new();
+        // phase = "Running" (field 1, length-delimited)
+        status.push(0x0a);
+        status.push(b"Running".len() as u8);
+        status.extend_from_slice(b"Running");
+        // conditions[0] (field 2, length-delimited, repeated)
+        status.push(0x12);
+        status.push(cond1.len() as u8);
+        status.extend_from_slice(&cond1);
+        // conditions[1]
+        status.push(0x12);
+        status.push(cond2.len() as u8);
+        status.extend_from_slice(&cond2);
+        // podIP = "10.1.2.3" (field 6 → tag 0x32)
+        status.push(0x32);
+        status.push(b"10.1.2.3".len() as u8);
+        status.extend_from_slice(b"10.1.2.3");
+        // qosClass = "BestEffort" (field 9 → tag 0x4a)
+        status.push(0x4a);
+        status.push(b"BestEffort".len() as u8);
+        status.extend_from_slice(b"BestEffort");
+
+        let val = registry
+            .decode_message("PodStatus", &status)
+            .expect("PodStatus must decode");
+
+        assert_eq!(val.get("phase"), Some(&Value::String("Running".into())));
+        assert_eq!(val.get("podIP"), Some(&Value::String("10.1.2.3".into())));
+        assert_eq!(
+            val.get("qosClass"),
+            Some(&Value::String("BestEffort".into()))
+        );
+
+        let conds = val
+            .get("conditions")
+            .and_then(|c| c.as_array())
+            .expect("conditions must be a JSON array");
+        assert_eq!(conds.len(), 2, "both conditions must round-trip");
+        assert_eq!(conds[0].get("type"), Some(&Value::String("Ready".into())));
+        assert_eq!(conds[0].get("status"), Some(&Value::String("False".into())));
+        assert_eq!(
+            conds[1].get("type"),
+            Some(&Value::String("ContainersReady".into()))
+        );
+        assert_eq!(conds[1].get("status"), Some(&Value::String("False".into())));
+    }
+
+    /// End-to-end: a full Pod wire body with metadata + spec + status with
+    /// flipped Ready/ContainersReady conditions. Mirrors the wire body that
+    /// `clientset.CoreV1().Pods(ns).UpdateStatus(...)` produces from a typed
+    /// `v1.Pod`. Verifies the protobuf middleware → JSON conversion preserves
+    /// `status.conditions` end to end.
+    #[test]
+    fn test_decode_pod_with_status_conditions_round_trips() {
+        let registry = ProtoRegistry::new();
+
+        // Build a minimal ObjectMeta { name = "pod-test" }
+        let mut meta = Vec::new();
+        meta.push(0x0a); // field 1 (name)
+        meta.push(b"pod-test".len() as u8);
+        meta.extend_from_slice(b"pod-test");
+
+        // Build a minimal PodSpec { containers: [{name=pod-test, image=agnhost}] }
+        let mut container = Vec::new();
+        container.push(0x0a);
+        container.push(b"pod-test".len() as u8);
+        container.extend_from_slice(b"pod-test");
+        container.push(0x12);
+        container.push(b"agnhost".len() as u8);
+        container.extend_from_slice(b"agnhost");
+        let mut pod_spec = Vec::new();
+        pod_spec.push(0x12); // field 2 (containers)
+        pod_spec.push(container.len() as u8);
+        pod_spec.extend_from_slice(&container);
+
+        // Build PodStatus { phase="Running", conditions=[Ready/False, ContainersReady/False] }
+        let mut cond1 = Vec::new();
+        cond1.extend_from_slice(&[0x0a, b"Ready".len() as u8]);
+        cond1.extend_from_slice(b"Ready");
+        cond1.extend_from_slice(&[0x12, b"False".len() as u8]);
+        cond1.extend_from_slice(b"False");
+        let mut cond2 = Vec::new();
+        cond2.extend_from_slice(&[0x0a, b"ContainersReady".len() as u8]);
+        cond2.extend_from_slice(b"ContainersReady");
+        cond2.extend_from_slice(&[0x12, b"False".len() as u8]);
+        cond2.extend_from_slice(b"False");
+        let mut pod_status = Vec::new();
+        pod_status.extend_from_slice(&[0x0a, b"Running".len() as u8]);
+        pod_status.extend_from_slice(b"Running");
+        pod_status.push(0x12);
+        pod_status.push(cond1.len() as u8);
+        pod_status.extend_from_slice(&cond1);
+        pod_status.push(0x12);
+        pod_status.push(cond2.len() as u8);
+        pod_status.extend_from_slice(&cond2);
+
+        // Build Pod { metadata, spec, status }
+        let mut pod = Vec::new();
+        pod.push(0x0a); // field 1 (metadata)
+        pod.push(meta.len() as u8);
+        pod.extend_from_slice(&meta);
+        pod.push(0x12); // field 2 (spec)
+        pod.push(pod_spec.len() as u8);
+        pod.extend_from_slice(&pod_spec);
+        pod.push(0x1a); // field 3 (status)
+        pod.push(pod_status.len() as u8);
+        pod.extend_from_slice(&pod_status);
+
+        let val = registry.decode_message("Pod", &pod).expect("Pod decodes");
+
+        // Spec and metadata still arrive.
+        assert_eq!(
+            val.pointer("/metadata/name"),
+            Some(&Value::String("pod-test".into()))
+        );
+        assert_eq!(
+            val.pointer("/spec/containers/0/name"),
+            Some(&Value::String("pod-test".into()))
+        );
+
+        // The bug we are fixing: status.conditions must be present with both
+        // Ready/False and ContainersReady/False entries, and status.phase must
+        // be "Running". Before this fix, `status` was always `{}`.
+        let status = val.get("status").expect("status must round-trip");
+        assert_eq!(status.get("phase"), Some(&Value::String("Running".into())));
+        let conds = status
+            .get("conditions")
+            .and_then(|c| c.as_array())
+            .expect("status.conditions must be decoded as an array");
+        let mut false_ready = 0;
+        for c in conds {
+            let ty = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let st = c.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if (ty == "Ready" || ty == "ContainersReady") && st == "False" {
+                false_ready += 1;
+            }
+        }
+        assert_eq!(
+            false_ready, 2,
+            "PodStatus protobuf decode must preserve both Ready=False and \
+             ContainersReady=False conditions (regression test for the \
+             '[sig-node] Pods should run through the lifecycle of Pods and \
+             PodStatus' conformance test)"
         );
     }
 
