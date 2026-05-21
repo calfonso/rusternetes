@@ -82,6 +82,127 @@ fn resource_type_to_kind_api_version(resource_type: &str) -> (String, String) {
     }
 }
 
+/// Build the merged resource for a /status subresource write.
+///
+/// This is the pure, testable core of `update_status`: given the currently
+/// stored resource and the request body (already parsed as JSON), it builds
+/// the resource that will be persisted.
+///
+/// Behavior, modelled on k8s.io/kubernetes/pkg/registry/core/pod/strategy.go's
+/// `podStatusStrategy.PrepareForUpdate` (release-1.35):
+///   - Spec is taken from the current resource (clients cannot change spec
+///     through /status).
+///   - Metadata is taken from the current resource, with annotations and
+///     labels from the request body merged in (status subresource is allowed
+///     to update metadata.annotations/labels but not other metadata fields,
+///     and most importantly not metadata.deletionTimestamp /
+///     metadata.ownerReferences).
+///   - resourceVersion is stripped from metadata so storage can assign one.
+///   - Status is taken from the request body. For merge-patch /
+///     strategic-merge-patch content types the request status is *deep-merged*
+///     into the current status; for PUT and JSON Patch it replaces wholesale.
+///
+/// `is_merge_patch` is `true` when the request `Content-Type` was a JSON
+/// merge-patch or strategic-merge-patch (so the body's status is a sparse
+/// patch document, not a full status object).
+pub fn build_updated_resource_for_status(
+    current_resource: &Value,
+    new_resource: &Value,
+    is_merge_patch: bool,
+    resource_type: &str,
+) -> Result<Value> {
+    let current_metadata = current_resource
+        .get("metadata")
+        .ok_or_else(|| rusternetes_common::Error::InvalidResource("Missing metadata".to_string()))?
+        .clone();
+
+    let current_spec = current_resource.get("spec").cloned();
+
+    // Status: for merge-patch, deep-merge into current; for PUT, replace.
+    let new_status = if is_merge_patch {
+        let patch_status = new_resource
+            .get("status")
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+        let mut merged = current_resource
+            .get("status")
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+        // K8s strategic merge patch recursively merges maps (like
+        // capacity, allocatable). Simple insert replaces the entire
+        // map, wiping out existing entries. This broke preemption
+        // tests that patch node status to add extended resources.
+        crate::patch::deep_merge_objects(&mut merged, &patch_status);
+        merged
+    } else {
+        new_resource
+            .get("status")
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()))
+    };
+
+    // Build the updated resource starting from current (preserves any fields
+    // we don't explicitly touch).
+    let mut updated_resource = current_resource.clone();
+
+    if let Some(obj) = updated_resource.as_object_mut() {
+        // Preserve spec from current resource
+        if let Some(spec) = current_spec {
+            obj.insert("spec".to_string(), spec);
+        }
+
+        // Update status
+        obj.insert("status".to_string(), new_status);
+
+        // Merge metadata: keep current metadata but apply annotations/labels
+        // from the incoming request.
+        if let Some(metadata_obj) = current_metadata.as_object() {
+            let mut merged_metadata = metadata_obj.clone();
+            merged_metadata.remove("resourceVersion");
+
+            if let Some(new_meta) = new_resource.get("metadata").and_then(|m| m.as_object()) {
+                if let Some(new_annotations) =
+                    new_meta.get("annotations").and_then(|a| a.as_object())
+                {
+                    let annotations = merged_metadata
+                        .entry("annotations")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if let Some(existing) = annotations.as_object_mut() {
+                        for (k, v) in new_annotations {
+                            existing.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                if let Some(new_labels) = new_meta.get("labels").and_then(|l| l.as_object()) {
+                    let labels = merged_metadata
+                        .entry("labels")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if let Some(existing) = labels.as_object_mut() {
+                        for (k, v) in new_labels {
+                            existing.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+
+            obj.insert("metadata".to_string(), Value::Object(merged_metadata));
+        }
+
+        // Ensure TypeMeta fields are present before saving — some clients
+        // (e.g. protobuf) may strip kind/apiVersion and K8s clients require
+        // them in responses.
+        if !obj.contains_key("kind") || !obj.contains_key("apiVersion") {
+            let (kind, api_version) = resource_type_to_kind_api_version(resource_type);
+            obj.entry("kind".to_string())
+                .or_insert_with(|| Value::String(kind));
+            obj.entry("apiVersion".to_string())
+                .or_insert_with(|| Value::String(api_version));
+        }
+    }
+
+    Ok(updated_resource)
+}
+
 /// Generic status update handler
 ///
 /// This handler updates only the status field of a resource while preserving
@@ -203,100 +324,12 @@ pub async fn update_status(
     let key = build_key(&resource_type, Some(&namespace), &name);
     let current_resource: Value = state.storage.get(&key).await?;
 
-    // Extract current and new status
-    let current_metadata = current_resource
-        .get("metadata")
-        .ok_or_else(|| rusternetes_common::Error::InvalidResource("Missing metadata".to_string()))?
-        .clone();
-
-    let current_spec = current_resource.get("spec").cloned();
-
-    // For merge-patch, merge the status fields rather than replacing entirely.
-    // This preserves replicas/readyReplicas when only conditions are patched.
-    let new_status = if is_merge_patch {
-        let patch_status = new_resource
-            .get("status")
-            .cloned()
-            .unwrap_or(Value::Object(serde_json::Map::new()));
-        let mut merged = current_resource
-            .get("status")
-            .cloned()
-            .unwrap_or(Value::Object(serde_json::Map::new()));
-        // K8s strategic merge patch recursively merges maps (like
-        // capacity, allocatable). Simple insert replaces the entire
-        // map, wiping out existing entries. This broke preemption
-        // tests that patch node status to add extended resources.
-        crate::patch::deep_merge_objects(&mut merged, &patch_status);
-        merged
-    } else {
-        new_resource
-            .get("status")
-            .cloned()
-            .unwrap_or(Value::Object(serde_json::Map::new()))
-    };
-
-    // Build the updated resource:
-    // - Keep the current spec
-    // - Keep the current metadata (except resourceVersion)
-    // - Update only the status
-    let mut updated_resource = current_resource.clone();
-
-    if let Some(obj) = updated_resource.as_object_mut() {
-        // Preserve spec from current resource
-        if let Some(spec) = current_spec {
-            obj.insert("spec".to_string(), spec);
-        }
-
-        // Update status
-        obj.insert("status".to_string(), new_status);
-
-        // Merge metadata: keep current metadata but apply annotations/labels
-        // from the incoming request (for PATCH/server-side apply support).
-        if let Some(metadata_obj) = current_metadata.as_object() {
-            let mut merged_metadata = metadata_obj.clone();
-            merged_metadata.remove("resourceVersion");
-
-            // Merge annotations and labels from the new resource
-            if let Some(new_meta) = new_resource.get("metadata").and_then(|m| m.as_object()) {
-                if let Some(new_annotations) =
-                    new_meta.get("annotations").and_then(|a| a.as_object())
-                {
-                    let annotations = merged_metadata
-                        .entry("annotations")
-                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                    if let Some(existing) = annotations.as_object_mut() {
-                        for (k, v) in new_annotations {
-                            existing.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                if let Some(new_labels) = new_meta.get("labels").and_then(|l| l.as_object()) {
-                    let labels = merged_metadata
-                        .entry("labels")
-                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                    if let Some(existing) = labels.as_object_mut() {
-                        for (k, v) in new_labels {
-                            existing.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-
-            obj.insert("metadata".to_string(), Value::Object(merged_metadata));
-        }
-    }
-
-    // Ensure TypeMeta fields are present before saving — some clients (e.g., protobuf)
-    // may strip kind/apiVersion and K8s clients require them in responses.
-    if let Some(obj) = updated_resource.as_object_mut() {
-        if !obj.contains_key("kind") || !obj.contains_key("apiVersion") {
-            let (kind, api_version) = resource_type_to_kind_api_version(&resource_type);
-            obj.entry("kind".to_string())
-                .or_insert_with(|| Value::String(kind));
-            obj.entry("apiVersion".to_string())
-                .or_insert_with(|| Value::String(api_version));
-        }
-    }
+    let updated_resource = build_updated_resource_for_status(
+        &current_resource,
+        &new_resource,
+        is_merge_patch,
+        &resource_type,
+    )?;
 
     // Save the updated resource
     let mut saved: Value = state.storage.update(&key, &updated_resource).await?;
