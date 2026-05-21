@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 # Dockerfile for the all-in-one rusternetes binary.
 #
 # Build context must be the PARENT directory of both rusternetes/ and rhino/
@@ -13,6 +14,18 @@
 #     dockerfile: rusternetes/Dockerfile.all-in-one
 #     args:
 #       CARGO_FEATURES: redis
+#
+# Two-stage cargo build (matches Dockerfile.services pattern):
+#   Pass 1 — copy crate manifests + dummy src files, compile dep graph
+#            into cache-mounted target/. Cached until a Cargo.toml /
+#            Cargo.lock / build.rs / proto/ changes.
+#   Pass 2 — copy real src, touch Cargo.toml fingerprints, rebuild.
+#            Only changed workspace crates recompile.
+#
+# Workspace member list (Cargo.toml [workspace] members) — keep the
+# three CRATE-ENUMERATION blocks below in sync:
+#   api-server, cloud-providers, common, controller-manager, kubectl,
+#   kubelet, kube-proxy, rusternetes, scheduler, storage
 
 # Stage 1: Build the console SPA
 FROM node:24-slim AS console-builder
@@ -38,32 +51,94 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# Copy rhino crate first (dependency)
+# Copy rhino crate first (dependency). Rhino sits at /build/rhino and
+# the workspace lives under /build/rusternetes/ so the relative path
+# `../../../rhino` from /build/rusternetes/crates/storage resolves
+# correctly.
 COPY rhino/Cargo.toml rhino/Cargo.lock rhino/build.rs ./rhino/
 COPY rhino/proto/ ./rhino/proto/
 COPY rhino/src/ ./rhino/src/
 
-# Copy rusternetes workspace manifest
+# ----- PASS 1: dependency-only compile (cache-friendly) -----
+
+# Workspace manifest + lockfile.
 COPY rusternetes/Cargo.toml rusternetes/Cargo.lock* ./rusternetes/
 
-# Copy all crate manifests for layer caching
-COPY rusternetes/crates/rusternetes/Cargo.toml ./rusternetes/crates/rusternetes/
-COPY rusternetes/crates/api-server/Cargo.toml ./rusternetes/crates/api-server/
-COPY rusternetes/crates/common/Cargo.toml ./rusternetes/crates/common/
-COPY rusternetes/crates/storage/Cargo.toml ./rusternetes/crates/storage/
-COPY rusternetes/crates/scheduler/Cargo.toml ./rusternetes/crates/scheduler/
-COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/
-COPY rusternetes/crates/kubelet/Cargo.toml ./rusternetes/crates/kubelet/
-COPY rusternetes/crates/kube-proxy/Cargo.toml ./rusternetes/crates/kube-proxy/
-COPY rusternetes/crates/kubectl/Cargo.toml ./rusternetes/crates/kubectl/
+# CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
+COPY rusternetes/crates/api-server/Cargo.toml         ./rusternetes/crates/api-server/Cargo.toml
+COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud-providers/Cargo.toml
+COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
+COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
+COPY rusternetes/crates/kubectl/Cargo.toml            ./rusternetes/crates/kubectl/Cargo.toml
+COPY rusternetes/crates/kubelet/Cargo.toml            ./rusternetes/crates/kubelet/Cargo.toml
+COPY rusternetes/crates/kube-proxy/Cargo.toml         ./rusternetes/crates/kube-proxy/Cargo.toml
+COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/rusternetes/Cargo.toml
+COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
+COPY rusternetes/crates/storage/Cargo.toml            ./rusternetes/crates/storage/Cargo.toml
 
-# Copy all source code
-COPY rusternetes/crates ./rusternetes/crates
+# build.rs + proto/ (only api-server has these today).
+COPY rusternetes/crates/api-server/build.rs ./rusternetes/crates/api-server/build.rs
+COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/proto
 
-# Build the all-in-one binary
+# CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
+#   - lib only:   common, storage, cloud-providers
+#   - bin only:   kubectl, rusternetes
+#   - lib + bin:  api-server, controller-manager, kubelet, kube-proxy,
+#                 scheduler
+RUN set -eux; \
+    cd /build/rusternetes; \
+    for c in common storage cloud-providers; do \
+        mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
+    done; \
+    for c in kubectl rusternetes; do \
+        mkdir -p crates/$c/src && echo "fn main(){}" > crates/$c/src/main.rs; \
+    done; \
+    for c in api-server controller-manager kubelet kube-proxy scheduler; do \
+        mkdir -p crates/$c/src && \
+        : > crates/$c/src/lib.rs && \
+        echo "fn main(){}" > crates/$c/src/main.rs; \
+    done
+
 ARG CARGO_FEATURES=sqlite
 WORKDIR /build/rusternetes
-RUN cargo build --release --features ${CARGO_FEATURES} -p rusternetes
+
+# Pass 1: compile dep graph with dummy sources. Populates the
+# cache-mounted target/ with every external dep's .rlib.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/rusternetes/target \
+    cargo build --release --features ${CARGO_FEATURES} -p rusternetes
+
+# ----- PASS 2: real source compile -----
+
+# CRATE-ENUMERATION (3/3): real source COPYs, per crate.
+COPY rusternetes/crates/api-server/src           ./crates/api-server/src
+COPY rusternetes/crates/api-server/tests         ./crates/api-server/tests
+COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
+COPY rusternetes/crates/common/src               ./crates/common/src
+COPY rusternetes/crates/common/tests             ./crates/common/tests
+COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src
+COPY rusternetes/crates/controller-manager/tests ./crates/controller-manager/tests
+COPY rusternetes/crates/kubectl/src              ./crates/kubectl/src
+COPY rusternetes/crates/kubectl/tests            ./crates/kubectl/tests
+COPY rusternetes/crates/kubelet/src              ./crates/kubelet/src
+COPY rusternetes/crates/kubelet/tests            ./crates/kubelet/tests
+COPY rusternetes/crates/kube-proxy/src           ./crates/kube-proxy/src
+COPY rusternetes/crates/kube-proxy/tests         ./crates/kube-proxy/tests
+COPY rusternetes/crates/rusternetes/src          ./crates/rusternetes/src
+COPY rusternetes/crates/scheduler/src            ./crates/scheduler/src
+COPY rusternetes/crates/scheduler/tests          ./crates/scheduler/tests
+COPY rusternetes/crates/storage/src              ./crates/storage/src
+
+# Pass 2: rebuild with real sources. Touch every Cargo.toml so cargo
+# notices the source tree changed. Copy the binary out to /out before
+# the cache-mounted target/ is unmounted.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/rusternetes/target \
+    find crates -name "Cargo.toml" -exec touch {} \; && \
+    cargo build --release --features ${CARGO_FEATURES} -p rusternetes && \
+    mkdir -p /out && cp target/release/rusternetes /out/rusternetes
 
 # Stage 3: Runtime image
 FROM debian:sid-slim
@@ -75,7 +150,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /build/rusternetes/target/release/rusternetes /app/rusternetes
+COPY --from=builder /out/rusternetes /app/rusternetes
 COPY --from=console-builder /console/dist /app/console
 
 EXPOSE 6443 10250

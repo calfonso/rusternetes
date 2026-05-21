@@ -24,6 +24,43 @@
 # Compose selects the target stage via `build.target: <name>`.
 # Cargo features can be plumbed through with `--build-arg
 # CARGO_FEATURES=...` (e.g. `--features rusternetes-storage/sqlite`).
+#
+# ---- TWO-STAGE CARGO BUILD ----
+#
+# The cargo-builder stage uses a two-pass cargo build to maximise
+# layer cache reuse:
+#
+#   Pass 1: COPY only Cargo.toml + Cargo.lock + build.rs + proto/ +
+#           dummy src/lib.rs / src/main.rs files for every crate.
+#           Run `cargo build --release ... <bins>`. This compiles the
+#           entire dependency graph (the dominant cost — hundreds of
+#           crates from crates.io) into the cache-mounted target/.
+#           The Docker layer that caches this RUN is invalidated only
+#           when a Cargo.toml, Cargo.lock, build.rs, or proto/ file
+#           changes — which is rare.
+#
+#   Pass 2: COPY the real src/ + tests/ contents. `touch` every
+#           Cargo.toml so cargo's mtime-based change detection picks
+#           up the new source. Run cargo build again — this only
+#           recompiles workspace crates whose source actually changed
+#           plus the final link step. The dep graph is reused.
+#
+# Net effect: a leaf-crate edit goes from ~18 min (rebuild whole dep
+# graph) to <5 min (recompile just that crate + link).
+#
+# ---- ADDING A NEW WORKSPACE CRATE ----
+#
+# When you add a new crate under `crates/<n>/`, update THREE blocks
+# below labelled `# CRATE-ENUMERATION:` — they MUST stay in sync with
+# the `[workspace] members` list in Cargo.toml. Each block has a
+# one-line comment listing every crate so the matching set is easy
+# to audit. Forgetting to update them will not always fail loudly:
+# the build may succeed by accident if your new crate has no deps
+# unique to itself, then break the moment someone changes its source.
+#
+# Current workspace members (Cargo.toml [workspace] members):
+#   api-server, cloud-providers, common, controller-manager, kubectl,
+#   kubelet, kube-proxy, rusternetes, scheduler, storage
 
 # ---------------------------------------------------------------------
 # Stage 1: console SPA build (only api-server uses the output, but
@@ -63,18 +100,113 @@ WORKDIR /app
 # which from /app/crates/storage resolves to /rhino, so land it there.
 COPY --from=rhino . /rhino
 
+# ----- PASS 1: dependency-only compile (cache-friendly) -----
+
+# Workspace manifest + lockfile (rare changes, dep-graph layer cache
+# survives across ordinary source edits).
 COPY Cargo.toml Cargo.lock* ./
-COPY crates ./crates
+
+# CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
+# Must mirror `[workspace] members` in Cargo.toml.
+# Crates: api-server, cloud-providers, common, controller-manager,
+#         kubectl, kubelet, kube-proxy, rusternetes, scheduler, storage
+COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
+COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
+COPY crates/common/Cargo.toml             crates/common/Cargo.toml
+COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
+COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
+COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
+COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
+COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
+COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
+
+# build.rs scripts + proto/ files belong with the manifests because
+# they participate in dependency resolution / codegen during the
+# Pass-1 build. Only api-server has these in the current workspace.
+COPY crates/api-server/build.rs crates/api-server/build.rs
+COPY crates/api-server/proto    crates/api-server/proto
+
+# CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
+# bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
+#   - lib only:   common, storage, cloud-providers
+#   - bin only:   kubectl, rusternetes
+#   - lib + bin:  api-server, controller-manager, kubelet, kube-proxy,
+#                 scheduler
+# `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
+RUN set -eux; \
+    for c in common storage cloud-providers; do \
+        mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
+    done; \
+    for c in kubectl rusternetes; do \
+        mkdir -p crates/$c/src && echo "fn main(){}" > crates/$c/src/main.rs; \
+    done; \
+    for c in api-server controller-manager kubelet kube-proxy scheduler; do \
+        mkdir -p crates/$c/src && \
+        : > crates/$c/src/lib.rs && \
+        echo "fn main(){}" > crates/$c/src/main.rs; \
+    done
 
 ARG CARGO_FEATURES=""
-# One build, all five binaries. BuildKit cache mounts persist registry +
-# git checkouts + the workspace target/ across rebuilds; the binaries
-# are copied out of the cache-mounted target/ into /out so the runtime
-# stages can pick them up (cache-mount contents disappear after the
-# RUN finishes).
+
+# Pass 1: compile the dep graph using dummy sources. The point of
+# this RUN is to populate the cache-mounted target/ with every
+# external dependency's .rlib so Pass 2 only has to recompile the
+# workspace crates whose source actually changed. BuildKit invalidates
+# this layer only when one of the COPYs above (manifests / build.rs /
+# proto/) changes, which is rare.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
+    cargo build --release $CARGO_FEATURES \
+        --bin api-server \
+        --bin kubelet \
+        --bin scheduler \
+        --bin controller-manager \
+        --bin kube-proxy
+
+# ----- PASS 2: real source compile (only changed workspace crates rebuild) -----
+
+# CRATE-ENUMERATION (3/3): copy each crate's real src/ (and tests/
+# when present). Splitting per crate keeps BuildKit content-hash
+# invalidation scoped: editing crates/kubelet/src/foo.rs only
+# invalidates the kubelet COPY layers, leaving the other nine
+# untouched. Tests/ aren't strictly required for the release build
+# but are kept so future `cargo test` inside this image works
+# without an extra COPY pass.
+COPY crates/api-server/src           crates/api-server/src
+COPY crates/api-server/tests         crates/api-server/tests
+COPY crates/cloud-providers/src      crates/cloud-providers/src
+COPY crates/common/src               crates/common/src
+COPY crates/common/tests             crates/common/tests
+COPY crates/controller-manager/src   crates/controller-manager/src
+COPY crates/controller-manager/tests crates/controller-manager/tests
+COPY crates/kubectl/src              crates/kubectl/src
+COPY crates/kubectl/tests            crates/kubectl/tests
+COPY crates/kubelet/src              crates/kubelet/src
+COPY crates/kubelet/tests            crates/kubelet/tests
+COPY crates/kube-proxy/src           crates/kube-proxy/src
+COPY crates/kube-proxy/tests         crates/kube-proxy/tests
+COPY crates/rusternetes/src          crates/rusternetes/src
+COPY crates/scheduler/src            crates/scheduler/src
+COPY crates/scheduler/tests          crates/scheduler/tests
+COPY crates/storage/src              crates/storage/src
+
+# Touch every Cargo.toml so cargo's mtime check notices that the
+# source tree has changed. Without this, cargo can be fooled by the
+# Pass-1 artefacts still present in the cache-mounted target/ and
+# skip the rebuild of the workspace crates. (The fingerprint is keyed
+# off mtime of the manifest + source, so touching the manifest is the
+# canonical kick.)
+#
+# The binaries are copied out of the cache-mounted target/ into /out
+# so the runtime stages can pick them up (cache-mount contents are
+# discarded after the RUN finishes — they only persist across builds,
+# not into the image layer).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    find crates -name "Cargo.toml" -exec touch {} \; && \
     cargo build --release $CARGO_FEATURES \
         --bin api-server \
         --bin kubelet \
