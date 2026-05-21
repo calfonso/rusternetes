@@ -125,7 +125,15 @@ impl ProtoRegistry {
                     (3, ("apiVersion".into(), FieldType::String)),
                     (4, ("time".into(), FieldType::Message("Time".into()))),
                     (6, ("fieldsType".into(), FieldType::String)),
-                    (7, ("fieldsV1".into(), FieldType::Bytes)),
+                    // Upstream wraps the raw JSON in a `FieldsV1` message that
+                    // carries a single `Raw` bytes field — registering this as
+                    // bare `Bytes` mismatches the wire format and causes
+                    // typed-client SSA writes to silently drop managed-field
+                    // metadata.
+                    (
+                        7,
+                        ("fieldsV1".into(), FieldType::Message("FieldsV1".into())),
+                    ),
                     (8, ("subresource".into(), FieldType::String)),
                 ]),
             },
@@ -505,7 +513,9 @@ impl ProtoRegistry {
                         ),
                     ),
                     (4, ("minReadySeconds".into(), FieldType::Int)),
-                    (5, ("revisionHistoryLimit".into(), FieldType::Int)),
+                    // Upstream skips field #5 in DaemonSetSpec —
+                    // revisionHistoryLimit is wire-tag #6, not #5.
+                    (6, ("revisionHistoryLimit".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -3642,10 +3652,11 @@ impl ProtoRegistry {
             },
         );
 
-        // FieldsV1 — opaque JSON blob carried as bytes. The Go side decodes
-        // the inner `Raw` field as a raw JSON document; treating it as
-        // `Bytes` mirrors the on-wire encoding (consumers re-parse the JSON
-        // separately, same as `ManagedFieldsEntry.fieldsV1`).
+        // FieldsV1 — wrapper message for the opaque JSON managed-fields
+        // payload. Upstream defines it with a single `Raw` bytes field at #1
+        // (capital R — proto field name follows Go style); the JSON document
+        // is re-parsed by consumers. `ManagedFieldsEntry.fieldsV1` references
+        // this as a Message, not bare bytes.
         schemas.insert(
             "FieldsV1".into(),
             MessageSchema {
@@ -6041,12 +6052,17 @@ impl ProtoRegistry {
     }
 
     fn owner_reference_schema() -> MessageSchema {
+        // Field numbers match upstream
+        // k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto exactly:
+        // kind=1, name=3, uid=4, apiVersion=5, controller=6,
+        // blockOwnerDeletion=7. The ordering is historical, not
+        // monotonic — `kind` was added before `apiVersion`.
         MessageSchema {
             fields: HashMap::from([
-                (1, ("apiVersion".into(), FieldType::String)),
-                (2, ("kind".into(), FieldType::String)),
+                (1, ("kind".into(), FieldType::String)),
                 (3, ("name".into(), FieldType::String)),
                 (4, ("uid".into(), FieldType::String)),
+                (5, ("apiVersion".into(), FieldType::String)),
                 (6, ("controller".into(), FieldType::Bool)),
                 (7, ("blockOwnerDeletion".into(), FieldType::Bool)),
             ]),
