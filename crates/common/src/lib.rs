@@ -13,6 +13,7 @@ pub mod leader_election;
 pub mod observability;
 pub mod pagination;
 pub mod protobuf;
+pub mod quantity;
 pub mod resources;
 pub mod schema_validation;
 pub mod server_side_apply;

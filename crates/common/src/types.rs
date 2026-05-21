@@ -311,6 +311,9 @@ where
                         )));
                     }
                 };
+                crate::quantity::Quantity::parse(&s).map_err(|e| {
+                    serde::de::Error::custom(format!("invalid Quantity value for {key:?}: {e}"))
+                })?;
                 out.insert(key, s);
             }
             Ok(out)
