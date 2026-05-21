@@ -82,7 +82,17 @@ pub struct PaginationError {
     pub fresh_continue_token: Option<String>,
 }
 
-/// Paginate a list of items according to Kubernetes API conventions
+/// Paginate a list of items according to Kubernetes API conventions.
+///
+/// Upstream parity:
+/// - `limit=0` is treated as "no chunking — return everything" (NOT
+///   "empty page"), matching the apiserver contract documented in
+///   `staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go::ListOptions.Limit`.
+/// - A continue chain is conceptually a snapshot at the original list's
+///   resourceVersion. We approximate this by carrying
+///   `total_at_creation` forward in every token and truncating later
+///   pages to that count, so items appended after the chain started
+///   never leak into a subsequent page.
 pub fn paginate<T>(
     mut items: Vec<T>,
     params: PaginationParams,
@@ -90,7 +100,7 @@ pub fn paginate<T>(
 ) -> Result<PaginatedResult<T>, PaginationError> {
     // Parse continue token if provided
     // Use the token's resource_version for consistency across pages
-    let (start, effective_rv) = if let Some(token) = &params.continue_token {
+    let (start, effective_rv, snapshot_total) = if let Some(token) = &params.continue_token {
         let cont = ContinuationToken::decode(token).map_err(|e| PaginationError {
             message: e,
             fresh_continue_token: None,
@@ -133,28 +143,38 @@ pub fn paginate<T>(
             });
         }
 
-        // Use the token's resource_version for consistent pagination
-        (cont.start, cont.resource_version.clone())
+        // Carry the original snapshot's total forward so later pages do
+        // not see items inserted mid-chain.
+        let snap = if cont.total_at_creation > 0 {
+            Some(cont.total_at_creation)
+        } else {
+            None
+        };
+        (cont.start, cont.resource_version.clone(), snap)
     } else {
-        (0, resource_version.to_string())
+        (0, resource_version.to_string(), None)
     };
 
-    // If no limit is specified, return all items
+    // Snapshot pinning: if a snapshot total was carried in, cap the items
+    // vector to that count so appended items are invisible.
+    if let Some(snap) = snapshot_total {
+        if items.len() > snap {
+            items.truncate(snap);
+        }
+    }
+
+    // Resolve the page size. `None` and `Some(0)` both mean "no
+    // chunking — return everything from start to end", matching the
+    // upstream apiserver contract.
     let limit = match params.limit {
         Some(l) if l > 0 => l as usize,
-        Some(0) => {
-            // limit=0 is a special case that returns only metadata
-            // For now, treat it as returning an empty list
-            return Ok(PaginatedResult {
-                items: vec![],
-                continue_token: None,
-                remaining_item_count: Some(items.len() as i64),
-                resource_version: effective_rv,
-            });
-        }
         _ => {
             // No limit, return all items from start
-            let result_items = items.drain(start..).collect();
+            let result_items = if start >= items.len() {
+                Vec::new()
+            } else {
+                items.drain(start..).collect()
+            };
             return Ok(PaginatedResult {
                 items: result_items,
                 continue_token: None,
@@ -182,6 +202,11 @@ pub fn paginate<T>(
     // Extract the page of items
     let page_items: Vec<T> = items.drain(start..end).collect();
 
+    // Choose the total to carry forward in the next token: the snapshot
+    // total if pagination is mid-chain, otherwise the current total
+    // (which becomes the snapshot for the rest of the chain).
+    let chain_total = snapshot_total.unwrap_or(total);
+
     // Check if there are more items
     let (continue_token, remaining_count) = if end < total {
         // Include a nonce so tokens are always unique, even for the same offset
@@ -195,7 +220,7 @@ pub fn paginate<T>(
             .unwrap_or(0);
         let next_token = ContinuationToken {
             start: end,
-            total_at_creation: total,
+            total_at_creation: chain_total,
             resource_version: effective_rv.clone(),
             filters: HashMap::new(),
             nonce,
@@ -308,7 +333,8 @@ mod tests {
     }
 
     #[test]
-    fn test_limit_zero() {
+    fn test_limit_zero_returns_all_items_upstream_contract() {
+        // Upstream: `limit=0` is "no chunking", not "empty page".
         let items = vec![1, 2, 3, 4, 5];
         let params = PaginationParams {
             limit: Some(0),
@@ -317,9 +343,59 @@ mod tests {
 
         let result = paginate(items, params, "v1").unwrap();
 
-        assert_eq!(result.items.len(), 0);
+        assert_eq!(result.items, vec![1, 2, 3, 4, 5]);
         assert_eq!(result.continue_token, None);
-        assert_eq!(result.remaining_item_count, Some(5));
+        assert_eq!(result.remaining_item_count, None);
+    }
+
+    #[test]
+    fn test_snapshot_pinning_excludes_mid_chain_inserts() {
+        // Page 1 over the original 5-item list.
+        let items_v1 = vec![1, 2, 3, 4, 5];
+        let result1 = paginate(
+            items_v1,
+            PaginationParams {
+                limit: Some(2),
+                continue_token: None,
+            },
+            "v1",
+        )
+        .unwrap();
+        assert_eq!(result1.items, vec![1, 2]);
+        let token = result1.continue_token.expect("first page has a token");
+
+        // Between pages, two new items appear. Snapshot pinning should
+        // truncate items_v2 back to the original 5 before paginating.
+        let items_v2 = vec![1, 2, 3, 4, 5, 6, 7];
+        let result2 = paginate(
+            items_v2,
+            PaginationParams {
+                limit: Some(2),
+                continue_token: Some(token),
+            },
+            "v1",
+        )
+        .unwrap();
+        assert_eq!(result2.items, vec![3, 4]);
+        assert!(result2.continue_token.is_some());
+
+        // Drain remaining pages — must not surface 6 or 7.
+        let mut all = vec![1, 2, 3, 4];
+        let mut next = result2.continue_token;
+        while let Some(t) = next {
+            let r = paginate(
+                vec![1, 2, 3, 4, 5, 6, 7],
+                PaginationParams {
+                    limit: Some(2),
+                    continue_token: Some(t),
+                },
+                "v1",
+            )
+            .unwrap();
+            all.extend(r.items);
+            next = r.continue_token;
+        }
+        assert_eq!(all, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]

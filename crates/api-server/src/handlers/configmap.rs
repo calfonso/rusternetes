@@ -460,8 +460,11 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut configmaps, &params)?;
 
-    let list = List::new("ConfigMapList", "v1", configmaps);
-    Ok(Json(list).into_response())
+    // Deterministic sort by name so `?continue` chains are stable
+    // regardless of underlying storage iteration order.
+    configmaps.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+
+    paginate_configmaps_response(&state, configmaps, &params, "ConfigMapList").await
 }
 
 /// List all configmaps across all namespaces
@@ -521,8 +524,69 @@ pub async fn list_all_configmaps(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut configmaps, &params)?;
 
-    let list = List::new("ConfigMapList", "v1", configmaps);
-    Ok(Json(list).into_response())
+    // Cluster-scoped LIST sorts by (namespace, name) so paginated
+    // chains across namespaces are deterministic.
+    configmaps.sort_by(|a, b| {
+        a.metadata
+            .namespace
+            .cmp(&b.metadata.namespace)
+            .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+    });
+
+    paginate_configmaps_response(&state, configmaps, &params, "ConfigMapList").await
+}
+
+/// Apply `?limit` / `?continue` semantics over an already-sorted slice
+/// of ConfigMaps and wrap the response as a `ConfigMapList` with
+/// `metadata.continue`, `metadata.remainingItemCount`, and
+/// `metadata.resourceVersion`. Mirrors the pattern used by the Pod
+/// handler.
+async fn paginate_configmaps_response(
+    state: &Arc<ApiServerState>,
+    configmaps: Vec<ConfigMap>,
+    params: &HashMap<String, String>,
+    list_kind: &str,
+) -> Result<axum::response::Response> {
+    let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok());
+    let continue_token = params.get("continue").cloned();
+
+    let pagination_params = rusternetes_common::PaginationParams {
+        limit,
+        continue_token,
+    };
+
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => crate::handlers::list_resource_version(&configmaps),
+    };
+
+    let paginated =
+        match rusternetes_common::paginate(configmaps, pagination_params, &resource_version) {
+            Ok(p) => p,
+            Err(e) => {
+                if e.message.contains("410 Gone") {
+                    let mut status =
+                        rusternetes_common::Status::failure(&e.message, "Expired", 410);
+                    if let Some(token) = e.fresh_continue_token {
+                        status.metadata = Some(rusternetes_common::ListMeta {
+                            resource_version: Some(resource_version),
+                            continue_token: Some(token),
+                            remaining_item_count: None,
+                        });
+                    }
+                    return Ok((axum::http::StatusCode::GONE, axum::Json(status)).into_response());
+                }
+                // Malformed continue token / encoding error -> 400 BadRequest
+                // Status object (kind=Status), matching upstream apiserver.
+                return Err(rusternetes_common::Error::BadRequest(e.message));
+            }
+        };
+
+    let mut list = List::new(list_kind, "v1", paginated.items);
+    list.metadata.continue_token = paginated.continue_token;
+    list.metadata.remaining_item_count = paginated.remaining_item_count;
+    list.metadata.resource_version = Some(paginated.resource_version);
+    Ok(axum::Json(list).into_response())
 }
 
 // Use the macro to create a PATCH handler
