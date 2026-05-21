@@ -54,6 +54,13 @@ escape_regex() {
 FOCUS="$(escape_regex "$TEST_NAME")"
 
 PER_TEST_DIR="${AGENT_ARTIFACT_DIR}/per-test/${SLUG}"
+# Wipe any prior run of this slug before invoking hydrophone. Without
+# this, a stale junit_01.xml from a previous PASS gets accepted by the
+# status classifier below when the current hydrophone call exits early
+# (e.g. etcd NOSPACE: hydrophone bails at deploy, no fresh junit is
+# written, but the stale one still lives at $PER_TEST_DIR/junit_01.xml
+# and the [[ -f "$JUNIT" ]] branch reports a false PASS).
+rm -rf "$PER_TEST_DIR"
 mkdir -p "$PER_TEST_DIR"
 
 RESULTS_CSV="${RESULTS_CSV:-${AGENT_ARTIFACT_DIR}/results/results.csv}"
