@@ -618,11 +618,24 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // Upstream core/v1.ConfigMapKeySelector + SecretKeySelector both
+        // embed `LocalObjectReference` at field 1, with `name` living inside
+        // it. Go's protobuf tags flatten the inner field into the parent
+        // JSON, which is what `InlineMessage` models — so the decoded JSON
+        // still ends up as `{name, key, optional}`, but the wire format now
+        // matches what real clients send (a length-delimited
+        // LocalObjectReference message at #1, not a top-level string).
         schemas.insert(
             "ConfigMapKeySelector".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("name".into(), FieldType::String)),
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
                     (2, ("key".into(), FieldType::String)),
                     (3, ("optional".into(), FieldType::Bool)),
                 ]),
@@ -632,7 +645,13 @@ impl ProtoRegistry {
             "SecretKeySelector".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("name".into(), FieldType::String)),
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
+                        ),
+                    ),
                     (2, ("key".into(), FieldType::String)),
                     (3, ("optional".into(), FieldType::Bool)),
                 ]),
