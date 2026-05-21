@@ -429,6 +429,11 @@ impl ProtoRegistry {
         );
         schemas.insert(
             "StatefulSetStatus".into(),
+            // Upstream apps/v1.StatefulSetStatus per generated.proto:
+            //   collisionCount     = 9    (was registered at 8)
+            //   conditions         = 10   (was registered at 9)
+            //   availableReplicas  = 11   (was registered at 10)
+            // Field 8 is unallocated upstream (gap in the schema).
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("observedGeneration".into(), FieldType::Int)),
@@ -438,9 +443,9 @@ impl ProtoRegistry {
                     (5, ("updatedReplicas".into(), FieldType::Int)),
                     (6, ("currentRevision".into(), FieldType::String)),
                     (7, ("updateRevision".into(), FieldType::String)),
-                    (8, ("collisionCount".into(), FieldType::Int)),
+                    (9, ("collisionCount".into(), FieldType::Int)),
                     (
-                        9,
+                        10,
                         (
                             "conditions".into(),
                             FieldType::Repeated(Box::new(FieldType::Message(
@@ -448,7 +453,7 @@ impl ProtoRegistry {
                             ))),
                         ),
                     ),
-                    (10, ("availableReplicas".into(), FieldType::Int)),
+                    (11, ("availableReplicas".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -6795,14 +6800,19 @@ impl ProtoRegistry {
                         FieldType::Message("SeccompProfile".into()),
                     ),
                 ),
+                // Upstream core/v1.PodSecurityContext numbers per generated.proto:
+                //   appArmorProfile          = 11   (was registered at 12)
+                //   supplementalGroupsPolicy = 12   (was registered at 13)
+                //   seLinuxChangePolicy      = 13   (was missing entirely)
                 (
-                    12,
+                    11,
                     (
                         "appArmorProfile".into(),
                         FieldType::Message("AppArmorProfile".into()),
                     ),
                 ),
-                (13, ("supplementalGroupsPolicy".into(), FieldType::String)),
+                (12, ("supplementalGroupsPolicy".into(), FieldType::String)),
+                (13, ("seLinuxChangePolicy".into(), FieldType::String)),
             ]),
         }
     }
