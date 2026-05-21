@@ -214,7 +214,6 @@ fn urlencode(s: &str) -> String {
 /// `metadata.continue` token, and (per upstream contract) a
 /// `metadata.remainingItemCount` reflecting the items not yet sent.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ConfigMap LIST handler does not yet honour ?limit / ?continue (see handlers/configmap.rs::list — calls storage.list() with no pagination)"]
 async fn limit_first_page_returns_n_plus_continue_token() {
     let state = make_state(Arc::new(MemoryStorage::new()));
     let ns = "pag-first";
@@ -264,7 +263,6 @@ async fn limit_first_page_returns_n_plus_continue_token() {
 /// count, (b) no duplicates, (c) every seeded name appears, (d) the final
 /// page omits the continue token, (e) results are sorted.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ConfigMap LIST handler does not yet honour ?limit / ?continue"]
 async fn limit_continue_chain_covers_all_items_exactly_once() {
     let state = make_state(Arc::new(MemoryStorage::new()));
     let ns = "pag-chain";
@@ -403,7 +401,6 @@ async fn limit_greater_than_total_returns_all_no_continue() {
 /// Upstream contract: `limit=0` means "no chunking, return everything",
 /// not "empty page". Pin the expected upstream wire behaviour.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ConfigMap LIST handler does not yet honour ?limit; AND rusternetes_common::paginate treats limit=0 as 'empty page + remainingItemCount=total', which diverges from upstream's 'limit=0 == unlimited'. See common/src/pagination.rs::paginate."]
 async fn limit_zero_returns_all_items() {
     let state = make_state(Arc::new(MemoryStorage::new()));
     let ns = "pag-zero";
@@ -443,7 +440,6 @@ async fn limit_zero_returns_all_items() {
 /// created after the first page MUST NOT appear in subsequent pages of
 /// the same continue chain.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ConfigMap LIST handler does not yet honour ?limit / ?continue / ?resourceVersion snapshotting (see handlers/configmap.rs::list)"]
 async fn limit_with_explicit_resource_version_is_consistent() {
     let state = make_state(Arc::new(MemoryStorage::new()));
     let ns = "pag-rv";
@@ -507,7 +503,6 @@ async fn limit_with_explicit_resource_version_is_consistent() {
 /// partial list. Upstream returns either `400 Bad Request` or `410 Gone`
 /// with a `Status` body (`kind: Status`).
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ConfigMap LIST handler does not yet honour ?continue at all — malformed tokens are silently dropped because the handler never inspects the param"]
 async fn malformed_continue_token_returns_status_error() {
     let state = make_state(Arc::new(MemoryStorage::new()));
     let ns = "pag-malformed";
@@ -547,7 +542,6 @@ async fn malformed_continue_token_returns_status_error() {
 /// compaction, so this scenario is pinned as `#[ignore]` rather than
 /// asserting a behaviour the system can't yet exhibit.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: storage layer does not implement revision compaction; expired-token paths cannot be exercised end-to-end. See storage/src/lib.rs::is_revision_compacted (returns Ok(false) on memory/rhino backends)."]
 async fn expired_continue_token_returns_410_gone() {
     let state = make_state(Arc::new(MemoryStorage::new()));
     let ns = "pag-expired";
@@ -588,7 +582,6 @@ async fn expired_continue_token_returns_410_gone() {
 /// the same chain — the chain is conceptually a snapshot at the original
 /// list's RV.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: ConfigMap LIST handler does not yet honour ?limit / ?continue, so the snapshot guarantee cannot be observed via the HTTP surface."]
 async fn mid_pagination_insert_not_visible_in_continue_chain() {
     let state = make_state(Arc::new(MemoryStorage::new()));
     let ns = "pag-midmut";
