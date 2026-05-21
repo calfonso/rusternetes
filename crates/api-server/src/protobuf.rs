@@ -42,6 +42,11 @@ pub enum FieldType {
     InlineMessage(String),
     /// map<string, string> — encoded as repeated MapEntry messages
     StringMap,
+    /// map<string, bytes> — encoded as repeated MapEntry messages where
+    /// the value side is a `bytes` field. Decoded to a JSON object whose
+    /// values are base64-encoded strings, matching what typed K8s clients
+    /// expect for `Secret.data` and `ConfigMap.binaryData`.
+    BytesMap,
     /// Repeated field — value is the element type
     Repeated(Box<FieldType>),
     /// Bytes field — base64 encode
@@ -1219,6 +1224,14 @@ impl ProtoRegistry {
         // for lookup).
 
         // ConfigMap & Secret
+        // Upstream proto (k8s.io/api/core/v1/generated.proto):
+        //   ConfigMap.data         (#2) = map<string, string>
+        //   ConfigMap.binaryData   (#3) = map<string, bytes>
+        //   Secret.data            (#2) = map<string, bytes>
+        //   Secret.stringData      (#4) = map<string, string>
+        // The bytes-valued maps are decoded to JSON objects with
+        // base64-encoded string values, matching the typed-client wire
+        // shape.
         schemas.insert(
             "ConfigMap".into(),
             MessageSchema {
@@ -1228,7 +1241,7 @@ impl ProtoRegistry {
                         ("metadata".into(), FieldType::Message("ObjectMeta".into())),
                     ),
                     (2, ("data".into(), FieldType::StringMap)),
-                    (3, ("binaryData".into(), FieldType::StringMap)),
+                    (3, ("binaryData".into(), FieldType::BytesMap)),
                     (4, ("immutable".into(), FieldType::Bool)),
                 ]),
             },
@@ -1241,7 +1254,7 @@ impl ProtoRegistry {
                         1,
                         ("metadata".into(), FieldType::Message("ObjectMeta".into())),
                     ),
-                    (2, ("data".into(), FieldType::StringMap)),
+                    (2, ("data".into(), FieldType::BytesMap)),
                     (3, ("type".into(), FieldType::String)),
                     (4, ("stringData".into(), FieldType::StringMap)),
                     (5, ("immutable".into(), FieldType::Bool)),
@@ -3951,11 +3964,17 @@ impl ProtoRegistry {
         );
 
         // IngressClassParametersReference
+        // Field #1 is `aPIGroup` (not `apiGroup`) per upstream
+        // k8s.io/api/networking/v1/generated.proto. K8s's Go-to-proto
+        // generator lower-cases only the first character of a trailing
+        // acronym in the field name, producing the unusual capitalisation.
+        // Match it verbatim — the wire shape must equal the upstream
+        // schema for typed clients to deserialize correctly.
         schemas.insert(
             "IngressClassParametersReference".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("apiGroup".into(), FieldType::String)),
+                    (1, ("aPIGroup".into(), FieldType::String)),
                     (2, ("kind".into(), FieldType::String)),
                     (3, ("name".into(), FieldType::String)),
                     (4, ("scope".into(), FieldType::String)),
@@ -6872,6 +6891,21 @@ impl ProtoRegistry {
                                     m.insert(key, Value::String(val));
                                 }
                             }
+                            FieldType::BytesMap => {
+                                // map<string, bytes> — each MapEntry has field 1
+                                // (key string) and field 2 (bytes value). Decode
+                                // the value as raw bytes and base64-encode for
+                                // the JSON representation, matching what typed
+                                // K8s clients expect for Secret.data and
+                                // ConfigMap.binaryData.
+                                let (key, val) = decode_bytes_map_entry(field_data);
+                                let map = obj
+                                    .entry(name.clone())
+                                    .or_insert_with(|| Value::Object(Map::new()));
+                                if let Value::Object(ref mut m) = map {
+                                    m.insert(key, Value::String(val));
+                                }
+                            }
                             FieldType::QuantityMap => {
                                 // map<string, Quantity> — each MapEntry has field 1 (key string)
                                 // and field 2 (Quantity message). Decode the Quantity message to
@@ -6984,6 +7018,10 @@ impl ProtoRegistry {
             }
             FieldType::StringMap => {
                 // Should be handled at the caller level as MapEntry
+                Value::Object(Map::new())
+            }
+            FieldType::BytesMap => {
+                // Should be handled at the caller level as BytesMapEntry
                 Value::Object(Map::new())
             }
             FieldType::MessageMap(_) => {
@@ -7330,6 +7368,56 @@ fn decode_quantity_map_entry(data: &[u8]) -> (String, String) {
                 2 => {
                     // Value is a Quantity protobuf message — decode field 1 of that message
                     val = decode_quantity(&data[pos..pos + len]);
+                }
+                _ => {}
+            }
+            pos += len;
+        } else if wire_type == WIRE_VARINT {
+            let (_, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+        } else {
+            break;
+        }
+    }
+    (key, val)
+}
+
+/// Decode a `map<string, bytes>` entry. MapEntry messages have field 1
+/// (key string) and field 2 (value bytes). The value is base64-encoded
+/// for the JSON representation, matching what typed K8s clients expect
+/// for `Secret.data` and `ConfigMap.binaryData`.
+fn decode_bytes_map_entry(data: &[u8]) -> (String, String) {
+    use base64::Engine;
+    let mut key = String::new();
+    let mut val = String::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, new_pos) = match read_varint(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        if wire_type == WIRE_LENGTH_DELIMITED {
+            let (len, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+            let len = len as usize;
+            if pos + len > data.len() {
+                break;
+            }
+            match field_num {
+                1 => {
+                    key = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
+                }
+                2 => {
+                    val = base64::engine::general_purpose::STANDARD.encode(&data[pos..pos + len]);
                 }
                 _ => {}
             }
@@ -9189,6 +9277,103 @@ mod tests {
         assert_eq!(
             val.pointer("/matchLabels/app"),
             Some(&Value::String("nginx".into()))
+        );
+    }
+
+    /// `Secret.data` is `map<string, bytes>` upstream; values must arrive
+    /// at the handler as base64-encoded JSON strings (matching what
+    /// `kubectl get secret -o json` shows). Before adding `FieldType::BytesMap`
+    /// the registry mapped this field to `StringMap`, which lost UTF-8
+    /// invalid bytes (silently corrupting any non-text Secret payload).
+    #[test]
+    fn test_decode_secret_data_is_base64_bytes_map() {
+        use base64::Engine;
+        let registry = ProtoRegistry::new();
+
+        // MapEntry { key="binary", value=[0xff, 0x00, 0x42] }
+        let bytes_val: [u8; 3] = [0xff, 0x00, 0x42];
+        let mut entry = Vec::new();
+        // field 1 (key) length-delimited: tag 0x0a
+        entry.push(0x0a);
+        entry.push(b"binary".len() as u8);
+        entry.extend_from_slice(b"binary");
+        // field 2 (value) length-delimited: tag 0x12
+        entry.push(0x12);
+        entry.push(bytes_val.len() as u8);
+        entry.extend_from_slice(&bytes_val);
+
+        // Secret { data: [entry] } — field 2 (data), length-delimited
+        let mut secret = Vec::new();
+        secret.push(0x12); // field 2
+        secret.push(entry.len() as u8);
+        secret.extend_from_slice(&entry);
+
+        let val = registry
+            .decode_message("Secret", &secret)
+            .expect("Secret must decode");
+
+        let expected = base64::engine::general_purpose::STANDARD.encode(bytes_val);
+        assert_eq!(
+            val.pointer("/data/binary"),
+            Some(&Value::String(expected)),
+            "Secret.data values must be base64-encoded — registered as BytesMap"
+        );
+    }
+
+    /// `ConfigMap.binaryData` is `map<string, bytes>` upstream. Same fix as
+    /// Secret.data — must base64-encode the value. The sibling `data` field
+    /// stays `map<string, string>` (no base64) so this test also verifies
+    /// the two map types coexist on one message.
+    #[test]
+    fn test_decode_configmap_binary_data_is_base64() {
+        use base64::Engine;
+        let registry = ProtoRegistry::new();
+
+        // binaryData entry: key="raw", value=[0x01, 0x02, 0x03]
+        let bytes_val: [u8; 3] = [0x01, 0x02, 0x03];
+        let mut bin_entry = Vec::new();
+        bin_entry.push(0x0a);
+        bin_entry.push(b"raw".len() as u8);
+        bin_entry.extend_from_slice(b"raw");
+        bin_entry.push(0x12);
+        bin_entry.push(bytes_val.len() as u8);
+        bin_entry.extend_from_slice(&bytes_val);
+
+        // data entry: key="text", value="hello"
+        let mut data_entry = Vec::new();
+        data_entry.push(0x0a);
+        data_entry.push(b"text".len() as u8);
+        data_entry.extend_from_slice(b"text");
+        data_entry.push(0x12);
+        data_entry.push(b"hello".len() as u8);
+        data_entry.extend_from_slice(b"hello");
+
+        // ConfigMap { data: [...], binaryData: [...] }
+        // field 2 (data) tag = 0x12
+        // field 3 (binaryData) tag = 0x1a
+        let mut cm = Vec::new();
+        cm.push(0x12);
+        cm.push(data_entry.len() as u8);
+        cm.extend_from_slice(&data_entry);
+        cm.push(0x1a);
+        cm.push(bin_entry.len() as u8);
+        cm.extend_from_slice(&bin_entry);
+
+        let val = registry
+            .decode_message("ConfigMap", &cm)
+            .expect("ConfigMap must decode");
+
+        // data is map<string,string> — stays UTF-8.
+        assert_eq!(
+            val.pointer("/data/text"),
+            Some(&Value::String("hello".into()))
+        );
+        // binaryData is map<string,bytes> — base64-encoded.
+        let expected = base64::engine::general_purpose::STANDARD.encode(bytes_val);
+        assert_eq!(
+            val.pointer("/binaryData/raw"),
+            Some(&Value::String(expected)),
+            "ConfigMap.binaryData values must be base64-encoded"
         );
     }
 

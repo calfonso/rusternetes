@@ -213,9 +213,18 @@ fn build_upstream_index(files: &[FileDescriptorProto]) -> (UpstreamIndex, MapEnt
     let map_entries = collect_map_entries(files);
     let mut index: UpstreamIndex = BTreeMap::new();
 
-    // First pass: collect every top-level + nested message (excluding map
-    // entries) into the index keyed by simple name. Build a lookup from
-    // simple name -> &DescriptorProto for the second pass (map collapsing).
+    // Collect every top-level + nested message keyed by simple name. We use
+    // this as a fallback when a `type_name` reference appears unqualified.
+    //
+    // Synthetic map-entry messages (`<Parent>.<Field>Entry`) collide on
+    // simple name across distinct parents (e.g. `Secret.DataEntry` and
+    // `ConfigMap.DataEntry` both flatten to `DataEntry`). Hashing them by
+    // simple name silently picked one entry's value type for the other,
+    // which used to be invisible — every `data` field happened to be
+    // `map<string, string>` — but now that `Secret.data` is genuinely
+    // `map<string, bytes>` the collision flips `ConfigMap.data`'s reported
+    // value type to bytes. Resolve map entries from the parent message's
+    // own nested types so each map keeps its true value side.
     let mut by_simple_name: HashMap<String, DescriptorProto> = HashMap::new();
     for file in files {
         for msg in &file.message_type {
@@ -227,14 +236,27 @@ fn build_upstream_index(files: &[FileDescriptorProto]) -> (UpstreamIndex, MapEnt
         if map_entries.contains(msg.name()) {
             continue;
         }
+        // Per-parent index of nested map entries, used to disambiguate
+        // colliding simple names across messages.
+        let local_map_entries: HashMap<String, &DescriptorProto> = msg
+            .nested_type
+            .iter()
+            .filter(|n| map_entries.contains(n.name()))
+            .map(|n| (n.name().to_string(), n))
+            .collect();
+
         let mut fields_by_number: BTreeMap<u32, UpstreamField> = BTreeMap::new();
         for f in &msg.field {
             let logical = build_logical(f, &map_entries);
-            // Collapse a Repeated(Message<MapEntry>) into a Map.
+            // Collapse a Repeated(Message<MapEntry>) into a Map. Prefer the
+            // parent's nested map-entry over the global by-simple-name view.
             let logical = match &logical {
                 LogicalType::Repeated(inner) => match inner.as_ref() {
                     LogicalType::Message(name) if map_entries.contains(name) => {
-                        let entry = by_simple_name.get(name);
+                        let entry = local_map_entries
+                            .get(name)
+                            .copied()
+                            .or_else(|| by_simple_name.get(name));
                         let value_ty = entry
                             .map(|e| map_value_type(e, &map_entries))
                             .unwrap_or(LogicalType::Message("unknown".into()));
@@ -309,6 +331,13 @@ fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<String> {
                 other
             )),
         },
+        (FieldType::BytesMap, LogicalType::Map(value)) => match value.as_ref() {
+            LogicalType::Scalar(Scalar::Bytes) => None,
+            other => Some(format!(
+                "expected map<string,bytes>, upstream value={:?}",
+                other
+            )),
+        },
         (FieldType::QuantityMap, LogicalType::Map(value)) => match value.as_ref() {
             LogicalType::Message(name) if name == "Quantity" => None,
             other => Some(format!(
@@ -336,12 +365,16 @@ fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<String> {
         (FieldType::Repeated(_), LogicalType::Map(_)) => {
             Some("ours=Repeated, upstream=Map (registry needs StringMap/MessageMap)".into())
         }
-        (FieldType::StringMap | FieldType::MessageMap(_) | FieldType::QuantityMap, _) => {
-            Some(format!(
-                "ours=Map, upstream={:?} (registry expected a map field)",
-                theirs
-            ))
-        }
+        (
+            FieldType::StringMap
+            | FieldType::BytesMap
+            | FieldType::MessageMap(_)
+            | FieldType::QuantityMap,
+            _,
+        ) => Some(format!(
+            "ours=Map, upstream={:?} (registry expected a map field)",
+            theirs
+        )),
 
         // Anything else — print both sides.
         (ours, theirs) => Some(format!(
