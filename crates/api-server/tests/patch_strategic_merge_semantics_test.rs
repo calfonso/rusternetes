@@ -231,7 +231,6 @@ async fn smp_containers_untouched_preserved() {
 /// not honor this on list entries — it merges the `$patch` key into the
 /// kept entry instead. Ignored as a documented parity gap.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: SMP $patch:delete on list entry not honored in strategic_merge_arrays"]
 async fn smp_containers_delete_directive_drops_entry() {
     let (mem, router) = spawn_router();
     let pod = pod_with_containers(
@@ -258,7 +257,6 @@ async fn smp_containers_delete_directive_drops_entry() {
 /// SMP-1e: combination — patch updates c1, adds c-new, deletes c2 in one
 /// call. Pins multi-op SMP body semantics.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: SMP $patch:delete on list entry not honored (same gap as smp_containers_delete_directive_drops_entry)"]
 async fn smp_containers_combined_update_add_delete() {
     let (mem, router) = spawn_router();
     let pod = pod_with_containers(
@@ -315,7 +313,6 @@ async fn smp_containers_combined_update_add_delete() {
 /// back to "not a named array → replace entirely". Result is that the
 /// existing port is lost. Ignored pending composite-merge-key support.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: SMP composite merge keys (containerPort+protocol) not implemented; ports[] currently replaces wholesale"]
 async fn smp_ports_composite_key_append() {
     let (mem, router) = spawn_router();
     let pod = json!({
@@ -354,7 +351,6 @@ async fn smp_ports_composite_key_append() {
 /// SMP-2b: patching a port with an existing (containerPort, protocol) tuple
 /// should merge (e.g. update name/hostPort), not duplicate the entry.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: SMP composite merge keys not implemented"]
 async fn smp_ports_composite_key_merges_existing() {
     let (mem, router) = spawn_router();
     let pod = json!({
@@ -741,7 +737,6 @@ async fn smp_delete_directive_on_annotations_map() {
 /// implementation merges `$patch` into the entry as a sibling field
 /// rather than dropping the entry. Ignored.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: SMP $patch:delete on list entry not honored; see strategic_merge_arrays in patch.rs"]
 async fn smp_delete_directive_on_list_entry() {
     let (mem, router) = spawn_router();
     let pod = pod_with_containers(
@@ -817,7 +812,6 @@ async fn smp_delete_directive_on_absent_map_is_noop() {
 /// same patch — order-of-ops semantics. Today rusternetes' `delete`
 /// strategy short-circuits the merge, so a co-mingled add is dropped.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: $patch:delete short-circuits sibling merges in same object"]
 async fn smp_delete_then_re_add_in_same_patch() {
     let (mem, router) = spawn_router();
     let pod = json!({
@@ -1012,7 +1006,6 @@ async fn smp_retain_keys_directive_stripped_from_output() {
 /// in a normal merge — upstream uses it during merge too, but rusternetes
 /// only acts on it under replace. Documented as a parity gap; ignored.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: $retainKeys in merge context ignored (only acted on with $patch:replace)"]
 async fn smp_retain_keys_in_merge_context() {
     let (mem, router) = spawn_router();
     let pod = json!({

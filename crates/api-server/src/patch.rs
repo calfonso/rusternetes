@@ -384,7 +384,25 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
             }
         }
         "delete" => {
-            // Delete the object entirely
+            // Upstream parity: `$patch: delete` on a map clears the
+            // original. If the patch carries sibling (non-directive)
+            // keys, treat the directive as "start from an empty map and
+            // merge the siblings" so combined delete + add bodies work
+            // (e.g. `{$patch: delete, new: value}`).
+            let mut new_obj = serde_json::Map::new();
+            let mut had_siblings = false;
+            for (key, value) in patch_obj {
+                if key.starts_with('$') {
+                    continue;
+                }
+                had_siblings = true;
+                if !value.is_null() {
+                    new_obj.insert(key.clone(), value.clone());
+                }
+            }
+            if had_siblings {
+                return Ok(Value::Object(new_obj));
+            }
             return Ok(Value::Null);
         }
         _ => {
@@ -456,82 +474,181 @@ fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value,
                     result_obj.insert(key.clone(), patch_value.clone());
                 }
             }
+
+            // Upstream parity: `$retainKeys` is also honored in a merge
+            // context (not just under `$patch: replace`). After the
+            // normal merge, drop any pre-existing key that is neither
+            // listed in `$retainKeys` nor explicitly set by the patch.
+            if let Some(keys_to_retain) = &retain_keys {
+                let allowed: std::collections::HashSet<String> = keys_to_retain
+                    .iter()
+                    .cloned()
+                    .chain(patch_obj.keys().filter(|k| !k.starts_with('$')).cloned())
+                    .collect();
+                result_obj.retain(|k, _| allowed.contains(k));
+            }
         }
     }
 
     Ok(result)
 }
 
-/// Strategic merge for arrays
-///
-/// If array items have a 'name' field, merge by name.
-/// Otherwise, replace the array.
-fn strategic_merge_arrays(original: &[Value], patch: &[Value]) -> Result<Vec<Value>, PatchError> {
-    // Check if this is a named array (items have 'name' field)
-    let is_named_array = patch
-        .iter()
-        .all(|v| v.as_object().is_some_and(|o| o.contains_key("name")));
+/// Strategy used to compute the merge key for every item in an array
+/// being strategic-merged. The whole array uses a single strategy so
+/// items in `original` and `patch` always derive comparable keys, even
+/// when one side has extra optional fields (e.g. an original port that
+/// carries a `name` but the patch port doesn't).
+#[derive(Debug, Clone, Copy)]
+enum MergeKeyStrategy {
+    /// `name` field — applies to containers, volumes, envFrom, env, etc.
+    Name,
+    /// `(containerPort, protocol)` composite key — applies to
+    /// `containers[*].ports`. Defaults `protocol` to `"TCP"`.
+    ContainerPort,
+}
 
-    if is_named_array {
-        // Merge by name
-        let mut result: HashMap<String, Value> = HashMap::new();
-
-        // Add all original items
-        for item in original {
-            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                result.insert(name.to_string(), item.clone());
-            }
-        }
-
-        // Merge/add patch items
-        for item in patch {
-            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                if let Some(original_item) = result.get(name) {
-                    // Merge with existing item
-                    let merged = apply_strategic_merge_patch(original_item, item)?;
-                    result.insert(name.to_string(), merged);
-                } else {
-                    // Add new item
-                    result.insert(name.to_string(), item.clone());
-                }
-            }
-        }
-
-        // K8s SMP enforces order: patch items first (in patch order),
-        // then server-only items (items in original but not in patch).
-        // See: apimachinery/pkg/util/strategicpatch/patch.go normalizeElementOrder
-        let patch_names: Vec<String> = patch
-            .iter()
-            .filter_map(|v| {
-                v.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-
-        let mut final_array = Vec::new();
-
-        // First: items from the patch, in patch order
-        for name in &patch_names {
-            if let Some(item) = result.remove(name) {
-                final_array.push(item);
-            }
-        }
-
-        // Then: server-only items (in original order, not in patch)
-        for item in original {
-            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                if let Some(item) = result.remove(name) {
-                    final_array.push(item);
-                }
-            }
-        }
-
-        Ok(final_array)
-    } else {
-        // Not a named array - replace entirely
-        Ok(patch.to_vec())
+/// Pick the merge-key strategy for an array based on the patch items.
+/// Returns `None` for primitive lists or arrays where no patch item
+/// exposes a recognized key, so the caller can fall back to wholesale
+/// replacement.
+fn detect_merge_key_strategy(patch: &[Value]) -> Option<MergeKeyStrategy> {
+    if patch.is_empty() {
+        return None;
     }
+    let all_objects = patch.iter().all(|v| v.is_object());
+    if !all_objects {
+        return None;
+    }
+    if patch
+        .iter()
+        .all(|v| v.as_object().is_some_and(|o| o.contains_key("name")))
+    {
+        return Some(MergeKeyStrategy::Name);
+    }
+    if patch.iter().all(|v| {
+        v.as_object()
+            .is_some_and(|o| o.contains_key("containerPort"))
+    }) {
+        return Some(MergeKeyStrategy::ContainerPort);
+    }
+    None
+}
+
+fn merge_key_with(item: &Value, strategy: MergeKeyStrategy) -> Option<String> {
+    let obj = item.as_object()?;
+    match strategy {
+        MergeKeyStrategy::Name => obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("name:{s}")),
+        MergeKeyStrategy::ContainerPort => {
+            let port = obj.get("containerPort")?;
+            let protocol = obj
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("TCP");
+            Some(format!("port:{port}:{protocol}"))
+        }
+    }
+}
+
+fn is_delete_directive(item: &Value) -> bool {
+    item.as_object()
+        .and_then(|o| o.get("$patch"))
+        .and_then(|v| v.as_str())
+        == Some("delete")
+}
+
+/// Strategic merge for arrays.
+///
+/// A single [`MergeKeyStrategy`] is picked for the whole array so that
+/// originals and patch items always derive comparable keys. Arrays
+/// where no patch item exposes a recognized key are replaced wholesale
+/// (matching upstream's behavior for primitive lists and lists of
+/// un-keyed structs).
+///
+/// `$patch: delete` on a list entry drops the matched item from the
+/// resulting array, matching upstream
+/// `apimachinery/pkg/util/strategicpatch/patch.go::mergePatchIntoOriginal`.
+fn strategic_merge_arrays(original: &[Value], patch: &[Value]) -> Result<Vec<Value>, PatchError> {
+    let strategy = match detect_merge_key_strategy(patch) {
+        Some(s) => s,
+        None => {
+            // Primitive list or un-keyed objects — replace the array.
+            return Ok(patch.to_vec());
+        }
+    };
+    let patch_keys: Vec<Option<String>> =
+        patch.iter().map(|i| merge_key_with(i, strategy)).collect();
+    if patch_keys.iter().any(|k| k.is_none()) {
+        // The chosen strategy can't key every patch item — bail to
+        // replacement rather than silently dropping items.
+        return Ok(patch.to_vec());
+    }
+
+    // Index originals by merge key. Originals that cannot be keyed
+    // under the chosen strategy are preserved untouched at the tail of
+    // the result (matching upstream behavior for "named patch over
+    // unnamed original").
+    let mut result: HashMap<String, Value> = HashMap::new();
+    let mut original_unkeyed: Vec<Value> = Vec::new();
+    for item in original {
+        match merge_key_with(item, strategy) {
+            Some(k) => {
+                result.insert(k, item.clone());
+            }
+            None => original_unkeyed.push(item.clone()),
+        }
+    }
+
+    // Apply patch items in order. `$patch: delete` drops the matched
+    // entry from the result map; other items are merged into the
+    // existing entry or inserted fresh.
+    for (item, key_opt) in patch.iter().zip(patch_keys.iter()) {
+        let key = key_opt.clone().expect("is_keyed guarantees Some");
+        if is_delete_directive(item) {
+            result.remove(&key);
+            continue;
+        }
+        if let Some(existing) = result.get(&key) {
+            let merged = apply_strategic_merge_patch(existing, item)?;
+            result.insert(key, merged);
+        } else {
+            // Fresh insert — strip top-level $-directives so they don't
+            // leak into the rendered list entry.
+            let mut clean = item.clone();
+            if let Some(o) = clean.as_object_mut() {
+                o.retain(|k, _| !k.starts_with('$'));
+            }
+            result.insert(key, clean);
+        }
+    }
+
+    // K8s SMP order: items in patch order first (skipping deletes),
+    // then server-only items in original order.
+    // See: apimachinery/pkg/util/strategicpatch/patch.go normalizeElementOrder
+    let mut final_array = Vec::new();
+    for (item, key_opt) in patch.iter().zip(patch_keys.iter()) {
+        if is_delete_directive(item) {
+            continue;
+        }
+        let key = key_opt.as_ref().expect("is_keyed guarantees Some");
+        if let Some(v) = result.remove(key) {
+            final_array.push(v);
+        }
+    }
+    for item in original {
+        if let Some(k) = merge_key_with(item, strategy) {
+            if let Some(v) = result.remove(&k) {
+                final_array.push(v);
+            }
+        }
+    }
+    // Preserve un-keyable originals at the tail so a named patch over
+    // an unnamed original doesn't silently drop the original entry.
+    final_array.extend(original_unkeyed);
+
+    Ok(final_array)
 }
 
 /// Get a value at the specified JSON pointer path
