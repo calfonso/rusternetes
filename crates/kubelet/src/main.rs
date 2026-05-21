@@ -8,7 +8,7 @@ mod lifecycle;
 mod runtime;
 mod server;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::{Path, Query},
     http::StatusCode,
@@ -20,14 +20,46 @@ use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
+use eviction::{
+    build_thresholds, parse_duration, parse_eviction_flag, EvictionManager, EvictionSignal,
+    DEFAULT_TRANSITION_PERIOD,
+};
 use futures::StreamExt;
 use kubelet::Kubelet;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn, Level};
 
+/// Rusternetes Kubelet — node agent that manages containers.
+///
+/// ## Eviction flags (upstream parity)
+///
+/// The kubelet evicts pods when node resources fall below configured
+/// thresholds. The following flags mirror upstream Kubernetes
+/// (`cmd/kubelet/app/options/options.go`):
+///
+/// - `--eviction-hard` — comma-separated `<signal><op><value>` list. Crossing
+///   a hard threshold immediately triggers eviction. Setting to the empty
+///   string disables the eviction subsystem entirely (no node-condition
+///   updates, no log spam). Default:
+///   `memory.available<100Mi,nodefs.available<10%,nodefs.inodesFree<5%,imagefs.available<15%,imagefs.inodesFree<5%`.
+/// - `--eviction-soft` — same format. Soft thresholds wait for the matching
+///   `--eviction-soft-grace-period` entry before triggering. Default empty.
+/// - `--eviction-soft-grace-period` — comma-separated `<signal>=<duration>`,
+///   e.g. `memory.available=1m30s`.
+/// - `--eviction-minimum-reclaim` — comma-separated `<signal>=<value>`. Used
+///   when actually choosing how many bytes/inodes to reclaim per eviction
+///   pass. Default empty.
+/// - `--eviction-pressure-transition-period` — duration the kubelet stays in
+///   a pressure state after the underlying signal recovers. Default `5m`.
+///   This dampens flapping and prevents watch-event storms.
+///
+/// Supported signals: `memory.available`, `nodefs.available`,
+/// `nodefs.inodesFree`, `imagefs.available`, `imagefs.inodesFree`,
+/// `pid.available`. Only the `<` operator is supported (upstream parity).
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes-kubelet")]
 #[command(about = "Rusternetes Kubelet - Node agent that manages containers", long_about = None)]
@@ -88,6 +120,108 @@ struct Args {
     /// SQLite database path (only used when --storage-backend=sqlite)
     #[arg(long, default_value = "./data/rusternetes.db")]
     data_dir: String,
+
+    /// Hard eviction thresholds, upstream `<signal><op><value>` syntax.
+    /// Empty string disables eviction. See module docs for details.
+    #[arg(long, default_value = None)]
+    eviction_hard: Option<String>,
+
+    /// Soft eviction thresholds. Same format as `--eviction-hard`.
+    #[arg(long, default_value = None)]
+    eviction_soft: Option<String>,
+
+    /// Soft eviction grace periods, `<signal>=<duration>` comma-separated.
+    #[arg(long, default_value = None)]
+    eviction_soft_grace_period: Option<String>,
+
+    /// Minimum reclaim per eviction pass (accepted for upstream parity but
+    /// not yet used by the reclaim logic).
+    #[arg(long, default_value = None)]
+    eviction_minimum_reclaim: Option<String>,
+
+    /// Duration the kubelet stays in a pressure state after recovery.
+    /// Default `5m`, matching upstream.
+    #[arg(long, default_value = None)]
+    eviction_pressure_transition_period: Option<String>,
+}
+
+/// Parse `<signal>=<duration>,...` into a map. Empty/None → empty map.
+fn parse_soft_grace_periods(raw: Option<&str>) -> Result<HashMap<EvictionSignal, Duration>> {
+    let mut out = HashMap::new();
+    let Some(raw) = raw else {
+        return Ok(out);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(out);
+    }
+    for entry in trimmed.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (sig_str, dur_str) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid grace-period entry '{}'", entry))?;
+        let signal = EvictionSignal::from_upstream_name(sig_str.trim())
+            .ok_or_else(|| anyhow::anyhow!("unknown signal '{}' in grace-period", sig_str))?;
+        let dur = parse_duration(dur_str.trim())
+            .ok_or_else(|| anyhow::anyhow!("invalid duration '{}' in grace-period", dur_str))?;
+        out.insert(signal, dur);
+    }
+    Ok(out)
+}
+
+/// Build the eviction manager from CLI flags (or upstream defaults).
+fn build_eviction_manager(args: &Args) -> Result<EvictionManager> {
+    let transition_period = match args.eviction_pressure_transition_period.as_deref() {
+        Some(raw) => parse_duration(raw).ok_or_else(|| {
+            anyhow::anyhow!("invalid --eviction-pressure-transition-period: '{}'", raw)
+        })?,
+        None => DEFAULT_TRANSITION_PERIOD,
+    };
+
+    // If the user did NOT pass --eviction-hard at all, we use upstream defaults.
+    // If they passed an empty string, eviction is disabled.
+    let (use_defaults, hard_raw, soft_raw) = match (&args.eviction_hard, &args.eviction_soft) {
+        (None, None) => (true, "", ""),
+        (Some(h), None) => (false, h.as_str(), ""),
+        (None, Some(s)) => (false, "", s.as_str()),
+        (Some(h), Some(s)) => (false, h.as_str(), s.as_str()),
+    };
+
+    if use_defaults {
+        info!(
+            "Eviction: using upstream default thresholds (transition_period = {:?})",
+            transition_period
+        );
+        let defaults = EvictionManager::new();
+        return Ok(EvictionManager::with_config(
+            defaults.thresholds,
+            transition_period,
+        ));
+    }
+
+    let hard = parse_eviction_flag(hard_raw).context("parsing --eviction-hard")?;
+    let soft = parse_eviction_flag(soft_raw).context("parsing --eviction-soft")?;
+    let grace = parse_soft_grace_periods(args.eviction_soft_grace_period.as_deref())
+        .context("parsing --eviction-soft-grace-period")?;
+
+    if hard.is_empty() && soft.is_empty() {
+        info!(
+            "Eviction: explicitly disabled by empty --eviction-hard/--eviction-soft \
+             (no node-condition updates, no eviction sync)"
+        );
+        return Ok(EvictionManager::with_config(Vec::new(), transition_period));
+    }
+
+    let thresholds = build_thresholds(hard, soft, grace);
+    info!(
+        "Eviction: configured {} threshold(s), transition_period = {:?}",
+        thresholds.len(),
+        transition_period
+    );
+    Ok(EvictionManager::with_config(thresholds, transition_period))
 }
 
 #[tokio::main]
@@ -108,6 +242,10 @@ async fn main() -> Result<()> {
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
+
+    // Build eviction manager from CLI flags BEFORE consuming `args` into
+    // RuntimeConfig::build — that call moves out several String fields.
+    let eviction_manager = build_eviction_manager(&args)?;
 
     // Build runtime configuration with proper precedence
     let runtime_config = RuntimeConfig::build(
@@ -224,7 +362,7 @@ async fn main() -> Result<()> {
     // Create kubelet before starting the API server so /healthz can read
     // the live sync-loop monitor.
     let kubelet = Arc::new(
-        Kubelet::new(
+        Kubelet::new_with_eviction(
             runtime_config.node_name.clone(),
             storage.clone(),
             runtime_config.sync_frequency,
@@ -233,6 +371,8 @@ async fn main() -> Result<()> {
             args.cluster_domain,
             args.network,
             runtime_config.kubernetes_service_host.clone(),
+            runtime_config.root_dir.clone(),
+            eviction_manager,
         )
         .await?,
     );

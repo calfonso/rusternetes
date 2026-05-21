@@ -97,8 +97,17 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_addr
     );
 
+    // For the all-in-one binary, derive the statvfs root from the volume dir's
+    // parent (or default to /var/lib/kubelet). Eviction config uses upstream
+    // defaults; CLI overrides are only available via the standalone `kubelet`
+    // binary today.
+    let eviction_root = std::path::PathBuf::from(&config.volume_dir)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/kubelet"));
+
     let k = Arc::new(
-        kubelet::Kubelet::new(
+        kubelet::Kubelet::new_with_eviction(
             config.node_name.clone(),
             storage.clone(),
             config.sync_interval,
@@ -107,6 +116,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             config.cluster_domain,
             config.network,
             config.kubernetes_service_host,
+            eviction_root,
+            eviction::EvictionManager::new(),
         )
         .await?,
     );

@@ -13,6 +13,21 @@ use rusternetes_kubelet::eviction::{
     PodStats, QoSClass,
 };
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// Drive the eviction manager past its first-observation gate. Hard
+/// thresholds are not reported on the very first call (mirrors upstream
+/// `thresholdsFirstObservedAt`). This helper ticks once at `t=0`, then
+/// returns the result of a second tick `11s` later — past the
+/// `HARD_MIN_OBSERVATION` window.
+fn check_after_observation_window(
+    manager: &mut EvictionManager,
+    stats: &NodeStats,
+) -> Vec<EvictionSignal> {
+    let t0 = Instant::now();
+    manager.check_eviction_needed_at(stats, t0);
+    manager.check_eviction_needed_at(stats, t0 + Duration::from_secs(11))
+}
 
 /// Test helper to create a pod with specific QoS class
 fn create_pod_with_qos(name: &str, namespace: &str, qos: QoSClass) -> Pod {
@@ -171,7 +186,7 @@ fn test_memory_pressure_detection_hard_threshold() {
         pid_total: 32768,
     };
 
-    let signals = manager.check_eviction_needed(&low_memory_stats);
+    let signals = check_after_observation_window(&mut manager, &low_memory_stats);
     assert!(
         signals.contains(&EvictionSignal::MemoryAvailable),
         "Memory pressure should be detected when available memory is below hard threshold"
@@ -194,7 +209,7 @@ fn test_disk_pressure_detection_hard_threshold() {
         pid_total: 32768,
     };
 
-    let signals = manager.check_eviction_needed(&low_disk_stats);
+    let signals = check_after_observation_window(&mut manager, &low_disk_stats);
     assert!(
         signals.contains(&EvictionSignal::NodeFsAvailable),
         "Disk pressure should be detected when available disk is below hard threshold"
@@ -217,7 +232,7 @@ fn test_inode_pressure_detection() {
         pid_total: 32768,
     };
 
-    let signals = manager.check_eviction_needed(&low_inode_stats);
+    let signals = check_after_observation_window(&mut manager, &low_inode_stats);
     assert!(
         signals.contains(&EvictionSignal::NodeFsInodesFree),
         "Inode pressure should be detected when free inodes are below hard threshold"
@@ -529,7 +544,7 @@ fn test_eviction_threshold_percentage() {
         pid_total: 32768,
     };
 
-    let signals = manager.check_eviction_needed(&stats);
+    let signals = check_after_observation_window(&mut manager, &stats);
     assert!(signals.contains(&EvictionSignal::NodeFsAvailable));
 }
 
