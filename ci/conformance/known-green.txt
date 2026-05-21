@@ -36,3 +36,5 @@
 [sig-node] Containers should use the image defaults if command and args are blank [NodeConformance]
 # closes #452
 [sig-node] Downward API should provide host IP as an env var [NodeConformance]
+# closes #492
+[sig-node] Pods should run through the lifecycle of Pods and PodStatus
