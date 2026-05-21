@@ -40,7 +40,15 @@ RUN npm run build
 # Stage 2: shared cargo builder — compiles ALL service binaries in a
 # single cargo invocation so dependency compile time is paid once.
 # ---------------------------------------------------------------------
-FROM rust:latest AS cargo-builder
+# Pin rust toolchain explicitly so the BuildKit cache mounts at
+# `/usr/local/cargo/registry` / `/usr/local/cargo/git` / `/app/target`
+# survive across rebuilds. With `rust:latest` the `target/` cache is
+# silently invalidated every time upstream rolls a new minor version
+# (each rustc has its own ABI-stable artifact directory layout), so
+# a Wednesday `docker compose build` after a Tuesday Rust release
+# pays the full ~25 min uncached cost. Bump this pin in a deliberate
+# PR when the toolchain genuinely needs to move; do not chase nightly.
+FROM rust:1.95 AS cargo-builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \

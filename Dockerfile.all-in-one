@@ -22,8 +22,13 @@ RUN npm ci --ignore-scripts
 COPY rusternetes/console/ ./
 RUN npm run build
 
-# Stage 2: Build the Rust binary
-FROM rust:latest AS builder
+# Stage 2: Build the Rust binary.
+#
+# Pin the toolchain — keep in lock-step with `Dockerfile.services` so
+# both compose stacks share the same rustc and the BuildKit
+# /app/target cache stays valid. See the comment in
+# Dockerfile.services for the rationale.
+FROM rust:1.95 AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
