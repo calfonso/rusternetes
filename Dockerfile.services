@@ -192,12 +192,20 @@ COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
 COPY crates/storage/src              crates/storage/src
 
-# Touch every Cargo.toml so cargo's mtime check notices that the
-# source tree has changed. Without this, cargo can be fooled by the
-# Pass-1 artefacts still present in the cache-mounted target/ and
-# skip the rebuild of the workspace crates. (The fingerprint is keyed
-# off mtime of the manifest + source, so touching the manifest is the
-# canonical kick.)
+# Touch every Cargo.toml AND every workspace .rs file so cargo's
+# fingerprint check notices the source tree has changed.
+#
+# Cargo decides whether to recompile a crate by comparing the mtime
+# of its src/ tree against the mtime of the cached `.fingerprint`
+# entry. Docker's `COPY` preserves the mtime of the source file from
+# the build context (often the original git checkout time), which can
+# be OLDER than the dummy lib.rs Pass 1 just wrote. Without an
+# explicit `touch`, cargo sees "src older than fingerprint" and
+# happily reuses the empty-library .rlib from Pass 1, which makes
+# every dependent crate fail with `unresolved import …`.
+#
+# `touch` with no args bumps mtime to "now", which is always newer
+# than both the dummy artefact and the original source mtime.
 #
 # The binaries are copied out of the cache-mounted target/ into /out
 # so the runtime stages can pick them up (cache-mount contents are
@@ -206,7 +214,7 @@ COPY crates/storage/src              crates/storage/src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    find crates -name "Cargo.toml" -exec touch {} \; && \
+    find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
     cargo build --release $CARGO_FEATURES \
         --bin api-server \
         --bin kubelet \

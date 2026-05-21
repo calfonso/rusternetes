@@ -96,10 +96,13 @@ COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
 COPY crates/storage/src              crates/storage/src
 
+# Touch Cargo.toml AND every .rs — see Dockerfile.services for why
+# touching manifests alone is insufficient (cargo fingerprint also
+# tracks src/ mtime, which COPY preserves from the build context).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    find crates -name "Cargo.toml" -exec touch {} \; && \
+    find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
     cargo build --release --bin kubectl && \
     mkdir -p /out && cp target/release/kubectl /out/kubectl
 
