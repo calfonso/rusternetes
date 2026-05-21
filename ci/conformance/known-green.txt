@@ -85,3 +85,11 @@
 [sig-storage] ConfigMap should be consumable from pods in volume with mappings as non-root [NodeConformance] [Conformance]
 # closes #559
 [sig-storage] ConfigMap should be consumable in multiple volumes in the same pod [NodeConformance] [Conformance]
+# closes #387
+[sig-network] DNS should provide DNS for ExternalName services [Conformance]
+# closes #389
+[sig-network] DNS should provide DNS for pods for Subdomain [Conformance]
+# closes #434
+[sig-node] ConfigMap should fail to create ConfigMap with empty key [Conformance]
+# closes #560
+[sig-storage] ConfigMap should be immutable if `immutable` field is set [Conformance]
