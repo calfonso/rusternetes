@@ -389,7 +389,250 @@ pub async fn normalize_content_type_middleware(
         }
     }
 
+    // Upstream-parity Table / PartialObjectMetadata conversion. Mirrors
+    // `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/json` and
+    // the meta.k8s.io/v1 Table builder used by kubectl's columnar output
+    // and informer-cache clients. Triggered by the `as=` parameter in the
+    // Accept header. We only convert when the upstream handler returned a
+    // 200 application/json body — error Status objects are left alone so
+    // clients still see the original failure shape.
+    if let Some(as_target) = parse_accept_as_target(&accept_header) {
+        if response.status() == StatusCode::OK {
+            let response_ct = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            if response_ct.starts_with("application/json") {
+                let (parts, body) = response.into_parts();
+                match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+                    Ok(json_bytes) => {
+                        match serde_json::from_slice::<serde_json::Value>(&json_bytes) {
+                            Ok(v) => {
+                                let converted = match as_target {
+                                    AsTarget::Table => convert_to_table(v),
+                                    AsTarget::PartialObjectMetadata => {
+                                        convert_to_partial_object_metadata(v)
+                                    }
+                                    AsTarget::PartialObjectMetadataList => {
+                                        convert_to_partial_object_metadata_list(v)
+                                    }
+                                };
+                                let new_body = serde_json::to_vec(&converted)
+                                    .unwrap_or_else(|_| json_bytes.to_vec());
+                                let mut resp = Response::from_parts(parts, Body::from(new_body));
+                                let new_ct = format!(
+                                    "application/json;as={};v=v1;g=meta.k8s.io",
+                                    as_target.name()
+                                );
+                                if let Ok(hv) = axum::http::HeaderValue::from_str(&new_ct) {
+                                    resp.headers_mut()
+                                        .insert(axum::http::header::CONTENT_TYPE, hv);
+                                }
+                                return Ok(resp);
+                            }
+                            Err(_) => {
+                                // Body wasn't JSON — return original bytes untouched.
+                                let resp = Response::from_parts(parts, Body::from(json_bytes));
+                                return Ok(resp);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        return Ok(Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::empty())
+                            .unwrap());
+                    }
+                }
+            }
+        }
+    }
+
     Ok(response)
+}
+
+/// Subset of `meta.k8s.io/v1` response shapes that can be requested via
+/// `Accept: application/json;as=<Target>;v=v1;g=meta.k8s.io`.
+#[derive(Debug, Clone, Copy)]
+enum AsTarget {
+    Table,
+    PartialObjectMetadata,
+    PartialObjectMetadataList,
+}
+
+impl AsTarget {
+    fn name(self) -> &'static str {
+        match self {
+            AsTarget::Table => "Table",
+            AsTarget::PartialObjectMetadata => "PartialObjectMetadata",
+            AsTarget::PartialObjectMetadataList => "PartialObjectMetadataList",
+        }
+    }
+}
+
+/// Scan an Accept header for the first recognized `as=<Target>` parameter.
+/// Matches the upstream apiserver logic in
+/// `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/negotiated_codec_factory.go`:
+/// the parameter is looked up per media-range and must accompany an
+/// `application/json` (or other supported base) media type.
+fn parse_accept_as_target(accept: &str) -> Option<AsTarget> {
+    for range in accept.split(',') {
+        let mut parts = range.split(';');
+        let base = parts.next().unwrap_or("").trim();
+        if !base.starts_with("application/json") && base != "*/*" {
+            continue;
+        }
+        for param in parts {
+            let trimmed = param.trim();
+            if let Some(value) = trimmed.strip_prefix("as=") {
+                let value = value.trim_matches('"');
+                return match value {
+                    "Table" => Some(AsTarget::Table),
+                    "PartialObjectMetadata" => Some(AsTarget::PartialObjectMetadata),
+                    "PartialObjectMetadataList" => Some(AsTarget::PartialObjectMetadataList),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Convert a single object or List into a `meta.k8s.io/v1.Table`.
+/// Upstream's Table builder picks columnDefinitions per resource type;
+/// rusternetes ships the minimum columns kubectl needs (Name, Age) plus
+/// the underlying object in each row so callers can still introspect.
+fn convert_to_table(value: serde_json::Value) -> serde_json::Value {
+    let (items, list_metadata) = extract_items(&value);
+    let kind_hint = items
+        .first()
+        .and_then(|o| o.get("kind"))
+        .and_then(|k| k.as_str())
+        .or_else(|| value.get("kind").and_then(|k| k.as_str()))
+        .unwrap_or("");
+    let columns = table_columns_for(kind_hint);
+    let rows: Vec<serde_json::Value> = items
+        .iter()
+        .map(|obj| table_row_for(kind_hint, obj))
+        .collect();
+    serde_json::json!({
+        "kind": "Table",
+        "apiVersion": "meta.k8s.io/v1",
+        "metadata": list_metadata,
+        "columnDefinitions": columns,
+        "rows": rows,
+    })
+}
+
+/// Convert a single object into a `meta.k8s.io/v1.PartialObjectMetadata`
+/// by keeping only TypeMeta + ObjectMeta and dropping `spec` / `status`.
+/// If the input is a List, the caller should use
+/// [`convert_to_partial_object_metadata_list`] instead — but if it ends
+/// up here we transparently downgrade to the List form so behaviour
+/// matches upstream regardless of the URL.
+fn convert_to_partial_object_metadata(value: serde_json::Value) -> serde_json::Value {
+    if value.get("items").is_some() {
+        return convert_to_partial_object_metadata_list(value);
+    }
+    let metadata = value
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "kind": "PartialObjectMetadata",
+        "apiVersion": "meta.k8s.io/v1",
+        "metadata": metadata,
+    })
+}
+
+/// Convert a List response into a `meta.k8s.io/v1.PartialObjectMetadataList`.
+fn convert_to_partial_object_metadata_list(value: serde_json::Value) -> serde_json::Value {
+    let (items, list_metadata) = extract_items(&value);
+    let stripped: Vec<serde_json::Value> = items
+        .into_iter()
+        .map(|obj| {
+            serde_json::json!({
+                "kind": "PartialObjectMetadata",
+                "apiVersion": "meta.k8s.io/v1",
+                "metadata": obj.get("metadata").cloned().unwrap_or_else(|| serde_json::json!({})),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "kind": "PartialObjectMetadataList",
+        "apiVersion": "meta.k8s.io/v1",
+        "metadata": list_metadata,
+        "items": stripped,
+    })
+}
+
+/// Extract `(items, list_metadata)` from a response payload that may be
+/// either a single object or a `*List` shape. For single objects the
+/// payload itself becomes the only item and an empty ListMeta is
+/// returned.
+fn extract_items(value: &serde_json::Value) -> (Vec<serde_json::Value>, serde_json::Value) {
+    if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
+        let metadata = value
+            .get("metadata")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        (items.clone(), metadata)
+    } else {
+        (vec![value.clone()], serde_json::json!({}))
+    }
+}
+
+/// Default column set for a Table row. Kubernetes' apiserver ships
+/// per-kind printer columns; rusternetes returns the minimum that
+/// kubectl's columnar output needs to render. Resource-specific
+/// printers can extend this table without changing the surrounding
+/// negotiation surface.
+fn table_columns_for(kind: &str) -> serde_json::Value {
+    match kind {
+        "Pod" | "PodList" => serde_json::json!([
+            {"name": "Name", "type": "string", "format": "name", "description": "Name of the pod"},
+            {"name": "Status", "type": "string", "description": "Pod phase"},
+            {"name": "Age", "type": "date", "description": "Time since creation"},
+        ]),
+        _ => serde_json::json!([
+            {"name": "Name", "type": "string", "format": "name", "description": "Name of the resource"},
+            {"name": "Age", "type": "date", "description": "Time since creation"},
+        ]),
+    }
+}
+
+fn table_row_for(kind: &str, obj: &serde_json::Value) -> serde_json::Value {
+    let name = obj
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let creation = obj
+        .get("metadata")
+        .and_then(|m| m.get("creationTimestamp"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let cells: Vec<serde_json::Value> = match kind {
+        "Pod" | "PodList" => {
+            let phase = obj
+                .get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            vec![
+                serde_json::Value::String(name.into()),
+                serde_json::Value::String(phase.into()),
+                creation,
+            ]
+        }
+        _ => vec![serde_json::Value::String(name.into()), creation],
+    };
+    serde_json::json!({
+        "cells": cells,
+        "object": obj,
+    })
 }
 
 /// Extract apiVersion and kind from JSON bytes without full parsing.
