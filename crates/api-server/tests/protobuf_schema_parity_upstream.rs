@@ -301,6 +301,7 @@ fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<String> {
         // Scalars
         (FieldType::String, LogicalType::Scalar(Scalar::String)) => None,
         (FieldType::Int, LogicalType::Scalar(Scalar::Int)) => None,
+        (FieldType::Double, LogicalType::Scalar(Scalar::Float)) => None,
         (FieldType::Bool, LogicalType::Scalar(Scalar::Bool)) => None,
         (FieldType::Bytes, LogicalType::Scalar(Scalar::Bytes)) => None,
 
@@ -405,21 +406,51 @@ const REGISTRY_SKIP: &[&str] = &[
 
 /// Messages where a specific field number is intentionally not in the
 /// upstream schema and should be tolerated. Keyed by message name.
+///
+/// Most entries below are *JSON-name vs Go-field-name* differences:
+/// the registry tracks the wire/JSON name (the one that has to
+/// round-trip through every client), while upstream's `protoc-gen-go`
+/// strips `$` prefixes, kebab-case dashes, and PascalCases the first
+/// letter to derive a Go field name. Both names describe the same
+/// field number — only their string differs.
 fn intentional_field_skip(msg: &str, field_number: u32) -> bool {
     match (msg, field_number) {
-        // `TypeMeta` exists in two upstream packages with different field
-        // layouts:
+        // `TypeMeta` exists in two upstream packages with different
+        // field layouts:
         //   apimachinery/pkg/apis/meta/v1.TypeMeta — kind=1, apiVersion=2;
         //     embedded in every API kind body.
         //   apimachinery/pkg/runtime.TypeMeta    — apiVersion=1, kind=2;
         //     part of the `Unknown` envelope.
         // The registry intentionally tracks the meta/v1 form (see
-        // src/protobuf.rs and the assertion in `test_meta_v1_schemas_present`).
-        // Upstream's by-simple-name index collapses both into one entry, so
-        // suppress the field-name false positives at #1 and #2 here. The
-        // Unknown envelope decoder handles its own TypeMeta out-of-band
-        // (src/protobuf.rs around line 7179), so this skip is safe.
+        // src/protobuf.rs and `test_meta_v1_schemas_present`).
+        // Upstream's by-simple-name index collapses both into one
+        // entry, so suppress the field-name false positives at #1 and
+        // #2 here. The Unknown envelope decoder handles its own
+        // TypeMeta out-of-band, so the skip is safe.
         ("TypeMeta", 1 | 2) => true,
+
+        // JSONSchemaProps — `$schema`, `$ref`, and `x-kubernetes-*`
+        // are the actual JSON field names in CRD JSON-Schema
+        // documents. protoc-gen-go strips the `$` and dash-camel-cases
+        // to derive `schema`, `ref`, `xKubernetesPreserveUnknownFields`,
+        // etc. Wire numbers match; only the Go-side string differs.
+        ("JSONSchemaProps", 2 | 3) => true,
+        ("JSONSchemaProps", 38..=44) => true,
+
+        // JSONSchemaPropsOrArray — `jsonSchemas` (JSON name) becomes
+        // `jSONSchemas` (Go field name) under protoc-gen-go's
+        // initialism convention.
+        ("JSONSchemaPropsOrArray", 2) => true,
+
+        // Webhook configurations — `webhooks` (JSON name) becomes
+        // `Webhooks` (PascalCase Go field name).
+        ("MutatingWebhookConfiguration", 2) => true,
+        ("ValidatingWebhookConfiguration", 2) => true,
+
+        // CEL ValidatingAdmissionPolicy types — Go-side PascalCase
+        // variants of the JSON names.
+        ("Validation", 1) => true,
+        ("Variable", 1 | 2) => true,
         _ => false,
     }
 }
@@ -450,22 +481,19 @@ fn upstream_protos_parse_cleanly() {
     );
 }
 
-/// Strict parity check — fails the moment any field number/name/type in our
-/// `ProtoRegistry` disagrees with the upstream `.proto` schema. The test is
-/// `#[ignore]`d so the default `cargo test` run stays green: the first
-/// invocation surfaced ~75 pre-existing mismatches (real registry bugs from
-/// before this tool existed), and those gaps are tracked as separate
-/// follow-ups. Run on-demand when working on the registry:
+/// Strict parity check — fails the moment any field number/name/type
+/// in our `ProtoRegistry` disagrees with the upstream `.proto` schema.
+/// The first invocation surfaced ~75 pre-existing mismatches that were
+/// then closed across a sequence of `fix(api-server): protobuf
+/// registry parity for ...` PRs. The remaining JSON-name vs Go-name
+/// false positives (CRD JSON-Schema fields, CEL Validation /
+/// Variable, webhook configs) are whitelisted in
+/// [`intentional_field_skip`].
 ///
-/// ```text
-/// cargo test --test protobuf_schema_parity_upstream \
-///     registry_parity_with_upstream -- --ignored --nocapture
-/// ```
-///
-/// The output is the actionable to-do list. When the count goes to zero,
-/// flip the `#[ignore]` to `#[test]` so any future drift goes red in CI.
+/// Runs as part of `cargo test` so any future drift — a new resource
+/// landing with wrong field numbers, or a forgotten skip-entry —
+/// goes red immediately.
 #[test]
-#[ignore = "actionable mismatch list — see test docstring; flip to #[test] when registry parity is complete"]
 fn registry_parity_with_upstream() {
     let files = parse_all_files();
     let (upstream, _map_entries) = build_upstream_index(&files);
