@@ -40,6 +40,7 @@ prost.workspace = true
 http = "1"
 tar = "0.4"
 sysinfo = "0.32"
+rustix = { version = "0.38", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

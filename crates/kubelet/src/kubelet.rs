@@ -11,6 +11,7 @@ use rusternetes_common::{
 use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend, WatchEvent};
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -48,6 +49,9 @@ pub struct Kubelet {
     storage: Arc<StorageBackend>,
     runtime: Arc<ContainerRuntime>,
     sync_interval: Duration,
+    /// Filesystem path used for `statvfs` when computing nodefs eviction stats.
+    /// Defaults to `/var/lib/kubelet` when not provided.
+    eviction_root_dir: PathBuf,
     eviction_manager: Mutex<EvictionManager>,
     /// Per-pod worker state. K8s uses a goroutine per pod; we track state
     /// per-UID and dispatch in the sync loop.
@@ -88,7 +92,11 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
 }
 
 impl Kubelet {
+    /// Construct a Kubelet with upstream-default eviction config and
+    /// `root_dir = /var/lib/kubelet`. Kept for library back-compat; the
+    /// binary uses [`Kubelet::new_with_eviction`] to honor CLI flags.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub async fn new(
         node_name: String,
         storage: Arc<StorageBackend>,
@@ -98,6 +106,37 @@ impl Kubelet {
         cluster_domain: String,
         network: String,
         kubernetes_service_host: String,
+    ) -> Result<Self> {
+        Self::new_with_eviction(
+            node_name,
+            storage,
+            sync_interval_secs,
+            volume_dir,
+            cluster_dns,
+            cluster_domain,
+            network,
+            kubernetes_service_host,
+            PathBuf::from("/var/lib/kubelet"),
+            EvictionManager::new(),
+        )
+        .await
+    }
+
+    /// Construct a Kubelet with an explicit eviction-root path (for statvfs)
+    /// and a pre-configured `EvictionManager`. Used by the kubelet binary's
+    /// main to honor `--root-dir`, `--eviction-hard`, etc.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_eviction(
+        node_name: String,
+        storage: Arc<StorageBackend>,
+        sync_interval_secs: u64,
+        volume_dir: String,
+        cluster_dns: String,
+        cluster_domain: String,
+        network: String,
+        kubernetes_service_host: String,
+        eviction_root_dir: PathBuf,
+        eviction_manager: EvictionManager,
     ) -> Result<Self> {
         let runtime = ContainerRuntime::new(
             volume_dir,
@@ -109,12 +148,18 @@ impl Kubelet {
         .await?
         .with_storage(storage.clone());
 
+        // Log the resolved statvfs path once so operators can see which
+        // mount we're measuring for eviction. Upstream cadvisor logs this
+        // in `fs.go::GetFsInfoForPath`.
+        crate::eviction::log_statvfs_path(&eviction_root_dir);
+
         Ok(Self {
             node_name,
             storage,
             runtime: Arc::new(runtime),
             sync_interval: Duration::from_secs(sync_interval_secs),
-            eviction_manager: Mutex::new(EvictionManager::new()),
+            eviction_root_dir,
+            eviction_manager: Mutex::new(eviction_manager),
             pod_states: Mutex::new(HashMap::new()),
             pod_sync_locks: Mutex::new(HashSet::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
@@ -535,22 +580,24 @@ impl Kubelet {
         let key = build_key("nodes", None, &self.node_name);
         let mut node: Node = self.storage.get(&key).await?;
 
-        // Get current node resource statistics
-        let node_stats = get_node_stats();
+        // Get current node resource statistics via upstream-parity statvfs.
+        let node_stats = get_node_stats(&self.eviction_root_dir);
 
         // Check if eviction is needed — scoped block ensures the MutexGuard
-        // is dropped before any subsequent .await points.
+        // is dropped before any subsequent .await points. When the eviction
+        // subsystem is disabled (empty thresholds), this is a no-op beyond
+        // clearing any stale pressure conditions.
         let active_signals = {
             let mut eviction_manager = self.eviction_manager.lock().unwrap();
-            let active_signals = eviction_manager.check_eviction_needed(&node_stats);
-
-            if !active_signals.is_empty() {
-                info!("Resource pressure detected: {:?}", active_signals);
-                eviction_manager.update_node_conditions(&mut node, &active_signals)?;
-            } else {
+            if eviction_manager.is_disabled() {
+                // Disabled: ensure conditions are False/cleared without churning logs.
                 eviction_manager.update_node_conditions(&mut node, &[])?;
+                Vec::new()
+            } else {
+                let active_signals = eviction_manager.check_eviction_needed(&node_stats);
+                eviction_manager.update_node_conditions(&mut node, &active_signals)?;
+                active_signals
             }
-            active_signals
         };
 
         // Ensure default node labels are always set (K8s kubelet updateDefaultLabels)
