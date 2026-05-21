@@ -17,7 +17,7 @@ Flags:
 
 - `--output-dir <dir>` — override output directory.
 - `--kubeconfig <path>` — default `${KUBECONFIG:-~/.kube/rusternetes-config}`.
-- `--conformance-image <img>` — default `registry.k8s.io/conformance:v1.32.0`.
+- `--conformance-image <img>` — default `registry.k8s.io/conformance:v1.35.0`.
 - `--no-anchor` — treat the positional arg as a raw regex (skip escaping +
   `^…$` anchoring). Useful for `--focus 'should .*provide DNS'`-style globs.
 
