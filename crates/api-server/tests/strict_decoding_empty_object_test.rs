@@ -94,7 +94,13 @@ async fn test_pod_with_empty_last_state_accepted_under_strict() {
             }]
         }
     });
-    let (status, resp) = send(router, Method::POST, &format!("/api/v1/namespaces/{}/pods", TEST_NS), body).await;
+    let (status, resp) = send(
+        router,
+        Method::POST,
+        &format!("/api/v1/namespaces/{}/pods", TEST_NS),
+        body,
+    )
+    .await;
     assert!(
         status.is_success(),
         "containerStatus.lastState: {{}} must be accepted under default-Strict; got {} body={}",
@@ -129,7 +135,13 @@ async fn test_pod_with_empty_init_container_last_state_accepted_under_strict() {
             }]
         }
     });
-    let (status, resp) = send(router, Method::POST, &format!("/api/v1/namespaces/{}/pods", TEST_NS), body).await;
+    let (status, resp) = send(
+        router,
+        Method::POST,
+        &format!("/api/v1/namespaces/{}/pods", TEST_NS),
+        body,
+    )
+    .await;
     assert!(
         status.is_success(),
         "initContainerStatus.lastState: {{}} must be accepted under default-Strict; got {} body={}",
@@ -152,7 +164,13 @@ async fn test_genuinely_unknown_non_empty_field_still_rejected_under_strict() {
             "thisFieldDoesNotExist": "has-a-value"
         }
     });
-    let (status, resp) = send(router, Method::POST, &format!("/api/v1/namespaces/{}/pods", TEST_NS), body).await;
+    let (status, resp) = send(
+        router,
+        Method::POST,
+        &format!("/api/v1/namespaces/{}/pods", TEST_NS),
+        body,
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
