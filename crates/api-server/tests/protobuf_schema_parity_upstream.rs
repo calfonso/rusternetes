@@ -405,8 +405,23 @@ const REGISTRY_SKIP: &[&str] = &[
 
 /// Messages where a specific field number is intentionally not in the
 /// upstream schema and should be tolerated. Keyed by message name.
-fn intentional_field_skip(_msg: &str, _field_number: u32) -> bool {
-    false
+fn intentional_field_skip(msg: &str, field_number: u32) -> bool {
+    match (msg, field_number) {
+        // `TypeMeta` exists in two upstream packages with different field
+        // layouts:
+        //   apimachinery/pkg/apis/meta/v1.TypeMeta — kind=1, apiVersion=2;
+        //     embedded in every API kind body.
+        //   apimachinery/pkg/runtime.TypeMeta    — apiVersion=1, kind=2;
+        //     part of the `Unknown` envelope.
+        // The registry intentionally tracks the meta/v1 form (see
+        // src/protobuf.rs and the assertion in `test_meta_v1_schemas_present`).
+        // Upstream's by-simple-name index collapses both into one entry, so
+        // suppress the field-name false positives at #1 and #2 here. The
+        // Unknown envelope decoder handles its own TypeMeta out-of-band
+        // (src/protobuf.rs around line 7179), so this skip is safe.
+        ("TypeMeta", 1 | 2) => true,
+        _ => false,
+    }
 }
 
 // -------- the tests ------------------------------------------------------

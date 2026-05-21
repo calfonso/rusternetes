@@ -6099,7 +6099,10 @@ impl ProtoRegistry {
         // k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto exactly:
         // kind=1, name=3, uid=4, apiVersion=5, controller=6,
         // blockOwnerDeletion=7. The ordering is historical, not
-        // monotonic — `kind` was added before `apiVersion`.
+        // monotonic — `kind` was added before `apiVersion`. Prior to
+        // this fix the registry had apiVersion=1/kind=2 — wire-
+        // incompatible with every real client and silently mis-decoded
+        // ownerReferences on the way in.
         MessageSchema {
             fields: HashMap::from([
                 (1, ("kind".into(), FieldType::String)),
