@@ -367,43 +367,56 @@ async fn accept_q_values_protobuf_first_falls_back_to_json() {
 
 /// `Accept: application/json;as=Table;v=v1;g=meta.k8s.io`. Upstream
 /// converts the resource into a `meta.k8s.io/v1.Table` for kubectl's
-/// columnar output. Rusternetes has no Table conversion path; it
-/// ignores the `as=` parameter and returns the underlying Pod JSON.
-///
-/// This blocks `[sig-cli] Kubectl get` conformance scenarios that depend
-/// on Table responses. Marked as `ignore` with a note pointing at the
-/// missing feature.
+/// columnar output. Rusternetes' `normalize_content_type_middleware`
+/// intercepts the response and rebuilds it as a Table when the Accept
+/// header carries `as=Table`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: meta.k8s.io/v1 Table conversion not implemented"]
 async fn accept_as_table_returns_table() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "p-table").await;
 
-    let (status, ct, _body) = get_with_accept(
+    let (status, ct, body) = get_with_accept(
         router,
         "/api/v1/namespaces/default/pods/p-table",
         "application/json;as=Table;v=v1;g=meta.k8s.io",
     )
     .await;
 
-    // When implemented, the response should be a Table with `columnDefinitions`
-    // and `rows`. Until then this assertion will fail with the underlying Pod
-    // body — exactly why the test is ignored.
     assert_eq!(status, StatusCode::OK);
     assert!(
         ct.contains("as=Table") || ct.contains("Table"),
         "expected Table Content-Type; got {}",
         ct
     );
+    let v: Value = serde_json::from_slice(&body).expect("Table body is JSON");
+    assert_eq!(v["kind"], "Table", "kind must be Table; got {}", v);
+    assert_eq!(
+        v["apiVersion"], "meta.k8s.io/v1",
+        "apiVersion must be meta.k8s.io/v1; got {}",
+        v
+    );
+    let cols = v["columnDefinitions"]
+        .as_array()
+        .expect("columnDefinitions must be array");
+    assert!(
+        !cols.is_empty(),
+        "columnDefinitions must not be empty; got {}",
+        v
+    );
+    let rows = v["rows"].as_array().expect("rows must be array");
+    assert_eq!(rows.len(), 1, "single-object Table has one row; got {}", v);
+    assert_eq!(
+        rows[0]["object"]["metadata"]["name"], "p-table",
+        "row.object must carry the source Pod; got {}",
+        rows[0]
+    );
 }
 
 /// `Accept: application/json;as=PartialObjectMetadata;v=v1;g=meta.k8s.io`.
-/// Upstream strips `spec` and `status`, returning just TypeMeta + ObjectMeta
-/// to keep watch traffic light. Rusternetes returns the full Pod regardless.
-///
-/// `kubectl get -o name` and the informer-cache layer rely on this.
+/// Upstream strips `spec` and `status`, returning just TypeMeta +
+/// ObjectMeta to keep watch traffic light. Rusternetes' middleware
+/// performs the same projection.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: PartialObjectMetadata conversion not implemented"]
 async fn accept_as_partial_object_metadata_strips_spec_status() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "p-pom").await;
@@ -422,6 +435,9 @@ async fn accept_as_partial_object_metadata_strips_spec_status() {
         ct
     );
     let v: Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["kind"], "PartialObjectMetadata");
+    assert_eq!(v["apiVersion"], "meta.k8s.io/v1");
+    assert_eq!(v["metadata"]["name"], "p-pom");
     assert!(
         v.get("spec").is_none(),
         "PartialObjectMetadata must strip spec; got {}",
