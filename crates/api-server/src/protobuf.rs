@@ -8460,6 +8460,14 @@ impl ProtoRegistry {
     fn register_core_v1_remaining_nested(schemas: &mut HashMap<String, MessageSchema>) {
         // -- envFrom sources (same shape: LocalObjectReference + optional bool) ----
 
+        // Field 1 is an embedded LocalObjectReference whose Go JSON tag is
+        // `json:",inline"` — the `name` key surfaces directly on the parent
+        // object on the wire. Use `InlineMessage` so the proto→JSON decoder
+        // flattens its fields, matching every other LocalObjectReference
+        // embedding (ConfigMapVolumeSource, SecretProjection, etc.). The
+        // wrapped `Message` variant produces `{"localObjectReference":{...}}`,
+        // which then fails the typed `ConfigMapEnvSource`/`SecretEnvSource`
+        // decode with `missing field 'name'`.
         schemas.insert(
             "ConfigMapEnvSource".into(),
             MessageSchema {
@@ -8468,7 +8476,7 @@ impl ProtoRegistry {
                         1,
                         (
                             "localObjectReference".into(),
-                            FieldType::Message("LocalObjectReference".into()),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
                         ),
                     ),
                     (2, ("optional".into(), FieldType::Bool)),
@@ -8484,7 +8492,7 @@ impl ProtoRegistry {
                         1,
                         (
                             "localObjectReference".into(),
-                            FieldType::Message("LocalObjectReference".into()),
+                            FieldType::InlineMessage("LocalObjectReference".into()),
                         ),
                     ),
                     (2, ("optional".into(), FieldType::Bool)),
