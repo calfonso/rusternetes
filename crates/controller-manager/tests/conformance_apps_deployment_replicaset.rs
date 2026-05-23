@@ -820,14 +820,17 @@ async fn deployment_namespaces_are_isolated() {
 /// [sig-apps] ReplicaSet should serve a basic image on each replica with a public image [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/replica_set.go:95
-/// Sonobuoy (Round 160): FAIL — see docs/CONFORMANCE.md "Apps controllers" bucket
+/// Sonobuoy (Round 160): FAIL end-to-end — the upstream scenario curls each
+/// pod IP through the Service plane, so the failure surface is pod
+/// networking / readiness, not the ReplicaSet controller itself.
 ///
-/// The conformance scenario fails end-to-end because it depends on pod
-/// readiness reaching the Service plane. At the controller level we still
-/// verify the contract the RC test owns: the ReplicaSet produces N pods
-/// labeled with the spec.template.metadata.labels.
+/// At the controller level we still verify the contract this test owns: the
+/// ReplicaSet produces N pods, each inheriting the template labels and
+/// container image. That contract holds today, so the controller-level
+/// mirror runs unconditionally. The end-to-end Sonobuoy verdict remains
+/// tracked in `docs/CONFORMANCE.md` and is gated on cluster-side fixes
+/// (pod IP / Service plane), not on the controller.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-deployment-replicaset.md (basic image serving E2E)"]
 async fn replicaset_should_serve_basic_image_on_each_replica() {
     let storage = setup();
     let ns = "default";
