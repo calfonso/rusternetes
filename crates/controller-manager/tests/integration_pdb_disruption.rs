@@ -28,10 +28,12 @@
 
 use rusternetes_common::resources::pod::{Container, Pod, PodCondition, PodSpec, PodStatus};
 use rusternetes_common::resources::{
-    IntOrString, PodDisruptionBudget, PodDisruptionBudgetSpec, PodDisruptionBudgetStatus,
+    CustomResource, CustomResourceDefinition, CustomResourceDefinitionVersion,
+    CustomResourceSubresourceScale, CustomResourceSubresources, IntOrString, PodDisruptionBudget,
+    PodDisruptionBudgetSpec, PodDisruptionBudgetStatus,
 };
 use rusternetes_common::types::{
-    LabelSelector, LabelSelectorRequirement, ObjectMeta, Phase, TypeMeta,
+    LabelSelector, LabelSelectorRequirement, ObjectMeta, OwnerReference, Phase, TypeMeta,
 };
 use rusternetes_controller_manager::controllers::pod_disruption_budget::{
     PodDisruptionBudgetController, StalePodDisruptionController,
@@ -286,10 +288,140 @@ async fn test_pdb_with_scale_subresource() {
     );
 }
 
+/// Mirror of upstream `TestPDBWithScaleSubresource` CRD variant
+/// (`test/integration/disruption/disruption_test.go`).
+///
+/// The PDB controller must walk every selected pod's controller
+/// ownerReference up to the CRD root, find the CRD's `scale` subresource
+/// definition, and read `expectedPods` from the JSON path declared by
+/// `subresources.scale.specReplicasPath`. Pods alone undercount the
+/// workload when the CRD's spec.replicas is greater than the number of
+/// currently-running pods.
 #[tokio::test]
-#[ignore = "Follow-up: PDB controller must follow ownerReference chains to a CRD's scale subresource for expectedPods. Tracked outside this PR — needs CRD plumbing in controller-manager + storage layer."]
 async fn test_pdb_with_scale_subresource_crd_variant() {
-    panic!("not implemented: PDB scale subresource for CRDs (see ignore reason)");
+    let storage = new_storage();
+    let controller = new_controller(storage.clone());
+
+    let ns = "pdb-scale-subresource-crd";
+    let labels = HashMap::from([("app".to_string(), "test-crd".to_string())]);
+    // CRD declares spec.replicas = 4 — this is the canonical "expected" count.
+    // Only 3 pods are currently scheduled (e.g. mid-rollout); the controller
+    // must still report expectedPods=4 from the scale subresource.
+    let crd_replicas: i32 = 4;
+    let live_pods: i32 = 3;
+    let max_unavailable: i32 = 1;
+
+    // 1. Define the CRD with a /scale subresource at .spec.replicas.
+    let crd = CustomResourceDefinition {
+        api_version: "apiextensions.k8s.io/v1".to_string(),
+        kind: "CustomResourceDefinition".to_string(),
+        metadata: ObjectMeta::new("scalecrds.example.com"),
+        spec: rusternetes_common::resources::CustomResourceDefinitionSpec {
+            group: "example.com".to_string(),
+            names: rusternetes_common::resources::CustomResourceDefinitionNames {
+                plural: "scalecrds".to_string(),
+                singular: Some("scalecrd".to_string()),
+                kind: "ScaleCRD".to_string(),
+                short_names: None,
+                categories: None,
+                list_kind: Some("ScaleCRDList".to_string()),
+            },
+            scope: rusternetes_common::resources::ResourceScope::Namespaced,
+            versions: vec![CustomResourceDefinitionVersion {
+                name: "v1".to_string(),
+                served: true,
+                storage: true,
+                deprecated: None,
+                deprecation_warning: None,
+                schema: None,
+                subresources: Some(CustomResourceSubresources {
+                    status: None,
+                    scale: Some(CustomResourceSubresourceScale {
+                        spec_replicas_path: ".spec.replicas".to_string(),
+                        status_replicas_path: ".status.replicas".to_string(),
+                        label_selector_path: None,
+                    }),
+                }),
+                additional_printer_columns: None,
+                selectable_fields: None,
+            }],
+            conversion: None,
+            preserve_unknown_fields: None,
+        },
+        status: None,
+    };
+    let crd_key = build_key("customresourcedefinitions", None, &crd.metadata.name);
+    storage.create(&crd_key, &crd).await.expect("create crd");
+
+    // 2. Define a CR with spec.replicas == crd_replicas.
+    let cr_uid = uuid::Uuid::new_v4().to_string();
+    let cr_name = "my-scalecrd";
+    let cr = CustomResource {
+        api_version: "example.com/v1".to_string(),
+        kind: "ScaleCRD".to_string(),
+        metadata: ObjectMeta {
+            name: cr_name.to_string(),
+            namespace: Some(ns.to_string()),
+            uid: cr_uid.clone(),
+            generation: Some(1),
+            creation_timestamp: Some(chrono::Utc::now()),
+            ..Default::default()
+        },
+        spec: Some(serde_json::json!({ "replicas": crd_replicas })),
+        status: None,
+        extra: HashMap::new(),
+    };
+    // Storage key matches the api-server convention: `<group>_<plural>`
+    let cr_key = build_key("example_com_scalecrds", Some(ns), cr_name);
+    storage.create(&cr_key, &cr).await.expect("create cr");
+
+    // 3. Create `live_pods` pods, each pointing back at the CR via a controller
+    //    ownerReference (the canonical CRD adoption shape).
+    for i in 0..live_pods {
+        let mut pod = create_test_pod(&format!("pod-{}", i), ns, labels.clone());
+        pod.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "example.com/v1".to_string(),
+            kind: "ScaleCRD".to_string(),
+            name: cr_name.to_string(),
+            uid: cr_uid.clone(),
+            controller: Some(true),
+            block_owner_deletion: None,
+        }]);
+        put_pod(&storage, &pod).await;
+    }
+
+    // 4. Define a PDB selecting the same labels.
+    let pdb = PodDisruptionBudget::new(
+        "test-pdb",
+        ns,
+        PodDisruptionBudgetSpec {
+            min_available: None,
+            max_unavailable: Some(IntOrString::Int(max_unavailable)),
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                match_expressions: None,
+            },
+            unhealthy_pod_eviction_policy: None,
+        },
+    );
+    put_pdb(&storage, &pdb).await;
+
+    // 5. Reconcile and assert: expectedPods MUST equal crd.spec.replicas (4),
+    //    NOT the count of live pods (3). currentHealthy is still 3 (the
+    //    pods that actually exist + are Ready). desiredHealthy is
+    //    expectedPods - maxUnavailable = 3. disruptionsAllowed is
+    //    currentHealthy - desiredHealthy = 0.
+    controller.reconcile_all().await.expect("reconcile_all");
+
+    let updated = get_pdb(&storage, ns, "test-pdb").await;
+    let status = updated.status.expect("status");
+    assert_pdb_status(
+        &status,
+        crd_replicas,
+        live_pods,
+        crd_replicas - max_unavailable,
+        live_pods - (crd_replicas - max_unavailable),
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 use rusternetes_common::resources::{
-    IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetStatus,
+    CustomResource, CustomResourceDefinition, IntOrString, Pod, PodDisruptionBudget,
+    PodDisruptionBudgetStatus,
 };
-use rusternetes_common::types::{LabelSelector, Phase};
+use rusternetes_common::types::{LabelSelector, OwnerReference, Phase};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{debug, error, info, warn};
@@ -161,16 +163,29 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
             .filter(|p| self.pod_matches_selector(p, &pdb.spec.selector, is_v1beta1))
             .collect();
 
-        // 3. Count healthy vs unhealthy pods
-        let total_pods = matching_pods.len() as i32;
+        // 3. Count healthy pods (Running + Ready).
+        let pod_count = matching_pods.len() as i32;
         let healthy_pods = matching_pods
             .iter()
             .filter(|p| self.is_pod_healthy(p))
             .count() as i32;
 
+        // 3a. Compute expectedPods. Upstream mirrors
+        // `pkg/controller/disruption/disruption.go::getExpectedScale`: walk
+        // every matched pod's controller ownerReference up to a workload
+        // root (Deployment, ReplicaSet, StatefulSet, ReplicationController,
+        // or any CRD with a scale subresource) and SUM their `spec.replicas`
+        // values. Pods without a resolvable controller fall back to the
+        // pod count for that owner, which is the same shape upstream uses
+        // when an owner kind is unknown.
+        let total_pods = self
+            .compute_expected_pods(namespace, &matching_pods)
+            .await
+            .unwrap_or(pod_count);
+
         debug!(
-            "PDB {}/{}: total={}, healthy={}",
-            namespace, pdb.metadata.name, total_pods, healthy_pods
+            "PDB {}/{}: total={} (pods={}), healthy={}",
+            namespace, pdb.metadata.name, total_pods, pod_count, healthy_pods
         );
 
         // 4. Calculate desired_healthy based on min_available or max_unavailable
@@ -272,6 +287,200 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
                     .to_string(),
             ))
         }
+    }
+
+    /// Compute `expectedPods` by walking each pod's controller ownerReference
+    /// up to a workload root and summing the workload sizes.
+    ///
+    /// Mirrors upstream `pkg/controller/disruption/disruption.go::
+    /// getExpectedScale`. The upstream algorithm:
+    ///
+    ///   1. Bucket pods by their controller ownerReference UID. Pods with
+    ///      no controller owner are bucketed under a sentinel "orphan" key.
+    ///   2. For each unique controller, resolve a scale value:
+    ///        - Well-known workload kinds (Deployment, StatefulSet,
+    ///          ReplicaSet, ReplicationController) → read `spec.replicas`
+    ///          from the workload object.
+    ///        - ReplicaSet whose controller owner is a Deployment → bubble
+    ///          up to the Deployment's `spec.replicas`.
+    ///        - CRD kinds with a `scale` subresource → fetch the CR and
+    ///          resolve `subresources.scale.specReplicasPath` against its
+    ///          JSON body.
+    ///        - Unknown / unresolvable → fall back to the pod count for
+    ///          that owner (so we never UNDER-report).
+    ///   3. Sum the scales. Orphan pods contribute their own count.
+    ///
+    /// Returns `None` only when the storage layer is unreachable — that
+    /// case is treated as transient and the caller falls back to the raw
+    /// pod count rather than failing the whole reconcile.
+    async fn compute_expected_pods(&self, namespace: &str, matching_pods: &[Pod]) -> Option<i32> {
+        // Group pods by their controller owner UID. Pods without a
+        // controller owner are accumulated into `orphan_pods` and
+        // contribute their raw count to expectedPods (one-per-pod), which
+        // mirrors upstream's "no controller found" path in
+        // `getExpectedScale`.
+        let mut owners_by_uid: std::collections::HashMap<String, OwnerReference> =
+            std::collections::HashMap::new();
+        let mut pod_count_by_owner: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+        let mut orphan_pods: i32 = 0;
+        for pod in matching_pods {
+            match controller_ref(pod) {
+                Some(owner) => {
+                    *pod_count_by_owner.entry(owner.uid.clone()).or_insert(0) += 1;
+                    owners_by_uid
+                        .entry(owner.uid.clone())
+                        .or_insert_with(|| owner.clone());
+                }
+                None => orphan_pods += 1,
+            }
+        }
+
+        // Dedupe scales by the **root** owner UID, not the pod's direct
+        // owner UID. Upstream `getExpectedScale` does the same: when a
+        // ReplicaSet bubbles up to its Deployment, the returned UID is
+        // the Deployment's, so two RSes of the same Deployment collapse
+        // to a single Deployment-scale entry rather than double-counting.
+        let mut scale_by_root_uid: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+        // `unresolved_pod_fallback` accumulates pod counts for owners
+        // whose scale we could not determine (deleted workload, unknown
+        // CRD, missing replicas field). These contribute their raw pod
+        // count so we never under-report expectedPods.
+        let mut unresolved_pod_fallback: i32 = 0;
+        for (uid, owner) in &owners_by_uid {
+            let pod_count = pod_count_by_owner.get(uid).copied().unwrap_or(0);
+            let mut visited: HashSet<String> = HashSet::new();
+            visited.insert(uid.clone());
+            match self
+                .resolve_owner_scale(namespace, owner, &mut visited)
+                .await
+            {
+                Some((root_uid, scale)) => {
+                    // Insert dedupes; if the same Deployment is reached
+                    // via two different RSes we keep one entry.
+                    scale_by_root_uid.insert(root_uid, scale);
+                }
+                None => unresolved_pod_fallback += pod_count,
+            }
+        }
+
+        let total = orphan_pods + unresolved_pod_fallback + scale_by_root_uid.values().sum::<i32>();
+        Some(total)
+    }
+
+    /// Resolve `(root_uid, replicas)` for a single controller ownerReference.
+    ///
+    /// `root_uid` is the UID we want the caller to dedupe by — for the
+    /// built-in workloads it is the workload's own UID, except for a
+    /// ReplicaSet whose controller owner is a Deployment, in which case
+    /// it is the Deployment's UID (mirrors upstream
+    /// `pkg/controller/disruption/disruption.go::getPodReplicaSet`).
+    ///
+    /// Returns `None` when:
+    ///   - the owner could not be fetched (deleted / not yet stored)
+    ///   - the owner kind is unknown AND no CRD with a scale subresource
+    ///     matches its apiVersion+kind
+    ///   - the scale path on a CRD-backed owner did not resolve to a
+    ///     non-negative integer
+    ///
+    /// In any "unresolvable" case the caller falls back to the pod count
+    /// for that owner, mirroring upstream's behaviour of never
+    /// under-reporting `expectedPods`.
+    async fn resolve_owner_scale(
+        &self,
+        namespace: &str,
+        owner: &OwnerReference,
+        visited: &mut HashSet<String>,
+    ) -> Option<(String, i32)> {
+        // Built-in workload kinds — read .spec.replicas directly.
+        // Upstream uses the same hard-coded list because the dynamic
+        // scale client is only consulted for kinds that DO NOT appear
+        // here (`disruption.go::finders`).
+        let key = match owner.kind.as_str() {
+            "Deployment" => Some(build_key("deployments", Some(namespace), &owner.name)),
+            "StatefulSet" => Some(build_key("statefulsets", Some(namespace), &owner.name)),
+            "ReplicationController" => Some(build_key(
+                "replicationcontrollers",
+                Some(namespace),
+                &owner.name,
+            )),
+            "ReplicaSet" => Some(build_key("replicasets", Some(namespace), &owner.name)),
+            _ => None,
+        };
+
+        if let Some(key) = key {
+            // Built-in workload — fetch as opaque JSON and read .spec.replicas.
+            // Going through JSON keeps this function generic across the four
+            // workload types without pulling a half-dozen typed structs.
+            let workload: serde_json::Value = self.storage.get(&key).await.ok()?;
+            // ReplicaSets owned by a Deployment must report the
+            // Deployment's UID + scale (NOT the RS's), so two RSes of the
+            // same Deployment dedupe to a single entry at the caller.
+            if owner.kind == "ReplicaSet" {
+                if let Some(parent) = controller_ref_from_json(&workload) {
+                    if parent.kind == "Deployment" && !visited.contains(&parent.uid) {
+                        visited.insert(parent.uid.clone());
+                        if let Some((dep_uid, dep_scale)) =
+                            Box::pin(self.resolve_owner_scale(namespace, &parent, visited)).await
+                        {
+                            return Some((dep_uid, dep_scale));
+                        }
+                    }
+                }
+            }
+            let scale = workload
+                .get("spec")
+                .and_then(|s| s.get("replicas"))
+                .and_then(|r| r.as_i64())
+                .map(|r| r as i32)?;
+            return Some((owner.uid.clone(), scale));
+        }
+
+        // CRD path: look up a CRD whose names.kind matches the owner kind
+        // AND whose group matches the owner apiVersion's group. Then use
+        // the CRD's subresources.scale.specReplicasPath to resolve scale
+        // from the CR body.
+        let (group, version) = split_group_version(&owner.api_version);
+        let crd = self.find_crd(&group, &owner.kind).await?;
+        let crd_version = crd.spec.versions.iter().find(|v| v.name == version)?;
+        let scale = crd_version.subresources.as_ref()?.scale.as_ref()?;
+
+        // Storage key for the CR mirrors the api-server convention:
+        // `<group_with_underscores>_<plural>`. We fetch it as a generic
+        // CustomResource (whose `spec` is a serde_json::Value) so we can
+        // resolve the JSONPath without growing a schema dependency.
+        let resource_type = format!("{}_{}", group.replace('.', "_"), crd.spec.names.plural);
+        let cr_key = build_key(&resource_type, Some(namespace), &owner.name);
+        let cr: CustomResource = self.storage.get(&cr_key).await.ok()?;
+
+        // Build the JSON document from the CR's spec/status so the path
+        // can address either side (`.spec.replicas`, `.status.replicas`,
+        // ...). Upstream's scale client walks the same document shape.
+        let mut doc = serde_json::Map::new();
+        if let Some(s) = cr.spec {
+            doc.insert("spec".to_string(), s);
+        }
+        if let Some(s) = cr.status {
+            doc.insert("status".to_string(), s);
+        }
+        let doc = serde_json::Value::Object(doc);
+
+        let scale_val = resolve_json_path(&doc, &scale.spec_replicas_path)
+            .and_then(|v| v.as_i64().map(|i| i as i32))?;
+        Some((owner.uid.clone(), scale_val))
+    }
+
+    /// Look up a CRD by group + kind (mirrors apiextensions discovery).
+    /// Returns `None` if no matching CRD is registered.
+    async fn find_crd(&self, group: &str, kind: &str) -> Option<CustomResourceDefinition> {
+        let crds: Vec<CustomResourceDefinition> = self
+            .storage
+            .list("/registry/customresourcedefinitions/")
+            .await
+            .ok()?;
+        crds.into_iter()
+            .find(|c| c.spec.group == group && c.spec.names.kind == kind)
     }
 
     /// Check if a pod is healthy (Running and Ready)
@@ -383,6 +592,57 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
 
         true
     }
+}
+
+/// Return the *controller* ownerReference of an object (the one with
+/// `controller: true`). Mirrors upstream `metav1.GetControllerOf`.
+fn controller_ref(pod: &Pod) -> Option<OwnerReference> {
+    pod.metadata
+        .owner_references
+        .as_ref()
+        .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)).cloned())
+}
+
+/// Same as [`controller_ref`] but reads from a raw JSON object so we can
+/// chase ownership through workload types fetched as `serde_json::Value`.
+fn controller_ref_from_json(obj: &serde_json::Value) -> Option<OwnerReference> {
+    let refs = obj
+        .get("metadata")
+        .and_then(|m| m.get("ownerReferences"))
+        .and_then(|r| r.as_array())?;
+    for r in refs {
+        if r.get("controller").and_then(|c| c.as_bool()) == Some(true) {
+            return serde_json::from_value(r.clone()).ok();
+        }
+    }
+    None
+}
+
+/// Split a Kubernetes apiVersion ("group/version" or just "version" for
+/// core /api/v1) into its component parts. Core resources return an
+/// empty group, matching upstream's `schema.ParseGroupVersion`.
+fn split_group_version(api_version: &str) -> (String, String) {
+    match api_version.split_once('/') {
+        Some((g, v)) => (g.to_string(), v.to_string()),
+        None => (String::new(), api_version.to_string()),
+    }
+}
+
+/// Resolve a dot-prefixed JSONPath (e.g. `.spec.replicas`) against a
+/// JSON object. Only supports the dotted-field subset that CRD
+/// `specReplicasPath` / `statusReplicasPath` are allowed to use per the
+/// apiextensions docs — no array indexing, no filters. The leading `.`
+/// is required by the spec; we tolerate its absence for ergonomics.
+fn resolve_json_path<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let trimmed = path.strip_prefix('.').unwrap_or(path);
+    let mut cur = doc;
+    for segment in trimmed.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        cur = cur.get(segment)?;
+    }
+    Some(cur)
 }
 
 /// Default `stalePodDisruptionTimeout` mirrored from upstream
@@ -550,6 +810,81 @@ mod tests {
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::MemoryStorage;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_resolve_json_path_simple() {
+        let doc = serde_json::json!({"spec": {"replicas": 7, "nested": {"x": 1}}});
+        assert_eq!(
+            resolve_json_path(&doc, ".spec.replicas").and_then(|v| v.as_i64()),
+            Some(7)
+        );
+        // Leading-dot stripping is just sugar — both should work identically.
+        assert_eq!(
+            resolve_json_path(&doc, "spec.replicas").and_then(|v| v.as_i64()),
+            Some(7)
+        );
+        // Multi-level descent.
+        assert_eq!(
+            resolve_json_path(&doc, ".spec.nested.x").and_then(|v| v.as_i64()),
+            Some(1)
+        );
+        // Missing path returns None (caller falls back to pod count).
+        assert!(resolve_json_path(&doc, ".spec.missing").is_none());
+        // Empty segment is malformed input; must not panic / silently match.
+        assert!(resolve_json_path(&doc, ".spec..replicas").is_none());
+    }
+
+    #[test]
+    fn test_split_group_version() {
+        assert_eq!(
+            split_group_version("apps/v1"),
+            ("apps".to_string(), "v1".to_string())
+        );
+        // Core resources live under just "v1" (no group prefix).
+        assert_eq!(split_group_version("v1"), (String::new(), "v1".to_string()));
+        assert_eq!(
+            split_group_version("example.com/v1beta1"),
+            ("example.com".to_string(), "v1beta1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_controller_ref_from_json_returns_only_controller() {
+        // Pure ownerRef without `controller: true` MUST be ignored — upstream's
+        // GetControllerOf is strict about this. Only the explicit controller
+        // ref is the one we walk up from.
+        let obj = serde_json::json!({
+            "metadata": {
+                "ownerReferences": [
+                    {"apiVersion": "v1", "kind": "Pod", "name": "side", "uid": "1"},
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "name": "main",
+                        "uid": "2",
+                        "controller": true
+                    }
+                ]
+            }
+        });
+        let r = controller_ref_from_json(&obj).expect("controller present");
+        assert_eq!(r.kind, "Deployment");
+        assert_eq!(r.uid, "2");
+
+        // No controller flag set anywhere → None.
+        let obj2 = serde_json::json!({
+            "metadata": {
+                "ownerReferences": [
+                    {"apiVersion": "v1", "kind": "Pod", "name": "side", "uid": "1"}
+                ]
+            }
+        });
+        assert!(controller_ref_from_json(&obj2).is_none());
+
+        // No metadata at all → None.
+        let obj3 = serde_json::json!({});
+        assert!(controller_ref_from_json(&obj3).is_none());
+    }
 
     #[tokio::test]
     async fn test_calculate_desired_healthy_min_available_int() {
