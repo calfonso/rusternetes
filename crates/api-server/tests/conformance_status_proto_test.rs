@@ -298,6 +298,255 @@ async fn status_404_stays_json_when_accept_is_json() {
     assert_eq!(v["code"], 404);
 }
 
+/// Regression guard for the kind-defaulting bug. `metav1.Status` has
+/// `#[serde(default = "default_status_kind")]` on its `kind` field, so a
+/// naive `serde_json::from_slice::<Status>(...)` succeeds on ANY JSON body
+/// — the `kind` is silently defaulted to the literal string `"Status"`.
+/// Without an explicit `"kind":"Status"` check on the source bytes, a
+/// proto-Accept request to a handler that returns plain JSON (no top-level
+/// `kind`, e.g. `/version` returning a `VersionInfo`) would have its body
+/// silently replaced with an empty Status proto envelope. The middleware
+/// must parse the JSON to `Value` and gate the re-encode on the explicit
+/// `kind` field.
+#[tokio::test]
+async fn non_status_json_passes_through_unchanged_when_accept_is_protobuf() {
+    let router = spawn_router();
+
+    // `/version` is the canonical kind-less JSON endpoint: `VersionInfo`
+    // serialises to a flat object without `apiVersion` or `kind`.
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/version")
+        .header("accept", "application/vnd.kubernetes.protobuf")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::OK, "/version must return 200");
+    assert!(
+        !bytes.starts_with(K8S_MAGIC),
+        "kind-less JSON body must NOT be wrapped in the k8s\\0 envelope; got first bytes={:?}",
+        &bytes[..bytes.len().min(16)],
+    );
+    assert!(
+        content_type.starts_with("application/json"),
+        "kind-less JSON must keep `application/json` Content-Type; got {content_type}",
+    );
+
+    // Body must remain the canonical VersionInfo JSON with the literal
+    // field set the handler produced — gitVersion etc. — and crucially must
+    // NOT have been replaced with an empty Status proto envelope.
+    let v: Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+    assert!(
+        v.get("gitVersion").and_then(Value::as_str).is_some(),
+        "/version response must contain `gitVersion`; got {v}",
+    );
+}
+
+/// A 422 Invalid response from the field-validation layer must round-trip
+/// the populated `Status.details.causes[]` through the native proto encoder.
+/// Each cause carries `(type, message, field)`; typed clients walk those to
+/// surface per-field error toasts. Lose any of them on the wire and the
+/// `pod-validation` and `apply` conformance suites flag an opaque
+/// "invalid request" instead of the field-specific error.
+///
+/// Trigger path: POST a Pod with empty `spec.containers` — the create
+/// handler in `crates/api-server/src/handlers/pod.rs` builds a
+/// `field::ErrorList` via `validation.go::ValidatePodSpec` parity and returns
+/// `Error::Invalid(errs)`, which `crates/common/src/error.rs::IntoResponse`
+/// renders as a 422 Status whose `details.causes[]` mirrors every entry.
+#[tokio::test]
+async fn status_422_invalid_pod_round_trips_causes_as_native_protobuf() {
+    let router = spawn_router();
+
+    // Pod body with an empty `spec.containers` list — the create validator
+    // accumulates `spec.containers: Required value` as the first cause.
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "no-containers", "namespace": "default" },
+        "spec": { "containers": [] },
+    });
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/namespaces/default/pods")
+        .header("accept", "application/vnd.kubernetes.protobuf")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "empty containers must produce 422; got {status} body={:?}",
+        String::from_utf8_lossy(&bytes),
+    );
+    assert!(
+        content_type.starts_with("application/vnd.kubernetes.protobuf"),
+        "Content-Type must be protobuf; got {content_type}",
+    );
+    assert!(
+        bytes.starts_with(K8S_MAGIC),
+        "body must start with k8s\\0 magic; got first bytes={:?}",
+        &bytes[..bytes.len().min(16)],
+    );
+
+    let raw = extract_unknown_raw(&bytes);
+    let registry = ProtoRegistry::new();
+    let decoded = registry
+        .decode_message("Status", &raw)
+        .expect("Status schema must be registered and the raw bytes must decode");
+
+    assert_eq!(
+        decoded.get("status").and_then(Value::as_str),
+        Some("Failure"),
+        "Status.status must be 'Failure'; got {decoded}",
+    );
+    assert_eq!(
+        decoded.get("reason").and_then(Value::as_str),
+        Some("Invalid"),
+        "Status.reason must be 'Invalid'; got {decoded}",
+    );
+    assert_eq!(
+        decoded.get("code").and_then(Value::as_i64),
+        Some(422),
+        "Status.code must be 422; got {decoded}",
+    );
+
+    let details = decoded
+        .get("details")
+        .unwrap_or_else(|| panic!("Status.details must be populated for Invalid; got {decoded}"));
+    let causes = details
+        .get("causes")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("Status.details.causes must be a populated array; got {details}")
+        });
+    assert!(
+        !causes.is_empty(),
+        "Status.details.causes must carry at least one entry; got {details}",
+    );
+
+    // At least one cause must surface the (reason, message, field) triple
+    // on the wire — clients walk this triple to surface per-field errors.
+    let has_field_cause = causes.iter().any(|c| {
+        let reason = c.get("reason").and_then(Value::as_str).unwrap_or("");
+        let message = c.get("message").and_then(Value::as_str).unwrap_or("");
+        let field = c.get("field").and_then(Value::as_str).unwrap_or("");
+        !reason.is_empty() && !message.is_empty() && !field.is_empty()
+    });
+    assert!(
+        has_field_cause,
+        "at least one cause must carry reason/message/field intact; got {causes:?}",
+    );
+
+    // And the `spec.containers` field path must be reachable through the
+    // proto round-trip — that's the load-bearing signal for typed clients.
+    let mentions_containers = causes.iter().any(|c| {
+        c.get("field")
+            .and_then(Value::as_str)
+            .map(|f| f.contains("spec.containers"))
+            .unwrap_or(false)
+    });
+    assert!(
+        mentions_containers,
+        "at least one cause.field must reference spec.containers; got {causes:?}",
+    );
+}
+
+/// 200 Status responses (e.g. `deleteCollection` success) must also be
+/// re-encoded as native protobuf when the client negotiates it. Upstream
+/// `responsewriters/writers.go::SerializeObject` encodes any `runtime.Object`
+/// — Status included — as proto when negotiated, regardless of HTTP status.
+/// Trigger: `DELETE /apis/apps/v1/namespaces/default/statefulsets` which
+/// returns the K8s-canonical `{kind:Status, status:Success, code:200}`.
+#[tokio::test]
+async fn status_200_success_returns_native_protobuf_when_accept_is_protobuf() {
+    let router = spawn_router();
+
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri("/apis/apps/v1/namespaces/default/statefulsets")
+        .header("accept", "application/vnd.kubernetes.protobuf")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "deleteCollection (empty) must return 200; got {status} body={:?}",
+        String::from_utf8_lossy(&bytes),
+    );
+    assert!(
+        content_type.starts_with("application/vnd.kubernetes.protobuf"),
+        "Content-Type must be protobuf; got {content_type}",
+    );
+    assert!(
+        bytes.starts_with(K8S_MAGIC),
+        "body must start with k8s\\0 magic; got first bytes={:?}",
+        &bytes[..bytes.len().min(16)],
+    );
+
+    let (api_version, kind) = extract_unknown_type_meta(&bytes);
+    assert_eq!(api_version, "v1", "Unknown.typeMeta.apiVersion must be v1");
+    assert_eq!(kind, "Status", "Unknown.typeMeta.kind must be Status");
+
+    let raw = extract_unknown_raw(&bytes);
+    let registry = ProtoRegistry::new();
+    let decoded = registry
+        .decode_message("Status", &raw)
+        .expect("Status proto must decode");
+    assert_eq!(
+        decoded.get("status").and_then(Value::as_str),
+        Some("Success"),
+        "Status.status must be 'Success' for a successful deleteCollection; got {decoded}",
+    );
+    assert_eq!(
+        decoded.get("code").and_then(Value::as_i64),
+        Some(200),
+        "Status.code must be 200; got {decoded}",
+    );
+}
+
 /// The client-go default Accept is the dual `protobuf, json` header. Per
 /// upstream contract the server picks the highest-precedence supported type;
 /// for Status responses Rusternetes now supports protobuf, so this case must

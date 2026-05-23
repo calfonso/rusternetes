@@ -450,7 +450,7 @@ pub async fn normalize_content_type_middleware(
     // error). See `staging/src/k8s.io/client-go/rest/request.go::transformResponse`.
     let wants_status_protobuf = accept_header.contains("application/vnd.kubernetes.protobuf");
 
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
 
     // Wrap response in CBOR if the client negotiated it. We only wrap
     // successful 2xx responses with `application/json` bodies — error
@@ -506,15 +506,59 @@ pub async fn normalize_content_type_middleware(
         }
     }
 
-    // Re-encode error Status envelopes as native protobuf when the client
-    // asked for `application/vnd.kubernetes.protobuf`. Only triggers on 4xx /
-    // 5xx JSON bodies that look like a `Status` (`kind: "Status"`). Success
-    // responses stay JSON because the rest of the codebase cannot produce
-    // native protobuf for resource bodies (see the `wants_protobuf = false`
-    // comment below).
-    if wants_status_protobuf
-        && (response.status().is_client_error() || response.status().is_server_error())
-    {
+    // Re-encode `kind: "Status"` JSON bodies as native protobuf when the
+    // client asked for `application/vnd.kubernetes.protobuf`. Triggers on
+    // ANY HTTP status (200/201/4xx/5xx) — upstream's
+    // `staging/src/k8s.io/apiserver/pkg/endpoints/handlers/responsewriters/writers.go::SerializeObject`
+    // encodes any `runtime.Object` (including the Success Status returned by
+    // DELETE) as proto when negotiated, regardless of HTTP status.
+    //
+    // Three guards keep this safe and cheap on the default code path:
+    //
+    //   1. `!is_watch_request` — streaming responses (chunked watch
+    //      envelopes, SPDY-upgraded exec streams) MUST NOT be buffered; the
+    //      body is open-ended and slurping it would deadlock. Matches the
+    //      `wants_protobuf` resource branch below.
+    //   2. A small `Content-Length` cap (STATUS_BODY_MAX_BYTES). client-go's
+    //      default Accept is `application/vnd.kubernetes.protobuf,
+    //      application/json`, so this branch runs for nearly every request.
+    //      Buffering a multi-MB PodList just to discover it isn't a Status
+    //      would pin heap for no reason; the cap skips large list bodies and
+    //      streaming responses (no Content-Length) entirely. metav1.Status
+    //      payloads are tiny (a handful of strings + ints + at most a
+    //      `details.causes` array of field errors); 256 KiB covers the
+    //      largest plausible Invalid response.
+    //   3. Explicit `"kind": "Status"` check on the parsed JSON BEFORE the
+    //      typed deserialization. The `Status` struct has
+    //      `#[serde(default = "default_status_kind")]` on its `kind` field,
+    //      so a body that omits `kind` entirely (e.g. `/version` returning a
+    //      bare `VersionInfo`) would otherwise deserialize successfully with
+    //      a defaulted `kind = "Status"` — and we'd silently replace the
+    //      response with an empty Status proto envelope. Parsing to
+    //      `serde_json::Value` first and requiring the explicit field
+    //      mirrors `extract_api_version_kind` and matches the wire-format
+    //      check upstream's typed `Status` decoder applies.
+    const STATUS_BODY_MAX_BYTES: u64 = 256 * 1024;
+    // Try `Content-Length` first (set when handlers attach the header
+    // explicitly), then fall back to the body's `size_hint().upper()` —
+    // `axum::Json` constructs a `Full<Bytes>` whose upper bound IS the JSON
+    // size, even though Hyper only writes the `Content-Length` header at the
+    // wire layer, AFTER this middleware runs. Streaming bodies (chunked
+    // watch envelopes) return `None` from `upper()` and are skipped.
+    let response_known_size: Option<u64> = {
+        use http_body::Body as _;
+        let header_len = response
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        header_len.or_else(|| response.body().size_hint().upper())
+    };
+    let small_enough_for_status_peek = matches!(
+        response_known_size,
+        Some(len) if len <= STATUS_BODY_MAX_BYTES,
+    );
+    if wants_status_protobuf && !is_watch_request && small_enough_for_status_peek {
         let response_ct = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -523,32 +567,44 @@ pub async fn normalize_content_type_middleware(
             .to_string();
         if response_ct.starts_with("application/json") {
             let (parts, body) = response.into_parts();
-            match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+            match axum::body::to_bytes(body, STATUS_BODY_MAX_BYTES as usize).await {
                 Ok(json_bytes) => {
-                    // Try to deserialize as Status. If parsing fails or the
-                    // payload is not a Status (e.g. some handler returned a
-                    // bare error string), pass the original bytes through
-                    // unchanged so the client still sees the failure.
-                    match serde_json::from_slice::<rusternetes_common::types::Status>(&json_bytes) {
-                        Ok(status_obj) if status_obj.kind == "Status" => {
-                            let pb = crate::protobuf::encode_status_protobuf(&status_obj);
-                            let mut resp = Response::from_parts(parts, Body::from(pb));
-                            resp.headers_mut().insert(
-                                axum::http::header::CONTENT_TYPE,
-                                axum::http::HeaderValue::from_static(
-                                    "application/vnd.kubernetes.protobuf",
-                                ),
-                            );
-                            resp.headers_mut()
-                                .remove(axum::http::header::CONTENT_LENGTH);
-                            return Ok(resp);
-                        }
-                        _ => {
-                            // Not a Status — return the original JSON body.
-                            let resp = Response::from_parts(parts, Body::from(json_bytes));
-                            return Ok(resp);
-                        }
+                    // Step 1: parse to free-form `Value` and require the
+                    // EXPLICIT `kind` field is the string `"Status"`. See
+                    // the block comment above for why the typed-decode
+                    // shortcut would misfire on bodies without a `kind`.
+                    let value: Option<serde_json::Value> = serde_json::from_slice(&json_bytes).ok();
+                    let kind_is_status = value
+                        .as_ref()
+                        .and_then(|v| v.get("kind"))
+                        .and_then(|k| k.as_str())
+                        == Some("Status");
+                    let typed_status: Option<rusternetes_common::types::Status> = if kind_is_status
+                    {
+                        value.and_then(|v| serde_json::from_value(v).ok())
+                    } else {
+                        None
+                    };
+                    if let Some(status_obj) = typed_status {
+                        let pb = crate::protobuf::encode_status_protobuf(&status_obj);
+                        let mut resp = Response::from_parts(parts, Body::from(pb));
+                        resp.headers_mut().insert(
+                            axum::http::header::CONTENT_TYPE,
+                            axum::http::HeaderValue::from_static(
+                                "application/vnd.kubernetes.protobuf",
+                            ),
+                        );
+                        resp.headers_mut()
+                            .remove(axum::http::header::CONTENT_LENGTH);
+                        return Ok(resp);
                     }
+                    // Either not a Status, or it has `kind:Status` but fails
+                    // typed deserialization. Rebuild the response with the
+                    // buffered bytes and continue the middleware chain — the
+                    // PartialObjectMetadata / Table branches below still
+                    // need to see the original JSON body for proto-
+                    // negotiated 2xx resource responses.
+                    response = Response::from_parts(parts, Body::from(json_bytes));
                 }
                 Err(_) => {
                     return Ok(Response::builder()
