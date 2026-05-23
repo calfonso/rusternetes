@@ -42,6 +42,18 @@ const DNS1123_SUBDOMAIN_ERR_MSG: &str =
     "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character";
 const DNS1123_SUBDOMAIN_MAX_LENGTH: usize = 253;
 
+// Underscore-permissive subdomain — mirrors upstream
+// `dns1123SubdomainFmtWithUnderscore` in
+// `staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go`. Gated
+// by the `RelaxedDNSSearchValidation` feature in pod DNS search validation.
+// Each label may carry one leading underscore (`_sip`, `_tcp`, etc.), and
+// label-interior dashes/underscores are allowed; the label must still start
+// and end with an alphanumeric character (after the optional leading `_`).
+const DNS1123_SUBDOMAIN_FMT_WITH_UNDERSCORE: &str =
+    "_?[a-z0-9]([-_a-z0-9]*[a-z0-9])?(\\._?[a-z0-9]([-_a-z0-9]*[a-z0-9])?)*";
+const DNS1123_SUBDOMAIN_ERR_MSG_FG: &str =
+    "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '_', '-' or '.', and must start and end with an alphanumeric character";
+
 static LABEL_KEY_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(&format!("^{LABEL_KEY_FMT}$")).expect("label key regex"));
 // Label value upstream is `(labelKeyFmt)?` — i.e. either empty or a label-key.
@@ -51,6 +63,10 @@ static DNS1123_LABEL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(&format!("^{DNS1123_LABEL_FMT}$")).expect("dns1123 label regex"));
 static DNS1123_SUBDOMAIN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!("^{DNS1123_SUBDOMAIN_FMT}$")).expect("dns1123 subdomain regex")
+});
+static DNS1123_SUBDOMAIN_WITH_UNDERSCORE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(&format!("^{DNS1123_SUBDOMAIN_FMT_WITH_UNDERSCORE}$"))
+        .expect("dns1123 subdomain with underscore regex")
 });
 static CONDITION_REASON_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$").expect("condition reason regex")
@@ -102,6 +118,26 @@ pub fn is_dns1123_subdomain(value: &str) -> Vec<String> {
         errs.push(regex_error(
             DNS1123_SUBDOMAIN_ERR_MSG,
             DNS1123_SUBDOMAIN_FMT,
+            &["example.com"],
+        ));
+    }
+    errs
+}
+
+/// Upstream `validation.IsDNS1123SubdomainWithUnderScore` — the relaxed
+/// variant that allows a single leading underscore per label. Used by pod
+/// `dnsConfig.searches` when the `RelaxedDNSSearchValidation` feature gate
+/// is enabled. Source:
+/// `staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go`.
+pub fn is_dns1123_subdomain_with_underscore(value: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    if value.len() > DNS1123_SUBDOMAIN_MAX_LENGTH {
+        errs.push(max_len_error(DNS1123_SUBDOMAIN_MAX_LENGTH));
+    }
+    if !DNS1123_SUBDOMAIN_WITH_UNDERSCORE_RE.is_match(value) {
+        errs.push(regex_error(
+            DNS1123_SUBDOMAIN_ERR_MSG_FG,
+            DNS1123_SUBDOMAIN_FMT_WITH_UNDERSCORE,
             &["example.com"],
         ));
     }

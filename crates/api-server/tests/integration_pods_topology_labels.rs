@@ -51,7 +51,9 @@
 //!     enforces full-spec-immutability and rejects the additions.
 //!
 //!   * `TestRelaxedDNSSearchValidation` — gated by the
-//!     `RelaxedDNSSearchValidation` feature flag; not implemented.
+//!     `RelaxedDNSSearchValidation` feature flag; the gate plumbing lives in
+//!     `rusternetes_common::feature_gates` and the validator lives in
+//!     `rusternetes_common::validation::pod::validate_pod_dns_config`.
 //!
 //!   * `TestNodeDeclaredFeatureAdmission` — gated by `NodeDeclaredFeatures` +
 //!     `node.status.declaredFeatures`; the resource field is not present on
@@ -794,13 +796,106 @@ async fn test_mutable_pod_scheduling_directives() {
 /// ON, search entries like `_sip._tcp.abc_d.example.com` and the literal `.`
 /// must be accepted; when OFF, they must be rejected.
 ///
-/// We have no feature-gate plumbing yet, so this test is `#[ignore]`d.
+/// Mirrors upstream `TestRelaxedDNSSearchValidation` (`pods_test.go:1403`).
+/// The six sub-cases — underscore / dot / plain example.com, each with the
+/// gate enabled and disabled — exercise both branches of
+/// `validatePodDNSConfig` in `pkg/apis/core/validation/validation.go`.
+///
+/// `#[serial]` because the feature gate is process-wide; running parallel
+/// tests that read or flip the same gate would race.
 #[tokio::test]
-#[ignore = "RelaxedDNSSearchValidation feature gate plumbing not implemented; see docstring"]
+#[serial_test::serial]
 async fn test_relaxed_dns_search_validation() {
-    let (_, _router) = spawn_router();
-    // Once gates exist, mirror the six upstream sub-cases:
-    //   underscore + dot + plain * (gate enabled, gate disabled).
+    use rusternetes_common::feature_gates::{reset_to_defaults, with_feature, Feature};
+
+    let (_, router) = spawn_router();
+    let ns = "pod-update-dns-search";
+    create_namespace(&router, ns).await;
+
+    struct Case {
+        name: &'static str,
+        search: &'static str,
+        gate_enabled: bool,
+        valid: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "underscore-gate-on",
+            search: "_sip._tcp.abc_d.example.com",
+            gate_enabled: true,
+            valid: true,
+        },
+        Case {
+            name: "dot-gate-on",
+            search: ".",
+            gate_enabled: true,
+            valid: true,
+        },
+        Case {
+            name: "plain-gate-on",
+            search: "example.com",
+            gate_enabled: true,
+            valid: true,
+        },
+        Case {
+            name: "underscore-gate-off",
+            search: "_sip._tcp.abc_d.example.com",
+            gate_enabled: false,
+            valid: false,
+        },
+        Case {
+            name: "dot-gate-off",
+            search: ".",
+            gate_enabled: false,
+            valid: false,
+        },
+        Case {
+            name: "plain-gate-off",
+            search: "example.com",
+            gate_enabled: false,
+            valid: true,
+        },
+    ];
+
+    for case in cases {
+        let _guard = with_feature(Feature::RelaxedDNSSearchValidation, case.gate_enabled);
+        // Unique pod name per case so successful cases don't collide with
+        // earlier ones via 409 AlreadyExists.
+        let pod_name = format!("dns-{}", case.name);
+        let mut pod = prototype_pod(&pod_name);
+        pod["spec"]["dnsConfig"] = json!({ "searches": [case.search] });
+        let (status, body) =
+            post_json(&router, &format!("/api/v1/namespaces/{}/pods", ns), &pod).await;
+        if case.valid {
+            assert!(
+                status == 200 || status == 201,
+                "case {}: expected accept, got status={} body={}",
+                case.name,
+                status,
+                body
+            );
+        } else {
+            assert_eq!(
+                status, 422,
+                "case {}: expected 422 Invalid, got status={} body={}",
+                case.name, status, body
+            );
+            // Parity check — upstream returns the failure under the
+            // `spec.dnsConfig.searches[0]` field path.
+            let body_str = body.to_string();
+            assert!(
+                body_str.contains("spec.dnsConfig.searches[0]"),
+                "case {}: error body must name the offending field, got {}",
+                case.name,
+                body_str
+            );
+        }
+    }
+
+    // Restore defaults so any later tests in this process start from a
+    // known-good baseline even if a guard above was leaked by a panic-unwind.
+    reset_to_defaults();
 }
 
 // ---------------------------------------------------------------------------
