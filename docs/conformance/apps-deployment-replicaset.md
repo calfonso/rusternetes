@@ -41,9 +41,15 @@ failures in this slice are:
 3. `ReplicaSet / ReplicationController should serve a basic image on each
    replica with a public image` — `replica_set.go:95`, `rc.go:65` — the
    end-to-end image-serving contract fails because the conformance check
-   curls each pod IP. Tracked via
-   `replicaset_should_serve_basic_image_on_each_replica` and
-   `rc_should_serve_basic_image_on_each_replica`.
+   curls each pod IP. The failure surface is pod IP / Service plane, not
+   the workload controllers. The controller-level mirrors
+   (`replicaset_should_serve_basic_image_on_each_replica`,
+   `rc_should_serve_basic_image_on_each_replica`) verify the slice of the
+   contract the controllers own (N pods produced, each with template labels
+   and container image). The ReplicaSet mirror is now active and passing
+   locally as of 2026-05-23; the RC mirror is still tagged pending its own
+   un-ignore. The end-to-end Sonobuoy verdict remains gated on cluster-side
+   networking fixes.
 
 `Deployment paused` is now honored — `reconcile_deployment` short-circuits to
 a status-only path when `spec.paused` is true, so a template hash change does
@@ -69,7 +75,7 @@ exercises that guarantee.
 | Strategy: rollback to previous template | deployment.go:207 (lifecycle rollback) | PASS | `deployment_rollback_reuses_existing_old_replicaset` | mirrored, passing |
 | Strategy: scale to zero drains pods | deployment.go:207 (lifecycle scale-to-zero) | PASS | `deployment_scale_to_zero_drains_replicaset_to_zero` | mirrored, passing |
 | Strategy: cross-namespace deployments are isolated | deployment.go lifecycle (per-namespace) | PASS | `deployment_namespaces_are_isolated` | mirrored, passing |
-| `ReplicaSet should serve a basic image on each replica with a public image` | replica_set.go:95 | FAIL | `replicaset_should_serve_basic_image_on_each_replica` | mirrored, ignored (tracks failure) |
+| `ReplicaSet should serve a basic image on each replica with a public image` | replica_set.go:95 | FAIL | `replicaset_should_serve_basic_image_on_each_replica` | mirrored, passing locally (2026-05-23); end-to-end gated on cluster networking |
 | `ReplicaSet should adopt matching pods on creation and release no longer matching pods` | replica_set.go:115 | PASS | `replicaset_should_adopt_matching_pods_and_release_mismatched` | mirrored, passing |
 | `Replicaset should have a working scale subresource` | replica_set.go:128 | PASS | `replicaset_scale_subresource_resizes_pod_population` | mirrored, passing |
 | `ReplicaSet Replace and Patch tests` | replica_set.go:142 | PASS | `replicaset_replace_and_patch_propagates_to_pods` | mirrored, passing |
