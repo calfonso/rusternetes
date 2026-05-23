@@ -1638,6 +1638,22 @@ fn merge_container_resources_from(
 ///
 /// Subresource handler for in-place pod resize (KEP-1287). Wraps
 /// [`apply_pod_resize_with_retry`] with auth + axum extraction.
+///
+/// Before applying the resize, this enforces delta-aware ResourceQuota
+/// admission: the pod was already counted against the namespace's quota
+/// `status.used` (its current `containers[*].resources` contribution is
+/// the *baseline*), so we charge only the **difference** between the
+/// requested resources and the old resources. An over-budget delta is
+/// rejected with `403 Forbidden ("exceeded quota")`; an in-budget delta
+/// passes through to `apply_pod_resize_with_retry`.
+///
+/// K8s ref:
+///   - plugin/pkg/admission/resourcequota/controller.go (`checkRequest`
+///     subtracts the old object's contribution before charging the new
+///     one — the same logic powering the main PUT path's
+///     `check_resource_quota_with_old`).
+///   - pkg/registry/core/pod/strategy.go `ResizeStrategy` runs quota
+///     admission on the `/resize` subresource specifically.
 pub async fn resize_pod(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -1658,6 +1674,39 @@ pub async fn resize_pod(
 
     let desired: rusternetes_common::resources::Pod = serde_json::from_slice(&body)
         .map_err(|e| Error::InvalidResource(format!("failed to decode resize body: {}", e)))?;
+
+    // Delta-aware ResourceQuota admission. Read the currently-stored Pod
+    // (the baseline already accounted in quota.status.used), build the
+    // *would-be* post-resize Pod by overlaying the desired container
+    // resources, and run quota admission with `old_pod = Some(&current)`
+    // so the evaluator charges only `new − old` against `.spec.hard`.
+    //
+    // Upstream Go does this in `plugin/pkg/admission/resourcequota/
+    // controller.go::checkRequest`, which is invoked for both main-PUT
+    // and the `/resize` subresource via `ResizeStrategy`.
+    let key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
+    let current: rusternetes_common::resources::Pod = state.storage.get(&key).await?;
+    let mut projected = current.clone();
+    merge_container_resources_from(&mut projected, &desired);
+
+    match crate::admission::check_resource_quota_with_old(
+        &state.storage,
+        &namespace,
+        &projected,
+        Some(&current),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Error::Forbidden("exceeded quota".to_string()));
+        }
+        Err(e) => {
+            // Match the main PUT path: log but do not block on internal
+            // evaluator errors. This is the same posture as `update_pod`.
+            tracing::warn!("Error checking ResourceQuota on pod resize: {}", e);
+        }
+    }
 
     let updated =
         apply_pod_resize_with_retry(state.storage.as_ref(), &namespace, &name, &desired).await?;
