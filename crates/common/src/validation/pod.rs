@@ -573,9 +573,7 @@ mod tests {
     #[test]
     fn dns_search_too_many_paths_rejected() {
         let p = Path::new("spec").child("dnsConfig");
-        let too_many: Vec<&str> = std::iter::repeat("a.com")
-            .take(MAX_DNS_SEARCH_PATHS + 1)
-            .collect();
+        let too_many: Vec<&str> = std::iter::repeat_n("a.com", MAX_DNS_SEARCH_PATHS + 1).collect();
         let cfg = dns_cfg(&too_many);
         let errs = validate_pod_dns_config(Some(&cfg), None, true, &p);
         assert!(errs.iter().any(|e| e

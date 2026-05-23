@@ -73,7 +73,12 @@ pub fn set(feature: Feature, value: bool) -> bool {
 /// Reset every feature gate to its rusternetes default. Useful between tests
 /// that flip gates without going through [`FeatureGuard`].
 pub fn reset_to_defaults() {
-    // Iterate in `Feature::idx` order.
+    // The array literal mirrors [`STATES`] one-to-one and is the obvious
+    // place to add a slot when a new [`Feature`] variant lands. The loop
+    // form deliberately stays even though clippy notices it currently has
+    // exactly one element — collapsing it would force every new-gate PR to
+    // change two unrelated lines just to keep clippy quiet.
+    #[allow(clippy::single_element_loop)]
     for f in [Feature::RelaxedDNSSearchValidation] {
         STATES[f.idx()].store(f.default_enabled(), Ordering::Relaxed);
     }
