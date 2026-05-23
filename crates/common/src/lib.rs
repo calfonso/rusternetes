@@ -7,6 +7,7 @@ pub mod cloud_provider;
 pub mod deletion;
 pub mod encryption;
 pub mod error;
+pub mod feature_gates;
 pub mod field_selector;
 pub mod label_selector;
 pub mod leader_election;

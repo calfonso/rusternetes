@@ -219,6 +219,22 @@ pub async fn create(
                     ));
                 }
             }
+            // K8s ref: pkg/apis/core/validation/validation.go validatePodDNSConfig
+            // — bounds-check nameservers/searches/options and validate each
+            // search path. The underscore + lone-`.` relaxations are gated by
+            // the `RelaxedDNSSearchValidation` feature gate (GA-default-true
+            // in v1.34+); see `rusternetes_common::feature_gates`.
+            {
+                use rusternetes_common::feature_gates::{enabled, Feature};
+                let allow_relaxed = enabled(Feature::RelaxedDNSSearchValidation);
+                let dns_errs = rusternetes_common::validation::pod::validate_pod_dns_config(
+                    spec.dns_config.as_ref(),
+                    spec.dns_policy.as_deref(),
+                    allow_relaxed,
+                    &spec_path.child("dnsConfig"),
+                );
+                errs.extend(dns_errs);
+            }
         }
 
         if !errs.is_empty() {

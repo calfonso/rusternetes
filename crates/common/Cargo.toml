@@ -41,3 +41,4 @@ axum-support = ["axum"]
 [dev-dependencies]
 tempfile = "3.27.0"
 proptest = "1"
+serial_test = { workspace = true }

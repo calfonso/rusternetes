@@ -1,10 +1,16 @@
-//! Pod update validation — port of upstream Kubernetes
-//! `pkg/apis/core/validation/validation.go::ValidatePodUpdate` (release-1.35).
+//! Pod validation — port of upstream Kubernetes
+//! `pkg/apis/core/validation/validation.go` (release-1.35).
 //!
-//! Composes the four upstream pre-checks (container count, tolerations
-//! additions-only, schedulingGates deletions-only, terminationGracePeriodSeconds
-//! immutability with the negative→1 relaxation) and a munge+DeepEqual fence
-//! that catches everything else.
+//! Two layers:
+//! * **Create-side** ([`validate_pod_dns_config`]) — the per-field validators
+//!   the upstream `ValidatePodSpec` pipeline runs on a brand-new Pod. The
+//!   first such validator ported here is `validatePodDNSConfig`, gated by
+//!   the `RelaxedDNSSearchValidation` feature flag.
+//! * **Update-side** ([`validate_pod_spec_update`]) — composes the four
+//!   upstream pre-checks (container count, tolerations additions-only,
+//!   schedulingGates deletions-only, terminationGracePeriodSeconds
+//!   immutability with the negative→1 relaxation) and a munge+DeepEqual
+//!   fence that catches everything else.
 //!
 //! NOT covered (intentionally deferred):
 //! - Gated-pod `nodeSelector` / `nodeAffinity` mutation rules
@@ -15,8 +21,144 @@
 //!   enforces these directly (see `crates/api-server/src/handlers/pod.rs`)
 //!   because the error wording is checked by tests pinned at that layer.
 
-use crate::resources::pod::{PodSchedulingGate, PodSpec, Toleration};
+use crate::resources::pod::{PodDNSConfig, PodSchedulingGate, PodSpec, Toleration};
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::metav1::{is_dns1123_subdomain, is_dns1123_subdomain_with_underscore};
+
+// Upstream limits — `pkg/apis/core/validation/validation.go` const block at
+// line ~4126 in release-1.35.
+pub const MAX_DNS_NAMESERVERS: usize = 3;
+pub const MAX_DNS_SEARCH_PATHS: usize = 32;
+pub const MAX_DNS_SEARCH_LIST_CHARS: usize = 2048;
+
+/// Mirrors upstream `validatePodDNSConfig`
+/// (`pkg/apis/core/validation/validation.go:4156`, release-1.35).
+///
+/// `allow_relaxed_dns_search_validation` is wired from the
+/// `RelaxedDNSSearchValidation` feature gate. When `true`:
+/// * the lone `.` domain is accepted verbatim, and
+/// * non-`.` entries are validated with the underscore-permissive subdomain
+///   regex (`IsDNS1123SubdomainWithUnderScore`).
+///
+/// When `false`, every entry is trimmed of a trailing `.` (kept for
+/// rooted-name compatibility) and then validated with the strict
+/// `IsDNS1123Subdomain` regex. This is the pre-1.32 behaviour and is what
+/// emulated-version test clusters still exercise.
+///
+/// The `dns_policy` argument lets us emit the
+/// `must provide \`dnsConfig\` when \`dnsPolicy\` is None` parity error.
+/// Callers that don't track policy (e.g. PodTemplateSpec validators) may
+/// pass `None`.
+pub fn validate_pod_dns_config(
+    dns_config: Option<&PodDNSConfig>,
+    dns_policy: Option<&str>,
+    allow_relaxed_dns_search_validation: bool,
+    path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // DNSNone path — must provide a dnsConfig with at least one nameserver.
+    if matches!(dns_policy, Some("None")) {
+        match dns_config {
+            None => {
+                errs.push(Error::required(
+                    path,
+                    "must provide `dnsConfig` when `dnsPolicy` is None",
+                ));
+                return errs;
+            }
+            Some(cfg) => {
+                let empty: Vec<String> = Vec::new();
+                let ns = cfg.nameservers.as_ref().unwrap_or(&empty);
+                if ns.is_empty() {
+                    errs.push(Error::required(
+                        &path.child("nameservers"),
+                        "must provide at least one DNS nameserver when `dnsPolicy` is None",
+                    ));
+                    return errs;
+                }
+            }
+        }
+    }
+
+    let Some(cfg) = dns_config else {
+        return errs;
+    };
+
+    let empty_ns: Vec<String> = Vec::new();
+    let nameservers = cfg.nameservers.as_ref().unwrap_or(&empty_ns);
+    if nameservers.len() > MAX_DNS_NAMESERVERS {
+        errs.push(Error::invalid(
+            &path.child("nameservers"),
+            nameservers.as_slice(),
+            format!("must not have more than {MAX_DNS_NAMESERVERS} nameservers"),
+        ));
+    }
+    // NOTE: upstream additionally runs `IsValidIPForLegacyField` per
+    // nameserver. That helper isn't ported to rusternetes yet — DNS IP
+    // validation lands with the upstream "legacy IP" port (see
+    // pkg/apis/core/validation/validation.go::IsValidIPForLegacyField). The
+    // current handler accepts any string here, which preserves prior
+    // behaviour and stays orthogonal to this change.
+
+    let empty_searches: Vec<String> = Vec::new();
+    let searches = cfg.searches.as_ref().unwrap_or(&empty_searches);
+    if searches.len() > MAX_DNS_SEARCH_PATHS {
+        errs.push(Error::invalid(
+            &path.child("searches"),
+            searches.as_slice(),
+            format!("must not have more than {MAX_DNS_SEARCH_PATHS} search paths"),
+        ));
+    }
+    // Upstream includes the space between search paths — `strings.Join(..., " ")`.
+    let joined_len = if searches.is_empty() {
+        0
+    } else {
+        searches.iter().map(|s| s.len()).sum::<usize>() + (searches.len() - 1)
+    };
+    if joined_len > MAX_DNS_SEARCH_LIST_CHARS {
+        errs.push(Error::invalid(
+            &path.child("searches"),
+            searches.as_slice(),
+            format!(
+                "must not have more than {MAX_DNS_SEARCH_LIST_CHARS} characters (including spaces) in the search list"
+            ),
+        ));
+    }
+
+    for (i, search) in searches.iter().enumerate() {
+        let search_path = path.child("searches").index(i);
+        if allow_relaxed_dns_search_validation {
+            // The lone `.` is the canonical "no search" entry and is
+            // accepted verbatim under the relaxed gate.
+            if search == "." {
+                continue;
+            }
+            let trimmed = search.strip_suffix('.').unwrap_or(search);
+            for msg in is_dns1123_subdomain_with_underscore(trimmed) {
+                errs.push(Error::invalid(&search_path, search.clone(), msg));
+            }
+        } else {
+            let trimmed = search.strip_suffix('.').unwrap_or(search);
+            for msg in is_dns1123_subdomain(trimmed) {
+                errs.push(Error::invalid(&search_path, search.clone(), msg));
+            }
+        }
+    }
+
+    if let Some(options) = &cfg.options {
+        for (i, option) in options.iter().enumerate() {
+            if option.name.is_empty() {
+                errs.push(Error::required(
+                    &path.child("options").index(i),
+                    "must not be empty",
+                ));
+            }
+        }
+    }
+
+    errs
+}
 
 /// Mirrors upstream `validateOnlyAddedTolerations` (validation.go:5630).
 pub fn validate_only_added_tolerations(
@@ -336,6 +478,127 @@ mod tests {
         let errs = validate_termination_grace_period_immutable(Some(30), Some(60), &p);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].to_string().contains("field is immutable"));
+    }
+
+    fn dns_cfg(searches: &[&str]) -> PodDNSConfig {
+        PodDNSConfig {
+            nameservers: None,
+            searches: Some(searches.iter().map(|s| s.to_string()).collect()),
+            options: None,
+        }
+    }
+
+    #[test]
+    fn dns_search_underscore_rejected_when_gate_off() {
+        let p = Path::new("spec").child("dnsConfig");
+        let cfg = dns_cfg(&["_sip._tcp.abc_d.example.com"]);
+        let errs = validate_pod_dns_config(Some(&cfg), None, false, &p);
+        assert!(
+            !errs.is_empty(),
+            "underscore search must be rejected with relaxed gate disabled"
+        );
+        assert!(errs[0].to_string().contains("spec.dnsConfig.searches[0]"));
+    }
+
+    #[test]
+    fn dns_search_underscore_accepted_when_gate_on() {
+        let p = Path::new("spec").child("dnsConfig");
+        let cfg = dns_cfg(&["_sip._tcp.abc_d.example.com"]);
+        let errs = validate_pod_dns_config(Some(&cfg), None, true, &p);
+        assert!(
+            errs.is_empty(),
+            "underscore search must be accepted with relaxed gate enabled: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn dns_search_lone_dot_rejected_when_gate_off() {
+        let p = Path::new("spec").child("dnsConfig");
+        // Strict mode trims trailing `.` and then runs IsDNS1123Subdomain on
+        // the empty string, which the upstream regex rejects.
+        let cfg = dns_cfg(&["."]);
+        let errs = validate_pod_dns_config(Some(&cfg), None, false, &p);
+        assert!(
+            !errs.is_empty(),
+            "lone-dot search must be rejected with relaxed gate disabled"
+        );
+    }
+
+    #[test]
+    fn dns_search_lone_dot_accepted_when_gate_on() {
+        let p = Path::new("spec").child("dnsConfig");
+        let cfg = dns_cfg(&["."]);
+        let errs = validate_pod_dns_config(Some(&cfg), None, true, &p);
+        assert!(
+            errs.is_empty(),
+            "lone-dot search must be accepted with relaxed gate enabled: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn dns_search_plain_subdomain_accepted_both_modes() {
+        let p = Path::new("spec").child("dnsConfig");
+        let cfg = dns_cfg(&["example.com"]);
+        assert!(validate_pod_dns_config(Some(&cfg), None, true, &p).is_empty());
+        assert!(validate_pod_dns_config(Some(&cfg), None, false, &p).is_empty());
+    }
+
+    #[test]
+    fn dns_policy_none_without_config_is_rejected() {
+        let p = Path::new("spec").child("dnsConfig");
+        let errs = validate_pod_dns_config(None, Some("None"), true, &p);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0]
+            .to_string()
+            .contains("must provide `dnsConfig` when `dnsPolicy` is None"));
+    }
+
+    #[test]
+    fn dns_policy_none_with_empty_nameservers_is_rejected() {
+        let p = Path::new("spec").child("dnsConfig");
+        let cfg = PodDNSConfig {
+            nameservers: Some(vec![]),
+            searches: None,
+            options: None,
+        };
+        let errs = validate_pod_dns_config(Some(&cfg), Some("None"), true, &p);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0]
+            .to_string()
+            .contains("must provide at least one DNS nameserver"));
+    }
+
+    #[test]
+    fn dns_search_too_many_paths_rejected() {
+        let p = Path::new("spec").child("dnsConfig");
+        let too_many: Vec<&str> = std::iter::repeat_n("a.com", MAX_DNS_SEARCH_PATHS + 1).collect();
+        let cfg = dns_cfg(&too_many);
+        let errs = validate_pod_dns_config(Some(&cfg), None, true, &p);
+        assert!(errs.iter().any(|e| e
+            .to_string()
+            .contains("must not have more than 32 search paths")));
+    }
+
+    #[test]
+    fn dns_option_empty_name_rejected() {
+        let p = Path::new("spec").child("dnsConfig");
+        let cfg = PodDNSConfig {
+            nameservers: None,
+            searches: None,
+            options: Some(vec![crate::resources::pod::PodDNSConfigOption {
+                name: String::new(),
+                value: None,
+            }]),
+        };
+        let errs = validate_pod_dns_config(Some(&cfg), None, true, &p);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("must not be empty")),
+            "got: {:?}",
+            errs
+        );
     }
 
     #[test]

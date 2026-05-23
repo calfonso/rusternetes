@@ -70,3 +70,4 @@ warp.workspace = true
 async-trait.workspace = true
 protox-parse = "0.7"
 prost-types = "0.13"
+serial_test = { workspace = true }
