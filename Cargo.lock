@@ -3750,6 +3750,7 @@ dependencies = [
  "clap",
  "futures",
  "get_if_addrs",
+ "http-body 1.0.1",
  "hyper 1.9.0",
  "hyper-util",
  "indexmap 2.14.0",
