@@ -29,16 +29,22 @@ Cross-reference: `docs/CONFORMANCE.md` failure bucket
 
 with the failure recorded at upstream `resource_quota.go:312`
 (`Ensuring a pod cannot update its resource requirements` →
-`Expected an error to have occurred. Got: nil`). The fix landed in two
+`Expected an error to have occurred. Got: nil`). The fix landed in three
 stages: PR #45 (`748241cf`) wired the `reconcile_one()` entry point +
-pod-watch fanout for the **recompute-on-delete** sub-symptom, and the
+pod-watch fanout for the **recompute-on-delete** sub-symptom; the
 follow-up `fix(api-server): run ResourceQuota admission on pod
 UPDATE/PATCH` plumbed the **request-immutability admission check** into
 the Pod UPDATE and PATCH handlers with delta-usage semantics (new
-request − old request, fail if cumulative exceeds `.spec.hard`). With
-both pieces in place the upstream `:312` assertion is now satisfied
-end-to-end and `resource_quota_captures_full_pod_lifecycle` no longer
-needs an `#[ignore]`.
+request − old request, fail if cumulative exceeds `.spec.hard`); and
+finally `fix(api-server): delta-aware ResourceQuota admission on
+/resize subresource` extended that delta-usage check to the
+`/pods/{name}/resize` subresource (KEP-1287) — required because the
+upstream `ValidatePodUpdate` fence now rejects
+`spec.containers[*].resources` mutation on plain PUT, so all resource
+changes flow through `/resize`. With these three pieces in place the
+upstream `:312` assertion is satisfied end-to-end and
+`resource_quota_captures_full_pod_lifecycle` no longer needs an
+`#[ignore]`.
 
 ## Coverage matrix
 
@@ -53,7 +59,7 @@ needs an `#[ignore]`.
 | `ResourceQuota should create a ResourceQuota and ensure its status is promptly calculated` | resource_quota.go:90 | PASS | `resource_quota_create_seeds_status_used_to_zero` | mirrored, passing |
 | `ResourceQuota CRUD round-trip` | resource_quota.go:412 | PASS | `resource_quota_crud_round_trip_over_http` | mirrored, passing |
 | `ResourceQuota list across namespaces` | resource_quota.go:412 (cross-ns) | PASS | `resource_quota_list_all_namespaces` | mirrored, passing |
-| `ResourceQuota should create a ResourceQuota and capture the life of a pod` | resource_quota.go:243 (asserts at :312) | **FAIL** → fixed | `resource_quota_captures_full_pod_lifecycle` | mirrored, **passing** (Pod UPDATE/PATCH now run ResourceQuota admission with delta-usage semantics) |
+| `ResourceQuota should create a ResourceQuota and capture the life of a pod` | resource_quota.go:243 (asserts at :312) | **FAIL** → fixed | `resource_quota_captures_full_pod_lifecycle` | mirrored, **passing** (Pod UPDATE/PATCH **and the `/resize` subresource** now run ResourceQuota admission with delta-usage semantics) |
 | `ResourceQuota usage recompute on object delete` (PR #45 regression guard, HTTP surface) | resource_quota.go:243 (sub-assertion) | n/a (regression guard) | `resource_quota_usage_recomputes_on_pod_delete_via_http` | mirrored, passing |
 | `ResourceQuota /status subresource returns reconciled used` | resource_quota.go (status family) | PASS | `resource_quota_status_subresource_returns_used` | mirrored, passing |
 | `ResourceQuota PATCH spec.hard persists` | resource_quota.go:412 (update family) | PASS | `resource_quota_patch_spec_hard_persists` | mirrored, passing |
@@ -71,9 +77,12 @@ needs an `#[ignore]`.
 
 - `resource_quota_captures_full_pod_lifecycle` now drives the full
   scenario end-to-end: quota seed → pod CREATE in-budget → controller
-  reconcile → pod UPDATE that would exceed `requests.cpu` (rejected with
-  403) → in-budget UPDATE (accepted, delta semantics) → PATCH that would
-  exceed `requests.memory` (rejected with 403). The constituent
+  reconcile → pod RESIZE that would exceed `requests.cpu` (rejected with
+  403) → in-budget RESIZE (accepted, delta semantics) → RESIZE that
+  would exceed `requests.memory` (rejected with 403). Resource
+  mutations go through the `/pods/{name}/resize` subresource (KEP-1287)
+  because the main PUT `ValidatePodUpdate` fence forbids container
+  resource changes. The constituent
   sub-symptoms (usage initialization, usage recompute on pod create +
   delete, status subresource, scope filtering, terminal-pod exclusion)
   remain asserted by individual tests so a regression in any one of them
