@@ -5997,11 +5997,13 @@ impl ProtoRegistry {
                 ]),
             },
         );
-        // ResourceQuotaSpec.hard is map<string, Quantity> — skipped.
+        // ResourceQuotaSpec.hard is map<string, Quantity> per
+        // k8s.io/api/core/v1/generated.proto (field 1).
         schemas.insert(
             "ResourceQuotaSpec".into(),
             MessageSchema {
                 fields: HashMap::from([
+                    (1, ("hard".into(), FieldType::QuantityMap)),
                     (
                         2,
                         (
@@ -6019,14 +6021,15 @@ impl ProtoRegistry {
                 ]),
             },
         );
-        // ResourceQuotaStatus.hard and .used are map<string, Quantity> — skipped.
-        // No non-Quantity fields remain, but register an empty schema so the type
-        // is known to the decoder (otherwise nested decode produces a missing-schema
-        // warning instead of `{}`).
+        // ResourceQuotaStatus.hard and .used are map<string, Quantity> per
+        // k8s.io/api/core/v1/generated.proto (fields 1 and 2).
         schemas.insert(
             "ResourceQuotaStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("hard".into(), FieldType::QuantityMap)),
+                    (2, ("used".into(), FieldType::QuantityMap)),
+                ]),
             },
         );
 
