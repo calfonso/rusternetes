@@ -22,6 +22,7 @@ mod router;
 mod spdy;
 #[allow(dead_code)]
 mod spdy_handlers;
+mod ssa;
 mod state;
 #[allow(dead_code)]
 mod streaming;
