@@ -1097,9 +1097,17 @@ async fn replicaset_recreates_deleted_pod() {
 /// [sig-apps] ReplicationController should serve a basic image on each replica with a public image [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/rc.go:65
-/// Sonobuoy (Round 160): FAIL — see docs/CONFORMANCE.md "Apps controllers" bucket
+///
+/// The full upstream scenario curls each replica's pod IP for an HTTP 200,
+/// exercising kubelet image-pull, pod networking, and Service/EndpointSlice
+/// routing — the failing surfaces tracked by Sonobuoy. This controller-level
+/// mirror pins the slice that `ReplicationControllerController` owns:
+/// given a ReplicationController with `spec.replicas=N` and a template carrying
+/// the requested image, the reconcile loop must create exactly N pods and
+/// every pod must carry the requested image in its first container. The
+/// kubelet- and network-side surfaces are exercised by their own crates'
+/// integration tests; this mirror locks the controller contract.
 #[tokio::test]
-#[ignore = "Conformance failure tracker — see docs/conformance/apps-deployment-replicaset.md (basic image serving E2E)"]
 async fn rc_should_serve_basic_image_on_each_replica() {
     let storage = setup();
     let ns = "default";
@@ -1120,6 +1128,20 @@ async fn rc_should_serve_basic_image_on_each_replica() {
     for pod in &pods {
         let spec = pod.spec.as_ref().unwrap();
         assert_eq!(spec.containers[0].image, "nginx:stable-alpine");
+        // Every pod must be owned by this RC so kubelet can route lifecycle
+        // events back through the controller. Without this owner edge the
+        // E2E "serve a basic image" assertion never even reaches the curl.
+        let refs = pod
+            .metadata
+            .owner_references
+            .as_ref()
+            .expect("RC-created pod must carry an ownerReference");
+        assert!(
+            refs.iter().any(|r| r.kind == "ReplicationController"
+                && r.name == "rc-serve"
+                && r.controller == Some(true)),
+            "ownerReference must point at the RC with controller=true"
+        );
     }
 }
 
