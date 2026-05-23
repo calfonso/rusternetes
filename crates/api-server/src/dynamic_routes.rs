@@ -221,20 +221,15 @@ mod tests {
     };
     use rusternetes_common::types::ObjectMeta;
 
-    // These tests require etcd because ApiServerState uses StorageBackend.
+    // Build an ApiServerState backed by the in-memory storage backend, so these
+    // tests can exercise route-building logic without any external etcd cluster.
     async fn create_test_state() -> Arc<ApiServerState> {
         use rusternetes_common::auth::TokenManager;
         use rusternetes_common::authz::AlwaysAllowAuthorizer;
         use rusternetes_common::observability::MetricsRegistry;
-        use rusternetes_storage::{StorageBackend, StorageConfig};
+        use rusternetes_storage::StorageBackend;
 
-        let storage = Arc::new(
-            StorageBackend::new(StorageConfig::Etcd {
-                endpoints: vec!["http://localhost:2379".to_string()],
-            })
-            .await
-            .expect("Failed to create storage"),
-        );
+        let storage = Arc::new(StorageBackend::new_memory());
         let token_manager = Arc::new(TokenManager::new(b"test-secret"));
         let authorizer =
             Arc::new(AlwaysAllowAuthorizer) as Arc<dyn rusternetes_common::authz::Authorizer>;
@@ -297,7 +292,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires etcd
     async fn test_dynamic_route_manager_creation() {
         let state = create_test_state().await;
         let manager = DynamicRouteManager::new(state);
@@ -306,7 +300,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires etcd
     async fn test_build_namespaced_crd_routes() {
         let state = create_test_state().await;
         let manager = DynamicRouteManager::new(state);
@@ -317,7 +310,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires etcd
     async fn test_build_crd_routes_with_subresources() {
         let state = create_test_state().await;
         let manager = DynamicRouteManager::new(state);
@@ -328,7 +320,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires etcd
     async fn test_build_cluster_scoped_crd_routes() {
         let state = create_test_state().await;
         let manager = DynamicRouteManager::new(state);
@@ -340,7 +331,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires etcd
     async fn test_register_and_unregister_crd() {
         let state = create_test_state().await;
         let manager = DynamicRouteManager::new(state);
