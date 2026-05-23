@@ -355,12 +355,16 @@ pub async fn get_swagger_spec(
         .and_then(|d| d.as_object())
         .map(|m| m.len())
         .unwrap_or(0);
-    // Subtract the two baseline definitions (ObjectMeta + OwnerReference)
-    // that are always present to surface the CRD-derived count.
-    if total_definitions > 2 {
+    // Subtract the baseline definitions (ObjectMeta + OwnerReference + built-in
+    // core/v1 GVK stubs) that are always present to surface the CRD-derived
+    // count. The exact count is owned by `core_v1_builtin_definitions` plus
+    // the two apimachinery types above; recompute it from the same source so
+    // this stays in sync if either list changes.
+    let baseline = 2 + core_v1_builtin_definitions().len();
+    if total_definitions > baseline {
         info!(
             "OpenAPI /v2: serving swagger spec with {} CRD definitions",
-            total_definitions - 2
+            total_definitions - baseline
         );
     }
 
@@ -591,6 +595,22 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
         }),
     );
 
+    // Built-in core/v1 GVK schemas.
+    //
+    // Upstream kube-apiserver publishes one definition per built-in GVK via
+    // kube-openapi's `pkg/builder`, sourced from `types_swagger_doc_generated.go`
+    // that's codegen'd from the Go struct comments. Rusternetes does not have
+    // codegen for this; we publish hand-written stubs so that:
+    //   * kubectl explain / discovery sees the GVK + standard metadata layout
+    //   * conformance assertions that check for `io.k8s.api.core.v1.Pod`
+    //     (and other built-in keys) in the `definitions` map pass.
+    //
+    // K8s ref: staging/src/k8s.io/kube-openapi/pkg/builder/openapi.go
+    //          staging/src/k8s.io/api/core/v1/types_swagger_doc_generated.go
+    for (key, def) in core_v1_builtin_definitions() {
+        definitions.insert(key, def);
+    }
+
     serde_json::json!({
         "swagger": "2.0",
         "info": {
@@ -600,6 +620,111 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
         "paths": paths,
         "definitions": definitions
     })
+}
+
+/// Hand-written stub schemas for the most commonly referenced built-in
+/// `io.k8s.api.core.v1` (and a few sibling) GVKs.
+///
+/// Upstream Go publishes per-GVK schemas generated from struct comments via
+/// `kube-openapi/pkg/builder` + `types_swagger_doc_generated.go`. Rusternetes
+/// doesn't have that codegen pipeline yet; we instead inline minimal stubs
+/// here so discovery clients can resolve the canonical definition keys.
+///
+/// Each definition carries:
+///   * the `x-kubernetes-group-version-kind` vendor extension (the marker the
+///     Go conformance tests assert on for built-in resources), and
+///   * the standard `apiVersion` / `kind` / `metadata` properties, with
+///     `metadata` `$ref`'ing the existing ObjectMeta definition.
+///
+/// Returns an ordered list of `(definition_key, schema)` pairs. Keys must use
+/// the dotted format (`io.k8s.api.core.v1.Pod`) matching upstream
+/// `ToRESTFriendlyName`. `spec` / `status` are intentionally typed as
+/// permissive `{type: object}` for now — fully fleshing them out requires
+/// per-field codegen that's a follow-up.
+fn core_v1_builtin_definitions() -> Vec<(String, serde_json::Value)> {
+    /// One built-in resource: `(group, version, kind, description)`.
+    /// For core types the group is the empty string, matching the Go GVK.
+    const BUILT_INS: &[(&str, &str, &str, &str)] = &[
+        ("", "v1", "Pod", "Pod is a collection of containers that can run on a host."),
+        ("", "v1", "Service", "Service is a named abstraction of software service consisting of local port (for example 3306) that the proxy listens on, and the selector that determines which pods will answer requests sent through the proxy."),
+        ("", "v1", "Node", "Node is a worker node in Kubernetes."),
+        ("", "v1", "Namespace", "Namespace provides a scope for Names."),
+        ("", "v1", "ConfigMap", "ConfigMap holds configuration data for pods to consume."),
+        ("", "v1", "Secret", "Secret holds secret data of a certain type."),
+        ("", "v1", "ServiceAccount", "ServiceAccount binds together: a name, understood by users, and perhaps by peripheral systems, for an identity; a principal that can be authenticated and authorized; a set of secrets."),
+        ("", "v1", "PersistentVolume", "PersistentVolume (PV) is a storage resource provisioned by an administrator."),
+        ("", "v1", "PersistentVolumeClaim", "PersistentVolumeClaim is a user's request for and claim to a persistent volume."),
+        ("", "v1", "Event", "Event is a report of an event somewhere in the cluster."),
+        ("", "v1", "Endpoints", "Endpoints is a collection of endpoints that implement the actual service."),
+        ("", "v1", "ReplicationController", "ReplicationController represents the configuration of a replication controller."),
+        ("apps", "v1", "Deployment", "Deployment enables declarative updates for Pods and ReplicaSets."),
+        ("apps", "v1", "ReplicaSet", "ReplicaSet ensures that a specified number of pod replicas are running at any given time."),
+        ("apps", "v1", "StatefulSet", "StatefulSet represents a set of pods with consistent identities."),
+        ("apps", "v1", "DaemonSet", "DaemonSet represents the configuration of a daemon set."),
+        ("batch", "v1", "Job", "Job represents the configuration of a single job."),
+        ("batch", "v1", "CronJob", "CronJob represents the configuration of a single cron job."),
+    ];
+
+    BUILT_INS
+        .iter()
+        .map(|(group, version, kind, description)| {
+            let api_group_dotted = if group.is_empty() {
+                // core/v1 lives under io.k8s.api.core.v1
+                "io.k8s.api.core".to_string()
+            } else {
+                // sibling groups live under io.k8s.api.<group>; non-domain
+                // groups like "apps" and "batch" match upstream's flat layout.
+                format!("io.k8s.api.{}", group)
+            };
+            let key = format!("{}.{}.{}", api_group_dotted, version, kind);
+
+            let gvk_version = serde_json::json!([{
+                "group": *group,
+                "version": *version,
+                "kind": *kind,
+            }]);
+            let mut def = serde_json::json!({
+                "description": *description,
+                "type": "object",
+                "properties": {
+                    "apiVersion": {
+                        "type": "string",
+                        "description": "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
+                    },
+                    "metadata": {
+                        "$ref": "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+                        "description": "Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+                    },
+                    "spec": { "type": "object", "description": "Specification of the desired behavior of the resource." },
+                    "status": { "type": "object", "description": "Most recently observed status of the resource." }
+                },
+                "x-kubernetes-group-version-kind": gvk_version,
+            });
+
+            // Trim spec/status for resources that don't carry them upstream
+            // (k8s.io/api/core/v1/types.go): ConfigMap/Secret/Event/Endpoints
+            // are flat objects with no nested spec/status; ServiceAccount has
+            // top-level secrets/imagePullSecrets but no spec or status.
+            if matches!(
+                *kind,
+                "ConfigMap" | "Secret" | "Event" | "Endpoints" | "ServiceAccount"
+            ) {
+                if let Some(props) = def
+                    .get_mut("properties")
+                    .and_then(|p| p.as_object_mut())
+                {
+                    props.remove("spec");
+                    props.remove("status");
+                }
+            }
+
+            (key, def)
+        })
+        .collect()
 }
 
 /// Build the per-version CRD schema definition that's inserted into the spec's
@@ -1591,6 +1716,60 @@ mod tests {
                 def_key("example.com", "v2", "Beta")
             ))
             .is_some());
+    }
+
+    #[test]
+    fn test_builtin_core_v1_definitions_are_published() {
+        // Upstream conformance and kubectl discovery both expect canonical
+        // built-in GVK keys (`io.k8s.api.core.v1.Pod`,
+        // `io.k8s.api.apps.v1.Deployment`, ...) in /openapi/v2's
+        // `definitions` map. Build a spec with no CRDs and verify the
+        // baselines are present.
+        let spec = build_swagger_spec_for_crds(&[]);
+        let defs = spec
+            .get("definitions")
+            .and_then(|d| d.as_object())
+            .expect("definitions object");
+
+        let pod = defs
+            .get("io.k8s.api.core.v1.Pod")
+            .expect("io.k8s.api.core.v1.Pod must be published");
+        // GVK extension carries the right kind so discovery clients can
+        // resolve the resource to a schema.
+        let gvk = pod
+            .get("x-kubernetes-group-version-kind")
+            .and_then(|v| v.as_array())
+            .expect("GVK extension must be an array");
+        assert_eq!(gvk.len(), 1);
+        assert_eq!(gvk[0]["group"], "");
+        assert_eq!(gvk[0]["version"], "v1");
+        assert_eq!(gvk[0]["kind"], "Pod");
+
+        // Spot-check that the standard wrapper properties are present and
+        // metadata $refs the existing ObjectMeta definition (no broken refs).
+        let props = pod["properties"].as_object().unwrap();
+        assert!(props.contains_key("apiVersion"));
+        assert!(props.contains_key("kind"));
+        assert!(props.contains_key("metadata"));
+        assert_eq!(
+            props["metadata"]["$ref"],
+            "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+        );
+        assert!(props.contains_key("spec"));
+        assert!(props.contains_key("status"));
+
+        // Sibling built-ins kubectl discovery cares about must also be
+        // present under their canonical group keys.
+        assert!(defs.contains_key("io.k8s.api.apps.v1.Deployment"));
+        assert!(defs.contains_key("io.k8s.api.batch.v1.Job"));
+        assert!(defs.contains_key("io.k8s.api.core.v1.Service"));
+
+        // ConfigMap/Secret carry no spec/status — verify we don't suggest
+        // fields the resource doesn't have.
+        let cm = defs.get("io.k8s.api.core.v1.ConfigMap").unwrap();
+        let cm_props = cm["properties"].as_object().unwrap();
+        assert!(!cm_props.contains_key("spec"));
+        assert!(!cm_props.contains_key("status"));
     }
 
     #[test]
