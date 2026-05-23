@@ -1209,13 +1209,29 @@ impl ProtoRegistry {
         schemas.insert(
             "PodFailurePolicy".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "rules".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "PodFailurePolicyRule".into(),
+                        ))),
+                    ),
+                )]),
             },
         );
         schemas.insert(
             "SuccessPolicy".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "rules".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "SuccessPolicyRule".into(),
+                        ))),
+                    ),
+                )]),
             },
         );
 

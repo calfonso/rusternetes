@@ -318,11 +318,14 @@ async fn test_indexed_job_success_policy_caps_status_succeeded_at_policy_match()
     let mut job = make_job("idx-sp-cap", "default", 2, 2);
     job.spec.completion_mode = Some("Indexed".to_string());
     // Policy fires the moment index 0 succeeds, regardless of index 1.
-    job.spec.success_policy = Some(serde_json::json!({
-        "rules": [
-            { "succeededIndexes": "0", "succeededCount": 1 }
-        ]
-    }));
+    job.spec.success_policy = Some(
+        serde_json::from_value(serde_json::json!({
+            "rules": [
+                { "succeededIndexes": "0", "succeededCount": 1 }
+            ]
+        }))
+        .unwrap(),
+    );
     let key = build_key("jobs", Some("default"), "idx-sp-cap");
     storage.create(&key, &job).await.unwrap();
 

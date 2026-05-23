@@ -191,9 +191,12 @@ async fn test_success_criteria_met_alone_prevents_status_overwrite() {
 
     // Job with successPolicy requiring index 0 to succeed
     let mut job = make_indexed_job("sp-guard-job", "default", 3, 3);
-    job.spec.success_policy = Some(serde_json::json!({
-        "rules": [{"succeededIndexes": "0"}]
-    }));
+    job.spec.success_policy = Some(
+        serde_json::from_value(serde_json::json!({
+            "rules": [{"succeededIndexes": "0"}]
+        }))
+        .unwrap(),
+    );
 
     // Pre-seed status with ONLY SuccessCriteriaMet (no Complete).
     // This simulates the intermediate state that the race could produce.
@@ -283,9 +286,12 @@ async fn test_both_conditions_preserve_completed_status_across_reconciles() {
 
     // Indexed job with 5 completions; successPolicy requires indexes 0-1
     let mut job = make_indexed_job("sp-both-job", "default", 5, 5);
-    job.spec.success_policy = Some(serde_json::json!({
-        "rules": [{"succeededIndexes": "0-1"}]
-    }));
+    job.spec.success_policy = Some(
+        serde_json::from_value(serde_json::json!({
+            "rules": [{"succeededIndexes": "0-1"}]
+        }))
+        .unwrap(),
+    );
 
     let job_key = "/registry/jobs/default/sp-both-job";
     storage.create(job_key, &job).await.unwrap();

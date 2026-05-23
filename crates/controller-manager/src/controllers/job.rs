@@ -569,7 +569,7 @@ impl<S: Storage + 'static> JobController<S> {
         let mut pod_failure_message = String::new();
         let mut ignored_pods: HashSet<String> = HashSet::new();
         if let Some(ref policy) = job.spec.pod_failure_policy {
-            if let Some(rules) = policy.get("rules").and_then(|r| r.as_array()) {
+            if !policy.rules.is_empty() {
                 for pod in job_pods.iter() {
                     let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
                     // Check ALL terminated pods (Failed AND Succeeded with non-zero exit).
@@ -599,26 +599,15 @@ impl<S: Storage + 'static> JobController<S> {
                         })
                         .unwrap_or_default();
 
-                    for rule in rules {
-                        let action = rule.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                    for rule in policy.rules.iter() {
+                        let action = rule.action.as_str();
 
                         let mut rule_matched = false;
 
                         // Check onExitCodes
-                        if let Some(on_exit) = rule.get("onExitCodes") {
-                            let operator = on_exit
-                                .get("operator")
-                                .and_then(|o| o.as_str())
-                                .unwrap_or("In");
-                            let values: Vec<i32> = on_exit
-                                .get("values")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_i64().map(|i| i as i32))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                        if let Some(ref on_exit) = rule.on_exit_codes {
+                            let operator = on_exit.operator.as_str();
+                            let values = &on_exit.values;
                             rule_matched = exit_codes.iter().any(|code| match operator {
                                 "In" => values.contains(code),
                                 "NotIn" => !values.contains(code),
@@ -627,29 +616,20 @@ impl<S: Storage + 'static> JobController<S> {
                         }
 
                         // Check onPodConditions
-                        if !rule_matched {
-                            if let Some(on_conditions) = rule.get("onPodConditions") {
-                                if let Some(conditions) = on_conditions.as_array() {
-                                    let pod_conditions =
-                                        pod.status.as_ref().and_then(|s| s.conditions.as_ref());
-                                    rule_matched = conditions.iter().any(|cond| {
-                                        let ctype =
-                                            cond.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                        let cstatus = cond
-                                            .get("status")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("True");
-                                        pod_conditions
-                                            .map(|pcs| {
-                                                pcs.iter().any(|pc| {
-                                                    pc.condition_type == ctype
-                                                        && pc.status == cstatus
-                                                })
-                                            })
-                                            .unwrap_or(false)
-                                    });
-                                }
-                            }
+                        if !rule_matched && !rule.on_pod_conditions.is_empty() {
+                            let pod_conditions =
+                                pod.status.as_ref().and_then(|s| s.conditions.as_ref());
+                            rule_matched = rule.on_pod_conditions.iter().any(|cond| {
+                                let ctype = cond.condition_type.as_str();
+                                let cstatus = cond.status.as_deref().unwrap_or("True");
+                                pod_conditions
+                                    .map(|pcs| {
+                                        pcs.iter().any(|pc| {
+                                            pc.condition_type == ctype && pc.status == cstatus
+                                        })
+                                    })
+                                    .unwrap_or(false)
+                            });
                         }
 
                         if rule_matched {
@@ -827,39 +807,32 @@ impl<S: Storage + 'static> JobController<S> {
 
         // Check successPolicy — if defined and criteria met, mark job complete
         let success_policy_met = if let Some(ref policy) = job.spec.success_policy {
-            if let Some(rules) = policy.get("rules").and_then(|r| r.as_array()) {
-                rules.iter().any(|rule| {
-                    let indexes_ok = if let Some(succeeded_indexes_str) =
-                        rule.get("succeededIndexes").and_then(|s| s.as_str())
-                    {
-                        // Parse required indexes and check they are all in completed set
-                        let completed = completed_indexes.as_deref().unwrap_or("");
-                        let completed_set: HashSet<i32> = parse_index_ranges(completed);
-                        let required_set: HashSet<i32> = parse_index_ranges(succeeded_indexes_str);
-                        required_set.is_subset(&completed_set)
-                    } else {
-                        true // No index constraint
-                    };
+            policy.rules.iter().any(|rule| {
+                let indexes_ok = if let Some(ref succeeded_indexes_str) = rule.succeeded_indexes {
+                    // Parse required indexes and check they are all in completed set
+                    let completed = completed_indexes.as_deref().unwrap_or("");
+                    let completed_set: HashSet<i32> = parse_index_ranges(completed);
+                    let required_set: HashSet<i32> = parse_index_ranges(succeeded_indexes_str);
+                    required_set.is_subset(&completed_set)
+                } else {
+                    true // No index constraint
+                };
 
-                    let count_ok =
-                        if let Some(count) = rule.get("succeededCount").and_then(|c| c.as_i64()) {
-                            succeeded_index_count >= count as i32
-                        } else {
-                            true // No count constraint
-                        };
+                let count_ok = if let Some(count) = rule.succeeded_count {
+                    succeeded_index_count >= count
+                } else {
+                    true // No count constraint
+                };
 
-                    // If rule has neither succeededIndexes nor succeededCount, match on all completions
-                    let has_criteria = rule.get("succeededIndexes").is_some()
-                        || rule.get("succeededCount").is_some();
-                    if has_criteria {
-                        indexes_ok && count_ok
-                    } else {
-                        succeeded_index_count >= completions
-                    }
-                })
-            } else {
-                false
-            }
+                // If rule has neither succeededIndexes nor succeededCount, match on all completions
+                let has_criteria =
+                    rule.succeeded_indexes.is_some() || rule.succeeded_count.is_some();
+                if has_criteria {
+                    indexes_ok && count_ok
+                } else {
+                    succeeded_index_count >= completions
+                }
+            })
         } else {
             false
         };
@@ -1933,17 +1906,20 @@ mod tests {
         job.spec.completion_mode = Some("Indexed".to_string());
         job.spec.backoff_limit = Some(100);
         // Set up a FailIndex policy for exit code 42
-        job.spec.pod_failure_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "action": "FailIndex",
-                    "onExitCodes": {
-                        "operator": "In",
-                        "values": [42]
+        job.spec.pod_failure_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "action": "FailIndex",
+                        "onExitCodes": {
+                            "operator": "In",
+                            "values": [42]
+                        }
                     }
-                }
-            ]
-        }));
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/failindex-job";
         storage.create(job_key, &job).await.unwrap();
@@ -2025,17 +2001,20 @@ mod tests {
 
         let mut job = make_job("failjob-job", "default", 3, 3);
         job.spec.backoff_limit = Some(100);
-        job.spec.pod_failure_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "action": "FailJob",
-                    "onExitCodes": {
-                        "operator": "In",
-                        "values": [99]
+        job.spec.pod_failure_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "action": "FailJob",
+                        "onExitCodes": {
+                            "operator": "In",
+                            "values": [99]
+                        }
                     }
-                }
-            ]
-        }));
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/failjob-job";
         storage.create(job_key, &job).await.unwrap();
@@ -2201,13 +2180,16 @@ mod tests {
         // Indexed job with 5 completions, successPolicy requiring indexes 0-1
         let mut job = make_job("sp-job", "default", 5, 5);
         job.spec.completion_mode = Some("Indexed".to_string());
-        job.spec.success_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "succeededIndexes": "0-1"
-                }
-            ]
-        }));
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "succeededIndexes": "0-1"
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/sp-job";
         storage.create(job_key, &job).await.unwrap();
@@ -2290,13 +2272,16 @@ mod tests {
 
         let mut job = make_job("sp-count-job", "default", 5, 5);
         job.spec.completion_mode = Some("Indexed".to_string());
-        job.spec.success_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "succeededCount": 2
-                }
-            ]
-        }));
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "succeededCount": 2
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/sp-count-job";
         storage.create(job_key, &job).await.unwrap();
@@ -2365,13 +2350,16 @@ mod tests {
 
         let mut job = make_job("sp-notyet", "default", 5, 5);
         job.spec.completion_mode = Some("Indexed".to_string());
-        job.spec.success_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "succeededIndexes": "0-2"
-                }
-            ]
-        }));
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "succeededIndexes": "0-2"
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/sp-notyet";
         storage.create(job_key, &job).await.unwrap();
@@ -2433,19 +2421,22 @@ mod tests {
         let mut job = make_job("ignore-job", "default", 3, 3);
         job.spec.completion_mode = Some("Indexed".to_string());
         job.spec.backoff_limit = Some(0); // Would fail immediately if the pod is counted
-        job.spec.pod_failure_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "action": "Ignore",
-                    "onPodConditions": [
-                        {
-                            "type": "DisruptionTarget",
-                            "status": "True"
-                        }
-                    ]
-                }
-            ]
-        }));
+        job.spec.pod_failure_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "action": "Ignore",
+                        "onPodConditions": [
+                            {
+                                "type": "DisruptionTarget",
+                                "status": "True"
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/ignore-job";
         storage.create(job_key, &job).await.unwrap();
@@ -2837,13 +2828,16 @@ mod tests {
 
         let mut job = make_job("sp-all-job", "default", 3, 3);
         job.spec.completion_mode = Some("Indexed".to_string());
-        job.spec.success_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "succeededIndexes": "0-2"
-                }
-            ]
-        }));
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "succeededIndexes": "0-2"
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/sp-all-job";
         storage.create(job_key, &job).await.unwrap();
@@ -2903,13 +2897,16 @@ mod tests {
 
         let mut job = make_job("sp-count2", "default", 5, 5);
         job.spec.completion_mode = Some("Indexed".to_string());
-        job.spec.success_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "succeededCount": 3
-                }
-            ]
-        }));
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "succeededCount": 3
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/sp-count2";
         storage.create(job_key, &job).await.unwrap();
@@ -2980,13 +2977,16 @@ mod tests {
         let mut job = make_job("sp-idx-rule", "default", 5, 5);
         job.spec.completion_mode = Some("Indexed".to_string());
         // Only indexes 0 and 4 need to succeed
-        job.spec.success_policy = Some(serde_json::json!({
-            "rules": [
-                {
-                    "succeededIndexes": "0,4"
-                }
-            ]
-        }));
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    {
+                        "succeededIndexes": "0,4"
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
 
         let job_key = "/registry/jobs/default/sp-idx-rule";
         storage.create(job_key, &job).await.unwrap();
@@ -3071,9 +3071,12 @@ mod tests {
 
         let mut job = make_job("sp-job", "default", 2, 5);
         job.spec.completion_mode = Some("Indexed".to_string());
-        job.spec.success_policy = Some(serde_json::json!({
-            "rules": [{"succeededCount": 1}]
-        }));
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{"succeededCount": 1}]
+            }))
+            .unwrap(),
+        );
         storage
             .create("/registry/jobs/default/sp-job", &job)
             .await

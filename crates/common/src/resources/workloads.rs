@@ -632,13 +632,114 @@ pub struct JobSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_failed_indexes: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pod_failure_policy: Option<serde_json::Value>,
+    pub pod_failure_policy: Option<PodFailurePolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pod_replacement_policy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub success_policy: Option<serde_json::Value>,
+    pub success_policy: Option<SuccessPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_by: Option<String>,
+}
+
+/// PodFailurePolicy describes how failed pods influence the backoffLimit.
+///
+/// Mirrors `k8s.io/api/batch/v1.PodFailurePolicy` (proto field 11 of `JobSpec`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PodFailurePolicy {
+    /// A list of pod failure policy rules. The rules are evaluated in order.
+    /// Once a rule matches a Pod failure, the remaining of the rules are ignored.
+    /// When no rule matches the Pod failure, the default handling applies — the
+    /// counter of pod failures is incremented and it is checked against the
+    /// backoffLimit. At most 20 elements are allowed.
+    #[serde(default)]
+    pub rules: Vec<PodFailurePolicyRule>,
+}
+
+/// PodFailurePolicyRule describes how a pod failure is handled when the
+/// requirements are met. Only one of `on_exit_codes` and `on_pod_conditions`
+/// can be set per rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PodFailurePolicyRule {
+    /// Action taken on a pod failure when the requirements are satisfied.
+    /// Possible values: `FailJob`, `FailIndex`, `Ignore`, `Count`.
+    pub action: String,
+
+    /// Requirement on the container exit codes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_exit_codes: Option<PodFailurePolicyOnExitCodesRequirement>,
+
+    /// Requirement on the pod conditions. The requirement is satisfied if at
+    /// least one pattern matches an actual pod condition. At most 20 elements
+    /// are allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_pod_conditions: Vec<PodFailurePolicyOnPodConditionsPattern>,
+}
+
+/// PodFailurePolicyOnExitCodesRequirement describes the requirement for
+/// handling a failed pod based on its container exit codes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PodFailurePolicyOnExitCodesRequirement {
+    /// Restricts the check for exit codes to the container with the specified
+    /// name. When `None`, the rule applies to all containers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+
+    /// Relationship between the container exit code(s) and the specified
+    /// values. Possible values: `In`, `NotIn`.
+    pub operator: String,
+
+    /// Set of values. At least one element is required; at most 255 allowed.
+    /// `0` cannot be used with the `In` operator.
+    pub values: Vec<i32>,
+}
+
+/// PodFailurePolicyOnPodConditionsPattern describes a pattern for matching
+/// an actual pod condition type/status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PodFailurePolicyOnPodConditionsPattern {
+    /// Required Pod condition type.
+    #[serde(rename = "type")]
+    pub condition_type: String,
+
+    /// Required Pod condition status. Defaults to `True` when unspecified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// SuccessPolicy describes when a Job can be declared as succeeded based on
+/// the success of some indexes.
+///
+/// Mirrors `k8s.io/api/batch/v1.SuccessPolicy` (proto field 16 of `JobSpec`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SuccessPolicy {
+    /// Rules represents the list of alternative rules for declaring the Jobs
+    /// as successful before `.status.succeeded >= .spec.completions`. Once any
+    /// of the rules are met, the `SuccessCriteriaMet` condition is added and
+    /// the lingering pods are removed. At most 20 elements are allowed.
+    #[serde(default)]
+    pub rules: Vec<SuccessPolicyRule>,
+}
+
+/// SuccessPolicyRule describes a rule for declaring a Job as succeeded.
+/// Each rule must have at least one of `succeeded_indexes` or `succeeded_count`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SuccessPolicyRule {
+    /// Set of indexes which must be contained in the actual set of succeeded
+    /// indexes for the Job. Expressed as comma-separated intervals
+    /// (e.g. `"1,3-5,7"`). When `None`, the field is not evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub succeeded_indexes: Option<String>,
+
+    /// Minimal required size of the actual set of succeeded indexes for the
+    /// Job. When `None`, the field is not evaluated. Must be positive when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub succeeded_count: Option<i32>,
 }
 
 /// JobStatus represents the current state of a Job
