@@ -403,17 +403,102 @@ async fn test_pod_topology_labels_filters_and_preserves_existing() {
 /// Mirrors upstream `TestPodTopologyLabels_FeatureDisabled` (pods_test.go:109).
 ///
 /// When the feature gate is OFF, the admission plugin must do nothing — the
-/// pod ends up with an empty (or `nil`) label map even when the bound Node
-/// carries the canonical zone/region keys. We don't have feature gates yet,
-/// so this test is `#[ignore]`d but documents the desired behaviour.
+/// pod ends up with no `topology.kubernetes.io/*` label keys after Binding,
+/// even when the bound Node carries the canonical zone/region keys.
+///
+/// `#[serial]` because `feature_gates::with_feature` flips a process-wide
+/// `AtomicBool`; running parallel tests that read or flip the same gate would
+/// race.
 #[tokio::test]
-#[ignore = "feature-gate plumbing (PodTopologyLabelsAdmission) not implemented; see docstring"]
+#[serial_test::serial]
 async fn test_pod_topology_labels_feature_disabled() {
-    // Intentionally a stub — once feature gates exist this should mirror the
-    // single "does nothing when the feature is not enabled" sub-case from
-    // upstream pods_test.go:109. Asserts: after Binding, the pod has no
-    // `topology.kubernetes.io/*` labels at all.
-    let (_, _router) = spawn_router();
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+
+    // Disable the PodTopologyLabelsAdmission gate for the lifetime of this
+    // test. The gate defaults to ON at our v1.35 target (Beta), so without
+    // this override the topology labels WOULD be copied — which is exactly
+    // the behaviour `test_pod_topology_labels` above pins. The guard
+    // restores the previous value on drop.
+    let _guard = with_feature(Feature::PodTopologyLabelsAdmission, false);
+    let (_, router) = spawn_router();
+
+    let ns = "pod-topology-labels-disabled";
+    create_namespace(&router, ns).await;
+
+    // Node carries the canonical zone+region keys that *would* be copied if
+    // the gate were on.
+    let node = json!({
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {
+            "name": "topo-node-disabled",
+            "labels": {
+                "topology.kubernetes.io/zone":   "zone",
+                "topology.kubernetes.io/region": "region",
+            },
+        },
+    });
+    let (st, body) = post_json(&router, "/api/v1/nodes", &node).await;
+    assert!(
+        st == 201 || st == 200,
+        "node create: status={} body={}",
+        st,
+        body
+    );
+
+    let pod = prototype_pod("topo-pod-disabled");
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{}/pods", ns), &pod).await;
+    assert!(
+        st == 201 || st == 200,
+        "pod create: status={} body={}",
+        st,
+        body
+    );
+
+    let binding = json!({
+        "apiVersion": "v1",
+        "kind": "Binding",
+        "metadata": { "name": "topo-pod-disabled", "namespace": ns },
+        "target": { "kind": "Node", "name": "topo-node-disabled" },
+    });
+    let (st, body) = post_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/topo-pod-disabled/binding", ns),
+        &binding,
+    )
+    .await;
+    assert!(
+        st == 201 || st == 200,
+        "binding create: status={} body={}",
+        st,
+        body
+    );
+
+    let (st, body) = get(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/topo-pod-disabled", ns),
+    )
+    .await;
+    assert_eq!(st, 200, "pod get: body={}", body);
+
+    // Upstream contract: with the gate disabled, no `topology.kubernetes.io/*`
+    // labels should appear on the bound pod. The label map may be omitted
+    // entirely (None) or be present but empty — both shapes satisfy the
+    // "did nothing" assertion. Anything containing a topology key is a
+    // regression.
+    match body["metadata"]["labels"].as_object() {
+        None => { /* no labels object at all — pass */ }
+        Some(labels) => {
+            assert!(
+                !labels
+                    .keys()
+                    .any(|k| k.starts_with("topology.kubernetes.io/")),
+                "with PodTopologyLabelsAdmission disabled, no topology.kubernetes.io/* \
+                 keys must be copied from the node; got labels={:?}",
+                labels,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

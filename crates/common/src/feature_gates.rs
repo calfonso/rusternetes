@@ -29,6 +29,16 @@ pub enum Feature {
     /// GA + locked-to-default in v1.34; rusternetes targets v1.35 so the
     /// default is `true`.
     RelaxedDNSSearchValidation,
+
+    /// When enabled, the api-server's pod-binding handler copies
+    /// `topology.kubernetes.io/zone` and `topology.kubernetes.io/region`
+    /// labels from the bound Node onto the Pod. When disabled, the
+    /// binding handler does not touch the pod's labels at all — matching
+    /// upstream's `Plugin.Admit` no-op behaviour when `p.enabled == false`.
+    ///
+    /// Upstream: `plugin/pkg/admission/podtopologylabels/admission.go`.
+    /// Beta in v1.35, default `true`.
+    PodTopologyLabelsAdmission,
 }
 
 impl Feature {
@@ -36,6 +46,7 @@ impl Feature {
     const fn idx(self) -> usize {
         match self {
             Feature::RelaxedDNSSearchValidation => 0,
+            Feature::PodTopologyLabelsAdmission => 1,
         }
     }
 
@@ -44,6 +55,8 @@ impl Feature {
         match self {
             // GA + LockToDefault since v1.34.
             Feature::RelaxedDNSSearchValidation => true,
+            // Beta in v1.35 — defaults to true.
+            Feature::PodTopologyLabelsAdmission => true,
         }
     }
 }
@@ -59,7 +72,10 @@ impl Feature {
 /// Skipping a gate here is therefore impossible without also changing every
 /// derived definition — the previous hand-maintained mirror in
 /// `reset_to_defaults` would silently miss new gates.
-pub const ALL_FEATURES: &[Feature] = &[Feature::RelaxedDNSSearchValidation];
+pub const ALL_FEATURES: &[Feature] = &[
+    Feature::RelaxedDNSSearchValidation,
+    Feature::PodTopologyLabelsAdmission,
+];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
 const NUM_FEATURES: usize = ALL_FEATURES.len();
@@ -72,9 +88,10 @@ const NUM_FEATURES: usize = ALL_FEATURES.len();
 /// that even a brand-new process — before any caller has invoked
 /// [`reset_to_defaults`] — sees the upstream default for every gate, not just
 /// `RelaxedDNSSearchValidation`.
-static STATES: [AtomicBool; NUM_FEATURES] = [AtomicBool::new(
-    Feature::RelaxedDNSSearchValidation.default_enabled(),
-)];
+static STATES: [AtomicBool; NUM_FEATURES] = [
+    AtomicBool::new(Feature::RelaxedDNSSearchValidation.default_enabled()),
+    AtomicBool::new(Feature::PodTopologyLabelsAdmission.default_enabled()),
+];
 
 /// Returns whether `feature` is currently enabled in this process.
 pub fn enabled(feature: Feature) -> bool {
@@ -138,6 +155,10 @@ mod tests {
             enabled(Feature::RelaxedDNSSearchValidation),
             "RelaxedDNSSearchValidation is GA-locked-default-true since v1.34"
         );
+        assert!(
+            enabled(Feature::PodTopologyLabelsAdmission),
+            "PodTopologyLabelsAdmission is Beta+enabled in v1.35; default must be true"
+        );
     }
 
     /// Pin that `STATES` is seeded from `default_enabled()` — without a
@@ -189,5 +210,17 @@ mod tests {
             assert!(!enabled(Feature::RelaxedDNSSearchValidation));
         }
         assert!(enabled(Feature::RelaxedDNSSearchValidation));
+    }
+
+    #[test]
+    #[serial]
+    fn pod_topology_labels_admission_guard_round_trip() {
+        reset_to_defaults();
+        assert!(enabled(Feature::PodTopologyLabelsAdmission));
+        {
+            let _g = with_feature(Feature::PodTopologyLabelsAdmission, false);
+            assert!(!enabled(Feature::PodTopologyLabelsAdmission));
+        }
+        assert!(enabled(Feature::PodTopologyLabelsAdmission));
     }
 }
