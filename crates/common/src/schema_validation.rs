@@ -23,6 +23,19 @@ use std::sync::{LazyLock, RwLock};
 static REGEX_CACHE: LazyLock<RwLock<HashMap<String, Regex>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Free helper: does `value` satisfy a JSONSchema `type` declaration?
+fn type_matches(type_: &str, value: &Value) -> bool {
+    matches!(
+        (type_, value),
+        ("object", Value::Object(_))
+            | ("array", Value::Array(_))
+            | ("string", Value::String(_))
+            | ("number", Value::Number(_))
+            | ("boolean", Value::Bool(_))
+            | ("null", Value::Null)
+    ) || (type_ == "integer" && matches!(value, Value::Number(n) if n.is_i64() || n.is_u64()))
+}
+
 fn compile_regex_cached(pattern: &str) -> Result<Regex, regex::Error> {
     if let Some(re) = REGEX_CACHE
         .read()
@@ -36,6 +49,49 @@ fn compile_regex_cached(pattern: &str) -> Result<Regex, regex::Error> {
         g.insert(pattern.to_string(), re.clone());
     }
     Ok(re)
+}
+
+/// A single validation issue with its location inside the validated value.
+///
+/// `path` is the sequence of structural segments from the root of the
+/// validated value to the offending node. Object segments are property
+/// names; array segments are indices. Empty path means the issue applies
+/// to the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub path: Vec<PathSeg>,
+    pub message: String,
+}
+
+/// A single segment of a JSON path used by ratcheting.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PathSeg {
+    /// Object property name (or `additionalProperties` key).
+    Key(String),
+    /// Array index.
+    Index(usize),
+}
+
+impl PathSeg {
+    /// Format a path as a K8s-style dotted/indexed string. The path
+    /// `[Key("list"), Index(0), Key("field")]` becomes `list[0].field`.
+    pub fn render_path(segs: &[PathSeg]) -> String {
+        let mut out = String::new();
+        for s in segs {
+            match s {
+                PathSeg::Key(k) => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(k);
+                }
+                PathSeg::Index(i) => {
+                    out.push_str(&format!("[{}]", i));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Validator validates JSON values against JSONSchemaProps
@@ -66,6 +122,240 @@ impl SchemaValidator {
     pub fn validate_no_unknown_check(schema: &JSONSchemaProps, value: &Value) -> Result<(), Error> {
         let mut dummy = Vec::new();
         Self::validate_with_path_skip_unknown(schema, value, "", &mut dummy)
+    }
+
+    /// Walk a JSON value against a schema and collect every validation issue
+    /// (with structural path segments) instead of returning at the first one.
+    /// Unknown-field detection is skipped — callers wanting strict behaviour
+    /// should still call [`Self::validate_strict`]. This is the entry point
+    /// used by CRD ratcheting (KEP-4008): the caller filters issues whose path
+    /// resolves to an unchanged correlatable sub-tree before reporting.
+    pub fn collect_issues(schema: &JSONSchemaProps, value: &Value) -> Vec<ValidationIssue> {
+        let mut out = Vec::new();
+        Self::collect_issues_recursive(schema, value, &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn collect_issues_recursive(
+        schema: &JSONSchemaProps,
+        value: &Value,
+        path: &mut Vec<PathSeg>,
+        out: &mut Vec<ValidationIssue>,
+    ) {
+        // Type check
+        if let Some(ref type_) = schema.type_ {
+            if !type_matches(type_, value) {
+                out.push(ValidationIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "{}: must be of type {}, got {}",
+                        PathSeg::render_path(path),
+                        type_,
+                        Self::value_type(value)
+                    ),
+                });
+                return;
+            }
+        }
+
+        // Enum
+        if let Some(ref enum_values) = schema.enum_ {
+            if !enum_values.contains(value) {
+                let val_str = match value {
+                    Value::String(s) => format!("\"{}\"", s),
+                    other => other.to_string(),
+                };
+                out.push(ValidationIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "{}: Unsupported value: {}",
+                        PathSeg::render_path(path),
+                        val_str
+                    ),
+                });
+            }
+        }
+
+        match value {
+            Value::Object(obj) => Self::collect_object(schema, obj, path, out),
+            Value::Array(arr) => Self::collect_array(schema, arr, path, out),
+            Value::String(s) => {
+                if let Err(e) = Self::validate_string(schema, s, &PathSeg::render_path(path)) {
+                    out.push(ValidationIssue {
+                        path: path.clone(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+            Value::Number(n) => {
+                if let Err(e) = Self::validate_number(schema, n, &PathSeg::render_path(path)) {
+                    out.push(ValidationIssue {
+                        path: path.clone(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+            Value::Bool(_) => {}
+            Value::Null => {
+                if let Some(false) = schema.nullable {
+                    out.push(ValidationIssue {
+                        path: path.clone(),
+                        message: format!("{}: cannot be null", PathSeg::render_path(path)),
+                    });
+                }
+            }
+        }
+    }
+
+    fn collect_object(
+        schema: &JSONSchemaProps,
+        obj: &serde_json::Map<String, Value>,
+        path: &mut Vec<PathSeg>,
+        out: &mut Vec<ValidationIssue>,
+    ) {
+        if let Some(ref required) = schema.required {
+            for field in required {
+                if !obj.contains_key(field) {
+                    let mut p = path.clone();
+                    p.push(PathSeg::Key(field.clone()));
+                    out.push(ValidationIssue {
+                        path: p,
+                        message: format!(
+                            "{}: Required value",
+                            {
+                                let mut s = PathSeg::render_path(path);
+                                if !s.is_empty() {
+                                    s.push('.');
+                                }
+                                s.push_str(field);
+                                s
+                            }
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let Some(min) = schema.min_properties {
+            if (obj.len() as i64) < min {
+                out.push(ValidationIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "{}: must have at least {} properties",
+                        PathSeg::render_path(path),
+                        min
+                    ),
+                });
+            }
+        }
+        if let Some(max) = schema.max_properties {
+            if (obj.len() as i64) > max {
+                out.push(ValidationIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "{}: must have at most {} properties",
+                        PathSeg::render_path(path),
+                        max
+                    ),
+                });
+            }
+        }
+
+        if let Some(ref properties) = schema.properties {
+            for (key, value) in obj {
+                if let Some(prop_schema) = properties.get(key) {
+                    path.push(PathSeg::Key(key.clone()));
+                    Self::collect_issues_recursive(prop_schema, value, path, out);
+                    path.pop();
+                } else if let Some(ref additional) = schema.additional_properties {
+                    use crate::resources::crd::JSONSchemaPropsOrBool;
+                    if let JSONSchemaPropsOrBool::Schema(addl_schema) = additional {
+                        path.push(PathSeg::Key(key.clone()));
+                        Self::collect_issues_recursive(addl_schema, value, path, out);
+                        path.pop();
+                    }
+                }
+            }
+        } else if let Some(ref additional) = schema.additional_properties {
+            use crate::resources::crd::JSONSchemaPropsOrBool;
+            if let JSONSchemaPropsOrBool::Schema(addl_schema) = additional {
+                for (key, value) in obj {
+                    path.push(PathSeg::Key(key.clone()));
+                    Self::collect_issues_recursive(addl_schema, value, path, out);
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    fn collect_array(
+        schema: &JSONSchemaProps,
+        arr: &[Value],
+        path: &mut Vec<PathSeg>,
+        out: &mut Vec<ValidationIssue>,
+    ) {
+        if let Some(min) = schema.min_items {
+            if (arr.len() as i64) < min {
+                out.push(ValidationIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "{}: must have at least {} items",
+                        PathSeg::render_path(path),
+                        min
+                    ),
+                });
+            }
+        }
+        if let Some(max) = schema.max_items {
+            if (arr.len() as i64) > max {
+                out.push(ValidationIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "{}: must have at most {} items",
+                        PathSeg::render_path(path),
+                        max
+                    ),
+                });
+            }
+        }
+        if let Some(true) = schema.unique_items {
+            let mut seen: Vec<&Value> = Vec::new();
+            for item in arr {
+                if seen.contains(&item) {
+                    out.push(ValidationIssue {
+                        path: path.clone(),
+                        message: format!(
+                            "{}: must have unique items",
+                            PathSeg::render_path(path)
+                        ),
+                    });
+                    break;
+                }
+                seen.push(item);
+            }
+        }
+
+        if let Some(ref items) = schema.items {
+            use crate::resources::crd::JSONSchemaPropsOrArray;
+            match items.as_ref() {
+                JSONSchemaPropsOrArray::Schema(item_schema) => {
+                    for (i, item) in arr.iter().enumerate() {
+                        path.push(PathSeg::Index(i));
+                        Self::collect_issues_recursive(item_schema, item, path, out);
+                        path.pop();
+                    }
+                }
+                JSONSchemaPropsOrArray::Schemas(schemas) => {
+                    for (i, item) in arr.iter().enumerate() {
+                        if let Some(s) = schemas.get(i) {
+                            path.push(PathSeg::Index(i));
+                            Self::collect_issues_recursive(s, item, path, out);
+                            path.pop();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Validate with strict mode — returns unknown fields as K8s-formatted errors.
@@ -295,16 +585,7 @@ impl SchemaValidator {
     }
 
     fn validate_type(type_: &str, value: &Value, path: &str) -> Result<(), Error> {
-        let matches = match (type_, value) {
-            ("object", Value::Object(_)) => true,
-            ("array", Value::Array(_)) => true,
-            ("string", Value::String(_)) => true,
-            ("number", Value::Number(_)) => true,
-            ("integer", Value::Number(n)) => n.is_i64() || n.is_u64(),
-            ("boolean", Value::Bool(_)) => true,
-            ("null", Value::Null) => true,
-            _ => false,
-        };
+        let matches = type_matches(type_, value);
 
         if !matches {
             return Err(Error::InvalidResource(format!(
