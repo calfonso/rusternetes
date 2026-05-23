@@ -21,22 +21,22 @@
 //! Each test below pins one observable contract of that pipeline:
 //!
 //!   - `test_post_cbor_configmap_decoded_and_stored`
-//!       POST `application/cbor` → server decodes → ConfigMap appears in
-//!       storage with the same `.data` map.
+//!     POST `application/cbor` → server decodes → ConfigMap appears in
+//!     storage with the same `.data` map.
 //!
 //!   - `test_get_cbor_round_trip`
-//!       GET with `Accept: application/cbor` → response is CBOR bytes whose
-//!       transcoded JSON matches the JSON shape of the resource.
+//!     GET with `Accept: application/cbor` → response is CBOR bytes whose
+//!     transcoded JSON matches the JSON shape of the resource.
 //!
 //!   - `test_crd_handler_accepts_cbor_body`
-//!       Pre-fix, `crates/api-server/src/handlers/crd.rs` rejected any
-//!       non-JSON first byte with HTTP 415. The fix moves CBOR decode into
-//!       the middleware, so CRD creation with `application/cbor` now
-//!       succeeds.
+//!     Pre-fix, `crates/api-server/src/handlers/crd.rs` rejected any
+//!     non-JSON first byte with HTTP 415. The fix moves CBOR decode into
+//!     the middleware, so CRD creation with `application/cbor` now
+//!     succeeds.
 //!
 //!   - `test_malformed_cbor_returns_400`
-//!       Random bytes sent with `application/cbor` must produce a 4xx, not
-//!       a panic and not silent data corruption.
+//!     Random bytes sent with `application/cbor` must produce a 4xx, not
+//!     a panic and not silent data corruption.
 
 use axum::{
     body::Body,
