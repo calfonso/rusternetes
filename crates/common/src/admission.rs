@@ -68,11 +68,24 @@ pub enum PatchOp {
     Test,
 }
 
-/// Admission request containing the resource to be validated/mutated
+/// Admission request containing the resource to be validated/mutated.
+///
+/// Mirrors the K8s admission `request` payload exposed to CEL expressions in
+/// `ValidatingAdmissionPolicy.spec.matchConditions[*]` and
+/// `Webhook.matchConditions[*]`. CEL expressions reference these fields via
+/// `request.kind.group`, `request.kind.version`, `request.kind.kind`,
+/// `request.operation`, etc.
+///
+/// Upstream Go reference: `staging/src/k8s.io/api/admission/v1/types.go`
+/// (`AdmissionRequest` — the wire request that webhooks receive).
 #[derive(Debug, Clone)]
 pub struct AdmissionRequest {
     /// The operation being performed (CREATE, UPDATE, DELETE)
     pub operation: Operation,
+    /// The API group of the resource (e.g. "apps", or "" for core).
+    pub group: String,
+    /// The API version of the resource (e.g. "v1", "v1beta1").
+    pub version: String,
     /// The resource kind (Pod, Service, etc.)
     pub kind: String,
     /// The resource namespace (if namespaced)
