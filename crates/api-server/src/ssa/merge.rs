@@ -2,15 +2,26 @@
 //!
 //! This module implements the smallest viable subset of K8s SSA: a JSON-Pointer
 //! based ownership tracker for string-map fields (`data`, `binaryData`,
-//! `metadata.labels`, `metadata.annotations`) and the scalar leaves under
-//! `metadata` that an Apply request is allowed to touch.
+//! `metadata.labels`, `metadata.annotations`, `stringData`) plus a small set
+//! of top-level atomic scalar leaves (e.g. `Secret.type`).
+//!
+//! # Schema-driven design
+//!
+//! Each supported resource registers a [`ResourceLeafSchema`] enumerating
+//! which string-map groups exist (via [`LeafGroup`]) and which atomic scalar
+//! leaves the applier may touch. The SSA driver
+//! ([`super::apply_via_schema`]) iterates the schema rather than hard-coding
+//! ConfigMap-specific groups. Today ConfigMap and Secret are registered;
+//! other resources still go through the legacy
+//! [`rusternetes_common::server_side_apply`] codepath.
 //!
 //! The full upstream merge algorithm in
 //! `staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/typeconverter.go`
-//! relies on the OpenAPI schema to know whether each field is `granular`
-//! (atomic / merge / set). ConfigMap is the smallest possible case — every
-//! managed field is a granular string leaf — so we hard-code the schema here
-//! and leave a TODO for schema-driven generalisation.
+//! is fully schema-driven off the OpenAPI spec. We deliberately ship a
+//! curated per-resource leaf schema instead: the OpenAPI converter is a much
+//! bigger lift, and the resources we care about for the first round of SSA
+//! conformance (ConfigMap, Secret) only need granular string-map merges plus
+//! a couple of atomic scalars.
 //!
 //! # Ownership representation
 //!
@@ -169,17 +180,24 @@ pub struct PathConflict {
     pub applying_manager: String,
 }
 
-/// The four leaf groups SSA recognises on ConfigMap.
+/// The string-map leaf groups SSA recognises.
 ///
-/// Each group is a flat string→string map. Server-Side Apply on these is
+/// Each group is a flat string→Value map. Server-Side Apply on these is
 /// always a granular merge: keys present in `desired` are claimed by the
 /// applying manager; keys absent from `desired` but previously owned by
 /// the applying manager are removed; keys owned by some other manager are
 /// left untouched (or trigger a conflict if `desired` tries to set them).
+///
+/// `StringData` is Secret-specific — it's a write-only sibling of `data`
+/// whose entries are base64-encoded and merged into `data` at storage time
+/// (see [`rusternetes_common::resources::Secret::normalize`]). SSA still
+/// tracks ownership of the raw `/stringData/<key>` paths so a manager that
+/// applied via `stringData` can later release those entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafGroup {
     Data,
     BinaryData,
+    StringData,
     Labels,
     Annotations,
 }
@@ -190,88 +208,139 @@ impl LeafGroup {
         match self {
             LeafGroup::Data => "data",
             LeafGroup::BinaryData => "binaryData",
+            LeafGroup::StringData => "stringData",
             LeafGroup::Labels => "metadata/labels",
             LeafGroup::Annotations => "metadata/annotations",
+        }
+    }
+
+    /// The JSON object path (sequence of object keys, no leading `/`) where
+    /// this group's inner map lives. `Data` lives at `["data"]`, `Labels`
+    /// lives at `["metadata", "labels"]`, etc.
+    fn path(self) -> &'static [&'static str] {
+        match self {
+            LeafGroup::Data => &["data"],
+            LeafGroup::BinaryData => &["binaryData"],
+            LeafGroup::StringData => &["stringData"],
+            LeafGroup::Labels => &["metadata", "labels"],
+            LeafGroup::Annotations => &["metadata", "annotations"],
         }
     }
 
     /// Walk the resource and return the inner string→Value map for this
     /// group, or an empty map if the parent path doesn't exist.
     pub fn extract_map(self, resource: &Value) -> Map<String, Value> {
-        match self {
-            LeafGroup::Data => resource
-                .get("data")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default(),
-            LeafGroup::BinaryData => resource
-                .get("binaryData")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default(),
-            LeafGroup::Labels => resource
-                .get("metadata")
-                .and_then(|m| m.get("labels"))
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default(),
-            LeafGroup::Annotations => resource
-                .get("metadata")
-                .and_then(|m| m.get("annotations"))
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default(),
+        let mut cursor = resource;
+        for segment in self.path() {
+            match cursor.get(segment) {
+                Some(next) => cursor = next,
+                None => return Map::new(),
+            }
         }
+        cursor.as_object().cloned().unwrap_or_default()
     }
 
-    /// Replace the inner map for this group on `resource`.
+    /// Replace the inner map for this group on `resource`. Empty maps are
+    /// removed (parity with upstream: an empty `data` field is serialised
+    /// out, not stored as `data: {}`).
     pub fn set_map(self, resource: &mut Value, map: Map<String, Value>) {
-        let obj = match resource.as_object_mut() {
-            Some(o) => o,
-            None => return,
+        let Some(root) = resource.as_object_mut() else {
+            return;
         };
-        match self {
-            LeafGroup::Data => {
-                if map.is_empty() {
-                    obj.remove("data");
-                } else {
-                    obj.insert("data".to_string(), Value::Object(map));
-                }
+        let segments = self.path();
+        // Walk-or-create down to the parent of the leaf key.
+        let (leaf_key, parents) = segments
+            .split_last()
+            .expect("LeafGroup::path() is never empty");
+        let mut cursor = root;
+        for segment in parents {
+            let entry = cursor
+                .entry((*segment).to_string())
+                .or_insert_with(|| json!({}));
+            match entry.as_object_mut() {
+                Some(obj) => cursor = obj,
+                None => return,
             }
-            LeafGroup::BinaryData => {
-                if map.is_empty() {
-                    obj.remove("binaryData");
-                } else {
-                    obj.insert("binaryData".to_string(), Value::Object(map));
-                }
-            }
-            LeafGroup::Labels => {
-                let meta = obj
-                    .entry("metadata".to_string())
-                    .or_insert_with(|| json!({}));
-                if let Some(meta_obj) = meta.as_object_mut() {
-                    if map.is_empty() {
-                        meta_obj.remove("labels");
-                    } else {
-                        meta_obj.insert("labels".to_string(), Value::Object(map));
-                    }
-                }
-            }
-            LeafGroup::Annotations => {
-                let meta = obj
-                    .entry("metadata".to_string())
-                    .or_insert_with(|| json!({}));
-                if let Some(meta_obj) = meta.as_object_mut() {
-                    if map.is_empty() {
-                        meta_obj.remove("annotations");
-                    } else {
-                        meta_obj.insert("annotations".to_string(), Value::Object(map));
-                    }
-                }
-            }
+        }
+        if map.is_empty() {
+            cursor.remove(*leaf_key);
+        } else {
+            cursor.insert((*leaf_key).to_string(), Value::Object(map));
         }
     }
 }
+
+/// Declarative SSA merge surface for one resource kind.
+///
+/// Each registered resource lists which string-map groups exist on it (the
+/// common cases — `data`, `metadata.labels`, etc.) and which top-level
+/// scalar leaves the applier may touch (e.g. `Secret.type`). The SSA driver
+/// iterates this schema rather than hard-coding per-kind logic, so adding a
+/// new resource is purely a matter of declaring its schema.
+///
+/// This is the rusternetes equivalent of the OpenAPI-driven type converter
+/// in `staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/typeconverter.go`
+/// — except we curate the schema by hand per resource we want to support,
+/// which keeps the implementation small while still being general enough
+/// to add new resources without touching the merge core.
+#[derive(Debug, Clone)]
+pub struct ResourceLeafSchema {
+    /// Kind name (e.g. `"ConfigMap"`, `"Secret"`). Used for diagnostics only.
+    pub kind: &'static str,
+    /// Plural resource name as it appears in API paths (e.g. `"configmaps"`,
+    /// `"secrets"`). Surfaced via the public field so downstream tooling
+    /// (audit, conformance reporting) can correlate a schema with its
+    /// REST path without re-deriving it.
+    #[allow(dead_code)]
+    pub apply_resource: &'static str,
+    /// String-map groups merged with granular ownership.
+    pub string_map_groups: &'static [LeafGroup],
+    /// Top-level scalar leaves an Apply request may touch directly. Each
+    /// entry is a top-level JSON object key (no nested paths supported
+    /// yet — Secret only needs `type`).
+    pub atomic_leaves: &'static [&'static str],
+    /// Whether the resource honours `immutable: true` post-create (true
+    /// for both ConfigMap and Secret). The post-merge enforcement lives
+    /// in the per-resource HTTP handler (`apply_configmap_ssa`,
+    /// `apply_secret_ssa`) rather than in the merge core; this flag is
+    /// exposed so a future generic immutability fence can consult the
+    /// schema instead of being hard-coded per resource.
+    #[allow(dead_code)]
+    pub immutable_supported: bool,
+}
+
+/// SSA schema for `ConfigMap`. Four string-map groups, no atomic leaves
+/// outside `metadata.*`.
+pub const CONFIGMAP_SCHEMA: ResourceLeafSchema = ResourceLeafSchema {
+    kind: "ConfigMap",
+    apply_resource: "configmaps",
+    string_map_groups: &[
+        LeafGroup::Data,
+        LeafGroup::BinaryData,
+        LeafGroup::Labels,
+        LeafGroup::Annotations,
+    ],
+    atomic_leaves: &[],
+    immutable_supported: true,
+};
+
+/// SSA schema for `Secret`. Two payload string-map groups (`data` plus the
+/// write-only `stringData` sibling), the usual metadata maps, and a single
+/// atomic scalar — `type` — which upstream
+/// (`pkg/registry/core/secret/strategy.go::ValidateUpdate`) treats as
+/// immutable post-create via `ValidateImmutableField`.
+pub const SECRET_SCHEMA: ResourceLeafSchema = ResourceLeafSchema {
+    kind: "Secret",
+    apply_resource: "secrets",
+    string_map_groups: &[
+        LeafGroup::Data,
+        LeafGroup::StringData,
+        LeafGroup::Labels,
+        LeafGroup::Annotations,
+    ],
+    atomic_leaves: &["type"],
+    immutable_supported: true,
+};
 
 /// Per-group structural merge result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

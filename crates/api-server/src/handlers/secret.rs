@@ -7,6 +7,7 @@ use axum::{
 };
 use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
+    admission::{GroupVersionKind, Operation},
     authz::{Decision, RequestAttributes},
     resources::{PodSpec, Secret},
     List, Result,
@@ -462,8 +463,311 @@ pub async fn list_all_secrets(
     Ok(Json(list).into_response())
 }
 
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, Secret, "secrets", "");
+// Generic PATCH handler used for all non-SSA patch types (strategic merge,
+// JSON merge, JSON patch). The dispatcher below intercepts SSA before
+// delegating here so this macro still drives all the legacy patch paths.
+crate::patch_handler_namespaced!(patch_legacy, Secret, "secrets", "");
+
+/// Secret PATCH dispatcher.
+///
+/// Branches on `Content-Type`:
+///
+/// - `application/apply-patch+yaml` / `application/apply-patch+json` →
+///   schema-driven SSA via [`crate::ssa::apply_secret`].
+/// - everything else → the legacy [`patch_legacy`] handler (strategic
+///   merge, JSON merge, JSON patch).
+///
+/// ConfigMap and Secret are the two resources wired to the new SSA module
+/// today. Other resources (Pod / Deployment / Service / …) still go through
+/// the legacy top-level-key SSA in `rusternetes_common::server_side_apply`
+/// via the generic patch macro — see `handlers::configmap::patch` for the
+/// pattern this mirrors.
+pub async fn patch(
+    state: axum::extract::State<Arc<ApiServerState>>,
+    auth_ctx: axum::Extension<AuthContext>,
+    path: axum::extract::Path<(String, String)>,
+    query: axum::extract::Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response> {
+    let content_type = headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if content_type.contains("apply-patch") {
+        return apply_secret_ssa(state, auth_ctx, path, query, &content_type, body).await;
+    }
+
+    // Delegate to the legacy patch handler.
+    let response = patch_legacy(state, auth_ctx, path, query, headers, body).await?;
+    Ok(response.into_response())
+}
+
+/// Server-Side Apply branch for Secret PATCH.
+///
+/// Mirrors `handlers::configmap::apply_configmap_ssa` line-for-line — the
+/// only Secret-specific bits are:
+///
+/// 1. `Secret.type` immutability fence post-create. Upstream
+///    `pkg/registry/core/secret/strategy.go::ValidateUpdate` calls
+///    `apivalidation.ValidateImmutableField(newSecret.Type, oldSecret.Type, …)`
+///    unconditionally — SSA must honour that too, otherwise an applier
+///    could flip `type: Opaque` to `type: kubernetes.io/basic-auth` after
+///    create.
+/// 2. `Secret::normalize()` is called after the merge so the `stringData`
+///    entries the applier supplied are folded into `data` (base64-encoded)
+///    before storage. SSA ownership is tracked against the raw
+///    `/stringData/<key>` paths so the applier can later release them by
+///    re-applying without that key.
+/// 3. The `immutable: true` fence is wider than ConfigMap's — Secret
+///    blocks `data`, `stringData`, and `type` changes once locked.
+async fn apply_secret_ssa(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    content_type: &str,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response> {
+    info!(
+        "SSA apply secret {}/{} (Content-Type: {})",
+        namespace, name, content_type
+    );
+
+    // Save user info for webhooks before RBAC check consumes it.
+    let webhook_user = auth_ctx.user.clone();
+
+    // RBAC: SSA uses the `patch` verb.
+    let attrs = RequestAttributes::new(auth_ctx.user, "patch", "secrets")
+        .with_api_group("")
+        .with_namespace(&namespace)
+        .with_name(&name);
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => {
+            return Err(rusternetes_common::Error::Forbidden(reason));
+        }
+    }
+
+    // ?fieldManager= is mandatory for SSA; upstream returns 400 when missing.
+    let field_manager = params.get("fieldManager").cloned().ok_or_else(|| {
+        rusternetes_common::Error::BadRequest(
+            "fieldManager query parameter is required for apply-patch requests".to_string(),
+        )
+    })?;
+    let force = params
+        .get("force")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
+    let opts = crate::ssa::ApplyOptions::new(field_manager).with_force(force);
+
+    // Decode the body — apply-patch+yaml or apply-patch+json.
+    let mut desired = crate::ssa::decode_apply_body(content_type, &body)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+    // Path-coerce name/namespace so the body cannot rename the object.
+    if let Some(meta) = desired
+        .as_object_mut()
+        .and_then(|o| o.get_mut("metadata"))
+        .and_then(|m| m.as_object_mut())
+    {
+        meta.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        meta.insert(
+            "namespace".to_string(),
+            serde_json::Value::String(namespace.clone()),
+        );
+    }
+
+    let key = build_key("secrets", Some(&namespace), &name);
+
+    // Load current object (if any) for the merge.
+    let current: Option<Secret> = match state.storage.get::<Secret>(&key).await {
+        Ok(s) => Some(s),
+        Err(rusternetes_common::Error::NotFound(_)) => None,
+        Err(e) => return Err(e),
+    };
+
+    let outcome = crate::ssa::apply_secret(current.as_ref(), &desired, &opts)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+
+    // Immutability + type-fence checks — both run only when there's an
+    // existing object. They cannot bypass via SSA, otherwise an applier
+    // could mutate immutable Secrets or flip the `type` field.
+    if let (Some(existing), crate::ssa::ApplyOutcome::Applied { ref object, .. }) =
+        (current.as_ref(), &outcome)
+    {
+        // `Secret.type` is immutable post-create per upstream strategy.
+        // Compare the merged object's type against the existing object's
+        // type — if the applier flipped it, reject. We allow the applier
+        // to omit `type` entirely (in which case the merger preserved the
+        // current value).
+        if existing.secret_type != object.secret_type {
+            return Err(rusternetes_common::Error::InvalidResource(format!(
+                "Secret \"{}/{}\" field is immutable: type",
+                namespace, name
+            )));
+        }
+
+        if existing.immutable == Some(true) {
+            // For an immutable Secret, reject any change to `data`,
+            // `stringData`, or the `immutable` flag itself. We compare
+            // both `data` and `stringData` because the merger preserves
+            // them as separate fields until `normalize()` runs below.
+            let data_changed = existing.data != object.data;
+            let string_data_changed = existing.string_data != object.string_data;
+            let immutable_changed =
+                object.immutable != Some(true) && object.immutable != existing.immutable;
+            if data_changed || string_data_changed || immutable_changed {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "Secret \"{}/{}\" is immutable",
+                    namespace, name
+                )));
+            }
+        }
+    }
+
+    match outcome {
+        crate::ssa::ApplyOutcome::Applied {
+            object: boxed,
+            created,
+        } => {
+            let mut object: Secret = *boxed;
+            // Ensure path-derived metadata is set even when the merge
+            // started from a brand-new body.
+            object.metadata.name = name.clone();
+            object.metadata.namespace = Some(namespace.clone());
+            if created {
+                object.metadata.ensure_uid();
+                object.metadata.ensure_creation_timestamp();
+            }
+            // Fold stringData into base64-encoded data before storage —
+            // matches `Secret::PrepareForCreate` / `PrepareForUpdate`
+            // semantics in upstream Go where `stringData` is a write-only
+            // convenience that never round-trips to clients.
+            object.normalize();
+
+            let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+
+            // Run mutating + validating admission webhooks on the
+            // SSA-produced object, mirroring the non-SSA PATCH path.
+            let op = if created {
+                Operation::Create
+            } else {
+                Operation::Update
+            };
+            let gvk = GroupVersionKind {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                kind: "Secret".to_string(),
+            };
+            let s_val = serde_json::to_value(&object).ok();
+            state
+                .webhook_manager
+                .run_validating_admission_policies_ext(
+                    &op,
+                    &gvk,
+                    s_val.as_ref(),
+                    None,
+                    Some("secrets"),
+                    Some(&namespace),
+                )
+                .await?;
+            {
+                let gvr = rusternetes_common::admission::GroupVersionResource {
+                    group: "".to_string(),
+                    version: "v1".to_string(),
+                    resource: "secrets".to_string(),
+                };
+                let user_info = rusternetes_common::admission::UserInfo {
+                    username: webhook_user.username.clone(),
+                    uid: webhook_user.uid.clone(),
+                    groups: webhook_user.groups.clone(),
+                };
+                let (response, mutated_obj) = state
+                    .webhook_manager
+                    .run_mutating_webhooks_with_dryrun(
+                        &op,
+                        &gvk,
+                        &gvr,
+                        Some(&namespace),
+                        &name,
+                        s_val.clone(),
+                        None,
+                        &user_info,
+                        is_dry_run,
+                    )
+                    .await?;
+                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &response {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "admission webhook denied the request: {}",
+                        reason
+                    )));
+                }
+                if let Some(mutated) = mutated_obj {
+                    if let Ok(m) = serde_json::from_value::<Secret>(mutated) {
+                        object = m;
+                    }
+                }
+                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
+                    .webhook_manager
+                    .run_validating_webhooks_with_dryrun(
+                        &op,
+                        &gvk,
+                        &gvr,
+                        Some(&namespace),
+                        &name,
+                        serde_json::to_value(&object).ok(),
+                        None,
+                        &user_info,
+                        is_dry_run,
+                    )
+                    .await?
+                {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "admission webhook denied the request: {}",
+                        reason
+                    )));
+                }
+            }
+
+            let saved: Secret = if is_dry_run {
+                object
+            } else if created {
+                state.storage.create::<Secret>(&key, &object).await?
+            } else {
+                state.storage.update::<Secret>(&key, &object).await?
+            };
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            Ok((status, axum::Json(saved)).into_response())
+        }
+        crate::ssa::ApplyOutcome::Conflicts(conflicts) => {
+            // Mirror upstream: 409 Conflict with reason=Conflict.
+            let detail = conflicts
+                .iter()
+                .map(|c| {
+                    format!(
+                        ".{} is managed by {}",
+                        c.path.replace('/', "."),
+                        c.current_manager
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(rusternetes_common::Error::Conflict(format!(
+                "Apply failed with {} conflict{}: {}",
+                conflicts.len(),
+                if conflicts.len() == 1 { "" } else { "s" },
+                detail
+            )))
+        }
+    }
+}
 
 pub async fn deletecollection_secrets(
     State(state): State<Arc<ApiServerState>>,
