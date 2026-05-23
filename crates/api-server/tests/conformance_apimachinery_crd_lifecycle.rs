@@ -1249,71 +1249,704 @@ async fn cel_transition_rule_violated_update_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// Validation ratcheting — crd_validation_ratcheting.go
+// Validation ratcheting — crd_validation_ratcheting.go (KEP-4008)
 // ---------------------------------------------------------------------------
 //
-// Ratcheting (the behaviour where unchanged correlatable fields are exempted
-// from new schema constraints on update) builds on CEL eval (this PR landed
-// CR-level rule evaluation + transition rules) plus a schema-diff engine that
-// walks the old/new CR pair and selectively re-validates only changed
-// sub-trees. The schema-diff engine is multi-week work, so all ratcheting
-// trackers stay `#[ignore]`d for now.
+// Each test follows the upstream pattern: create a CRD with a *lax* schema,
+// POST an instance that satisfies the lax schema, then PUT the CRD to install
+// a *tight* schema that the existing instance would fail. On the subsequent
+// PUT of the instance (typically with a label change), ratcheting must
+// suppress any failure whose path resolves to an unchanged correlatable
+// sub-tree. Transition rules (those referencing `oldSelf`) are NEVER
+// ratcheted.
+
+/// Build a permissive CRD whose `spec` is `preserveUnknownFields: true` so
+/// the initial CR survives without any constraint, and tightening to the
+/// real schema later is purely additive. We park each test on its own group
+/// to isolate CRD state inside the per-test in-memory storage.
+fn ratchet_lax_crd(group: &str) -> Value {
+    json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": format!("ratchets.{group}")},
+        "spec": {
+            "group": group,
+            "scope": "Namespaced",
+            "names": {
+                "plural": "ratchets",
+                "singular": "ratchet",
+                "kind": "Ratchet",
+                "listKind": "RatchetList",
+            },
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "x-kubernetes-preserve-unknown-fields": true,
+                    }
+                }
+            }]
+        }
+    })
+}
+
+/// Replace the schema on the existing CRD with `spec_props`. The CRD route
+/// expects a fully-formed body; we keep names/group identical to the lax
+/// CRD and only swap the schema for the named version.
+fn ratchet_tight_crd(group: &str, spec_props: Value) -> Value {
+    json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": format!("ratchets.{group}")},
+        "spec": {
+            "group": group,
+            "scope": "Namespaced",
+            "names": {
+                "plural": "ratchets",
+                "singular": "ratchet",
+                "kind": "Ratchet",
+                "listKind": "RatchetList",
+            },
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": spec_props,
+                        }
+                    }
+                }
+            }]
+        }
+    })
+}
+
+async fn ratchet_install_crd(router: &axum::Router, body: &Value) {
+    let (s, b) = post_json(
+        router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        body,
+    )
+    .await;
+    assert_eq!(s, 201, "lax CRD must install, body={b}");
+}
+
+async fn ratchet_tighten_crd(router: &axum::Router, group: &str, body: &Value) {
+    let uri = format!(
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/ratchets.{group}"
+    );
+    let (s, b) = put_json(router, &uri, body).await;
+    assert_eq!(s, 200, "tight CRD update must succeed, body={b}");
+}
+
+async fn ratchet_post_cr(
+    router: &axum::Router,
+    group: &str,
+    name: &str,
+    spec: Value,
+) -> (u16, Value) {
+    let cr = json!({
+        "apiVersion": format!("{group}/v1"),
+        "kind": "Ratchet",
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": spec,
+    });
+    let uri = format!("/apis/{group}/v1/namespaces/default/ratchets");
+    post_json(router, &uri, &cr).await
+}
+
+async fn ratchet_put_cr(
+    router: &axum::Router,
+    group: &str,
+    name: &str,
+    spec: Value,
+    labels: Option<Value>,
+) -> (u16, Value) {
+    let mut metadata = json!({"name": name, "namespace": "default"});
+    if let Some(l) = labels {
+        metadata["labels"] = l;
+    }
+    let cr = json!({
+        "apiVersion": format!("{group}/v1"),
+        "kind": "Ratchet",
+        "metadata": metadata,
+        "spec": spec,
+    });
+    let uri = format!("/apis/{group}/v1/namespaces/default/ratchets/{name}");
+    put_json(router, &uri, &cr).await
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to JSONSchema errors on unchanged correlatable fields [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:201
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {}
+async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {
+    let (_mem, _state, router) = spawn_router();
+    let group = "rl1.example.com";
+
+    // 1) Permissive CRD.
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    // 2) Create an instance with values that the tight schema will later
+    //    reject (`field: "foo"`, but the tight enum allows only "notfoo").
+    let instance_spec = json!({
+        "field": "foo",
+        "struct": {"field": "foo"},
+        "list": [{"key": "first", "field": "foo"}],
+        "map": {"foo": {"field": "foo"}}
+    });
+    let (s, b) = ratchet_post_cr(&router, group, "t1", instance_spec.clone()).await;
+    assert_eq!(s, 201, "CREATE under lax schema must succeed, body={b}");
+
+    // 3) Tighten the schema: enum allows only "notfoo".
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "enum": ["notfoo"]},
+            "struct": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string", "enum": ["notfoo"]}
+                }
+            },
+            "list": {
+                "type": "array",
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["key"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "field": {"type": "string", "enum": ["notfoo"]}
+                    },
+                    "required": ["key"]
+                }
+            },
+            "map": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string", "enum": ["notfoo"]}
+                    }
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    // 4) Re-PUT the same instance with a label change. Every offending
+    //    `field == "foo"` value is unchanged AND lives under a correlatable
+    //    parent (struct, list-type=map keyed by "key", map by name) so
+    //    ratcheting must suppress every error.
+    let (s, b) = ratchet_put_cr(
+        &router,
+        group,
+        "t1",
+        instance_spec,
+        Some(json!({"foo": "bar"})),
+    )
+    .await;
+    assert_eq!(
+        s, 200,
+        "UPDATE with unchanged correlatable invalid values must be ratcheted, body={b}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on unchanged uncorrelatable fields [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:244
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {}
+async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {
+    let (_mem, _state, router) = spawn_router();
+    let group = "rl2.example.com";
+
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    // Two uncorrelatable arrays (atomic + set).
+    let initial = json!({
+        "atomicArray": ["foo", "bar", "baz"],
+        "setArray": ["foo", "bar", "baz"],
+    });
+    let (s, b) = ratchet_post_cr(&router, group, "t1", initial.clone()).await;
+    assert_eq!(s, 201, "CREATE under lax schema must succeed, body={b}");
+
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "atomicArray": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["notfoo", "notbar", "notbaz"]
+                }
+            },
+            "setArray": {
+                "type": "array",
+                "x-kubernetes-list-type": "set",
+                "items": {
+                    "type": "string",
+                    "enum": ["notfoo", "notbar", "notbaz"]
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    // Even appending a *valid* element doesn't help: every existing element
+    // fails enum, and atomic/set arrays are uncorrelatable per upstream so
+    // index-level ratcheting never kicks in.
+    let modified = json!({
+        "atomicArray": ["foo", "bar", "baz", "notfoo"],
+        "setArray": ["foo", "bar", "baz", "notfoo"],
+    });
+    let (s, body) = ratchet_put_cr(
+        &router,
+        group,
+        "t1",
+        modified,
+        Some(json!({"foo": "bar"})),
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "UPDATE on uncorrelatable arrays must be rejected, got {s}, body={body}"
+    );
+    let msg = body["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("atomicArray") || msg.contains("setArray"),
+        "rejection must reference one of the offending arrays, got: {msg}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to JSONSchema errors on changed fields [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:280
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_changed_jsonschema_errors_blocked() {}
+async fn ratcheting_changed_jsonschema_errors_blocked() {
+    let (_mem, _state, router) = spawn_router();
+    let group = "rl3.example.com";
+
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    let initial = json!({
+        "field": "foo",
+        "struct": {"field": "foo"},
+        "list": [
+            {"key": "foo", "field": "foo"},
+            {"key": "bar", "field": "foo"}
+        ],
+        "map": {"foo": {"field": "foo"}, "bar": {"field": "foo"}}
+    });
+    let (s, _) = ratchet_post_cr(&router, group, "t1", initial).await;
+    assert_eq!(s, 201);
+
+    // Tight enum allows ONLY "foo". The instance was created with "foo", so
+    // unchanged values would pass. We now change every value to "notfoo".
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "enum": ["foo"]},
+            "struct": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string", "enum": ["foo"]}
+                }
+            },
+            "list": {
+                "type": "array",
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["key"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "field": {"type": "string", "enum": ["foo"]}
+                    },
+                    "required": ["key"]
+                }
+            },
+            "map": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string", "enum": ["foo"]}
+                    }
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    let modified = json!({
+        "field": "notfoo",
+        "struct": {"field": "notfoo"},
+        "list": [
+            {"key": "foo", "field": "notfoo"},
+            {"key": "bar", "field": "notfoo"}
+        ],
+        "map": {"foo": {"field": "notfoo"}, "bar": {"field": "notfoo"}}
+    });
+    let (s, body) = ratchet_put_cr(&router, group, "t1", modified, None).await;
+    assert!(
+        (400..500).contains(&s),
+        "changed-field UPDATE must be rejected, got {s}, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST NOT fail to update a resource due to CRD Validation Rule errors on unchanged correlatable fields [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:333
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {}
+async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {
+    let (_mem, _state, router) = spawn_router();
+    let group = "rl4.example.com";
+
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    // Initial instance violates the (about-to-be-installed) CEL rule
+    // `self == "foo"`.
+    let initial = json!({
+        "field": "notfoo",
+        "struct": {"field": "notfoo"},
+        "list": [
+            {"key": "foo", "field": "notfoo"},
+            {"key": "bar", "field": "notfoo"}
+        ],
+        "map": {"foo": {"field": "notfoo"}, "bar": {"field": "notfoo"}}
+    });
+    let (s, b) = ratchet_post_cr(&router, group, "t1", initial.clone()).await;
+    assert_eq!(s, 201, "CREATE must succeed, body={b}");
+
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "string",
+                "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+            },
+            "otherField": {"type": "string"},
+            "struct": {
+                "type": "object",
+                "properties": {
+                    "field": {
+                        "type": "string",
+                        "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+                    },
+                    "otherField": {"type": "string"}
+                }
+            },
+            "list": {
+                "type": "array",
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["key"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "field": {
+                            "type": "string",
+                            "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+                        },
+                        "otherField": {"type": "string"}
+                    },
+                    "required": ["key"]
+                }
+            },
+            "map": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                            "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+                        },
+                        "otherField": {"type": "string"}
+                    }
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    // Introduce a brand new (valid) field everywhere but leave the old
+    // invalid `field` values untouched. Also append a new list item with a
+    // valid `field` value — its `field` is changed (introduced) but valid.
+    let modified = json!({
+        "field": "notfoo",
+        "otherField": "doesntmatter",
+        "struct": {
+            "field": "notfoo",
+            "otherField": "doesntmatter"
+        },
+        "list": [
+            {"key": "foo", "field": "notfoo", "otherField": "doesntmatter"},
+            {"key": "bar", "field": "notfoo", "otherField": "doesntmatter"},
+            {"key": "baz", "field": "foo", "otherField": "doesntmatter"}
+        ],
+        "map": {
+            "foo": {"field": "notfoo", "otherField": "doesntmatter"},
+            "bar": {"field": "notfoo", "otherField": "doesntmatter"}
+        }
+    });
+    let (s, b) = ratchet_put_cr(&router, group, "t1", modified, None).await;
+    assert_eq!(
+        s, 200,
+        "UPDATE must ratchet unchanged correlatable CEL failures, body={b}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on unchanged uncorrelatable fields [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:412
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {}
+async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {
+    let (_mem, _state, router) = spawn_router();
+    let group = "rl5.example.com";
+
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    let initial = json!({
+        "setArray": ["foo", "bar", "baz"],
+        "atomicArray": ["foo", "bar", "baz"],
+    });
+    let (s, _) = ratchet_post_cr(&router, group, "t1", initial).await;
+    assert_eq!(s, 201);
+
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "atomicArray": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "x-kubernetes-validations": [{"rule": "self != 'foo'"}]
+                }
+            },
+            "setArray": {
+                "type": "array",
+                "x-kubernetes-list-type": "set",
+                "items": {
+                    "type": "string",
+                    "x-kubernetes-validations": [{"rule": "self != 'foo'"}]
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    let modified = json!({
+        "setArray": ["foo", "bar", "baz", "notfoo"],
+        "atomicArray": ["foo", "bar", "baz", "notfoo"],
+    });
+    let (s, body) = ratchet_put_cr(
+        &router,
+        group,
+        "t1",
+        modified,
+        Some(json!({"foo": "bar"})),
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "UPDATE on uncorrelatable arrays must be rejected, got {s}, body={body}"
+    );
+    let msg = body["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("atomicArray") || msg.contains("setArray"),
+        "rejection must reference one of the offending arrays, got: {msg}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail to update a resource due to CRD Validation Rule errors on changed fields [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:448
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_changed_cel_errors_blocked() {}
+async fn ratcheting_changed_cel_errors_blocked() {
+    let (_mem, _state, router) = spawn_router();
+    let group = "rl6.example.com";
+
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    let initial = json!({
+        "field": "foo",
+        "struct": {"field": "foo"},
+        "list": [
+            {"key": "foo", "field": "foo"},
+            {"key": "bar", "field": "foo"}
+        ],
+        "map": {"foo": {"field": "foo"}, "bar": {"field": "foo"}}
+    });
+    let (s, _) = ratchet_post_cr(&router, group, "t1", initial).await;
+    assert_eq!(s, 201);
+
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "string",
+                "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+            },
+            "struct": {
+                "type": "object",
+                "properties": {
+                    "field": {
+                        "type": "string",
+                        "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+                    }
+                }
+            },
+            "list": {
+                "type": "array",
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["key"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "field": {
+                            "type": "string",
+                            "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+                        }
+                    },
+                    "required": ["key"]
+                }
+            },
+            "map": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                            "x-kubernetes-validations": [{"rule": "self == 'foo'"}]
+                        }
+                    }
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    let modified = json!({
+        "field": "notfoo",
+        "struct": {"field": "notfoo"},
+        "list": [
+            {"key": "foo", "field": "notfoo"},
+            {"key": "bar", "field": "notfoo"}
+        ],
+        "map": {"foo": {"field": "notfoo"}, "bar": {"field": "notfoo"}}
+    });
+    let (s, body) = ratchet_put_cr(&router, group, "t1", modified, None).await;
+    assert!(
+        (400..500).contains(&s),
+        "changed-field UPDATE must be rejected, got {s}, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST NOT ratchet errors raised by transition rules [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_ratcheting.go:511
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_transition_rule_errors_never_ratcheted() {}
+async fn ratcheting_transition_rule_errors_never_ratcheted() {
+    let (_mem, _state, router) = spawn_router();
+    let group = "rl7.example.com";
+
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    let initial = json!({
+        "field": "foo",
+        "struct": {"field": "foo"},
+        "list": [
+            {"key": "foo", "field": "foo"},
+            {"key": "bar", "field": "foo"}
+        ],
+        "map": {"foo": {"field": "foo"}, "bar": {"field": "foo"}}
+    });
+    let (s, _) = ratchet_post_cr(&router, group, "t1", initial.clone()).await;
+    assert_eq!(s, 201);
+
+    // Tight CRD with transition rule `self != oldSelf`. Even with the
+    // sub-tree unchanged (`self == oldSelf`), this rule MUST fail — and
+    // ratcheting MUST NOT suppress it.
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "string",
+                "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
+            },
+            "struct": {
+                "type": "object",
+                "properties": {
+                    "field": {
+                        "type": "string",
+                        "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
+                    }
+                }
+            },
+            "list": {
+                "type": "array",
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["key"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "field": {
+                            "type": "string",
+                            "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
+                        }
+                    },
+                    "required": ["key"]
+                }
+            },
+            "map": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                            "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
+                        }
+                    }
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    // PUT the SAME instance (label-only change). Every transition rule must
+    // fail because `self == oldSelf` for every covered leaf.
+    let (s, body) = ratchet_put_cr(
+        &router,
+        group,
+        "t1",
+        initial,
+        Some(json!({"foo": "bar"})),
+    )
+    .await;
+    assert!(
+        (400..500).contains(&s),
+        "transition rule failure must NOT be ratcheted, got {s}, body={body}"
+    );
+}
 
 /// [sig-api-machinery] CustomResourceValidationRules MUST evaluate a CRD Validation Rule with oldSelf = nil for new values when optionalOldSelf is true [Conformance]
 ///
