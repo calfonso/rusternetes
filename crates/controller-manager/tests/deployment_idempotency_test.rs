@@ -311,6 +311,47 @@ async fn snapshot(storage: &Arc<MemoryStorage>, key: &str) -> String {
     serde_json::to_string(&v).unwrap()
 }
 
+/// Simulate what a real cluster's kubelet + ReplicaSet controller would do
+/// between deployment reconciles: walk every ReplicaSet in the namespace and
+/// bring its `.status` fields up to match its `.spec.replicas` (i.e. "every
+/// pod the RS asked for is now Running, Ready, and Available").
+///
+/// In production this convergence happens asynchronously across many controllers
+/// (RS controller observes pods, kubelet posts pod status, RS controller
+/// aggregates back into `status.{ready,available}Replicas`). For deterministic
+/// unit tests of the *deployment* reconciler we collapse that pipeline into
+/// one synchronous step so the rolling-update progression branch sees the
+/// availability the cluster would actually have settled on, instead of the
+/// stale preseeded numbers that produce a spurious "scale old RS down"
+/// decision.
+///
+/// Only the RS `.status` fields the deployment controller reads in
+/// `reconcileNewReplicaSet` / `reconcileOldReplicaSets` are updated.
+async fn simulate_kubelet_convergence(storage: &Arc<MemoryStorage>, namespace: &str) {
+    let rs_prefix = rusternetes_storage::build_prefix("replicasets", Some(namespace));
+    let all_rs: Vec<ReplicaSet> = storage.list(&rs_prefix).await.unwrap_or_default();
+    for mut rs in all_rs {
+        let target = rs.spec.replicas;
+        let needs_update = rs.status.as_ref().is_none_or(|s| {
+            s.replicas != target || s.ready_replicas != target || s.available_replicas != target
+        });
+        if !needs_update {
+            continue;
+        }
+        rs.status = Some(ReplicaSetStatus {
+            replicas: target,
+            ready_replicas: target,
+            available_replicas: target,
+            fully_labeled_replicas: Some(target),
+            observed_generation: rs.status.as_ref().and_then(|s| s.observed_generation),
+            conditions: rs.status.as_ref().and_then(|s| s.conditions.clone()),
+            terminating_replicas: rs.status.as_ref().and_then(|s| s.terminating_replicas),
+        });
+        let key = build_key("replicasets", Some(namespace), &rs.metadata.name);
+        storage.update(&key, &rs).await.unwrap();
+    }
+}
+
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
@@ -459,16 +500,6 @@ async fn test_deployment_annotation_refresh_skipped_when_values_match() {
 /// Note: with `is_rolling_update == false`, this becomes a stricter test —
 /// the controller must not silently invent writes in the absence of a
 /// rolling-update plan.
-// IGNORED: this test fails not because Unit 8 (proportional scaling) is broken
-// — that block converges in one reconcile as Unit 8 promises — but because the
-// fall-through RollingUpdate progression branch reacts to the test's frozen
-// ReplicaSet status (availableReplicas=20 on each RS, totaling 40 ≥ desired=30)
-// and legitimately scales the old RS down. In a real cluster pod status flows
-// back to RS status and the rolling-update terminates. Fixing the test would
-// require simulating live status convergence, which is out of scope here.
-// Tracked as a separate concern: rolling-update progression should be more
-// defensive about stale or test-only status fields.
-#[ignore = "rolling-update progression scales the old RS on the second reconcile because MemoryStorage cannot simulate live pod->RS status convergence; needs a status-driving fixture"]
 #[tokio::test]
 async fn test_proportional_scaling_converges_no_oscillation() {
     let storage = setup().await;
@@ -515,15 +546,16 @@ async fn test_proportional_scaling_converges_no_oscillation() {
     let controller = DeploymentController::new(storage.clone(), 10);
 
     // First reconcile: legitimate scaling event detected (annotation 25 != 30).
-    // Proportional scaling distributes replicas and refreshes annotations.
+    // Proportional scaling distributes replicas (oldRS 20→32, newRS 5→6 so
+    // the total reaches desired+maxSurge=38) and refreshes annotations to
+    // the new desired=30 / max=38.
     let dep: Deployment = storage.get(&dep_key).await.unwrap();
     controller.reconcile_deployment(&dep).await.unwrap();
 
     // After the first reconcile, ALL active RSes should carry desired=30 and
     // max=38 annotations — that's the Unit 8 promise.
-    let old_now: ReplicaSet = storage.get(&old_key).await.unwrap();
-    let new_now: ReplicaSet = storage.get(&new_key).await.unwrap();
-    for (label, rs) in [("old", &old_now), ("new", &new_now)] {
+    for (label, key) in [("old", &old_key), ("new", &new_key)] {
+        let rs: ReplicaSet = storage.get(key).await.unwrap();
         let ann = rs
             .metadata
             .annotations
@@ -545,55 +577,88 @@ async fn test_proportional_scaling_converges_no_oscillation() {
         );
     }
 
-    // Snapshot the state of the RSes that were updated by proportional scaling.
-    let old_after_first = snapshot(&storage, &old_key).await;
-    let new_after_first = snapshot(&storage, &new_key).await;
+    // Drive the rolling-update to convergence the same way a live cluster
+    // would: between each deployment reconcile, simulate the RS controller +
+    // kubelet bringing pod status in line with spec.replicas. The deployment
+    // reconciler's rolling-update progression will then legitimately scale
+    // the new RS up and the old RS down, eventually reaching new=30 / old=0
+    // (no more old pods, all new pods Ready).
+    //
+    // Bounded loop: in the worst case each reconcile shifts at most maxSurge
+    // pods, so 30 steps is a generous upper bound and prevents an infinite
+    // loop if the controller regressed.
+    let mut converged = false;
+    for _ in 0..30 {
+        simulate_kubelet_convergence(&storage, ns).await;
+        let dep: Deployment = storage.get(&dep_key).await.unwrap();
+        controller.reconcile_deployment(&dep).await.unwrap();
 
-    // Second reconcile: deployment.replicas (30) now matches both RS
-    // desired-replicas annotations (30), so is_scaling_event must be false.
-    // The Unit 8 proportional-scaling block must not re-fire and must not
-    // re-write the annotations it already set.
-    let dep: Deployment = storage.get(&dep_key).await.unwrap();
-    controller.reconcile_deployment(&dep).await.unwrap();
+        let new_rs: ReplicaSet = storage.get(&new_key).await.unwrap();
+        let old_rs: ReplicaSet = storage.get(&old_key).await.unwrap();
+        if new_rs.spec.replicas == 30 && old_rs.spec.replicas == 0 {
+            converged = true;
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "rolling update should converge to new=30 / old=0 within 30 reconciles"
+    );
 
-    // Verify the annotations are still 30/38 — i.e. annotation refresh did
-    // not run again (no redundant write that would re-fire watchers).
-    let old_after_second_rs: ReplicaSet = storage.get(&old_key).await.unwrap();
-    let new_after_second_rs: ReplicaSet = storage.get(&new_key).await.unwrap();
-    for (label, rs) in [("old", &old_after_second_rs), ("new", &new_after_second_rs)] {
-        let ann = rs.metadata.annotations.as_ref().unwrap();
+    // Throughout convergence the proportional-scaling annotations on every
+    // active RS must remain pinned at desired=30 / max=38 — they were set
+    // exactly once by the scaling-event branch and the subsequent reconciles
+    // must NOT have re-fired it (which would be the hot-loop signature).
+    {
+        let new_rs: ReplicaSet = storage.get(&new_key).await.unwrap();
+        let ann = new_rs.metadata.annotations.as_ref().unwrap();
         assert_eq!(
             ann.get("deployment.kubernetes.io/desired-replicas")
                 .map(String::as_str),
             Some("30"),
-            "{} RS desired-replicas annotation must remain 30 across second reconcile",
-            label
+            "active RS desired-replicas annotation must stay 30 after convergence"
         );
         assert_eq!(
             ann.get("deployment.kubernetes.io/max-replicas")
                 .map(String::as_str),
             Some("38"),
-            "{} RS max-replicas annotation must remain 38 across second reconcile",
-            label
+            "active RS max-replicas annotation must stay 38 after convergence"
         );
     }
 
-    let old_after_second = snapshot(&storage, &old_key).await;
-    let new_after_second = snapshot(&storage, &new_key).await;
+    // Bring RS status fully in line one more time, then take a steady-state
+    // snapshot.
+    simulate_kubelet_convergence(&storage, ns).await;
+    let dep: Deployment = storage.get(&dep_key).await.unwrap();
+    controller.reconcile_deployment(&dep).await.unwrap();
 
-    // Final byte-equality check. NOTE: if this assertion ever fails it
-    // indicates the deployment reconciler is still mutating ReplicaSets even
-    // after proportional scaling has logically converged (annotations match
-    // deployment.spec.replicas). That is the hot-loop signature Unit 8 was
-    // meant to eliminate.
-    assert_eq!(
-        old_after_first, old_after_second,
-        "Old RS must not be rewritten on second reconcile (scaling event has converged)"
-    );
-    assert_eq!(
-        new_after_first, new_after_second,
-        "New RS must not be rewritten on second reconcile (scaling event has converged)"
-    );
+    let old_steady = snapshot(&storage, &old_key).await;
+    let new_steady = snapshot(&storage, &new_key).await;
+
+    // Two more reconciles on the converged state. With status matching spec
+    // (kubelet convergence applied), no scaling decision should fire, no
+    // annotation should be rewritten, no RS field should be touched. Byte
+    // equality across these reconciles is the actual hot-loop assertion the
+    // original test wanted to make — now valid because we're testing it on
+    // a real steady state, not in the middle of an active rolling update.
+    for iteration in 1..=2 {
+        simulate_kubelet_convergence(&storage, ns).await;
+        let dep: Deployment = storage.get(&dep_key).await.unwrap();
+        controller.reconcile_deployment(&dep).await.unwrap();
+
+        let old_now = snapshot(&storage, &old_key).await;
+        let new_now = snapshot(&storage, &new_key).await;
+        assert_eq!(
+            old_steady, old_now,
+            "old RS must be byte-equal on converged reconcile #{}",
+            iteration
+        );
+        assert_eq!(
+            new_steady, new_now,
+            "new RS must be byte-equal on converged reconcile #{}",
+            iteration
+        );
+    }
 }
 
 /// A standalone Pod in an unrelated namespace, with NO owner references,
