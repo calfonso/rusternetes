@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::NetworkPolicy,
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut network_policy): Json<NetworkPolicy>,
+    DumpingJson(mut network_policy): DumpingJson<NetworkPolicy>,
 ) -> Result<(StatusCode, Json<NetworkPolicy>)> {
     info!(
         "Creating networkpolicy: {}/{}",
@@ -95,7 +96,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut network_policy): Json<NetworkPolicy>,
+    DumpingJson(mut network_policy): DumpingJson<NetworkPolicy>,
 ) -> Result<Json<NetworkPolicy>> {
     info!("Updating networkpolicy: {}/{}", namespace, name);
 

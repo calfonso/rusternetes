@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     admission::{GroupVersionKind, Operation},
     authz::{Decision, RequestAttributes},
@@ -21,7 +22,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut configmap): Json<ConfigMap>,
+    DumpingJson(mut configmap): DumpingJson<ConfigMap>,
 ) -> Result<(StatusCode, Json<ConfigMap>)> {
     info!(
         "Creating configmap: {} in namespace: {}",
@@ -185,7 +186,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut configmap): Json<ConfigMap>,
+    DumpingJson(mut configmap): DumpingJson<ConfigMap>,
 ) -> Result<Json<ConfigMap>> {
     info!("Updating configmap: {} in namespace: {}", name, namespace);
 

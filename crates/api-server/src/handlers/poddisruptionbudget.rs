@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::PodDisruptionBudget,
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut pdb): Json<PodDisruptionBudget>,
+    DumpingJson(mut pdb): DumpingJson<PodDisruptionBudget>,
 ) -> Result<(StatusCode, Json<PodDisruptionBudget>)> {
     info!(
         "Creating poddisruptionbudget: {}/{}",
@@ -93,7 +94,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut pdb): Json<PodDisruptionBudget>,
+    DumpingJson(mut pdb): DumpingJson<PodDisruptionBudget>,
 ) -> Result<Json<PodDisruptionBudget>> {
     info!("Updating poddisruptionbudget: {}/{}", namespace, name);
 
@@ -345,7 +346,7 @@ pub async fn update_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    Json(pdb): Json<PodDisruptionBudget>,
+    DumpingJson(pdb): DumpingJson<PodDisruptionBudget>,
 ) -> Result<Json<PodDisruptionBudget>> {
     info!(
         "Updating poddisruptionbudget status: {}/{}",

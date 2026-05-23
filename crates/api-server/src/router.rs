@@ -5,8 +5,9 @@ use axum::{
     middleware as axum_middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
-    Extension, Json, Router,
+    Extension, Router,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::resources::CustomResourceDefinition;
 use rusternetes_storage::{build_key, Storage};
 use std::path::Path;
@@ -566,7 +567,7 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
-                Json(status),
+                DumpingJson(status),
             )
             .await
             {
@@ -642,7 +643,7 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
-                Json(scale),
+                DumpingJson(scale),
             )
             .await
             {

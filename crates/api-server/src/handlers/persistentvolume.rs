@@ -6,6 +6,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::PersistentVolume,
@@ -159,7 +160,7 @@ pub async fn update_pv(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut pv): Json<PersistentVolume>,
+    DumpingJson(mut pv): DumpingJson<PersistentVolume>,
 ) -> Result<Json<PersistentVolume>> {
     info!("Updating PersistentVolume: {}", name);
 

@@ -5,6 +5,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::CSINode,
@@ -108,7 +109,7 @@ pub async fn update_csinode(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut node): Json<CSINode>,
+    DumpingJson(mut node): DumpingJson<CSINode>,
 ) -> Result<Json<CSINode>> {
     info!("Updating CSINode: {}", name);
 

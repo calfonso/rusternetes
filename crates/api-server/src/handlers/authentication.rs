@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{
@@ -21,7 +22,7 @@ use tracing::{info, warn};
 pub async fn create_token_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Json(mut token_review): Json<TokenReview>,
+    DumpingJson(mut token_review): DumpingJson<TokenReview>,
 ) -> Result<Json<TokenReview>> {
     info!("Creating token review");
 
@@ -246,7 +247,7 @@ pub async fn create_token_request(
 pub async fn create_self_subject_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Json(mut self_subject_review): Json<SelfSubjectReview>,
+    DumpingJson(mut self_subject_review): DumpingJson<SelfSubjectReview>,
 ) -> Result<Json<SelfSubjectReview>> {
     info!("Creating self subject review for user: {:?}", auth_ctx.user);
 

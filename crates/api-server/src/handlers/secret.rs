@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{PodSpec, Secret},
@@ -70,7 +71,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut secret): Json<Secret>,
+    DumpingJson(mut secret): DumpingJson<Secret>,
 ) -> Result<(StatusCode, Json<Secret>)> {
     info!(
         "Creating secret: {} in namespace: {}",
@@ -184,7 +185,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut secret): Json<Secret>,
+    DumpingJson(mut secret): DumpingJson<Secret>,
 ) -> Result<Json<Secret>> {
     info!("Updating secret: {} in namespace: {}", name, namespace);
 

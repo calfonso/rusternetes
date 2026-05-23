@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::CronJob,
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut cronjob): Json<CronJob>,
+    DumpingJson(mut cronjob): DumpingJson<CronJob>,
 ) -> Result<(StatusCode, Json<CronJob>)> {
     info!("Creating cronjob: {}/{}", namespace, cronjob.metadata.name);
 
@@ -93,7 +94,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut cronjob): Json<CronJob>,
+    DumpingJson(mut cronjob): DumpingJson<CronJob>,
 ) -> Result<Json<CronJob>> {
     info!("Updating cronjob: {}/{}", namespace, name);
 

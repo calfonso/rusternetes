@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{LoadBalancerStatus, Service, ServiceStatus, ServiceType},
@@ -417,7 +418,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut service): Json<Service>,
+    DumpingJson(mut service): DumpingJson<Service>,
 ) -> Result<Json<Service>> {
     info!("Updating service: {}/{}", namespace, name);
 

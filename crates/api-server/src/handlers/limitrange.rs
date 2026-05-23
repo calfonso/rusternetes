@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::LimitRange,
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut limit_range): Json<LimitRange>,
+    DumpingJson(mut limit_range): DumpingJson<LimitRange>,
 ) -> Result<(StatusCode, Json<LimitRange>)> {
     info!(
         "Creating LimitRange: {} in namespace: {}",
@@ -95,7 +96,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut limit_range): Json<LimitRange>,
+    DumpingJson(mut limit_range): DumpingJson<LimitRange>,
 ) -> Result<Json<LimitRange>> {
     info!("Updating LimitRange: {} in namespace: {}", name, namespace);
 

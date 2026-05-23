@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::VolumeAttributesClass,
@@ -18,7 +19,7 @@ pub async fn create_volumeattributesclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut vac): Json<VolumeAttributesClass>,
+    DumpingJson(mut vac): DumpingJson<VolumeAttributesClass>,
 ) -> Result<(StatusCode, Json<VolumeAttributesClass>)> {
     info!("Creating VolumeAttributesClass: {}", vac.metadata.name);
 
@@ -104,7 +105,7 @@ pub async fn update_volumeattributesclass(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut vac): Json<VolumeAttributesClass>,
+    DumpingJson(mut vac): DumpingJson<VolumeAttributesClass>,
 ) -> Result<Json<VolumeAttributesClass>> {
     info!("Updating VolumeAttributesClass: {}", name);
 

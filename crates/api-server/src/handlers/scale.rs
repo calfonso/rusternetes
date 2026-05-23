@@ -14,8 +14,9 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode, Uri},
     response::Response,
-    Extension, Json,
+    Extension,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     protobuf::encode_protobuf,
@@ -147,7 +148,7 @@ pub async fn update_scale(
     uri: Uri,
     headers: HeaderMap,
     Path((namespace, name)): Path<(String, String)>,
-    Json(scale): Json<Scale>,
+    DumpingJson(scale): DumpingJson<Scale>,
 ) -> Result<Response> {
     let (group, version, resource) = parse_scale_uri(&uri);
     info!(

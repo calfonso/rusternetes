@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     auth::ServiceAccountClaims,
     authz::{Decision, RequestAttributes},
@@ -22,7 +23,7 @@ pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut namespace): Json<Namespace>,
+    DumpingJson(mut namespace): DumpingJson<Namespace>,
 ) -> Result<(StatusCode, Json<Namespace>)> {
     info!("Creating namespace: {}", namespace.metadata.name);
 
@@ -286,7 +287,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut namespace): Json<Namespace>,
+    DumpingJson(mut namespace): DumpingJson<Namespace>,
 ) -> Result<Json<Namespace>> {
     info!("Updating namespace: {}", name);
 

@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{MutatingWebhookConfiguration, ValidatingWebhookConfiguration},
@@ -21,7 +22,7 @@ pub async fn create_validating_webhook(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut config): Json<ValidatingWebhookConfiguration>,
+    DumpingJson(mut config): DumpingJson<ValidatingWebhookConfiguration>,
 ) -> Result<(StatusCode, Json<ValidatingWebhookConfiguration>)> {
     info!(
         "Creating ValidatingWebhookConfiguration: {}",
@@ -185,7 +186,7 @@ pub async fn update_validating_webhook(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut config): Json<ValidatingWebhookConfiguration>,
+    DumpingJson(mut config): DumpingJson<ValidatingWebhookConfiguration>,
 ) -> Result<Json<ValidatingWebhookConfiguration>> {
     info!("Updating ValidatingWebhookConfiguration: {}", name);
 
@@ -331,7 +332,7 @@ pub async fn create_mutating_webhook(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut config): Json<MutatingWebhookConfiguration>,
+    DumpingJson(mut config): DumpingJson<MutatingWebhookConfiguration>,
 ) -> Result<(StatusCode, Json<MutatingWebhookConfiguration>)> {
     info!(
         "Creating MutatingWebhookConfiguration: {}",
@@ -478,7 +479,7 @@ pub async fn update_mutating_webhook(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut config): Json<MutatingWebhookConfiguration>,
+    DumpingJson(mut config): DumpingJson<MutatingWebhookConfiguration>,
 ) -> Result<Json<MutatingWebhookConfiguration>> {
     info!("Updating MutatingWebhookConfiguration: {}", name);
 

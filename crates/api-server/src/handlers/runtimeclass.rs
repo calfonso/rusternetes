@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::RuntimeClass,
@@ -19,7 +20,7 @@ pub async fn create_runtimeclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut runtime_class): Json<RuntimeClass>,
+    DumpingJson(mut runtime_class): DumpingJson<RuntimeClass>,
 ) -> Result<(StatusCode, Json<RuntimeClass>)> {
     info!("Creating RuntimeClass: {}", runtime_class.metadata.name);
 
@@ -87,7 +88,7 @@ pub async fn update_runtimeclass(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut runtime_class): Json<RuntimeClass>,
+    DumpingJson(mut runtime_class): DumpingJson<RuntimeClass>,
 ) -> Result<Json<RuntimeClass>> {
     info!("Updating RuntimeClass: {}", name);
 

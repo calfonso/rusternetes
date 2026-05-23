@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{Event, EventList},
@@ -184,7 +185,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut event): Json<Event>,
+    DumpingJson(mut event): DumpingJson<Event>,
 ) -> Result<(StatusCode, Json<Event>)> {
     info!("Creating event in namespace: {}", namespace);
 
@@ -240,7 +241,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut event): Json<Event>,
+    DumpingJson(mut event): DumpingJson<Event>,
 ) -> Result<Json<Event>> {
     info!("Updating event: {}/{}", namespace, name);
 
@@ -667,7 +668,7 @@ pub async fn create_events_v1(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut event): Json<Event>,
+    DumpingJson(mut event): DumpingJson<Event>,
 ) -> Result<(StatusCode, Json<Event>)> {
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
@@ -735,7 +736,7 @@ pub async fn update_events_v1(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut event): Json<Event>,
+    DumpingJson(mut event): DumpingJson<Event>,
 ) -> Result<Json<Event>> {
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 

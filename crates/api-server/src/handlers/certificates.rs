@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::CertificateSigningRequest,
@@ -19,7 +20,7 @@ pub async fn create_certificate_signing_request(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut csr): Json<CertificateSigningRequest>,
+    DumpingJson(mut csr): DumpingJson<CertificateSigningRequest>,
 ) -> Result<(StatusCode, Json<CertificateSigningRequest>)> {
     info!("Creating CertificateSigningRequest: {}", csr.metadata.name);
 
@@ -75,7 +76,7 @@ pub async fn update_certificate_signing_request(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut csr): Json<CertificateSigningRequest>,
+    DumpingJson(mut csr): DumpingJson<CertificateSigningRequest>,
 ) -> Result<Json<CertificateSigningRequest>> {
     info!("Updating CertificateSigningRequest: {}", name);
 
@@ -240,7 +241,7 @@ pub async fn update_certificate_signing_request_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-    Json(updated_csr): Json<CertificateSigningRequest>,
+    DumpingJson(updated_csr): DumpingJson<CertificateSigningRequest>,
 ) -> Result<Json<CertificateSigningRequest>> {
     info!("Updating CertificateSigningRequest status: {}", name);
 
@@ -292,7 +293,7 @@ pub async fn approve_certificate_signing_request(
     state: State<Arc<ApiServerState>>,
     auth_ctx: Extension<AuthContext>,
     name: Path<String>,
-    csr: Json<CertificateSigningRequest>,
+    csr: DumpingJson<CertificateSigningRequest>,
 ) -> Result<Json<CertificateSigningRequest>> {
     update_certificate_signing_request_status(state, auth_ctx, name, csr).await
 }

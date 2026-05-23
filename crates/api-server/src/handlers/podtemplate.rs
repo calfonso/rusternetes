@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::PodTemplate,
@@ -19,7 +20,7 @@ pub async fn create_podtemplate(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut podtemplate): Json<PodTemplate>,
+    DumpingJson(mut podtemplate): DumpingJson<PodTemplate>,
 ) -> Result<(StatusCode, Json<PodTemplate>)> {
     info!(
         "Creating podtemplate: {} in namespace: {}",
@@ -89,7 +90,7 @@ pub async fn update_podtemplate(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut podtemplate): Json<PodTemplate>,
+    DumpingJson(mut podtemplate): DumpingJson<PodTemplate>,
 ) -> Result<Json<PodTemplate>> {
     info!("Updating podtemplate: {} in namespace: {}", name, namespace);
 

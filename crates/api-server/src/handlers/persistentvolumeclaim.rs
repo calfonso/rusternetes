@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::PersistentVolumeClaim,
@@ -20,7 +21,7 @@ pub async fn create_pvc(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut pvc): Json<PersistentVolumeClaim>,
+    DumpingJson(mut pvc): DumpingJson<PersistentVolumeClaim>,
 ) -> Result<(StatusCode, Json<PersistentVolumeClaim>)> {
     info!(
         "Creating PersistentVolumeClaim: {}/{}",
@@ -232,7 +233,7 @@ pub async fn update_pvc(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut pvc): Json<PersistentVolumeClaim>,
+    DumpingJson(mut pvc): DumpingJson<PersistentVolumeClaim>,
 ) -> Result<Json<PersistentVolumeClaim>> {
     info!("Updating PersistentVolumeClaim: {}/{}", namespace, name);
 

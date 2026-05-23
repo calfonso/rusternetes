@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::IPAddress,
@@ -19,7 +20,7 @@ pub async fn create_ipaddress(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut ipaddress): Json<IPAddress>,
+    DumpingJson(mut ipaddress): DumpingJson<IPAddress>,
 ) -> Result<(StatusCode, Json<IPAddress>)> {
     info!("Creating IPAddress: {}", ipaddress.metadata.name);
 
@@ -82,7 +83,7 @@ pub async fn update_ipaddress(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut ipaddress): Json<IPAddress>,
+    DumpingJson(mut ipaddress): DumpingJson<IPAddress>,
 ) -> Result<Json<IPAddress>> {
     info!("Updating IPAddress: {}", name);
 

@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     auth::ServiceAccountClaims,
     authz::{Decision, RequestAttributes},
@@ -21,7 +22,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut service_account): Json<ServiceAccount>,
+    DumpingJson(mut service_account): DumpingJson<ServiceAccount>,
 ) -> Result<(StatusCode, Json<ServiceAccount>)> {
     info!(
         "Creating service account: {}/{}",
@@ -173,7 +174,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut service_account): Json<ServiceAccount>,
+    DumpingJson(mut service_account): DumpingJson<ServiceAccount>,
 ) -> Result<Json<ServiceAccount>> {
     info!("Updating service account: {}/{}", namespace, name);
 
@@ -458,7 +459,7 @@ pub async fn create_token(
     State(state): State<Arc<ApiServerState>>,
     Extension(_auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    Json(body): Json<serde_json::Value>,
+    DumpingJson(body): DumpingJson<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
     info!("Creating token for service account: {}/{}", namespace, name);
 

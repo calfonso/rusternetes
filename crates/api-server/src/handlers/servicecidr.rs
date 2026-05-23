@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::ServiceCIDR,
@@ -19,7 +20,7 @@ pub async fn create_servicecidr(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut servicecidr): Json<ServiceCIDR>,
+    DumpingJson(mut servicecidr): DumpingJson<ServiceCIDR>,
 ) -> Result<(StatusCode, Json<ServiceCIDR>)> {
     info!("Creating ServiceCIDR: {}", servicecidr.metadata.name);
 
@@ -98,7 +99,7 @@ pub async fn update_servicecidr(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut servicecidr): Json<ServiceCIDR>,
+    DumpingJson(mut servicecidr): DumpingJson<ServiceCIDR>,
 ) -> Result<Json<ServiceCIDR>> {
     info!("Updating ServiceCIDR: {}", name);
 

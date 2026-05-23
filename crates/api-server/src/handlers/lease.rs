@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::Lease,
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut lease): Json<Lease>,
+    DumpingJson(mut lease): DumpingJson<Lease>,
 ) -> Result<(StatusCode, Json<Lease>)> {
     info!("Creating lease: {}/{}", namespace, lease.metadata.name);
 
@@ -88,7 +89,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut lease): Json<Lease>,
+    DumpingJson(mut lease): DumpingJson<Lease>,
 ) -> Result<Json<Lease>> {
     info!("Updating lease: {}/{}", namespace, name);
 

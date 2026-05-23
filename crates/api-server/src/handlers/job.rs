@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::Job,
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut job): Json<Job>,
+    DumpingJson(mut job): DumpingJson<Job>,
 ) -> Result<(StatusCode, Json<Job>)> {
     info!("Creating job: {}/{}", namespace, job.metadata.name);
 
@@ -118,7 +119,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut job): Json<Job>,
+    DumpingJson(mut job): DumpingJson<Job>,
 ) -> Result<Json<Job>> {
     info!("Updating job: {}/{}", namespace, name);
 

@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::ControllerRevision,
@@ -19,7 +20,7 @@ pub async fn create_controllerrevision(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut cr): Json<ControllerRevision>,
+    DumpingJson(mut cr): DumpingJson<ControllerRevision>,
 ) -> Result<(StatusCode, Json<ControllerRevision>)> {
     info!(
         "Creating controllerrevision: {} in namespace: {}",
@@ -92,7 +93,7 @@ pub async fn update_controllerrevision(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut cr): Json<ControllerRevision>,
+    DumpingJson(mut cr): DumpingJson<ControllerRevision>,
 ) -> Result<Json<ControllerRevision>> {
     info!(
         "Updating controllerrevision: {} in namespace: {}",

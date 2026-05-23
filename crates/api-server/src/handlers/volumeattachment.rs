@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::VolumeAttachment,
@@ -18,7 +19,7 @@ pub async fn create_volumeattachment(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut va): Json<VolumeAttachment>,
+    DumpingJson(mut va): DumpingJson<VolumeAttachment>,
 ) -> Result<(StatusCode, Json<VolumeAttachment>)> {
     info!("Creating VolumeAttachment: {}", va.metadata.name);
 
@@ -104,7 +105,7 @@ pub async fn update_volumeattachment(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut va): Json<VolumeAttachment>,
+    DumpingJson(mut va): DumpingJson<VolumeAttachment>,
 ) -> Result<Json<VolumeAttachment>> {
     info!("Updating VolumeAttachment: {}", name);
 
