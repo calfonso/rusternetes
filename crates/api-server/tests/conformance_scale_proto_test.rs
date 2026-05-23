@@ -166,9 +166,7 @@ fn test_scale_full_proto_decode_with_spec_and_status() {
         "Scale.spec.replicas mismatch; got {decoded}",
     );
 
-    let status = decoded
-        .get("status")
-        .expect("Scale.status must be present");
+    let status = decoded.get("status").expect("Scale.status must be present");
     assert_eq!(
         status.get("replicas").and_then(|v| v.as_i64()),
         Some(4),
@@ -237,7 +235,9 @@ async fn seed_deployment(mem: &Arc<MemoryStorage>, name: &str, replicas: i64) {
         }
     });
     let key = build_key("deployments", Some(TEST_NS), name);
-    mem.create(&key, &deployment).await.expect("seed deployment");
+    mem.create(&key, &deployment)
+        .await
+        .expect("seed deployment");
 }
 
 /// `GET /apis/apps/v1/namespaces/default/deployments/{name}/scale` with
