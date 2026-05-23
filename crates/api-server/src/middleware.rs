@@ -197,7 +197,7 @@ pub async fn normalize_content_type_middleware(
                 }
             };
 
-            let json_body = match cbor::decode_cbor_to_json_bytes(&body_bytes) {
+            let json_body: Vec<u8> = match cbor::decode_cbor_to_json_bytes(&body_bytes) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     warn!("CBOR decode failed: {}", e);

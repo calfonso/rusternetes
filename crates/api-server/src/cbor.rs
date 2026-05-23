@@ -316,8 +316,7 @@ mod tests {
         // Map with one entry: key = unsigned 1, value = unsigned 2.
         // CBOR: 0xa1 (map of 1) 0x01 (uint 1) 0x02 (uint 2).
         let bytes = [0xa1, 0x01, 0x02];
-        let err =
-            decode_cbor_to_json(&bytes).expect_err("must reject maps with non-string keys");
+        let err = decode_cbor_to_json(&bytes).expect_err("must reject maps with non-string keys");
         match err {
             CborError::Transcode(_) => {}
             other => panic!("expected Transcode error, got {:?}", other),
