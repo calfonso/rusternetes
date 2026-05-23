@@ -10937,10 +10937,7 @@ impl ProtoRegistry {
             MessageSchema {
                 fields: HashMap::from([(
                     1,
-                    (
-                        "cel".into(),
-                        FieldType::Message("CELDeviceSelector".into()),
-                    ),
+                    ("cel".into(), FieldType::Message("CELDeviceSelector".into())),
                 )]),
             },
         );
@@ -11163,9 +11160,7 @@ impl ProtoRegistry {
                         4,
                         (
                             "conditions".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "Condition".into(),
-                            ))),
+                            FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
                         ),
                     ),
                     (5, ("data".into(), FieldType::JsonRaw)),
@@ -11312,9 +11307,7 @@ impl ProtoRegistry {
                         8,
                         (
                             "sharedCounters".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "CounterSet".into(),
-                            ))),
+                            FieldType::Repeated(Box::new(FieldType::Message("CounterSet".into()))),
                         ),
                     ),
                 ]),
@@ -11383,9 +11376,7 @@ impl ProtoRegistry {
                         8,
                         (
                             "taints".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "DeviceTaint".into(),
-                            ))),
+                            FieldType::Repeated(Box::new(FieldType::Message("DeviceTaint".into()))),
                         ),
                     ),
                     (9, ("bindsToNode".into(), FieldType::Bool)),
@@ -11427,10 +11418,7 @@ impl ProtoRegistry {
                     (5, ("version".into(), FieldType::String)),
                     (
                         6,
-                        (
-                            "ints".into(),
-                            FieldType::Repeated(Box::new(FieldType::Int)),
-                        ),
+                        ("ints".into(), FieldType::Repeated(Box::new(FieldType::Int))),
                     ),
                     (
                         7,
@@ -11520,10 +11508,7 @@ impl ProtoRegistry {
                     (1, ("name".into(), FieldType::String)),
                     (
                         2,
-                        (
-                            "counters".into(),
-                            FieldType::MessageMap("Counter".into()),
-                        ),
+                        ("counters".into(), FieldType::MessageMap("Counter".into())),
                     ),
                 ]),
             },
@@ -11545,10 +11530,7 @@ impl ProtoRegistry {
                     (1, ("counterSet".into(), FieldType::String)),
                     (
                         2,
-                        (
-                            "counters".into(),
-                            FieldType::MessageMap("Counter".into()),
-                        ),
+                        ("counters".into(), FieldType::MessageMap("Counter".into())),
                     ),
                 ]),
             },
