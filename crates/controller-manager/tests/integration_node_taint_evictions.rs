@@ -79,6 +79,7 @@ fn make_ready_node(name: &str) -> Node {
             config: None,
             features: None,
             runtime_handlers: None,
+            declared_features: None,
         }),
     }
 }

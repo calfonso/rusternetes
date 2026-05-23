@@ -56,9 +56,12 @@
 //!     `rusternetes_common::validation::pod::validate_pod_dns_config`.
 //!
 //!   * `TestNodeDeclaredFeatureAdmission` — gated by `NodeDeclaredFeatures` +
-//!     `node.status.declaredFeatures`; the resource field is not present on
-//!     the Rust `NodeStatus` struct, so the corresponding admission check
-//!     cannot exist. Mirrored as `#[ignore]`.
+//!     `InPlacePodVerticalScaling`. The `/pods/{name}/resize` handler refuses
+//!     a Guaranteed-QoS CPU resize when the target Node's
+//!     `status.declaredFeatures` does not include `GuaranteedQoSPodCPUResize`.
+//!     Field lives on `NodeStatus`; gate registry in
+//!     `rusternetes_common::feature_gates`; admission helper in
+//!     `handlers::pod_subresources::check_node_declared_features_for_resize`.
 //!
 //! See also: `pod_handler_test.rs` and `pod_resize_cas_test.rs` for the
 //! complementary handler-level pod tests already covering create/get/update/
@@ -984,16 +987,168 @@ async fn test_relaxed_dns_search_validation() {
 /// Gated by `NodeDeclaredFeatures` + `InPlacePodVerticalScaling`. The
 /// admission check refuses a CPU resize when the target Node's
 /// `status.declaredFeatures` does not include `GuaranteedQoSPodCPUResize`.
-/// The `declaredFeatures` field is not present on the Rust `NodeStatus`
-/// struct, so the corresponding admission check cannot exist yet.
+///
+/// Three sub-cases mirror upstream `TestNodeDeclaredFeatureAdmission`
+/// (`test/integration/pods/pods_test.go:1504`):
+///   1. Bound node has no `declaredFeatures` — CPU resize on a Guaranteed
+///      pod is rejected with 403 Forbidden, error names
+///      `GuaranteedQoSPodCPUResize`.
+///   2. Bound node declares `GuaranteedQoSPodCPUResize` — the same CPU
+///      resize is accepted.
+///   3. Label-only update via the main `/pods/{name}` PUT path is allowed
+///      regardless of declared features (the admission only fires on
+///      `/resize` when CPU actually changes on a Guaranteed pod).
+///
+/// `#[serial]` because the feature gates are process-wide; the test
+/// flips `NodeDeclaredFeatures` (off-by-default) and confirms
+/// `InPlacePodVerticalScaling` (default-on) is set.
 #[tokio::test]
-#[ignore = "node.status.declaredFeatures field + NodeDeclaredFeatures gate not implemented; see docstring"]
+#[serial_test::serial]
 async fn test_node_declared_feature_admission() {
-    let (_, _router) = spawn_router();
-    // Once declaredFeatures + the gate exist, mirror the three sub-cases:
-    //   - resize denied when feature missing,
-    //   - resize allowed when feature present,
-    //   - label-only update allowed regardless of declared features.
+    use rusternetes_common::feature_gates::{reset_to_defaults, with_feature, Feature};
+    use rusternetes_storage::Storage;
+
+    let (mem, router) = spawn_router();
+    let ns = "node-declared-features";
+    create_namespace(&router, ns).await;
+
+    // Enable both gates for the duration of the test. RAII guards restore
+    // the prior values on drop.
+    let _g1 = with_feature(Feature::NodeDeclaredFeatures, true);
+    let _g2 = with_feature(Feature::InPlacePodVerticalScaling, true);
+
+    // Seed a Node directly via storage (the resize handler reads the node
+    // by storage key, so we don't need to drive the Node create handler).
+    async fn seed_node(
+        mem: &Arc<rusternetes_storage::memory::MemoryStorage>,
+        name: &str,
+        declared: &[&str],
+    ) {
+        use rusternetes_common::resources::{Node, NodeStatus};
+        let declared_vec: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        let mut node = Node::new(name);
+        node.status = Some(NodeStatus {
+            declared_features: if declared_vec.is_empty() {
+                None
+            } else {
+                Some(declared_vec)
+            },
+            ..Default::default()
+        });
+        let key = rusternetes_storage::build_key("nodes", None, name);
+        mem.create(&key, &node).await.expect("seed node");
+    }
+
+    seed_node(&mem, "node-without-features", &[]).await;
+    seed_node(&mem, "node-with-features", &["GuaranteedQoSPodCPUResize"]).await;
+
+    // Create a Guaranteed-QoS pod bound to the feature-less node.
+    // Guaranteed requires cpu+memory in both requests and limits, with
+    // requests == limits.
+    let pod_name = "guaranteed-cpu";
+    let mut pod = prototype_pod(pod_name);
+    pod["spec"]["nodeName"] = json!("node-without-features");
+    pod["spec"]["containers"][0]["resources"] = json!({
+        "requests": { "cpu": "100m", "memory": "64Mi" },
+        "limits":   { "cpu": "100m", "memory": "64Mi" },
+    });
+    let (st, body) = post_json(&router, &format!("/api/v1/namespaces/{}/pods", ns), &pod).await;
+    assert!(
+        st == 201 || st == 200,
+        "create guaranteed pod must succeed: status={} body={}",
+        st,
+        body
+    );
+
+    // ---- sub-case 1: resize denied when feature missing ----
+    let mut resize_body = pod.clone();
+    resize_body["spec"]["containers"][0]["resources"] = json!({
+        "requests": { "cpu": "200m", "memory": "64Mi" },
+        "limits":   { "cpu": "200m", "memory": "64Mi" },
+    });
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/{}/resize", ns, pod_name),
+        &resize_body,
+    )
+    .await;
+    assert_eq!(
+        st, 403,
+        "CPU resize on node without GuaranteedQoSPodCPUResize must be 403, \
+         got status={} body={}",
+        st, body
+    );
+    let body_str = body.to_string();
+    assert!(
+        body_str.contains("GuaranteedQoSPodCPUResize"),
+        "denial must name the missing feature, got: {}",
+        body_str
+    );
+
+    // ---- sub-case 2: resize allowed when feature present ----
+    // The resize handler reads the *current* pod's `spec.nodeName` to find
+    // the node, so a direct storage edit is sufficient — no need to drive
+    // a PUT through the immutability fence.
+    {
+        let key = rusternetes_storage::build_key("pods", Some(ns), pod_name);
+        let mut stored: rusternetes_common::resources::Pod =
+            mem.get(&key).await.expect("re-read pod");
+        if let Some(spec) = stored.spec.as_mut() {
+            spec.node_name = Some("node-with-features".to_string());
+        }
+        mem.update(&key, &stored).await.expect("rebind pod");
+    }
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/{}/resize", ns, pod_name),
+        &resize_body,
+    )
+    .await;
+    assert!(
+        st == 200 || st == 201,
+        "CPU resize on node WITH GuaranteedQoSPodCPUResize must succeed, \
+         got status={} body={}",
+        st,
+        body
+    );
+
+    // ---- sub-case 3: label-only update via main PUT — gate must NOT fire ----
+    // Rebind to the feature-less node so a regression that wrongly fires
+    // the resize admission on the main PUT path would be caught.
+    {
+        let key = rusternetes_storage::build_key("pods", Some(ns), pod_name);
+        let mut stored: rusternetes_common::resources::Pod =
+            mem.get(&key).await.expect("re-read pod");
+        if let Some(spec) = stored.spec.as_mut() {
+            spec.node_name = Some("node-without-features".to_string());
+        }
+        mem.update(&key, &stored).await.expect("rebind pod");
+    }
+    // Build a label-only PUT body off the latest stored pod so unrelated
+    // fields don't trip the immutability fence.
+    let label_update = {
+        let key = rusternetes_storage::build_key("pods", Some(ns), pod_name);
+        let stored: rusternetes_common::resources::Pod =
+            mem.get(&key).await.expect("re-read pod for label update");
+        let mut as_value = serde_json::to_value(&stored).expect("pod to json");
+        as_value["metadata"]["labels"] = json!({ "tier": "frontend" });
+        as_value
+    };
+    let (st, body) = put_json(
+        &router,
+        &format!("/api/v1/namespaces/{}/pods/{}", ns, pod_name),
+        &label_update,
+    )
+    .await;
+    assert!(
+        st == 200 || st == 201,
+        "label-only PUT must succeed regardless of declared features: \
+         status={} body={}",
+        st,
+        body
+    );
+
+    reset_to_defaults();
 }
 
 // ---------------------------------------------------------------------------

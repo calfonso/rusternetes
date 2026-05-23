@@ -178,6 +178,7 @@ async fn test_f94882a_heartbeat_cas_retry_persists_heartbeat() {
             config: None,
             features: None,
             runtime_handlers: None,
+            declared_features: None,
         }),
     };
     let stored_node = inner.create(&key, &node).await.expect("create node");

@@ -60,6 +60,7 @@ async fn create_test_node(
             config: None,
             features: None,
             runtime_handlers: None,
+            declared_features: None,
         }),
     };
 

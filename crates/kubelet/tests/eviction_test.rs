@@ -402,6 +402,7 @@ fn test_node_condition_updates_memory_pressure() {
         config: None,
         features: None,
         runtime_handlers: None,
+        declared_features: None,
     });
 
     // Update conditions with memory pressure
@@ -445,6 +446,7 @@ fn test_node_condition_updates_disk_pressure() {
         config: None,
         features: None,
         runtime_handlers: None,
+        declared_features: None,
     });
 
     // Update conditions with disk pressure
@@ -485,6 +487,7 @@ fn test_node_condition_clears_when_pressure_resolved() {
         config: None,
         features: None,
         runtime_handlers: None,
+        declared_features: None,
     });
 
     // Set memory pressure

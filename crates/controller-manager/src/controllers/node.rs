@@ -374,6 +374,7 @@ impl<S: Storage + 'static> NodeController<S> {
                 config: None,
                 features: None,
                 runtime_handlers: None,
+                declared_features: None,
             });
         }
 
@@ -644,6 +645,7 @@ mod tests {
                 config: None,
                 features: None,
                 runtime_handlers: None,
+                declared_features: None,
             }),
         };
 
@@ -672,6 +674,7 @@ mod tests {
                 config: None,
                 features: None,
                 runtime_handlers: None,
+                declared_features: None,
             }),
             ..node_ready
         };

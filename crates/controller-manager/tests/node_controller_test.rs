@@ -61,6 +61,7 @@ async fn test_node_ready_with_recent_heartbeat() {
             config: None,
             features: None,
             runtime_handlers: None,
+            declared_features: None,
         }),
     };
 
@@ -135,6 +136,7 @@ async fn test_node_not_ready_with_old_heartbeat() {
             config: None,
             features: None,
             runtime_handlers: None,
+            declared_features: None,
         }),
     };
 
@@ -206,6 +208,7 @@ async fn test_node_without_ready_condition() {
             config: None,
             features: None,
             runtime_handlers: None,
+            declared_features: None,
         }),
     };
 

@@ -109,6 +109,7 @@ fn make_node(name: &str, cpu: &str, memory: &str) -> Node {
         config: None,
         features: None,
         runtime_handlers: None,
+        declared_features: None,
     });
     node
 }
