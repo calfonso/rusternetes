@@ -1544,6 +1544,172 @@ async fn compute_pdb_disruptions_allowed<S: Storage>(
     healthy_pods - desired_healthy
 }
 
+/// Feature name kubelets advertise in `node.status.declaredFeatures` once they
+/// support the CPU-resize path for Guaranteed-QoS pods (KEP-5328 — KEP-1287
+/// integration). The api-server uses this constant when deciding whether to
+/// admit a `/pods/{name}/resize` request that mutates a Guaranteed pod's CPU.
+pub(crate) const GUARANTEED_QOS_POD_CPU_RESIZE: &str = "GuaranteedQoSPodCPUResize";
+
+/// Returns `true` if `pod` is Guaranteed-QoS (all containers have `cpu` AND
+/// `memory` in both `requests` and `limits`, with `requests == limits`).
+///
+/// Mirrors `pkg/apis/core/v1/helper/qos/qos.go::GetPodQOS` for the Guaranteed
+/// branch. Keeping the helper local avoids dragging the full QoS classifier
+/// into the resize path — the admission check only needs the Guaranteed/not
+/// distinction.
+fn is_guaranteed_qos(pod: &rusternetes_common::resources::Pod) -> bool {
+    let Some(spec) = pod.spec.as_ref() else {
+        return false;
+    };
+    if spec.containers.is_empty() {
+        return false;
+    }
+    for c in &spec.containers {
+        let Some(res) = c.resources.as_ref() else {
+            return false;
+        };
+        let has_limits = res
+            .limits
+            .as_ref()
+            .is_some_and(|l| l.contains_key("cpu") && l.contains_key("memory"));
+        if !has_limits {
+            return false;
+        }
+        // For Guaranteed, requests must either be absent (defaulted from
+        // limits) or equal to limits. Upstream `qos.go` collapses these.
+        if let Some(req) = res.requests.as_ref() {
+            if res.limits.as_ref() != Some(req) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Returns `true` if the CPU resource request OR limit differs between any
+/// matching container in `desired` vs `current`. The match is by container
+/// name; missing-on-one-side counts as a change.
+fn resize_changes_cpu(
+    current: &rusternetes_common::resources::Pod,
+    desired: &rusternetes_common::resources::Pod,
+) -> bool {
+    let (Some(cur_spec), Some(des_spec)) = (current.spec.as_ref(), desired.spec.as_ref()) else {
+        return false;
+    };
+    for desired_c in &des_spec.containers {
+        let Some(current_c) = cur_spec
+            .containers
+            .iter()
+            .find(|c| c.name == desired_c.name)
+        else {
+            continue;
+        };
+        let cur_cpu_req = current_c
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|m| m.get("cpu"));
+        let des_cpu_req = desired_c
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|m| m.get("cpu"));
+        let cur_cpu_lim = current_c
+            .resources
+            .as_ref()
+            .and_then(|r| r.limits.as_ref())
+            .and_then(|m| m.get("cpu"));
+        let des_cpu_lim = desired_c
+            .resources
+            .as_ref()
+            .and_then(|r| r.limits.as_ref())
+            .and_then(|m| m.get("cpu"));
+        if cur_cpu_req != des_cpu_req || cur_cpu_lim != des_cpu_lim {
+            return true;
+        }
+    }
+    false
+}
+
+/// Node-declared-feature admission for `/pods/{name}/resize` (KEP-5328 +
+/// KEP-1287). When both `NodeDeclaredFeatures` and `InPlacePodVerticalScaling`
+/// are enabled, a CPU resize against a Guaranteed-QoS pod is admitted only if
+/// the target node has advertised `GuaranteedQoSPodCPUResize` in
+/// `status.declaredFeatures`.
+///
+/// Returns:
+///   - `Ok(())` when the gate combination does not apply (either gate off, or
+///     the change does not touch CPU, or the pod is not Guaranteed), when the
+///     pod is not yet bound to a node, when the node does not exist (the
+///     resize is allowed in that case — upstream defers to scheduler), or
+///     when the node *has* declared the feature.
+///   - `Err(Error::Forbidden(_))` when the target node exists, both gates are
+///     on, the pod is Guaranteed, the resize touches CPU, and the node has
+///     not declared `GuaranteedQoSPodCPUResize`.
+///
+/// Upstream: `plugin/pkg/admission/noderestriction/admission.go` consults
+/// `nodeFeatures` when admitting `/pods/{name}/resize`; missing
+/// `GuaranteedQoSPodCPUResize` produces:
+///   "spec.containers[*].resources: Forbidden: node \"<n>\" has not declared
+///    feature \"GuaranteedQoSPodCPUResize\""
+async fn check_node_declared_features_for_resize<S: Storage>(
+    storage: &S,
+    current: &rusternetes_common::resources::Pod,
+    desired: &rusternetes_common::resources::Pod,
+) -> Result<()> {
+    use rusternetes_common::feature_gates::{enabled, Feature};
+
+    // Both gates must be on. Mirrors upstream's
+    // `if utilfeature.DefaultFeatureGate.Enabled(features.NodeDeclaredFeatures)
+    //   && utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling)`
+    // in the resize strategy.
+    if !enabled(Feature::NodeDeclaredFeatures) || !enabled(Feature::InPlacePodVerticalScaling) {
+        return Ok(());
+    }
+
+    // The check only fires when the change actually touches CPU on a
+    // Guaranteed pod — label-only resizes (or memory-only) sail through.
+    if !is_guaranteed_qos(current) || !resize_changes_cpu(current, desired) {
+        return Ok(());
+    }
+
+    // Pod must already be bound to a node — there is nothing to consult
+    // otherwise. Upstream returns nil in that case.
+    let Some(node_name) = current
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_ref())
+        .filter(|n| !n.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let node_key = rusternetes_storage::build_key("nodes", None, node_name);
+    let node: rusternetes_common::resources::Node = match storage.get(&node_key).await {
+        Ok(n) => n,
+        // Missing node: upstream's NodeRestriction admission allows the
+        // request through and lets the scheduler / node controller catch up.
+        Err(Error::NotFound(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    let declares_resize = node
+        .status
+        .as_ref()
+        .and_then(|s| s.declared_features.as_ref())
+        .map(|features| features.iter().any(|f| f == GUARANTEED_QOS_POD_CPU_RESIZE))
+        .unwrap_or(false);
+
+    if declares_resize {
+        Ok(())
+    } else {
+        Err(Error::Forbidden(format!(
+            "spec.containers[*].resources: Forbidden: node \"{}\" has not declared feature \"{}\"",
+            node_name, GUARANTEED_QOS_POD_CPU_RESIZE
+        )))
+    }
+}
+
 /// Maximum number of CAS retry attempts for `/pods/{name}/resize` (KEP-1287).
 ///
 /// In-place pod resize is a hot path: kubelet + admission webhooks may bump the
@@ -1697,6 +1863,13 @@ pub async fn resize_pod(
     let current: rusternetes_common::resources::Pod = state.storage.get(&key).await?;
     let mut projected = current.clone();
     merge_container_resources_from(&mut projected, &desired);
+
+    // KEP-5328 + KEP-1287: when both `NodeDeclaredFeatures` and
+    // `InPlacePodVerticalScaling` are enabled, refuse a Guaranteed-QoS CPU
+    // resize against a node that has not advertised
+    // `GuaranteedQoSPodCPUResize`. Off-by-default; mirrors the upstream
+    // resize strategy's call into noderestriction admission.
+    check_node_declared_features_for_resize(state.storage.as_ref(), &current, &projected).await?;
 
     match crate::admission::check_resource_quota_with_old(
         &state.storage,

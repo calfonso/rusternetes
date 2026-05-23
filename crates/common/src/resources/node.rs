@@ -118,6 +118,18 @@ pub struct NodeStatus {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_handlers: Option<Vec<NodeRuntimeHandler>>,
+
+    /// DeclaredFeatures is the list of feature names the kubelet has declared
+    /// support for. The api-server consults this list when admitting requests
+    /// gated by the `NodeDeclaredFeatures` feature gate (KEP-5328).
+    ///
+    /// Upstream: `pkg/apis/core/types.go::NodeStatus` introduced
+    /// `Features.DeclaredFeatures` in v1.34 as part of KEP-5328 ("Node Declared
+    /// Features"). The pod `/resize` admission strategy refuses CPU-resize
+    /// requests against Guaranteed-QoS pods unless the target node has
+    /// `GuaranteedQoSPodCPUResize` in this list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_features: Option<Vec<String>>,
 }
 
 /// ContainerImage describes a container image present on the node

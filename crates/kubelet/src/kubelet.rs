@@ -525,6 +525,10 @@ impl Kubelet {
             config: None,
             features: None,
             runtime_handlers: None,
+            // KEP-5328: leave empty until the kubelet's feature-discovery
+            // surface is wired up. The api-server treats `None` the same
+            // as "no features declared".
+            declared_features: None,
         });
 
         let key = build_key("nodes", None, &self.node_name);

@@ -39,6 +39,26 @@ pub enum Feature {
     /// Upstream: `plugin/pkg/admission/podtopologylabels/admission.go`.
     /// Beta in v1.35, default `true`.
     PodTopologyLabelsAdmission,
+
+    /// When enabled, the api-server consults `node.status.declaredFeatures`
+    /// during pod admission so that node-side features (such as
+    /// `GuaranteedQoSPodCPUResize`) can be required by the API plane before a
+    /// mutation is admitted to a node that has not declared support.
+    ///
+    /// Upstream: `pkg/features/kube_features.go::NodeDeclaredFeatures` —
+    /// KEP-5328. Alpha in v1.34; rusternetes targets v1.35 where the gate is
+    /// still off-by-default.
+    NodeDeclaredFeatures,
+
+    /// When enabled, pods may have their `spec.containers[*].resources` mutated
+    /// in place via the `/resize` subresource (KEP-1287). Required for the
+    /// node-declared-feature admission to reject a CPU resize on a node that
+    /// has not declared `GuaranteedQoSPodCPUResize`.
+    ///
+    /// Upstream: `pkg/features/kube_features.go::InPlacePodVerticalScaling`.
+    /// Beta + default-on in v1.33; rusternetes targets v1.35 so the default
+    /// is `true`.
+    InPlacePodVerticalScaling,
 }
 
 impl Feature {
@@ -47,6 +67,8 @@ impl Feature {
         match self {
             Feature::RelaxedDNSSearchValidation => 0,
             Feature::PodTopologyLabelsAdmission => 1,
+            Feature::NodeDeclaredFeatures => 2,
+            Feature::InPlacePodVerticalScaling => 3,
         }
     }
 
@@ -57,6 +79,10 @@ impl Feature {
             Feature::RelaxedDNSSearchValidation => true,
             // Beta in v1.35 — defaults to true.
             Feature::PodTopologyLabelsAdmission => true,
+            // Alpha (off-by-default) in v1.34/v1.35.
+            Feature::NodeDeclaredFeatures => false,
+            // Beta + default-on since v1.33.
+            Feature::InPlacePodVerticalScaling => true,
         }
     }
 }
@@ -75,6 +101,8 @@ impl Feature {
 pub const ALL_FEATURES: &[Feature] = &[
     Feature::RelaxedDNSSearchValidation,
     Feature::PodTopologyLabelsAdmission,
+    Feature::NodeDeclaredFeatures,
+    Feature::InPlacePodVerticalScaling,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -91,6 +119,8 @@ const NUM_FEATURES: usize = ALL_FEATURES.len();
 static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::RelaxedDNSSearchValidation.default_enabled()),
     AtomicBool::new(Feature::PodTopologyLabelsAdmission.default_enabled()),
+    AtomicBool::new(Feature::NodeDeclaredFeatures.default_enabled()),
+    AtomicBool::new(Feature::InPlacePodVerticalScaling.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.

@@ -120,6 +120,7 @@ mod tests {
                 config: None,
                 features: None,
                 runtime_handlers: None,
+                declared_features: None,
             }),
         }
     }

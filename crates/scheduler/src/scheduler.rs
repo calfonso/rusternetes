@@ -1502,6 +1502,7 @@ mod tests {
                 config: None,
                 runtime_handlers: None,
                 features: None,
+                declared_features: None,
             }),
         }
     }

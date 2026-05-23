@@ -48,6 +48,7 @@ async fn test_proxy_node_missing_address() {
             config: None,
             features: None,
             runtime_handlers: None,
+            declared_features: None,
         }),
     };
 
