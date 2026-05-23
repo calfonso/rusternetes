@@ -2286,3 +2286,62 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Conformance payload-dump middleware.
+//
+// Outermost layer in the router. Buffers the request body (up to
+// MAX_DUMP_BODY) into `rusternetes_common::dump::CURRENT_PAYLOAD`, then
+// logs the body on any 5xx response. No-op when RUSTERNETES_DUMP_PAYLOADS
+// is unset.
+// ============================================================================
+
+/// 4 MiB — matches Kubernetes' default max request size.
+#[allow(dead_code)]
+const MAX_DUMP_BODY: usize = 4 * 1024 * 1024;
+
+pub async fn capture_payload(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::body::{to_bytes, Body};
+    use rusternetes_common::dump::{self, redact_secret_like, CURRENT_PAYLOAD};
+    use std::cell::RefCell;
+
+    if !dump::dumps_enabled() {
+        return next.run(req).await;
+    }
+
+    let (parts, body) = req.into_parts();
+    let bytes = match to_bytes(body, MAX_DUMP_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            return CURRENT_PAYLOAD
+                .scope(RefCell::new(None), async {
+                    next.run(axum::extract::Request::from_parts(parts, Body::empty()))
+                        .await
+                })
+                .await;
+        }
+    };
+
+    let rebuilt = axum::extract::Request::from_parts(parts.clone(), Body::from(bytes.clone()));
+    let bytes_for_scope = bytes.clone();
+    let resp = CURRENT_PAYLOAD
+        .scope(RefCell::new(Some(bytes_for_scope)), next.run(rebuilt))
+        .await;
+
+    if resp.status().is_server_error() {
+        let redacted = redact_secret_like(&bytes);
+        tracing::error!(
+            method = %parts.method,
+            uri = %parts.uri,
+            status = %resp.status(),
+            kind = "5xx",
+            payload = %String::from_utf8_lossy(&redacted),
+            "request handler returned 5xx"
+        );
+    }
+
+    resp
+}
