@@ -353,15 +353,49 @@ impl LeaderElector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use testcontainers::{
+        core::{IntoContainerPort, WaitFor},
+        runners::AsyncRunner,
+        GenericImage, ImageExt,
+    };
+
+    /// Spawn an ephemeral single-node etcd container and return both the
+    /// container handle and the client endpoint string. The handle MUST be
+    /// kept alive for the duration of the test — dropping it stops the
+    /// container.
+    async fn start_etcd() -> (testcontainers::ContainerAsync<GenericImage>, String) {
+        // `etcd` logs `ready to serve client requests` on stderr once the
+        // client port is listening. Wait for that marker so the test can
+        // connect immediately on `start()` returning.
+        let container = GenericImage::new("quay.io/coreos/etcd", "v3.5.17")
+            .with_exposed_port(2379.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("ready to serve client requests"))
+            .with_cmd([
+                "etcd",
+                "--listen-client-urls",
+                "http://0.0.0.0:2379",
+                "--advertise-client-urls",
+                "http://0.0.0.0:2379",
+            ])
+            .start()
+            .await
+            .expect("failed to start etcd test container");
+
+        let port = container
+            .get_host_port_ipv4(2379)
+            .await
+            .expect("etcd container did not expose client port");
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        (container, endpoint)
+    }
 
     #[tokio::test]
-    #[ignore] // Requires running etcd
     async fn test_leader_election() {
-        // Start etcd: docker run -d -p 2379:2379 quay.io/coreos/etcd:v3.5.17 \
-        //   /usr/local/bin/etcd --listen-client-urls http://0.0.0.0:2379 \
-        //   --advertise-client-urls http://localhost:2379
-
-        let endpoints = vec!["http://localhost:2379".to_string()];
+        // Spin up an isolated etcd instance; previously this test required a
+        // long-running etcd at localhost:2379 and was `#[ignore]`d.
+        let (_etcd, endpoint) = start_etcd().await;
+        let endpoints = vec![endpoint];
 
         let config1 = LeaderElectionConfig {
             identity: "instance-1".to_string(),

@@ -45,6 +45,7 @@ proptest = "1"
 serial_test = { workspace = true }
 criterion = "0.5"
 futures = "0.3"
+testcontainers = "0.22"
 
 [[bench]]
 name = "regex_cache"
