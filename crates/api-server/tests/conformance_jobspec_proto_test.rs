@@ -14,6 +14,7 @@
 //!   - `should run a job to completion when tasks succeed and indexes
 //!     are evaluated with successPolicy [Conformance]`
 //!   - `should allow to use the pod failure policy on Job [Conformance]`
+//!
 //! Either of those drives a write that uses `application/vnd.kubernetes.protobuf`
 //! on the wire — exactly the path that exposed the silent-drop bug for Pod
 //! status.
@@ -303,16 +304,21 @@ fn jobspec_proto_decode_round_trips_into_typed_jobspec() {
         "successPolicy must appear at the top level of decoded JobSpec; got {decoded}",
     );
 
-    // Round-trip through the typed JobSpec — this is what the pod/job
-    // handler does after the protobuf middleware converts bytes → Value.
-    let json_bytes = serde_json::to_vec(&decoded).expect("decoded value must serialize");
-    let spec: JobSpec = serde_json::from_slice(&json_bytes).unwrap_or_else(|e| {
-        panic!("typed JobSpec decode failed: {e}\nproto-decoded value: {decoded}")
+    // Round-trip through the typed sub-structs — this is what the api-server's
+    // pod/job handler ends up doing after the protobuf middleware converts
+    // bytes → Value. We can't decode the whole `JobSpec` here because the
+    // synthetic wire payload above only carries the two policy fields, and
+    // `JobSpec.template` is required by upstream contract (kubectl always
+    // sends it). The middleware bug we guard against drops the policy fields
+    // silently, which would surface as `None` below regardless of whether
+    // `template` is present.
+    let pfp_value = decoded
+        .get("podFailurePolicy")
+        .cloned()
+        .expect("podFailurePolicy must be present on the decoded JobSpec");
+    let pfp: PodFailurePolicy = serde_json::from_value(pfp_value).unwrap_or_else(|e| {
+        panic!("typed PodFailurePolicy decode failed: {e}\nproto-decoded value: {decoded}")
     });
-
-    let pfp = spec
-        .pod_failure_policy
-        .expect("podFailurePolicy must survive the round-trip");
     assert_eq!(pfp.rules.len(), 1, "exactly one PodFailurePolicyRule");
     assert_eq!(pfp.rules[0].action, "FailJob");
     let on_exit = pfp.rules[0]
@@ -322,9 +328,13 @@ fn jobspec_proto_decode_round_trips_into_typed_jobspec() {
     assert_eq!(on_exit.operator, "In");
     assert_eq!(on_exit.values, vec![1]);
 
-    let sp = spec
-        .success_policy
-        .expect("successPolicy must survive the round-trip");
+    let sp_value = decoded
+        .get("successPolicy")
+        .cloned()
+        .expect("successPolicy must be present on the decoded JobSpec");
+    let sp: SuccessPolicy = serde_json::from_value(sp_value).unwrap_or_else(|e| {
+        panic!("typed SuccessPolicy decode failed: {e}\nproto-decoded value: {decoded}")
+    });
     assert_eq!(sp.rules.len(), 1);
     assert_eq!(sp.rules[0].succeeded_indexes.as_deref(), Some("0,2"));
 }
