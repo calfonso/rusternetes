@@ -5204,6 +5204,13 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // EphemeralContainer wraps EphemeralContainerCommon at proto field 1.
+        // Upstream Go declares the embed as `json:",inline"`, so its keys
+        // (name, image, command, ...) appear at the EphemeralContainer JSON
+        // level — never under an `ephemeralContainerCommon` wrapper. Our
+        // Rust `EphemeralContainer` struct mirrors that flat shape. Use
+        // `InlineMessage` so the proto→JSON decoder merges the inner
+        // fields into the parent object.
         schemas.insert(
             "EphemeralContainer".into(),
             MessageSchema {
@@ -5212,7 +5219,7 @@ impl ProtoRegistry {
                         1,
                         (
                             "ephemeralContainerCommon".into(),
-                            FieldType::Message("EphemeralContainerCommon".into()),
+                            FieldType::InlineMessage("EphemeralContainerCommon".into()),
                         ),
                     ),
                     (2, ("targetContainerName".into(), FieldType::String)),
@@ -5812,6 +5819,12 @@ impl ProtoRegistry {
         // persistentVolumeSource (field 2) references PersistentVolumeSource, which
         // is not registered (one of many vendor volume sources excluded from this
         // worker's scope) — it will decode to `{}` per the registry's fallback.
+        // PersistentVolumeSpec embeds PersistentVolumeSource at proto field
+        // 2. Upstream Go marks the embed `json:",inline"`, so individual
+        // volume-source keys (hostPath, nfs, csi, ...) live at the
+        // PersistentVolumeSpec level on the JSON wire — never wrapped in
+        // a `persistentVolumeSource` object. Our Rust struct mirrors that
+        // flat shape. Use `InlineMessage` so proto→JSON merges correctly.
         schemas.insert(
             "PersistentVolumeSpec".into(),
             MessageSchema {
@@ -5820,7 +5833,7 @@ impl ProtoRegistry {
                         2,
                         (
                             "persistentVolumeSource".into(),
-                            FieldType::Message("PersistentVolumeSource".into()),
+                            FieldType::InlineMessage("PersistentVolumeSource".into()),
                         ),
                     ),
                     (
@@ -6741,11 +6754,20 @@ impl ProtoRegistry {
     }
 
     fn probe_schema() -> MessageSchema {
+        // Probe embeds ProbeHandler at proto field 1. Upstream Go marks the
+        // embed `json:",inline"`, so the action keys (httpGet, tcpSocket,
+        // exec, grpc) appear at the Probe JSON level — never under a
+        // `handler` wrapper. Our Rust `Probe` struct exposes those fields
+        // directly; use `InlineMessage` so the proto→JSON decoder lifts
+        // them out of the inner message into the Probe object.
         MessageSchema {
             fields: HashMap::from([
                 (
                     1,
-                    ("handler".into(), FieldType::Message("ProbeHandler".into())),
+                    (
+                        "handler".into(),
+                        FieldType::InlineMessage("ProbeHandler".into()),
+                    ),
                 ),
                 (2, ("initialDelaySeconds".into(), FieldType::Int)),
                 (3, ("timeoutSeconds".into(), FieldType::Int)),
