@@ -1052,75 +1052,7 @@ mod tests {
         );
     }
 
-    /// Microbenchmark: prove the cache makes a hot path meaningfully faster.
-    /// Marked `#[ignore]` because timing-based asserts are inherently noisy
-    /// in CI — run explicitly with:
-    ///
-    ///   cargo test -p rusternetes-common --release -- --ignored regex_cache_speedup --nocapture
-    ///
-    /// Compares two equivalent workloads on the same input:
-    ///   1. cached: validate via SchemaValidator (hits compile_regex_cached)
-    ///   2. uncached: `Regex::new(pattern)` per iteration (the pre-cache path)
-    ///
-    /// On a warm machine the cached path is typically 50–500× faster than
-    /// re-compiling. The assertion uses a conservative 10× lower bound so
-    /// it doesn't flake on a slow runner; the printed ratio is the real
-    /// signal — read it from `--nocapture` output.
-    #[test]
-    #[ignore = "perf microbenchmark; run with --ignored on --release"]
-    fn regex_cache_speedup() {
-        use std::time::Instant;
-
-        // A pattern with character classes + quantifiers + anchors so
-        // compile work is non-trivial. Same shape as common K8s patterns
-        // (DNS label, semver, label-value).
-        let pattern = r"^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$";
-        let input = "subdomain.example.com";
-        let n: u32 = 5_000;
-
-        let schema = JSONSchemaProps {
-            type_: Some("string".to_string()),
-            pattern: Some(pattern.to_string()),
-            ..Default::default()
-        };
-        let value = serde_json::Value::String(input.to_string());
-
-        // Warm the cache once so the timed loop measures hit-path only.
-        SchemaValidator::validate(&schema, &value).unwrap();
-
-        // Cached path: every call hits compile_regex_cached via the
-        // public validate() entry point. Mirrors real CRD admission.
-        let cached = {
-            let t = Instant::now();
-            for _ in 0..n {
-                SchemaValidator::validate(&schema, &value).unwrap();
-            }
-            t.elapsed()
-        };
-
-        // Uncached path: what the code does on fork/main without this
-        // PR — Regex::new + is_match per call.
-        let uncached = {
-            let t = Instant::now();
-            for _ in 0..n {
-                let re = regex::Regex::new(pattern).unwrap();
-                assert!(re.is_match(input));
-            }
-            t.elapsed()
-        };
-
-        let ratio = uncached.as_nanos() as f64 / cached.as_nanos().max(1) as f64;
-        eprintln!(
-            "regex_cache_speedup: n={} cached={:?} uncached={:?} speedup={:.1}x",
-            n, cached, uncached, ratio
-        );
-
-        assert!(
-            ratio >= 10.0,
-            "expected cache to give >=10x speedup; got {:.1}x (cached={:?} uncached={:?})",
-            ratio,
-            cached,
-            uncached
-        );
-    }
+    // Note: the `regex_cache_speedup` perf microbenchmark that used to live
+    // here was moved to `crates/common/benches/regex_cache.rs` (criterion).
+    // Run with: `cargo bench -p rusternetes-common --bench regex_cache`.
 }

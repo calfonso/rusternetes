@@ -42,3 +42,8 @@ axum-support = ["axum"]
 tempfile = "3.27.0"
 proptest = "1"
 serial_test = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "regex_cache"
+harness = false
