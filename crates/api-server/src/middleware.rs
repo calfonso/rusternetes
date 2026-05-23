@@ -11,6 +11,8 @@ use rusternetes_storage::{build_key, Storage, StorageBackend};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
 
+use crate::cbor;
+
 /// Global protobuf schema registry — initialized once on first use
 static PROTO_REGISTRY: LazyLock<crate::protobuf::ProtoRegistry> =
     LazyLock::new(crate::protobuf::ProtoRegistry::new);
@@ -171,11 +173,81 @@ pub async fn normalize_content_type_middleware(
             .unwrap_or("")
             .to_string();
 
+        // Handle CBOR Content-Type: decode CBOR body to JSON in-place so the
+        // downstream Axum handler (which only knows `application/json`) can
+        // process it normally. This covers both `application/cbor` (full
+        // object encoding) and `application/apply-patch+cbor` (SSA patches).
+        // Mirrors upstream `runtime/serializer/cbor` whose `Decode` produces
+        // a JSON-equivalent runtime.Object.
+        if cbor::is_cbor_content_type(&content_type) {
+            debug!(
+                "Decoding CBOR body to JSON for: {} {}",
+                request.method(),
+                request.uri()
+            );
+
+            let (parts, body) = request.into_parts();
+            let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => {
+                    return Err(axum::response::Response::builder()
+                        .status(axum::http::StatusCode::BAD_REQUEST)
+                        .body(axum::body::Body::from("failed to read request body"))
+                        .unwrap());
+                }
+            };
+
+            let json_body = match cbor::decode_cbor_to_json_bytes(&body_bytes) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("CBOR decode failed: {}", e);
+                    return Err(axum::response::Response::builder()
+                        .status(axum::http::StatusCode::BAD_REQUEST)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(format!(
+                            r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","message":"failed to decode CBOR body: {}","reason":"BadRequest","code":400}}"#,
+                            e
+                        )))
+                        .unwrap());
+                }
+            };
+
+            // If this was an apply-patch+cbor request, preserve the original
+            // Content-Type so the patch dispatcher can route it to SSA.
+            let is_apply_patch = content_type
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with(cbor::APPLY_PATCH_CBOR_CONTENT_TYPE);
+            let mut new_request = Request::from_parts(parts, axum::body::Body::from(json_body));
+            if is_apply_patch {
+                // Patch dispatcher uses x-original-content-type to remember
+                // the original patch MIME type when the wire body has been
+                // rewritten to JSON for the JSON extractor.
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&content_type) {
+                    new_request.headers_mut().insert(
+                        axum::http::HeaderName::from_static("x-original-content-type"),
+                        hv,
+                    );
+                }
+            }
+            new_request.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            // Remember that this request arrived as CBOR so the response
+            // wrapper can emit CBOR if the client also asked for it (or
+            // if it sent the CBOR header without an explicit Accept).
+            new_request.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-was-cbor"),
+                axum::http::HeaderValue::from_static("true"),
+            );
+            request = new_request;
+        }
         // Handle protobuf Content-Type: extract JSON from K8s protobuf envelope.
         // The K8s protobuf format wraps JSON in a simple envelope:
         //   magic: "k8s\0" (4 bytes)
         //   protobuf Unknown message with `raw` field containing JSON
-        if content_type.starts_with("application/vnd.kubernetes.protobuf") {
+        else if content_type.starts_with("application/vnd.kubernetes.protobuf") {
             debug!(
                 "Converting protobuf to JSON for: {} {}",
                 request.method(),
@@ -338,7 +410,7 @@ pub async fn normalize_content_type_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let _is_watch_request = accept_header.contains("stream=watch")
+    let is_watch_request = accept_header.contains("stream=watch")
         || request.uri().path().contains("/watch/")
         || request
             .uri()
@@ -352,7 +424,77 @@ pub async fn normalize_content_type_middleware(
     // and falls back to JSON when protobuf is unavailable.
     let wants_protobuf = false;
 
+    // CBOR response negotiation. We honor either an explicit
+    // `Accept: application/cbor` header OR the convention that a CBOR-encoded
+    // request (recorded via `x-was-cbor` in the request branch above) should
+    // get a CBOR-encoded response unless the client explicitly asked for a
+    // different type. Watch streams are excluded — they emit chunked JSON
+    // lines which cannot be collected into a single CBOR item.
+    let was_cbor_request = request
+        .headers()
+        .get("x-was-cbor")
+        .and_then(|v| v.to_str().ok())
+        == Some("true");
+    let accept_specifies_concrete_type = !accept_header.is_empty() && accept_header != "*/*";
+    let wants_cbor = !is_watch_request
+        && (cbor::accept_wants_cbor(&accept_header)
+            || (was_cbor_request && !accept_specifies_concrete_type));
+
     let response = next.run(request).await;
+
+    // Wrap response in CBOR if the client negotiated it. We only wrap
+    // successful 2xx responses with `application/json` bodies — error
+    // Status objects stay JSON so clients always see a consistent failure
+    // shape (upstream's CBOR serializer behaves the same way: errors are
+    // never re-encoded, the wire format follows the handler output).
+    if wants_cbor {
+        let response_ct = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let status = response.status();
+        if status.is_success() && response_ct.starts_with("application/json") {
+            let (parts, body) = response.into_parts();
+            match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+                Ok(json_bytes) => match serde_json::from_slice::<serde_json::Value>(&json_bytes) {
+                    Ok(value) => match cbor::encode_json_to_cbor(&value) {
+                        Ok(cbor_bytes) => {
+                            let mut resp = Response::from_parts(parts, Body::from(cbor_bytes));
+                            resp.headers_mut().insert(
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static(cbor::CBOR_CONTENT_TYPE),
+                            );
+                            // Drop any stale Content-Length the upstream set
+                            // for the JSON body — Axum will recompute the
+                            // length from the new body on its own.
+                            resp.headers_mut()
+                                .remove(axum::http::header::CONTENT_LENGTH);
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            warn!("CBOR encode failed: {}", e);
+                            return Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Body::empty())
+                                .unwrap());
+                        }
+                    },
+                    Err(_) => {
+                        // Body wasn't JSON — return it untouched.
+                        return Ok(Response::from_parts(parts, Body::from(json_bytes)));
+                    }
+                },
+                Err(_) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap());
+                }
+            }
+        }
+    }
 
     // Wrap response in protobuf if:
     // 1. The Accept header requests protobuf

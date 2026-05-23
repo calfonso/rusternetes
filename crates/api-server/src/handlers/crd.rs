@@ -34,8 +34,13 @@ pub async fn create_crd(
         ));
     }
 
-    // Detect binary (protobuf/CBOR) bodies early — before attempting JSON parse.
-    // If the first byte isn't a valid JSON start character, reject immediately.
+    // Detect binary (protobuf) bodies early — before attempting JSON parse.
+    // CBOR (`application/cbor` / `application/apply-patch+cbor`) is decoded
+    // upstream of this handler by `normalize_content_type_middleware`, which
+    // transcodes the request body to JSON before it reaches us. So at this
+    // point a non-JSON first byte means an unhandled binary format
+    // (typically the `k8s\0` protobuf envelope) — we still reject those
+    // because the CRD handler has no native binary decode path.
     if !body.is_empty()
         && !matches!(
             body[0],
@@ -43,7 +48,8 @@ pub async fn create_crd(
         )
     {
         return Err(rusternetes_common::Error::UnsupportedMediaType(
-            "the body is not valid JSON (protobuf/CBOR content type is not supported for this resource)".to_string(),
+            "the body is not valid JSON (protobuf content type is not supported for this resource)"
+                .to_string(),
         ));
     }
 
