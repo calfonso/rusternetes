@@ -2,6 +2,7 @@ mod admission;
 mod admission_webhook;
 mod bootstrap;
 mod cbor;
+mod cel;
 mod conversion;
 mod dynamic_routes;
 #[allow(dead_code)]
