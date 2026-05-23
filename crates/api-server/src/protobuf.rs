@@ -5729,6 +5729,72 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // events.k8s.io/v1.Event — distinct wire layout from core/v1.Event.
+        // Registered under a group-qualified key so `decode_k8s_resource`'s
+        // apiVersion-aware lookup picks the right schema; the unqualified
+        // `Event` schema above stays as the core/v1 default.
+        // Field numbers from k8s.io/api/events/v1/generated.proto (release-1.35).
+        schemas.insert(
+            "events.k8s.io/v1.Event".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("eventTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (
+                        3,
+                        ("series".into(), FieldType::Message("EventSeries".into())),
+                    ),
+                    (4, ("reportingController".into(), FieldType::String)),
+                    (5, ("reportingInstance".into(), FieldType::String)),
+                    (6, ("action".into(), FieldType::String)),
+                    (7, ("reason".into(), FieldType::String)),
+                    (
+                        8,
+                        (
+                            "regarding".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "related".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (10, ("note".into(), FieldType::String)),
+                    (11, ("type".into(), FieldType::String)),
+                    (
+                        12,
+                        (
+                            "deprecatedFirstTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (
+                        13,
+                        (
+                            "deprecatedLastTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (14, ("deprecatedCount".into(), FieldType::Int)),
+                    (
+                        15,
+                        (
+                            "deprecatedSource".into(),
+                            FieldType::Message("EventSource".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
         schemas.insert(
             "EventSource".into(),
             MessageSchema {
@@ -7055,6 +7121,16 @@ impl ProtoRegistry {
                     // K8s Time is a Timestamp proto — decode to RFC3339 string
                     return decode_timestamp(data);
                 }
+                if msg_type == "MicroTime" {
+                    // K8s MicroTime is wire-identical to Time but its JSON form
+                    // keeps microsecond precision (see metav1.MicroTime.MarshalJSON).
+                    // Falling back to the generic message decoder here would emit
+                    // `{seconds, nanos}` and break every consumer that types
+                    // these fields as RFC3339 strings — most visibly
+                    // `events.k8s.io/v1.Event.eventTime` (see canary run
+                    // #26315095760).
+                    return decode_micro_timestamp(data);
+                }
                 match self.decode_message(msg_type, data) {
                     Some(v) => v,
                     None => {
@@ -7318,8 +7394,18 @@ impl ProtoRegistry {
             return Some(raw.to_vec());
         }
 
-        // Look up the schema for this kind
-        if let Some(json_obj) = self.decode_message(&kind, raw) {
+        // Look up the schema. Prefer a group-qualified key
+        // (`<apiVersion>.<kind>`, e.g. `events.k8s.io/v1.Event`) so kinds that
+        // collide on bare name but differ across groups — most notably
+        // `Event` between `core/v1` and `events.k8s.io/v1`, which have
+        // entirely distinct proto field numberings — pick the right schema.
+        // Fall back to the bare kind for the (vast majority) of types where
+        // only one definition exists.
+        let qualified = format!("{}.{}", api_version, kind);
+        let decoded = self
+            .decode_message(&qualified, raw)
+            .or_else(|| self.decode_message(&kind, raw));
+        if let Some(json_obj) = decoded {
             // Add apiVersion and kind to the JSON
             let result = match json_obj {
                 Value::Object(m) => {
@@ -7558,8 +7644,19 @@ fn decode_map_entry(data: &[u8]) -> (String, String) {
     (key, val)
 }
 
-/// Decode a K8s Timestamp protobuf to RFC3339 string
+/// Decode a K8s Timestamp protobuf to RFC3339 string (second precision).
 fn decode_timestamp(data: &[u8]) -> Value {
+    decode_timestamp_inner(data, "%Y-%m-%dT%H:%M:%SZ")
+}
+
+/// Decode a K8s MicroTime protobuf to RFC3339 string with microsecond
+/// precision. Same wire layout as `Time`; differs only in JSON output
+/// granularity (`metav1.MicroTime.MarshalJSON` keeps fractional seconds).
+fn decode_micro_timestamp(data: &[u8]) -> Value {
+    decode_timestamp_inner(data, "%Y-%m-%dT%H:%M:%S%.6fZ")
+}
+
+fn decode_timestamp_inner(data: &[u8], fmt: &str) -> Value {
     let mut seconds: i64 = 0;
     let mut nanos: i32 = 0;
     let mut pos = 0;
@@ -7592,7 +7689,7 @@ fn decode_timestamp(data: &[u8]) -> Value {
     // Convert to RFC3339
     let dt = chrono::DateTime::from_timestamp(seconds, nanos as u32);
     match dt {
-        Some(dt) => Value::String(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        Some(dt) => Value::String(dt.format(fmt).to_string()),
         None => Value::String(format!("{}s", seconds)),
     }
 }
