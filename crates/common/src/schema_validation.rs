@@ -267,7 +267,7 @@ impl SchemaValidator {
                     path.push(PathSeg::Key(key.clone()));
                     Self::collect_issues_recursive(prop_schema, value, path, out);
                     path.pop();
-                } else if let Some(ref additional) = schema.additional_properties {
+                } else if let Some(additional) = schema.additional_properties.as_deref() {
                     use crate::resources::crd::JSONSchemaPropsOrBool;
                     if let JSONSchemaPropsOrBool::Schema(addl_schema) = additional {
                         path.push(PathSeg::Key(key.clone()));
@@ -276,7 +276,7 @@ impl SchemaValidator {
                     }
                 }
             }
-        } else if let Some(ref additional) = schema.additional_properties {
+        } else if let Some(additional) = schema.additional_properties.as_deref() {
             use crate::resources::crd::JSONSchemaPropsOrBool;
             if let JSONSchemaPropsOrBool::Schema(addl_schema) = additional {
                 for (key, value) in obj {
