@@ -102,6 +102,37 @@ pub fn redact_secret_like(bytes: &[u8]) -> Cow<'_, [u8]> {
 }
 
 use std::cell::RefCell;
+use std::sync::Once;
+
+static INSTALL: Once = Once::new();
+
+/// Install a panic hook that, when a panic fires inside a `with_payload`
+/// scope, emits one `tracing::error!` with the component name and the
+/// redacted payload. Chains over (does not replace) the previous hook so
+/// the default backtrace continues to print. Safe to call multiple times;
+/// only the first call wins.
+pub fn install_panic_hook(component: &'static str) {
+    INSTALL.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = CURRENT_PAYLOAD
+                .try_with(|cell| cell.borrow().clone())
+                .ok()
+                .flatten();
+            if let Some(body) = payload {
+                let redacted = redact_secret_like(&body);
+                let preview = String::from_utf8_lossy(&redacted);
+                tracing::error!(
+                    component = component,
+                    panic = %info,
+                    payload = %preview,
+                    "panic with in-flight payload"
+                );
+            }
+            prev(info);
+        }));
+    });
+}
 
 tokio::task_local! {
     pub static CURRENT_PAYLOAD: RefCell<Option<bytes::Bytes>>;
@@ -207,5 +238,58 @@ mod tests {
     async fn current_payload_outside_scope_returns_err() {
         let res = CURRENT_PAYLOAD.try_with(|cell| cell.borrow().clone());
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn panic_hook_logs_payload_under_scope() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default, Clone)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        impl<S> tracing_subscriber::Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = StrVisitor::default();
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        #[derive(Default)]
+        struct StrVisitor(String);
+        impl tracing::field::Visit for StrVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+        }
+
+        let capture = Capture::default();
+        let sub = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(sub);
+
+        install_panic_hook("test-component");
+
+        let body = bytes::Bytes::from_static(br#"{"kind":"Pod"}"#);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(with_payload(body, async {
+                panic!("boom");
+            }))
+        }));
+
+        let logs = capture.0.lock().unwrap().clone();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("test-component") && l.contains("Pod")),
+            "no dump log captured; got: {logs:?}"
+        );
     }
 }

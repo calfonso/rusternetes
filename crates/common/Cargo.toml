@@ -44,6 +44,7 @@ tempfile = "3.27.0"
 proptest = "1"
 serial_test = { workspace = true }
 criterion = "0.5"
+futures = "0.3"
 
 [[bench]]
 name = "regex_cache"
