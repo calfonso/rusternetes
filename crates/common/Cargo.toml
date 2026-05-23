@@ -20,7 +20,8 @@ rcgen.workspace = true
 rustls.workspace = true
 rustls-pemfile = "2.1"
 axum = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["fs", "io-util"] }
+bytes = "1"
+tokio = { workspace = true, features = ["fs", "io-util", "macros"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 aes-gcm = "0.10"
@@ -43,6 +44,7 @@ tempfile = "3.27.0"
 proptest = "1"
 serial_test = { workspace = true }
 criterion = "0.5"
+futures = "0.3"
 
 [[bench]]
 name = "regex_cache"

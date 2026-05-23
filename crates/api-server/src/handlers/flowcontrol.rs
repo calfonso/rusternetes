@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{FlowSchema, PriorityLevelConfiguration},
@@ -21,7 +22,7 @@ pub async fn create_priority_level_configuration(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut plc): Json<PriorityLevelConfiguration>,
+    DumpingJson(mut plc): DumpingJson<PriorityLevelConfiguration>,
 ) -> Result<(StatusCode, Json<PriorityLevelConfiguration>)> {
     info!("Creating PriorityLevelConfiguration: {}", plc.metadata.name);
 
@@ -77,7 +78,7 @@ pub async fn update_priority_level_configuration(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut plc): Json<PriorityLevelConfiguration>,
+    DumpingJson(mut plc): DumpingJson<PriorityLevelConfiguration>,
 ) -> Result<Json<PriorityLevelConfiguration>> {
     info!("Updating PriorityLevelConfiguration: {}", name);
 
@@ -232,7 +233,7 @@ pub async fn create_flow_schema(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut fs): Json<FlowSchema>,
+    DumpingJson(mut fs): DumpingJson<FlowSchema>,
 ) -> Result<(StatusCode, Json<FlowSchema>)> {
     info!("Creating FlowSchema: {}", fs.metadata.name);
 
@@ -288,7 +289,7 @@ pub async fn update_flow_schema(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut fs): Json<FlowSchema>,
+    DumpingJson(mut fs): DumpingJson<FlowSchema>,
 ) -> Result<Json<FlowSchema>> {
     info!("Updating FlowSchema: {}", name);
 

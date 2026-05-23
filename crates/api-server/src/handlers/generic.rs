@@ -15,6 +15,7 @@ use axum::{
     Extension, Json,
 };
 use rusternetes_common::authz::{Decision, RequestAttributes};
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_storage::{build_key, build_prefix, Storage};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -26,7 +27,7 @@ use tracing::{debug, info, warn};
 pub async fn create_apiservice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Json(mut value): Json<Value>,
+    DumpingJson(mut value): DumpingJson<Value>,
 ) -> rusternetes_common::Result<(StatusCode, Json<Value>)> {
     let name = value
         .get("metadata")
@@ -111,7 +112,7 @@ pub async fn update_apiservice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-    Json(mut value): Json<Value>,
+    DumpingJson(mut value): DumpingJson<Value>,
 ) -> rusternetes_common::Result<Json<Value>> {
     let attrs = RequestAttributes::new(auth_ctx.user, "update", "apiservices")
         .with_api_group("apiregistration.k8s.io")
@@ -138,7 +139,7 @@ pub async fn update_apiservice_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
-    Json(mut value): Json<Value>,
+    DumpingJson(mut value): DumpingJson<Value>,
 ) -> rusternetes_common::Result<Json<Value>> {
     let attrs = RequestAttributes::new(auth_ctx.user, "update", "apiservices/status")
         .with_api_group("apiregistration.k8s.io")

@@ -11,6 +11,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{CustomResource, CustomResourceDefinition},
@@ -1581,7 +1582,7 @@ pub async fn update_custom_resource_status(
         Option<String>,
         String,
     )>,
-    Json(status): Json<serde_json::Value>,
+    DumpingJson(status): DumpingJson<serde_json::Value>,
 ) -> Result<Json<CustomResource>> {
     info!(
         "Updating custom resource status {}/{}/{}: {}",
@@ -1783,7 +1784,7 @@ pub async fn update_custom_resource_scale(
         Option<String>,
         String,
     )>,
-    Json(scale): Json<Scale>,
+    DumpingJson(scale): DumpingJson<Scale>,
 ) -> Result<Json<Scale>> {
     info!(
         "Updating custom resource scale {}/{}/{}: {}",

@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::ResourceSlice,
@@ -19,7 +20,7 @@ pub async fn create_resourceslice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut slice): Json<ResourceSlice>,
+    DumpingJson(mut slice): DumpingJson<ResourceSlice>,
 ) -> Result<(StatusCode, Json<ResourceSlice>)> {
     info!(
         "Creating ResourceSlice: {}",
@@ -167,7 +168,7 @@ pub async fn update_resourceslice(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut slice): Json<ResourceSlice>,
+    DumpingJson(mut slice): DumpingJson<ResourceSlice>,
 ) -> Result<Json<ResourceSlice>> {
     info!("Updating ResourceSlice: {}", name);
 

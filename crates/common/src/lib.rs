@@ -5,6 +5,7 @@ pub mod authz;
 pub mod cel;
 pub mod cloud_provider;
 pub mod deletion;
+pub mod dump;
 pub mod encryption;
 pub mod error;
 pub mod feature_gates;

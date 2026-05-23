@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::DeviceClass,
@@ -19,7 +20,7 @@ pub async fn create_deviceclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut dc): Json<DeviceClass>,
+    DumpingJson(mut dc): DumpingJson<DeviceClass>,
 ) -> Result<(StatusCode, Json<DeviceClass>)> {
     info!(
         "Creating DeviceClass: {}",
@@ -166,7 +167,7 @@ pub async fn update_deviceclass(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut dc): Json<DeviceClass>,
+    DumpingJson(mut dc): DumpingJson<DeviceClass>,
 ) -> Result<Json<DeviceClass>> {
     info!("Updating DeviceClass: {}", name);
 

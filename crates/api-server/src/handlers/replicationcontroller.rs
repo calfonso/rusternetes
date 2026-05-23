@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::ReplicationController,
@@ -19,7 +20,7 @@ pub async fn create_replicationcontroller(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
-    Json(mut rc): Json<ReplicationController>,
+    DumpingJson(mut rc): DumpingJson<ReplicationController>,
 ) -> Result<(StatusCode, Json<ReplicationController>)> {
     info!(
         "Creating replicationcontroller: {} in namespace: {}",
@@ -102,7 +103,7 @@ pub async fn update_replicationcontroller(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    Json(mut rc): Json<ReplicationController>,
+    DumpingJson(mut rc): DumpingJson<ReplicationController>,
 ) -> Result<Json<ReplicationController>> {
     info!(
         "Updating replicationcontroller: {} in namespace: {}",

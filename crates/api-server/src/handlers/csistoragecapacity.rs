@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::CSIStorageCapacity,
@@ -19,7 +20,7 @@ pub async fn create_csistoragecapacity(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut csc): Json<CSIStorageCapacity>,
+    DumpingJson(mut csc): DumpingJson<CSIStorageCapacity>,
 ) -> Result<(StatusCode, Json<CSIStorageCapacity>)> {
     info!(
         "Creating CSIStorageCapacity: {} in namespace: {}",
@@ -213,7 +214,7 @@ pub async fn update_csistoragecapacity(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut csc): Json<CSIStorageCapacity>,
+    DumpingJson(mut csc): DumpingJson<CSIStorageCapacity>,
 ) -> Result<Json<CSIStorageCapacity>> {
     info!(
         "Updating CSIStorageCapacity: {} in namespace: {}",

@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::ResourceClaimTemplate,
@@ -20,7 +21,7 @@ pub async fn create_resourceclaimtemplate(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut template): Json<ResourceClaimTemplate>,
+    DumpingJson(mut template): DumpingJson<ResourceClaimTemplate>,
 ) -> Result<(StatusCode, Json<ResourceClaimTemplate>)> {
     info!(
         "Creating ResourceClaimTemplate: {}/{}",
@@ -235,7 +236,7 @@ pub async fn update_resourceclaimtemplate(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut template): Json<ResourceClaimTemplate>,
+    DumpingJson(mut template): DumpingJson<ResourceClaimTemplate>,
 ) -> Result<Json<ResourceClaimTemplate>> {
     info!("Updating ResourceClaimTemplate: {}/{}", namespace, name);
 

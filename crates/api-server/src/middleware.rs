@@ -1851,6 +1851,68 @@ fn try_brace_scan_or_type_meta(body_bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+// ============================================================================
+// Conformance payload-dump middleware.
+//
+// Outermost layer in the router. Buffers the request body (up to
+// MAX_DUMP_BODY) into `rusternetes_common::dump::CURRENT_PAYLOAD`, then
+// logs the body on any 5xx response. No-op when RUSTERNETES_DUMP_PAYLOADS
+// is unset.
+// ============================================================================
+
+/// 4 MiB — matches Kubernetes' default max request size.
+const MAX_DUMP_BODY: usize = 4 * 1024 * 1024;
+
+pub async fn capture_payload(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::body::{to_bytes, Body};
+    use rusternetes_common::dump::{self, redact_secret_like, CURRENT_PAYLOAD};
+    use std::cell::RefCell;
+
+    if !dump::dumps_enabled() {
+        return next.run(req).await;
+    }
+
+    let (parts, body) = req.into_parts();
+    let (bytes, truncated) = match to_bytes(body, MAX_DUMP_BODY).await {
+        Ok(b) => (Some(b), false),
+        Err(_) => (None, true),
+    };
+
+    let body_for_inner = match &bytes {
+        Some(b) => Body::from(b.clone()),
+        None => Body::empty(),
+    };
+    let scope_payload = bytes.clone();
+    let rebuilt = axum::extract::Request::from_parts(parts.clone(), body_for_inner);
+    let resp = CURRENT_PAYLOAD
+        .scope(RefCell::new(scope_payload), next.run(rebuilt))
+        .await;
+
+    if resp.status().is_server_error() {
+        let payload_str = match &bytes {
+            Some(b) => {
+                let redacted = redact_secret_like(b);
+                String::from_utf8_lossy(&redacted).into_owned()
+            }
+            None => "<truncated>".to_string(),
+        };
+        tracing::error!(
+            method = %parts.method,
+            uri = %parts.uri,
+            status = %resp.status(),
+            kind = "5xx",
+            payload_truncated = truncated,
+            payload = %payload_str,
+            "request handler returned 5xx"
+        );
+    }
+
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

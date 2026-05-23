@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::Node,
@@ -19,7 +20,7 @@ pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut node): Json<Node>,
+    DumpingJson(mut node): DumpingJson<Node>,
 ) -> Result<(StatusCode, Json<Node>)> {
     info!("Creating node: {}", node.metadata.name);
 
@@ -86,7 +87,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut node): Json<Node>,
+    DumpingJson(mut node): DumpingJson<Node>,
 ) -> Result<Json<Node>> {
     info!("Updating node: {}", name);
 

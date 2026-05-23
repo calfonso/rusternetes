@@ -61,6 +61,7 @@ services:
     environment:
       - RUST_LOG=info
       - DOCKER_HOST=unix:///run/podman/podman.sock
+      - RUSTERNETES_DUMP_PAYLOADS=${RUSTERNETES_DUMP_PAYLOADS:-}
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
@@ -143,6 +144,7 @@ services:
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      - RUSTERNETES_DUMP_PAYLOADS=${RUSTERNETES_DUMP_PAYLOADS:-}
     command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   # Kubelet 2 - second node agent for multi-node conformance tests
@@ -169,6 +171,7 @@ services:
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      - RUSTERNETES_DUMP_PAYLOADS=${RUSTERNETES_DUMP_PAYLOADS:-}
     command: ["--node-name", "node-2", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10251", "--sync-interval", "3"]
 
   # Kube-proxy - network proxy

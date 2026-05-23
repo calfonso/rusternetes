@@ -3,6 +3,7 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     auth::UserInfo,
     authz::{Decision, RequestAttributes},
@@ -20,7 +21,7 @@ use tracing::info;
 pub async fn create_subject_access_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Json(mut sar): Json<SubjectAccessReview>,
+    DumpingJson(mut sar): DumpingJson<SubjectAccessReview>,
 ) -> Result<Json<SubjectAccessReview>> {
     info!("Creating subject access review");
 
@@ -95,7 +96,7 @@ pub async fn create_self_subject_access_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     headers: axum::http::HeaderMap,
-    Json(mut ssar): Json<SelfSubjectAccessReview>,
+    DumpingJson(mut ssar): DumpingJson<SelfSubjectAccessReview>,
 ) -> Result<Json<SelfSubjectAccessReview>> {
     info!(
         "Creating self subject access review for user: {}",
@@ -176,7 +177,7 @@ pub async fn create_local_subject_access_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
-    Json(mut lsar): Json<LocalSubjectAccessReview>,
+    DumpingJson(mut lsar): DumpingJson<LocalSubjectAccessReview>,
 ) -> Result<Json<LocalSubjectAccessReview>> {
     info!(
         "Creating local subject access review in namespace: {}",
@@ -244,7 +245,7 @@ pub async fn create_local_subject_access_review(
 pub async fn create_self_subject_rules_review(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
-    Json(mut ssrr): Json<SelfSubjectRulesReview>,
+    DumpingJson(mut ssrr): DumpingJson<SelfSubjectRulesReview>,
 ) -> Result<Json<SelfSubjectRulesReview>> {
     info!(
         "Creating self subject rules review for user: {} in namespace: {}",

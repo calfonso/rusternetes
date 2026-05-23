@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::HorizontalPodAutoscaler,
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut hpa): Json<HorizontalPodAutoscaler>,
+    DumpingJson(mut hpa): DumpingJson<HorizontalPodAutoscaler>,
 ) -> Result<(StatusCode, Json<HorizontalPodAutoscaler>)> {
     info!(
         "Creating horizontalpodautoscaler: {}/{}",
@@ -97,7 +98,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut hpa): Json<HorizontalPodAutoscaler>,
+    DumpingJson(mut hpa): DumpingJson<HorizontalPodAutoscaler>,
 ) -> Result<Json<HorizontalPodAutoscaler>> {
     info!("Updating horizontalpodautoscaler: {}/{}", namespace, name);
 
@@ -319,7 +320,7 @@ pub async fn update_status(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    Json(hpa): Json<HorizontalPodAutoscaler>,
+    DumpingJson(hpa): DumpingJson<HorizontalPodAutoscaler>,
 ) -> Result<Json<HorizontalPodAutoscaler>> {
     info!(
         "Updating horizontalpodautoscaler status: {}/{}",

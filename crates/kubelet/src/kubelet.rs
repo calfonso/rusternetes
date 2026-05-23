@@ -906,9 +906,10 @@ impl Kubelet {
             let kubelet = Arc::clone(self);
             let timeout_secs = 120u64;
             tokio::spawn(async move {
+                let body = serde_json::to_vec(&pod).unwrap_or_default().into();
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    kubelet.sync_pod(&pod),
+                    rusternetes_common::dump::with_payload(body, kubelet.sync_pod(&pod)),
                 )
                 .await;
                 match result {
@@ -1319,9 +1320,10 @@ impl Kubelet {
                         // K8s pod workers don't have a per-sync timeout.
                         // 120s is generous enough for container startup + probes.
                         let timeout_secs = 120u64;
+                        let body = serde_json::to_vec(&pod).unwrap_or_default().into();
                         match tokio::time::timeout(
                             Duration::from_secs(timeout_secs),
-                            kubelet.sync_pod(&pod),
+                            rusternetes_common::dump::with_payload(body, kubelet.sync_pod(&pod)),
                         )
                         .await
                         {

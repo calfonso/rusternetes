@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::IngressClass,
@@ -19,7 +20,7 @@ pub async fn create_ingressclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut ingress_class): Json<IngressClass>,
+    DumpingJson(mut ingress_class): DumpingJson<IngressClass>,
 ) -> Result<(StatusCode, Json<IngressClass>)> {
     info!("Creating IngressClass: {}", ingress_class.metadata.name);
 
@@ -81,7 +82,7 @@ pub async fn update_ingressclass(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut ingress_class): Json<IngressClass>,
+    DumpingJson(mut ingress_class): DumpingJson<IngressClass>,
 ) -> Result<Json<IngressClass>> {
     info!("Updating IngressClass: {}", name);
 

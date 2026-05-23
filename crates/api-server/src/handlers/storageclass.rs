@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::StorageClass,
@@ -19,7 +20,7 @@ pub async fn create_storageclass(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut sc): Json<StorageClass>,
+    DumpingJson(mut sc): DumpingJson<StorageClass>,
 ) -> Result<(StatusCode, Json<StorageClass>)> {
     info!("Creating StorageClass: {}", sc.metadata.name);
 
@@ -117,7 +118,7 @@ pub async fn update_storageclass(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut sc): Json<StorageClass>,
+    DumpingJson(mut sc): DumpingJson<StorageClass>,
 ) -> Result<Json<StorageClass>> {
     info!("Updating StorageClass: {}", name);
 

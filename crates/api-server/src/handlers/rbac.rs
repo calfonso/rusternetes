@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
@@ -21,7 +22,7 @@ pub async fn create_role(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut role): Json<Role>,
+    DumpingJson(mut role): DumpingJson<Role>,
 ) -> Result<(StatusCode, Json<Role>)> {
     info!("Creating role: {}/{}", namespace, role.metadata.name);
 
@@ -94,7 +95,7 @@ pub async fn update_role(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut role): Json<Role>,
+    DumpingJson(mut role): DumpingJson<Role>,
 ) -> Result<Json<Role>> {
     info!("Updating role: {}/{}", namespace, name);
 
@@ -264,7 +265,7 @@ pub async fn create_rolebinding(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut rolebinding): Json<RoleBinding>,
+    DumpingJson(mut rolebinding): DumpingJson<RoleBinding>,
 ) -> Result<(StatusCode, Json<RoleBinding>)> {
     info!(
         "Creating rolebinding: {}/{}",
@@ -340,7 +341,7 @@ pub async fn update_rolebinding(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut rolebinding): Json<RoleBinding>,
+    DumpingJson(mut rolebinding): DumpingJson<RoleBinding>,
 ) -> Result<Json<RoleBinding>> {
     info!("Updating rolebinding: {}/{}", namespace, name);
 
@@ -520,7 +521,7 @@ pub async fn create_clusterrole(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut clusterrole): Json<ClusterRole>,
+    DumpingJson(mut clusterrole): DumpingJson<ClusterRole>,
 ) -> Result<(StatusCode, Json<ClusterRole>)> {
     info!("Creating clusterrole: {}", clusterrole.metadata.name);
 
@@ -597,7 +598,7 @@ pub async fn update_clusterrole(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut clusterrole): Json<ClusterRole>,
+    DumpingJson(mut clusterrole): DumpingJson<ClusterRole>,
 ) -> Result<Json<ClusterRole>> {
     info!("Updating clusterrole: {}", name);
 
@@ -714,7 +715,7 @@ pub async fn create_clusterrolebinding(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut clusterrolebinding): Json<ClusterRoleBinding>,
+    DumpingJson(mut clusterrolebinding): DumpingJson<ClusterRoleBinding>,
 ) -> Result<(StatusCode, Json<ClusterRoleBinding>)> {
     info!(
         "Creating clusterrolebinding: {}",
@@ -798,7 +799,7 @@ pub async fn update_clusterrolebinding(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut clusterrolebinding): Json<ClusterRoleBinding>,
+    DumpingJson(mut clusterrolebinding): DumpingJson<ClusterRoleBinding>,
 ) -> Result<Json<ClusterRoleBinding>> {
     info!("Updating clusterrolebinding: {}", name);
 

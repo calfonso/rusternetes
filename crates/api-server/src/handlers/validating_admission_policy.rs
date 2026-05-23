@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding},
@@ -21,7 +22,7 @@ pub async fn create_validating_admission_policy(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut policy): Json<ValidatingAdmissionPolicy>,
+    DumpingJson(mut policy): DumpingJson<ValidatingAdmissionPolicy>,
 ) -> Result<(StatusCode, Json<ValidatingAdmissionPolicy>)> {
     info!(
         "Creating ValidatingAdmissionPolicy: {}",
@@ -86,7 +87,7 @@ pub async fn update_validating_admission_policy(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut policy): Json<ValidatingAdmissionPolicy>,
+    DumpingJson(mut policy): DumpingJson<ValidatingAdmissionPolicy>,
 ) -> Result<Json<ValidatingAdmissionPolicy>> {
     info!("Updating ValidatingAdmissionPolicy: {}", name);
 
@@ -232,7 +233,7 @@ pub async fn create_validating_admission_policy_binding(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut binding): Json<ValidatingAdmissionPolicyBinding>,
+    DumpingJson(mut binding): DumpingJson<ValidatingAdmissionPolicyBinding>,
 ) -> Result<(StatusCode, Json<ValidatingAdmissionPolicyBinding>)> {
     info!(
         "Creating ValidatingAdmissionPolicyBinding: {}",
@@ -302,7 +303,7 @@ pub async fn update_validating_admission_policy_binding(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut binding): Json<ValidatingAdmissionPolicyBinding>,
+    DumpingJson(mut binding): DumpingJson<ValidatingAdmissionPolicyBinding>,
 ) -> Result<Json<ValidatingAdmissionPolicyBinding>> {
     info!("Updating ValidatingAdmissionPolicyBinding: {}", name);
 

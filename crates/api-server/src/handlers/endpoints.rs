@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::Endpoints,
@@ -21,7 +22,7 @@ pub async fn create_endpoints(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut endpoints): Json<Endpoints>,
+    DumpingJson(mut endpoints): DumpingJson<Endpoints>,
 ) -> Result<(StatusCode, Json<Endpoints>)> {
     info!(
         "Creating endpoints: {}/{}",
@@ -194,7 +195,7 @@ pub async fn update_endpoints(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut endpoints): Json<Endpoints>,
+    DumpingJson(mut endpoints): DumpingJson<Endpoints>,
 ) -> Result<Json<Endpoints>> {
     info!("Updating endpoints: {}/{}", namespace, name);
 

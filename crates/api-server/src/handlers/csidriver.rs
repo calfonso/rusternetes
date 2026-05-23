@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::CSIDriver,
@@ -18,7 +19,7 @@ pub async fn create_csidriver(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut driver): Json<CSIDriver>,
+    DumpingJson(mut driver): DumpingJson<CSIDriver>,
 ) -> Result<(StatusCode, Json<CSIDriver>)> {
     info!("Creating CSIDriver: {}", driver.metadata.name);
 
@@ -104,7 +105,7 @@ pub async fn update_csidriver(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut driver): Json<CSIDriver>,
+    DumpingJson(mut driver): DumpingJson<CSIDriver>,
 ) -> Result<Json<CSIDriver>> {
     info!("Updating CSIDriver: {}", name);
 

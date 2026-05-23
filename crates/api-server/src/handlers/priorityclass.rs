@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::PriorityClass,
@@ -19,7 +20,7 @@ pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut priority_class): Json<PriorityClass>,
+    DumpingJson(mut priority_class): DumpingJson<PriorityClass>,
 ) -> Result<(StatusCode, Json<PriorityClass>)> {
     info!("Creating PriorityClass: {}", priority_class.metadata.name);
 
@@ -87,7 +88,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut priority_class): Json<PriorityClass>,
+    DumpingJson(mut priority_class): DumpingJson<PriorityClass>,
 ) -> Result<Json<PriorityClass>> {
     info!("Updating PriorityClass: {}", name);
 

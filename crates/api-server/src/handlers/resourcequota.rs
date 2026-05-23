@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::{ResourceQuota, ResourceQuotaStatus},
@@ -20,7 +21,7 @@ pub async fn create(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut quota): Json<ResourceQuota>,
+    DumpingJson(mut quota): DumpingJson<ResourceQuota>,
 ) -> Result<(StatusCode, Json<ResourceQuota>)> {
     info!(
         "Creating ResourceQuota: {} in namespace: {}",
@@ -115,7 +116,7 @@ pub async fn update(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-    Json(mut quota): Json<ResourceQuota>,
+    DumpingJson(mut quota): DumpingJson<ResourceQuota>,
 ) -> Result<Json<ResourceQuota>> {
     info!(
         "Updating ResourceQuota: {} in namespace: {}",

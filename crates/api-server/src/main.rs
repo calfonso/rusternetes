@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
+    rusternetes_common::dump::install_panic_hook("api-server");
 
     info!("Starting Rusternetes API Server");
 
