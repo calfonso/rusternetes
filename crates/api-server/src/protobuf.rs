@@ -11579,6 +11579,176 @@ impl ProtoRegistry {
     }
 }
 
+// ============================================================================
+// Native protobuf encoding for `metav1.Status`
+// ============================================================================
+//
+// `IntoResponse for Error` in `crates/common/src/error.rs` builds a typed
+// `Status` and serializes it as JSON via `axum::Json<Status>`. When the client
+// negotiates `application/vnd.kubernetes.protobuf`, upstream Kubernetes
+// returns the same `Status` wrapped in the `k8s\0` + `Unknown` envelope with
+// `raw` carrying the native protobuf encoding (NOT JSON-in-protobuf, which is
+// what the rest of our middleware does for resource bodies).
+//
+// The encoder here mirrors the upstream wire layout from
+// `staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto`:
+//
+// ```text
+// message Status {
+//     optional ListMeta      metadata = 1;
+//     optional string        status   = 2;
+//     optional string        message  = 3;
+//     optional string        reason   = 4;
+//     optional StatusDetails details  = 5;
+//     optional int32         code     = 6;
+// }
+// message StatusDetails {
+//     optional string name              = 1;
+//     optional string group             = 2;
+//     optional string kind              = 3;
+//     repeated StatusCause causes       = 4;
+//     optional int32 retryAfterSeconds  = 5;
+//     optional string uid               = 6;
+// }
+// message StatusCause {
+//     optional string reason  = 1;
+//     optional string message = 2;
+//     optional string field   = 3;
+// }
+// ```
+//
+// `Status.metadata` (ListMeta) is intentionally omitted: the upstream Go
+// `metav1.Status` value built by `apierrors.New*` helpers carries a
+// zero-valued ListMeta, and proto3 message-typed optional fields encode as
+// nothing on the wire when the value is the zero value.
+
+/// Encode a [`Status`] to the native K8s protobuf envelope:
+/// `k8s\0` magic + `Unknown { typeMeta, raw, contentType="application/vnd.kubernetes.protobuf" }`
+/// where `raw` carries the native protobuf encoding of `Status` itself.
+///
+/// The returned bytes are decodable via `ProtoRegistry::decode_message("Status", &bytes[k8s\0+Unknown.raw offset..])`.
+pub fn encode_status_protobuf(status: &rusternetes_common::types::Status) -> Vec<u8> {
+    let raw = encode_status_native(status);
+
+    // Wrap in the K8s runtime.Unknown envelope.
+    //   field 1 (typeMeta, TypeMeta): nested message { apiVersion, kind }
+    //   field 2 (raw, bytes)
+    //   field 4 (contentType, string)
+    let api_version = status.api_version.as_str();
+    let kind = status.kind.as_str();
+    let content_type = b"application/vnd.kubernetes.protobuf";
+
+    let mut type_meta = Vec::with_capacity(api_version.len() + kind.len() + 8);
+    if !api_version.is_empty() {
+        push_string_field(&mut type_meta, 1, api_version.as_bytes());
+    }
+    if !kind.is_empty() {
+        push_string_field(&mut type_meta, 2, kind.as_bytes());
+    }
+
+    let mut unknown = Vec::with_capacity(raw.len() + type_meta.len() + content_type.len() + 16);
+    if !type_meta.is_empty() {
+        push_length_delimited_field(&mut unknown, 1, &type_meta);
+    }
+    push_length_delimited_field(&mut unknown, 2, &raw);
+    push_string_field(&mut unknown, 4, content_type);
+
+    let mut out = Vec::with_capacity(unknown.len() + 4);
+    out.extend_from_slice(b"k8s\0");
+    out.extend_from_slice(&unknown);
+    out
+}
+
+/// Encode a `Status` to native protobuf bytes (without the `k8s\0` + Unknown
+/// envelope). Public for tests that want to round-trip via
+/// `ProtoRegistry::decode_message("Status", …)`.
+pub fn encode_status_native(status: &rusternetes_common::types::Status) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+
+    if let Some(ref s) = status.status {
+        push_string_field(&mut buf, 2, s.as_bytes());
+    }
+    if let Some(ref m) = status.message {
+        push_string_field(&mut buf, 3, m.as_bytes());
+    }
+    if let Some(ref r) = status.reason {
+        push_string_field(&mut buf, 4, r.as_bytes());
+    }
+    if let Some(ref d) = status.details {
+        let inner = encode_status_details_native(d);
+        push_length_delimited_field(&mut buf, 5, &inner);
+    }
+    if let Some(code) = status.code {
+        push_varint_field(&mut buf, 6, code as u64);
+    }
+    buf
+}
+
+fn encode_status_details_native(d: &rusternetes_common::types::StatusDetails) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    if let Some(ref name) = d.name {
+        push_string_field(&mut buf, 1, name.as_bytes());
+    }
+    if let Some(ref group) = d.group {
+        push_string_field(&mut buf, 2, group.as_bytes());
+    }
+    if let Some(ref kind) = d.kind {
+        push_string_field(&mut buf, 3, kind.as_bytes());
+    }
+    if let Some(ref causes) = d.causes {
+        for cause in causes {
+            let inner = encode_status_cause_native(cause);
+            push_length_delimited_field(&mut buf, 4, &inner);
+        }
+    }
+    if let Some(retry) = d.retry_after_seconds {
+        push_varint_field(&mut buf, 5, retry as u64);
+    }
+    if let Some(ref uid) = d.uid {
+        push_string_field(&mut buf, 6, uid.as_bytes());
+    }
+    buf
+}
+
+fn encode_status_cause_native(c: &rusternetes_common::types::StatusCause) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16);
+    if let Some(ref r) = c.reason {
+        push_string_field(&mut buf, 1, r.as_bytes());
+    }
+    if let Some(ref m) = c.message {
+        push_string_field(&mut buf, 2, m.as_bytes());
+    }
+    if let Some(ref f) = c.field {
+        push_string_field(&mut buf, 3, f.as_bytes());
+    }
+    buf
+}
+
+// --- low-level wire helpers (encode side) -----------------------------------
+
+fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push(((value & 0x7f) as u8) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+fn push_string_field(buf: &mut Vec<u8>, field_number: u32, payload: &[u8]) {
+    push_length_delimited_field(buf, field_number, payload);
+}
+
+fn push_length_delimited_field(buf: &mut Vec<u8>, field_number: u32, payload: &[u8]) {
+    encode_varint(buf, ((field_number as u64) << 3) | 2);
+    encode_varint(buf, payload.len() as u64);
+    buf.extend_from_slice(payload);
+}
+
+fn push_varint_field(buf: &mut Vec<u8>, field_number: u32, value: u64) {
+    encode_varint(buf, (field_number as u64) << 3);
+    encode_varint(buf, value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

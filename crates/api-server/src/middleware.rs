@@ -440,6 +440,16 @@ pub async fn normalize_content_type_middleware(
         && (cbor::accept_wants_cbor(&accept_header)
             || (was_cbor_request && !accept_specifies_concrete_type));
 
+    // Detect whether the client negotiated protobuf for Status responses.
+    // Status (the metav1 error/result envelope) is small and well-defined, so
+    // unlike the generic resource body — which we cannot natively
+    // proto-encode — we CAN emit a real protobuf-wire `Status` here. Upstream
+    // clients that send `Accept: application/vnd.kubernetes.protobuf` expect
+    // error responses to round-trip through their typed `StatusUnmarshaler`,
+    // not through a JSON fallback (which the typed client treats as a decode
+    // error). See `staging/src/k8s.io/client-go/rest/request.go::transformResponse`.
+    let wants_status_protobuf = accept_header.contains("application/vnd.kubernetes.protobuf");
+
     let response = next.run(request).await;
 
     // Wrap response in CBOR if the client negotiated it. We only wrap
@@ -486,6 +496,60 @@ pub async fn normalize_content_type_middleware(
                         return Ok(Response::from_parts(parts, Body::from(json_bytes)));
                     }
                 },
+                Err(_) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap());
+                }
+            }
+        }
+    }
+
+    // Re-encode error Status envelopes as native protobuf when the client
+    // asked for `application/vnd.kubernetes.protobuf`. Only triggers on 4xx /
+    // 5xx JSON bodies that look like a `Status` (`kind: "Status"`). Success
+    // responses stay JSON because the rest of the codebase cannot produce
+    // native protobuf for resource bodies (see the `wants_protobuf = false`
+    // comment below).
+    if wants_status_protobuf
+        && (response.status().is_client_error() || response.status().is_server_error())
+    {
+        let response_ct = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if response_ct.starts_with("application/json") {
+            let (parts, body) = response.into_parts();
+            match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+                Ok(json_bytes) => {
+                    // Try to deserialize as Status. If parsing fails or the
+                    // payload is not a Status (e.g. some handler returned a
+                    // bare error string), pass the original bytes through
+                    // unchanged so the client still sees the failure.
+                    match serde_json::from_slice::<rusternetes_common::types::Status>(&json_bytes) {
+                        Ok(status_obj) if status_obj.kind == "Status" => {
+                            let pb = crate::protobuf::encode_status_protobuf(&status_obj);
+                            let mut resp = Response::from_parts(parts, Body::from(pb));
+                            resp.headers_mut().insert(
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static(
+                                    "application/vnd.kubernetes.protobuf",
+                                ),
+                            );
+                            resp.headers_mut()
+                                .remove(axum::http::header::CONTENT_LENGTH);
+                            return Ok(resp);
+                        }
+                        _ => {
+                            // Not a Status — return the original JSON body.
+                            let resp = Response::from_parts(parts, Body::from(json_bytes));
+                            return Ok(resp);
+                        }
+                    }
+                }
                 Err(_) => {
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
