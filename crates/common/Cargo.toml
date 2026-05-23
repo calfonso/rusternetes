@@ -50,3 +50,4 @@ tracing-full = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-stdout", "t
 
 [dev-dependencies]
 tempfile = "3.27.0"
+proptest = "1"
