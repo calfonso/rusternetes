@@ -285,11 +285,13 @@ async fn test_create_with_non_existent_owner() {
 /// concurrency shape: all RCs deleted in parallel, GC scan reaps every
 /// dependent.
 ///
-/// RED-state: ignored because our `scan_and_collect` is single-pass and
-/// does not yet model the orphan / foreground propagation variants the
-/// upstream test exercises. Re-enable when those code paths land.
+/// Concurrent owner deletion is the load shape that matters here:
+/// owner keys are deleted from many tasks in parallel, then a single
+/// `scan_and_collect` must reap every dependent. The GC's snapshot
+/// + per-orphan owner re-verification (see `delete_orphan`) is what
+/// makes this safe under racing owner deletes — there is no per-RC
+/// finalizer to coordinate with.
 #[tokio::test]
-#[ignore = "GC does not yet differentiate orphan / foreground propagation under concurrent owner deletion"]
 async fn test_stressing_cascading_deletion() {
     let storage = fresh_storage();
     let gc = GarbageCollector::new(storage.clone());
@@ -336,6 +338,98 @@ async fn test_stressing_cascading_deletion() {
         0,
         "all dependent pods must be GC'd; {} survivors found",
         remaining.len()
+    );
+}
+
+/// Foreground propagation: when an owner is deleted with
+/// `propagationPolicy: Foreground`, the GC must keep the owner alive
+/// (deletionTimestamp + `foregroundDeletion` finalizer) until every
+/// dependent that set `blockOwnerDeletion: true` is gone. Once those
+/// dependents are removed, the GC strips the finalizer and the owner
+/// itself disappears.
+///
+/// Upstream behaviour: `processDeleteItem` (foreground branch) +
+/// `deleteDependents` in `pkg/controller/garbagecollector/`.
+#[tokio::test]
+async fn test_foreground_propagation_blocks_until_dependents_gone() {
+    let storage = fresh_storage();
+    let gc = GarbageCollector::new(storage.clone());
+    let ns = "ns-foreground";
+
+    // Owner stand-in with deletionTimestamp + foregroundDeletion finalizer.
+    let mut owner = make_owner_pod("rc-fg", ns);
+    owner.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    owner.metadata.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+    save_pod(&storage, &owner).await;
+
+    // Dependent with blockOwnerDeletion=true. Must be deleted before
+    // the owner's foregroundDeletion finalizer is removed.
+    let dep = make_pod(
+        "pod-blocker",
+        ns,
+        vec![rc_ref("rc-fg", &owner.metadata.uid)],
+    );
+    save_pod(&storage, &dep).await;
+
+    // First scan: the GC processes the owner's deletion, sees a blocking
+    // dependent, deletes it (foreground cascade), and then can strip the
+    // finalizer because no more blockers remain.
+    gc.scan_and_collect().await.unwrap();
+
+    assert!(
+        !pod_exists(&storage, ns, "pod-blocker").await,
+        "blocker dependent must be deleted by foreground cascade",
+    );
+    assert!(
+        !pod_exists(&storage, ns, "rc-fg").await,
+        "owner must be finalised once its foreground blockers are gone",
+    );
+}
+
+/// Orphan propagation: when an owner is deleted with
+/// `propagationPolicy: Orphan`, dependents must have their owner
+/// reference to that owner stripped — NOT cascade-deleted.
+///
+/// Upstream behaviour: `processAttemptToOrphan` in
+/// `pkg/controller/garbagecollector/garbagecollector.go`.
+#[tokio::test]
+async fn test_orphan_propagation_strips_owner_ref_without_deleting_dependent() {
+    let storage = fresh_storage();
+    let gc = GarbageCollector::new(storage.clone());
+    let ns = "ns-orphan";
+
+    let mut owner = make_owner_pod("rc-orphan", ns);
+    owner.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    owner.metadata.finalizers = Some(vec!["orphan".to_string()]);
+    save_pod(&storage, &owner).await;
+
+    let dep = make_pod(
+        "pod-keep-me",
+        ns,
+        vec![rc_ref("rc-orphan", &owner.metadata.uid)],
+    );
+    save_pod(&storage, &dep).await;
+
+    gc.scan_and_collect().await.unwrap();
+
+    // The dependent must still exist...
+    assert!(
+        pod_exists(&storage, ns, "pod-keep-me").await,
+        "orphan policy must NOT delete the dependent",
+    );
+    // ...and its ownerReferences must no longer point at the owner UID.
+    let key = build_key("pods", Some(ns), "pod-keep-me");
+    let kept: Pod = storage.get(&key).await.unwrap();
+    let refs = kept.metadata.owner_references.unwrap_or_default();
+    assert!(
+        refs.iter().all(|r| r.uid != owner.metadata.uid),
+        "owner reference to the deleted owner must be stripped",
+    );
+
+    // Owner finalizer is removed → owner disappears.
+    assert!(
+        !pod_exists(&storage, ns, "rc-orphan").await,
+        "owner must be finalised once orphan finalizer is removed",
     );
 }
 
