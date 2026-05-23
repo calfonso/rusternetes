@@ -572,8 +572,19 @@ fn registry_parity_with_upstream() {
     }
 }
 
+/// Coverage check: every upstream message in our bundled snapshots has a
+/// counterpart in the registry. Originally a `#[ignore]`d dashboard that
+/// listed the missing entries; now enforced as a hard parity gate.
+///
+/// If this fails, the panic body lists every upstream message that has no
+/// registry entry, grouped by source `.proto` file. Recover by either:
+///   - adding the missing entry to a `register_*` helper in `src/protobuf.rs`
+///     (the by-far-most-common case — even no-op shapes like List wrappers
+///     belong in the registry), or
+///   - if a message has no rusternetes counterpart (a deprecated upstream
+///     type, internal-only payload), wire it into a name-skip set here and
+///     leave a comment explaining why.
 #[test]
-#[ignore = "coverage dashboard — run with: cargo test --test protobuf_schema_parity_upstream upstream_messages_we_dont_register_yet -- --ignored --nocapture"]
 fn upstream_messages_we_dont_register_yet() {
     let files = parse_all_files();
     let (upstream, _) = build_upstream_index(&files);
@@ -598,16 +609,24 @@ fn upstream_messages_we_dont_register_yet() {
         });
     }
 
-    println!("Upstream messages NOT registered in ProtoRegistry:");
+    if by_file.is_empty() {
+        eprintln!(
+            "all {} upstream messages are registered in ProtoRegistry",
+            upstream.len()
+        );
+        return;
+    }
+
+    let mut report = String::from("upstream messages NOT registered in ProtoRegistry:\n");
     let mut total = 0;
     for (file, messages) in &by_file {
-        println!("\n[{}] ({} missing)", file, messages.len());
+        report.push_str(&format!("\n[{}] ({} missing)\n", file, messages.len()));
         for m in messages {
-            println!("  - {}", m);
+            report.push_str(&format!("  - {}\n", m));
             total += 1;
         }
     }
-    println!("\nTotal: {} message(s) missing from the registry", total);
+    panic!("{}\n{} message(s) missing from the registry", report, total);
 }
 
 fn collect_message_names<F: FnMut(&str)>(messages: &[DescriptorProto], visit: &mut F) {

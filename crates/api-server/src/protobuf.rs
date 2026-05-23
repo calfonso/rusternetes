@@ -2587,6 +2587,11 @@ impl ProtoRegistry {
         Self::register_coordination_v1(&mut schemas);
         Self::register_policy_v1(&mut schemas);
         Self::register_core_v1_remaining_nested(&mut schemas);
+        Self::register_list_kinds(&mut schemas);
+        Self::register_apimachinery_extras(&mut schemas);
+        Self::register_core_v1_subresource_options(&mut schemas);
+        Self::register_autoscaling_v1_scale(&mut schemas);
+        Self::register_apiextensions_v1_conversion(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -9559,6 +9564,973 @@ impl ProtoRegistry {
                         (
                             "conditions".into(),
                             FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+    }
+
+    /// Register every K8s `*List` collection wrapper. Each is the canonical
+    /// `{ metadata: ListMeta = 1, items: repeated T = 2 }` envelope upstream
+    /// `protoc` emits — only the element type differs. Registering them is
+    /// not strictly required for the proto-decode path (the watch envelope
+    /// uses `Unknown`+`raw`, not a registered shape for the list message
+    /// itself), but the upstream schema-parity dashboard expects parity, and
+    /// future direct-decode paths get a real schema to look up.
+    ///
+    /// Field numbers from the respective `generated.proto` files
+    /// (release-1.35). Both fields use the JSON name (`metadata`, `items`)
+    /// as the registry key; the upstream parser emits the same lowercase
+    /// names.
+    fn register_list_kinds(schemas: &mut HashMap<String, MessageSchema>) {
+        fn list_schema(item: &str) -> MessageSchema {
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ListMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(item.into()))),
+                        ),
+                    ),
+                ]),
+            }
+        }
+
+        // core/v1 Lists
+        schemas.insert("ComponentStatusList".into(), list_schema("ComponentStatus"));
+        schemas.insert("ConfigMapList".into(), list_schema("ConfigMap"));
+        schemas.insert("EndpointsList".into(), list_schema("Endpoints"));
+        schemas.insert("EventList".into(), list_schema("Event"));
+        schemas.insert("LimitRangeList".into(), list_schema("LimitRange"));
+        schemas.insert("NamespaceList".into(), list_schema("Namespace"));
+        schemas.insert("NodeList".into(), list_schema("Node"));
+        schemas.insert(
+            "PersistentVolumeClaimList".into(),
+            list_schema("PersistentVolumeClaim"),
+        );
+        schemas.insert(
+            "PersistentVolumeList".into(),
+            list_schema("PersistentVolume"),
+        );
+        schemas.insert("PodList".into(), list_schema("Pod"));
+        schemas.insert("PodTemplateList".into(), list_schema("PodTemplate"));
+        schemas.insert(
+            "ReplicationControllerList".into(),
+            list_schema("ReplicationController"),
+        );
+        schemas.insert("ResourceQuotaList".into(), list_schema("ResourceQuota"));
+        schemas.insert("SecretList".into(), list_schema("Secret"));
+        schemas.insert("ServiceAccountList".into(), list_schema("ServiceAccount"));
+        schemas.insert("ServiceList".into(), list_schema("Service"));
+
+        // core/v1.List and meta/v1.List both have the same simple name and
+        // the same shape: items is `repeated runtime.RawExtension`. The
+        // upstream by-simple-name index keeps one of them (insertion order
+        // dependent). Either way the registered shape matches both.
+        schemas.insert(
+            "List".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ListMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::JsonRaw)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // apps/v1 Lists
+        schemas.insert(
+            "ControllerRevisionList".into(),
+            list_schema("ControllerRevision"),
+        );
+        schemas.insert("DaemonSetList".into(), list_schema("DaemonSet"));
+        schemas.insert("DeploymentList".into(), list_schema("Deployment"));
+        schemas.insert("ReplicaSetList".into(), list_schema("ReplicaSet"));
+        schemas.insert("StatefulSetList".into(), list_schema("StatefulSet"));
+
+        // batch/v1
+        schemas.insert("CronJobList".into(), list_schema("CronJob"));
+        schemas.insert("JobList".into(), list_schema("Job"));
+
+        // networking/v1
+        schemas.insert("IPAddressList".into(), list_schema("IPAddress"));
+        schemas.insert("IngressClassList".into(), list_schema("IngressClass"));
+        schemas.insert("IngressList".into(), list_schema("Ingress"));
+        schemas.insert("NetworkPolicyList".into(), list_schema("NetworkPolicy"));
+        schemas.insert("ServiceCIDRList".into(), list_schema("ServiceCIDR"));
+
+        // policy/v1
+        schemas.insert(
+            "PodDisruptionBudgetList".into(),
+            list_schema("PodDisruptionBudget"),
+        );
+
+        // rbac/v1
+        schemas.insert(
+            "ClusterRoleBindingList".into(),
+            list_schema("ClusterRoleBinding"),
+        );
+        schemas.insert("ClusterRoleList".into(), list_schema("ClusterRole"));
+        schemas.insert("RoleBindingList".into(), list_schema("RoleBinding"));
+        schemas.insert("RoleList".into(), list_schema("Role"));
+
+        // scheduling/v1
+        schemas.insert("PriorityClassList".into(), list_schema("PriorityClass"));
+
+        // storage/v1
+        schemas.insert("CSIDriverList".into(), list_schema("CSIDriver"));
+        schemas.insert("CSINodeList".into(), list_schema("CSINode"));
+        schemas.insert(
+            "CSIStorageCapacityList".into(),
+            list_schema("CSIStorageCapacity"),
+        );
+        schemas.insert("StorageClassList".into(), list_schema("StorageClass"));
+        schemas.insert(
+            "VolumeAttachmentList".into(),
+            list_schema("VolumeAttachment"),
+        );
+        schemas.insert(
+            "VolumeAttributesClassList".into(),
+            list_schema("VolumeAttributesClass"),
+        );
+
+        // autoscaling/v1 and v2 — both files declare HorizontalPodAutoscalerList
+        // with the same shape (metadata, repeated HorizontalPodAutoscaler items).
+        schemas.insert(
+            "HorizontalPodAutoscalerList".into(),
+            list_schema("HorizontalPodAutoscaler"),
+        );
+
+        // discovery/v1
+        schemas.insert("EndpointSliceList".into(), list_schema("EndpointSlice"));
+
+        // admissionregistration/v1
+        schemas.insert(
+            "MutatingWebhookConfigurationList".into(),
+            list_schema("MutatingWebhookConfiguration"),
+        );
+        schemas.insert(
+            "ValidatingAdmissionPolicyBindingList".into(),
+            list_schema("ValidatingAdmissionPolicyBinding"),
+        );
+        schemas.insert(
+            "ValidatingAdmissionPolicyList".into(),
+            list_schema("ValidatingAdmissionPolicy"),
+        );
+        schemas.insert(
+            "ValidatingWebhookConfigurationList".into(),
+            list_schema("ValidatingWebhookConfiguration"),
+        );
+
+        // coordination/v1
+        schemas.insert("LeaseList".into(), list_schema("Lease"));
+
+        // apiextensions/v1
+        schemas.insert(
+            "CustomResourceDefinitionList".into(),
+            list_schema("CustomResourceDefinition"),
+        );
+
+        // kube-aggregator/v1
+        schemas.insert("APIServiceList".into(), list_schema("APIService"));
+    }
+
+    /// Register apimachinery types that ride alongside the resource schemas:
+    /// runtime envelopes (`RawExtension`, `Unknown`), the quantity/intstr
+    /// scalar wrappers, the discovery API (`APIGroup`/`APIResource`/...),
+    /// the per-verb request-side `*Options`, and the small group/version
+    /// identity messages used in error replies.
+    ///
+    /// Field numbers from `k8s.io/apimachinery/pkg/...` (release-1.35).
+    fn register_apimachinery_extras(schemas: &mut HashMap<String, MessageSchema>) {
+        // runtime/RawExtension — wire shape used by `WatchEvent.object`,
+        // CRD conversion review bodies, and the meta/v1.List items array.
+        // Single `raw` bytes field carries the nested serialized object.
+        schemas.insert(
+            "RawExtension".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("raw".into(), FieldType::Bytes))]),
+            },
+        );
+
+        // runtime/Unknown — the envelope every K8s protobuf payload is wrapped
+        // in (`k8s\0` + proto-encoded Unknown). Field order matches the proto
+        // header: typeMeta (1), raw (2), contentEncoding (3), contentType (4).
+        schemas.insert(
+            "Unknown".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("typeMeta".into(), FieldType::Message("TypeMeta".into())),
+                    ),
+                    (2, ("raw".into(), FieldType::Bytes)),
+                    (3, ("contentEncoding".into(), FieldType::String)),
+                    (4, ("contentType".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // api/resource/Quantity — single string field that holds the canonical
+        // form (e.g. "100m", "32Mi"). `QuantityValue` is the by-value sibling
+        // with the same wire layout. The registry's `FieldType::Quantity`
+        // short-circuits decoding for nested usages; the schema entry exists
+        // so the registry/upstream-parity dashboard accounts for them.
+        schemas.insert(
+            "Quantity".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("string".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "QuantityValue".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("string".into(), FieldType::String))]),
+            },
+        );
+
+        // util/intstr/IntOrString — packs an int32 or string into one field.
+        // `type` is the discriminator (0=int, 1=string). The proto wire layout
+        // is what the `FieldType::IntOrString` decoder consumes inline.
+        schemas.insert(
+            "IntOrString".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::Int)),
+                    (2, ("intVal".into(), FieldType::Int)),
+                    (3, ("strVal".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ---------- discovery API ----------
+
+        // APIGroup — entry in `/apis` showing a single group's versions.
+        schemas.insert(
+            "APIGroup".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "versions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "GroupVersionForDiscovery".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "preferredVersion".into(),
+                            FieldType::Message("GroupVersionForDiscovery".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "serverAddressByClientCIDRs".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ServerAddressByClientCIDR".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // APIGroupList — top-level discovery body at `/apis`.
+        schemas.insert(
+            "APIGroupList".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "groups".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("APIGroup".into()))),
+                    ),
+                )]),
+            },
+        );
+
+        // APIResource — entry in an APIResourceList. Field numbers are *not*
+        // contiguous upstream (added incrementally over many releases): 1,6,2,
+        // 8,9,3,4,5,7,10.
+        schemas.insert(
+            "APIResource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (6, ("singularName".into(), FieldType::String)),
+                    (2, ("namespaced".into(), FieldType::Bool)),
+                    (8, ("group".into(), FieldType::String)),
+                    (9, ("version".into(), FieldType::String)),
+                    (3, ("kind".into(), FieldType::String)),
+                    (4, ("verbs".into(), FieldType::Message("Verbs".into()))),
+                    (
+                        5,
+                        (
+                            "shortNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "categories".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (10, ("storageVersionHash".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // APIResourceList — body returned by `/apis/<group>/<version>` and
+        // the legacy `/api/v1`.
+        schemas.insert(
+            "APIResourceList".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("groupVersion".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("APIResource".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // APIVersions — body returned by `/api` (legacy core-group discovery).
+        schemas.insert(
+            "APIVersions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "versions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "serverAddressByClientCIDRs".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ServerAddressByClientCIDR".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ServerAddressByClientCIDR — value type in APIGroup/APIVersions.
+        schemas.insert(
+            "ServerAddressByClientCIDR".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("clientCIDR".into(), FieldType::String)),
+                    (2, ("serverAddress".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // GroupVersionForDiscovery — `{groupVersion, version}` pair embedded
+        // in APIGroup.
+        schemas.insert(
+            "GroupVersionForDiscovery".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("groupVersion".into(), FieldType::String)),
+                    (2, ("version".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // RootPaths — body returned by `/` (top-level path discovery).
+        schemas.insert(
+            "RootPaths".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "paths".into(),
+                        FieldType::Repeated(Box::new(FieldType::String)),
+                    ),
+                )]),
+            },
+        );
+
+        // Verbs — opaque newtype around `repeated string`. Used in
+        // APIResource.verbs and elsewhere.
+        schemas.insert(
+            "Verbs".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::String)),
+                    ),
+                )]),
+            },
+        );
+
+        // ---------- request-side *Options ----------
+
+        // ApplyOptions — server-side apply request options.
+        schemas.insert(
+            "ApplyOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "dryRun".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("force".into(), FieldType::Bool)),
+                    (3, ("fieldManager".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // CreateOptions — query-side options for POST requests.
+        schemas.insert(
+            "CreateOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "dryRun".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (3, ("fieldManager".into(), FieldType::String)),
+                    (4, ("fieldValidation".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // GetOptions — query-side options for GET requests.
+        schemas.insert(
+            "GetOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("resourceVersion".into(), FieldType::String))]),
+            },
+        );
+
+        // ListOptions — every list/watch query carries this on the wire.
+        schemas.insert(
+            "ListOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("labelSelector".into(), FieldType::String)),
+                    (2, ("fieldSelector".into(), FieldType::String)),
+                    (3, ("watch".into(), FieldType::Bool)),
+                    (9, ("allowWatchBookmarks".into(), FieldType::Bool)),
+                    (4, ("resourceVersion".into(), FieldType::String)),
+                    (10, ("resourceVersionMatch".into(), FieldType::String)),
+                    (5, ("timeoutSeconds".into(), FieldType::Int)),
+                    (7, ("limit".into(), FieldType::Int)),
+                    (8, ("continue".into(), FieldType::String)),
+                    (11, ("sendInitialEvents".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        // PatchOptions — query-side options for PATCH requests.
+        schemas.insert(
+            "PatchOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "dryRun".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("force".into(), FieldType::Bool)),
+                    (3, ("fieldManager".into(), FieldType::String)),
+                    (4, ("fieldValidation".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // UpdateOptions — query-side options for PUT requests.
+        schemas.insert(
+            "UpdateOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "dryRun".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("fieldManager".into(), FieldType::String)),
+                    (3, ("fieldValidation".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // TableOptions — used by clients requesting `Table` responses.
+        schemas.insert(
+            "TableOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("includeObject".into(), FieldType::String))]),
+            },
+        );
+
+        // ---------- identity / lookup types ----------
+
+        // FieldSelectorRequirement — typed field-selector clause used by
+        // ResourceRule and webhook selectors.
+        schemas.insert(
+            "FieldSelectorRequirement".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("operator".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "values".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // Duration — nanosecond-resolution duration sibling of Time.
+        schemas.insert(
+            "Duration".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("duration".into(), FieldType::Int))]),
+            },
+        );
+
+        // GroupKind — `{group, kind}` identifier used in status errors and
+        // OwnerReferences.
+        schemas.insert(
+            "GroupKind".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("group".into(), FieldType::String)),
+                    (2, ("kind".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // GroupResource — `{group, resource}` identifier; used in StatusDetails
+        // and admission requests.
+        schemas.insert(
+            "GroupResource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("group".into(), FieldType::String)),
+                    (2, ("resource".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // GroupVersion — `{group, version}` discovery primitive.
+        schemas.insert(
+            "GroupVersion".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("group".into(), FieldType::String)),
+                    (2, ("version".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // GroupVersionKind — `{group, version, kind}` identifier.
+        schemas.insert(
+            "GroupVersionKind".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("group".into(), FieldType::String)),
+                    (2, ("version".into(), FieldType::String)),
+                    (3, ("kind".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // GroupVersionResource — `{group, version, resource}` identifier.
+        schemas.insert(
+            "GroupVersionResource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("group".into(), FieldType::String)),
+                    (2, ("version".into(), FieldType::String)),
+                    (3, ("resource".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // PartialObjectMetadata — metadata-only client view used by `--watch`
+        // with `as=PartialObjectMetadata` and by garbage-collector lookups.
+        schemas.insert(
+            "PartialObjectMetadata".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                )]),
+            },
+        );
+
+        // PartialObjectMetadataList — paginated wrapper around
+        // PartialObjectMetadata items.
+        schemas.insert(
+            "PartialObjectMetadataList".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ListMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PartialObjectMetadata".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // Timestamp — google.protobuf.Timestamp-shaped (seconds+nanos), but
+        // K8s carries its own copy. Distinct from `Time`/`MicroTime` only in
+        // that its nanos slot is int32.
+        schemas.insert(
+            "Timestamp".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("seconds".into(), FieldType::Int)),
+                    (2, ("nanos".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // WatchEvent — single envelope every watch frame is wrapped in.
+        // `object` is a RawExtension whose `raw` bytes carry the per-event
+        // resource payload.
+        schemas.insert(
+            "WatchEvent".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (
+                        2,
+                        ("object".into(), FieldType::Message("RawExtension".into())),
+                    ),
+                ]),
+            },
+        );
+    }
+
+    /// Register core/v1 subresource request shapes (exec/attach/log/portforward/
+    /// proxy) and the rarely-used scheduling helpers `AvoidPods`, `PodSignature`,
+    /// `PreferAvoidPodsEntry`, `SerializedReference`. These are not stored as
+    /// resources but appear on the wire as request bodies / `Node.annotations`
+    /// entries.
+    ///
+    /// Field numbers from `k8s.io/api/core/v1/generated.proto` (release-1.35).
+    fn register_core_v1_subresource_options(schemas: &mut HashMap<String, MessageSchema>) {
+        // AvoidPods — historical Node annotation payload listing pods that
+        // should avoid the node. Carried inside `scheduler.alpha.kubernetes.io/
+        // preferAvoidPods` as JSON. Still defined in the proto schema.
+        schemas.insert(
+            "AvoidPods".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "preferAvoidPods".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "PreferAvoidPodsEntry".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+
+        // PreferAvoidPodsEntry — one item in `AvoidPods.preferAvoidPods`.
+        schemas.insert(
+            "PreferAvoidPodsEntry".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "podSignature".into(),
+                            FieldType::Message("PodSignature".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        ("evictionTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (3, ("reason".into(), FieldType::String)),
+                    (4, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // PodSignature — owner reference of the pod class to avoid.
+        schemas.insert(
+            "PodSignature".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "podController".into(),
+                        FieldType::Message("OwnerReference".into()),
+                    ),
+                )]),
+            },
+        );
+
+        // SerializedReference — payload of legacy event `involvedObject`
+        // serialization. Still part of the upstream proto.
+        schemas.insert(
+            "SerializedReference".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "reference".into(),
+                        FieldType::Message("ObjectReference".into()),
+                    ),
+                )]),
+            },
+        );
+
+        // NodeProxyOptions / PodProxyOptions / ServiceProxyOptions — each is
+        // a request body for the proxy subresource that carries just the
+        // forwarded URL path.
+        schemas.insert(
+            "NodeProxyOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("path".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "PodProxyOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("path".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "ServiceProxyOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("path".into(), FieldType::String))]),
+            },
+        );
+
+        // PodAttachOptions — POST body for `/pods/{name}/attach`.
+        schemas.insert(
+            "PodAttachOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("stdin".into(), FieldType::Bool)),
+                    (2, ("stdout".into(), FieldType::Bool)),
+                    (3, ("stderr".into(), FieldType::Bool)),
+                    (4, ("tty".into(), FieldType::Bool)),
+                    (5, ("container".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // PodExecOptions — POST body for `/pods/{name}/exec`.
+        schemas.insert(
+            "PodExecOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("stdin".into(), FieldType::Bool)),
+                    (2, ("stdout".into(), FieldType::Bool)),
+                    (3, ("stderr".into(), FieldType::Bool)),
+                    (4, ("tty".into(), FieldType::Bool)),
+                    (5, ("container".into(), FieldType::String)),
+                    (
+                        6,
+                        (
+                            "command".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // PodLogOptions — GET query params for `/pods/{name}/log` rendered as
+        // a proto body when clients use a wrapped client.
+        schemas.insert(
+            "PodLogOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("container".into(), FieldType::String)),
+                    (2, ("follow".into(), FieldType::Bool)),
+                    (3, ("previous".into(), FieldType::Bool)),
+                    (4, ("sinceSeconds".into(), FieldType::Int)),
+                    (5, ("sinceTime".into(), FieldType::Message("Time".into()))),
+                    (6, ("timestamps".into(), FieldType::Bool)),
+                    (7, ("tailLines".into(), FieldType::Int)),
+                    (8, ("limitBytes".into(), FieldType::Int)),
+                    (9, ("insecureSkipTLSVerifyBackend".into(), FieldType::Bool)),
+                    (10, ("stream".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // PodPortForwardOptions — POST body for `/pods/{name}/portforward`.
+        schemas.insert(
+            "PodPortForwardOptions".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "ports".into(),
+                        FieldType::Repeated(Box::new(FieldType::Int)),
+                    ),
+                )]),
+            },
+        );
+    }
+
+    /// Register autoscaling/v1 `Scale`, `ScaleSpec`, and `ScaleStatus`. These
+    /// are not autoscaler resources themselves but the body of every
+    /// `/scale` subresource — clients GET/PUT/PATCH them against Deployments,
+    /// ReplicaSets, StatefulSets, and ReplicationControllers.
+    ///
+    /// Field numbers from `k8s.io/api/autoscaling/v1/generated.proto`
+    /// (release-1.35).
+    fn register_autoscaling_v1_scale(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "Scale".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("ScaleSpec".into()))),
+                    (
+                        3,
+                        ("status".into(), FieldType::Message("ScaleStatus".into())),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ScaleSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("replicas".into(), FieldType::Int))]),
+            },
+        );
+        schemas.insert(
+            "ScaleStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("replicas".into(), FieldType::Int)),
+                    (2, ("selector".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    /// Register apiextensions/v1 CRD conversion-webhook envelope messages.
+    /// `ConversionReview` is the body POSTed to a CRD's conversion webhook
+    /// and the response payload it returns; it wraps a `ConversionRequest`
+    /// (objects to convert) and `ConversionResponse` (converted objects +
+    /// status).
+    ///
+    /// Field numbers from
+    /// `k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto`
+    /// (release-1.35).
+    fn register_apiextensions_v1_conversion(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "ConversionRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("uid".into(), FieldType::String)),
+                    (2, ("desiredAPIVersion".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "objects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "RawExtension".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConversionResponse".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("uid".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "convertedObjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "RawExtension".into(),
+                            ))),
+                        ),
+                    ),
+                    (3, ("result".into(), FieldType::Message("Status".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConversionReview".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "request".into(),
+                            FieldType::Message("ConversionRequest".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "response".into(),
+                            FieldType::Message("ConversionResponse".into()),
                         ),
                     ),
                 ]),
