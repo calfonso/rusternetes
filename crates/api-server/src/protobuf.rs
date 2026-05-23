@@ -2575,6 +2575,7 @@ impl ProtoRegistry {
         Self::register_apimachinery_meta_v1(&mut schemas);
         Self::register_networking_v1(&mut schemas);
         Self::register_autoscaling_v2(&mut schemas);
+        Self::register_autoscaling_v1(&mut schemas);
         Self::register_batch_v1(&mut schemas);
         Self::register_core_v1_container_runtime(&mut schemas);
         Self::register_core_v1_kinds(&mut schemas);
@@ -4959,6 +4960,60 @@ impl ProtoRegistry {
                             FieldType::Message("HorizontalPodAutoscalerStatus".into()),
                         ),
                     ),
+                ]),
+            },
+        );
+    }
+
+    /// Register autoscaling/v1 message schemas.
+    ///
+    /// Field numbers come from
+    /// k8s.io/api/autoscaling/v1/generated.proto (release-1.35). Covers the
+    /// `Scale` subresource (`Scale` + `ScaleSpec` + `ScaleStatus`), which is
+    /// the request/response payload for `/scale` subresource endpoints on
+    /// scalable kinds (`Deployment`, `StatefulSet`, `ReplicaSet`,
+    /// `ReplicationController`). Other autoscaling/v1 messages (legacy v1
+    /// HPA) are intentionally omitted; conformant clients negotiate
+    /// autoscaling/v2 for HPA.
+    fn register_autoscaling_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // Scale: top-level subresource wrapper.
+        //   field 1 = metadata (ObjectMeta)
+        //   field 2 = spec (ScaleSpec)
+        //   field 3 = status (ScaleStatus)
+        schemas.insert(
+            "Scale".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("ScaleSpec".into()))),
+                    (
+                        3,
+                        ("status".into(), FieldType::Message("ScaleStatus".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // ScaleSpec: desired replicas (single int32 field).
+        schemas.insert(
+            "ScaleSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("replicas".into(), FieldType::Int))]),
+            },
+        );
+
+        // ScaleStatus: observed replicas plus selector string.
+        //   field 1 = replicas (int32)
+        //   field 2 = selector (string — already serialized to label-query form)
+        schemas.insert(
+            "ScaleStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("replicas".into(), FieldType::Int)),
+                    (2, ("selector".into(), FieldType::String)),
                 ]),
             },
         );

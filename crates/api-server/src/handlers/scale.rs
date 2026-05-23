@@ -4,14 +4,21 @@
 //! The scale subresource allows getting and setting the replica count
 //! for workload resources like Deployments, StatefulSets, and ReplicaSets.
 
-use crate::{middleware::AuthContext, state::ApiServerState};
+use crate::{
+    middleware::AuthContext,
+    response::{negotiate_content_type, ContentType},
+    state::ApiServerState,
+};
 use axum::{
+    body::Body,
     extract::{Path, State},
-    http::Uri,
+    http::{header, HeaderMap, StatusCode, Uri},
+    response::Response,
     Extension, Json,
 };
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
+    protobuf::encode_protobuf,
     Error, Result,
 };
 use rusternetes_storage::{build_key, Storage};
@@ -82,13 +89,19 @@ fn parse_scale_uri(uri: &Uri) -> (String, String, String) {
 }
 
 /// GET /apis/{group}/{version}/namespaces/{namespace}/{resource}/{name}/scale
-/// Returns the scale subresource for a resource
+/// Returns the scale subresource for a resource.
+///
+/// Honors content negotiation: when the client sends
+/// `Accept: application/vnd.kubernetes.protobuf`, the Scale is emitted as a
+/// `k8s\0`-prefixed Unknown envelope (matching upstream kube-apiserver's
+/// protobuf serializer). Otherwise JSON is returned.
 pub async fn get_scale(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     uri: Uri,
+    headers: HeaderMap,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Scale>> {
+) -> Result<Response> {
     let (group, version, resource) = parse_scale_uri(&uri);
     info!(
         "Getting scale for {}/{}/{}/{}",
@@ -116,18 +129,26 @@ pub async fn get_scale(
     // Extract scale information
     let scale = extract_scale(&resource_obj, &namespace, &name, &group, &version)?;
 
-    Ok(Json(scale))
+    Ok(scale_response(&scale, &headers, StatusCode::OK))
 }
 
 /// PUT /apis/{group}/{version}/namespaces/{namespace}/{resource}/{name}/scale
-/// Updates the scale subresource for a resource
+/// Updates the scale subresource for a resource.
+///
+/// Honors content negotiation on the response side: clients that send
+/// `Accept: application/vnd.kubernetes.protobuf` receive the updated Scale
+/// wrapped in the K8s `k8s\0` Unknown envelope. Request body is parsed via
+/// `Json<Scale>` — proto-encoded request bodies are decoded by the
+/// `normalize_content_type_middleware` into JSON before reaching this
+/// handler, so a single extractor covers both wire formats.
 pub async fn update_scale(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     uri: Uri,
+    headers: HeaderMap,
     Path((namespace, name)): Path<(String, String)>,
     Json(scale): Json<Scale>,
-) -> Result<Json<Scale>> {
+) -> Result<Response> {
     let (group, version, resource) = parse_scale_uri(&uri);
     info!(
         "Updating scale for {}/{}/{}/{}",
@@ -173,18 +194,23 @@ pub async fn update_scale(
         group, resource, namespace, name
     );
 
-    Ok(Json(updated_scale))
+    Ok(scale_response(&updated_scale, &headers, StatusCode::OK))
 }
 
 /// PATCH /apis/{group}/{version}/namespaces/{namespace}/{resource}/{name}/scale
-/// Patches the scale subresource for a resource
+/// Patches the scale subresource for a resource.
+///
+/// Same content-negotiation semantics as [`get_scale`] / [`update_scale`]:
+/// a protobuf Accept header produces a `k8s\0`-framed Unknown envelope on
+/// the response side.
 pub async fn patch_scale(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     uri: Uri,
+    headers: HeaderMap,
     Path((namespace, name)): Path<(String, String)>,
     body: String,
-) -> Result<Json<Scale>> {
+) -> Result<Response> {
     let (group, version, resource) = parse_scale_uri(&uri);
     info!(
         "Patching scale for {}/{}/{}/{}",
@@ -261,7 +287,50 @@ pub async fn patch_scale(
         group, resource, namespace, name
     );
 
-    Ok(Json(updated_scale))
+    Ok(scale_response(&updated_scale, &headers, StatusCode::OK))
+}
+
+/// Build a Scale response that honors the client's Accept header.
+///
+/// Per upstream `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/`:
+/// `application/vnd.kubernetes.protobuf` produces a `k8s\0`-prefixed Unknown
+/// envelope carrying TypeMeta (`autoscaling/v1`, `Scale`) and the JSON-encoded
+/// body. Anything else falls back to plain JSON. The Scale schema itself is
+/// registered in [`crate::protobuf::ProtoRegistry::register_autoscaling_v1`]
+/// for clients that decode the proto bytes back to a typed Go/Rust struct.
+fn scale_response(scale: &Scale, headers: &HeaderMap, status: StatusCode) -> Response {
+    match negotiate_content_type(headers) {
+        ContentType::Protobuf => match encode_protobuf(scale, &scale.api_version, &scale.kind) {
+            Ok(bytes) => Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, ContentType::Protobuf.mime_type())
+                .body(Body::from(bytes))
+                .unwrap(),
+            Err(e) => {
+                // Encoding a Scale message should never fail (JSON serialization
+                // of an i32 + selector string), but if it does we fall back to
+                // JSON so the client at least sees the payload rather than a
+                // 500 with an empty body.
+                tracing::warn!("scale proto encode failed; falling back to JSON: {}", e);
+                json_response(scale, status)
+            }
+        },
+        ContentType::Json => json_response(scale, status),
+    }
+}
+
+fn json_response(scale: &Scale, status: StatusCode) -> Response {
+    match serde_json::to_vec(scale) {
+        Ok(body) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, ContentType::Json.mime_type())
+            .body(Body::from(body))
+            .unwrap(),
+        Err(e) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(format!("Failed to serialize Scale: {}", e)))
+            .unwrap(),
+    }
 }
 
 /// Extract scale information from a resource object
