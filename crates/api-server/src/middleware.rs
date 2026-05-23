@@ -404,10 +404,26 @@ pub async fn normalize_content_type_middleware(
     }
 
     // Track if the client wants protobuf responses (via Accept header).
-    // Real Kubernetes always wraps in protobuf when Accept requests it,
-    // regardless of request Content-Type.
+    // Real Kubernetes wraps the response in a `k8s\0`-framed `runtime.Unknown`
+    // envelope when the client's `Accept` header asks for
+    // `application/vnd.kubernetes.protobuf`, regardless of the request
+    // Content-Type. Per `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/protobuf`,
+    // the envelope's `raw` field carries the native protobuf bytes produced
+    // by the generated `pb.go` `Marshal` method for the resource. Rusternetes
+    // does not yet ship per-resource native encoders; the [`ProtoEncoder`]
+    // in `crate::response` produces an `Unknown` envelope whose `raw` is
+    // JSON and whose `contentType` is `application/json` — a valid envelope
+    // that `Unknown`-aware clients (and `decode_protobuf` in the common
+    // crate) round-trip. See the module-level doc on `crate::response`.
+    //
+    // Routes opt in to protobuf encoding by attaching a [`NativeProtoOptIn`]
+    // extension to their response. We default to JSON for every route that
+    // has not yet been migrated so existing conformance suites stay green.
+    //
     // Skip for watch/streaming requests — those use chunked JSON lines and
-    // cannot be collected into a single protobuf envelope.
+    // cannot be collected into a single protobuf envelope. The watch path
+    // negotiates `application/vnd.kubernetes.protobuf;stream=watch`
+    // separately and is handled by the dedicated watch encoder.
     let accept_header = request
         .headers()
         .get(axum::http::header::ACCEPT)
@@ -421,12 +437,8 @@ pub async fn normalize_content_type_middleware(
             .query()
             .map(|q| q.contains("watch=true") || q.contains("watch=1"))
             .unwrap_or(false);
-    // Protobuf disabled. K8s protobuf requires Unknown.raw to contain native
-    // protobuf-encoded bytes (e.g., proto.Marshal(NamespaceList)), not JSON.
-    // We can't produce native protobuf for K8s types in Rust. Client-go always
-    // sends "Accept: application/vnd.kubernetes.protobuf, application/json"
-    // and falls back to JSON when protobuf is unavailable.
-    let wants_protobuf = false;
+    let accept_wants_protobuf =
+        accept_header.contains("application/vnd.kubernetes.protobuf") && !is_watch_request;
 
     // CBOR response negotiation. We honor either an explicit
     // `Accept: application/cbor` header OR the convention that a CBOR-encoded
@@ -622,9 +634,19 @@ pub async fn normalize_content_type_middleware(
 
     // Wrap response in protobuf if:
     // 1. The Accept header requests protobuf
-    // 2. The response is JSON (our handlers always produce JSON)
-    // 3. The response is NOT a streaming/watch response (no Content-Length means streaming)
-    if wants_protobuf {
+    // 2. The handler opted into protobuf encoding via `NativeProtoOptIn`
+    // 3. The response body is JSON (our handlers always produce JSON)
+    // 4. The response is NOT a streaming/watch response
+    // 5. The Accept header does NOT also carry an `as=<Target>` projection —
+    //    those are handled by the Table / PartialObjectMetadata branch below
+    //    which produces its own protobuf envelope with the correct TypeMeta
+    //    and Content-Type echoing back the projection target.
+    let as_projection_requested = parse_accept_as_target(&accept_header).is_some();
+    let opt_in = response
+        .extensions()
+        .get::<crate::response::NativeProtoOptIn>()
+        .cloned();
+    if let (true, false, Some(opt_in)) = (accept_wants_protobuf, as_projection_requested, opt_in) {
         let response_ct = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -634,18 +656,17 @@ pub async fn normalize_content_type_middleware(
         if response_ct.starts_with("application/json") {
             let (parts, body) = response.into_parts();
             if let Ok(json_bytes) = axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-                // Extract apiVersion/kind from JSON for the TypeMeta field
-                let (api_version, kind) = extract_api_version_kind(&json_bytes);
-                let pb = wrap_json_in_protobuf_with_type_meta(
-                    &json_bytes,
-                    api_version.as_deref().unwrap_or(""),
-                    kind.as_deref().unwrap_or(""),
-                );
+                let encoder = crate::response::default_proto_encoder();
+                let pb = encoder.encode(&json_bytes, opt_in.api_version, opt_in.kind);
                 let mut resp = Response::from_parts(parts, Body::from(pb));
                 resp.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
                     axum::http::HeaderValue::from_static("application/vnd.kubernetes.protobuf"),
                 );
+                // The protobuf body length differs from the JSON body — drop
+                // any stale Content-Length so hyper recomputes it.
+                resp.headers_mut()
+                    .remove(axum::http::header::CONTENT_LENGTH);
                 return Ok(resp);
             }
             return Ok(Response::builder()
@@ -961,6 +982,13 @@ fn table_row_for(kind: &str, obj: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Extract apiVersion and kind from JSON bytes without full parsing.
+///
+/// Now superseded by [`crate::response::NativeProtoOptIn`] — handlers carry
+/// the strongly-typed TypeMeta on the response extension so the middleware
+/// no longer has to re-parse the JSON body. Kept around for tests that
+/// validate the wire format and for a future "auto-discover TypeMeta"
+/// fallback path.
+#[allow(dead_code)]
 fn extract_api_version_kind(json: &[u8]) -> (Option<String>, Option<String>) {
     // Quick parse just the top-level apiVersion and kind
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(json) {
@@ -980,6 +1008,11 @@ fn extract_api_version_kind(json: &[u8]) -> (Option<String>, Option<String>) {
 
 /// Wrap JSON bytes in the K8s protobuf envelope with TypeMeta:
 /// "k8s\0" + Unknown{typeMeta: {apiVersion, kind}, raw: json, contentType: "application/json"}
+///
+/// Superseded by [`crate::response::wrap_json_in_protobuf_envelope`] / the
+/// [`crate::response::ProtoEncoder`] trait. Kept under `#[allow(dead_code)]`
+/// because the in-file roundtrip tests still cover the wire format here.
+#[allow(dead_code)]
 fn wrap_json_in_protobuf_with_type_meta(json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
     // K8s runtime.Unknown protobuf message:
     //   field 1 (typeMeta, TypeMeta): nested message

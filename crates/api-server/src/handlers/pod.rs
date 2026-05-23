@@ -26,7 +26,7 @@ pub async fn create(
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, HeaderMap, Json<Pod>)> {
+) -> Result<axum::response::Response> {
     // Parse the body manually so we can do strict field validation against the
     // raw bytes. In strict mode (now the K8s 1.25+ default) serde_json will
     // reject duplicate keys outright — fall back to a lenient Value parse so
@@ -731,7 +731,11 @@ pub async fn create(
             "Dry-run: Pod {}/{} validated successfully (not created)",
             namespace, pod.metadata.name
         );
-        return Ok((StatusCode::CREATED, response_headers, Json(pod)));
+        return Ok(build_pod_response(
+            StatusCode::CREATED,
+            response_headers,
+            pod,
+        ));
     }
 
     match state.storage.create(&key, &pod).await {
@@ -740,7 +744,11 @@ pub async fn create(
                 "Pod created successfully: {}/{}",
                 namespace, pod.metadata.name
             );
-            Ok((StatusCode::CREATED, response_headers, Json(created)))
+            Ok(build_pod_response(
+                StatusCode::CREATED,
+                response_headers,
+                created,
+            ))
         }
         Err(e) => {
             warn!(
@@ -750,6 +758,22 @@ pub async fn create(
             Err(e)
         }
     }
+}
+
+/// Construct a Pod response with the conventional `(status, headers, body)`
+/// shape AND attach the [`crate::response::NativeProtoOptIn`] marker so the
+/// response middleware will emit a `application/vnd.kubernetes.protobuf`
+/// envelope when the client negotiated protobuf.
+fn build_pod_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    pod: Pod,
+) -> axum::response::Response {
+    let mut response = (status, headers, Json(pod)).into_response();
+    response
+        .extensions_mut()
+        .insert(crate::response::NativeProtoOptIn::pod());
+    response
 }
 
 /// Convert the `validate_strict_fields` warning strings into a `HeaderMap`
@@ -770,7 +794,7 @@ pub async fn get(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Pod>> {
+) -> Result<axum::response::Response> {
     debug!("Getting pod: {}/{}", namespace, name);
 
     // Check authorization
@@ -787,9 +811,19 @@ pub async fn get(
     }
 
     let key = build_key("pods", Some(&namespace), &name);
-    let pod = state.storage.get(&key).await?;
+    let pod: Pod = state.storage.get(&key).await?;
 
-    Ok(Json(pod))
+    // Opt this response in to native-protobuf encoding when the client
+    // negotiated `application/vnd.kubernetes.protobuf`. The response
+    // middleware in `crate::middleware::normalize_content_type_middleware`
+    // reads the marker, encodes the JSON into a `k8s\0`-framed
+    // `runtime.Unknown` envelope and rewrites the Content-Type.
+    // See `crates/api-server/src/response.rs` for the encoder scaffold.
+    let mut response = Json(pod).into_response();
+    response
+        .extensions_mut()
+        .insert(crate::response::NativeProtoOptIn::pod());
+    Ok(response)
 }
 
 pub async fn update(
@@ -1365,7 +1399,12 @@ pub async fn list(
     list.metadata.remaining_item_count = paginated.remaining_item_count;
     list.metadata.resource_version = Some(paginated.resource_version);
 
-    Ok(axum::Json(list).into_response())
+    // Same opt-in pattern as `get` — see `crate::response::NativeProtoOptIn`.
+    let mut response = axum::Json(list).into_response();
+    response
+        .extensions_mut()
+        .insert(crate::response::NativeProtoOptIn::pod_list());
+    Ok(response)
 }
 
 /// List all pods across all namespaces
