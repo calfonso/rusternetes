@@ -3884,6 +3884,47 @@ impl ProtoRegistry {
                 ]),
             },
         );
+
+        // PartialObjectMetadata — the metadata-only projection requested via
+        // `Accept: application/vnd.kubernetes.protobuf;as=PartialObjectMetadata`
+        // (and the JSON sibling). Upstream:
+        // `staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto`
+        // message #PartialObjectMetadata with a single `metadata` field at #1
+        // pointing at `ObjectMeta`. Used by informer-cache and metadata-only
+        // clients to keep watch traffic light.
+        schemas.insert(
+            "PartialObjectMetadata".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                )]),
+            },
+        );
+
+        // PartialObjectMetadataList — list shape paired with
+        // `PartialObjectMetadata`. Field #1 is `metadata` (ListMeta), field
+        // #2 is `items` (repeated PartialObjectMetadata).
+        schemas.insert(
+            "PartialObjectMetadataList".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ListMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PartialObjectMetadata".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
     }
 
     fn register_networking_v1(schemas: &mut HashMap<String, MessageSchema>) {

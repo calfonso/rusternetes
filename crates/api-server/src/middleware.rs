@@ -538,7 +538,16 @@ pub async fn normalize_content_type_middleware(
     // Accept header. We only convert when the upstream handler returned a
     // 200 application/json body — error Status objects are left alone so
     // clients still see the original failure shape.
-    if let Some(as_target) = parse_accept_as_target(&accept_header) {
+    //
+    // The `wire` half of the negotiation determines the response envelope:
+    // `application/json` clients get the converted JSON document directly;
+    // `application/vnd.kubernetes.protobuf` clients get the JSON wrapped in
+    // the `k8s\0` Unknown envelope with the correct kind/apiVersion in
+    // TypeMeta. The latter matches upstream behaviour for
+    // `Accept: application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;
+    // g=meta.k8s.io;v=v1` requests (see
+    // `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/protobuf`).
+    if let Some(neg) = parse_accept_as_target(&accept_header) {
         if response.status() == StatusCode::OK {
             let response_ct = response
                 .headers()
@@ -552,7 +561,7 @@ pub async fn normalize_content_type_middleware(
                     Ok(json_bytes) => {
                         match serde_json::from_slice::<serde_json::Value>(&json_bytes) {
                             Ok(v) => {
-                                let converted = match as_target {
+                                let converted = match neg.target {
                                     AsTarget::Table => convert_to_table(v),
                                     AsTarget::PartialObjectMetadata => {
                                         convert_to_partial_object_metadata(v)
@@ -561,13 +570,37 @@ pub async fn normalize_content_type_middleware(
                                         convert_to_partial_object_metadata_list(v)
                                     }
                                 };
-                                let new_body = serde_json::to_vec(&converted)
+                                let converted_json = serde_json::to_vec(&converted)
                                     .unwrap_or_else(|_| json_bytes.to_vec());
+                                let (new_body, new_ct) = match neg.wire {
+                                    AsWire::Json => (
+                                        converted_json,
+                                        format!(
+                                            "application/json;as={};v=v1;g=meta.k8s.io",
+                                            neg.target.name()
+                                        ),
+                                    ),
+                                    AsWire::Protobuf => {
+                                        // Wrap the converted JSON in the K8s
+                                        // protobuf Unknown envelope. TypeMeta
+                                        // carries the converted kind (e.g.
+                                        // PartialObjectMetadata) so clients
+                                        // know how to decode the inner body.
+                                        let pb = wrap_json_in_protobuf_with_type_meta(
+                                            &converted_json,
+                                            "meta.k8s.io/v1",
+                                            neg.target.name(),
+                                        );
+                                        (
+                                            pb,
+                                            format!(
+                                                "application/vnd.kubernetes.protobuf;as={};v=v1;g=meta.k8s.io",
+                                                neg.target.name()
+                                            ),
+                                        )
+                                    }
+                                };
                                 let mut resp = Response::from_parts(parts, Body::from(new_body));
-                                let new_ct = format!(
-                                    "application/json;as={};v=v1;g=meta.k8s.io",
-                                    as_target.name()
-                                );
                                 if let Ok(hv) = axum::http::HeaderValue::from_str(&new_ct) {
                                     resp.headers_mut()
                                         .insert(axum::http::header::CONTENT_TYPE, hv);
@@ -596,7 +629,8 @@ pub async fn normalize_content_type_middleware(
 }
 
 /// Subset of `meta.k8s.io/v1` response shapes that can be requested via
-/// `Accept: application/json;as=<Target>;v=v1;g=meta.k8s.io`.
+/// `Accept: application/json;as=<Target>;v=v1;g=meta.k8s.io` or the
+/// equivalent `application/vnd.kubernetes.protobuf` Accept variant.
 #[derive(Debug, Clone, Copy)]
 enum AsTarget {
     Table,
@@ -614,28 +648,53 @@ impl AsTarget {
     }
 }
 
+/// Wire format requested alongside an `as=<Target>` parameter. JSON is the
+/// default and matches the original Table / PartialObjectMetadata path;
+/// Protobuf wraps the converted JSON in the K8s `k8s\0` Unknown envelope
+/// with TypeMeta set to `meta.k8s.io/v1.<Target>`.
+#[derive(Debug, Clone, Copy)]
+enum AsWire {
+    Json,
+    Protobuf,
+}
+
+/// Outcome of [`parse_accept_as_target`]: the target conversion and the wire
+/// format the client wants the converted document delivered in.
+#[derive(Debug, Clone, Copy)]
+struct AsNegotiation {
+    target: AsTarget,
+    wire: AsWire,
+}
+
 /// Scan an Accept header for the first recognized `as=<Target>` parameter.
 /// Matches the upstream apiserver logic in
 /// `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/negotiated_codec_factory.go`:
 /// the parameter is looked up per media-range and must accompany an
-/// `application/json` (or other supported base) media type.
-fn parse_accept_as_target(accept: &str) -> Option<AsTarget> {
+/// `application/json` or `application/vnd.kubernetes.protobuf` base media
+/// type. The wildcard `*/*` is treated as JSON for backward compatibility
+/// with the original Table negotiation path.
+fn parse_accept_as_target(accept: &str) -> Option<AsNegotiation> {
     for range in accept.split(',') {
         let mut parts = range.split(';');
         let base = parts.next().unwrap_or("").trim();
-        if !base.starts_with("application/json") && base != "*/*" {
+        let wire = if base.starts_with("application/vnd.kubernetes.protobuf") {
+            AsWire::Protobuf
+        } else if base.starts_with("application/json") || base == "*/*" {
+            AsWire::Json
+        } else {
             continue;
-        }
+        };
         for param in parts {
             let trimmed = param.trim();
             if let Some(value) = trimmed.strip_prefix("as=") {
                 let value = value.trim_matches('"');
-                return match value {
-                    "Table" => Some(AsTarget::Table),
-                    "PartialObjectMetadata" => Some(AsTarget::PartialObjectMetadata),
-                    "PartialObjectMetadataList" => Some(AsTarget::PartialObjectMetadataList),
-                    _ => None,
+                let target = match value {
+                    "Table" => AsTarget::Table,
+                    "PartialObjectMetadata" => AsTarget::PartialObjectMetadata,
+                    "PartialObjectMetadataList" => AsTarget::PartialObjectMetadataList,
+                    _ => return None,
                 };
+                return Some(AsNegotiation { target, wire });
             }
         }
     }
