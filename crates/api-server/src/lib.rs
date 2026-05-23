@@ -20,6 +20,7 @@ pub mod router;
 pub mod spdy;
 #[allow(dead_code)]
 pub mod spdy_handlers;
+pub mod ssa;
 pub mod state;
 #[allow(dead_code)]
 pub mod streaming;

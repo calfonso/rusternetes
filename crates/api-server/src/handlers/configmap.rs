@@ -589,8 +589,282 @@ async fn paginate_configmaps_response(
     Ok(axum::Json(list).into_response())
 }
 
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, ConfigMap, "configmaps", "");
+// Generic PATCH handler used for all non-SSA patch types (strategic merge,
+// JSON merge, JSON patch). The wrapper above intercepts SSA before
+// delegating here so this macro still drives all the legacy patch paths.
+crate::patch_handler_namespaced!(patch_legacy, ConfigMap, "configmaps", "");
+
+/// ConfigMap PATCH dispatcher.
+///
+/// Branches on `Content-Type`:
+///
+/// - `application/apply-patch+yaml` / `application/apply-patch+json` →
+///   structural-merge SSA via [`crate::ssa::apply_configmap`].
+/// - everything else → the legacy [`patch_legacy`] handler (strategic
+///   merge, JSON merge, JSON patch).
+///
+/// This is the SCAFFOLD: ConfigMap is the only resource wired to the new
+/// SSA module today. Other resources still go through the legacy
+/// top-level-key SSA in `rusternetes_common::server_side_apply` via the
+/// generic patch macro.
+pub async fn patch(
+    state: axum::extract::State<Arc<ApiServerState>>,
+    auth_ctx: axum::Extension<AuthContext>,
+    path: axum::extract::Path<(String, String)>,
+    query: axum::extract::Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response> {
+    let content_type = headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if content_type.contains("apply-patch") {
+        return apply_configmap_ssa(state, auth_ctx, path, query, &content_type, body).await;
+    }
+
+    // Delegate to the legacy patch handler.
+    let response = patch_legacy(state, auth_ctx, path, query, headers, body).await?;
+    Ok(response.into_response())
+}
+
+/// Server-Side Apply branch for ConfigMap PATCH.
+///
+/// Translates the HTTP request into an [`crate::ssa::ApplyOptions`] +
+/// desired-state value, runs [`crate::ssa::apply_configmap`], and maps the
+/// outcome to a Response:
+///
+/// - new object → HTTP 201 Created
+/// - merged object → HTTP 200 OK
+/// - conflicts without `?force=true` → HTTP 409 Conflict (Status body)
+async fn apply_configmap_ssa(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    content_type: &str,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response> {
+    info!(
+        "SSA apply configmap {}/{} (Content-Type: {})",
+        namespace, name, content_type
+    );
+
+    // Save user info for webhooks before RBAC check consumes it.
+    let webhook_user = auth_ctx.user.clone();
+
+    // RBAC: SSA uses the `patch` verb.
+    let attrs = RequestAttributes::new(auth_ctx.user, "patch", "configmaps")
+        .with_api_group("")
+        .with_namespace(&namespace)
+        .with_name(&name);
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => {
+            return Err(rusternetes_common::Error::Forbidden(reason));
+        }
+    }
+
+    // ?fieldManager= is mandatory for SSA; upstream returns 400 when
+    // missing.
+    let field_manager = params.get("fieldManager").cloned().ok_or_else(|| {
+        rusternetes_common::Error::BadRequest(
+            "fieldManager query parameter is required for apply-patch requests".to_string(),
+        )
+    })?;
+    let force = params
+        .get("force")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
+    let opts = crate::ssa::ApplyOptions::new(field_manager).with_force(force);
+
+    // Decode the body — apply-patch+yaml or apply-patch+json.
+    let mut desired = crate::ssa::decode_apply_body(content_type, &body)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+    // Path-coerce name/namespace so the body cannot rename the object.
+    if let Some(meta) = desired
+        .as_object_mut()
+        .and_then(|o| o.get_mut("metadata"))
+        .and_then(|m| m.as_object_mut())
+    {
+        meta.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        meta.insert(
+            "namespace".to_string(),
+            serde_json::Value::String(namespace.clone()),
+        );
+    }
+
+    let key = build_key("configmaps", Some(&namespace), &name);
+
+    // Load current object (if any) for the merge.
+    let current: Option<ConfigMap> = match state.storage.get::<ConfigMap>(&key).await {
+        Ok(cm) => Some(cm),
+        Err(rusternetes_common::Error::NotFound(_)) => None,
+        Err(e) => return Err(e),
+    };
+
+    let outcome = crate::ssa::apply_configmap(current.as_ref(), &desired, &opts)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+
+    // Immutability check — mirrors the `update` handler. An immutable
+    // ConfigMap rejects any change to `data`, `binaryData`, or the
+    // `immutable` flag itself. SSA must not bypass this guard, otherwise
+    // a client could mutate an immutable ConfigMap via apply-patch.
+    if let (Some(existing), crate::ssa::ApplyOutcome::Applied { ref object, .. }) =
+        (current.as_ref(), &outcome)
+    {
+        if existing.immutable == Some(true) {
+            let data_changed = existing.data != object.data;
+            let binary_data_changed = existing.binary_data != object.binary_data;
+            let immutable_changed =
+                object.immutable != Some(true) && object.immutable != existing.immutable;
+            if data_changed || binary_data_changed || immutable_changed {
+                return Err(rusternetes_common::Error::InvalidResource(format!(
+                    "ConfigMap \"{}/{}\" is immutable",
+                    namespace, name
+                )));
+            }
+        }
+    }
+
+    match outcome {
+        crate::ssa::ApplyOutcome::Applied {
+            mut object,
+            created,
+        } => {
+            // Ensure path-derived metadata is set even when the merge
+            // started from a brand-new body.
+            object.metadata.name = name.clone();
+            object.metadata.namespace = Some(namespace.clone());
+            if created {
+                object.metadata.ensure_uid();
+                object.metadata.ensure_creation_timestamp();
+            }
+            let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+
+            // Run mutating + validating admission webhooks on the
+            // SSA-produced object, mirroring the non-SSA PATCH path. The
+            // operation is Create for new objects, Update for merges, so
+            // policies attached to either bucket fire correctly.
+            let op = if created {
+                Operation::Create
+            } else {
+                Operation::Update
+            };
+            let gvk = GroupVersionKind {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+            };
+            let cm_val = serde_json::to_value(&object).ok();
+            state
+                .webhook_manager
+                .run_validating_admission_policies_ext(
+                    &op,
+                    &gvk,
+                    cm_val.as_ref(),
+                    None,
+                    Some("configmaps"),
+                    Some(&namespace),
+                )
+                .await?;
+            {
+                let gvr = rusternetes_common::admission::GroupVersionResource {
+                    group: "".to_string(),
+                    version: "v1".to_string(),
+                    resource: "configmaps".to_string(),
+                };
+                let user_info = rusternetes_common::admission::UserInfo {
+                    username: webhook_user.username.clone(),
+                    uid: webhook_user.uid.clone(),
+                    groups: webhook_user.groups.clone(),
+                };
+                let (response, mutated_obj) = state
+                    .webhook_manager
+                    .run_mutating_webhooks_with_dryrun(
+                        &op,
+                        &gvk,
+                        &gvr,
+                        Some(&namespace),
+                        &name,
+                        cm_val.clone(),
+                        None,
+                        &user_info,
+                        is_dry_run,
+                    )
+                    .await?;
+                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = &response {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "admission webhook denied the request: {}",
+                        reason
+                    )));
+                }
+                if let Some(mutated) = mutated_obj {
+                    if let Ok(m) = serde_json::from_value::<ConfigMap>(mutated) {
+                        object = m;
+                    }
+                }
+                if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
+                    .webhook_manager
+                    .run_validating_webhooks_with_dryrun(
+                        &op,
+                        &gvk,
+                        &gvr,
+                        Some(&namespace),
+                        &name,
+                        serde_json::to_value(&object).ok(),
+                        None,
+                        &user_info,
+                        is_dry_run,
+                    )
+                    .await?
+                {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "admission webhook denied the request: {}",
+                        reason
+                    )));
+                }
+            }
+
+            let saved: ConfigMap = if is_dry_run {
+                object
+            } else if created {
+                state.storage.create::<ConfigMap>(&key, &object).await?
+            } else {
+                state.storage.update::<ConfigMap>(&key, &object).await?
+            };
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            Ok((status, axum::Json(saved)).into_response())
+        }
+        crate::ssa::ApplyOutcome::Conflicts(conflicts) => {
+            // Mirror upstream: 409 Conflict with reason=Conflict.
+            let detail = conflicts
+                .iter()
+                .map(|c| {
+                    format!(
+                        ".{} is managed by {}",
+                        c.path.replace('/', "."),
+                        c.current_manager
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(rusternetes_common::Error::Conflict(format!(
+                "Apply failed with {} conflict{}: {}",
+                conflicts.len(),
+                if conflicts.len() == 1 { "" } else { "s" },
+                detail
+            )))
+        }
+    }
+}
 
 pub async fn deletecollection_configmaps(
     State(state): State<Arc<ApiServerState>>,
