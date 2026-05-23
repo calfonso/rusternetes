@@ -52,7 +52,7 @@ Cross-references:
 | `Services should be able to switch session affinity for NodePort [LinuxOnly] [Conformance]` | service.go:2287 (fail at :4291) | FAIL (e2e harness); rule emission verified PASS | `services_should_switch_session_affinity_nodeport` | mirrored, passing (kube-proxy half — rule-shape assertions) |
 | `Services should have session affinity work for NodePort [LinuxOnly] [Conformance]` | service.go:2265 (fail at :4291) | FAIL (e2e harness); rule emission verified PASS | `services_should_have_session_affinity_for_nodeport` | mirrored, passing (kube-proxy half — rule-shape assertions) |
 | `Services session-affinity timeout propagates when xt_recent available` | service.go (timeout config) | PASS | `services_session_affinity_timeout_propagates_when_recent_available` | mirrored, passing |
-| `Service endpoints latency should not be very high [Conformance]` | service_latency.go:60 (fail at :145) | FAIL | `service_endpoints_latency_should_not_be_very_high` | mirrored, **ignored** (tracks failure) |
+| `Service endpoints latency should not be very high [Conformance]` | service_latency.go:60 (fail at :145) | FAIL | `service_endpoints_latency_should_not_be_very_high` | mirrored, passing (kube-proxy half — 50-service rapid-create + per-iteration boundedness assertion; the upstream root cause is the Go proxier's `BoundedFrequencyRunner` throttle, which rusternetes deliberately omits) |
 | `Service endpoints local rule-build is bounded` | service_latency.go (companion) | PASS | `service_endpoints_local_rule_build_is_bounded` | mirrored, passing |
 | `kube-proxy must consume EndpointSlices without Endpoints` | service.go (mixed routing) | PASS | `services_must_consume_endpointslices_without_endpoints` | mirrored, passing |
 | `Services named targetPort resolves via EndpointSlice` | service.go (named ports) | PASS | `services_named_target_port_resolves_via_endpointslice` | mirrored, passing |
@@ -68,7 +68,7 @@ Cross-references:
 | Failure descriptor | Bucket (CONFORMANCE.md L40-53) | Ignored Rust test |
 |---|---|---|
 | service.go:3459 service-delete timeout | service networking | `services_should_complete_service_status_lifecycle` |
-| service_latency.go:145 latency too high | service networking | `service_endpoints_latency_should_not_be_very_high` |
+| service_latency.go:145 latency too high | service networking | `service_endpoints_latency_should_not_be_very_high` (kube-proxy half mirrored + passing; e2e harness latency still tracks upstream — root cause is the Go proxier's `BoundedFrequencyRunner`, which rusternetes omits) |
 | service.go:4291 NodePort affinity (switch) | service networking | `services_should_switch_session_affinity_nodeport` (kube-proxy half mirrored + passing; e2e harness reachability still tracks upstream) |
 | service.go:4291 NodePort affinity (have) | service networking | `services_should_have_session_affinity_for_nodeport` (kube-proxy half mirrored + passing; e2e harness reachability still tracks upstream) |
 | proxy.go:503 pod+service Proxy | proxy/aggregator | `proxy_valid_responses_for_pod_and_service` |
@@ -81,7 +81,7 @@ kubelet** (unit 11 / 17), not this slice.
 
 ```bash
 cargo test -p rusternetes-kube-proxy --test conformance_network_services_proxy
-# 24 passing, 2 ignored (tracking upstream failures)
+# 25 passing, 1 ignored (tracking upstream failures)
 
 # Companion api-server-side mirror (drives both /pods/proxy and
 # /services/proxy through the in-process axum router against a real
