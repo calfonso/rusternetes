@@ -67,7 +67,7 @@ pub fn correlate<'a>(
                     .properties
                     .as_ref()
                     .and_then(|p| p.get(name))
-                    .or_else(|| match cur_schema.additional_properties.as_deref() {
+                    .or(match cur_schema.additional_properties.as_deref() {
                         Some(JSONSchemaPropsOrBool::Schema(s)) => Some(s),
                         _ => None,
                     })?;

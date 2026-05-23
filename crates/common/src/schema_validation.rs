@@ -220,17 +220,14 @@ impl SchemaValidator {
                     p.push(PathSeg::Key(field.clone()));
                     out.push(ValidationIssue {
                         path: p,
-                        message: format!(
-                            "{}: Required value",
-                            {
-                                let mut s = PathSeg::render_path(path);
-                                if !s.is_empty() {
-                                    s.push('.');
-                                }
-                                s.push_str(field);
-                                s
+                        message: format!("{}: Required value", {
+                            let mut s = PathSeg::render_path(path);
+                            if !s.is_empty() {
+                                s.push('.');
                             }
-                        ),
+                            s.push_str(field);
+                            s
+                        }),
                     });
                 }
             }
@@ -324,10 +321,7 @@ impl SchemaValidator {
                 if seen.contains(&item) {
                     out.push(ValidationIssue {
                         path: path.clone(),
-                        message: format!(
-                            "{}: must have unique items",
-                            PathSeg::render_path(path)
-                        ),
+                        message: format!("{}: must have unique items", PathSeg::render_path(path)),
                     });
                     break;
                 }

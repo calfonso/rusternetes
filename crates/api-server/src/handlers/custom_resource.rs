@@ -1530,16 +1530,10 @@ fn validate_custom_resource_with_ratcheting(
 
     // For each top-level property, collect schema + CEL failures, ratchet
     // those that resolve to an unchanged correlatable sub-tree.
-    let new_extra_specs: HashMap<&str, &serde_json::Value> = cr
-        .extra
-        .iter()
-        .map(|(k, v)| (k.as_str(), v))
-        .collect();
-    let old_extra_specs: HashMap<&str, &serde_json::Value> = old_cr
-        .extra
-        .iter()
-        .map(|(k, v)| (k.as_str(), v))
-        .collect();
+    let new_extra_specs: HashMap<&str, &serde_json::Value> =
+        cr.extra.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let old_extra_specs: HashMap<&str, &serde_json::Value> =
+        old_cr.extra.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
     for (key, prop_schema) in properties {
         let (new_val, old_val) = match key.as_str() {
@@ -1622,9 +1616,7 @@ fn render_issue_message(
     msg: &str,
 ) -> String {
     let p = render_full_path(path);
-    if p.is_empty() {
-        msg.to_string()
-    } else if msg.starts_with(&p) {
+    if p.is_empty() || msg.starts_with(&p) {
         msg.to_string()
     } else {
         format!("{}: {}", p, msg)

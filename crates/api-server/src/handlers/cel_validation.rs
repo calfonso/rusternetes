@@ -485,7 +485,9 @@ fn walk_and_eval(
         if let Some(properties) = &schema.properties {
             for (key, prop_schema) in properties {
                 if let Some(child) = map.get(key) {
-                    let old_child = old_node.and_then(|o| o.as_object()).and_then(|m| m.get(key));
+                    let old_child = old_node
+                        .and_then(|o| o.as_object())
+                        .and_then(|m| m.get(key));
                     path.push(PathSeg::Key(key.clone()));
                     walk_and_eval(
                         prop_schema,

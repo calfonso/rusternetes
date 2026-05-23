@@ -1338,9 +1338,7 @@ async fn ratchet_install_crd(router: &axum::Router, body: &Value) {
 }
 
 async fn ratchet_tighten_crd(router: &axum::Router, group: &str, body: &Value) {
-    let uri = format!(
-        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/ratchets.{group}"
-    );
+    let uri = format!("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/ratchets.{group}");
     let (s, b) = put_json(router, &uri, body).await;
     assert_eq!(s, 200, "tight CRD update must succeed, body={b}");
 }
@@ -1508,14 +1506,8 @@ async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {
         "atomicArray": ["foo", "bar", "baz", "notfoo"],
         "setArray": ["foo", "bar", "baz", "notfoo"],
     });
-    let (s, body) = ratchet_put_cr(
-        &router,
-        group,
-        "t1",
-        modified,
-        Some(json!({"foo": "bar"})),
-    )
-    .await;
+    let (s, body) =
+        ratchet_put_cr(&router, group, "t1", modified, Some(json!({"foo": "bar"}))).await;
     assert!(
         (400..500).contains(&s),
         "UPDATE on uncorrelatable arrays must be rejected, got {s}, body={body}"
@@ -1752,14 +1744,8 @@ async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {
         "setArray": ["foo", "bar", "baz", "notfoo"],
         "atomicArray": ["foo", "bar", "baz", "notfoo"],
     });
-    let (s, body) = ratchet_put_cr(
-        &router,
-        group,
-        "t1",
-        modified,
-        Some(json!({"foo": "bar"})),
-    )
-    .await;
+    let (s, body) =
+        ratchet_put_cr(&router, group, "t1", modified, Some(json!({"foo": "bar"}))).await;
     assert!(
         (400..500).contains(&s),
         "UPDATE on uncorrelatable arrays must be rejected, got {s}, body={body}"
@@ -1934,14 +1920,8 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
 
     // PUT the SAME instance (label-only change). Every transition rule must
     // fail because `self == oldSelf` for every covered leaf.
-    let (s, body) = ratchet_put_cr(
-        &router,
-        group,
-        "t1",
-        initial,
-        Some(json!({"foo": "bar"})),
-    )
-    .await;
+    let (s, body) =
+        ratchet_put_cr(&router, group, "t1", initial, Some(json!({"foo": "bar"}))).await;
     assert!(
         (400..500).contains(&s),
         "transition rule failure must NOT be ratcheted, got {s}, body={body}"
