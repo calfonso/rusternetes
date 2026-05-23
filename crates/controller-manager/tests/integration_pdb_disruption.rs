@@ -19,12 +19,14 @@
 //!   - TestPatchCompatibility
 //!   - TestStalePodDisruption
 //!
-//! Result: 12 green pins, 4 `#[ignore]`d surfaces awaiting tracked follow-up
-//! work (CRD scale subresource for `expectedPods`; the three patch verbs on
-//! the PDB selector — strategic-merge / JSON-merge / server-side apply —
-//! which live in api-server and belong in a `crates/api-server/tests/` mirror
-//! that doesn't exist yet). Each `#[ignore = "..."]` cites the missing
-//! surface so the gaps stay discoverable via `cargo test -- --ignored`.
+//! Result: 12 green pins. The three router-driven patch-verb tests on the
+//! PDB selector — strategic-merge / JSON-merge / server-side apply — moved
+//! to `crates/api-server/tests/pdb_patch_compatibility_test.rs`, which uses
+//! a `build_router` + `tower::ServiceExt::oneshot` harness to exercise the
+//! real PATCH dispatch in `crates/api-server/src/patch.rs`. Remaining
+//! `#[ignore]`d surfaces in this file cite the missing controller-side
+//! features (e.g. CRD scale subresource for `expectedPods`) and stay
+//! discoverable via `cargo test -- --ignored`.
 
 use rusternetes_common::resources::pod::{Container, Pod, PodCondition, PodSpec, PodStatus};
 use rusternetes_common::resources::{
@@ -604,23 +606,11 @@ async fn test_patch_compatibility_selector_round_trip() {
     assert_eq!(exprs[0].operator, "In");
 }
 
-#[tokio::test]
-#[ignore = "Follow-up: belongs in crates/api-server/tests/ — needs router-driven harness for PATCH application/strategic-merge-patch+json on PDB."]
-async fn test_patch_compatibility_v1_strategic_merge() {
-    panic!("not implemented here: see ignore reason for the follow-up location");
-}
-
-#[tokio::test]
-#[ignore = "Follow-up: belongs in crates/api-server/tests/ — needs router-driven harness for PATCH application/merge-patch+json on PDB."]
-async fn test_patch_compatibility_v1_merge_patch() {
-    panic!("not implemented here: see ignore reason for the follow-up location");
-}
-
-#[tokio::test]
-#[ignore = "Follow-up: belongs in crates/api-server/tests/ — needs router-driven harness for PATCH application/apply-patch+yaml on PDB."]
-async fn test_patch_compatibility_v1_apply_patch() {
-    panic!("not implemented here: see ignore reason for the follow-up location");
-}
+// The three router-driven patch-verb tests
+// (test_patch_compatibility_v1_strategic_merge / _merge_patch / _apply_patch)
+// live in `crates/api-server/tests/pdb_patch_compatibility_test.rs` — they
+// need the in-process Axum router + `tower::ServiceExt::oneshot` harness to
+// exercise real Content-Type dispatch in the PATCH handler.
 
 // ---------------------------------------------------------------------------
 // TestStalePodDisruption
