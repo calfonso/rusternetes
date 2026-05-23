@@ -34,6 +34,10 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# Enable payload dumps in api-server/kubelet so any panic / 5xx / decode
+# failure during conformance logs the offending request body.
+export RUSTERNETES_DUMP_PAYLOADS=1
+
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"

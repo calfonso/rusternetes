@@ -36,6 +36,9 @@ env:
   # silently break the workflow. The conformance image itself is pinned
   # by `scripts/conformance-canary-run.sh` (defaults to v1.35.0).
   HYDROPHONE_VERSION: v0.7.0
+  # Enable payload dumps in api-server/kubelet so any panic / 5xx / decode
+  # failure during conformance logs the offending request body.
+  RUSTERNETES_DUMP_PAYLOADS: "1"
 
 jobs:
   hydrophone:
