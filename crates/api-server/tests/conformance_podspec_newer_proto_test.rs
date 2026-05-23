@@ -119,8 +119,9 @@ fn test_podspec_host_users_proto_decode_round_trips() {
     write_string(&mut container, 1, "c");
     write_string(&mut container, 2, "i");
     write_message(&mut spec_bytes, 1, &container);
-    // hostUsers (field 37, varint, value=1=true).
-    write_varint(&mut spec_bytes, ((37u64) << 3) | 0); // wire_type 0 (varint)
+    // hostUsers (field 37, wire_type 0 = varint, value=1=true).
+    // Tag = (field_num << 3) | wire_type; wire_type 0 contributes no bits.
+    write_varint(&mut spec_bytes, 37u64 << 3);
     write_varint(&mut spec_bytes, 1);
 
     let decoded = registry
@@ -167,10 +168,7 @@ fn test_podspec_scheduling_gates_proto_decode_round_trips() {
         .and_then(|v| v.as_array())
         .expect("schedulingGates must be a JSON array");
     assert_eq!(gates.len(), 2, "two scheduling gates encoded");
-    assert_eq!(
-        gates[0].get("name").and_then(|v| v.as_str()),
-        Some("ready"),
-    );
+    assert_eq!(gates[0].get("name").and_then(|v| v.as_str()), Some("ready"),);
     assert_eq!(
         gates[1].get("name").and_then(|v| v.as_str()),
         Some("billing"),
@@ -313,8 +311,8 @@ fn test_podspec_all_newer_fields_decode_together() {
     let mut spec_bytes = Vec::new();
     write_message(&mut spec_bytes, 1, &container);
     write_message(&mut spec_bytes, 36, &os_msg);
-    // hostUsers = true (varint, wire_type 0)
-    write_varint(&mut spec_bytes, ((37u64) << 3) | 0);
+    // hostUsers = true (wire_type 0 = varint; tag is just field_num << 3).
+    write_varint(&mut spec_bytes, 37u64 << 3);
     write_varint(&mut spec_bytes, 1);
     write_message(&mut spec_bytes, 38, &gate);
     write_message(&mut spec_bytes, 39, &claim);
