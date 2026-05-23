@@ -529,33 +529,51 @@ async fn test_resource_version_delete_missing_returns_404() {
 // Compacted-RV 410 Gone + DELETE preconditions.resourceVersion
 // ---------------------------------------------------------------------------
 
-/// Watch with a compacted `resourceVersion` must return HTTP 410 Gone.
-/// Upstream contract: when etcd's compaction history no longer covers the
-/// requested RV, kube-apiserver responds with `Status{Reason: "Expired",
-/// Code: 410}`. `Storage::is_revision_compacted` already exists in the
-/// memory backend (`compact_to`), but the watch handler does not consult it.
+/// Watch with a compacted `resourceVersion` must emit a streamed `ERROR`
+/// envelope carrying `Status{Code: 410, Reason: "Expired"}`, NOT an HTTP
+/// 410 response.
+///
+/// Upstream contract: `staging/src/k8s.io/apiserver/pkg/storage/cacher/
+/// cacher.go::Watch` returns `errs.NewResourceExpired(...)` when the
+/// requested RV is below the cacher's earliest available revision. For
+/// `?watch=true`, `endpoints/handlers/watch.go::serveWatch` has already
+/// written the 200 status + chunked headers by the time the cacher reports
+/// the failure, so the only way to deliver it is an in-stream
+/// `watch.Event{Type: Error, Object: NewResourceExpired(...).Status()}`
+/// frame. Mirroring this is required by
+/// `watch_event_envelope_test.rs::watch_envelope_error_carries_status`.
+///
+/// This test pins the HTTP-level half (status 200 + the ERROR envelope
+/// carries `code: 410`); the envelope-shape suite pins the full payload.
 #[tokio::test]
-async fn test_watch_resource_version_stale_returns_410() {
+async fn test_watch_resource_version_stale_emits_streamed_error() {
     let (mem, router) = spawn_router();
 
     // Mark every revision up to 999 as compacted, then ask to watch from "100".
     mem.compact_to(999);
 
-    let (status, _events) = collect_watch_events(
+    let (status, events) = collect_watch_events(
         router,
         &format!(
             "/api/v1/namespaces/{}/configmaps?watch=true&resourceVersion=100",
             TEST_NS
         ),
-        0,
+        1,
         Duration::from_millis(500),
     )
     .await;
     assert_eq!(
         status,
-        StatusCode::GONE,
-        "compacted RV must surface as 410 Gone"
+        StatusCode::OK,
+        "watch with compacted RV must return 200 + streamed ERROR (not HTTP 410)"
     );
+    let error = events
+        .iter()
+        .find(|e| e["type"].as_str() == Some("ERROR"))
+        .unwrap_or_else(|| panic!("expected ERROR envelope, got: {events:?}"));
+    assert_eq!(error["object"]["kind"].as_str(), Some("Status"));
+    assert_eq!(error["object"]["reason"].as_str(), Some("Expired"));
+    assert_eq!(error["object"]["code"].as_u64(), Some(410));
 }
 
 /// DELETE with mismatched `preconditions.resourceVersion` must return 409.
