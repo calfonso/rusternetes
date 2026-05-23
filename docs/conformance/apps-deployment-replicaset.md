@@ -40,16 +40,18 @@ failures in this slice are:
    pending a fresh run.
 3. `ReplicaSet / ReplicationController should serve a basic image on each
    replica with a public image` — `replica_set.go:95`, `rc.go:65` — the
-   end-to-end image-serving contract fails because the conformance check
-   curls each pod IP. The failure surface is pod IP / Service plane, not
-   the workload controllers. The controller-level mirrors
+   end-to-end image-serving contract fails in Sonobuoy because the
+   conformance check curls each pod IP, exercising kubelet image-pull and
+   pod networking. The failure surface is pod IP / Service plane, not the
+   workload controllers. The controller-level mirrors
    (`replicaset_should_serve_basic_image_on_each_replica`,
-   `rc_should_serve_basic_image_on_each_replica`) verify the slice of the
-   contract the controllers own (N pods produced, each with template labels
-   and container image). The ReplicaSet mirror is now active and passing
-   locally as of 2026-05-23; the RC mirror is still tagged pending its own
-   un-ignore. The end-to-end Sonobuoy verdict remains gated on cluster-side
-   networking fixes.
+   `rc_should_serve_basic_image_on_each_replica`) pin the slice the
+   workload controllers actually own — "given an RS/RC with
+   `spec.replicas=N` and a template carrying the requested image, the
+   reconcile loop must create N pods, each owned by the parent and each
+   carrying the requested image." Both mirrors are now active and passing
+   locally as of 2026-05-23. The end-to-end Sonobuoy verdict still tracks
+   the kubelet/network surfaces, which live in their own crates.
 
 `Deployment paused` is now honored — `reconcile_deployment` short-circuits to
 a status-only path when `spec.paused` is true, so a template hash change does
@@ -82,7 +84,7 @@ exercises that guarantee.
 | `ReplicaSet should list and delete a collection of ReplicaSets` | replica_set.go:156 | PASS | `replicaset_list_and_delete_collection` | mirrored, passing |
 | `ReplicaSet should validate Replicaset Status endpoints` | replica_set.go:169 | PASS | `replicaset_status_replicas_match_pod_count` | mirrored, passing |
 | ReplicaSet self-healing on pod deletion | replica_set.go:95 (implied invariant) | PASS | `replicaset_recreates_deleted_pod` | mirrored, passing |
-| `ReplicationController should serve a basic image on each replica with a public image` | rc.go:65 | FAIL | `rc_should_serve_basic_image_on_each_replica` | mirrored, ignored (tracks failure) |
+| `ReplicationController should serve a basic image on each replica with a public image` | rc.go:65 | FAIL | `rc_should_serve_basic_image_on_each_replica` | mirrored, passing locally (2026-05-23); end-to-end gated on cluster networking |
 | `ReplicationController should adopt matching pods on creation` | rc.go:89 | PASS | `rc_should_adopt_matching_pods_on_creation` | mirrored, passing |
 | `ReplicationController should release no longer matching pods` | rc.go:99 | PASS | `rc_should_release_pods_whose_labels_no_longer_match` | mirrored, passing |
 | `ReplicationController should test the lifecycle of a ReplicationController` | rc.go:109 | PASS | `rc_lifecycle_create_scale_patch_delete` | mirrored, passing |

@@ -322,7 +322,10 @@ Complexity: Layer A **medium–large** (overlaps Area 5 + #1). Layer B **trivial
 
 **[ ] Layer A**: covered by the #18 work. Same fix unlocks both.
 
-**[ ] Layer B**: same options as #18; recommendation: delete this mirror too, for the same reason. The `ReplicationControllerController` reconciler is unit-covered by `rc_publishes_status_after_reconcile` already.
+**[x] Layer B**: mirror un-ignored and re-scoped to the controller slice the
+`ReplicationControllerController` actually owns (N pods created with the
+requested image, every pod owned by the parent RC). Passes against
+`MemoryStorage`. Kubelet image-pull + pod networking remain Layer A work.
 
 Complexity: same as #18.
 
