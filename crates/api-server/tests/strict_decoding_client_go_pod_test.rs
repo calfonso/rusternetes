@@ -217,15 +217,15 @@ async fn test_genuinely_unknown_field_with_non_null_value_still_rejected_under_s
     );
 }
 
-/// **Known limitation** — diff-based strict decoding cannot distinguish
-/// "legit Option<...> field round-trip-dropped because the value was
-/// null" (e.g. `metadata.creationTimestamp: null` from client-go) from
-/// "truly unknown field that happens to carry a null value". Once a
-/// schema-aware strict decoder is in place (likely via the
-/// `serde_ignored` crate or per-type `deny_unknown_fields`), flip
-/// this test from `#[ignore]` to a passing negative-path guard.
+/// Schema-aware strict decoding (via `serde_ignored`, see
+/// `find_unknown_fields_via_schema` in `validation.rs`) flags every key
+/// that isn't declared on `PodSpec`, regardless of value. Previously
+/// this case slipped through because the diff-based decoder couldn't
+/// distinguish "truly unknown null-valued field" from "legit
+/// `Option<...>` field round-trip-dropped because the value was null"
+/// — the new decoder asks `PodSpec`'s own `Visitor` what it consumed,
+/// so the ambiguity disappears.
 #[tokio::test]
-#[ignore = "diff-based strict decode false-negative; tracked alongside TODO in validation.rs"]
 async fn test_genuinely_unknown_null_valued_field_currently_slips_through() {
     let router = spawn_router();
     let body = json!({

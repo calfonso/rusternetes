@@ -336,9 +336,92 @@ fn is_empty_object(value: &serde_json::Value) -> bool {
     matches!(value, serde_json::Value::Object(map) if map.is_empty())
 }
 
-/// Recursively find fields in `original` that are not present in `canonical`.
-/// Returns a list of dotted field paths for unknown fields.
-fn find_unknown_fields_recursive(
+/// Render a `serde_ignored::Path` chain into the dotted+bracket format the
+/// upstream k8s strict-decoder uses (`spec.containers[0].image`).
+///
+/// `serde_ignored::Path`'s own `Display` impl renders sequence indices with
+/// dots (`spec.containers.0.image`), which doesn't match the
+/// `strict decoding error: unknown field "spec.containers[0].image"` shape
+/// every parity test pins against upstream output.
+fn format_ignored_path(path: &serde_ignored::Path<'_>) -> String {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => String::new(),
+        Path::Seq { parent, index } => {
+            let p = format_ignored_path(parent);
+            if p.is_empty() {
+                format!("[{}]", index)
+            } else {
+                format!("{}[{}]", p, index)
+            }
+        }
+        Path::Map { parent, key } => {
+            let p = format_ignored_path(parent);
+            if p.is_empty() {
+                key.clone()
+            } else {
+                format!("{}.{}", p, key)
+            }
+        }
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => format_ignored_path(parent),
+    }
+}
+
+/// Collect every field path in `original` that is NOT declared on the
+/// target type `T`, using schema-aware re-deserialization via the
+/// `serde_ignored` crate.
+///
+/// This is the precise (value-agnostic) half of the unknown-field check
+/// — it catches unknown keys regardless of whether their value is null,
+/// `{}`, or anything else. It closes the long-standing false-negative
+/// where the older canonical-vs-original diff couldn't distinguish
+/// "truly unknown null-valued field" from "legit `Option<...>` field
+/// round-trip-dropped because the value was null".
+///
+/// Upstream k8s detects unknown fields at the decoder level
+/// (`apimachinery/pkg/runtime/serializer/json/json.go`'s
+/// `UnmarshalCaseSensitivePreserveInts` + `DisallowUnknownFields`); the
+/// `serde_ignored` callback is the Rust equivalent — it fires for every
+/// key the target type's `Visitor` did not consume.
+///
+/// Known limitation: `#[serde(flatten)]` short-circuits serde's
+/// per-field tracking — leftover keys get funnelled through
+/// `FlatMapDeserializer`, which doesn't propagate ignored-key events
+/// back out to the outer callback. The diff-based helper below covers
+/// that gap (it only inspects the canonical round-trip output, so it's
+/// unaffected by flatten internals).
+fn find_unknown_fields_via_schema<T>(original: &serde_json::Value) -> Vec<String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut unknown: Vec<String> = Vec::new();
+    // The result is intentionally discarded — strict decoding only cares
+    // about whether unknown keys were encountered, not whether the typed
+    // deserialise itself succeeded. The handler has already produced a
+    // valid `T` from the same body; if `from_value` here returns an Err
+    // we still want to surface the ignored-key callbacks that fired
+    // before the failure point.
+    let _ = serde_ignored::deserialize::<_, _, T>(original, |path| {
+        unknown.push(format_ignored_path(&path));
+    });
+    unknown
+}
+
+/// Diff-based unknown-field discovery — the fallback that catches keys
+/// `serde_ignored` misses because `#[serde(flatten)]` short-circuits its
+/// per-field tracking.
+///
+/// Compares every key in `original` against the canonical round-trip of
+/// the typed parse. A key present in `original` but absent from
+/// `canonical` is reported as unknown — EXCEPT when its value is JSON
+/// `null` or `{}`, which a typed deserialiser may legitimately have
+/// folded into `Option::None` and the canonical serialise dropped via
+/// `skip_serializing_if = "Option::is_none"`. Those ambiguous cases are
+/// the schema-aware helper's responsibility (it can distinguish "legit
+/// `Option` field" from "truly unknown" without value-based heuristics).
+fn find_unknown_fields_via_diff(
     original: &serde_json::Value,
     canonical: &serde_json::Value,
     prefix: &str,
@@ -353,57 +436,76 @@ fn find_unknown_fields_recursive(
                     format!("{}.{}", prefix, key)
                 };
                 if let Some(canon_val) = canon_map.get(key) {
-                    // Recurse into nested objects
-                    find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
+                    find_unknown_fields_via_diff(orig_val, canon_val, &field_path, unknown);
                 } else if orig_val.is_null() || is_empty_object(orig_val) {
-                    // Known limitation of diff-based strict decoding:
-                    // client-go marshals zero-valued Go structs in two
-                    // forms that our typed deserialiser collapses to
-                    // `None`:
-                    //   - JSON `null` (e.g. `metadata.creationTimestamp:
-                    //     null` from a zero `time.Time` — fixed in
-                    //     PR #687).
-                    //   - JSON `{}` empty object (e.g.
-                    //     `status.containerStatuses[N].lastState: {}`
-                    //     when the container has no prior state — fixed
-                    //     in this branch).
-                    //
-                    // In both cases the canonical round-trip drops the
-                    // key because every `Option<...>` is
-                    // `skip_serializing_if = Option::is_none` and our
-                    // custom `deserialize_*_option` helpers treat both
-                    // null and empty-object as `None`. Without this
-                    // branch the differ flags legit declared fields
-                    // as unknown.
-                    //
-                    // Tradeoff: a truly-unknown field whose value is
-                    // null or `{}` will also slip through unflagged.
-                    // That false-negative is impossible to distinguish
-                    // from the legit case without schema-aware decoding
-                    // (e.g. `serde_ignored` or per-type
-                    // `deny_unknown_fields`). See the `#[ignore]`'d
-                    // test in `strict_decoding_client_go_pod_test.rs`
-                    // tracking the fix.
-                    // TODO(rusternetes): replace this diff approach
-                    // with schema-aware strict decoding so null- or
-                    // empty-object-valued unknown fields can still
-                    // be rejected.
+                    // Ambiguous case — let the schema-aware helper decide
+                    // (it sees `Option<...>` field declarations directly
+                    // via serde and won't be fooled by the round-trip
+                    // dropping `None` values).
                 } else {
                     unknown.push(field_path);
                 }
             }
         }
         (serde_json::Value::Array(orig_arr), serde_json::Value::Array(canon_arr)) => {
-            // For arrays, check element-by-element if both have the same length
+            // Walk element-wise when the array lengths line up so nested
+            // unknown keys inside array elements (e.g.
+            // `spec.containers[0].bogus`) get reported with their full
+            // dotted+bracket path.
             for (i, (orig_elem, canon_elem)) in orig_arr.iter().zip(canon_arr.iter()).enumerate() {
                 let field_path = format!("{}[{}]", prefix, i);
-                find_unknown_fields_recursive(orig_elem, canon_elem, &field_path, unknown);
+                find_unknown_fields_via_diff(orig_elem, canon_elem, &field_path, unknown);
             }
         }
         _ => {
-            // Scalar values — nothing to check
+            // Scalar values — nothing to check.
         }
     }
+}
+
+/// Union of the schema-aware (value-agnostic) and diff-based (flatten-
+/// resilient) unknown-field detectors. Each catches what the other
+/// misses; together they reproduce the upstream k8s strict-decoder's
+/// behaviour for the resource shapes the api-server handles.
+///
+/// Returns `Err(Error::Internal)` if `to_value` on the parsed resource
+/// fails. A silent fallback to an empty canonical would make the diff
+/// pass flag every legit top-level field as unknown — propagating the
+/// error preserves the pre-existing behaviour (PR #687-era code raised
+/// `Error::Internal` here too).
+fn find_unknown_fields_combined<T>(
+    original: &serde_json::Value,
+    parsed_resource: &T,
+) -> Result<Vec<String>, Error>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut unknown = find_unknown_fields_via_schema::<T>(original);
+    // Defensive: drop any empty-string path the schema collector could
+    // produce (only possible if `serde_ignored` ever fired with
+    // `Path::Root`). `unknown field ""` would mask the real problem.
+    unknown.retain(|p| !p.is_empty());
+
+    // Serialize the parsed struct so the diff-based helper has a
+    // canonical reference.
+    let canonical = serde_json::to_value(parsed_resource).map_err(|e| {
+        Error::Internal(format!(
+            "strict decoding: failed to canonicalise parsed resource for diff pass: {}",
+            e
+        ))
+    })?;
+    let mut diff_unknown: Vec<String> = Vec::new();
+    find_unknown_fields_via_diff(original, &canonical, "", &mut diff_unknown);
+
+    // Union without duplicates while preserving discovery order so the
+    // resulting error message is deterministic across runs.
+    let mut seen: HashSet<String> = unknown.iter().cloned().collect();
+    for path in diff_unknown {
+        if seen.insert(path.clone()) {
+            unknown.push(path);
+        }
+    }
+    Ok(unknown)
 }
 
 /// Field-validation mode resolved from the `?fieldValidation=` query param.
@@ -468,11 +570,14 @@ fn build_strict_decoding_message(unknown: &[String], duplicates: &[String]) -> S
 ///
 /// On success the returned vector contains zero or more `unknown field "..."`
 /// strings ready to be wrapped in the RFC 7234 Warning header value.
-pub fn validate_strict_fields(
+pub fn validate_strict_fields<T>(
     params: &HashMap<String, String>,
     original_body: &[u8],
-    parsed_resource: &impl serde::Serialize,
-) -> Result<Vec<String>, Error> {
+    parsed_resource: &T,
+) -> Result<Vec<String>, Error>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
     let mode = FieldValidationMode::from_query(params);
     if matches!(mode, FieldValidationMode::Ignore) {
         return Ok(Vec::new());
@@ -495,13 +600,14 @@ pub fn validate_strict_fields(
         Error::BadRequest(msg)
     })?;
 
-    // Re-serialize the parsed struct to get canonical JSON.
-    let canonical =
-        serde_json::to_value(parsed_resource).map_err(|e| Error::Internal(e.to_string()))?;
-
-    // Collect unknown field paths.
-    let mut unknown = Vec::new();
-    find_unknown_fields_recursive(&original, &canonical, "", &mut unknown);
+    // Collect unknown field paths via the combined detector. The
+    // schema-aware (serde_ignored) pass catches null- and empty-object-
+    // valued unknowns that the diff couldn't distinguish from legit
+    // `Option<...>` fields whose round-trip drops the key; the
+    // diff-based pass catches keys hidden from serde_ignored by
+    // `#[serde(flatten)]` short-circuits (e.g. wrong-cased `APIVersion`
+    // at a TypeMeta-flattened top level).
+    let unknown = find_unknown_fields_combined::<T>(&original, parsed_resource)?;
 
     // Collect duplicate field paths from the raw bytes (serde_json silently
     // takes the last duplicate so we must rescan).
