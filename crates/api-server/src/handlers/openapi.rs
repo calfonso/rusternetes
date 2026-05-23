@@ -28,11 +28,37 @@ fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+/// Content type emitted for the v3 protobuf response.
+/// Client-go negotiates this via the matching Accept header when calling
+/// `OpenAPIV3Client.Paths()`; we use a substring match on `proto-openapi.spec.v3`
+/// so quality values / fallbacks like `, application/json` still resolve.
+/// K8s ref: staging/src/k8s.io/client-go/openapi3/root.go
+const V3_PROTO_CONTENT_TYPE: &str = "application/com.github.proto-openapi.spec.v3@v1.0+protobuf";
+
+/// Does the Accept header request the gnostic v3 proto envelope?
+/// Substring match keeps the check lenient w.r.t. quality values and the
+/// `application/json` fallback that client-go always tacks on.
+fn wants_v3_protobuf(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("proto-openapi.spec.v3"))
+        .unwrap_or(false)
+}
+
 /// GET /openapi/v3
 /// Get the OpenAPI v3 root document listing available paths.
 ///
 /// Dynamically includes CRD group/version paths so kubectl can discover
 /// CRD schemas via the OpenAPI v3 discovery mechanism.
+///
+/// The root group-list document is JSON-only — its shape is
+/// `OpenAPIV3Discovery { paths: map<string, OpenAPIV3DiscoveryGroupVersion> }`,
+/// which doesn't have a counterpart in the gnostic openapi.v3.Document proto
+/// schema (Document is the per-sub-document spec). client-go's
+/// `OpenAPIV3Root.Paths()` reads this as JSON; the proto Accept header only
+/// kicks in on the per-group-version sub-documents.
+/// K8s ref: staging/src/k8s.io/client-go/openapi3/root.go
 pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Response {
     // Return the root document that lists all available OpenAPI paths
     // In real K8s, this returns {"paths": {"/apis/apps/v1": {...}, ...}}
@@ -107,9 +133,14 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
 /// Returns the OpenAPI v3 spec for a specific group version.
 ///
 /// Dynamically includes CRD schemas for the requested group/version.
+/// When the client sends `Accept: application/com.github.proto-openapi.spec.v3@v1.0+protobuf`
+/// (substring `proto-openapi.spec.v3`), the response body is the gnostic
+/// `openapi.v3.Document` protobuf bytes; otherwise JSON.
 /// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_handler.go
+/// K8s ref: staging/src/k8s.io/client-go/openapi3
 pub async fn get_openapi_spec_path(
     State(state): State<Arc<ApiServerState>>,
+    headers: HeaderMap,
     axum::extract::Path(gv_path): axum::extract::Path<String>,
 ) -> Response {
     // Cache the static OpenAPI v3 spec — it doesn't change at runtime
@@ -268,6 +299,26 @@ pub async fn get_openapi_spec_path(
     }
 
     let json_bytes = serde_json::to_vec(&spec_json).unwrap_or_default();
+
+    if wants_v3_protobuf(&headers) {
+        match gnostic::openapi_v3_json_to_protobuf(&json_bytes) {
+            Ok(proto_bytes) => {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, V3_PROTO_CONTENT_TYPE)
+                    .body(Body::from(proto_bytes))
+                    .unwrap();
+            }
+            Err(e) => {
+                info!(
+                    "Failed to convert OpenAPI v3 spec to protobuf: {}, falling back to JSON",
+                    e
+                );
+                // Fall through to JSON response
+            }
+        }
+    }
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
