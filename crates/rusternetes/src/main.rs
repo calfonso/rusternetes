@@ -12,7 +12,7 @@ use anyhow::Result;
 use clap::Parser;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
-use tracing::{error, info, Level};
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes")]
@@ -128,16 +128,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let level = match args.log_level.as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
-    };
-
-    tracing_subscriber::fmt().with_max_level(level).init();
+    rusternetes_common::tracing::init_basic_tracing("rusternetes", &args.log_level)?;
 
     info!("Starting Rusternetes (all-in-one)");
 

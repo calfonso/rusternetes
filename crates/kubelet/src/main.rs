@@ -31,7 +31,7 @@ use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn, Level};
+use tracing::{info, warn};
 
 /// Rusternetes Kubelet — node agent that manages containers.
 ///
@@ -260,17 +260,7 @@ async fn main() -> Result<()> {
         etcd_endpoints,
     )?;
 
-    // Initialize tracing
-    let level = match runtime_config.log_level.to_lowercase().as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
-    };
-
-    tracing_subscriber::fmt().with_max_level(level).init();
+    rusternetes_common::tracing::init_basic_tracing("kubelet", &runtime_config.log_level)?;
 
     info!("Starting Rusternetes Kubelet");
     info!("{}", runtime_config.display());

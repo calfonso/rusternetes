@@ -37,7 +37,7 @@ use rusternetes_storage::{Storage, StorageBackend, StorageConfig};
 use state::ApiServerState;
 use std::sync::Arc;
 use tracing::debug;
-use tracing::{info, warn, Level};
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes-api-server")]
@@ -108,17 +108,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
-    let level = match args.log_level.as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
-    };
-
-    tracing_subscriber::fmt().with_max_level(level).init();
+    rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
 
     info!("Starting Rusternetes API Server");
 
