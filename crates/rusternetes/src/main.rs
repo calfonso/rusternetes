@@ -130,6 +130,8 @@ async fn main() -> Result<()> {
 
     rusternetes_common::tracing::init_basic_tracing("rusternetes", &args.log_level)?;
 
+    rusternetes_common::dump::install_panic_hook("rusternetes");
+
     info!("Starting Rusternetes (all-in-one)");
 
     // Initialize storage — all components share one instance

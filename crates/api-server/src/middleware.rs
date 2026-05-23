@@ -1872,32 +1872,36 @@ pub async fn capture_payload(
     }
 
     let (parts, body) = req.into_parts();
-    let bytes = match to_bytes(body, MAX_DUMP_BODY).await {
-        Ok(b) => b,
-        Err(_) => {
-            return CURRENT_PAYLOAD
-                .scope(RefCell::new(None), async {
-                    next.run(axum::extract::Request::from_parts(parts, Body::empty()))
-                        .await
-                })
-                .await;
-        }
+    let (bytes, truncated) = match to_bytes(body, MAX_DUMP_BODY).await {
+        Ok(b) => (Some(b), false),
+        Err(_) => (None, true),
     };
 
-    let rebuilt = axum::extract::Request::from_parts(parts.clone(), Body::from(bytes.clone()));
-    let bytes_for_scope = bytes.clone();
+    let body_for_inner = match &bytes {
+        Some(b) => Body::from(b.clone()),
+        None => Body::empty(),
+    };
+    let scope_payload = bytes.clone();
+    let rebuilt = axum::extract::Request::from_parts(parts.clone(), body_for_inner);
     let resp = CURRENT_PAYLOAD
-        .scope(RefCell::new(Some(bytes_for_scope)), next.run(rebuilt))
+        .scope(RefCell::new(scope_payload), next.run(rebuilt))
         .await;
 
     if resp.status().is_server_error() {
-        let redacted = redact_secret_like(&bytes);
+        let payload_str = match &bytes {
+            Some(b) => {
+                let redacted = redact_secret_like(b);
+                String::from_utf8_lossy(&redacted).into_owned()
+            }
+            None => "<truncated>".to_string(),
+        };
         tracing::error!(
             method = %parts.method,
             uri = %parts.uri,
             status = %resp.status(),
             kind = "5xx",
-            payload = %String::from_utf8_lossy(&redacted),
+            payload_truncated = truncated,
+            payload = %payload_str,
             "request handler returned 5xx"
         );
     }

@@ -107,3 +107,32 @@ async fn does_not_dump_on_2xx() {
         "should not have dumped on 2xx; got {logs:?}"
     );
 }
+
+#[tokio::test]
+async fn marks_payload_truncated_when_oversized() {
+    let (sink, _guard) = install_capture();
+    // Body intentionally larger than MAX_DUMP_BODY (4 MiB). Use a payload
+    // 5 MiB long so to_bytes hits the cap.
+    let big = vec![b'a'; 5 * 1024 * 1024];
+    let app = Router::new()
+        .route(
+            "/boom",
+            post(|_b: axum::body::Bytes| async {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "kaboom")
+            }),
+        )
+        .layer(axum::middleware::from_fn(capture_payload));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/boom")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(big))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+    let logs = sink.0.lock().unwrap().clone();
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("payload_truncated=true") && l.contains("<truncated>")),
+        "expected truncated log line; got {logs:?}"
+    );
+}
