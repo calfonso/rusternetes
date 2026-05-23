@@ -25,3 +25,10 @@ tracing.workspace = true
 futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+# `testcontainers` spins up real etcd via Docker so the etcd backend tests
+# exercise the live wire protocol instead of being permanently `#[ignore]`d.
+# Requires Docker (or Podman with the Docker-compat socket) on the host;
+# CI / dev environments already have Docker available.
+testcontainers = "0.23"

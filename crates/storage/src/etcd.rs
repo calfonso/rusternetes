@@ -691,15 +691,62 @@ mod tests {
         assert!(result.contains("\"resourceVersion\":\"99\""));
     }
 
-    // Note: These tests require a running etcd instance and specifically test etcd backend
-    // Run with: docker run -d -p 2379:2379 -e ALLOW_NONE_AUTHENTICATION=yes bitnami/etcd
+    // These tests exercise the real etcd backend by spinning up a disposable
+    // etcd container via `testcontainers`. They require Docker (or a
+    // Docker-compatible socket) on the host. The container is torn down
+    // automatically when the `ContainerAsync` handle is dropped at the end of
+    // the test, so no manual cleanup is required.
+    //
+    // The image and CLI flags match what `compose.yml` runs in production
+    // (`quay.io/coreos/etcd:v3.5.17`, single-node, insecure client listener).
+
+    use testcontainers::{
+        core::{IntoContainerPort, WaitFor},
+        runners::AsyncRunner,
+        GenericImage, ImageExt,
+    };
+
+    /// Boot a single-node etcd container and return an `EtcdStorage` pointing
+    /// at it, alongside the container handle which must be kept alive for the
+    /// duration of the test (drop = teardown).
+    async fn start_etcd() -> (testcontainers::ContainerAsync<GenericImage>, EtcdStorage) {
+        // `quay.io/coreos/etcd` listens on 2379 for client gRPC and prints
+        // "ready to serve client requests" once the listener is up. We bind
+        // 0.0.0.0 so the port mapping works from the host network.
+        let container = GenericImage::new("quay.io/coreos/etcd", "v3.5.17")
+            .with_exposed_port(2379.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("ready to serve client requests"))
+            .with_cmd([
+                "/usr/local/bin/etcd",
+                "--name=etcd-test",
+                "--data-dir=/etcd-data",
+                "--listen-client-urls=http://0.0.0.0:2379",
+                "--advertise-client-urls=http://0.0.0.0:2379",
+            ])
+            .start()
+            .await
+            .expect("failed to start etcd test container — is Docker running?");
+
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to resolve test container host");
+        let port = container
+            .get_host_port_ipv4(2379)
+            .await
+            .expect("failed to read mapped etcd client port");
+
+        let endpoint = format!("http://{host}:{port}");
+        let storage = EtcdStorage::new(vec![endpoint])
+            .await
+            .expect("failed to connect to test etcd");
+
+        (container, storage)
+    }
 
     #[tokio::test]
-    #[ignore] // requires etcd
     async fn test_create_and_get() {
-        let storage = EtcdStorage::new(vec!["http://localhost:2379".to_string()])
-            .await
-            .unwrap();
+        let (_etcd, storage) = start_etcd().await;
 
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct TestData {
