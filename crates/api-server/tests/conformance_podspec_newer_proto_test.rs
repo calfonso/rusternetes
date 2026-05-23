@@ -65,6 +65,19 @@ fn write_message(buf: &mut Vec<u8>, field_num: u32, inner: &[u8]) {
     buf.extend_from_slice(inner);
 }
 
+/// Encode a minimal `Container { name: "c", image: "i" }` and append it to
+/// the supplied `PodSpec` byte buffer at proto field 2 (the correct slot per
+/// upstream `generated.proto` — field 1 of PodSpec is `volumes`). Without
+/// `containers` present, the typed `PodSpec` deserializer rejects the JSON
+/// with `missing field 'containers'`.
+fn write_minimal_container(spec_bytes: &mut Vec<u8>) {
+    let mut container = Vec::new();
+    write_string(&mut container, 1, "c");
+    write_string(&mut container, 2, "i");
+    // PodSpec.containers = field 2
+    write_message(spec_bytes, 2, &container);
+}
+
 /// PodSpec.os (field 36) = PodOS { name = "linux" }.
 #[test]
 fn test_podspec_os_proto_decode_round_trips() {
@@ -74,13 +87,10 @@ fn test_podspec_os_proto_decode_round_trips() {
     write_string(&mut os_msg, 1, "linux");
 
     let mut spec_bytes = Vec::new();
-    // PodSpec.containers (field 1) = [ Container { name: "c", image: "i" } ]
+    // PodSpec.containers (field 2) = [ Container { name: "c", image: "i" } ]
     // — required for downstream typed deserialization, but irrelevant to the
     //   PodOS wire-shape assertion.
-    let mut container = Vec::new();
-    write_string(&mut container, 1, "c");
-    write_string(&mut container, 2, "i");
-    write_message(&mut spec_bytes, 1, &container);
+    write_minimal_container(&mut spec_bytes);
     // PodSpec.os = field 36
     write_message(&mut spec_bytes, 36, &os_msg);
 
@@ -115,10 +125,7 @@ fn test_podspec_host_users_proto_decode_round_trips() {
     let registry = ProtoRegistry::new();
 
     let mut spec_bytes = Vec::new();
-    let mut container = Vec::new();
-    write_string(&mut container, 1, "c");
-    write_string(&mut container, 2, "i");
-    write_message(&mut spec_bytes, 1, &container);
+    write_minimal_container(&mut spec_bytes);
     // hostUsers (field 37, wire_type 0 = varint, value=1=true).
     // Tag = (field_num << 3) | wire_type; wire_type 0 contributes no bits.
     write_varint(&mut spec_bytes, 37u64 << 3);
@@ -152,10 +159,7 @@ fn test_podspec_scheduling_gates_proto_decode_round_trips() {
     write_string(&mut gate2, 1, "billing");
 
     let mut spec_bytes = Vec::new();
-    let mut container = Vec::new();
-    write_string(&mut container, 1, "c");
-    write_string(&mut container, 2, "i");
-    write_message(&mut spec_bytes, 1, &container);
+    write_minimal_container(&mut spec_bytes);
     write_message(&mut spec_bytes, 38, &gate1);
     write_message(&mut spec_bytes, 38, &gate2);
 
@@ -196,10 +200,7 @@ fn test_podspec_resource_claims_proto_decode_round_trips() {
     write_string(&mut claim, 4, "shared-tpl");
 
     let mut spec_bytes = Vec::new();
-    let mut container = Vec::new();
-    write_string(&mut container, 1, "c");
-    write_string(&mut container, 2, "i");
-    write_message(&mut spec_bytes, 1, &container);
+    write_minimal_container(&mut spec_bytes);
     write_message(&mut spec_bytes, 39, &claim);
 
     let decoded = registry
@@ -309,7 +310,9 @@ fn test_podspec_all_newer_fields_decode_together() {
     write_message(&mut container, 23, &policy);
 
     let mut spec_bytes = Vec::new();
-    write_message(&mut spec_bytes, 1, &container);
+    // PodSpec.containers = field 2; do NOT use the minimal-container helper
+    // here because we need the resizePolicy embedded inside.
+    write_message(&mut spec_bytes, 2, &container);
     write_message(&mut spec_bytes, 36, &os_msg);
     // hostUsers = true (wire_type 0 = varint; tag is just field_num << 3).
     write_varint(&mut spec_bytes, 37u64 << 3);
