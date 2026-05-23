@@ -180,7 +180,10 @@ async fn accept_as_partial_object_metadata_list_json() {
         "Content-Type must echo as=PartialObjectMetadataList; got {ct}",
     );
     let v: Value = serde_json::from_slice(&body).expect("body must be JSON");
-    assert_eq!(v["kind"], "PartialObjectMetadataList", "kind mismatch; got {v}");
+    assert_eq!(
+        v["kind"], "PartialObjectMetadataList",
+        "kind mismatch; got {v}"
+    );
     assert_eq!(v["apiVersion"], "meta.k8s.io/v1");
     let items = v["items"].as_array().expect("items must be array");
     assert_eq!(items.len(), 2, "want 2 items; got {v}");
