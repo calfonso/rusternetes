@@ -1857,10 +1857,8 @@ fn try_brace_scan_or_type_meta(body_bytes: &[u8]) -> Vec<u8> {
 // ============================================================================
 
 /// 4 MiB — matches Kubernetes' default max request size.
-#[allow(dead_code)]
 const MAX_DUMP_BODY: usize = 4 * 1024 * 1024;
 
-#[allow(dead_code)]
 pub async fn capture_payload(
     req: axum::extract::Request,
     next: axum::middleware::Next,

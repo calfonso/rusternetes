@@ -2436,4 +2436,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     ))
     .layer(TraceLayer::new_for_http())
     .with_state(state)
+    .layer(axum::middleware::from_fn(
+        crate::middleware::capture_payload,
+    ))
 }
