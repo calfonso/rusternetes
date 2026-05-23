@@ -15,6 +15,8 @@ use serde_json::json;
 fn create_configmap_request(namespace: &str, name: &str) -> AdmissionRequest {
     AdmissionRequest {
         operation: Operation::Create,
+        group: "".to_string(),
+        version: "v1".to_string(),
         kind: "ConfigMap".to_string(),
         namespace: Some(namespace.to_string()),
         name: name.to_string(),
@@ -219,5 +221,32 @@ fn matchcondition_user_info_visible() {
     assert_eq!(
         evaluator.evaluate(&conditions, &request, None),
         MatchOutcome::Matched,
+    );
+}
+
+#[test]
+fn matchcondition_request_kind_exposes_group_and_version() {
+    // Verifies Work Unit A: AdmissionRequest now carries group/version, and
+    // build_context surfaces them inside `request.kind.{group,version,kind}`
+    // exactly like the K8s admission webhook envelope.
+    let mut evaluator = MatchConditionEvaluator::new();
+    let mut request = create_configmap_request("default", "x");
+    // Swap to a non-core resource so group/version are non-trivial.
+    request.group = "apps".to_string();
+    request.version = "v1".to_string();
+    request.kind = "Deployment".to_string();
+
+    let conditions = vec![MatchCondition {
+        name: "deployment-only".to_string(),
+        expression: "request.kind.group == 'apps' \
+                     && request.kind.version == 'v1' \
+                     && request.kind.kind == 'Deployment'"
+            .to_string(),
+    }];
+
+    assert_eq!(
+        evaluator.evaluate(&conditions, &request, None),
+        MatchOutcome::Matched,
+        "request.kind.{{group,version,kind}} must reflect the AdmissionRequest"
     );
 }

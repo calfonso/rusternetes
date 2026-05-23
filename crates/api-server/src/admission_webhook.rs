@@ -723,52 +723,44 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                     }
 
-                    // Evaluate matchConditions (CEL expressions) for validating webhooks
+                    // Evaluate matchConditions (CEL expressions) for validating webhooks.
+                    // Source of truth: `crate::cel::MatchConditionEvaluator`.
                     if let Some(ref conditions) = webhook.match_conditions {
                         if !conditions.is_empty() {
-                            let mut all_match = true;
-                            let op_str = match operation {
-                                Operation::Create => "CREATE",
-                                Operation::Update => "UPDATE",
-                                Operation::Delete => "DELETE",
-                                Operation::Connect => "CONNECT",
-                            };
-                            let mut ctx = rusternetes_common::CELContext::new();
-                            if let Some(ref obj) = object {
-                                let _ = ctx.add_json_variable("object", obj);
-                            }
-                            if let Some(ref old) = old_object {
-                                let _ = ctx.add_json_variable("oldObject", old);
-                            } else {
-                                let _ =
-                                    ctx.add_json_variable("oldObject", &serde_json::Value::Null);
-                            }
-                            let request_val = serde_json::json!({
-                                "operation": op_str,
-                                "kind": { "group": gvk.group, "version": gvk.version, "kind": gvk.kind },
-                                "namespace": namespace.unwrap_or(""),
-                                "name": name,
-                            });
-                            let _ = ctx.add_json_variable("request", &request_val);
-                            let mut evaluator = rusternetes_common::CELEvaluator::new();
-                            for cond in conditions {
-                                if cond.expression.is_empty() {
+                            let request = build_admission_request_for_match(
+                                operation,
+                                gvk,
+                                namespace,
+                                name,
+                                object.as_ref(),
+                                old_object.as_ref(),
+                                Some(user_info),
+                            );
+                            let mut evaluator = crate::cel::MatchConditionEvaluator::new();
+                            let outcome = evaluator.evaluate(conditions, &request, None);
+                            match outcome {
+                                crate::cel::MatchOutcome::Matched => {}
+                                crate::cel::MatchOutcome::NotMatched => {
+                                    debug!(
+                                        "Skipping validating webhook {} — matchConditions not met for {}/{}",
+                                        webhook.name,
+                                        namespace.unwrap_or(""),
+                                        name
+                                    );
                                     continue;
                                 }
-                                match evaluator.evaluate(&cond.expression, &ctx) {
-                                    Ok(true) => {}
-                                    _ => {
-                                        all_match = false;
-                                        break;
-                                    }
+                                crate::cel::MatchOutcome::Error(msg) => {
+                                    // Upstream `matcher.go` treats compile/runtime
+                                    // errors as "no match" — the webhook is skipped.
+                                    // The caller can layer failurePolicy on top of the
+                                    // webhook *call*; matchCondition errors themselves
+                                    // do not flip the policy.
+                                    debug!(
+                                        "Skipping validating webhook {} — matchCondition error: {}",
+                                        webhook.name, msg
+                                    );
+                                    continue;
                                 }
-                            }
-                            if !all_match {
-                                debug!(
-                                    "Skipping validating webhook {} — matchConditions not met for {}/{}",
-                                    webhook.name, namespace.unwrap_or(""), name
-                                );
-                                continue;
                             }
                         }
                     }
@@ -1128,53 +1120,40 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                     }
 
-                    // Evaluate matchConditions (CEL expressions)
+                    // Evaluate matchConditions (CEL expressions) for mutating webhooks.
+                    // Source of truth: `crate::cel::MatchConditionEvaluator`.
                     // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/rules/rules.go
                     if let Some(ref conditions) = webhook.match_conditions {
                         if !conditions.is_empty() {
-                            let mut all_match = true;
-                            let op_str = match operation {
-                                Operation::Create => "CREATE",
-                                Operation::Update => "UPDATE",
-                                Operation::Delete => "DELETE",
-                                Operation::Connect => "CONNECT",
-                            };
-                            let mut ctx = rusternetes_common::CELContext::new();
-                            if let Some(ref obj) = object {
-                                let _ = ctx.add_json_variable("object", obj);
-                            }
-                            if let Some(ref old) = old_object {
-                                let _ = ctx.add_json_variable("oldObject", old);
-                            } else {
-                                let _ =
-                                    ctx.add_json_variable("oldObject", &serde_json::Value::Null);
-                            }
-                            let request_val = serde_json::json!({
-                                "operation": op_str,
-                                "kind": { "group": gvk.group, "version": gvk.version, "kind": gvk.kind },
-                                "namespace": namespace.unwrap_or(""),
-                                "name": name,
-                            });
-                            let _ = ctx.add_json_variable("request", &request_val);
-                            let mut evaluator = rusternetes_common::CELEvaluator::new();
-                            for cond in conditions {
-                                if cond.expression.is_empty() {
+                            let request = build_admission_request_for_match(
+                                operation,
+                                gvk,
+                                namespace,
+                                name,
+                                object.as_ref(),
+                                old_object.as_ref(),
+                                Some(user_info),
+                            );
+                            let mut evaluator = crate::cel::MatchConditionEvaluator::new();
+                            let outcome = evaluator.evaluate(conditions, &request, None);
+                            match outcome {
+                                crate::cel::MatchOutcome::Matched => {}
+                                crate::cel::MatchOutcome::NotMatched => {
+                                    debug!(
+                                        "Skipping mutating webhook {} — matchConditions not met for {}/{}",
+                                        webhook.name,
+                                        namespace.unwrap_or(""),
+                                        name
+                                    );
                                     continue;
                                 }
-                                match evaluator.evaluate(&cond.expression, &ctx) {
-                                    Ok(true) => {}
-                                    _ => {
-                                        all_match = false;
-                                        break;
-                                    }
+                                crate::cel::MatchOutcome::Error(msg) => {
+                                    debug!(
+                                        "Skipping mutating webhook {} — matchCondition error: {}",
+                                        webhook.name, msg
+                                    );
+                                    continue;
                                 }
-                            }
-                            if !all_match {
-                                debug!(
-                                    "Skipping mutating webhook {} — matchConditions not met for {}/{}",
-                                    webhook.name, namespace.unwrap_or(""), name
-                                );
-                                continue;
                             }
                         }
                     }
@@ -1910,15 +1889,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 }
             }
 
-            // Check matchConditions from the policy spec
+            // Check matchConditions from the policy spec.
+            // Source of truth: `crate::cel::MatchConditionEvaluator`.
+            let obj_name = object
+                .and_then(|o| o.pointer("/metadata/name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
             let match_conditions_pass = self.evaluate_match_conditions(
-                policy,
-                object,
-                old_object,
-                operation,
-                gvk,
-                namespace,
-                &mut evaluator,
+                policy, object, old_object, operation, gvk, namespace, obj_name, None,
             );
             if !match_conditions_pass {
                 continue;
@@ -2087,7 +2065,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 .and_then(|f| f.as_str())
                 .unwrap_or("Fail");
 
-            // Evaluate validations
+            // Evaluate validations.
+            // Source of truth: `crate::cel::ValidationEvaluator`.
             if let Some(validations) = policy
                 .get("spec")
                 .and_then(|s| s.get("validations"))
@@ -2101,17 +2080,27 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     if expression.is_empty() {
                         continue;
                     }
+                    let message_expression =
+                        validation.get("messageExpression").and_then(|m| m.as_str());
+                    let static_message = validation.get("message").and_then(|m| m.as_str());
 
-                    // Evaluate
-                    match evaluator.evaluate(expression, &context) {
-                        Ok(true) => {
+                    let outcome = crate::cel::ValidationEvaluator::evaluate_one(
+                        expression,
+                        message_expression,
+                        static_message,
+                        &mut evaluator,
+                        &context,
+                    );
+
+                    match outcome {
+                        crate::cel::ValidationOutcome::Pass => {
                             tracing::debug!(
                                 "VAP {} expression '{}' passed",
                                 policy_name,
                                 expression
                             );
                         }
-                        Ok(false) => {
+                        crate::cel::ValidationOutcome::Fail { message } => {
                             tracing::info!(
                                 "VAP {} expression '{}' DENIED for {} in ns {:?}",
                                 policy_name,
@@ -2133,44 +2122,87 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             let has_deny = actions
                                 .is_none_or(|acts| acts.iter().any(|a| a.as_str() == Some("Deny")));
                             if has_deny {
-                                // Use messageExpression (CEL) if present, otherwise static message
-                                let message = if let Some(msg_expr) =
-                                    validation.get("messageExpression").and_then(|m| m.as_str())
-                                {
-                                    match evaluator.evaluate_to_value(msg_expr, &context) {
-                                        Ok(cel::objects::Value::String(s)) => s.to_string(),
-                                        Ok(other) => format!("{:?}", other),
-                                        Err(_) => validation
-                                            .get("message")
-                                            .and_then(|m| m.as_str())
-                                            .unwrap_or("Validation failed")
-                                            .to_string(),
-                                    }
-                                } else {
-                                    validation
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("Validation failed")
-                                        .to_string()
-                                };
                                 return Err(rusternetes_common::Error::InvalidResource(format!(
                                     "ValidatingAdmissionPolicy {} denied: {}",
                                     policy_name, message
                                 )));
                             }
                         }
-                        Err(e) => {
+                        crate::cel::ValidationOutcome::Error { message } => {
                             tracing::warn!(
-                                "CEL evaluation error for policy {} expression '{}': {}",
+                                "CEL evaluation error for policy {}: {}",
                                 policy_name,
-                                expression,
-                                e
+                                message
                             );
-                            // On error, check failure policy
+                            // On error, honour the policy's failure policy.
                             if failure_policy == "Fail" {
                                 return Err(rusternetes_common::Error::InvalidResource(format!(
                                     "ValidatingAdmissionPolicy {} evaluation error: {}",
-                                    policy_name, e
+                                    policy_name, message
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Evaluate auditAnnotations.
+            // Source of truth: `crate::cel::AuditAnnotationEvaluator`.
+            //
+            // Upstream emits resolved annotations on the audit event under
+            // `<policy-name>/<key>` once we have an audit sink, we will plumb
+            // these through; for now they're logged at info level so the
+            // expression is exercised (catching regressions) without being
+            // silently dropped. A `valueExpression` returning `null` skips the
+            // annotation per upstream `validator.go`.
+            if let Some(audit_annotations) = policy
+                .get("spec")
+                .and_then(|s| s.get("auditAnnotations"))
+                .and_then(|a| a.as_array())
+            {
+                for annotation in audit_annotations {
+                    let key = annotation.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                    let value_expression = annotation
+                        .get("valueExpression")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if key.is_empty() || value_expression.is_empty() {
+                        continue;
+                    }
+
+                    let outcome = crate::cel::AuditAnnotationEvaluator::evaluate_one(
+                        key,
+                        value_expression,
+                        &mut evaluator,
+                        &context,
+                    );
+                    match outcome {
+                        crate::cel::AuditAnnotationOutcome::Emit { key, value } => {
+                            tracing::info!(
+                                "VAP {} audit annotation {}/{} = {}",
+                                policy_name,
+                                policy_name,
+                                key,
+                                value
+                            );
+                        }
+                        crate::cel::AuditAnnotationOutcome::Skip => {
+                            tracing::debug!(
+                                "VAP {} audit annotation {} skipped (valueExpression returned null)",
+                                policy_name,
+                                key
+                            );
+                        }
+                        crate::cel::AuditAnnotationOutcome::Error { message } => {
+                            tracing::warn!(
+                                "VAP {} audit annotation error: {}",
+                                policy_name,
+                                message
+                            );
+                            if failure_policy == "Fail" {
+                                return Err(rusternetes_common::Error::InvalidResource(format!(
+                                    "ValidatingAdmissionPolicy {} auditAnnotation error: {}",
+                                    policy_name, message
                                 )));
                             }
                         }
@@ -2181,7 +2213,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         Ok(())
     }
 
-    /// Evaluate matchConditions for a policy. Returns true if all conditions pass (or none exist).
+    /// Evaluate matchConditions for a VAP. Returns true if all conditions pass
+    /// (or none exist), false if any condition fails or errors.
+    ///
+    /// Thin wrapper around [`crate::cel::MatchConditionEvaluator`] — the source
+    /// of truth for the CEL semantics. The VAP-specific concern handled here
+    /// is the JSON shape of `spec.matchConditions[]`: each entry has a `name`
+    /// and `expression` field, which we deserialize into the typed
+    /// `MatchCondition` struct before evaluating.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_match_conditions(
         &self,
@@ -2191,59 +2230,76 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         operation: &Operation,
         gvk: &GroupVersionKind,
         namespace: Option<&str>,
-        evaluator: &mut rusternetes_common::CELEvaluator,
+        name: &str,
+        user_info: Option<&UserInfo>,
     ) -> bool {
-        let conditions = match policy
+        let raw_conditions = match policy
             .get("spec")
             .and_then(|s| s.get("matchConditions"))
             .and_then(|c| c.as_array())
         {
             Some(c) if !c.is_empty() => c,
-            _ => return true, // No conditions = always match
+            _ => return true, // No conditions = always match (upstream)
         };
 
-        let op_str = match operation {
-            Operation::Create => "CREATE",
-            Operation::Update => "UPDATE",
-            Operation::Delete => "DELETE",
-            _ => "",
-        };
+        let conditions: Vec<rusternetes_common::resources::MatchCondition> = raw_conditions
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+        if conditions.is_empty() {
+            return true;
+        }
 
-        let mut context = rusternetes_common::CELContext::new();
-        if let Some(obj) = object {
-            let _ = context.add_json_variable("object", obj);
-        }
-        if let Some(old) = old_object {
-            let _ = context.add_json_variable("oldObject", old);
-        } else {
-            let _ = context.add_json_variable("oldObject", &serde_json::Value::Null);
-        }
-        let request_val = serde_json::json!({
-            "operation": op_str,
-            "kind": {
-                "group": gvk.group,
-                "version": gvk.version,
-                "kind": gvk.kind,
-            },
-            "namespace": namespace.unwrap_or(""),
-        });
-        let _ = context.add_json_variable("request", &request_val);
+        let request = build_admission_request_for_match(
+            operation, gvk, namespace, name, object, old_object, user_info,
+        );
 
-        for cond in conditions {
-            let expr = cond
-                .get("expression")
-                .and_then(|e| e.as_str())
-                .unwrap_or("");
-            if expr.is_empty() {
-                continue;
-            }
-            match evaluator.evaluate(expr, &context) {
-                Ok(true) => { /* condition matched, continue */ }
-                Ok(false) => return false, // condition not met, skip this policy
-                Err(_) => return false,    // error evaluating = skip
-            }
-        }
-        true
+        let mut evaluator = crate::cel::MatchConditionEvaluator::new();
+        matches!(
+            evaluator.evaluate(&conditions, &request, None),
+            crate::cel::MatchOutcome::Matched
+        )
+    }
+}
+
+/// Build a typed `AdmissionRequest` from the loose params used inside the
+/// admission_webhook dispatcher. Used by all three match-condition call sites
+/// (VAP, validating webhook, mutating webhook) to feed
+/// [`crate::cel::MatchConditionEvaluator`].
+///
+/// `user_info` is optional because VAP runs in-server (no remote webhook) and
+/// the original `run_validating_admission_policies_ext` does not propagate the
+/// caller's identity yet — upstream's policy plugin synthesises a system-admin
+/// identity in the same situation. The dummy here matches what the inline VAP
+/// code was already publishing into the `request.userInfo` activation variable.
+fn build_admission_request_for_match(
+    operation: &Operation,
+    gvk: &GroupVersionKind,
+    namespace: Option<&str>,
+    name: &str,
+    object: Option<&Value>,
+    old_object: Option<&Value>,
+    user_info: Option<&UserInfo>,
+) -> rusternetes_common::admission::AdmissionRequest {
+    let resolved_user_info = user_info.cloned().unwrap_or_else(|| UserInfo {
+        username: "system:admin".to_string(),
+        uid: String::new(),
+        groups: vec![
+            "system:masters".to_string(),
+            "system:authenticated".to_string(),
+        ],
+    });
+
+    rusternetes_common::admission::AdmissionRequest {
+        operation: operation.clone(),
+        group: gvk.group.clone(),
+        version: gvk.version.clone(),
+        kind: gvk.kind.clone(),
+        namespace: namespace.map(|s| s.to_string()),
+        name: name.to_string(),
+        object: object.cloned().unwrap_or(Value::Null),
+        old_object: old_object.cloned(),
+        user_info: resolved_user_info,
     }
 }
 
