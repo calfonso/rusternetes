@@ -20,6 +20,7 @@ rcgen.workspace = true
 rustls.workspace = true
 rustls-pemfile = "2.1"
 axum = { workspace = true, optional = true }
+bytes = "1"
 tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
