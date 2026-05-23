@@ -189,8 +189,9 @@ pub use volume::{
 };
 pub use workloads::{
     CronJob, CronJobSpec, CronJobStatus, DaemonSet, DaemonSetSpec, DaemonSetStatus, Job, JobSpec,
-    JobStatus, JobTemplateSpec, PodTemplate, PodTemplateSpec, ReplicaSet, ReplicaSetCondition,
-    ReplicaSetSpec, ReplicaSetStatus, ReplicationController, ReplicationControllerCondition,
-    ReplicationControllerSpec, ReplicationControllerStatus, StatefulSet, StatefulSetSpec,
-    StatefulSetStatus,
+    JobStatus, JobTemplateSpec, PodFailurePolicy, PodFailurePolicyOnExitCodesRequirement,
+    PodFailurePolicyOnPodConditionsPattern, PodFailurePolicyRule, PodTemplate, PodTemplateSpec,
+    ReplicaSet, ReplicaSetCondition, ReplicaSetSpec, ReplicaSetStatus, ReplicationController,
+    ReplicationControllerCondition, ReplicationControllerSpec, ReplicationControllerStatus,
+    StatefulSet, StatefulSetSpec, StatefulSetStatus, SuccessPolicy, SuccessPolicyRule,
 };
