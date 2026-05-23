@@ -25,6 +25,7 @@ tokio = { version = "1.40", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+ciborium = "0.2" # CBOR codec for application/cbor + application/apply-patch+cbor
 anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
