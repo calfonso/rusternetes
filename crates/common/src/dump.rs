@@ -147,6 +147,102 @@ where
     CURRENT_PAYLOAD.scope(RefCell::new(Some(body)), fut).await
 }
 
+#[cfg(feature = "axum-support")]
+use axum::{
+    body::{Body, Bytes as AxumBytes},
+    extract::{rejection::JsonRejection, FromRequest, Request},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+
+/// Drop-in replacement for `axum::Json<T>` that, when payload dumps are
+/// enabled, buffers the request body into `CURRENT_PAYLOAD` before
+/// delegating to `axum::Json<T>` and logs the body on decode failure.
+#[cfg(feature = "axum-support")]
+#[derive(Debug)]
+pub struct DumpingJson<T>(pub T);
+
+#[cfg(feature = "axum-support")]
+#[async_trait::async_trait]
+impl<T, S> FromRequest<S> for DumpingJson<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = DumpingJsonRejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        if !dumps_enabled() {
+            // Fast path: just delegate to axum::Json.
+            let Json(t) = Json::<T>::from_request(req, state)
+                .await
+                .map_err(DumpingJsonRejection::Json)?;
+            return Ok(DumpingJson(t));
+        }
+
+        // Slow path: buffer body, store, then re-create a request for Json.
+        let (parts, body) = req.into_parts();
+        let bytes = AxumBytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(|_| DumpingJsonRejection::BodyRead)?;
+
+        // Stash in task-local for the panic-hook path.
+        let _ = CURRENT_PAYLOAD.try_with(|cell| {
+            *cell.borrow_mut() = Some(bytes.clone());
+        });
+
+        let rebuilt = Request::from_parts(parts, Body::from(bytes.clone()));
+        match Json::<T>::from_request(rebuilt, state).await {
+            Ok(Json(t)) => Ok(DumpingJson(t)),
+            Err(rej) => {
+                let redacted = redact_secret_like(&bytes);
+                tracing::error!(
+                    rejection = %rej,
+                    payload = %String::from_utf8_lossy(&redacted),
+                    "JSON body decode failed"
+                );
+                Err(DumpingJsonRejection::Json(rej))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "axum-support")]
+#[derive(Debug)]
+pub enum DumpingJsonRejection {
+    Json(JsonRejection),
+    BodyRead,
+}
+
+#[cfg(feature = "axum-support")]
+impl IntoResponse for DumpingJsonRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Json(r) => r.into_response(),
+            Self::BodyRead => (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/plain")],
+                "failed to read request body",
+            )
+                .into_response(),
+        }
+    }
+}
+
+#[cfg(feature = "axum-support")]
+impl std::fmt::Display for DumpingJsonRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(r) => write!(f, "{r}"),
+            Self::BodyRead => write!(f, "failed to read request body"),
+        }
+    }
+}
+
+#[cfg(feature = "axum-support")]
+impl std::error::Error for DumpingJsonRejection {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +386,53 @@ mod tests {
             logs.iter()
                 .any(|l| l.contains("test-component") && l.contains("Pod")),
             "no dump log captured; got: {logs:?}"
+        );
+    }
+
+    #[cfg(feature = "axum-support")]
+    #[tokio::test]
+    async fn dumping_json_decodes_valid_body() {
+        use axum::body::Body;
+        use axum::extract::FromRequest;
+        use axum::http::{header, Request};
+
+        #[derive(serde::Deserialize)]
+        struct Foo {
+            x: i32,
+        }
+
+        let req = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"x":7}"#))
+            .unwrap();
+        let DumpingJson(foo) = DumpingJson::<Foo>::from_request(req, &()).await.unwrap();
+        assert_eq!(foo.x, 7);
+    }
+
+    #[cfg(feature = "axum-support")]
+    #[tokio::test]
+    async fn dumping_json_rejects_invalid_body_with_same_status_as_json() {
+        use axum::body::Body;
+        use axum::extract::FromRequest;
+        use axum::http::{header, Request, StatusCode};
+        use axum::response::IntoResponse;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Foo {
+            _x: i32,
+        }
+
+        let req = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let err = DumpingJson::<Foo>::from_request(req, &())
+            .await
+            .unwrap_err();
+        let resp = err.into_response();
+        assert!(
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 }
