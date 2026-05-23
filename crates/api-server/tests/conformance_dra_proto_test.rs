@@ -20,22 +20,19 @@
 //!
 //! Registry coverage status
 //! ------------------------
-//! At the time this file lands, the four top-level DRA kinds and most of
-//! their nested message schemas are **not yet** registered in
-//! `ProtoRegistry::new()`. The unqualified `ResourceClaim` slot in the
-//! registry (`src/protobuf.rs:5452`) is the `core/v1.ResourceClaim`
-//! PodSpec sub-message (`{ name, request }`), which has a completely
-//! different wire layout from the DRA top-level kind and must not be used
-//! to decode DRA resources.
+//! The four top-level DRA kinds and their nested message schemas are
+//! registered in `ProtoRegistry::new()` under group-qualified keys (see
+//! `register_resource_v1` in `src/protobuf.rs`). The unqualified
+//! `ResourceClaim` slot is intentionally left as the
+//! `core/v1.ResourceClaim` PodSpec sub-message (`{ name, request }`),
+//! which has a completely different wire layout from the DRA top-level
+//! kind and must not be used to decode DRA resources — the bare-name
+//! guard test at the bottom of this file enforces that invariant.
 //!
-//! These tests are written as **forward-compatible regression nets**:
-//! each test builds the exact upstream wire payload, then short-circuits
-//! (no assertion) when the corresponding DRA schema is absent — leaving a
-//! `eprintln!` breadcrumb so a future PR that registers the schema can
-//! delete the skip branch and immediately exercise the round-trip path.
-//! When `decode_message` returns `Some(_)` (i.e. the schema was added),
-//! the full assertion chain runs and pins every nested field's
-//! `(field_number → json_name → value_shape)` triple.
+//! Each test below builds the exact upstream wire payload and pins every
+//! nested field's `(field_number → json_name → value_shape)` triple. If
+//! `decode_message` returns `None` (i.e. somebody removed the schema),
+//! the test fails fast rather than silently skipping.
 //!
 //! Why a group-qualified registry key
 //! ----------------------------------
@@ -118,31 +115,20 @@ fn push_bool(buf: &mut Vec<u8>, field_number: u32, value: bool) {
     push_varint(buf, field_number, u64::from(value));
 }
 
-/// Try to decode `msg_type` from `bytes`. Returns `Some(json)` when the
-/// schema is registered, otherwise prints a structured skip message
-/// (visible with `cargo test -- --nocapture`) and returns `None` so the
-/// caller short-circuits without failing CI.
-///
-/// This keeps these tests green today while the DRA schemas are not yet
-/// in `ProtoRegistry::new()`, and turns them into hard regression tests
-/// the moment those schemas are added — at which point the skip branch
-/// becomes dead code and a future cleanup can drop it.
-fn decode_or_skip(registry: &ProtoRegistry, msg_type: &str, bytes: &[u8]) -> Option<Value> {
-    match registry.decode_message(msg_type, bytes) {
-        Some(json) => Some(json),
-        None => {
-            eprintln!(
-                "[conformance_dra_proto_test] SKIP: `{msg_type}` is not yet \
-                 registered in ProtoRegistry::new(). Gap: register the four \
-                 top-level resource.k8s.io/v1 kinds (ResourceClaim, \
-                 ResourceClaimTemplate, DeviceClass, ResourceSlice) under \
-                 group-qualified keys plus the nested DRA message schemas. \
-                 See crates/api-server/proto upstream snapshot for field \
-                 numbers."
-            );
-            None
-        }
-    }
+/// Decode `msg_type` from `bytes`, asserting the schema is registered.
+/// Fails the test with a structured message pointing at the missing
+/// registry entry if `decode_message` returns `None`.
+fn decode_expect(registry: &ProtoRegistry, msg_type: &str, bytes: &[u8]) -> Value {
+    registry.decode_message(msg_type, bytes).unwrap_or_else(|| {
+        panic!(
+            "`{msg_type}` is not registered in ProtoRegistry::new(). The four \
+             top-level resource.k8s.io/v1 kinds (ResourceClaim, \
+             ResourceClaimTemplate, DeviceClass, ResourceSlice) must live \
+             under group-qualified keys, and the nested DRA messages must \
+             be registered under their bare names — see `register_resource_v1` \
+             in src/protobuf.rs."
+        )
+    })
 }
 
 // --------------------------------------------------------------------------
@@ -191,10 +177,7 @@ fn test_resource_claim_proto_decodes_full_request_chain() {
     push_ld(&mut claim, 1, &metadata);
     push_ld(&mut claim, 2, &spec);
 
-    let Some(decoded) = decode_or_skip(&registry, "resource.k8s.io/v1.ResourceClaim", &claim)
-    else {
-        return;
-    };
+    let decoded = decode_expect(&registry, "resource.k8s.io/v1.ResourceClaim", &claim);
 
     assert_eq!(
         decoded
@@ -270,10 +253,7 @@ fn test_resource_claim_proto_decodes_allocation_status() {
     let mut claim = Vec::new();
     push_ld(&mut claim, 3, &status);
 
-    let Some(decoded) = decode_or_skip(&registry, "resource.k8s.io/v1.ResourceClaim", &claim)
-    else {
-        return;
-    };
+    let decoded = decode_expect(&registry, "resource.k8s.io/v1.ResourceClaim", &claim);
 
     let result = decoded
         .pointer("/status/allocation/devices/results/0")
@@ -342,13 +322,11 @@ fn test_resource_claim_template_proto_decodes_nested_spec() {
     push_ld(&mut template, 1, &outer_meta);
     push_ld(&mut template, 2, &template_spec);
 
-    let Some(decoded) = decode_or_skip(
+    let decoded = decode_expect(
         &registry,
         "resource.k8s.io/v1.ResourceClaimTemplate",
         &template,
-    ) else {
-        return;
-    };
+    );
 
     assert_eq!(
         decoded.pointer("/metadata/name").and_then(Value::as_str),
@@ -434,10 +412,7 @@ fn test_device_class_proto_decodes_selectors_and_config() {
     push_ld(&mut device_class, 1, &metadata);
     push_ld(&mut device_class, 2, &spec);
 
-    let Some(decoded) = decode_or_skip(&registry, "resource.k8s.io/v1.DeviceClass", &device_class)
-    else {
-        return;
-    };
+    let decoded = decode_expect(&registry, "resource.k8s.io/v1.DeviceClass", &device_class);
 
     assert_eq!(
         decoded.pointer("/metadata/name").and_then(Value::as_str),
@@ -525,10 +500,7 @@ fn test_resource_slice_proto_decodes_pool_and_devices() {
     push_ld(&mut slice, 1, &metadata);
     push_ld(&mut slice, 2, &spec);
 
-    let Some(decoded) = decode_or_skip(&registry, "resource.k8s.io/v1.ResourceSlice", &slice)
-    else {
-        return;
-    };
+    let decoded = decode_expect(&registry, "resource.k8s.io/v1.ResourceSlice", &slice);
 
     assert_eq!(
         decoded.pointer("/metadata/name").and_then(Value::as_str),

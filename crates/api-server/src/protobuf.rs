@@ -2592,6 +2592,7 @@ impl ProtoRegistry {
         Self::register_core_v1_subresource_options(&mut schemas);
         Self::register_autoscaling_v1_scale(&mut schemas);
         Self::register_apiextensions_v1_conversion(&mut schemas);
+        Self::register_resource_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -10574,6 +10575,988 @@ impl ProtoRegistry {
                             FieldType::Message("ConversionResponse".into()),
                         ),
                     ),
+                ]),
+            },
+        );
+    }
+
+    /// Register `resource.k8s.io/v1` (Dynamic Resource Allocation) message
+    /// schemas.
+    ///
+    /// Field numbers from `k8s.io/api/resource/v1/generated.proto`
+    /// (upstream Kubernetes release-1.36; the v1 GA group was introduced
+    /// after v1alpha3 / v1beta1 / v1beta2 in earlier releases). The bundled
+    /// 1.35 proto snapshot under `crates/api-server/proto/upstream/v1.35/`
+    /// predates the v1 GA promotion, so the upstream module path
+    /// `k8s.io/api/resource/v1` is the source of truth for these field
+    /// numbers (cross-checked against upstream HEAD).
+    ///
+    /// The four top-level kinds collide on bare name with unrelated types:
+    ///
+    /// - `ResourceClaim` already exists as the `core/v1.ResourceClaim`
+    ///   PodSpec sub-message (`{ name, request }`).
+    /// - The other three top-level kinds happen not to collide today, but
+    ///   are nevertheless registered under group-qualified keys to keep the
+    ///   pattern uniform and to prevent silent shadowing if future
+    ///   refactors introduce same-name types in another group.
+    ///
+    /// Nested message types (DeviceRequest, DeviceClaim, ExactDeviceRequest,
+    /// AllocationResult, DeviceAllocationResult, DeviceRequestAllocationResult,
+    /// ResourcePool, DeviceClassSpec, DeviceClassConfiguration,
+    /// DeviceConfiguration, OpaqueDeviceConfiguration, CELDeviceSelector,
+    /// DeviceSelector, Device, ResourceClaimSpec, ResourceClaimStatus,
+    /// ResourceClaimTemplateSpec, ResourceSliceSpec) are registered under
+    /// their bare names because they are uniquely defined within DRA — the
+    /// recursive `decode_message` path uses the bare lookup for nested
+    /// fields.
+    ///
+    /// `DeviceClassConfiguration` inlines `DeviceConfiguration` per the
+    /// upstream JSON tag (`json:",inline"`), so its only field is modelled
+    /// with `FieldType::InlineMessage` and the decoder merges
+    /// `DeviceConfiguration`'s fields (currently just `opaque`) into the
+    /// parent JSON object.
+    ///
+    /// `OpaqueDeviceConfiguration.parameters` is a `runtime.RawExtension`,
+    /// modelled with `FieldType::JsonRaw` so the inner JSON body parses
+    /// rather than surfacing as base64-encoded bytes.
+    fn register_resource_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // ========== Top-level kinds (group-qualified keys) ==========
+
+        // ResourceClaim — the bare name is taken by core/v1.ResourceClaim
+        // (PodSpec sub-message). DRA's top-level kind must live behind the
+        // group-qualified key so `decode_k8s_resource`'s apiVersion-aware
+        // lookup picks the right schema.
+        schemas.insert(
+            "resource.k8s.io/v1.ResourceClaim".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ResourceClaimSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("ResourceClaimStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "resource.k8s.io/v1.ResourceClaimTemplate".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ResourceClaimTemplateSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "resource.k8s.io/v1.DeviceClass".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("DeviceClassSpec".into())),
+                    ),
+                ]),
+            },
+        );
+
+        schemas.insert(
+            "resource.k8s.io/v1.ResourceSlice".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ResourceSliceSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ========== Nested message types (bare names) ==========
+
+        // ResourceClaimSpec { devices=1 (DeviceClaim) }
+        schemas.insert(
+            "ResourceClaimSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    ("devices".into(), FieldType::Message("DeviceClaim".into())),
+                )]),
+            },
+        );
+
+        // ResourceClaimStatus { allocation=1, reservedFor=2 (repeated),
+        //                       devices=4 (repeated AllocatedDeviceStatus) }
+        schemas.insert(
+            "ResourceClaimStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "allocation".into(),
+                            FieldType::Message("AllocationResult".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "reservedFor".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ResourceClaimConsumerReference".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "devices".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "AllocatedDeviceStatus".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ResourceClaimConsumerReference { apiGroup=1, resource=3,
+        //                                  name=4, uid=5 }
+        schemas.insert(
+            "ResourceClaimConsumerReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("apiGroup".into(), FieldType::String)),
+                    (3, ("resource".into(), FieldType::String)),
+                    (4, ("name".into(), FieldType::String)),
+                    (5, ("uid".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ResourceClaimTemplateSpec { metadata=1 (ObjectMeta),
+        //                             spec=2 (ResourceClaimSpec) }
+        schemas.insert(
+            "ResourceClaimTemplateSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("ResourceClaimSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceClaim { requests=1, constraints=2, config=3 }
+        schemas.insert(
+            "DeviceClaim".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "requests".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceRequest".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "constraints".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceConstraint".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "config".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceClaimConfiguration".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceRequest { name=1, exactly=2, firstAvailable=3 }
+        schemas.insert(
+            "DeviceRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "exactly".into(),
+                            FieldType::Message("ExactDeviceRequest".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "firstAvailable".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceSubRequest".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ExactDeviceRequest { deviceClassName=1, selectors=2 (repeated),
+        //                      allocationMode=3, count=4, adminAccess=5,
+        //                      tolerations=6, capacity=7 }
+        schemas.insert(
+            "ExactDeviceRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("deviceClassName".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "selectors".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceSelector".into(),
+                            ))),
+                        ),
+                    ),
+                    (3, ("allocationMode".into(), FieldType::String)),
+                    (4, ("count".into(), FieldType::Int)),
+                    (5, ("adminAccess".into(), FieldType::Bool)),
+                    (
+                        6,
+                        (
+                            "tolerations".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceToleration".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "capacity".into(),
+                            FieldType::Message("CapacityRequirements".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceSubRequest { name=1, deviceClassName=2, selectors=3,
+        //                    allocationMode=4, count=5, tolerations=6,
+        //                    capacity=7 }
+        schemas.insert(
+            "DeviceSubRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("deviceClassName".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "selectors".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceSelector".into(),
+                            ))),
+                        ),
+                    ),
+                    (4, ("allocationMode".into(), FieldType::String)),
+                    (5, ("count".into(), FieldType::Int)),
+                    (
+                        6,
+                        (
+                            "tolerations".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceToleration".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "capacity".into(),
+                            FieldType::Message("CapacityRequirements".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceSelector { cel=1 }
+        schemas.insert(
+            "DeviceSelector".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    ("cel".into(), FieldType::Message("CELDeviceSelector".into())),
+                )]),
+            },
+        );
+
+        // CELDeviceSelector { expression=1 }
+        schemas.insert(
+            "CELDeviceSelector".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("expression".into(), FieldType::String))]),
+            },
+        );
+
+        // DeviceConstraint { requests=1 (repeated), matchAttribute=2,
+        //                    distinctAttribute=3 }
+        schemas.insert(
+            "DeviceConstraint".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "requests".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("matchAttribute".into(), FieldType::String)),
+                    (3, ("distinctAttribute".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // DeviceClaimConfiguration { requests=1 (repeated string),
+        //                            deviceConfiguration=2 (inline) }
+        schemas.insert(
+            "DeviceClaimConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "requests".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "deviceConfiguration".into(),
+                            FieldType::InlineMessage("DeviceConfiguration".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceToleration { key=1, operator=2, value=3, effect=4,
+        //                    tolerationSeconds=5 }
+        schemas.insert(
+            "DeviceToleration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("operator".into(), FieldType::String)),
+                    (3, ("value".into(), FieldType::String)),
+                    (4, ("effect".into(), FieldType::String)),
+                    (5, ("tolerationSeconds".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // CapacityRequirements { requests=1 (map<string, Quantity>) }
+        schemas.insert(
+            "CapacityRequirements".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("requests".into(), FieldType::QuantityMap))]),
+            },
+        );
+
+        // ========== AllocationResult chain ==========
+
+        // AllocationResult { devices=1, nodeSelector=3 (NodeSelector),
+        //                    allocationTimestamp=5 (Time) }
+        schemas.insert(
+            "AllocationResult".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "devices".into(),
+                            FieldType::Message("DeviceAllocationResult".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "nodeSelector".into(),
+                            FieldType::Message("NodeSelector".into()),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "allocationTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceAllocationResult { results=1 (repeated), config=2 (repeated) }
+        schemas.insert(
+            "DeviceAllocationResult".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "results".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceRequestAllocationResult".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "config".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceAllocationConfiguration".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceRequestAllocationResult { request=1, driver=2, pool=3,
+        //                                 device=4, adminAccess=5,
+        //                                 tolerations=6, bindingConditions=7,
+        //                                 bindingFailureConditions=8,
+        //                                 shareID=9, consumedCapacity=10 }
+        schemas.insert(
+            "DeviceRequestAllocationResult".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("request".into(), FieldType::String)),
+                    (2, ("driver".into(), FieldType::String)),
+                    (3, ("pool".into(), FieldType::String)),
+                    (4, ("device".into(), FieldType::String)),
+                    (5, ("adminAccess".into(), FieldType::Bool)),
+                    (
+                        6,
+                        (
+                            "tolerations".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceToleration".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "bindingConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "bindingFailureConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (9, ("shareID".into(), FieldType::String)),
+                    (10, ("consumedCapacity".into(), FieldType::QuantityMap)),
+                ]),
+            },
+        );
+
+        // DeviceAllocationConfiguration { source=1, requests=2 (repeated),
+        //                                 deviceConfiguration=3 (inline) }
+        schemas.insert(
+            "DeviceAllocationConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("source".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "requests".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "deviceConfiguration".into(),
+                            FieldType::InlineMessage("DeviceConfiguration".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // AllocatedDeviceStatus { driver=1, pool=2, device=3,
+        //                         conditions=4 (repeated Condition),
+        //                         data=5 (RawExtension/JsonRaw),
+        //                         networkData=6 (NetworkDeviceData),
+        //                         shareID=7 }
+        schemas.insert(
+            "AllocatedDeviceStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("driver".into(), FieldType::String)),
+                    (2, ("pool".into(), FieldType::String)),
+                    (3, ("device".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                        ),
+                    ),
+                    (5, ("data".into(), FieldType::JsonRaw)),
+                    (
+                        6,
+                        (
+                            "networkData".into(),
+                            FieldType::Message("NetworkDeviceData".into()),
+                        ),
+                    ),
+                    (7, ("shareID".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // NetworkDeviceData { interfaceName=1, ips=2 (repeated),
+        //                     hardwareAddress=3 }
+        schemas.insert(
+            "NetworkDeviceData".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("interfaceName".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "ips".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (3, ("hardwareAddress".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ========== DeviceClass chain ==========
+
+        // DeviceClassSpec { selectors=1 (repeated DeviceSelector),
+        //                   config=2 (repeated DeviceClassConfiguration),
+        //                   extendedResourceName=4 }
+        schemas.insert(
+            "DeviceClassSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "selectors".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceSelector".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "config".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceClassConfiguration".into(),
+                            ))),
+                        ),
+                    ),
+                    (4, ("extendedResourceName".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // DeviceClassConfiguration { deviceConfiguration=1 (inline) }
+        // Per upstream `json:",inline"`, DeviceConfiguration's fields are
+        // hoisted into the DeviceClassConfiguration JSON object.
+        schemas.insert(
+            "DeviceClassConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "deviceConfiguration".into(),
+                        FieldType::InlineMessage("DeviceConfiguration".into()),
+                    ),
+                )]),
+            },
+        );
+
+        // DeviceConfiguration { opaque=1 }
+        schemas.insert(
+            "DeviceConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "opaque".into(),
+                        FieldType::Message("OpaqueDeviceConfiguration".into()),
+                    ),
+                )]),
+            },
+        );
+
+        // OpaqueDeviceConfiguration { driver=1, parameters=2 (RawExtension)
+        // Parameters is a runtime.RawExtension carrying arbitrary JSON; use
+        // FieldType::JsonRaw so it surfaces as a parsed JSON value rather
+        // than base64-encoded bytes.
+        schemas.insert(
+            "OpaqueDeviceConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("driver".into(), FieldType::String)),
+                    (2, ("parameters".into(), FieldType::JsonRaw)),
+                ]),
+            },
+        );
+
+        // ========== ResourceSlice chain ==========
+
+        // ResourceSliceSpec { driver=1, pool=2, nodeName=3, nodeSelector=4,
+        //                     allNodes=5, devices=6 (repeated Device),
+        //                     perDeviceNodeSelection=7,
+        //                     sharedCounters=8 (repeated CounterSet) }
+        schemas.insert(
+            "ResourceSliceSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("driver".into(), FieldType::String)),
+                    (
+                        2,
+                        ("pool".into(), FieldType::Message("ResourcePool".into())),
+                    ),
+                    (3, ("nodeName".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "nodeSelector".into(),
+                            FieldType::Message("NodeSelector".into()),
+                        ),
+                    ),
+                    (5, ("allNodes".into(), FieldType::Bool)),
+                    (
+                        6,
+                        (
+                            "devices".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Device".into()))),
+                        ),
+                    ),
+                    (7, ("perDeviceNodeSelection".into(), FieldType::Bool)),
+                    (
+                        8,
+                        (
+                            "sharedCounters".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("CounterSet".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // ResourcePool { name=1, generation=2, resourceSliceCount=3 }
+        schemas.insert(
+            "ResourcePool".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("generation".into(), FieldType::Int)),
+                    (3, ("resourceSliceCount".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
+        // Device { name=1, attributes=2 (map<string, DeviceAttribute>),
+        //          capacity=3 (map<string, DeviceCapacity>),
+        //          consumesCounters=4 (repeated DeviceCounterConsumption),
+        //          nodeName=5, nodeSelector=6, allNodes=7,
+        //          taints=8 (repeated DeviceTaint), bindsToNode=9,
+        //          bindingConditions=10 (repeated string),
+        //          bindingFailureConditions=11 (repeated string),
+        //          allowMultipleAllocations=12,
+        //          nodeAllocatableResourceMappings=13 (map<string, ...>) }
+        schemas.insert(
+            "Device".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "attributes".into(),
+                            FieldType::MessageMap("DeviceAttribute".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "capacity".into(),
+                            FieldType::MessageMap("DeviceCapacity".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "consumesCounters".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceCounterConsumption".into(),
+                            ))),
+                        ),
+                    ),
+                    (5, ("nodeName".into(), FieldType::String)),
+                    (
+                        6,
+                        (
+                            "nodeSelector".into(),
+                            FieldType::Message("NodeSelector".into()),
+                        ),
+                    ),
+                    (7, ("allNodes".into(), FieldType::Bool)),
+                    (
+                        8,
+                        (
+                            "taints".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("DeviceTaint".into()))),
+                        ),
+                    ),
+                    (9, ("bindsToNode".into(), FieldType::Bool)),
+                    (
+                        10,
+                        (
+                            "bindingConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        11,
+                        (
+                            "bindingFailureConditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (12, ("allowMultipleAllocations".into(), FieldType::Bool)),
+                    (
+                        13,
+                        (
+                            "nodeAllocatableResourceMappings".into(),
+                            FieldType::MessageMap("NodeAllocatableResourceMapping".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceAttribute (one-of) { int=2, bool=3, string=4, version=5,
+        //                            ints=6, bools=7, strings=8, versions=9 }
+        schemas.insert(
+            "DeviceAttribute".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (2, ("int".into(), FieldType::Int)),
+                    (3, ("bool".into(), FieldType::Bool)),
+                    (4, ("string".into(), FieldType::String)),
+                    (5, ("version".into(), FieldType::String)),
+                    (
+                        6,
+                        ("ints".into(), FieldType::Repeated(Box::new(FieldType::Int))),
+                    ),
+                    (
+                        7,
+                        (
+                            "bools".into(),
+                            FieldType::Repeated(Box::new(FieldType::Bool)),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "strings".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "versions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceCapacity { value=1 (Quantity), requestPolicy=2 }
+        schemas.insert(
+            "DeviceCapacity".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("value".into(), FieldType::Quantity)),
+                    (
+                        2,
+                        (
+                            "requestPolicy".into(),
+                            FieldType::Message("CapacityRequestPolicy".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // CapacityRequestPolicy { default=1 (Quantity),
+        //                         validValues=3 (repeated Quantity),
+        //                         validRange=4 }
+        schemas.insert(
+            "CapacityRequestPolicy".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("default".into(), FieldType::Quantity)),
+                    (
+                        3,
+                        (
+                            "validValues".into(),
+                            FieldType::Repeated(Box::new(FieldType::Quantity)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "validRange".into(),
+                            FieldType::Message("CapacityRequestPolicyRange".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+
+        // CapacityRequestPolicyRange { min=1, max=2, step=3 } (all Quantity)
+        schemas.insert(
+            "CapacityRequestPolicyRange".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("min".into(), FieldType::Quantity)),
+                    (2, ("max".into(), FieldType::Quantity)),
+                    (3, ("step".into(), FieldType::Quantity)),
+                ]),
+            },
+        );
+
+        // CounterSet { name=1, counters=2 (map<string, Counter>) }
+        schemas.insert(
+            "CounterSet".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        ("counters".into(), FieldType::MessageMap("Counter".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // Counter { value=1 (Quantity) }
+        schemas.insert(
+            "Counter".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("value".into(), FieldType::Quantity))]),
+            },
+        );
+
+        // DeviceCounterConsumption { counterSet=1, counters=2 (map) }
+        schemas.insert(
+            "DeviceCounterConsumption".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("counterSet".into(), FieldType::String)),
+                    (
+                        2,
+                        ("counters".into(), FieldType::MessageMap("Counter".into())),
+                    ),
+                ]),
+            },
+        );
+
+        // DeviceTaint { key=1, value=2, effect=3, timeAdded=4 (Time) }
+        schemas.insert(
+            "DeviceTaint".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("value".into(), FieldType::String)),
+                    (3, ("effect".into(), FieldType::String)),
+                    (4, ("timeAdded".into(), FieldType::Message("Time".into()))),
+                ]),
+            },
+        );
+
+        // NodeAllocatableResourceMapping { capacityKey=1,
+        //                                  allocationMultiplier=2 (Quantity) }
+        schemas.insert(
+            "NodeAllocatableResourceMapping".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("capacityKey".into(), FieldType::String)),
+                    (2, ("allocationMultiplier".into(), FieldType::Quantity)),
                 ]),
             },
         );
