@@ -101,6 +101,21 @@ pub fn redact_secret_like(bytes: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+use std::cell::RefCell;
+
+tokio::task_local! {
+    pub static CURRENT_PAYLOAD: RefCell<Option<bytes::Bytes>>;
+}
+
+/// Run `fut` with `body` accessible via `CURRENT_PAYLOAD` for the duration
+/// of the future (and any tasks it spawns that inherit the task-local).
+pub async fn with_payload<F, T>(body: bytes::Bytes, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CURRENT_PAYLOAD.scope(RefCell::new(Some(body)), fut).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +191,21 @@ mod tests {
         let out = redact_secret_like(input);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["data"]["k"], "v");
+    }
+
+    #[tokio::test]
+    async fn with_payload_makes_bytes_visible_inside_scope() {
+        let body = bytes::Bytes::from_static(b"hello");
+        let seen = with_payload(body.clone(), async {
+            CURRENT_PAYLOAD.with(|cell| cell.borrow().clone())
+        })
+        .await;
+        assert_eq!(seen.as_deref(), Some(b"hello".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn current_payload_outside_scope_returns_err() {
+        let res = CURRENT_PAYLOAD.try_with(|cell| cell.borrow().clone());
+        assert!(res.is_err());
     }
 }

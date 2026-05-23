@@ -21,7 +21,7 @@ rustls.workspace = true
 rustls-pemfile = "2.1"
 axum = { workspace = true, optional = true }
 bytes = "1"
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 aes-gcm = "0.10"
