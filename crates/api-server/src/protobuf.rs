@@ -924,23 +924,84 @@ impl ProtoRegistry {
                 ]),
             },
         );
-        // Affinity sub-types are complex — decode as opaque messages
+        // Affinity sub-types — wire layout per k8s.io/api/core/v1/generated.proto
+        // (release-1.35). NodeAffinity field numbers:
+        //   1 = requiredDuringSchedulingIgnoredDuringExecution  (NodeSelector)
+        //   2 = preferredDuringSchedulingIgnoredDuringExecution (repeated PreferredSchedulingTerm)
+        // PodAffinity / PodAntiAffinity field numbers (same shape):
+        //   1 = requiredDuringSchedulingIgnoredDuringExecution  (repeated PodAffinityTerm)
+        //   2 = preferredDuringSchedulingIgnoredDuringExecution (repeated WeightedPodAffinityTerm)
         schemas.insert(
             "NodeAffinity".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "requiredDuringSchedulingIgnoredDuringExecution".into(),
+                            FieldType::Message("NodeSelector".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "preferredDuringSchedulingIgnoredDuringExecution".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PreferredSchedulingTerm".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
             "PodAffinity".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "requiredDuringSchedulingIgnoredDuringExecution".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PodAffinityTerm".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "preferredDuringSchedulingIgnoredDuringExecution".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "WeightedPodAffinityTerm".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
             "PodAntiAffinity".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "requiredDuringSchedulingIgnoredDuringExecution".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PodAffinityTerm".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "preferredDuringSchedulingIgnoredDuringExecution".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "WeightedPodAffinityTerm".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
