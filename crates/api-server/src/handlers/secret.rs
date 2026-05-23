@@ -214,6 +214,36 @@ pub async fn update(
 
     // Check if existing secret is immutable — only reject data/stringData changes
     if let Ok(existing) = state.storage.get::<Secret>(&key).await {
+        // Enforce `.type` immutability post-create. Upstream:
+        // `pkg/registry/core/secret/strategy.go::ValidateUpdate` calls
+        // `validation.ValidateSecretUpdate`, which appends
+        // `ValidateImmutableField(newSecret.Type, oldSecret.Type, field.NewPath("type"))`
+        // unconditionally — independent of `Secret.immutable`. The wire error is
+        // `field.Invalid(field.NewPath("type"), newSecret.Type, "field is immutable")`.
+        //
+        // Default the missing-type case to "Opaque" on both sides to mirror
+        // `pkg/apis/core/v1/defaults.go::SetDefaults_Secret`, so an UPDATE body
+        // that omits `.type` (the field is omitempty) compares equal to an
+        // existing secret whose type was server-defaulted to "Opaque" on
+        // create.
+        // Mirror upstream `SetDefaults_Secret`: treat both missing AND empty
+        // string as `Opaque`, so a client that sends `"type": ""` (or omits
+        // the field) on UPDATE matches an existing secret whose type was
+        // server-defaulted or left unset.
+        let old_type = match existing.secret_type.as_deref() {
+            None | Some("") => "Opaque",
+            Some(t) => t,
+        };
+        let new_type = match secret.secret_type.as_deref() {
+            None | Some("") => "Opaque",
+            Some(t) => t,
+        };
+        if old_type != new_type {
+            return Err(rusternetes_common::Error::InvalidResource(format!(
+                "type: Invalid value: \"{new_type}\": field is immutable"
+            )));
+        }
+
         if existing.immutable == Some(true) {
             // Compare data and stringData — reject if changed
             let data_changed = existing.data != secret.data;

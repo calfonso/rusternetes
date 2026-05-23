@@ -556,13 +556,11 @@ async fn test_secret_strategy_immutable_cannot_be_unset() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: Secret type field is not enforced as immutable post-create"]
 async fn test_secret_strategy_type_immutable_post_create() {
     // Upstream `pkg/registry/core/secret/strategy.go::ValidateUpdate` calls
     // `apivalidation.ValidateImmutableField(newSecret.Type, oldSecret.Type, …)`
-    // unconditionally. rusternetes' `handlers::secret::update` does not yet
-    // compare the new `type` against the old one, so this test stays #[ignore]
-    // until that fence lands.
+    // unconditionally. rusternetes' `handlers::secret::update` enforces the
+    // same fence in `handlers/secret.rs`.
     let (_mem, router) = spawn_router();
 
     let create = json!({
