@@ -52,6 +52,7 @@ pub mod poddisruptionbudget;
 pub mod podtemplate;
 pub mod priorityclass;
 pub mod proxy;
+pub mod ratcheting;
 pub mod rbac;
 pub mod replicaset;
 pub mod replicationcontroller;

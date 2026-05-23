@@ -23,6 +23,7 @@
 //!      rules at compile time and runaway evaluations at runtime.
 
 use rusternetes_common::resources::{CustomResource, CustomResourceDefinition, JSONSchemaProps};
+use rusternetes_common::schema_validation::PathSeg;
 use rusternetes_common::{CELContext, CELEvaluator, Error, Result};
 
 /// Default per-rule estimated cost budget (K8s default = 10M tokens).
@@ -354,6 +355,269 @@ pub fn validate_cr_against_crd(
     };
     let rules = collect_rules(&validation.open_apiv3_schema);
     validate_cr_rules(&rules, cr, old_cr)
+}
+
+// ---------------------------------------------------------------------------
+// Ratcheting-aware CR rule evaluation (KEP-4008)
+// ---------------------------------------------------------------------------
+//
+// The simple `validate_cr_rules` above is keyed by property-name paths, which
+// is fine for rules attached to scalar fields under `spec` but cannot describe
+// the per-item evaluations the ratcheting tests demand (a rule attached to
+// `list[].field` fails per-list-item, with `list[i]` carrying its own
+// structural index). For ratcheting we need the *concrete* path of every
+// failure so the caller can correlate against the prior object.
+
+/// A single CEL rule failure surfaced from a CR validation walk.
+#[derive(Debug, Clone)]
+pub struct CrRuleFailure {
+    /// Structural path to the node the rule was evaluated against.
+    pub path: Vec<PathSeg>,
+    /// Rendered failure message (the rule's `message`).
+    pub message: String,
+    /// Whether the rule references `oldSelf` (transition rule). Transition
+    /// rules are NEVER ratcheted — surfaced here so callers can preserve them.
+    pub is_transition: bool,
+}
+
+/// Walk `schema` and `cr_value` concurrently, evaluating every reachable
+/// instance of every `x-kubernetes-validations` rule. Returns the list of
+/// failures (each with a structural path) so the caller may filter them with
+/// the ratcheting predicate.
+///
+/// `old_value` is only used to bind `oldSelf` for transition rules; pass
+/// `None` on CREATE.
+pub fn evaluate_cr_rules_with_paths(
+    schema: &JSONSchemaProps,
+    cr_value: &serde_json::Value,
+    old_value: Option<&serde_json::Value>,
+) -> Result<Vec<CrRuleFailure>> {
+    let mut evaluator = CELEvaluator::new();
+    let mut failures = Vec::new();
+    let mut total_cost: u64 = 0;
+    walk_and_eval(
+        schema,
+        cr_value,
+        old_value,
+        &mut Vec::new(),
+        &mut evaluator,
+        &mut total_cost,
+        &mut failures,
+    )?;
+    Ok(failures)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_and_eval(
+    schema: &JSONSchemaProps,
+    node: &serde_json::Value,
+    old_node: Option<&serde_json::Value>,
+    path: &mut Vec<PathSeg>,
+    evaluator: &mut CELEvaluator,
+    total_cost: &mut u64,
+    failures: &mut Vec<CrRuleFailure>,
+) -> Result<()> {
+    // Evaluate every rule attached to this schema node against `node`.
+    if let Some(rules) = &schema.x_kubernetes_validations {
+        for raw in rules {
+            let obj = match raw.as_object() {
+                Some(o) => o,
+                None => continue,
+            };
+            let rule_str = match obj.get("rule").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            let message = obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed rule")
+                .to_string();
+
+            let is_transition = rule_references_old_self(rule_str);
+            // Skip transition rules on CREATE.
+            if is_transition && old_node.is_none() {
+                continue;
+            }
+
+            *total_cost = total_cost.saturating_add(estimate_cost(rule_str));
+            if *total_cost > DEFAULT_REQUEST_RUNTIME_COST_LIMIT {
+                return Err(Error::InvalidResource(format!(
+                    "x-kubernetes-validations rule exceeded the runtime cost limit: {}",
+                    rule_str
+                )));
+            }
+
+            let mut ctx = CELContext::new();
+            ctx.add_json_variable("self", node)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            if let Some(o) = old_node {
+                ctx.add_json_variable("oldSelf", o)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+            }
+
+            match evaluator.evaluate(rule_str, &ctx) {
+                Ok(true) => {}
+                Ok(false) => failures.push(CrRuleFailure {
+                    path: path.clone(),
+                    message,
+                    is_transition,
+                }),
+                Err(_) => {
+                    // Runtime errors are reported as failures (no ratcheting
+                    // for malformed evaluation either). Render the rule body
+                    // so the caller's diagnostics stay actionable.
+                    failures.push(CrRuleFailure {
+                        path: path.clone(),
+                        message: format!(
+                            "failed to evaluate x-kubernetes-validations rule {:?}",
+                            rule_str
+                        ),
+                        is_transition,
+                    });
+                }
+            }
+        }
+    }
+
+    // Recurse into object properties.
+    if let Some(map) = node.as_object() {
+        if let Some(properties) = &schema.properties {
+            for (key, prop_schema) in properties {
+                if let Some(child) = map.get(key) {
+                    let old_child = old_node
+                        .and_then(|o| o.as_object())
+                        .and_then(|m| m.get(key));
+                    path.push(PathSeg::Key(key.clone()));
+                    walk_and_eval(
+                        prop_schema,
+                        child,
+                        old_child,
+                        path,
+                        evaluator,
+                        total_cost,
+                        failures,
+                    )?;
+                    path.pop();
+                }
+            }
+        }
+        if let Some(addl) = &schema.additional_properties {
+            use rusternetes_common::resources::crd::JSONSchemaPropsOrBool;
+            if let JSONSchemaPropsOrBool::Schema(addl_schema) = addl.as_ref() {
+                let declared: std::collections::HashSet<&String> = schema
+                    .properties
+                    .as_ref()
+                    .map(|p| p.keys().collect())
+                    .unwrap_or_default();
+                for (key, child) in map {
+                    if declared.contains(key) {
+                        continue;
+                    }
+                    let old_child = old_node
+                        .and_then(|o| o.as_object())
+                        .and_then(|m| m.get(key));
+                    path.push(PathSeg::Key(key.clone()));
+                    walk_and_eval(
+                        addl_schema,
+                        child,
+                        old_child,
+                        path,
+                        evaluator,
+                        total_cost,
+                        failures,
+                    )?;
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    // Recurse into arrays.
+    if let Some(arr) = node.as_array() {
+        if let Some(items) = &schema.items {
+            use rusternetes_common::resources::crd::JSONSchemaPropsOrArray;
+            if let JSONSchemaPropsOrArray::Schema(item_schema) = items.as_ref() {
+                for (i, child) in arr.iter().enumerate() {
+                    let old_child = correlate_old_item(schema, old_node, child);
+                    path.push(PathSeg::Index(i));
+                    walk_and_eval(
+                        item_schema,
+                        child,
+                        old_child.as_ref(),
+                        path,
+                        evaluator,
+                        total_cost,
+                        failures,
+                    )?;
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// For a list-type=map parent schema, look up the old item whose composite
+/// key matches `new_item`. Returns `None` for any other shape.
+fn correlate_old_item(
+    array_schema: &JSONSchemaProps,
+    old_node: Option<&serde_json::Value>,
+    new_item: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if array_schema.x_kubernetes_list_type.as_deref() != Some("map") {
+        return None;
+    }
+    let keys = array_schema.x_kubernetes_list_map_keys.as_ref()?;
+    if keys.is_empty() {
+        return None;
+    }
+    let new_obj = new_item.as_object()?;
+    let mut new_ck = String::new();
+    for k in keys {
+        let v = new_obj.get(k)?;
+        new_ck.push('\x00');
+        match v {
+            serde_json::Value::Bool(b) => new_ck.push_str(&format!("b:{b}")),
+            serde_json::Value::Number(n) => new_ck.push_str(&format!("n:{n}")),
+            serde_json::Value::String(s) => new_ck.push_str(&format!("s:{s}")),
+            _ => return None,
+        }
+    }
+    let old_arr = old_node?.as_array()?;
+    for o in old_arr {
+        let o_obj = match o.as_object() {
+            Some(m) => m,
+            None => continue,
+        };
+        let mut ck = String::new();
+        let mut ok = true;
+        for k in keys {
+            match o_obj.get(k) {
+                Some(serde_json::Value::Bool(b)) => {
+                    ck.push('\x00');
+                    ck.push_str(&format!("b:{b}"))
+                }
+                Some(serde_json::Value::Number(n)) => {
+                    ck.push('\x00');
+                    ck.push_str(&format!("n:{n}"))
+                }
+                Some(serde_json::Value::String(s)) => {
+                    ck.push('\x00');
+                    ck.push_str(&format!("s:{s}"))
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && ck == new_ck {
+            return Some(o.clone());
+        }
+    }
+    None
 }
 
 /// Validate every served version's CEL rules at CRD admission time.

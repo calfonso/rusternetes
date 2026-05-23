@@ -1455,14 +1455,173 @@ fn validate_custom_resource(
 
 /// Like [`validate_custom_resource`] but also evaluates `x-kubernetes-validations`
 /// transition rules using `old_cr` as the prior version for `oldSelf` bindings.
+///
+/// When `old_cr` is `Some` (UPDATE/PATCH), validation runs in *ratcheting*
+/// mode (KEP-4008): schema and non-transition CEL rule failures whose path
+/// resolves to a sub-tree that is unchanged from the prior object — and
+/// every parent of which correlates between old and new — are dropped.
+/// Transition rules (those that reference `oldSelf`) are never ratcheted.
+///
+/// Upstream: `apiextensions-apiserver/pkg/apiserver/validation/ratcheting.go`.
 fn validate_custom_resource_with_old(
     crd: &CustomResourceDefinition,
     version: &str,
     cr: &CustomResource,
     old_cr: Option<&CustomResource>,
 ) -> Result<()> {
-    validate_custom_resource_schema(crd, version, cr)?;
-    crate::handlers::cel_validation::validate_cr_against_crd(crd, version, cr, old_cr)
+    match old_cr {
+        None => {
+            validate_custom_resource_schema(crd, version, cr)?;
+            crate::handlers::cel_validation::validate_cr_against_crd(crd, version, cr, None)
+        }
+        Some(old) => validate_custom_resource_with_ratcheting(crd, version, cr, old),
+    }
+}
+
+/// Ratcheting-aware validation used on UPDATE/PATCH. Walks each top-level
+/// property schema (spec/status/extra) twice:
+///
+///   1. Schema-issue pass — collects every JSONSchema failure with its
+///      structural path, then drops issues whose old/new sub-tree
+///      correlates AND is equal.
+///   2. CEL-rule pass — evaluates every `x-kubernetes-validations` rule at
+///      every reachable schema/data instance, ratcheting the non-transition
+///      failures with the same predicate.
+///
+/// If any unratcheted issue remains, returns the first one as an error so
+/// the response carries the offending path & message.
+fn validate_custom_resource_with_ratcheting(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    cr: &CustomResource,
+    old_cr: &CustomResource,
+) -> Result<()> {
+    use crate::handlers::cel_validation::evaluate_cr_rules_with_paths;
+    use crate::handlers::ratcheting::is_ratcheted;
+    use rusternetes_common::schema_validation::ValidationIssue;
+
+    let Some(crd_version) = crd.spec.versions.iter().find(|v| v.name == version) else {
+        return Err(rusternetes_common::Error::InvalidResource(format!(
+            "Version {} not found in CRD",
+            version
+        )));
+    };
+    if !crd_version.served {
+        return Err(rusternetes_common::Error::InvalidResource(format!(
+            "Version {} is not served",
+            version
+        )));
+    }
+    let Some(ref validation) = crd_version.schema else {
+        return Ok(());
+    };
+    let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
+    let schema_preserves = validation
+        .open_apiv3_schema
+        .x_kubernetes_preserve_unknown_fields
+        == Some(true);
+    if crd_preserves || schema_preserves {
+        // K8s skips structural validation when preserve-unknown-fields is set.
+        return Ok(());
+    }
+
+    let Some(ref properties) = validation.open_apiv3_schema.properties else {
+        return Ok(());
+    };
+
+    // For each top-level property, collect schema + CEL failures, ratchet
+    // those that resolve to an unchanged correlatable sub-tree.
+    let new_extra_specs: HashMap<&str, &serde_json::Value> =
+        cr.extra.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let old_extra_specs: HashMap<&str, &serde_json::Value> =
+        old_cr.extra.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    for (key, prop_schema) in properties {
+        let (new_val, old_val) = match key.as_str() {
+            "spec" => (cr.spec.as_ref(), old_cr.spec.as_ref()),
+            "status" => (cr.status.as_ref(), old_cr.status.as_ref()),
+            "metadata" | "apiVersion" | "kind" => continue,
+            k => (
+                new_extra_specs.get(k).copied(),
+                old_extra_specs.get(k).copied(),
+            ),
+        };
+        let Some(new_val) = new_val else { continue };
+        let old_val = old_val.cloned();
+        let old_val_ref = old_val.as_ref();
+
+        // 1) Schema issues.
+        let issues: Vec<ValidationIssue> = SchemaValidator::collect_issues(prop_schema, new_val);
+        for issue in issues {
+            let ratcheted = match old_val_ref {
+                Some(old) => is_ratcheted(prop_schema, old, new_val, &issue.path),
+                None => false,
+            };
+            if !ratcheted {
+                return Err(rusternetes_common::Error::InvalidResource(
+                    render_issue_message(&issue.path, &issue.message),
+                ));
+            }
+        }
+
+        // 2) CEL rule failures.
+        let failures = evaluate_cr_rules_with_paths(prop_schema, new_val, old_val_ref)?;
+        for f in failures {
+            let ratcheted = if f.is_transition {
+                false
+            } else if let Some(old) = old_val_ref {
+                is_ratcheted(prop_schema, old, new_val, &f.path)
+            } else {
+                false
+            };
+            if !ratcheted {
+                let path_str = render_full_path(&f.path);
+                let msg = if path_str.is_empty() {
+                    f.message.clone()
+                } else {
+                    format!("{}: {}", path_str, f.message)
+                };
+                return Err(rusternetes_common::Error::InvalidResource(msg));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Render the K8s-style path for a sub-tree issue. Object segments under a
+/// `additionalProperties` parent would appear as `[key]` in upstream's
+/// messages; we render every key with dot notation since paths are
+/// structural and the K8s test only matches substrings (`field`,
+/// `list[0].field`, etc.).
+fn render_full_path(path: &[rusternetes_common::schema_validation::PathSeg]) -> String {
+    let mut out = String::new();
+    for seg in path {
+        match seg {
+            rusternetes_common::schema_validation::PathSeg::Key(k) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(k);
+            }
+            rusternetes_common::schema_validation::PathSeg::Index(i) => {
+                out.push_str(&format!("[{}]", i));
+            }
+        }
+    }
+    out
+}
+
+fn render_issue_message(
+    path: &[rusternetes_common::schema_validation::PathSeg],
+    msg: &str,
+) -> String {
+    let p = render_full_path(path);
+    if p.is_empty() || msg.starts_with(&p) {
+        msg.to_string()
+    } else {
+        format!("{}: {}", p, msg)
+    }
 }
 
 /// Schema-only portion of CR validation, kept as a separate helper so the
