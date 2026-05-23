@@ -303,9 +303,13 @@ pub async fn normalize_content_type_middleware(
         // For patch content types, save the original in a custom header before
         // normalizing to application/json (which Axum's Json extractor requires).
         // Patch handlers check X-Original-Content-Type or Content-Type to determine patch type.
+        // SSA apply-patch+json shares the JSON envelope so it is normalised the same
+        // way; apply-patch+yaml is left untouched because its body is YAML — the SSA
+        // handler decodes it with serde_yaml directly.
         if content_type.starts_with("application/strategic-merge-patch+json")
             || content_type.starts_with("application/merge-patch+json")
             || content_type.starts_with("application/json-patch+json")
+            || content_type.starts_with("application/apply-patch+json")
         {
             if let Ok(hv) = axum::http::HeaderValue::from_str(&content_type) {
                 request.headers_mut().insert(

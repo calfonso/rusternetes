@@ -74,12 +74,20 @@ impl ApplyOptions {
 }
 
 /// Outcome of a server-side apply against an existing or new object.
+///
+/// `ConfigMap` carries ~500 bytes inline (TypeMeta + ObjectMeta + ManagedFields
+/// vec headers), so [`ApplyOutcome::Applied`] boxes it to keep the enum small —
+/// otherwise every `Conflicts` variant carries that dead weight and clippy
+/// (rightly) trips `large_enum_variant`.
 #[derive(Debug)]
 pub enum ApplyOutcome {
     /// The merge succeeded. The contained ConfigMap is ready for persistence.
     /// `created` is true when there was no previous object — the caller
     /// should return HTTP 201; otherwise HTTP 200.
-    Applied { object: ConfigMap, created: bool },
+    Applied {
+        object: Box<ConfigMap>,
+        created: bool,
+    },
 
     /// One or more leaves are owned by other managers and `force` was not
     /// set. The caller should translate this into HTTP 409 with an Apply
@@ -211,7 +219,7 @@ pub fn apply_configmap(
             &previously_owned_by_applier,
             opts.force,
         );
-        all_conflicts.extend(outcome.conflicts.into_iter());
+        all_conflicts.extend(outcome.conflicts);
         for p in outcome.claimed.iter() {
             all_claimed.insert(p.clone());
         }
@@ -249,7 +257,7 @@ pub fn apply_configmap(
     let object: ConfigMap = serde_json::from_value(working)
         .map_err(|e| ApplyError::Internal(format!("decode merged ConfigMap: {e}")))?;
     Ok(ApplyOutcome::Applied {
-        object,
+        object: Box::new(object),
         created: false,
     })
 }
@@ -289,7 +297,7 @@ fn finalise_initial_apply(
     let object: ConfigMap = serde_json::from_value(working)
         .map_err(|e| ApplyError::Internal(format!("decode applied ConfigMap: {e}")))?;
     Ok(ApplyOutcome::Applied {
-        object,
+        object: Box::new(object),
         created: true,
     })
 }

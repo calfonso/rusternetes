@@ -732,9 +732,13 @@ async fn apply_configmap_ssa(
 
     match outcome {
         crate::ssa::ApplyOutcome::Applied {
-            mut object,
+            object: boxed,
             created,
         } => {
+            // The SSA module returns the object boxed to keep ApplyOutcome
+            // small (clippy::large_enum_variant); unbox once here so the rest
+            // of the handler can treat it as a plain ConfigMap value.
+            let mut object: ConfigMap = *boxed;
             // Ensure path-derived metadata is set even when the merge
             // started from a brand-new body.
             object.metadata.name = name.clone();
