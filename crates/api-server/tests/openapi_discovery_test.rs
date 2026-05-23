@@ -112,12 +112,10 @@ async fn test_openapi_v2_shape() {
 /// publishes one definition per built-in GVK via kube-openapi's
 /// `pkg/builder` — see `staging/src/k8s.io/kube-openapi/pkg/builder/openapi.go`.
 ///
-/// Today rusternetes only publishes baseline `ObjectMeta` / `OwnerReference`
-/// + CRD-derived schemas; the built-in core/v1 types are absent. Tracking
-/// the gap explicitly here so a future "publish built-in schemas" PR has a
-/// failing test to flip green.
+/// Rusternetes publishes hand-written stubs for the most commonly referenced
+/// built-in GVKs (Pod, Service, Node, Deployment, ...). See
+/// `core_v1_builtin_definitions` in `crates/api-server/src/handlers/openapi.rs`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: api-server does not publish io.k8s.api.core.v1.Pod in /openapi/v2 definitions (built-in GVK schemas not yet generated)"]
 async fn test_openapi_v2_shape_includes_core_pod_definition() {
     let router = spawn_router();
     let (status, body) = get_json(router, "/openapi/v2").await;

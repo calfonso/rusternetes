@@ -1250,7 +1250,9 @@ async fn delete_crd_drops_definition_from_published_openapi_v2() {
 ///
 /// Supporting structural check — baseline definitions
 /// (`io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta`,
-/// `io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference`) are always
+/// `io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference`, and the
+/// `io.k8s.api.<group>.<version>.<Kind>` built-in GVK stubs upstream
+/// kube-apiserver publishes via `kube-openapi/pkg/builder`) are always
 /// present; CRD-derived definitions must NOT appear unsolicited.
 #[tokio::test]
 async fn openapi_v2_baseline_has_no_crd_definitions() {
@@ -1258,9 +1260,11 @@ async fn openapi_v2_baseline_has_no_crd_definitions() {
     let v2 = get_openapi_v2(state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     // No entry should look like a CRD key (reverse-domain group + version + kind).
+    // Both `io.k8s.apimachinery.*` (shared meta types) and `io.k8s.api.*`
+    // (built-in GVKs like Pod/Deployment/Job) are baseline and not CRD-derived.
     let crd_like: Vec<&String> = defs
         .keys()
-        .filter(|k| !k.starts_with("io.k8s.apimachinery."))
+        .filter(|k| !k.starts_with("io.k8s.apimachinery.") && !k.starts_with("io.k8s.api."))
         .collect();
     assert!(
         crd_like.is_empty(),
