@@ -697,23 +697,44 @@ mod tests {
     // automatically when the `ContainerAsync` handle is dropped at the end of
     // the test, so no manual cleanup is required.
     //
+    // On runners without a Docker socket (e.g. the ARC self-hosted runners
+    // that back this repo's `cargo nextest` workflow), `start_etcd` returns
+    // `None` and the test prints a skip message and exits 0 instead of
+    // panicking. Don't promote this back to `expect("...")` — that's exactly
+    // the regression that turned PR #746's nextest job red.
+    //
     // The image and CLI flags match what `compose.yml` runs in production
     // (`quay.io/coreos/etcd:v3.5.17`, single-node, insecure client listener).
 
     use testcontainers::{
         core::{IntoContainerPort, WaitFor},
         runners::AsyncRunner,
-        GenericImage, ImageExt,
+        GenericImage, ImageExt, TestcontainersError,
     };
+
+    /// Detects whether the host has a usable Docker (or Docker-compatible)
+    /// socket. We treat any `Client(Init(...))` failure from testcontainers
+    /// as "no Docker" — that variant wraps the bollard connect error, which
+    /// fires both for a missing `/var/run/docker.sock` and for a refused
+    /// connection to a custom `DOCKER_HOST`. Either way the test cannot run.
+    fn is_docker_unavailable(err: &TestcontainersError) -> bool {
+        matches!(
+            err,
+            TestcontainersError::Client(testcontainers::core::client::ClientError::Init(_))
+        )
+    }
 
     /// Boot a single-node etcd container and return an `EtcdStorage` pointing
     /// at it, alongside the container handle which must be kept alive for the
     /// duration of the test (drop = teardown).
-    async fn start_etcd() -> (testcontainers::ContainerAsync<GenericImage>, EtcdStorage) {
+    ///
+    /// Returns `None` when Docker isn't reachable so callers can soft-skip
+    /// rather than fail the whole nextest job on Docker-less runners.
+    async fn start_etcd() -> Option<(testcontainers::ContainerAsync<GenericImage>, EtcdStorage)> {
         // `quay.io/coreos/etcd` listens on 2379 for client gRPC and prints
         // "ready to serve client requests" once the listener is up. We bind
         // 0.0.0.0 so the port mapping works from the host network.
-        let container = GenericImage::new("quay.io/coreos/etcd", "v3.5.17")
+        let result = GenericImage::new("quay.io/coreos/etcd", "v3.5.17")
             .with_exposed_port(2379.tcp())
             .with_wait_for(WaitFor::message_on_stderr("ready to serve client requests"))
             .with_cmd([
@@ -724,8 +745,16 @@ mod tests {
                 "--advertise-client-urls=http://0.0.0.0:2379",
             ])
             .start()
-            .await
-            .expect("failed to start etcd test container — is Docker running?");
+            .await;
+
+        let container = match result {
+            Ok(c) => c,
+            Err(e) if is_docker_unavailable(&e) => {
+                eprintln!("skipping etcd integration test: Docker unavailable ({e})");
+                return None;
+            }
+            Err(e) => panic!("failed to start etcd test container: {e}"),
+        };
 
         let host = container
             .get_host()
@@ -741,12 +770,14 @@ mod tests {
             .await
             .expect("failed to connect to test etcd");
 
-        (container, storage)
+        Some((container, storage))
     }
 
     #[tokio::test]
     async fn test_create_and_get() {
-        let (_etcd, storage) = start_etcd().await;
+        let Some((_etcd, storage)) = start_etcd().await else {
+            return;
+        };
 
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct TestData {
