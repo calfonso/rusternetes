@@ -261,6 +261,7 @@ async fn main() -> Result<()> {
     )?;
 
     rusternetes_common::tracing::init_basic_tracing("kubelet", &runtime_config.log_level)?;
+    rusternetes_common::dump::install_panic_hook("kubelet");
 
     info!("Starting Rusternetes Kubelet");
     info!("{}", runtime_config.display());
