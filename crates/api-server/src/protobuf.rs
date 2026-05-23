@@ -5816,11 +5816,10 @@ impl ProtoRegistry {
             },
         );
         // PersistentVolumeSpec.capacity is map<string, Quantity> — skipped.
-        // persistentVolumeSource (field 2) references PersistentVolumeSource, which
-        // is not registered (one of many vendor volume sources excluded from this
-        // worker's scope) — it will decode to `{}` per the registry's fallback.
-        // PersistentVolumeSpec embeds PersistentVolumeSource at proto field
-        // 2. Upstream Go marks the embed `json:",inline"`, so individual
+        //
+        // persistentVolumeSource (field 2) references PersistentVolumeSource,
+        // which is registered separately (see `register_core_v1_remaining_nested`).
+        // Upstream Go marks the embed `json:",inline"`, so individual
         // volume-source keys (hostPath, nfs, csi, ...) live at the
         // PersistentVolumeSpec level on the JSON wire — never wrapped in
         // a `persistentVolumeSource` object. Our Rust struct mirrors that
