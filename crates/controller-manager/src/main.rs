@@ -38,7 +38,7 @@ use rusternetes_common::cloud_provider::CloudProvider;
 use rusternetes_common::leader_election::{LeaderElectionConfig, LeaderElector};
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
-use tracing::{error, info, warn, Level};
+use tracing::{error, info, warn};
 
 #[cfg(feature = "cloud-providers")]
 use rusternetes_cloud_providers;
@@ -100,17 +100,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
-    let level = match args.log_level.as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
-    };
-
-    tracing_subscriber::fmt().with_max_level(level).init();
+    rusternetes_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
 
     info!("Starting Rusternetes Controller Manager");
 

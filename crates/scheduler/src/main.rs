@@ -13,7 +13,7 @@ use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use scheduler::Scheduler;
 use std::sync::Arc;
-use tracing::{info, warn, Level};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -65,16 +65,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let level = match args.log_level.as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
-    };
-
-    tracing_subscriber::fmt().with_max_level(level).init();
+    rusternetes_common::tracing::init_basic_tracing("scheduler", &args.log_level)?;
 
     info!("Starting Rusternetes Scheduler");
 

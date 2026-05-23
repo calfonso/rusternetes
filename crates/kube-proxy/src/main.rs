@@ -6,7 +6,7 @@ use rusternetes_kube_proxy::{
 };
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
-use tracing::{info, Level};
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes-kube-proxy")]
@@ -53,16 +53,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let level = match args.log_level.as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
-    };
-
-    tracing_subscriber::fmt().with_max_level(level).init();
+    rusternetes_common::tracing::init_basic_tracing("kube-proxy", &args.log_level)?;
 
     let storage_config = match args.storage_backend.as_str() {
         #[cfg(feature = "sqlite")]
