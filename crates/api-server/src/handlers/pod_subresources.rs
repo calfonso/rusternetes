@@ -1070,19 +1070,28 @@ pub async fn create_binding(
     // Binding is created. Node labels win over pod-level labels. Subdomains
     // of `topology.kubernetes.io` and other keys under that domain are not
     // copied.
-    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, node_name);
-    if let Ok(node) = state
-        .storage
-        .get::<rusternetes_common::resources::Node>(&node_key)
-        .await
-    {
-        if let Some(node_labels) = node.metadata.labels.as_ref() {
-            const ZONE_KEY: &str = "topology.kubernetes.io/zone";
-            const REGION_KEY: &str = "topology.kubernetes.io/region";
-            for key in [ZONE_KEY, REGION_KEY] {
-                if let Some(value) = node_labels.get(key) {
-                    let labels = pod.metadata.labels.get_or_insert_with(Default::default);
-                    labels.insert(key.to_string(), value.clone());
+    //
+    // Gated by the `PodTopologyLabelsAdmission` feature gate (Beta + default
+    // on at v1.35; flipped process-wide via `rusternetes_common::feature_gates`).
+    // When the gate is off the plugin is a no-op — exactly the behaviour
+    // upstream's `Plugin.Admit` exhibits when `p.enabled == false`.
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::PodTopologyLabelsAdmission,
+    ) {
+        let node_key = rusternetes_storage::build_key("nodes", None::<&str>, node_name);
+        if let Ok(node) = state
+            .storage
+            .get::<rusternetes_common::resources::Node>(&node_key)
+            .await
+        {
+            if let Some(node_labels) = node.metadata.labels.as_ref() {
+                const ZONE_KEY: &str = "topology.kubernetes.io/zone";
+                const REGION_KEY: &str = "topology.kubernetes.io/region";
+                for key in [ZONE_KEY, REGION_KEY] {
+                    if let Some(value) = node_labels.get(key) {
+                        let labels = pod.metadata.labels.get_or_insert_with(Default::default);
+                        labels.insert(key.to_string(), value.clone());
+                    }
                 }
             }
         }
