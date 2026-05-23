@@ -31,15 +31,13 @@
 //!   the cadence window (the handler sends an immediate bookmark when there
 //!   are no initial events; see `handlers/watch.rs::322-342`).
 //! - `ERROR`: upstream emits a streamed `{type:"ERROR", object:Status}`
-//!   envelope when the watch backend reports an unrecoverable failure
-//!   mid-stream (e.g. compaction observed *after* the stream opened).
-//!   Rusternetes currently surfaces the only equivalent (stale-RV) as an
-//!   HTTP-level **410 Gone** with a `Status` body *before* the stream
-//!   starts (see `integration_watch_rv_test.rs::
-//!   test_watch_resource_version_stale_returns_410`); no in-stream `ERROR`
-//!   frame is ever produced. The `WatchEventType::Error` variant exists in
-//!   the source but has no call sites. The ERROR-envelope scenario is
-//!   `#[ignore]`'d until a code path emits it.
+//!   envelope when the watch backend reports an unrecoverable failure —
+//!   the canonical case being a `resourceVersion` that is below the
+//!   cacher's earliest available revision (compaction). Rusternetes
+//!   mirrors this: a compacted RV on `?watch=true` returns HTTP 200 with
+//!   a single streamed `{type:"ERROR", object:Status{code:410,
+//!   reason:"Expired"}}` envelope, then EOF. See
+//!   `handlers/watch.rs::build_watch_error_response`.
 //!
 //! Each scenario wraps frame collection in `tokio::time::timeout(5s)` so a
 //! handler regression that hangs the stream surfaces as a failed test, not
@@ -490,24 +488,30 @@ async fn watch_envelope_bookmark_carries_resource_version() {
 
 /// `ERROR` envelope: `{"type":"ERROR","object":<metav1.Status>}`.
 ///
-/// Upstream produces a streamed `ERROR` event when the watch encounters an
-/// unrecoverable backend failure *after* the stream has opened. Rusternetes
-/// instead surfaces the only equivalent path — a stale (compacted) resource
-/// version — as an HTTP-level **410 Gone** response with a `Status` body
-/// before any frames are written (handlers/watch.rs::187-204, pinned by
-/// `integration_watch_rv_test.rs::test_watch_resource_version_stale_returns_410`).
-/// `WatchEventType::Error` is defined but has zero call sites in the
-/// handler. Until a code path emits an in-stream ERROR frame this scenario
-/// has nothing to assert against.
+/// Upstream emits a streamed `ERROR` event whenever the watch backend reports
+/// an unrecoverable failure (e.g. the requested `resourceVersion` is below
+/// the cacher's earliest available revision — compaction observed *after*
+/// the stream opened, or detected at `Watch()`-time but reported via the
+/// event channel rather than the HTTP status). The handler at
+/// `staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go::serveWatch`
+/// writes the 200 status + headers before the cacher reports anything, so
+/// the fatal condition is delivered as a `watch.Event{Type: Error,
+/// Object: NewResourceExpired(...).Status()}` frame followed by stream
+/// close.
+///
+/// Rusternetes mirrors this contract: a stale (compacted) `resourceVersion`
+/// on a `?watch=true` request returns HTTP 200 with a single streamed
+/// `{type:"ERROR", object:Status{code:410, reason:"Expired", …}}` envelope,
+/// then EOF. See `handlers/watch.rs::resource_expired_status` /
+/// `build_watch_error_response`.
 #[tokio::test]
-#[ignore = "blocked on issue #TBD: rusternetes does not emit streamed ERROR watch envelopes (stale-RV surfaces as HTTP 410 Gone before any frame is written)"]
 async fn watch_envelope_error_carries_status() {
     let (mem, router) = spawn_router();
 
     // Mark every revision up to 999 as compacted, then ask to watch from "100".
     mem.compact_to(999);
 
-    let (_status, events) = collect_watch_events(
+    let (status, events) = collect_watch_events(
         router,
         &format!(
             "/api/v1/namespaces/{}/configmaps?watch=true&resourceVersion=100",
@@ -517,6 +521,12 @@ async fn watch_envelope_error_carries_status() {
         Duration::from_millis(500),
     )
     .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "watch with compacted RV must return HTTP 200 + in-stream ERROR \
+         envelope (not a pre-stream HTTP 410), upstream parity"
+    );
 
     let error = events
         .iter()

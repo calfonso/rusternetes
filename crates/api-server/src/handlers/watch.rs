@@ -11,7 +11,7 @@ use axum::{
 use futures::StreamExt;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    types::ObjectMeta,
+    types::{ObjectMeta, Status},
     Error, Result,
 };
 use rusternetes_storage::{build_prefix, Storage, WatchEvent};
@@ -184,11 +184,20 @@ where
         .and_then(|rv| rv.parse::<i64>().ok())
         .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
 
-    // If the requested resourceVersion has been compacted, return 410 Gone with
-    // reason=Expired. Upstream: staging/src/k8s.io/apiserver/pkg/storage/cacher/
-    // cacher.go::Watch returns errs.NewResourceExpired when the requested RV is
-    // below the cacher's earliest available revision; kube-apiserver maps this
-    // to HTTP 410 with Status{Reason:"Expired"}.
+    // If the requested resourceVersion has been compacted, emit a streamed
+    // ERROR envelope (HTTP 200 + `{type:"ERROR", object:Status{Code:410,
+    // Reason:"Expired"}}`) instead of returning HTTP 410 Gone.
+    //
+    // Upstream parity: `staging/src/k8s.io/apiserver/pkg/storage/cacher/
+    // cacher.go::Watch` returns `errs.NewResourceExpired(...)` when the
+    // requested RV is below the cacher's earliest available revision. For
+    // `?watch=true`, `endpoints/handlers/watch.go::serveWatch` has already
+    // written the 200 status + chunked headers by the time `cacher.Watch`
+    // can report the failure, so the only way to deliver it is an in-stream
+    // `watch.Event{Type: Error, Object: NewResourceExpired(...).Status()}`
+    // frame. Mirroring this is required by the watch-envelope conformance
+    // contract (`tests/watch_event_envelope_test.rs::
+    // watch_envelope_error_carries_status`).
     if let Some(since_rev) = replay_revision {
         if state
             .storage
@@ -196,10 +205,7 @@ where
             .await
             .unwrap_or(false)
         {
-            return Err(Error::Gone(format!(
-                "too old resource version: {} (current: {})",
-                since_rev, current_rev
-            )));
+            return build_watch_error_response(resource_expired_status(since_rev, current_rev));
         }
     }
 
@@ -691,11 +697,8 @@ where
         .and_then(|rv| rv.parse::<i64>().ok())
         .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
 
-    // If the requested resourceVersion has been compacted, return 410 Gone with
-    // reason=Expired. Upstream: staging/src/k8s.io/apiserver/pkg/storage/cacher/
-    // cacher.go::Watch returns errs.NewResourceExpired when the requested RV is
-    // below the cacher's earliest available revision; kube-apiserver maps this
-    // to HTTP 410 with Status{Reason:"Expired"}.
+    // Compacted-RV → streamed ERROR envelope. See `watch_namespaced` for the
+    // detailed upstream rationale; same contract for cluster-scoped watches.
     if let Some(since_rev) = replay_revision {
         if state
             .storage
@@ -703,10 +706,7 @@ where
             .await
             .unwrap_or(false)
         {
-            return Err(Error::Gone(format!(
-                "too old resource version: {} (current: {})",
-                since_rev, current_rev
-            )));
+            return build_watch_error_response(resource_expired_status(since_rev, current_rev));
         }
     }
 
@@ -1405,6 +1405,53 @@ pub struct BookmarkObject {
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
     pub metadata: ObjectMeta,
+}
+
+/// Build a streamed-ERROR watch response: HTTP 200 + a single
+/// `{type:"ERROR", object:<metav1.Status>}` frame, then close the stream.
+///
+/// Upstream parity: `staging/src/k8s.io/apiserver/pkg/endpoints/handlers/
+/// watch.go::serveWatch`. The watch handler writes a 200 status + headers
+/// *before* the watch backend reports anything, so once the stream is open
+/// the only way to deliver a fatal condition (compacted RV, cache
+/// invalidation, etc.) is an in-stream `watch.Event{Type: Error,
+/// Object: NewResourceExpired(...).Status()}` frame. Upstream
+/// `cacher.cacheWatcher.process` emits exactly this when the requested
+/// `resourceVersion` is below the cacher's earliest available revision.
+///
+/// We mirror that contract: even though the compacted-RV check could
+/// produce an HTTP 410 (and used to), upstream clients treat
+/// `?watch=true` as "always 200 + stream of events" — so we must surface
+/// the failure as a streamed ERROR envelope.
+fn build_watch_error_response(status_obj: Status) -> Result<Response> {
+    let envelope = K8sWatchEvent {
+        event_type: WatchEventType::Error,
+        object: status_obj,
+    };
+    let json = serde_json::to_string(&envelope)
+        .map_err(|e| Error::Internal(format!("Failed to serialize ERROR envelope: {}", e)))?;
+    let body = format!("{}\n", json);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-cache, private")
+        .header(header::TRANSFER_ENCODING, "chunked")
+        .body(Body::from(body))
+        .map_err(|e| Error::Internal(format!("Failed to build ERROR response: {}", e)))
+}
+
+/// Build the `metav1.Status` carried in an ERROR envelope for a compacted
+/// resourceVersion. Upstream emits `apierrors.NewResourceExpired(...)`
+/// which produces `Status{Code: 410, Reason: "Expired",
+/// Message: "too old resource version: X (Y)"}`. We mirror the wording so
+/// client-go's `errors.IsResourceExpired` reflect-based check still works.
+fn resource_expired_status(since_rev: i64, current_rev: i64) -> Status {
+    Status::failure(
+        format!("too old resource version: {} ({})", since_rev, current_rev),
+        "Expired",
+        410,
+    )
 }
 
 // Implement for common resource types
