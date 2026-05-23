@@ -733,17 +733,11 @@ async fn test_pod_update_ephemeral_containers() {
 /// are removed (and the pod scheduled), the same fields become immutable.
 ///
 /// Upstream `pkg/apis/core/validation/validation.go:5786-5828` implements
-/// this gated-pod nodeSelector / nodeAffinity mutation surface. We have
-/// not yet ported it — see `TODO(rusternetes)` in
-/// `crates/common/src/validation/pod.rs::validate_pod_spec_update`. The
-/// broader immutability fence in this PR is strict (rejects all gated-pod
-/// scheduling-directive mutations), which is the safer default until the
-/// gated-pod relaxation lands.
+/// this gated-pod nodeSelector / nodeAffinity mutation surface. Ported in
+/// `crates/common/src/validation/pod.rs::validate_pod_spec_update` — see
+/// the `pod_is_gated` block (and the `validate_node_selector_mutation` /
+/// `validate_node_affinity_mutation` helpers).
 #[tokio::test]
-#[ignore = "gated-pod nodeSelector/nodeAffinity mutation relaxation \
-            (validation.go:5786-5828) deferred until rusternetes ships a \
-            scheduling-gates feature; the broad ValidatePodUpdate fence is \
-            strictly more conservative for now"]
 async fn test_mutable_pod_scheduling_directives() {
     let (_, router) = spawn_router();
     let ns = "mutable-pod-scheduling-directives";

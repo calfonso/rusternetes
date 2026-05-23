@@ -9,19 +9,20 @@
 //! * **Update-side** ([`validate_pod_spec_update`]) — composes the four
 //!   upstream pre-checks (container count, tolerations additions-only,
 //!   schedulingGates deletions-only, terminationGracePeriodSeconds
-//!   immutability with the negative→1 relaxation) and a munge+DeepEqual
-//!   fence that catches everything else.
+//!   immutability with the negative→1 relaxation), the gated-pod
+//!   `nodeSelector` / `nodeAffinity` relaxation (KEP-3521), and a
+//!   munge+DeepEqual fence that catches everything else.
 //!
 //! NOT covered (intentionally deferred):
-//! - Gated-pod `nodeSelector` / `nodeAffinity` mutation rules
-//!   (`validation.go:5786-5828`) — only relevant once rusternetes ships a
-//!   real scheduling-gates feature. The broad fence below is strictly more
-//!   conservative (no gated-pod mutations are permitted at all).
 //! - ActiveDeadlineSeconds precise semantics — the api-server handler
 //!   enforces these directly (see `crates/api-server/src/handlers/pod.rs`)
 //!   because the error wording is checked by tests pinned at that layer.
 
-use crate::resources::pod::{PodDNSConfig, PodSchedulingGate, PodSpec, Toleration};
+use std::collections::HashMap;
+
+use crate::resources::pod::{
+    NodeAffinity, NodeSelectorTerm, PodDNSConfig, PodSchedulingGate, PodSpec, Toleration,
+};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_subdomain, is_dns1123_subdomain_with_underscore};
 
@@ -230,6 +231,140 @@ pub fn validate_termination_grace_period_immutable(
     errs
 }
 
+/// Mirrors upstream `validateNodeSelectorMutation` (validation.go:9311-9322).
+///
+/// Additions to `spec.nodeSelector` are allowed for gated pods. Existing
+/// keys may not be deleted or mutated.
+pub fn validate_node_selector_mutation(
+    path: &Path,
+    new_selector: Option<&HashMap<String, String>>,
+    old_selector: Option<&HashMap<String, String>>,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let empty = HashMap::new();
+    let old = old_selector.unwrap_or(&empty);
+    let new = new_selector.unwrap_or(&empty);
+    for (k, v1) in old {
+        match new.get(k) {
+            Some(v2) if v2 == v1 => {}
+            _ => {
+                errs.push(Error::invalid(
+                    path,
+                    format!("{:?}", new),
+                    "only additions to spec.nodeSelector are allowed (no mutations or deletions)",
+                ));
+                return errs;
+            }
+        }
+    }
+    errs
+}
+
+/// Mirrors upstream `validateNodeSelectorTermHasOnlyAdditions`
+/// (validation.go:9354-9380). Returns `true` iff `new_term` is `old_term`
+/// extended only with additional `matchExpressions` / `matchFields`
+/// entries — no deletions or in-place mutations to existing entries.
+pub fn validate_node_selector_term_has_only_additions(
+    new_term: &NodeSelectorTerm,
+    old_term: &NodeSelectorTerm,
+) -> bool {
+    let old_me = old_term.match_expressions.as_deref().unwrap_or(&[]);
+    let old_mf = old_term.match_fields.as_deref().unwrap_or(&[]);
+    let new_me = new_term.match_expressions.as_deref().unwrap_or(&[]);
+    let new_mf = new_term.match_fields.as_deref().unwrap_or(&[]);
+
+    // If old term was empty, the new term must also be empty (upstream
+    // refuses to let an empty term gain any requirements at all, because
+    // an empty term matches every node and adding requirements would
+    // narrow the match — the gated-pod relaxation is additions only and
+    // here "addition" means "more constraints on the same term").
+    if old_me.is_empty() && old_mf.is_empty() && (!new_me.is_empty() || !new_mf.is_empty()) {
+        return false;
+    }
+
+    // matchExpressions: additions only.
+    if !old_me.is_empty() {
+        if new_me.len() < old_me.len() {
+            return false;
+        }
+        if new_me[..old_me.len()] != *old_me {
+            return false;
+        }
+    }
+    // matchFields: additions only.
+    if !old_mf.is_empty() {
+        if new_mf.len() < old_mf.len() {
+            return false;
+        }
+        if new_mf[..old_mf.len()] != *old_mf {
+            return false;
+        }
+    }
+    true
+}
+
+/// Mirrors upstream `validateNodeAffinityMutation` (validation.go:9324-9352).
+///
+/// For gated pods, `spec.affinity.nodeAffinity` may be mutated under these
+/// rules:
+/// - If `oldNodeAffinity` is nil or has no
+///   `requiredDuringSchedulingIgnoredDuringExecution`, anything may be set.
+/// - If `requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms`
+///   was non-empty in `old`, the new list must have the same length and
+///   each term must be an "additions-only" extension of the old term
+///   (see [`validate_node_selector_term_has_only_additions`]).
+pub fn validate_node_affinity_mutation(
+    node_affinity_path: &Path,
+    new_node_affinity: Option<&NodeAffinity>,
+    old_node_affinity: Option<&NodeAffinity>,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    // If old was nil or had no required-DSIDE, anything goes.
+    let old_required = match old_node_affinity {
+        Some(na) => na
+            .required_during_scheduling_ignored_during_execution
+            .as_ref(),
+        None => None,
+    };
+    let Some(old_required) = old_required else {
+        return errs;
+    };
+
+    let old_terms = &old_required.node_selector_terms;
+    let new_terms: &[NodeSelectorTerm] = new_node_affinity
+        .and_then(|na| {
+            na.required_during_scheduling_ignored_during_execution
+                .as_ref()
+                .map(|ns| ns.node_selector_terms.as_slice())
+        })
+        .unwrap_or(&[]);
+
+    let terms_path = node_affinity_path
+        .child("requiredDuringSchedulingIgnoredDuringExecution")
+        .child("nodeSelectorTerms");
+
+    if !old_terms.is_empty() && old_terms.len() != new_terms.len() {
+        errs.push(Error::invalid(
+            &terms_path,
+            format!("{:?}", new_terms),
+            "no additions/deletions to non-empty NodeSelectorTerms list are allowed",
+        ));
+        return errs;
+    }
+
+    for (i, old_term) in old_terms.iter().enumerate() {
+        let new_term = &new_terms[i];
+        if !validate_node_selector_term_has_only_additions(new_term, old_term) {
+            errs.push(Error::invalid(
+                &terms_path.index(i),
+                format!("{:?}", new_term),
+                "only additions are allowed (no mutations or deletions)",
+            ));
+        }
+    }
+    errs
+}
+
 /// Top-level immutability fence. Composes the four pre-checks above plus a
 /// munge+DeepEqual fence that catches any other forbidden field changes.
 /// Mirrors `ValidatePodUpdate` (validation.go:5695-5838).
@@ -302,6 +437,72 @@ pub fn validate_pod_spec_update(
     munged.scheduling_gates = old.scheduling_gates.clone();
     if is_ephemeral_subresource {
         munged.ephemeral_containers = old.ephemeral_containers.clone();
+    }
+
+    // KEP-3521: gated-pod nodeSelector / nodeAffinity relaxation.
+    // Mirrors upstream validation.go:5785-5828. A pod is "gated" iff the
+    // OLD spec has at least one entry in spec.schedulingGates — this matches
+    // upstream's `podIsGated := len(oldPod.Spec.SchedulingGates) > 0`.
+    let pod_is_gated = old.scheduling_gates.as_ref().is_some_and(|g| !g.is_empty());
+    if pod_is_gated {
+        // Additions to spec.nodeSelector are allowed for gated pods.
+        if munged.node_selector != old.node_selector {
+            let errs = validate_node_selector_mutation(
+                &spec.child("nodeSelector"),
+                munged.node_selector.as_ref(),
+                old.node_selector.as_ref(),
+            );
+            if let Some(e) = errs.first() {
+                return Err(e.to_string());
+            }
+            munged.node_selector = old.node_selector.clone();
+        }
+
+        // Validate node-affinity mutations.
+        let old_node_affinity = old.affinity.as_ref().and_then(|a| a.node_affinity.as_ref());
+        let munged_node_affinity = munged
+            .affinity
+            .as_ref()
+            .and_then(|a| a.node_affinity.as_ref());
+
+        let na_equal = serde_json::to_value(old_node_affinity).ok()
+            == serde_json::to_value(munged_node_affinity).ok();
+        if !na_equal {
+            let errs = validate_node_affinity_mutation(
+                &spec.child("affinity").child("nodeAffinity"),
+                munged_node_affinity,
+                old_node_affinity,
+            );
+            if let Some(e) = errs.first() {
+                return Err(e.to_string());
+            }
+            // Re-munge so the trailing DeepEqual fence ignores this
+            // legitimate mutation. Mirrors upstream's four-way switch
+            // (validation.go:5807-5821).
+            let munged_has_affinity = munged.affinity.is_some();
+            let old_pod_has_affinity = old.affinity.is_some();
+            let munged_has_other_affinity = munged
+                .affinity
+                .as_ref()
+                .is_some_and(|a| a.pod_affinity.is_some() || a.pod_anti_affinity.is_some());
+
+            if !munged_has_affinity && old_node_affinity.is_none() {
+                // already effectively nil, no change needed
+            } else if !munged_has_affinity && old_node_affinity.is_some() {
+                munged.affinity = Some(crate::resources::pod::Affinity {
+                    node_affinity: old_node_affinity.cloned(),
+                    pod_affinity: None,
+                    pod_anti_affinity: None,
+                });
+            } else if munged_has_affinity && !old_pod_has_affinity && !munged_has_other_affinity {
+                // The mutation introduced only a NodeAffinity, and old had
+                // no Affinity at all — drop munged.affinity entirely so
+                // the DeepEqual matches.
+                munged.affinity = None;
+            } else if let Some(a) = munged.affinity.as_mut() {
+                a.node_affinity = old_node_affinity.cloned();
+            }
+        }
     }
 
     let mut munged_json = serde_json::to_value(&munged).unwrap_or_default();
@@ -610,5 +811,128 @@ mod tests {
         let p = Path::new("spec").child("terminationGracePeriodSeconds");
         let errs = validate_termination_grace_period_immutable(Some(30), None, &p);
         assert!(errs.is_empty(), "client-omitted TGPS must not be rejected");
+    }
+
+    // ----- gated-pod nodeSelector / nodeAffinity relaxation (KEP-3521) -----
+
+    use crate::resources::pod::{
+        NodeAffinity as NA, NodeSelector as NS, NodeSelectorRequirement as NSR,
+        NodeSelectorTerm as NST,
+    };
+
+    fn req(key: &str, op: &str, vals: &[&str]) -> NSR {
+        NSR {
+            key: key.to_string(),
+            operator: op.to_string(),
+            values: if vals.is_empty() {
+                None
+            } else {
+                Some(vals.iter().map(|s| s.to_string()).collect())
+            },
+        }
+    }
+
+    fn term(me: Vec<NSR>) -> NST {
+        NST {
+            match_expressions: if me.is_empty() { None } else { Some(me) },
+            match_fields: None,
+        }
+    }
+
+    fn na_required(terms: Vec<NST>) -> NA {
+        NA {
+            required_during_scheduling_ignored_during_execution: Some(NS {
+                node_selector_terms: terms,
+            }),
+            preferred_during_scheduling_ignored_during_execution: None,
+        }
+    }
+
+    #[test]
+    fn node_selector_addition_is_allowed() {
+        let p = Path::new("spec").child("nodeSelector");
+        let mut old = HashMap::new();
+        old.insert("foo".to_string(), "bar".to_string());
+        let mut new = old.clone();
+        new.insert("baz".to_string(), "qux".to_string());
+        assert!(validate_node_selector_mutation(&p, Some(&new), Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn node_selector_addition_from_empty_is_allowed() {
+        let p = Path::new("spec").child("nodeSelector");
+        let mut new = HashMap::new();
+        new.insert("foo".to_string(), "bar".to_string());
+        assert!(validate_node_selector_mutation(&p, Some(&new), None).is_empty());
+    }
+
+    #[test]
+    fn node_selector_deletion_is_rejected() {
+        let p = Path::new("spec").child("nodeSelector");
+        let mut old = HashMap::new();
+        old.insert("foo".to_string(), "bar".to_string());
+        old.insert("a".to_string(), "b".to_string());
+        let mut new = HashMap::new();
+        new.insert("foo".to_string(), "bar".to_string());
+        let errs = validate_node_selector_mutation(&p, Some(&new), Some(&old));
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0]
+            .to_string()
+            .contains("only additions to spec.nodeSelector are allowed"));
+    }
+
+    #[test]
+    fn node_selector_value_mutation_is_rejected() {
+        let p = Path::new("spec").child("nodeSelector");
+        let mut old = HashMap::new();
+        old.insert("foo".to_string(), "bar".to_string());
+        let mut new = HashMap::new();
+        new.insert("foo".to_string(), "baz".to_string());
+        let errs = validate_node_selector_mutation(&p, Some(&new), Some(&old));
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn node_affinity_nil_old_allows_anything() {
+        let p = Path::new("spec").child("affinity").child("nodeAffinity");
+        let new = na_required(vec![term(vec![req("a", "In", &["1"])])]);
+        assert!(validate_node_affinity_mutation(&p, Some(&new), None).is_empty());
+    }
+
+    #[test]
+    fn node_affinity_term_addition_inside_term_is_allowed() {
+        // Same number of terms; existing matchExpressions preserved as prefix.
+        let p = Path::new("spec").child("affinity").child("nodeAffinity");
+        let old = na_required(vec![term(vec![req("a", "In", &["1"])])]);
+        let new = na_required(vec![term(vec![
+            req("a", "In", &["1"]),
+            req("b", "In", &["2"]),
+        ])]);
+        assert!(validate_node_affinity_mutation(&p, Some(&new), Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn node_affinity_term_count_change_is_rejected() {
+        let p = Path::new("spec").child("affinity").child("nodeAffinity");
+        let old = na_required(vec![term(vec![req("a", "In", &["1"])])]);
+        let new = na_required(vec![
+            term(vec![req("a", "In", &["1"])]),
+            term(vec![req("b", "In", &["2"])]),
+        ]);
+        let errs = validate_node_affinity_mutation(&p, Some(&new), Some(&old));
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0]
+            .to_string()
+            .contains("no additions/deletions to non-empty NodeSelectorTerms list"));
+    }
+
+    #[test]
+    fn node_affinity_existing_expression_mutation_is_rejected() {
+        let p = Path::new("spec").child("affinity").child("nodeAffinity");
+        let old = na_required(vec![term(vec![req("a", "In", &["1"])])]);
+        let new = na_required(vec![term(vec![req("a", "In", &["2"])])]);
+        let errs = validate_node_affinity_mutation(&p, Some(&new), Some(&old));
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].to_string().contains("only additions are allowed"));
     }
 }
