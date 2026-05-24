@@ -287,35 +287,20 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
         <thead>
           <tr>
             <th>Dockerfile</th>
-            <th>Binary</th>
+            <th>Binary / Target</th>
             <th>Description</th>
           </tr>
         </thead>
         <tbody>
           <tr>
-            <td><code>Dockerfile.api-server</code></td>
-            <td><code>api-server</code></td>
-            <td>Axum HTTPS REST API</td>
+            <td><code>Dockerfile.services</code></td>
+            <td><code>api-server</code>, <code>scheduler</code>, <code>controller-manager</code>, <code>kubelet</code>, <code>kube-proxy</code></td>
+            <td>Shared multi-stage builder. Compose stacks pick the binary with <code>target: &lt;name&gt;</code>; one cargo invocation builds all five so dependency compile time is paid once.</td>
           </tr>
           <tr>
-            <td><code>Dockerfile.scheduler</code></td>
-            <td><code>scheduler</code></td>
-            <td>Pod scheduler with filter/score plugins</td>
-          </tr>
-          <tr>
-            <td><code>Dockerfile.controller-manager</code></td>
-            <td><code>controller-manager</code></td>
-            <td>31 reconciliation controllers</td>
-          </tr>
-          <tr>
-            <td><code>Dockerfile.kubelet</code></td>
-            <td><code>kubelet</code></td>
-            <td>Node agent with Docker runtime</td>
-          </tr>
-          <tr>
-            <td><code>Dockerfile.kube-proxy</code></td>
-            <td><code>kube-proxy</code></td>
-            <td>iptables service routing</td>
+            <td><code>Dockerfile.all-in-one</code></td>
+            <td><code>rusternetes</code></td>
+            <td>Single binary that runs api-server + scheduler + controller-manager + kubelet as concurrent tokio tasks. Used by <code>compose.all-in-one.yml</code> and <code>compose.all-in-one-redis.yml</code>.</td>
           </tr>
           <tr>
             <td><code>Dockerfile.kubectl</code></td>
@@ -325,7 +310,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
           <tr>
             <td><code>Dockerfile.rhino</code></td>
             <td><code>rhino</code></td>
-            <td>Standalone SQLite storage server</td>
+            <td>Standalone SQLite/Redis storage server (built from the adjacent <code>../rhino</code> repo)</td>
           </tr>
           <tr>
             <td><code>Dockerfile</code></td>

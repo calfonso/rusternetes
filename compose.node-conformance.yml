@@ -30,7 +30,8 @@ services:
   api-server:
     build:
       context: .
-      dockerfile: Dockerfile.api-server
+      dockerfile: Dockerfile.services
+      target: api-server
       additional_contexts:
         rhino: ../rhino
     container_name: rusternetes-nc-api-server
@@ -70,7 +71,8 @@ services:
   kubelet:
     build:
       context: .
-      dockerfile: Dockerfile.kubelet
+      dockerfile: Dockerfile.services
+      target: kubelet
       additional_contexts:
         rhino: ../rhino
     container_name: rusternetes-nc-kubelet
