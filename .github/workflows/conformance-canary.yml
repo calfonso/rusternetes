@@ -173,6 +173,13 @@ jobs:
       - name: Wait for api-server health
         timeout-minutes: 3
         run: |
+          # Runner default `bash -e` makes `OUT=$(kubectl ... 2>&1)` exit
+          # silently on the first kubectl failure: bash propagates the
+          # non-zero status of the command substitution and dies before
+          # `RC=$?` runs. The whole step died in <100ms with no output
+          # (run 26359713718, 2026-05-24). The retry loop *expects*
+          # kubectl to fail until api-server is listening, so opt out of -e.
+          set +e
           # Earlier loop piped kubectl through `grep -q ok`, which swallowed
           # every stderr line (run 26147385703 — 3 min of "waiting" with no
           # diagnostic). Surface the actual kubectl output each iteration so
