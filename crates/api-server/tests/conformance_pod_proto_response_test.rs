@@ -28,21 +28,27 @@
 //! - `crates/common/src/protobuf.rs::decode_protobuf` — round-trips the
 //!   `Unknown` envelope back into a typed Rust resource.
 //!
+//! Current status (post-2026-05-24): Pod's `NativeProtoOptIn` is
+//! deliberately disabled — the JSON-in-Unknown.raw approach breaks
+//! `client-go`'s typed proto serializer (which always tries
+//! `proto.Unmarshal(unk.Raw, target)` and never consults
+//! `Unknown.contentType`), so opting in produces
+//! `proto: illegal wireType N` decode errors at hydrophone / kubectl.
+//! See `crates/api-server/src/handlers/pod.rs::build_pod_response` for
+//! the rationale. The tests in groups (1)-(3) and (5) below are kept
+//! `#[ignore]` as the contract we want to honour once a native Pod
+//! proto encoder lands; un-ignore them then.
+//!
 //! These tests pin:
-//! 1. GET Pod with protobuf `Accept` returns a `k8s\0`-framed envelope
-//!    whose `decode_protobuf<Pod>` round-trips to the seeded value.
-//! 2. LIST Pods with protobuf `Accept` returns a `k8s\0`-framed envelope
-//!    whose `decode_protobuf<List<Pod>>` round-trips and has `kind=PodList`.
-//! 3. CREATE Pod with protobuf `Accept` returns a `k8s\0`-framed envelope
-//!    with status 201 and `decode_protobuf<Pod>` round-trips.
-//! 4. GET Pod with `Accept: application/json` keeps JSON shape (no
-//!    regression for the JSON path).
-//! 5. The `Accept: application/vnd.kubernetes.protobuf, application/json`
-//!    multi-codec header — what real `client-go` actually sends — is
-//!    honoured by emitting protobuf.
-//! 6. Non-opted-in resources (e.g. ConfigMap) still fall back to JSON.
-//! 7. WATCH requests (Accept stream=watch) do NOT get protobuf-wrapped;
-//!    chunked watch frames have their own encoder.
+//! 1. (IGNORED) GET Pod with protobuf `Accept` returns a `k8s\0`-framed envelope.
+//! 2. (IGNORED) LIST Pods with protobuf `Accept` returns a `k8s\0`-framed envelope.
+//! 3. (IGNORED) CREATE Pod with protobuf `Accept` returns a `k8s\0`-framed envelope.
+//! 4. GET Pod with `Accept: application/json` keeps JSON shape.
+//! 5. (IGNORED) `client-go` multi-codec Accept is honoured as protobuf.
+//! 6. Non-opted-in resources (e.g. ConfigMap) fall back to JSON.
+//! 7. WATCH requests (Accept stream=watch) do NOT get protobuf-wrapped.
+//! 8. Pod GET with protobuf `Accept` currently returns JSON
+//!    (regression guard for the dormant-opt-in state).
 
 use axum::{
     body::Body,
@@ -150,6 +156,7 @@ async fn http_request(
 ///   same `metadata.name`
 /// - decoded `TypeMeta` reports `apiVersion=v1` and `kind=Pod`
 #[tokio::test]
+#[ignore = "Pod NativeProtoOptIn currently disabled — wrapping JSON in Unknown.raw breaks client-go (proto: illegal wireType N). Re-enable when native Pod proto encoder lands."]
 async fn get_pod_with_protobuf_accept_returns_native_envelope() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "proto-get").await;
@@ -193,6 +200,7 @@ async fn get_pod_with_protobuf_accept_returns_native_envelope() {
 /// `k8s\0`-framed envelope that round-trips to `List<Pod>` with
 /// `kind=PodList`.
 #[tokio::test]
+#[ignore = "Pod NativeProtoOptIn currently disabled — wrapping JSON in Unknown.raw breaks client-go (proto: illegal wireType N). Re-enable when native Pod proto encoder lands."]
 async fn list_pods_with_protobuf_accept_returns_native_envelope() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "proto-list-1").await;
@@ -234,6 +242,7 @@ async fn list_pods_with_protobuf_accept_returns_native_envelope() {
 /// `POST /api/v1/namespaces/X/pods` with protobuf Accept and JSON body
 /// must return HTTP 201 + a `k8s\0`-framed envelope.
 #[tokio::test]
+#[ignore = "Pod NativeProtoOptIn currently disabled — wrapping JSON in Unknown.raw breaks client-go (proto: illegal wireType N). Re-enable when native Pod proto encoder lands."]
 async fn create_pod_with_protobuf_accept_returns_native_envelope() {
     let (_mem, router) = spawn_router();
 
@@ -312,6 +321,7 @@ async fn get_pod_with_json_accept_still_returns_json() {
 /// `staging/src/k8s.io/client-go/rest/config.go::SetKubernetesDefaults`.
 /// First media type is protobuf so the server must emit protobuf.
 #[tokio::test]
+#[ignore = "Pod NativeProtoOptIn currently disabled — wrapping JSON in Unknown.raw breaks client-go (proto: illegal wireType N). Re-enable when native Pod proto encoder lands."]
 async fn get_pod_with_client_go_default_accept_returns_protobuf() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "clientgo").await;
@@ -422,4 +432,47 @@ async fn list_pods_watch_does_not_wrap_in_single_response_protobuf() {
         "watch response must not advertise the single-response \
          protobuf Content-Type; got {ct}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Pod responses currently stay JSON despite proto Accept
+// ---------------------------------------------------------------------------
+
+/// Regression guard for the dormant-opt-in state. Until we ship a native
+/// Pod proto encoder, `build_pod_response` does NOT attach
+/// `NativeProtoOptIn`, so the response middleware leaves the JSON body
+/// alone — `Content-Type: application/json`, no `k8s\0` envelope. This
+/// is what unblocks client-go (its typed decoder uses the JSON serializer
+/// path when it sees `Content-Type: application/json`).
+///
+/// When a native Pod proto encoder lands and the opt-in goes back on,
+/// this test should be deleted (or inverted) and the four `#[ignore]`
+/// attributes above removed.
+#[tokio::test]
+async fn get_pod_with_protobuf_accept_currently_falls_back_to_json() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "dormant-optin").await;
+
+    let (status, ct, body) = http_request(
+        router,
+        Method::GET,
+        "/api/v1/namespaces/default/pods/dormant-optin",
+        Some(PROTOBUF_ACCEPT),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "status={status}");
+    assert!(
+        ct.starts_with("application/json"),
+        "Pod opt-in is dormant; response must stay JSON, got {ct}"
+    );
+    assert!(
+        !body.starts_with(PROTOBUF_MAGIC),
+        "body must NOT be wrapped in k8s\\0 envelope; first bytes={:?}",
+        &body[..body.len().min(8)]
+    );
+    let v: Value = serde_json::from_slice(&body).expect("body must parse as JSON");
+    assert_eq!(v["kind"], "Pod");
+    assert_eq!(v["metadata"]["name"], "dormant-optin");
 }

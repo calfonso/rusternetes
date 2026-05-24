@@ -761,19 +761,30 @@ pub async fn create(
 }
 
 /// Construct a Pod response with the conventional `(status, headers, body)`
-/// shape AND attach the [`crate::response::NativeProtoOptIn`] marker so the
-/// response middleware will emit a `application/vnd.kubernetes.protobuf`
-/// envelope when the client negotiated protobuf.
+/// shape.
+///
+/// We *deliberately* do NOT attach a [`crate::response::NativeProtoOptIn`]
+/// marker here. The opt-in causes the response middleware to wrap the JSON
+/// body in a `k8s\0` + `runtime.Unknown` envelope and advertise
+/// `Content-Type: application/vnd.kubernetes.protobuf`. That looks right at
+/// the envelope layer — but client-go's protobuf serializer
+/// (`staging/src/k8s.io/apimachinery/pkg/runtime/serializer/protobuf`) does
+/// NOT consult `Unknown.contentType`: it always calls `proto.Unmarshal` on
+/// `Unknown.Raw` into the target proto type. Our `Raw` carries JSON bytes,
+/// so the decoder interprets `{...}` as a protobuf wire stream and
+/// immediately errors with `proto: illegal wireType N` (run 26360429763
+/// post-#766 Pod CREATE).
+///
+/// Leaving the response as JSON keeps client-go happy: its transport sees
+/// `Content-Type: application/json`, picks the JSON serializer, decodes
+/// correctly. Re-enable the opt-in only after we ship native Pod proto
+/// marshalling that emits real proto bytes (not JSON) into `Unknown.Raw`.
 fn build_pod_response(
     status: StatusCode,
     headers: HeaderMap,
     pod: Pod,
 ) -> axum::response::Response {
-    let mut response = (status, headers, Json(pod)).into_response();
-    response
-        .extensions_mut()
-        .insert(crate::response::NativeProtoOptIn::pod());
-    response
+    (status, headers, Json(pod)).into_response()
 }
 
 /// Convert the `validate_strict_fields` warning strings into a `HeaderMap`
@@ -813,17 +824,12 @@ pub async fn get(
     let key = build_key("pods", Some(&namespace), &name);
     let pod: Pod = state.storage.get(&key).await?;
 
-    // Opt this response in to native-protobuf encoding when the client
-    // negotiated `application/vnd.kubernetes.protobuf`. The response
-    // middleware in `crate::middleware::normalize_content_type_middleware`
-    // reads the marker, encodes the JSON into a `k8s\0`-framed
-    // `runtime.Unknown` envelope and rewrites the Content-Type.
-    // See `crates/api-server/src/response.rs` for the encoder scaffold.
-    let mut response = Json(pod).into_response();
-    response
-        .extensions_mut()
-        .insert(crate::response::NativeProtoOptIn::pod());
-    Ok(response)
+    // NOTE: NativeProtoOptIn deliberately not attached. See the module-level
+    // comment on `build_pod_response` for why the opt-in is currently dormant
+    // — until we ship native Pod proto encoding, attaching it breaks client-go
+    // (`proto: illegal wireType N`), so we let response stay JSON and the
+    // transport's content negotiation picks the JSON serializer client-side.
+    Ok(Json(pod).into_response())
 }
 
 pub async fn update(
@@ -1399,12 +1405,12 @@ pub async fn list(
     list.metadata.remaining_item_count = paginated.remaining_item_count;
     list.metadata.resource_version = Some(paginated.resource_version);
 
-    // Same opt-in pattern as `get` — see `crate::response::NativeProtoOptIn`.
-    let mut response = axum::Json(list).into_response();
-    response
-        .extensions_mut()
-        .insert(crate::response::NativeProtoOptIn::pod_list());
-    Ok(response)
+    // NOTE: NativeProtoOptIn deliberately not attached. See the module-level
+    // comment on `build_pod_response` for why the opt-in is currently dormant
+    // — until we ship native Pod proto encoding, attaching it breaks client-go
+    // (`proto: illegal wireType N`), so we let response stay JSON and the
+    // transport's content negotiation picks the JSON serializer client-side.
+    Ok(axum::Json(list).into_response())
 }
 
 /// List all pods across all namespaces
