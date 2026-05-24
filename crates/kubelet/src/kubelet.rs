@@ -1597,7 +1597,7 @@ impl Kubelet {
                 .map(|f| !f.is_empty())
                 .unwrap_or(false);
             if !has_finalizers {
-                // Don't delete — just update status to terminal phase
+                // Update status to terminal phase before removing from storage.
                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
                     let original = p.clone();
                     if let Some(ref mut status) = p.status {
@@ -1646,10 +1646,20 @@ impl Kubelet {
                         let _ = self.storage.update(&key, &p).await;
                     }
                 }
-                debug!(
-                    "Pod {}/{} marked terminal (not deleted from storage)",
-                    namespace, pod_name
-                );
+                // If the pod was explicitly deleted (deletionTimestamp set), remove it
+                // from storage now that containers are stopped and status is terminal.
+                // Without this, removing pod_states causes the next reconcile to default
+                // back to SyncPod, which detects deletionTimestamp => needs_terminating,
+                // re-entering TerminatingPod indefinitely.
+                if pod.metadata.deletion_timestamp.is_some() {
+                    let _ = self.storage.delete(&key).await;
+                    debug!(
+                        "Pod {}/{} removed from storage (deletionTimestamp set, no finalizers)",
+                        namespace, pod_name
+                    );
+                } else {
+                    debug!("Pod {}/{} marked terminal in storage", namespace, pod_name);
+                }
             } else {
                 // Pod has finalizers — update status to Failed but don't delete
                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
