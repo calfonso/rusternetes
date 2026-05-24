@@ -656,7 +656,7 @@ pub async fn normalize_content_type_middleware(
         if response_ct.starts_with("application/json") {
             let (parts, body) = response.into_parts();
             if let Ok(json_bytes) = axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-                let encoder = crate::response::default_proto_encoder();
+                let encoder = crate::response::encoder_for(&opt_in);
                 let pb = encoder.encode(&json_bytes, opt_in.api_version, opt_in.kind);
                 let mut resp = Response::from_parts(parts, Body::from(pb));
                 resp.headers_mut().insert(
