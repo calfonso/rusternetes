@@ -7554,14 +7554,18 @@ impl ProtoRegistry {
                 push_length_delimited_field(buf, tag, &raw);
             }
             FieldType::Message(inner_type) => {
-                if let Some(inner) = self.encode_message(inner_type, val) {
+                // `Time` / `MicroTime` are registered as `{seconds, nanos}`
+                // schemas, but K8s JSON serialises them as RFC3339 strings —
+                // mirroring `decode_timestamp` which produces a string on
+                // the decode side. When the JSON value is a string we must
+                // round-trip via `encode_timestamp` rather than the
+                // generic `encode_with_schema` (which would see a non-Object
+                // value and emit a zero-length submessage).
+                if (inner_type == "Time" || inner_type == "MicroTime") && val.is_string() {
+                    let bytes = encode_timestamp(val);
+                    push_length_delimited_field(buf, tag, &bytes);
+                } else if let Some(inner) = self.encode_message(inner_type, val) {
                     push_length_delimited_field(buf, tag, &inner);
-                } else if inner_type == "Time" {
-                    let bytes = encode_timestamp(val);
-                    push_length_delimited_field(buf, tag, &bytes);
-                } else if inner_type == "MicroTime" {
-                    let bytes = encode_timestamp(val);
-                    push_length_delimited_field(buf, tag, &bytes);
                 }
             }
             FieldType::InlineMessage(_) => {
