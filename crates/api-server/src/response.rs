@@ -9,20 +9,24 @@
 //! contains native protobuf bytes produced by the generated `pb.go`
 //! `Marshal` methods for the resource type (e.g. `core/v1.Pod`).
 //!
-//! Until rusternetes ships per-resource native protobuf encoders, the
-//! Unknown envelope's `contentType` field is set to `application/json` and
-//! `raw` carries the JSON-serialized resource. That is still a valid K8s
-//! protobuf envelope — clients that decode via `Unknown` see the
-//! `contentType` hint and decode `raw` as JSON. `decode_protobuf` in
-//! `rusternetes_common::protobuf` exercises exactly that path.
+//! Today's encoder ladder:
+//!
+//! - [`NativePodProtoEncoder`] (Pod / PodList) walks the schema in
+//!   `crate::protobuf::PROTO_REGISTRY` and emits real proto bytes into
+//!   `Unknown.raw`, matching what upstream `pb.go` would produce.
+//! - [`WrappedJsonProtoEncoder`] is the default fallback for kinds without
+//!   a native encoder yet: it stuffs the JSON bytes into `Unknown.raw` and
+//!   sets `Unknown.contentType` to `application/json`. Upstream `client-go`'s
+//!   typed proto decoder does NOT consult `contentType` and so cannot handle
+//!   this fallback — only Unknown-aware tooling can — but it preserves the
+//!   pre-native behaviour for non-opted-in kinds.
 //!
 //! The [`ProtoEncoder`] trait is the extensibility seam: each resource type
 //! can register an implementation that produces native protobuf bytes for
-//! its kind. The default impl returned by [`default_proto_encoder`] wraps
-//! the JSON payload, matching today's behaviour. The
-//! [`NativeProtoOptIn`] response extension is how a handler tells the
-//! response-wrapping middleware "I'm OK with you emitting a protobuf
-//! envelope for this response when the client asked for one".
+//! its kind. The [`NativeProtoOptIn`] response extension is how a handler
+//! tells the response-wrapping middleware "I'm OK with you emitting a
+//! protobuf envelope for this response when the client asked for one";
+//! [`encoder_for`] picks the right encoder based on the opt-in's `kind`.
 //!
 //! See `crates/api-server/src/middleware.rs` for where the marker is read
 //! and `crates/api-server/src/handlers/pod.rs` for the first opt-in
@@ -247,6 +251,76 @@ pub fn wrap_json_in_protobuf_envelope(json: &[u8], api_version: &str, kind: &str
 /// middleware can share one definition.
 pub fn default_proto_encoder() -> &'static dyn ProtoEncoder {
     &WrappedJsonProtoEncoder
+}
+
+/// Native protobuf encoder for Pod / PodList responses.
+///
+/// Parses the JSON body into a `serde_json::Value`, runs it through
+/// `crate::protobuf::PROTO_REGISTRY.encode_message(kind, value)` to produce
+/// native protobuf bytes, then wraps those bytes in a `k8s\0`-framed
+/// `runtime.Unknown` envelope whose `contentType` advertises
+/// `application/vnd.kubernetes.protobuf`. The output is wire-compatible
+/// with `client-go`'s typed proto decoder, which calls
+/// `proto.Unmarshal(unk.Raw, target)` directly.
+///
+/// If the registry does not have a schema for the kind (e.g. the kind name
+/// arrived misspelt) the encoder transparently falls back to the JSON-in-
+/// `raw` wrapper so the endpoint still returns a parsable envelope rather
+/// than 500.
+pub struct NativePodProtoEncoder;
+
+impl ProtoEncoder for NativePodProtoEncoder {
+    fn encode(&self, json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
+        // Parse JSON. Failure here means a handler produced a non-JSON body;
+        // fall back to the wrapped-JSON encoder so we still emit a valid
+        // envelope rather than panic.
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) else {
+            return wrap_json_in_protobuf_envelope(json, api_version, kind);
+        };
+
+        match crate::protobuf::PROTO_REGISTRY.encode_message(kind, &value) {
+            Some(raw) => wrap_native_proto_in_envelope(&raw, api_version, kind),
+            None => wrap_json_in_protobuf_envelope(json, api_version, kind),
+        }
+    }
+}
+
+/// Build a K8s `runtime.Unknown` envelope around an already-encoded native
+/// protobuf payload. Mirrors [`wrap_json_in_protobuf_envelope`] but advertises
+/// `Unknown.contentType = application/vnd.kubernetes.protobuf` so
+/// Unknown-aware decoders know the body is native proto, not JSON.
+pub fn wrap_native_proto_in_envelope(raw: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
+    use rusternetes_common::protobuf::{Unknown, UnknownTypeMeta};
+
+    let unknown = Unknown {
+        type_meta: Some(UnknownTypeMeta {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+        }),
+        raw: raw.to_vec(),
+        content_encoding: String::new(),
+        // Empty contentType is what real K8s emits when `raw` is native
+        // proto — see `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/protobuf`.
+        // client-go's typed proto path never reads this field anyway, but
+        // setting it to the proto media type is explicit and harmless.
+        content_type: "application/vnd.kubernetes.protobuf".to_string(),
+    };
+
+    use prost::Message;
+    let mut buf = Vec::with_capacity(4 + unknown.encoded_len());
+    buf.extend_from_slice(b"k8s\0");
+    unknown.encode(&mut buf).expect("Unknown encode");
+    buf
+}
+
+/// Pick the [`ProtoEncoder`] best suited to a given opt-in. Kinds with a
+/// native encoder (Pod / PodList today) get one; everything else falls back
+/// to the JSON-wrapping default.
+pub fn encoder_for(opt_in: &NativeProtoOptIn) -> &'static dyn ProtoEncoder {
+    match opt_in.kind {
+        "Pod" | "PodList" => &NativePodProtoEncoder,
+        _ => default_proto_encoder(),
+    }
 }
 
 #[cfg(test)]

@@ -7457,6 +7457,247 @@ impl ProtoRegistry {
         }
     }
 
+    // =====================================================================
+    // Schema-driven JSON → native protobuf encoder
+    // =====================================================================
+    //
+    // Symmetric mirror of `decode_message`: walks the registered schema in
+    // lockstep with a `serde_json::Value`, producing wire-format bytes for
+    // every `FieldType` variant the decoder consumes. The result is exactly
+    // what upstream `pb.go` `Marshal` methods would produce — the same bytes
+    // that, when piped back through `decode_message`, reconstruct the source
+    // JSON.
+    //
+    // Note on field ordering: we walk the schema's field table by ascending
+    // tag number so the wire output is stable across hash-map iteration
+    // order. Upstream `pb.go` codegen also emits in tag order.
+    //
+    // Note on missing schemas: unknown message types return `None`, the same
+    // signal the decoder uses. Callers in `response.rs` fall back to the
+    // JSON-wrapping encoder in that case so a missing schema cannot break
+    // an endpoint that already worked under the JSON path.
+
+    /// Encode a JSON value as the named message type. Returns `None` if the
+    /// type is not registered.
+    pub fn encode_message(&self, msg_type: &str, value: &Value) -> Option<Vec<u8>> {
+        let schema = self.schemas.get(msg_type)?;
+        Some(self.encode_with_schema(schema, value))
+    }
+
+    /// Encode a JSON value (expected `Value::Object`) using the supplied
+    /// schema. Non-object values produce an empty payload (a missing message
+    /// on the wire), matching what an absent JSON field would emit at the
+    /// caller.
+    fn encode_with_schema(&self, schema: &MessageSchema, value: &Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let obj = match value.as_object() {
+            Some(o) => o,
+            None => return buf,
+        };
+
+        // Sort by tag for stable output.
+        let mut fields: Vec<(&u32, &(String, FieldType))> = schema.fields.iter().collect();
+        fields.sort_by_key(|(tag, _)| **tag);
+
+        for (tag, (name, field_type)) in fields {
+            // Inline messages collect their fields from the parent object —
+            // there is no JSON key for the embedded message itself.
+            if let FieldType::InlineMessage(inner_type) = field_type {
+                self.encode_inline_message(&mut buf, *tag, inner_type, obj);
+                continue;
+            }
+
+            let Some(val) = obj.get(name) else { continue };
+            if val.is_null() {
+                continue;
+            }
+            self.encode_field(&mut buf, *tag, field_type, val);
+        }
+
+        buf
+    }
+
+    /// Encode a single (tag, FieldType, Value) tuple to the buffer.
+    fn encode_field(&self, buf: &mut Vec<u8>, tag: u32, field_type: &FieldType, val: &Value) {
+        match field_type {
+            FieldType::String => {
+                if let Some(s) = val.as_str() {
+                    push_string_field(buf, tag, s.as_bytes());
+                }
+            }
+            FieldType::Int => {
+                if let Some(n) = json_to_i64(val) {
+                    // proto2/3 int{32,64} both fit a varint of the unsigned
+                    // representation — match upstream by zero-extending.
+                    push_varint_field(buf, tag, n as u64);
+                }
+            }
+            FieldType::Bool => {
+                let b = val.as_bool().unwrap_or(false);
+                if b {
+                    push_varint_field(buf, tag, 1);
+                } else {
+                    // proto2 omits false; emit only when present-and-true to
+                    // match the decoder which treats missing as default.
+                }
+            }
+            FieldType::Double => {
+                if let Some(f) = val.as_f64() {
+                    encode_varint(buf, ((tag as u64) << 3) | 1); // wire type 1 (fixed64)
+                    buf.extend_from_slice(&f.to_bits().to_le_bytes());
+                }
+            }
+            FieldType::Bytes => {
+                // K8s wire format for `bytes` is base64 in JSON. Decode the
+                // string then write raw bytes on the wire.
+                let raw = json_bytes_value(val);
+                push_length_delimited_field(buf, tag, &raw);
+            }
+            FieldType::Message(inner_type) => {
+                if let Some(inner) = self.encode_message(inner_type, val) {
+                    push_length_delimited_field(buf, tag, &inner);
+                } else if inner_type == "Time" {
+                    let bytes = encode_timestamp(val);
+                    push_length_delimited_field(buf, tag, &bytes);
+                } else if inner_type == "MicroTime" {
+                    let bytes = encode_timestamp(val);
+                    push_length_delimited_field(buf, tag, &bytes);
+                }
+            }
+            FieldType::InlineMessage(_) => {
+                // Handled at the caller in `encode_with_schema` because the
+                // inline message's fields live in the surrounding object.
+            }
+            FieldType::Repeated(inner) => {
+                if let Some(arr) = val.as_array() {
+                    for elem in arr {
+                        if elem.is_null() {
+                            continue;
+                        }
+                        self.encode_field(buf, tag, inner, elem);
+                    }
+                }
+            }
+            FieldType::StringMap => {
+                if let Some(map) = val.as_object() {
+                    for (k, v) in map {
+                        let mut entry = Vec::new();
+                        push_string_field(&mut entry, 1, k.as_bytes());
+                        if let Some(s) = v.as_str() {
+                            push_string_field(&mut entry, 2, s.as_bytes());
+                        }
+                        push_length_delimited_field(buf, tag, &entry);
+                    }
+                }
+            }
+            FieldType::BytesMap => {
+                if let Some(map) = val.as_object() {
+                    for (k, v) in map {
+                        let mut entry = Vec::new();
+                        push_string_field(&mut entry, 1, k.as_bytes());
+                        let raw = json_bytes_value(v);
+                        push_length_delimited_field(&mut entry, 2, &raw);
+                        push_length_delimited_field(buf, tag, &entry);
+                    }
+                }
+            }
+            FieldType::QuantityMap => {
+                if let Some(map) = val.as_object() {
+                    for (k, v) in map {
+                        let mut entry = Vec::new();
+                        push_string_field(&mut entry, 1, k.as_bytes());
+                        // Quantity message: field 1 = canonical string.
+                        let s = v.as_str().unwrap_or("");
+                        let mut qbuf = Vec::new();
+                        push_string_field(&mut qbuf, 1, s.as_bytes());
+                        push_length_delimited_field(&mut entry, 2, &qbuf);
+                        push_length_delimited_field(buf, tag, &entry);
+                    }
+                }
+            }
+            FieldType::MessageMap(inner_type) => {
+                if let Some(map) = val.as_object() {
+                    for (k, v) in map {
+                        let mut entry = Vec::new();
+                        push_string_field(&mut entry, 1, k.as_bytes());
+                        if let Some(inner) = self.encode_message(inner_type, v) {
+                            push_length_delimited_field(&mut entry, 2, &inner);
+                        }
+                        push_length_delimited_field(buf, tag, &entry);
+                    }
+                }
+            }
+            FieldType::IntOrString => {
+                // K8s IntOrString proto: field 1 (type, int32), field 2
+                // (intVal, int32), field 3 (strVal, string). type=0 means
+                // intVal is set; type=1 means strVal is set.
+                let mut inner = Vec::new();
+                if let Some(s) = val.as_str() {
+                    push_varint_field(&mut inner, 1, 1);
+                    push_string_field(&mut inner, 3, s.as_bytes());
+                } else if let Some(n) = json_to_i64(val) {
+                    push_varint_field(&mut inner, 1, 0);
+                    push_varint_field(&mut inner, 2, n as u64);
+                }
+                push_length_delimited_field(buf, tag, &inner);
+            }
+            FieldType::Quantity => {
+                // Quantity message with field 1 = canonical string.
+                let s = val.as_str().unwrap_or("");
+                let mut inner = Vec::new();
+                push_string_field(&mut inner, 1, s.as_bytes());
+                push_length_delimited_field(buf, tag, &inner);
+            }
+            FieldType::JsonRaw => {
+                // K8s JSON / RawExtension: a message with field 1 = raw
+                // bytes containing JSON. Re-serialise the Value into bytes.
+                let raw = serde_json::to_vec(val).unwrap_or_default();
+                let mut inner = Vec::new();
+                push_length_delimited_field(&mut inner, 1, &raw);
+                push_length_delimited_field(buf, tag, &inner);
+            }
+        }
+    }
+
+    /// Encode an inline message: gather every JSON field defined by the
+    /// inner schema out of the parent object, build a sub-`Value::Object`,
+    /// and emit it as a nested message at `tag`. Skip emission entirely if
+    /// none of the inner fields are present so an absent inline message
+    /// does not produce a zero-length submessage on the wire.
+    fn encode_inline_message(
+        &self,
+        buf: &mut Vec<u8>,
+        tag: u32,
+        inner_type: &str,
+        parent: &Map<String, Value>,
+    ) {
+        let Some(inner_schema) = self.schemas.get(inner_type) else {
+            return;
+        };
+        let mut sub = Map::new();
+        for (_inner_tag, (name, inner_ft)) in &inner_schema.fields {
+            // Recurse: an inline message can itself contain inline messages.
+            if let FieldType::InlineMessage(deeper) = inner_ft {
+                if let Some(deep_schema) = self.schemas.get(deeper) {
+                    for (_, (deep_name, _)) in &deep_schema.fields {
+                        if let Some(v) = parent.get(deep_name) {
+                            sub.insert(deep_name.clone(), v.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(v) = parent.get(name) {
+                sub.insert(name.clone(), v.clone());
+            }
+        }
+        if sub.is_empty() {
+            return;
+        }
+        let inner = self.encode_with_schema(inner_schema, &Value::Object(sub));
+        push_length_delimited_field(buf, tag, &inner);
+    }
+
     /// Decode a protobuf map entry where value is a message type
     fn decode_message_map_entry(&self, msg_type: &str, data: &[u8]) -> (String, Value) {
         let mut key = String::new();
@@ -11748,6 +11989,81 @@ fn push_varint_field(buf: &mut Vec<u8>, field_number: u32, value: u64) {
     encode_varint(buf, (field_number as u64) << 3);
     encode_varint(buf, value);
 }
+
+// --- JSON → proto value helpers (encode side) ------------------------------
+
+/// Parse a JSON value into an i64, accepting both numeric and string-encoded
+/// integers (resourceVersion arrives from K8s as a string in JSON but is
+/// emitted as a varint on the wire — see `ObjectMeta.resourceVersion`).
+fn json_to_i64(val: &Value) -> Option<i64> {
+    if let Some(i) = val.as_i64() {
+        return Some(i);
+    }
+    if let Some(u) = val.as_u64() {
+        return Some(u as i64);
+    }
+    if let Some(f) = val.as_f64() {
+        return Some(f as i64);
+    }
+    if let Some(s) = val.as_str() {
+        return s.parse::<i64>().ok();
+    }
+    None
+}
+
+/// Decode a JSON value that represents proto `bytes` into the raw byte
+/// vector. K8s wire format expects base64 in JSON; this helper undoes the
+/// base64. Non-string values fall back to UTF-8 bytes.
+fn json_bytes_value(val: &Value) -> Vec<u8> {
+    use base64::Engine;
+    if let Some(s) = val.as_str() {
+        // Try standard base64 first (matches the decoder's STANDARD engine).
+        if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(s) {
+            return b;
+        }
+        // Fall back to URL-safe (some K8s tooling emits this for `bytes`).
+        if let Ok(b) = base64::engine::general_purpose::URL_SAFE.decode(s) {
+            return b;
+        }
+        return s.as_bytes().to_vec();
+    }
+    Vec::new()
+}
+
+/// Encode a JSON timestamp string (RFC3339 — possibly with fractional
+/// seconds for MicroTime) into the K8s `Time` / `MicroTime` proto:
+///     message Time { int64 seconds = 1; int32 nanos = 2; }
+/// Falls back to a zero-length message on parse failure, matching the
+/// decoder which emits `Value::Null` for `seconds == 0 && nanos == 0`.
+fn encode_timestamp(val: &Value) -> Vec<u8> {
+    let Some(s) = val.as_str() else {
+        return Vec::new();
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let Some(dt) = parsed else {
+        return Vec::new();
+    };
+    let seconds = dt.timestamp();
+    let nanos = dt.timestamp_subsec_nanos() as i32;
+    let mut buf = Vec::new();
+    if seconds != 0 {
+        push_varint_field(&mut buf, 1, seconds as u64);
+    }
+    if nanos != 0 {
+        push_varint_field(&mut buf, 2, nanos as u64);
+    }
+    buf
+}
+
+// --- Shared registry singleton --------------------------------------------
+
+/// Process-wide `ProtoRegistry`. Built once on first access. Used by both
+/// the response-wrapping middleware (to decode incoming proto requests) and
+/// the response encoder (to emit native proto bytes for opt-in kinds).
+pub static PROTO_REGISTRY: std::sync::LazyLock<ProtoRegistry> =
+    std::sync::LazyLock::new(ProtoRegistry::new);
 
 #[cfg(test)]
 mod tests {
