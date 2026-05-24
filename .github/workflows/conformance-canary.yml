@@ -26,19 +26,18 @@ on:
       - '.github/workflows/conformance-canary.yml'
       - 'ci/conformance/known-green.txt'
       - 'scripts/conformance-canary-run.sh'
-      - 'compose.dind.yml'
+      - 'compose.all-in-one.yml'
+      - 'compose.dind.all-in-one.yml'
+      - 'Dockerfile.all-in-one'
 
 env:
   # The dind sidecar exposes the daemon at this canonical path; the
-  # compose.dind.yml override makes every rusternetes service use it.
+  # compose.dind.all-in-one.yml override makes the rusternetes service use it.
   DOCKER_HOST: unix:///var/run/docker.sock
   # Pin Hydrophone to a known release so a tag-rename upstream doesn't
   # silently break the workflow. The conformance image itself is pinned
   # by `scripts/conformance-canary-run.sh` (defaults to v1.35.0).
   HYDROPHONE_VERSION: v0.7.0
-  # Enable payload dumps in api-server/kubelet so any panic / 5xx / decode
-  # failure during conformance logs the offending request body.
-  RUSTERNETES_DUMP_PAYLOADS: "1"
 
 jobs:
   hydrophone:
@@ -80,30 +79,25 @@ jobs:
           docker version
           docker info --format '{{ .ServerVersion }}'
 
-      - name: Ensure docker-compose v2 plugin
-        # The custom ARC runner image (ci/arc-runner/Dockerfile) bakes
-        # this plugin in, so on an up-to-date runner this step is a
-        # no-op (`docker compose version` succeeds). The fallback only
-        # exists for the chicken-and-egg window where this PR ships
-        # both the Dockerfile change AND the conformance workflow — if
-        # the runner pod is still on an older image (build-runner-image
-        # workflow hasn't published yet), download the plugin into the
-        # user-local plugin dir so the workflow still works. Once the
-        # new image lands and rolls out, this whole step can be deleted.
+      - name: Check docker-compose v2 plugin
+        # The runner image (ci/arc-runner/Dockerfile) bakes in v2.30.3.
+        # Fail fast if the plugin is missing or older than the floor —
+        # rebuilding the runner image is the correct fix, not papering
+        # over it in this workflow.
+        env:
+          REQUIRED_COMPOSE_VERSION: v2.30.0
         run: |
           set -euo pipefail
-          if docker compose version >/dev/null 2>&1; then
-            echo "docker compose plugin already present:"
-            docker compose version
-            exit 0
+          if ! docker compose version --short >/dev/null 2>&1; then
+            echo "docker compose plugin missing — rebuild the ARC runner image (ci/arc-runner/Dockerfile)" >&2
+            exit 1
           fi
-          echo "docker compose plugin missing — installing fallback"
-          COMPOSE_VERSION="v2.30.3"
-          mkdir -p "$HOME/.docker/cli-plugins"
-          curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
-            -o "$HOME/.docker/cli-plugins/docker-compose"
-          chmod +x "$HOME/.docker/cli-plugins/docker-compose"
-          docker compose version
+          ACTUAL="v$(docker compose version --short)"
+          if ! printf '%s\n%s\n' "$REQUIRED_COMPOSE_VERSION" "$ACTUAL" | sort -V -C; then
+            echo "docker compose $ACTUAL is older than required $REQUIRED_COMPOSE_VERSION — rebuild the ARC runner image (ci/arc-runner/Dockerfile)" >&2
+            exit 1
+          fi
+          echo "docker compose $ACTUAL (>= $REQUIRED_COMPOSE_VERSION)"
 
       - name: Generate TLS certs
         run: |
@@ -120,8 +114,8 @@ jobs:
         # one for the runner. Inside the runner pod (which shares its
         # network namespace with the dind sidecar), the api-server's
         # published port 6443 is reachable on localhost. `--skip-auth`
-        # on the api-server (compose.yml) means any bearer token is
-        # accepted, so the placeholder works.
+        # on the api-server (compose.all-in-one.yml) means any bearer
+        # token is accepted, so the placeholder works.
         run: |
           mkdir -p "$HOME/.kube"
           cat > "$HOME/.kube/rusternetes-config" <<'EOF'
@@ -169,12 +163,12 @@ jobs:
         # rather than a slow build. Parallel build keeps wall time
         # reasonable on the 3-core conformance tier.
         run: |
-          docker compose -f compose.yml -f compose.dind.yml build --parallel
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml build --parallel
 
       - name: Bring up cluster
         run: |
-          docker compose -f compose.yml -f compose.dind.yml up -d
-          docker compose -f compose.yml -f compose.dind.yml ps
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml ps
 
       - name: Wait for api-server health
         timeout-minutes: 3
@@ -195,8 +189,8 @@ jobs:
             sleep 2
           done
           echo "api-server never became healthy — dumping diagnostics:"
-          docker compose -f compose.yml -f compose.dind.yml ps || true
-          docker compose -f compose.yml -f compose.dind.yml logs --tail=50 api-server || true
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml ps || true
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml logs --tail=50 rusternetes || true
           curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
           curl -kv --max-time 5 https://localhost:6443/healthz || true
           exit 1
@@ -237,5 +231,5 @@ jobs:
       - name: Tear down cluster
         if: always()
         run: |
-          docker compose -f compose.yml -f compose.dind.yml logs --tail=200 || true
-          docker compose -f compose.yml -f compose.dind.yml down -v || true
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml logs --tail=200 || true
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml down -v || true

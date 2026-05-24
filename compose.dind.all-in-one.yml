@@ -1,0 +1,23 @@
+# Compose override that points the all-in-one rusternetes container at
+# /var/run/docker.sock instead of /run/podman/podman.sock.
+#
+# Apply alongside compose.all-in-one.yml when running on a host whose
+# container runtime is Docker (not Podman) — most notably the GitHub
+# Actions self-hosted runners in ARC + the gha-runner-scale-set DinD
+# sidecar, which exposes its daemon at /var/run/docker.sock.
+#
+# Usage:
+#   docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d
+#
+# This is the all-in-one analogue of compose.dind.yml (which targets the
+# multi-container compose.yml services). Same pattern: list-typed
+# `volumes` and `environment` merge as concatenation with last-wins
+# semantics, so the override entries take precedence at the bollard /
+# Docker SDK lookup level.
+
+services:
+  rusternetes:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
