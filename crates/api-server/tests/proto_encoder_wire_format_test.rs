@@ -369,10 +369,7 @@ fn round_trip_pod_with_owner_references() {
         .and_then(|o| o.as_array())
         .expect("ownerReferences");
     assert_eq!(owners.len(), 1);
-    assert_eq!(
-        owners[0].get("name"),
-        Some(&Value::String("rs-1".into())),
-    );
+    assert_eq!(owners[0].get("name"), Some(&Value::String("rs-1".into())),);
     assert_eq!(
         owners[0].get("kind"),
         Some(&Value::String("ReplicaSet".into())),
@@ -394,9 +391,11 @@ fn encode_decode_through_unknown_envelope() {
     // End-to-end: build a Pod JSON, encode to native proto, wrap in the
     // Unknown envelope, then unwrap and decode. Exercises the full path
     // used by `NativePodProtoEncoder` in production.
-    use rusternetes_api_server::response::{wrap_native_proto_in_envelope, NativePodProtoEncoder, ProtoEncoder};
-    use rusternetes_common::protobuf::{is_protobuf, Unknown, PROTOBUF_MAGIC};
     use prost::Message;
+    use rusternetes_api_server::response::{
+        wrap_native_proto_in_envelope, NativePodProtoEncoder, ProtoEncoder,
+    };
+    use rusternetes_common::protobuf::{is_protobuf, Unknown, PROTOBUF_MAGIC};
 
     let pod = json!({
         "metadata": {"name": "envelope-roundtrip"},

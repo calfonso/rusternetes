@@ -454,4 +454,3 @@ async fn list_pods_watch_does_not_wrap_in_single_response_protobuf() {
          protobuf Content-Type; got {ct}"
     );
 }
-

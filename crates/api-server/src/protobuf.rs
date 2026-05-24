@@ -7679,11 +7679,11 @@ impl ProtoRegistry {
             return;
         };
         let mut sub = Map::new();
-        for (_inner_tag, (name, inner_ft)) in &inner_schema.fields {
+        for (name, inner_ft) in inner_schema.fields.values() {
             // Recurse: an inline message can itself contain inline messages.
             if let FieldType::InlineMessage(deeper) = inner_ft {
                 if let Some(deep_schema) = self.schemas.get(deeper) {
-                    for (_, (deep_name, _)) in &deep_schema.fields {
+                    for (deep_name, _) in deep_schema.fields.values() {
                         if let Some(v) = parent.get(deep_name) {
                             sub.insert(deep_name.clone(), v.clone());
                         }
