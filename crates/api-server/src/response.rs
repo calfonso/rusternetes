@@ -220,11 +220,13 @@ impl ProtoEncoder for WrappedJsonProtoEncoder {
 /// caller chooses not to override the Content-Type, but the standard
 /// usage path always treats the result as the protobuf envelope.
 pub fn wrap_json_in_protobuf_envelope(json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
-    use rusternetes_common::protobuf::Unknown;
+    use rusternetes_common::protobuf::{Unknown, UnknownTypeMeta};
 
     let unknown = Unknown {
-        api_version: api_version.to_string(),
-        kind: kind.to_string(),
+        type_meta: Some(UnknownTypeMeta {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+        }),
         raw: json.to_vec(),
         content_encoding: String::new(),
         // `contentType` tells decoders that `raw` carries JSON — required
