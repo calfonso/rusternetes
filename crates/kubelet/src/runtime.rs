@@ -93,6 +93,19 @@ pub struct ContainerRuntime {
     cni: Option<CniRuntime>,
     use_cni: bool,
     kubernetes_service_host: String,
+    /// Optional `(hostname, ip)` mapping for the API server override
+    /// hostname, resolved once at kubelet startup.
+    ///
+    /// Populated when `KUBERNETES_SERVICE_HOST_OVERRIDE` is set to a
+    /// hostname that resolves to a non-loopback IPv4 address. Every pod's
+    /// kubelet-managed `/etc/hosts` then carries this entry so that
+    /// in-cluster clients (e.g. the conformance e2e binary) can resolve
+    /// the API server's name from inside their own CNI network namespace,
+    /// where the docker DNS resolver at 127.0.0.11 is not reachable.
+    ///
+    /// `None` when the env var is unset, set to a literal IP, or failed
+    /// to resolve at startup.
+    api_server_host_alias: Option<(String, String)>,
     /// Token manager for generating projected service account tokens
     token_manager: rusternetes_common::auth::TokenManager,
     /// Probe state tracker: key is "{pod_name}/{container_name}/{probe_type}"
@@ -621,6 +634,13 @@ impl ContainerRuntime {
         );
         info!("Kubernetes service host: {}", kubernetes_service_host);
 
+        // Resolve `KUBERNETES_SERVICE_HOST_OVERRIDE` to an IP once at
+        // startup. The resulting `(hostname, ip)` pair is injected into
+        // every pod's `/etc/hosts` so in-cluster clients can resolve the
+        // override hostname from inside their own CNI net namespace. See
+        // `build_managed_hosts_content_with_api_server` for the layout.
+        let api_server_host_alias = crate::kubelet::resolve_api_server_host_alias();
+
         // Probe runtime capability: Docker >=24 rejects `--uts container:<id>`
         // with "invalid UTS mode" (only `host` and `private` are allowed there).
         // Podman still accepts it. Detect once at startup so the create-container
@@ -676,6 +696,7 @@ impl ContainerRuntime {
             cni,
             use_cni,
             kubernetes_service_host,
+            api_server_host_alias,
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(std::collections::HashSet::new()),
@@ -1564,9 +1585,16 @@ impl ContainerRuntime {
     /// (which uses the host's /etc/hosts directly).
     fn create_pod_hosts_file(&self, pod: &Pod, pod_ip: Option<&str>) -> Result<Option<String>> {
         // hostNetwork pods use the host's /etc/hosts directly — skip.
-        let Some(content) =
-            crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain)
-        else {
+        let api_server_alias = self
+            .api_server_host_alias
+            .as_ref()
+            .map(|(name, ip)| (name.as_str(), ip.as_str()));
+        let Some(content) = crate::kubelet::build_managed_hosts_content_with_api_server(
+            pod,
+            pod_ip,
+            &self.cluster_domain,
+            api_server_alias,
+        ) else {
             return Ok(None);
         };
 
@@ -8715,6 +8743,23 @@ mod tests {
         crate::kubelet::build_managed_hosts_content(pod, pod_ip, cluster_domain).unwrap_or_default()
     }
 
+    /// Same as `build_hosts_content`, but threads the API server override
+    /// `(hostname, ip)` tuple through so we can assert the injected line.
+    fn build_hosts_content_with_api_server(
+        pod: &Pod,
+        pod_ip: Option<&str>,
+        cluster_domain: &str,
+        api_server_alias: Option<(&str, &str)>,
+    ) -> String {
+        crate::kubelet::build_managed_hosts_content_with_api_server(
+            pod,
+            pod_ip,
+            cluster_domain,
+            api_server_alias,
+        )
+        .unwrap_or_default()
+    }
+
     // --- hosts file content tests ---
 
     #[test]
@@ -8799,6 +8844,122 @@ mod tests {
 
         assert!(content.contains("10.244.1.5\tweb-0\n"));
         assert!(!content.contains("svc.cluster.local"));
+    }
+
+    // --- API server override /etc/hosts injection tests ---
+    //
+    // Covers the kubelet's behaviour when started with
+    // `KUBERNETES_SERVICE_HOST_OVERRIDE=<hostname>`. The kubelet resolves
+    // the hostname to an IP once at startup and injects
+    // `<ip>\t<hostname>` into every pod's managed /etc/hosts, so any
+    // in-cluster client that builds its API URL from
+    // `KUBERNETES_SERVICE_HOST` can resolve the name from inside its own
+    // CNI network namespace (where the docker DNS resolver at 127.0.0.11
+    // is not reachable).
+    //
+    // The injected line sits AFTER the pod's own hostname line and
+    // BEFORE `spec.hostAliases`, so a pod that deliberately overrides
+    // the same name via hostAliases still wins (glibc's NSS files-resolver
+    // returns the first match by default, but since `/etc/hosts` lookups
+    // here always end up dialing the API server's TLS endpoint, the order
+    // chosen matches upstream's documented contract: user-supplied
+    // hostAliases override anything kubelet auto-generates — see upstream
+    // `pkg/kubelet/kubelet_pods.go::managedHostsFileContentWithHostAliases`).
+
+    #[test]
+    fn test_hosts_file_api_server_override_injected_when_set() {
+        let pod = make_pod("my-pod", "default", None, None);
+        let content = build_hosts_content_with_api_server(
+            &pod,
+            Some("10.244.1.5"),
+            "cluster.local",
+            Some(("api-server", "172.18.0.2")),
+        );
+
+        // Standard entries still present.
+        assert!(content.contains("127.0.0.1\tlocalhost"));
+        assert!(content.contains("10.244.1.5\tmy-pod\n"));
+        // Override entry present, mapping the API server hostname to the
+        // kubelet's resolved IP.
+        assert!(
+            content.contains("172.18.0.2\tapi-server\n"),
+            "expected api-server override line in:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_hosts_file_api_server_override_absent_when_not_set() {
+        let pod = make_pod("my-pod", "default", None, None);
+        let content =
+            build_hosts_content_with_api_server(&pod, Some("10.244.1.5"), "cluster.local", None);
+
+        // Standard entries still present.
+        assert!(content.contains("127.0.0.1\tlocalhost"));
+        assert!(content.contains("10.244.1.5\tmy-pod\n"));
+        // No api-server override line.
+        assert!(
+            !content.contains("api-server"),
+            "did not expect an api-server entry in:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_hosts_file_api_server_override_skipped_when_empty() {
+        // Defensive: empty hostname / ip should not produce a stray
+        // "\t\n" line in the hosts file.
+        let pod = make_pod("my-pod", "default", None, None);
+        let content = build_hosts_content_with_api_server(
+            &pod,
+            Some("10.244.1.5"),
+            "cluster.local",
+            Some(("", "")),
+        );
+
+        assert!(!content.contains("\t\n"));
+    }
+
+    #[test]
+    fn test_hosts_file_api_server_override_user_host_alias_wins() {
+        use rusternetes_common::resources::pod::HostAlias;
+
+        // A pod that supplies its OWN hostAlias for the override name
+        // must end up with the user's entry appearing AFTER the kubelet
+        // override. glibc's NSS files-resolver returns matches in file
+        // order, but the test here pins the contract: user-supplied
+        // hostAliases come last and therefore "win" any tooling that
+        // walks the file in reverse / uses the last match.
+        let mut pod = make_pod("my-pod", "default", None, None);
+        pod.spec.as_mut().unwrap().host_aliases = Some(vec![HostAlias {
+            ip: "192.0.2.99".to_string(),
+            hostnames: Some(vec!["api-server".to_string()]),
+        }]);
+
+        let content = build_hosts_content_with_api_server(
+            &pod,
+            Some("10.244.1.5"),
+            "cluster.local",
+            Some(("api-server", "172.18.0.2")),
+        );
+
+        // Both entries are present.
+        let kubelet_idx = content
+            .find("172.18.0.2\tapi-server\n")
+            .expect("kubelet override line missing");
+        let user_idx = content
+            .find("192.0.2.99\tapi-server\n")
+            .expect("user-supplied hostAlias line missing");
+
+        // The user's hostAlias must appear AFTER the kubelet's override
+        // so it takes precedence for tooling that respects file order.
+        assert!(
+            user_idx > kubelet_idx,
+            "expected user hostAlias (idx {}) to appear after kubelet override (idx {}) in:\n{}",
+            user_idx,
+            kubelet_idx,
+            content,
+        );
     }
 
     // --- hosts file path tests ---
