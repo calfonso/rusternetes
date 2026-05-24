@@ -264,7 +264,13 @@ async fn accept_application_yaml_falls_back_to_json() {
 /// envelope round-trips through
 /// `rusternetes_common::protobuf::decode_protobuf`.
 ///
-/// Pin: 200 + protobuf Content-Type + `k8s\0`-prefixed body.
+/// Pin: 200 + JSON Content-Type + no `k8s\0` prefix.
+///
+/// While the Pod `NativeProtoOptIn` is dormant (see
+/// `handlers/pod.rs::build_pod_response`), Pod GET with protobuf Accept
+/// falls back to JSON — wrapping JSON inside `Unknown.raw` breaks
+/// client-go's typed decoder. When a native Pod proto encoder lands
+/// the assertion flips back to the envelope form.
 #[tokio::test]
 async fn accept_protobuf_returns_native_envelope() {
     let (mem, router) = spawn_router();
@@ -279,13 +285,14 @@ async fn accept_protobuf_returns_native_envelope() {
 
     assert_eq!(status, StatusCode::OK, "status={} body={:?}", status, body);
     assert!(
-        ct.starts_with("application/vnd.kubernetes.protobuf"),
-        "Pod GET now opts in to protobuf responses; got {}",
+        ct.starts_with("application/json"),
+        "Pod opt-in is dormant; response must stay JSON, got {}",
         ct
     );
     assert!(
-        body.starts_with(b"k8s\0"),
-        "body must start with the k8s\\0 magic prefix; first bytes={:?}",
+        !body.starts_with(b"k8s\0"),
+        "body must NOT carry the k8s\\0 prefix while opt-in is dormant; \
+         first bytes={:?}",
         &body[..body.len().min(16)]
     );
 }
@@ -295,12 +302,11 @@ async fn accept_protobuf_returns_native_envelope() {
 // ---------------------------------------------------------------------------
 
 /// `Accept: application/vnd.kubernetes.protobuf;q=0.9, application/json;q=1.0`.
-/// Per RFC 7231 §5.3.1 the higher q value wins, so JSON should be picked.
-/// Rusternetes' new protobuf-opt-in path matches on a substring `contains`
-/// check and does not yet parse quality values — so any Accept that names
-/// protobuf produces a protobuf response, even when JSON has a higher q.
-/// This is a known divergence from upstream RFC 7231; pin the actual
-/// behaviour so a future q-value parser flips the assertion deliberately.
+/// While the Pod `NativeProtoOptIn` is dormant (see
+/// `handlers/pod.rs::build_pod_response`), q-value parsing is moot — Pod
+/// GET always returns JSON regardless of which media type wins
+/// negotiation. Pin that fall-back so a future opt-in re-enable trips
+/// CI deliberately.
 #[tokio::test]
 async fn accept_q_values_protobuf_wins_despite_lower_q() {
     let (mem, router) = spawn_router();
@@ -315,21 +321,22 @@ async fn accept_q_values_protobuf_wins_despite_lower_q() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        ct.starts_with("application/vnd.kubernetes.protobuf"),
-        "no q-value parser yet — protobuf wins on contains() match; got {}",
+        ct.starts_with("application/json"),
+        "Pod opt-in is dormant; response must stay JSON, got {}",
         ct
     );
     assert!(
-        body.starts_with(b"k8s\0"),
-        "body must be a protobuf envelope; first bytes={:?}",
+        !body.starts_with(b"k8s\0"),
+        "body must NOT carry the k8s\\0 prefix while opt-in is dormant; \
+         first bytes={:?}",
         &body[..body.len().min(16)]
     );
 }
 
 /// `Accept: application/vnd.kubernetes.protobuf;q=1.0, application/json;q=0.5`.
-/// Upstream RFC 7231 contract: protobuf has higher q AND is now supported by
-/// rusternetes for Pod GET, so protobuf wins. Same outcome the upstream
-/// contract demands.
+/// While the Pod `NativeProtoOptIn` is dormant, Pod GET ignores the
+/// negotiated protobuf preference and returns JSON. Pin the fall-back
+/// so a future opt-in re-enable trips CI deliberately.
 #[tokio::test]
 async fn accept_q_values_protobuf_first_returns_protobuf() {
     let (mem, router) = spawn_router();
@@ -345,16 +352,16 @@ async fn accept_q_values_protobuf_first_returns_protobuf() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "must return protobuf, not 406; status={} body={:?}",
+        "must not return 406; status={} body={:?}",
         status,
         body
     );
     assert!(
-        ct.starts_with("application/vnd.kubernetes.protobuf"),
-        "protobuf has higher q AND is supported; must be picked; got {}",
+        ct.starts_with("application/json"),
+        "Pod opt-in is dormant; response must stay JSON, got {}",
         ct
     );
-    assert!(body.starts_with(b"k8s\0"));
+    assert!(!body.starts_with(b"k8s\0"));
 }
 
 // ---------------------------------------------------------------------------
