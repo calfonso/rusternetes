@@ -113,6 +113,12 @@ RUN set -eux; \
         echo "fn main(){}" > crates/$c/src/main.rs; \
     done
 
+# Dummy bench files — see Dockerfile.services for the detailed rationale.
+# Path is rooted at /build/rusternetes because this Dockerfile's
+# workspace lives there (rhino sits next to it at /build/rhino).
+RUN mkdir -p /build/rusternetes/crates/common/benches \
+ && echo "fn main(){}" > /build/rusternetes/crates/common/benches/regex_cache.rs
+
 ARG CARGO_FEATURES=sqlite
 WORKDIR /build/rusternetes
 

@@ -165,6 +165,15 @@ RUN set -eux; \
         echo "fn main(){}" > crates/$c/src/main.rs; \
     done
 
+# Dummy bench files for crates that declare [[bench]] in Cargo.toml.
+# Cargo fails to parse the manifest if the referenced bench file is
+# missing — the Pass-1 dummy-source trick above doesn't create benches,
+# so any `[[bench]] name = "..."` entry would break the dep-only build
+# without an explicit dummy here. Keep this list in sync with every
+# crate's [[bench]] declarations.
+RUN mkdir -p crates/common/benches \
+ && echo "fn main(){}" > crates/common/benches/regex_cache.rs
+
 ARG CARGO_FEATURES=""
 
 # Pass 1: compile the dep graph using dummy sources. The point of
