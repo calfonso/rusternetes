@@ -69,6 +69,10 @@ RUN set -eux; \
         echo "fn main(){}" > crates/$c/src/main.rs; \
     done
 
+# Dummy bench files — see Dockerfile.services for the detailed rationale.
+RUN mkdir -p crates/common/benches \
+ && echo "fn main(){}" > crates/common/benches/regex_cache.rs
+
 ENV CARGO_BUILD_JOBS=2
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
