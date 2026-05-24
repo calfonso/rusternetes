@@ -49,6 +49,7 @@ services:
       - "/etc/kubernetes/pki/api-server.crt"
       - "--tls-key-file"
       - "/etc/kubernetes/pki/api-server.key"
+      - "--skip-auth"
       - "--disable-proxy"
       - "--console-dir"
       - "/app/console"
