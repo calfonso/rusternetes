@@ -22,7 +22,7 @@ on:
 
 jobs:
   node-conformance:
-    runs-on: self-hosted
+    runs-on: arc-runner-set-conformance
     timeout-minutes: 90
     steps:
       - name: Checkout repository
