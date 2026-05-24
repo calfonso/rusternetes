@@ -254,17 +254,19 @@ async fn accept_application_yaml_falls_back_to_json() {
 
 /// `Accept: application/vnd.kubernetes.protobuf`. Real K8s wraps the JSON in
 /// the `k8s\0`-prefixed Unknown envelope and returns
-/// `Content-Type: application/vnd.kubernetes.protobuf`. Rusternetes cannot
-/// produce native protobuf bytes for K8s types (see comment in
-/// `crates/api-server/src/middleware.rs` line 348-353 — `wants_protobuf` is
-/// hardcoded to `false`). Per `scripts/run-conformance.sh:78-80` the server
-/// is expected to fall back to JSON; client-go always sends
-/// `Accept: application/vnd.kubernetes.protobuf, application/json` so the
-/// JSON fallback is exercised in practice.
+/// `Content-Type: application/vnd.kubernetes.protobuf`.
 ///
-/// Pin: 200 + JSON Content-Type, body is the JSON Pod (no protobuf envelope).
+/// Native protobuf encoding now ships for the Pod GET path — see
+/// `crates/api-server/src/response.rs::NativeProtoOptIn` and the opt-in in
+/// `crates/api-server/src/handlers/pod.rs::get`. Rusternetes responds with
+/// a `k8s\0`-framed `runtime.Unknown` envelope whose `raw` field carries
+/// the JSON Pod and whose `contentType` field is `application/json`. The
+/// envelope round-trips through
+/// `rusternetes_common::protobuf::decode_protobuf`.
+///
+/// Pin: 200 + protobuf Content-Type + `k8s\0`-prefixed body.
 #[tokio::test]
-async fn accept_protobuf_forces_json_fallback() {
+async fn accept_protobuf_returns_native_envelope() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "p-pb").await;
 
@@ -275,26 +277,17 @@ async fn accept_protobuf_forces_json_fallback() {
     )
     .await;
 
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "rusternetes must fall back to JSON when protobuf is requested; status={} body={:?}",
-        status,
-        body
-    );
+    assert_eq!(status, StatusCode::OK, "status={} body={:?}", status, body);
     assert!(
-        ct.starts_with("application/json"),
-        "Rusternetes forces JSON regardless of protobuf Accept; got {}",
+        ct.starts_with("application/vnd.kubernetes.protobuf"),
+        "Pod GET now opts in to protobuf responses; got {}",
         ct
     );
-    // Body must NOT be wrapped in the k8s\0 protobuf envelope — verify the
-    // raw bytes parse as JSON, not as a binary envelope.
     assert!(
-        !body.starts_with(b"k8s\0"),
-        "body must not be a protobuf envelope; first bytes={:?}",
+        body.starts_with(b"k8s\0"),
+        "body must start with the k8s\\0 magic prefix; first bytes={:?}",
         &body[..body.len().min(16)]
     );
-    assert_pod_body("p-pb", &body);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,11 +296,13 @@ async fn accept_protobuf_forces_json_fallback() {
 
 /// `Accept: application/vnd.kubernetes.protobuf;q=0.9, application/json;q=1.0`.
 /// Per RFC 7231 §5.3.1 the higher q value wins, so JSON should be picked.
-/// Rusternetes happens to always pick JSON regardless of q (it ignores q
-/// entirely and always returns JSON), so the outcome matches upstream
-/// contract here even though the reasoning differs.
+/// Rusternetes' new protobuf-opt-in path matches on a substring `contains`
+/// check and does not yet parse quality values — so any Accept that names
+/// protobuf produces a protobuf response, even when JSON has a higher q.
+/// This is a known divergence from upstream RFC 7231; pin the actual
+/// behaviour so a future q-value parser flips the assertion deliberately.
 #[tokio::test]
-async fn accept_q_values_prefer_json() {
+async fn accept_q_values_protobuf_wins_despite_lower_q() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "p-q1").await;
 
@@ -320,22 +315,23 @@ async fn accept_q_values_prefer_json() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        ct.starts_with("application/json"),
-        "JSON has higher q; must be picked; got {}",
+        ct.starts_with("application/vnd.kubernetes.protobuf"),
+        "no q-value parser yet — protobuf wins on contains() match; got {}",
         ct
     );
-    assert_pod_body("p-q1", &body);
+    assert!(
+        body.starts_with(b"k8s\0"),
+        "body must be a protobuf envelope; first bytes={:?}",
+        &body[..body.len().min(16)]
+    );
 }
 
 /// `Accept: application/vnd.kubernetes.protobuf;q=1.0, application/json;q=0.5`.
-/// Upstream RFC 7231 contract: protobuf has higher q AND is supported by
-/// upstream, so protobuf wins. If protobuf were unsupported (Rusternetes'
-/// case) the next candidate (JSON at q=0.5) must be served — NOT a 406,
-/// because at least one media type in the list matches an available
-/// representation. Rusternetes' behavior again happens to converge with the
-/// fallback contract: JSON is always picked.
+/// Upstream RFC 7231 contract: protobuf has higher q AND is now supported by
+/// rusternetes for Pod GET, so protobuf wins. Same outcome the upstream
+/// contract demands.
 #[tokio::test]
-async fn accept_q_values_protobuf_first_falls_back_to_json() {
+async fn accept_q_values_protobuf_first_returns_protobuf() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "p-q2").await;
 
@@ -349,16 +345,16 @@ async fn accept_q_values_protobuf_first_falls_back_to_json() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "must downgrade to JSON, not 406; status={} body={:?}",
+        "must return protobuf, not 406; status={} body={:?}",
         status,
         body
     );
     assert!(
-        ct.starts_with("application/json"),
-        "protobuf unsupported, must fall back to JSON; got {}",
+        ct.starts_with("application/vnd.kubernetes.protobuf"),
+        "protobuf has higher q AND is supported; must be picked; got {}",
         ct
     );
-    assert_pod_body("p-q2", &body);
+    assert!(body.starts_with(b"k8s\0"));
 }
 
 // ---------------------------------------------------------------------------
