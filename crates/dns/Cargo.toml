@@ -1,0 +1,37 @@
+[package]
+name = "rusternetes-dns"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "rusternetes_dns"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rusternetes-dns"
+path = "src/main.rs"
+
+[features]
+default = []
+sqlite = ["rusternetes-storage/sqlite"]
+redis = ["rusternetes-storage/redis"]
+
+[dependencies]
+rusternetes-common = { path = "../common" }
+rusternetes-storage = { path = "../storage" }
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+hickory-server = { version = "0.26", default-features = false }
+hickory-proto = { version = "0.26", default-features = false }
+
+[dev-dependencies]
+serial_test.workspace = true

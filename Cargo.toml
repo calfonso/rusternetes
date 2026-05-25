@@ -10,6 +10,7 @@ members = [
     "crates/common",
     "crates/storage",
     "crates/cloud-providers",
+    "crates/dns",
     "crates/rusternetes",
 ]
 
