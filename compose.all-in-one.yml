@@ -20,14 +20,14 @@ services:
       args:
         CARGO_FEATURES: sqlite
     container_name: rusternetes
+    # `privileged: true` covers NET_ADMIN / NET_RAW (kube-proxy iptables)
+    # plus the kubelet's mount / cgroup manipulation, so one knob.
     privileged: true
     ports:
       - "6443:6443"
       - "10250:10250"
     networks:
-      rusternetes-net:
-        aliases:
-          - api-server
+      - rusternetes-net
     volumes:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
       - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
@@ -37,8 +37,13 @@ services:
     environment:
       - RUST_LOG=info
       - DOCKER_HOST=unix:///run/podman/podman.sock
-      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+      # No KUBERNETES_SERVICE_HOST_OVERRIDE: kubelet defaults to the
+      # kubernetes Service ClusterIP (10.96.0.1), which the in-process
+      # kube-proxy task routes to the api-server's listener — same model
+      # as upstream Kubernetes. In-cluster clients
+      # (`rest.InClusterConfig` from hydrophone, conformance pods, etc.)
+      # see a numeric IP and never need to DNS-resolve a hostname.
     command:
       - "--storage-backend"
       - "sqlite"
@@ -50,7 +55,8 @@ services:
       - "--tls-key-file"
       - "/etc/kubernetes/pki/api-server.key"
       - "--skip-auth"
-      - "--disable-proxy"
+      # kube-proxy now runs in-process (no `--disable-proxy`). The image
+      # ships iptables / iproute2 for that — see Dockerfile.all-in-one.
       - "--console-dir"
       - "/app/console"
       - "--network"

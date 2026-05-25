@@ -169,9 +169,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Stage 3: Runtime image
 FROM debian:sid-slim
 
+# iptables + iproute2 are required by the in-process kube-proxy task: it
+# programs DNAT rules so pods can reach the kubernetes Service ClusterIP
+# (10.96.0.1) the same way upstream kubelet expects. Without these binaries
+# the all-in-one stack had to disable kube-proxy and inject a docker-
+# network alias as KUBERNETES_SERVICE_HOST — a workaround that broke any
+# in-cluster client that did a DNS lookup of the hostname.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    iptables \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
