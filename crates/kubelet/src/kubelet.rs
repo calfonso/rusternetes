@@ -3410,10 +3410,16 @@ impl Kubelet {
                                 }
                                 if all_ready {
                                     status.message = Some("All containers ready".to_string());
-                                    status.conditions = Some(Self::running_pod_conditions());
+                                    status.conditions = Some(Self::merge_pod_conditions(
+                                        status.conditions.as_deref().unwrap_or(&[]),
+                                        Self::running_pod_conditions(),
+                                    ));
                                 } else {
                                     status.message = Some("Some containers not ready".to_string());
-                                    status.conditions = Some(Self::not_ready_pod_conditions());
+                                    status.conditions = Some(Self::merge_pod_conditions(
+                                        status.conditions.as_deref().unwrap_or(&[]),
+                                        Self::not_ready_pod_conditions(),
+                                    ));
                                 }
                             }
 
@@ -3707,6 +3713,25 @@ impl Kubelet {
         }
 
         Ok(())
+    }
+
+    /// Preserve `last_transition_time` from existing conditions whose
+    /// type+status match the incoming ones. Without this every status
+    /// sync re-stamps the time → pod_status_equal returns false → write
+    /// → watch event → next sync repeats. Hot loop at ~30 Hz per pod.
+    fn merge_pod_conditions(
+        existing: &[PodCondition],
+        mut incoming: Vec<PodCondition>,
+    ) -> Vec<PodCondition> {
+        for new in incoming.iter_mut() {
+            if let Some(prev) = existing
+                .iter()
+                .find(|c| c.condition_type == new.condition_type && c.status == new.status)
+            {
+                new.last_transition_time = prev.last_transition_time;
+            }
+        }
+        incoming
     }
 
     /// Build the standard pod conditions for a Running pod.
@@ -4323,11 +4348,63 @@ pub fn resolve_api_server_host_alias() -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use rusternetes_common::resources::pod::PodSpec;
+    use super::Kubelet;
+    use rusternetes_common::resources::pod::{PodCondition, PodSpec};
     use rusternetes_common::resources::{
         Container, ContainerState, ContainerStatus, Pod, PodStatus,
     };
     use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+
+    fn cond(t: &str, status: &str, transition: chrono::DateTime<chrono::Utc>) -> PodCondition {
+        PodCondition {
+            condition_type: t.to_string(),
+            status: status.to_string(),
+            reason: None,
+            message: None,
+            last_transition_time: Some(transition),
+            observed_generation: None,
+        }
+    }
+
+    #[test]
+    fn merge_pod_conditions_preserves_time_when_status_unchanged() {
+        let stamp_old = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let existing = vec![
+            cond("Ready", "True", stamp_old),
+            cond("Initialized", "True", stamp_old),
+        ];
+        // Incoming carries a fresh "now" — must be discarded for matching entries.
+        let stamp_new = chrono::Utc::now();
+        let incoming = vec![
+            cond("Ready", "True", stamp_new),
+            cond("Initialized", "True", stamp_new),
+        ];
+
+        let merged = Kubelet::merge_pod_conditions(&existing, incoming);
+
+        assert_eq!(merged[0].last_transition_time, Some(stamp_old));
+        assert_eq!(merged[1].last_transition_time, Some(stamp_old));
+    }
+
+    #[test]
+    fn merge_pod_conditions_keeps_fresh_time_on_status_flip() {
+        let stamp_old = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let stamp_new = chrono::Utc::now();
+        let existing = vec![cond("Ready", "False", stamp_old)];
+        let incoming = vec![cond("Ready", "True", stamp_new)];
+
+        let merged = Kubelet::merge_pod_conditions(&existing, incoming);
+
+        assert_eq!(merged[0].last_transition_time, Some(stamp_new));
+    }
+
+    #[test]
+    fn merge_pod_conditions_passes_new_conditions_through() {
+        let stamp_new = chrono::Utc::now();
+        let merged = Kubelet::merge_pod_conditions(&[], vec![cond("Ready", "True", stamp_new)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].last_transition_time, Some(stamp_new));
+    }
 
     fn make_container(name: &str) -> Container {
         Container {
