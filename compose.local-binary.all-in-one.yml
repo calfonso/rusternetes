@@ -1,0 +1,49 @@
+# Override: skip Docker cargo build, bind-mount host-built binary.
+#
+# Use with:
+#   cargo build --release -p rusternetes --features sqlite
+#   docker compose -f compose.all-in-one.yml \
+#                  -f compose.dind.all-in-one.yml \
+#                  -f compose.local-binary.all-in-one.yml \
+#                  up -d --no-build
+#
+# Reuses rusternetes-rusternetes:latest as runtime base (ships iptables,
+# iproute2, libssl3, ca-certificates) and overlays the freshly-built
+# binary from target/release on the host.
+
+services:
+  rusternetes:
+    image: rusternetes-rusternetes:latest
+    pull_policy: never
+    volumes:
+      - ./target/release/rusternetes:/app/rusternetes:ro
+    environment:
+      # Pod-facing endpoint: rusternetes container's docker-bridge IP.
+      # Pods on the same `rusternetes-network` bridge can reach this
+      # directly with no iptables NAT, so we don't need a kube-proxy
+      # sidecar. The cert SANs include 172.20.0.2 (see generate-certs.sh
+      # which adds gateway IPs 1..10 of the bridge subnet).
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=172.20.0.2
+    command:
+      - "--storage-backend"
+      - "sqlite"
+      - "--data-dir"
+      - "/data/db/rusternetes.db"
+      - "--tls"
+      - "--tls-cert-file"
+      - "/etc/kubernetes/pki/api-server.crt"
+      - "--tls-key-file"
+      - "/etc/kubernetes/pki/api-server.key"
+      - "--skip-auth"
+      # Listen on default 0.0.0.0:6443. Kubelet's env injection emits
+      # KUBERNETES_SERVICE_PORT from the kubernetes Service's targetPort
+      # (6443), not from `port` (443) — so binding 6443 means pods
+      # connect to the same port the env vars advertise.
+      - "--console-dir"
+      - "/app/console"
+      - "--network"
+      - "rusternetes-network"
+      - "--cluster-dns"
+      - "10.96.0.10"
+      - "--volume-dir"
+      - "${KUBELET_VOLUMES_PATH}"

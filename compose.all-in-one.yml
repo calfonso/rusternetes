@@ -38,12 +38,15 @@ services:
       - RUST_LOG=info
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-      # No KUBERNETES_SERVICE_HOST_OVERRIDE: kubelet defaults to the
-      # kubernetes Service ClusterIP (10.96.0.1), which the in-process
-      # kube-proxy task routes to the api-server's listener — same model
-      # as upstream Kubernetes. In-cluster clients
-      # (`rest.InClusterConfig` from hydrophone, conformance pods, etc.)
-      # see a numeric IP and never need to DNS-resolve a hostname.
+      # Point pods at the rusternetes container's docker-bridge IP. The
+      # in-process kube-proxy task programs iptables inside this
+      # container's net ns, but pod traffic transits the docker bridge
+      # — so DNAT for ClusterIP 10.96.0.1 → 6443 never fires for pod
+      # packets. A direct bridge-IP hop bypasses the kube-proxy gap.
+      # Hardcoded for the default `rusternetes-network` subnet
+      # (172.20.0.0/16, rusternetes is first → .0.2). If the bridge
+      # subnet differs on a given host, override this var.
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=172.20.0.2
     command:
       - "--storage-backend"
       - "sqlite"
