@@ -126,7 +126,7 @@ impl RequestHandler for DnsHandler {
         };
         let authorities: Vec<Record> = soa_record.into_iter().collect();
 
-        let builder = MessageResponseBuilder::from_message_request(&*request);
+        let builder = MessageResponseBuilder::from_message_request(request);
         let response = builder.build(
             metadata,
             answers.iter(),
@@ -154,7 +154,7 @@ async fn reply_error<R: ResponseHandler>(
     response_handle: &mut R,
     code: ResponseCode,
 ) -> ResponseInfo {
-    let builder = MessageResponseBuilder::from_message_request(&*request);
+    let builder = MessageResponseBuilder::from_message_request(request);
     let response = builder.error_msg(&request.metadata, code);
     let metadata = {
         let mut m = Metadata::response_from_request(&request.metadata);

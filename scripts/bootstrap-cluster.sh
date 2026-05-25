@@ -207,25 +207,114 @@ if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/nu
     echo "  .env file written: $PROJECT_ROOT/.env"
 fi
 
-# Step 5: Wait for CoreDNS to be ready
-print_step "Waiting for CoreDNS to be ready..."
-MAX_WAIT=30
-for i in $(seq 1 $MAX_WAIT); do
-    COREDNS_STATUS=$($KUBECTL $KUBECTL_FLAGS get pod coredns -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+# Step 5: Swap the CoreDNS Pod for the rusternetes-dns container.
+#
+# When USE_RUSTERNETES_DNS=1 (default), the script:
+#   1. Deletes the CoreDNS Pod and ConfigMap that bootstrap-cluster.yaml
+#      just created. The kube-dns Service stays — its ClusterIP
+#      (10.96.0.10) is what every Pod's `/etc/resolv.conf` references
+#      via kubelet's --cluster-dns flag, and we want to keep it stable.
+#   2. Resolves the rusternetes-dns container's IP on the
+#      rusternetes-network bridge.
+#   3. Creates a hand-written EndpointSlice in kube-system that points
+#      `kube-dns` at that container IP, so kube-proxy DNATs cluster DNS
+#      queries (10.96.0.10:53) onto the standalone DNS server.
+#
+# To run with the original CoreDNS Pod (e.g. for A/B comparison), set
+# USE_RUSTERNETES_DNS=0 in the environment and the script falls back
+# to waiting for the CoreDNS Pod to come up.
+USE_RUSTERNETES_DNS="${USE_RUSTERNETES_DNS:-1}"
 
-    if [ "$COREDNS_STATUS" == "Running" ]; then
-        print_success "CoreDNS is running!"
-        break
-    fi
+if [ "$USE_RUSTERNETES_DNS" = "1" ]; then
+    print_step "Swapping CoreDNS Pod for rusternetes-dns container..."
 
-    if [ $i -eq $MAX_WAIT ]; then
-        print_warning "CoreDNS not running after ${MAX_WAIT} seconds (status: $COREDNS_STATUS)"
-        print_warning "You may need to check the logs: $KUBECTL $KUBECTL_FLAGS logs -n kube-system coredns"
+    # Tear down the CoreDNS Pod + ConfigMap created above. The Service
+    # stays so the ClusterIP is stable.
+    $KUBECTL $KUBECTL_FLAGS delete pod coredns -n kube-system --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    $KUBECTL $KUBECTL_FLAGS delete configmap coredns -n kube-system --ignore-not-found >/dev/null 2>&1 || true
+    # Belt and braces: also nuke the pod object from etcd in case the
+    # apiserver has not yet observed the delete.
+    $CONTAINER_RT exec rusternetes-etcd etcdctl del /registry/pods/kube-system/coredns >/dev/null 2>&1 || true
+
+    # Discover the rusternetes-dns container's IP on the rusternetes
+    # bridge. The compose file pins the network name to
+    # `rusternetes-network` (see compose.yml `networks:` block).
+    DNS_CONTAINER_NAME="rusternetes-dns"
+    DNS_NETWORK="rusternetes-network"
+    DNS_IP=""
+    for i in $(seq 1 30); do
+        DNS_IP=$($CONTAINER_RT inspect "$DNS_CONTAINER_NAME" \
+            --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
+            2>/dev/null || true)
+        if [ -n "$DNS_IP" ] && [ "$DNS_IP" != "<no value>" ]; then
+            break
+        fi
+        echo "  Waiting for $DNS_CONTAINER_NAME container IP... ($i/30)"
+        sleep 1
+    done
+
+    if [ -z "$DNS_IP" ] || [ "$DNS_IP" = "<no value>" ]; then
+        print_warning "Could not resolve $DNS_CONTAINER_NAME IP on $DNS_NETWORK."
+        print_warning "Is the dns service running? Try: $CONTAINER_RT ps --filter name=$DNS_CONTAINER_NAME"
+        print_warning "Falling back: cluster DNS will NOT be functional until kube-dns has endpoints."
     else
-        echo "  Waiting for CoreDNS... ($i/$MAX_WAIT) Status: $COREDNS_STATUS"
-        sleep 2
+        echo "  Found rusternetes-dns at $DNS_IP"
+
+        # Wire up the EndpointSlice that backs the kube-dns Service.
+        # Without this kube-proxy has nothing to DNAT 10.96.0.10:53 to.
+        # The slice carries the standard `kubernetes.io/service-name`
+        # label so kube-proxy + the EndpointSlice controller treat it
+        # as belonging to kube-dns. `addressType: IPv4` matches the
+        # bridge IPs; dual-stack support is a follow-up.
+        cat <<EOF | $KUBECTL $KUBECTL_FLAGS apply -f -
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: kube-dns-rusternetes
+  namespace: kube-system
+  labels:
+    kubernetes.io/service-name: kube-dns
+    endpointslice.kubernetes.io/managed-by: bootstrap-cluster.sh
+addressType: IPv4
+ports:
+  - name: dns
+    port: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    protocol: TCP
+endpoints:
+  - addresses:
+      - "$DNS_IP"
+    conditions:
+      ready: true
+      serving: true
+      terminating: false
+EOF
+        print_success "rusternetes-dns wired up at $DNS_IP for kube-dns Service"
     fi
-done
+else
+    # Fallback path — original behaviour: wait for the CoreDNS Pod that
+    # bootstrap-cluster.yaml created to come up.
+    print_step "Waiting for CoreDNS to be ready (USE_RUSTERNETES_DNS=0)..."
+    MAX_WAIT=30
+    for i in $(seq 1 $MAX_WAIT); do
+        COREDNS_STATUS=$($KUBECTL $KUBECTL_FLAGS get pod coredns -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+
+        if [ "$COREDNS_STATUS" == "Running" ]; then
+            print_success "CoreDNS is running!"
+            break
+        fi
+
+        if [ $i -eq $MAX_WAIT ]; then
+            print_warning "CoreDNS not running after ${MAX_WAIT} seconds (status: $COREDNS_STATUS)"
+            print_warning "You may need to check the logs: $KUBECTL $KUBECTL_FLAGS logs -n kube-system coredns"
+        else
+            echo "  Waiting for CoreDNS... ($i/$MAX_WAIT) Status: $COREDNS_STATUS"
+            sleep 2
+        fi
+    done
+fi
 
 echo ""
 print_success "Cluster bootstrap complete!"

@@ -1,0 +1,132 @@
+# syntax=docker/dockerfile:1.6
+#
+# Standalone Dockerfile for the rusternetes-dns binary.
+#
+# This file exists primarily so the DNS image can be built independently
+# of the larger Dockerfile.services pipeline — useful for fast local
+# iteration on the DNS code without rebuilding the api-server / kubelet
+# / scheduler / controller-manager / kube-proxy stages alongside it.
+#
+# For the docker-compose flow, prefer the `dns` target in
+# Dockerfile.services: it shares the cargo-builder stage with the other
+# service binaries, so a `docker compose build` populates the BuildKit
+# cache once and reuses it across all six services.
+#
+# Build (rhino must be adjacent — same constraint Dockerfile.services
+# carries via the compose `additional_contexts: rhino: ../rhino` entry):
+#   docker build -f Dockerfile.dns --build-context rhino=../rhino \
+#       -t rusternetes-dns:dev .
+#
+# Run (against an etcd reachable from the container):
+#   docker run --rm -p 53:53/udp -p 53:53/tcp rusternetes-dns:dev \
+#       --etcd-servers http://etcd:2379
+
+FROM rust:1.95 AS builder
+
+ARG SCCACHE_VERSION=v0.8.2
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+        | tar -xz -C /tmp \
+    && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache \
+    && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+
+ENV RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/sccache \
+    CARGO_INCREMENTAL=0
+
+WORKDIR /app
+
+# Pull in the adjacent rhino crate (named build context). crates/storage/
+# Cargo.toml declares `rhino = { path = "../../../rhino", optional = true }`
+# which from /app/crates/storage resolves to /rhino, so land it there.
+# We need this even when building without the sqlite/redis features
+# because `cargo metadata` resolves all optional dependencies up-front.
+COPY --from=rhino . /rhino
+
+# Workspace manifest + lockfile.
+COPY Cargo.toml Cargo.lock* ./
+
+# Every workspace member's Cargo.toml — cargo refuses to resolve the
+# workspace if any member is missing.
+COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
+COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
+COPY crates/common/Cargo.toml             crates/common/Cargo.toml
+COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
+COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
+COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
+COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
+COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
+COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
+COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
+
+COPY crates/api-server/build.rs crates/api-server/build.rs
+COPY crates/api-server/proto    crates/api-server/proto
+
+# Dummy sources so `cargo build` can resolve the workspace before the
+# real source COPY further down.
+RUN set -eux; \
+    for c in common storage cloud-providers; do \
+        mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
+    done; \
+    for c in kubectl rusternetes; do \
+        mkdir -p crates/$c/src && echo "fn main(){}" > crates/$c/src/main.rs; \
+    done; \
+    for c in api-server controller-manager dns kubelet kube-proxy scheduler; do \
+        mkdir -p crates/$c/src && \
+        : > crates/$c/src/lib.rs && \
+        echo "fn main(){}" > crates/$c/src/main.rs; \
+    done
+
+RUN mkdir -p crates/common/benches \
+ && echo "fn main(){}" > crates/common/benches/regex_cache.rs
+
+# Pass 1: dependency-only compile.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes \
+    cargo build --release --bin rusternetes-dns \
+ && sccache --show-stats
+
+# Pass 2: real sources. Only the dns crate + its dependency chain
+# (`common`, `storage`) rebuilds.
+COPY crates/common/src   crates/common/src
+COPY crates/common/tests crates/common/tests
+COPY crates/storage/src  crates/storage/src
+COPY crates/dns/src      crates/dns/src
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes \
+    find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
+    cargo build --release --bin rusternetes-dns \
+ && sccache --show-stats \
+ && mkdir -p /out \
+ && cp target/release/rusternetes-dns /out/rusternetes-dns
+
+# ---------------------------------------------------------------------
+# Runtime image.
+# ---------------------------------------------------------------------
+FROM debian:sid-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /out/rusternetes-dns /app/rusternetes-dns
+
+EXPOSE 53/udp
+EXPOSE 53/tcp
+
+ENTRYPOINT ["/app/rusternetes-dns"]
+CMD ["--etcd-servers", "http://etcd:2379"]
