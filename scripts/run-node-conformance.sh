@@ -70,8 +70,10 @@ ${COMPOSE} up -d --build
 
 echo "[3/7] Waiting for kubelet to come up (max 60s)..."
 for i in $(seq 1 60); do
+    # Single HTTP server on :10250 serves both /healthz and /metrics —
+    # see compose.node-conformance.yml kubelet block for the rationale.
     if curl -sfk "http://localhost:10250/healthz" >/dev/null 2>&1 \
-        || curl -sfk "http://localhost:10249/metrics" >/dev/null 2>&1; then
+        || curl -sfk "http://localhost:10250/metrics" >/dev/null 2>&1; then
         echo "kubelet is up"
         break
     fi
@@ -127,6 +129,11 @@ if [ ! -f "${BIN_DIR}/e2e.test" ] || [ ! -f "${BIN_DIR}/ginkgo" ]; then
 fi
 
 echo "[6/7] Running ginkgo focus=${FOCUS}..."
+# Disable errexit + pipefail across the pipe so we can capture ginkgo's
+# real exit status from PIPESTATUS even when tee succeeds (or vice
+# versa) without killing the script. Re-enable immediately after.
+set +e
+set +o pipefail
 KUBECONFIG="${KUBECONFIG_FILE}" \
 "${BIN_DIR}/ginkgo" \
     --focus="${FOCUS}" \
@@ -137,7 +144,9 @@ KUBECONFIG="${KUBECONFIG_FILE}" \
     --provider=local \
     --num-nodes=1 \
     --report-dir="${RESULTS_DIR}" \
-    2>&1 | tee "${RESULTS_DIR}/ginkgo.log" || true
+    2>&1 | tee "${RESULTS_DIR}/ginkgo.log"
+GINKGO_RC=${PIPESTATUS[0]}
+set -eo pipefail
 
 echo "[7/7] Parsing results..."
 PASS=$(grep -cE '^\s*\[PASSED\]|• \[' "${RESULTS_DIR}/ginkgo.log" || true)
@@ -148,3 +157,14 @@ SUMMARY=$(grep -E "Ran [0-9]+ of [0-9]+ Specs" "${RESULTS_DIR}/ginkgo.log" | tai
 echo "PASS=${PASS} FAIL=${FAIL}"
 echo "Summary: ${SUMMARY}"
 echo "Full log: ${RESULTS_DIR}/ginkgo.log"
+echo "Ginkgo exit code: ${GINKGO_RC}"
+
+# Propagate failure so CI surfaces it. Either a non-zero ginkgo exit
+# (covers BeforeSuite / infra failures) or any spec FAIL count is a
+# real failure — even a single SynchronizedBeforeSuite failure ran 0
+# specs and produces PASS=0 FAIL=2 in the parsed output (see run
+# 26392683106 — the script previously masked this as success).
+if [ "${GINKGO_RC}" -ne 0 ] || [ "${FAIL}" -gt 0 ]; then
+    echo "ERROR: conformance run did not pass (ginkgo_rc=${GINKGO_RC}, FAIL=${FAIL})"
+    exit 1
+fi
