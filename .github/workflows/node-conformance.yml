@@ -48,6 +48,23 @@ jobs:
             echo "rhino already present at ../rhino"
           fi
 
+      - name: Install kubectl
+        # bootstrap-cluster.sh (invoked from run-node-conformance.sh) shells
+        # out to kubectl for service / SA / CoreDNS setup. The ARC runner
+        # image (ci/arc-runner/Dockerfile) does not bake kubectl. Drop it
+        # into $HOME/.local/bin so no sudo is needed. Pin to v1.35 to match
+        # the upstream conformance image we test against.
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION="v1.35.0"
+          mkdir -p "$HOME/.local/bin"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+            -o "$HOME/.local/bin/kubectl"
+          chmod +x "$HOME/.local/bin/kubectl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/kubectl" version --client
+
       - name: Generate TLS certificates
         run: bash scripts/generate-certs.sh
 
@@ -70,4 +87,6 @@ jobs:
       - name: Tear down stack
         if: always()
         run: |
-          docker compose -f compose.node-conformance.yml down -v --remove-orphans || true
+          docker compose -f compose.node-conformance.yml \
+            -f compose.dind.node-conformance.yml \
+            down -v --remove-orphans || true
