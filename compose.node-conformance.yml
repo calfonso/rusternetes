@@ -83,10 +83,19 @@ services:
     networks:
       - nc-net
     ports:
-      # 10250: kubelet HTTP server (lands in PR2 of node-conformance work)
-      # 10249: kubelet metrics — used by run-node-conformance.sh readiness probe in PR1
+      # 10250 is the single kubelet HTTP server port. The kubelet binary
+      # merges metrics + /configz + the read-only server router (/healthz,
+      # /pods, /runningpods, /stats/summary) onto one axum app behind
+      # `--metrics-port` (crates/kubelet/src/main.rs). The api-server's
+      # node-proxy handler reaches the kubelet at whatever port
+      # `node.status.daemonEndpoints.kubeletEndpoint.port` advertises —
+      # set to 10250 in kubelet.rs:518-522. The earlier 10249/10250 split
+      # was a placeholder for a separate HTTP server that never landed;
+      # with the merged router an api-server -> kubelet proxy to :10250
+      # hit a closed port and SynchronizedBeforeSuite's kubelet-pods dump
+      # failed (PR #788 follow-up). Pin metrics to 10250 so the advertised
+      # port and the listening port match.
       - "10250:10250"
-      - "10249:10249"
     volumes:
       - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
       - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw
@@ -96,9 +105,7 @@ services:
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}
-      - RUSTERNETES_KUBELET_SERVER_PORT=10250
-    # metrics-port intentionally on 10249 so the new kubelet HTTP server (port 10250) doesn't collide.
-    command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10249", "--sync-interval", "3"]
+    command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
 networks:
   nc-net:
