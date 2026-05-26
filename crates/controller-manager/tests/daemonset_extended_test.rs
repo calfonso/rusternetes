@@ -1069,7 +1069,10 @@ async fn daemonset_status_counters_steady_state_all_fields() {
     controller.reconcile_all().await.unwrap();
     let after_create: DaemonSet = storage.get(&key).await.unwrap();
     let status = after_create.status.as_ref().expect("status must be set");
-    assert_eq!(status.desired_number_scheduled, 3, "desired = eligible nodes");
+    assert_eq!(
+        status.desired_number_scheduled, 3,
+        "desired = eligible nodes"
+    );
     assert_eq!(
         status.current_number_scheduled, 3,
         "current = nodes with at least one pod"
@@ -1143,19 +1146,14 @@ async fn daemonset_status_counters_steady_state_all_fields() {
             requiredDuringSchedulingIgnoredDuringExecution — schedules even when a \
             conflicting pod already occupies the topology"]
 async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
-    use rusternetes_common::resources::pod::{
-        PodAffinityTerm, PodAntiAffinity,
-    };
+    use rusternetes_common::resources::pod::{PodAffinityTerm, PodAntiAffinity};
 
     let storage = setup_test().await;
     let ns = "default";
 
     // Two nodes, both labelled with the same topology key.
     for i in 1..=2 {
-        let labels = HashMap::from([(
-            "kubernetes.io/hostname".to_string(),
-            format!("node-{}", i),
-        )]);
+        let labels = HashMap::from([("kubernetes.io/hostname".to_string(), format!("node-{}", i))]);
         let node = make_node(&format!("node-{}", i), Some(labels));
         storage
             .create(&build_key("nodes", None, &format!("node-{}", i)), &node)
@@ -1184,10 +1182,7 @@ async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
         }),
     };
     storage
-        .create(
-            &build_key("pods", Some(ns), "conflict-pod"),
-            &conflict_pod,
-        )
+        .create(&build_key("pods", Some(ns), "conflict-pod"), &conflict_pod)
         .await
         .unwrap();
 
@@ -1224,7 +1219,8 @@ async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
                 .owner_references
                 .as_ref()
                 .map(|refs| {
-                    refs.iter().any(|r| r.kind == "DaemonSet" && r.name == "antiaffinity-ds")
+                    refs.iter()
+                        .any(|r| r.kind == "DaemonSet" && r.name == "antiaffinity-ds")
                 })
                 .unwrap_or(false)
         })
@@ -1323,7 +1319,10 @@ async fn daemonset_handles_burst_template_updates() {
     let status = ds_after.status.as_ref().expect("status must be set");
     assert_eq!(status.desired_number_scheduled, 4);
     assert_eq!(status.current_number_scheduled, 4);
-    assert_eq!(status.number_ready, 4, "all pods Ready after burst converges");
+    assert_eq!(
+        status.number_ready, 4,
+        "all pods Ready after burst converges"
+    );
     assert_eq!(
         status.updated_number_scheduled,
         Some(4),
