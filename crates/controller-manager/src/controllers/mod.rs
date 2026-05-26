@@ -18,6 +18,8 @@ pub mod namespace;
 pub mod network_policy;
 pub mod node;
 pub mod pod_disruption_budget;
+#[allow(dead_code)]
+pub mod priorityclass;
 pub mod pv_binder;
 pub mod pvc;
 pub mod replicaset;
