@@ -139,13 +139,11 @@ data:
           pods insecure
           fallthrough in-addr.arpa ip6.arpa
           ttl 30
-          # Rusternetes container's docker-bridge IP. Pods on the same
-          # `rusternetes-network` bridge can reach it directly — no
-          # iptables NAT needed. `api-server` hostname doesn't resolve
-          # from a pod's CNI net ns; ClusterIP 10.96.0.1 only works
-          # when kube-proxy programs NAT on the pod's net ns (which
-          # the in-process all-in-one task can't).
-          endpoint https://172.20.0.2:6443
+          # Docker bridge gateway (always [subnet].1), discovered at
+          # bootstrap time. Reaches the host where the 6443:6443 port
+          # mapping forwards to the in-process api-server — no known
+          # subnet required.
+          endpoint https://${DOCKER_GATEWAY}:6443
           tls "" "" /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
         }
         prometheus :9153

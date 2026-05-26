@@ -167,6 +167,33 @@ jobs:
 
       - name: Bring up cluster
         run: |
+          # Initial up creates the bridge network (needed before we can
+          # discover the gateway.  KUBERNETES_SERVICE_HOST_OVERRIDE will
+          # be wrong until the restart step below.
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d
+          docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml ps
+
+      - id: discover-gateway
+        name: Discover docker bridge gateway
+        run: |
+          GW=$(docker network inspect rusternetes-network -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "")
+          if [ -z "$GW" ]; then
+            GW=$(ip route show | grep "docker0" | grep -oP 'inet\K[0-9./]+' | head -1 | cut -d/ -f1 | rev | cut -d. -f2,3,4 | rev | sed 's/\.[0-9]*$/.1/')
+          fi
+          if [ -z "$GW" ]; then
+            echo "ERROR: Could not discover docker bridge gateway" >&2
+            exit 1
+          fi
+          echo "gateway=$GW" >> "$GITHUB_OUTPUT"
+          echo "export DOCKER_GATEWAY=$GW" >> "$GITHUB_ENV"
+          echo "Docker bridge gateway: $GW"
+
+      - name: Restart cluster with discovered gateway
+        # Write .env so compose interpolates the real gateway on restart.
+        # The kubelet inside the container now sees the correct IP.
+        run: |
+          echo "DOCKER_GATEWAY=${{ steps.discover-gateway.outputs.gateway }}" > .env
+          echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> .env
           docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d
           docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml ps
 
