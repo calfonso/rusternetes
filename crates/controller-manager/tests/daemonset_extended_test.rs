@@ -867,3 +867,468 @@ async fn daemonset_should_respect_min_ready_seconds() {
         "Pods not ready due to minReadySeconds"
     );
 }
+
+// ===========================================================================
+// Additional extended DaemonSet coverage (batch 1.3 expansion)
+// ===========================================================================
+//
+// The tests below extend the suite with five upstream-inspired scenarios that
+// are not yet covered above. Each test documents its upstream reference and,
+// where Rusternetes' controller does not yet honour the contract, is gated
+// with `#[ignore = "RED-state: ..."]` so they document missing behaviour
+// without making the suite red.
+
+/// DaemonSet `maxUnavailable=1` should serialise rolling updates one pod at a
+/// time even when many nodes are eligible.
+///
+/// Upstream: kubernetes/test/e2e/apps/daemon_set.go
+///   "rolling update should respect maxUnavailable"
+///
+/// The earlier `daemonset_rolling_update_respects_max_unavailable` test
+/// exercises the absolute value `"2"`. This case pins the strictest budget
+/// (`"1"`) across six nodes to ensure the controller never deletes more than
+/// a single pod per reconcile, even when most pods are ready and updating.
+#[tokio::test]
+async fn daemonset_rolling_update_max_unavailable_one_serialises_deletions() {
+    let storage = setup_test().await;
+    let ns = "default";
+
+    // Create 6 nodes so the budget (1) is meaningfully smaller than the fleet.
+    for i in 1..=6 {
+        let node = make_node(&format!("node-{}", i), None);
+        storage
+            .create(&build_key("nodes", None, &format!("node-{}", i)), &node)
+            .await
+            .unwrap();
+    }
+
+    let mut ds = make_daemonset("serial-rolling-ds", ns, "nginx:1.25-alpine", None);
+    ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
+        strategy_type: Some("RollingUpdate".to_string()),
+        rolling_update: Some(RollingUpdateDaemonSet {
+            max_unavailable: Some("1".to_string()),
+            max_surge: None,
+        }),
+    });
+
+    let key = build_key("daemonsets", Some(ns), "serial-rolling-ds");
+    storage.create(&key, &ds).await.unwrap();
+
+    let controller = DaemonSetController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+    mark_all_pods_ready(&storage, ns).await;
+
+    let initial_pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(
+        initial_pods.len(),
+        6,
+        "expected one pod per node before update"
+    );
+
+    // Bump the template image — triggers rolling update.
+    let mut updated: DaemonSet = storage.get(&key).await.unwrap();
+    updated.spec.template.spec.containers[0].image = "nginx:1.26-alpine".to_string();
+    storage.update(&key, &updated).await.unwrap();
+
+    // First reconcile after the template change should delete AT MOST one pod
+    // (the maxUnavailable budget). The controller marks deletion via
+    // deletionTimestamp; the in-memory store also issues a hard delete in
+    // certain code paths, so count both.
+    controller.reconcile_all().await.unwrap();
+
+    let after_first_reconcile: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    let marked_for_deletion = after_first_reconcile
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_some())
+        .count();
+    let hard_deleted = 6 - after_first_reconcile.len();
+
+    let disruption_window = marked_for_deletion + hard_deleted;
+    assert!(
+        disruption_window <= 1,
+        "maxUnavailable=1 must cap concurrent disruption at one pod, observed {} \
+         (deletionTimestamp: {}, hard-deleted: {})",
+        disruption_window,
+        marked_for_deletion,
+        hard_deleted
+    );
+
+    // Drive the rolling update to completion: simulate kubelet cleanup +
+    // readiness for several rounds. Each round can only progress one pod.
+    for _ in 0..12 {
+        controller.reconcile_all().await.unwrap();
+        simulate_kubelet_cleanup(&storage, ns).await;
+        mark_all_pods_ready(&storage, ns).await;
+    }
+
+    let final_pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(final_pods.len(), 6, "fleet restored after rolling update");
+    for pod in &final_pods {
+        assert_eq!(
+            pod.spec.as_ref().unwrap().containers[0].image,
+            "nginx:1.26-alpine",
+            "all pods should have been rolled forward"
+        );
+    }
+}
+
+/// DaemonSet with a `priorityClassName` should propagate that field (and any
+/// pre-computed `priority` integer) to every pod it creates.
+///
+/// Upstream: kubernetes/pkg/controller/daemon/daemon_controller.go (the
+/// template's PodSpec is cloned wholesale into each pod).
+///
+/// A scheduler/admission plugin is responsible for resolving the named
+/// PriorityClass into the integer `priority` value, but the *controller*'s
+/// contract is that whatever the user puts on the template arrives intact on
+/// the pod. This test pins that property.
+#[tokio::test]
+async fn daemonset_propagates_priority_class_to_pods() {
+    let storage = setup_test().await;
+    let ns = "default";
+
+    // Three eligible nodes — assert propagation on every one.
+    for i in 1..=3 {
+        let node = make_node(&format!("node-{}", i), None);
+        storage
+            .create(&build_key("nodes", None, &format!("node-{}", i)), &node)
+            .await
+            .unwrap();
+    }
+
+    // Persist the PriorityClass at the cluster-scoped registry path. The
+    // controller is not required to consult it for this test, but storing it
+    // keeps the test honest in a future where the controller might.
+    let pc = rusternetes_common::resources::policy::PriorityClass::new("high-priority", 1_000_000)
+        .with_description("DaemonSet critical workloads");
+    storage
+        .create(&build_key("priorityclasses", None, "high-priority"), &pc)
+        .await
+        .unwrap();
+
+    let mut ds = make_daemonset("priority-ds", ns, "nginx:1.25-alpine", None);
+    ds.spec.template.spec.priority_class_name = Some("high-priority".to_string());
+    ds.spec.template.spec.priority = Some(1_000_000);
+
+    let key = build_key("daemonsets", Some(ns), "priority-ds");
+    storage.create(&key, &ds).await.unwrap();
+
+    let controller = DaemonSetController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+
+    let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(pods.len(), 3, "one pod per eligible node");
+
+    for pod in &pods {
+        let spec = pod.spec.as_ref().expect("pod spec must be populated");
+        assert_eq!(
+            spec.priority_class_name.as_deref(),
+            Some("high-priority"),
+            "priorityClassName must be propagated from the DaemonSet template"
+        );
+        assert_eq!(
+            spec.priority,
+            Some(1_000_000),
+            "priority integer must be propagated from the DaemonSet template"
+        );
+    }
+}
+
+/// DaemonSet status must fill the full set of counter fields correctly at
+/// steady state: desired, current, ready, numberMisscheduled,
+/// updatedNumberScheduled, numberAvailable, numberUnavailable.
+///
+/// Upstream: kubernetes/pkg/controller/daemon/update.go
+///   `manage()` + `updateDaemonSetStatus()`
+///
+/// The earlier `daemonset_status_should_be_accurate_during_update` test
+/// only asserts three of these. This case pins every counter, including the
+/// ones whose value is `0` at steady state, so a regression that flips e.g.
+/// `numberMisscheduled` to non-zero would be caught.
+#[tokio::test]
+async fn daemonset_status_counters_steady_state_all_fields() {
+    let storage = setup_test().await;
+    let ns = "default";
+
+    // Create 3 eligible nodes.
+    for i in 1..=3 {
+        let node = make_node(&format!("node-{}", i), None);
+        storage
+            .create(&build_key("nodes", None, &format!("node-{}", i)), &node)
+            .await
+            .unwrap();
+    }
+
+    let ds = make_daemonset("full-status-ds", ns, "nginx:1.25-alpine", None);
+    let key = build_key("daemonsets", Some(ns), "full-status-ds");
+    storage.create(&key, &ds).await.unwrap();
+
+    let controller = DaemonSetController::new(storage.clone());
+
+    // Round 1: pods are created but not yet ready.
+    controller.reconcile_all().await.unwrap();
+    let after_create: DaemonSet = storage.get(&key).await.unwrap();
+    let status = after_create.status.as_ref().expect("status must be set");
+    assert_eq!(status.desired_number_scheduled, 3, "desired = eligible nodes");
+    assert_eq!(
+        status.current_number_scheduled, 3,
+        "current = nodes with at least one pod"
+    );
+    assert_eq!(
+        status.number_ready, 0,
+        "no pods are Ready before mark_all_pods_ready"
+    );
+    assert_eq!(status.number_misscheduled, 0, "no pods on ineligible nodes");
+    assert_eq!(
+        status.number_unavailable,
+        Some(3),
+        "desired - ready when nothing is ready yet"
+    );
+    assert_eq!(
+        status.number_available,
+        Some(0),
+        "no pods are available before they're Ready"
+    );
+    assert_eq!(
+        status.updated_number_scheduled,
+        Some(3),
+        "all pods share the current template hash on first reconcile"
+    );
+
+    // Round 2: kubelet marks everything Ready and the controller resyncs.
+    mark_all_pods_ready(&storage, ns).await;
+    controller.reconcile_all().await.unwrap();
+
+    let after_ready: DaemonSet = storage.get(&key).await.unwrap();
+    let status = after_ready
+        .status
+        .as_ref()
+        .expect("status must be set after ready reconcile");
+
+    assert_eq!(status.desired_number_scheduled, 3);
+    assert_eq!(status.current_number_scheduled, 3);
+    assert_eq!(status.number_ready, 3, "all three pods now Ready");
+    assert_eq!(status.number_misscheduled, 0);
+    assert_eq!(
+        status.number_unavailable,
+        Some(0),
+        "no pods unavailable when all are Ready"
+    );
+    assert_eq!(
+        status.number_available,
+        Some(3),
+        "all Ready pods count as available"
+    );
+    assert_eq!(
+        status.updated_number_scheduled,
+        Some(3),
+        "all pods carry the current template hash"
+    );
+}
+
+/// DaemonSet with pod *anti*-affinity should refuse to schedule a second pod
+/// onto a node already running a matching pod.
+///
+/// Upstream: kubernetes/test/e2e/apps/daemon_set.go
+///   "should not schedule extra pods when constrained"
+///
+/// Pod anti-affinity is normally enforced by the scheduler, not the
+/// DaemonSet controller. Our controller is happy to place one DS pod per
+/// node regardless. The interesting failure mode is when a *user* pod with
+/// matching labels already exists on a node and pod-anti-affinity should
+/// block the DS from co-locating. Rusternetes' controller does not yet
+/// consult `podAntiAffinity`, so this is RED-state.
+#[tokio::test]
+#[ignore = "RED-state: DaemonSet controller does not honour podAntiAffinity \
+            requiredDuringSchedulingIgnoredDuringExecution — schedules even when a \
+            conflicting pod already occupies the topology"]
+async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
+    use rusternetes_common::resources::pod::{
+        PodAffinityTerm, PodAntiAffinity,
+    };
+
+    let storage = setup_test().await;
+    let ns = "default";
+
+    // Two nodes, both labelled with the same topology key.
+    for i in 1..=2 {
+        let labels = HashMap::from([(
+            "kubernetes.io/hostname".to_string(),
+            format!("node-{}", i),
+        )]);
+        let node = make_node(&format!("node-{}", i), Some(labels));
+        storage
+            .create(&build_key("nodes", None, &format!("node-{}", i)), &node)
+            .await
+            .unwrap();
+    }
+
+    // Place a conflicting user pod on node-1 carrying the DaemonSet's label.
+    let mut conflict_labels = HashMap::new();
+    conflict_labels.insert("conflict".to_string(), "true".to_string());
+    let mut conflict_meta = ObjectMeta::new("conflict-pod").with_namespace(ns.to_string());
+    conflict_meta.labels = Some(conflict_labels.clone());
+    conflict_meta.ensure_uid();
+    let mut conflict_spec = empty_pod_spec("nginx:1.25-alpine", "app");
+    conflict_spec.node_name = Some("node-1".to_string());
+    let conflict_pod = Pod {
+        type_meta: TypeMeta {
+            kind: "Pod".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: conflict_meta,
+        spec: Some(conflict_spec),
+        status: Some(PodStatus {
+            phase: Some(Phase::Running),
+            ..Default::default()
+        }),
+    };
+    storage
+        .create(
+            &build_key("pods", Some(ns), "conflict-pod"),
+            &conflict_pod,
+        )
+        .await
+        .unwrap();
+
+    // DaemonSet has pod anti-affinity on `conflict=true` across hostname.
+    let mut ds = make_daemonset("antiaffinity-ds", ns, "nginx:1.25-alpine", None);
+    ds.spec.template.spec.affinity = Some(Affinity {
+        node_affinity: None,
+        pod_affinity: None,
+        pod_anti_affinity: Some(PodAntiAffinity {
+            required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
+                label_selector: LabelSelector {
+                    match_labels: Some(conflict_labels),
+                    match_expressions: None,
+                },
+                namespaces: Some(vec![ns.to_string()]),
+                topology_key: "kubernetes.io/hostname".to_string(),
+            }]),
+            preferred_during_scheduling_ignored_during_execution: None,
+        }),
+    });
+
+    let key = build_key("daemonsets", Some(ns), "antiaffinity-ds");
+    storage.create(&key, &ds).await.unwrap();
+
+    let controller = DaemonSetController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+
+    // Only DS-owned pods (skip the conflict pod we seeded).
+    let all_pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    let ds_pods: Vec<&Pod> = all_pods
+        .iter()
+        .filter(|p| {
+            p.metadata
+                .owner_references
+                .as_ref()
+                .map(|refs| {
+                    refs.iter().any(|r| r.kind == "DaemonSet" && r.name == "antiaffinity-ds")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Anti-affinity should skip node-1; expect exactly one pod on node-2.
+    assert_eq!(
+        ds_pods.len(),
+        1,
+        "podAntiAffinity should keep the DS off the conflicting node"
+    );
+    assert_eq!(
+        ds_pods[0].spec.as_ref().unwrap().node_name.as_deref(),
+        Some("node-2"),
+        "the surviving pod must land on the conflict-free node"
+    );
+}
+
+/// DaemonSet should converge to the final template even when the user
+/// "bursts" several template updates back to back without waiting for the
+/// rolling update to settle.
+///
+/// Upstream: kubernetes/test/e2e/apps/daemon_set.go
+///   "should rollback without unnecessary restarts" — covers the related
+///   case where rapid spec changes must not strand pods on intermediate
+///   templates.
+///
+/// We don't assert the *number* of intermediate revisions (that's a
+/// controller implementation detail) — we assert (a) the controller never
+/// crashes on a burst, and (b) after enough reconciles, every pod carries
+/// the *final* image and the status reports a fully-updated fleet.
+#[tokio::test]
+async fn daemonset_handles_burst_template_updates() {
+    let storage = setup_test().await;
+    let ns = "default";
+
+    // Four nodes.
+    for i in 1..=4 {
+        let node = make_node(&format!("node-{}", i), None);
+        storage
+            .create(&build_key("nodes", None, &format!("node-{}", i)), &node)
+            .await
+            .unwrap();
+    }
+
+    let mut ds = make_daemonset("burst-ds", ns, "nginx:1.25-alpine", None);
+    ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
+        strategy_type: Some("RollingUpdate".to_string()),
+        rolling_update: Some(RollingUpdateDaemonSet {
+            max_unavailable: Some("2".to_string()),
+            max_surge: None,
+        }),
+    });
+
+    let key = build_key("daemonsets", Some(ns), "burst-ds");
+    storage.create(&key, &ds).await.unwrap();
+
+    let controller = DaemonSetController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+    mark_all_pods_ready(&storage, ns).await;
+
+    // Burst: five back-to-back template changes with no reconcile in between.
+    let final_image = "nginx:1.30-alpine";
+    let bursts = [
+        "nginx:1.26-alpine",
+        "nginx:1.27-alpine",
+        "nginx:1.28-alpine",
+        "nginx:1.29-alpine",
+        final_image,
+    ];
+    for image in &bursts {
+        let mut updated: DaemonSet = storage.get(&key).await.unwrap();
+        updated.spec.template.spec.containers[0].image = (*image).to_string();
+        storage.update(&key, &updated).await.unwrap();
+    }
+
+    // Drive the controller until the fleet converges to the final image.
+    for _ in 0..40 {
+        controller.reconcile_all().await.unwrap();
+        simulate_kubelet_cleanup(&storage, ns).await;
+        mark_all_pods_ready(&storage, ns).await;
+    }
+
+    let final_pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(final_pods.len(), 4, "fleet returns to the desired size");
+    for pod in &final_pods {
+        assert_eq!(
+            pod.spec.as_ref().unwrap().containers[0].image,
+            final_image,
+            "every pod must converge to the final template image after the burst"
+        );
+    }
+
+    // Status must also reflect a fully-updated fleet.
+    let ds_after: DaemonSet = storage.get(&key).await.unwrap();
+    let status = ds_after.status.as_ref().expect("status must be set");
+    assert_eq!(status.desired_number_scheduled, 4);
+    assert_eq!(status.current_number_scheduled, 4);
+    assert_eq!(status.number_ready, 4, "all pods Ready after burst converges");
+    assert_eq!(
+        status.updated_number_scheduled,
+        Some(4),
+        "all pods carry the final template hash"
+    );
+    assert_eq!(status.number_available, Some(4));
+    assert_eq!(status.number_unavailable, Some(0));
+}
