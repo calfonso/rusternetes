@@ -695,31 +695,36 @@ async fn test_service_internal_traffic_policy_local_filters_by_node() {
 
     controller.reconcile_all().await.unwrap();
 
-    // Expected behavior once implemented: separate EndpointSlices per
-    // node (or per-endpoint hints with `forNodes`), so a kube-proxy on
-    // node-1 only sees pod-a's IP. Today both pod IPs land in the same
-    // subset with no node hint.
-    let slices: Vec<rusternetes_common::resources::EndpointSlice> = storage
-        .list("/registry/endpointslices/default/")
+    // Expected behavior once implemented: the EndpointsController must
+    // segregate addresses by node so a node-local kube-proxy on node-1
+    // only consumes pod-a. The simplest enforceable shape is one
+    // EndpointSubset per node (each subset's `addresses` contains a
+    // single pod IP whose target_ref.node_name matches the subset's
+    // owning node). Today the controller emits a single subset
+    // containing both pod IPs with no per-node segregation.
+    let ep_key = build_key("endpoints", Some("default"), "internal-local");
+    let ep: Endpoints = storage
+        .get(&ep_key)
         .await
-        .unwrap_or_default();
-    let node_1_slice = slices.iter().find(|s| {
-        s.endpoints
+        .expect("Endpoints must exist after reconcile");
+
+    // Every subset should contain endpoints from exactly one node when
+    // internalTrafficPolicy=Local. Mixed-node subsets defeat the policy.
+    let any_mixed_subset = ep.subsets.iter().any(|s| {
+        let nodes: std::collections::HashSet<&str> = s
+            .addresses
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
-            .any(|e| e.node_name.as_deref() == Some("node-1") && !e.addresses.is_empty())
-            && !s.endpoints.iter().any(|e| {
-                e.node_name.as_deref() == Some("node-2")
-                    && e.hints
-                        .as_ref()
-                        .and_then(|h| h.for_nodes.as_ref())
-                        .map(|n| n.iter().any(|x| x.name == "node-1"))
-                        .unwrap_or(false)
-            })
+            .filter_map(|a| a.node_name.as_deref())
+            .collect();
+        nodes.len() > 1
     });
     assert!(
-        node_1_slice.is_some(),
-        "internalTrafficPolicy=Local must yield a per-node EndpointSlice or for_nodes hint, got {} slices",
-        slices.len(),
+        !any_mixed_subset,
+        "internalTrafficPolicy=Local must segregate addresses by node \
+         (no subset may contain addresses from more than one node); subsets={:?}",
+        ep.subsets,
     );
 }
 
@@ -733,11 +738,19 @@ async fn test_service_internal_traffic_policy_local_filters_by_node() {
 /// controller must emit `hints.forZones` per endpoint pointing at the
 /// node's `topology.kubernetes.io/zone` label. We do not look at node
 /// zone labels yet — `hints` is always `None`.
+///
+/// NOTE: When unignoring this test, the EndpointSliceController must
+/// also be driven (EndpointsController alone does not write slices), so
+/// the failure surface points at the missing hint rather than missing
+/// slices.
 #[tokio::test]
 #[ignore = "RED-state: topology-aware EndpointSlice hints (for_zones) not implemented"]
 async fn test_service_topology_keys_emit_for_zone_hints() {
+    use rusternetes_controller_manager::controllers::endpointslice::EndpointSliceController;
+
     let storage = setup_test().await;
     let controller = EndpointsController::new(storage.clone());
+    let slice_controller = EndpointSliceController::new(storage.clone());
 
     // Seed a node with a zone label so the controller has data to
     // populate `hints.forZones` from.
@@ -779,11 +792,16 @@ async fn test_service_topology_keys_emit_for_zone_hints() {
         .unwrap();
 
     controller.reconcile_all().await.unwrap();
+    slice_controller.reconcile_all().await.unwrap();
 
     let slices: Vec<rusternetes_common::resources::EndpointSlice> = storage
         .list("/registry/endpointslices/default/")
         .await
         .unwrap_or_default();
+    assert!(
+        !slices.is_empty(),
+        "EndpointSliceController must mirror the Endpoints into at least one slice"
+    );
     let has_zone_hint = slices.iter().any(|s| {
         s.endpoints.iter().any(|e| {
             e.hints
