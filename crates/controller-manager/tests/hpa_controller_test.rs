@@ -699,18 +699,16 @@ async fn test_hpa_scale_down_stabilization_window() {
         }),
     };
 
-    // Target=80, mock current=85 → ratio>1 → no scale-down anyway.
-    // For the stabilization window to be observable we'd need the mock
-    // current util to drop below target between reconciles. Either way the
-    // assertion below MUST hold: during the cooldown, replicas may not
-    // shrink below 8.
+    // Target=200%, mock cpu=85% ⇒ ratio≈0.425 ⇒ unbounded math wants
+    // ceil(8*0.425) = 4 replicas. With the stabilization window honoured
+    // the controller must NOT collapse from 8 → 4 in a single reconcile.
     let hpa = create_test_hpa_with_behavior(
         "cooldown-hpa",
         "default",
         "cooldown-app",
         Some(2),
         20,
-        80,
+        200,
         behavior,
     );
     let hpa_key = build_key("horizontalpodautoscalers", Some("default"), "cooldown-hpa");
@@ -718,15 +716,16 @@ async fn test_hpa_scale_down_stabilization_window() {
 
     // First reconcile records the "recent high" of 8 replicas.
     controller.reconcile_all().await.unwrap();
-    // Second reconcile, immediately after, must NOT scale down even if
-    // metrics would recommend fewer replicas.
+    // Second reconcile, immediately after, must NOT scale down even though
+    // metrics now recommend 4 replicas.
     controller.reconcile_all().await.unwrap();
 
     let updated_deployment: Deployment = storage.get(&deploy_key).await.unwrap();
-    assert!(
-        updated_deployment.spec.replicas.unwrap_or(0) >= 8,
+    assert_eq!(
+        updated_deployment.spec.replicas,
+        Some(8),
         "Within the scale-down stabilization window the replica count must \
-         not drop below the recent high (8); got {}",
+         hold at the recent high (8); got {}",
         updated_deployment.spec.replicas.unwrap_or(0),
     );
 }
@@ -882,22 +881,27 @@ async fn test_hpa_external_metrics() {
 }
 
 /// HPA average utilization calculation — per-pod CPU utilization must be
-/// derived as `sum(pod.cpu) / count(running_pods)`, not as a raw cluster
-/// total. Upstream HPA aggregates only Ready pods that have passed the
-/// initial readiness delay.
+/// derived as `sum(pod.cpu) / count(running_pods)` from real pod metrics,
+/// not from a static mock. Upstream HPA aggregates only Ready pods that
+/// have passed the initial readiness delay.
 ///
-/// RED-state: `get_current_resource_utilization` returns a hard-coded mock
-/// (85% for cpu) that ignores actual pod counts/usage.
+/// RED-state: `get_current_resource_utilization` returns a hard-coded
+/// constant (85% for cpu) that ignores actual pod metrics. The test
+/// asserts that the reported `current.average_utilization` differs from
+/// that constant when the underlying pod metrics are configured to
+/// produce a different aggregate — proving the controller is actually
+/// looking at pod state instead of returning the canned value.
 #[tokio::test]
 #[ignore = "RED-state: per-pod averaging uses mocked utilization (hpa.rs:456-470)"]
 async fn test_hpa_average_utilization_per_pod_calculation() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = HorizontalPodAutoscalerController::new(storage.clone());
 
-    // 4 replicas. If the mock returns a fixed 85% utilization regardless of
-    // pod count, this test passes only when the controller does true
-    // per-pod averaging.
-    let deployment = create_test_deployment("avg-util-app", "default", 4);
+    // Zero replicas → no pods → average utilization is undefined. A real
+    // controller would surface a FailedGetResourceMetric / scaling-active
+    // False condition. The mocked controller will instead happily report
+    // the canned 85%, so the assertion below distinguishes them.
+    let deployment = create_test_deployment("avg-util-app", "default", 0);
     let deploy_key = build_key("deployments", Some("default"), "avg-util-app");
     storage.create(&deploy_key, &deployment).await.unwrap();
 
@@ -906,7 +910,7 @@ async fn test_hpa_average_utilization_per_pod_calculation() {
         "default",
         "avg-util-app",
         "Deployment",
-        Some(1),
+        Some(0),
         10,
         80,
     );
@@ -915,16 +919,22 @@ async fn test_hpa_average_utilization_per_pod_calculation() {
 
     controller.reconcile_all().await.unwrap();
 
-    // With current=4, target=80%, current-util=85% the canonical HPA
-    // formula yields ceil(4 * 85/80) = 5. A controller that incorrectly
-    // sums utilization across pods (4 × 85 = 340%) would compute a much
-    // larger desired count.
-    let updated_deployment: Deployment = storage.get(&deploy_key).await.unwrap();
+    // With zero replicas a real metrics aggregation cannot produce 85% —
+    // it must either skip the metric or report ScalingActive=False. The
+    // current mock implementation reports 85% regardless, so this
+    // assertion is RED until per-pod averaging is wired up.
+    let updated_hpa: HorizontalPodAutoscaler = storage.get(&hpa_key).await.unwrap();
+    let status = updated_hpa.status.unwrap();
+    let conditions = status.conditions.expect("conditions present");
+    let scaling_active = conditions
+        .iter()
+        .find(|c| c.condition_type == "ScalingActive")
+        .expect("ScalingActive condition must exist");
     assert_eq!(
-        updated_deployment.spec.replicas,
-        Some(5),
-        "ceil(4 * 85/80) = 5; got {}. Per-pod averaging must NOT sum across pods.",
-        updated_deployment.spec.replicas.unwrap_or(0),
+        scaling_active.status, "False",
+        "With zero running pods the controller cannot aggregate per-pod \
+         utilization; ScalingActive must be False (real per-pod averaging \
+         absent today reports True)."
     );
 }
 
@@ -1052,13 +1062,17 @@ async fn test_hpa_behavior_scale_up_policy() {
         scale_down: None,
     };
 
+    // Target=10% with mock cpu=85% ⇒ ratio≈8.5 ⇒ unbounded math wants
+    // ceil(2*8.5)=17 replicas. The policy caps the jump at +2 pods, so
+    // the correct first-step result is 4. A controller that ignores the
+    // policy will scale 2→17 (or 2→max=20), which fails this assertion.
     let hpa = create_test_hpa_with_behavior(
         "rate-limit-hpa",
         "default",
         "rate-limited-app",
         Some(1),
         20,
-        50, // aggressive target → strong scale-up signal
+        10, // extreme target to drive a large unbounded recommendation
         behavior,
     );
     let hpa_key = build_key(
