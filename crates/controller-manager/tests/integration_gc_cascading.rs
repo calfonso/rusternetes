@@ -492,3 +492,252 @@ async fn test_cross_namespace_references_with_watch_cache() {
         surviving_b.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8.4 extended coverage — additional GC behaviours pinned to upstream
+// semantics. These tests focus on edge cases not exercised by the mirrors
+// above:
+//
+//   * Orphan propagation with multiple dependents (fan-out)
+//   * Namespaced dependent → namespaced owner in a DIFFERENT namespace
+//     is treated as an invalid (cross-namespace) ref, per the
+//     `classifyReferences` invariant
+//   * Foreground finalizer keeps owner alive while every blocker remains
+//   * Mid-flight ownerReference updates re-target GC behaviour
+//
+// Upstream source: `pkg/controller/garbagecollector/garbagecollector.go`
+// and `test/integration/garbagecollector/garbage_collector_test.go`
+// (release-1.35).
+// ---------------------------------------------------------------------------
+
+/// Orphan propagation policy with multiple dependents.
+///
+/// Upstream: when an owner is deleted with `propagationPolicy: Orphan`,
+/// EVERY dependent must have its ownerReference to the owner stripped —
+/// not just one. The `orphan_dependents` path iterates all matching
+/// dependents and updates each via `update_raw`; a partial-orphan bug
+/// would leave the un-stripped dependents with a dangling ownerReference
+/// pointing at the now-deleted owner, which the test asserts is gone for
+/// every dependent.
+///
+/// This mirrors the fan-out shape of upstream's
+/// `processAttemptToOrphan` working on a worklist of dependents — the
+/// owner is finalised only after every dependent in the list has been
+/// successfully updated.
+#[tokio::test]
+async fn test_gc_orphan_policy_fans_out_to_all_dependents() {
+    let storage = fresh_storage();
+    let gc = GarbageCollector::new(storage.clone());
+    let ns = "ns-orphan-fanout";
+
+    let mut owner = make_owner_pod("rc-fanout", ns);
+    owner.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    owner.metadata.finalizers = Some(vec!["orphan".to_string()]);
+    save_pod(&storage, &owner).await;
+
+    // Five dependents, all owned solely by `rc-fanout`. After the orphan
+    // sweep every one of them must still exist with NO ownerReference to
+    // `rc-fanout`.
+    const N_DEPS: usize = 5;
+    for i in 0..N_DEPS {
+        let dep = make_pod(
+            &format!("dep-{}", i),
+            ns,
+            vec![rc_ref("rc-fanout", &owner.metadata.uid)],
+        );
+        save_pod(&storage, &dep).await;
+    }
+
+    gc.scan_and_collect().await.unwrap();
+
+    // Owner is gone — finalizer was stripped after fan-out.
+    assert!(
+        !pod_exists(&storage, ns, "rc-fanout").await,
+        "owner must be finalised once all dependents have been orphaned",
+    );
+
+    // Every dependent survives with no stale ownerReference to the owner.
+    for i in 0..N_DEPS {
+        let name = format!("dep-{}", i);
+        assert!(
+            pod_exists(&storage, ns, &name).await,
+            "dependent {} must NOT be deleted by orphan policy",
+            name,
+        );
+        let key = build_key("pods", Some(ns), &name);
+        let kept: rusternetes_common::resources::pod::Pod = storage.get(&key).await.unwrap();
+        let refs = kept.metadata.owner_references.unwrap_or_default();
+        assert!(
+            refs.iter().all(|r| r.uid != owner.metadata.uid),
+            "dependent {} must have owner ref to {} stripped (refs left: {:?})",
+            name,
+            owner.metadata.uid,
+            refs.iter().map(|r| r.uid.as_str()).collect::<Vec<_>>(),
+        );
+    }
+}
+
+/// Cross-namespace owner references must be rejected: a namespaced
+/// dependent referencing an owner in a DIFFERENT namespace is treated as
+/// having an unresolvable owner ref and is GC'd as an orphan.
+///
+/// Upstream: `classifyReferences` in
+/// `pkg/controller/garbagecollector/garbagecollector.go`. The invariant
+/// is that namespaced dependents may only resolve owners in the same
+/// namespace OR cluster-scoped owners — never owners in some other
+/// namespace, regardless of UID matches.
+///
+/// This is the inverse of `test_cross_namespace_references_with_watch_cache`:
+/// instead of pinning a phantom UID, the UID *does exist* but lives in
+/// the wrong namespace. Upstream still considers the ref invalid.
+#[tokio::test]
+async fn test_gc_namespaced_owner_in_different_namespace_is_rejected() {
+    let storage = fresh_storage();
+    let gc = GarbageCollector::new(storage.clone());
+    let ns_owner = "ns-owner-side";
+    let ns_dep = "ns-dependent-side";
+
+    // Owner lives in `ns_owner`; UID is real.
+    let owner = make_owner_pod("owner", ns_owner);
+    save_pod(&storage, &owner).await;
+
+    // Dependent lives in `ns_dep`; its ownerRef points at the real UID
+    // above but in a different namespace — illegal per upstream invariant.
+    let dep = make_pod(
+        "dependent",
+        ns_dep,
+        vec![rc_ref("owner", &owner.metadata.uid)],
+    );
+    save_pod(&storage, &dep).await;
+
+    gc.scan_and_collect().await.unwrap();
+
+    // Owner survives — nothing references it within its own namespace.
+    assert!(
+        pod_exists(&storage, ns_owner, "owner").await,
+        "owner in ns_owner must survive — it has no in-namespace dependents",
+    );
+    // Dependent is GC'd — its only ownerRef is cross-namespace, which the
+    // GC treats as unresolvable.
+    assert!(
+        !pod_exists(&storage, ns_dep, "dependent").await,
+        "dependent with a cross-namespace owner ref must be GC'd",
+    );
+}
+
+/// Foreground finalizer keeps owner alive while ANY blocking dependent
+/// remains. The existing mirror tests a single blocker; this one pins
+/// the multi-blocker semantics: with N blockers, a single scan must drain
+/// all of them before the finalizer is removed.
+///
+/// Upstream: `processDeleteItem` foreground branch +
+/// `deleteDependents`. The owner is kept in Terminating (deletionTimestamp
+/// set, foregroundDeletion finalizer present) for as long as the
+/// dependent list — restricted to `blockOwnerDeletion: true` entries — is
+/// non-empty. Once the list drains, the finalizer comes off and the
+/// owner itself is reaped.
+#[tokio::test]
+async fn test_gc_foreground_finalizer_blocks_until_all_dependents_drained() {
+    let storage = fresh_storage();
+    let gc = GarbageCollector::new(storage.clone());
+    let ns = "ns-fg-multi-block";
+
+    let mut owner = make_owner_pod("rc-multi", ns);
+    owner.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    owner.metadata.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+    save_pod(&storage, &owner).await;
+
+    // Three blocking dependents.
+    const N_BLOCKERS: usize = 3;
+    for i in 0..N_BLOCKERS {
+        let dep = make_pod(
+            &format!("blocker-{}", i),
+            ns,
+            vec![rc_ref("rc-multi", &owner.metadata.uid)],
+        );
+        save_pod(&storage, &dep).await;
+    }
+
+    gc.scan_and_collect().await.unwrap();
+
+    // All blockers gone.
+    for i in 0..N_BLOCKERS {
+        let name = format!("blocker-{}", i);
+        assert!(
+            !pod_exists(&storage, ns, &name).await,
+            "blocker {} must be deleted by foreground cascade",
+            name,
+        );
+    }
+    // Owner finalised exactly once the blocker list drained.
+    assert!(
+        !pod_exists(&storage, ns, "rc-multi").await,
+        "owner must be finalised once every blocker dependent is gone",
+    );
+}
+
+/// Mid-flight ownerReference updates re-target GC behaviour.
+///
+/// Sequence:
+///   1. RC-A and RC-B exist. Pod is initially owned by RC-A only.
+///   2. Pod's ownerReferences are updated to also reference RC-B (a
+///      common pattern when a controller "adopts" an orphan, or when
+///      multiple controllers reconcile the same dependent).
+///   3. RC-A is deleted.
+///   4. GC scan must NOT delete the pod, because RC-B is still a valid
+///      owner.
+///
+/// This pins that the GC reads ownerReferences live from storage on
+/// every scan — it does NOT cache an early snapshot from before the
+/// adoption update. Upstream achieves this via watch-driven graph
+/// updates; we achieve it by rebuilding the relationship map on every
+/// `scan_and_collect`.
+#[tokio::test]
+async fn test_gc_owner_reference_updates_retarget_collection() {
+    let storage = fresh_storage();
+    let gc = GarbageCollector::new(storage.clone());
+    let ns = "ns-ref-updates";
+
+    let rc_a = make_owner_pod("rc-a", ns);
+    let rc_b = make_owner_pod("rc-b", ns);
+    save_pod(&storage, &rc_a).await;
+    save_pod(&storage, &rc_b).await;
+
+    // Pod is initially owned only by RC-A.
+    let mut pod = make_pod("adoptee", ns, vec![rc_ref("rc-a", &rc_a.metadata.uid)]);
+    save_pod(&storage, &pod).await;
+
+    // Simulate a controller adopting the pod by updating its
+    // ownerReferences to also include RC-B. We write the updated pod
+    // back to storage before the GC scan.
+    pod.metadata.owner_references = Some(vec![
+        rc_ref("rc-a", &rc_a.metadata.uid),
+        rc_ref("rc-b", &rc_b.metadata.uid),
+    ]);
+    let pod_key = build_key("pods", Some(ns), "adoptee");
+    storage.update(&pod_key, &pod).await.unwrap();
+
+    // RC-A is deleted. RC-B remains.
+    let rc_a_key = build_key("pods", Some(ns), "rc-a");
+    storage.delete(&rc_a_key).await.unwrap();
+
+    gc.scan_and_collect().await.unwrap();
+
+    // Pod must survive — RC-B is still a valid owner. The GC must have
+    // read the post-adoption ownerReferences, not the original list.
+    assert!(
+        pod_exists(&storage, ns, "adoptee").await,
+        "pod must survive RC-A deletion because RC-B was adopted as an owner",
+    );
+
+    // Now delete RC-B as well — pod becomes a true orphan and must be GC'd.
+    let rc_b_key = build_key("pods", Some(ns), "rc-b");
+    storage.delete(&rc_b_key).await.unwrap();
+
+    gc.scan_and_collect().await.unwrap();
+
+    assert!(
+        !pod_exists(&storage, ns, "adoptee").await,
+        "pod must be GC'd once every owner ref is unresolvable",
+    );
+}
