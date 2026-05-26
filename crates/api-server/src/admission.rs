@@ -1255,6 +1255,57 @@ pub async fn check_count_quota<S: Storage>(
     Ok(())
 }
 
+/// PodSecurityAdmission — stub for the Kubernetes Pod Security Admission
+/// (PSA) plugin.
+///
+/// PSA replaced the now-removed PodSecurityPolicy (PSP) in v1.25. Each
+/// namespace selects a Pod Security Standard via the
+/// `pod-security.kubernetes.io/enforce` label (`privileged`, `baseline`, or
+/// `restricted`) and the admission plugin rejects pods that violate the
+/// standard.
+///
+/// This struct exists so the api-server can wire a single PSA admission
+/// plugin into the pod create / update flow. The current `admit()`
+/// implementation is intentionally an **allow-all** stub: a small surface
+/// area we can grow into a full enforcer without touching every callsite.
+///
+/// Today, partial PSA enforcement (privileged, hostPID / hostNetwork /
+/// hostIPC) lives inline in `handlers::pod::create_pod`. The longer-term
+/// plan is to fold that logic — plus volume types, runAsUser, capabilities,
+/// seccomp / AppArmor profiles, etc. — into [`PodSecurityAdmission::admit`].
+///
+/// Upstream references:
+/// - <https://kubernetes.io/docs/concepts/security/pod-security-admission/>
+/// - <https://kubernetes.io/docs/concepts/security/pod-security-standards/>
+/// - `staging/src/k8s.io/pod-security-admission/admission/admission.go`
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PodSecurityAdmission;
+
+impl PodSecurityAdmission {
+    /// Create a new PSA admission plugin instance.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Evaluate a pod against the namespace's enforced Pod Security
+    /// Standard.
+    ///
+    /// Returns `Ok(())` to admit the pod, `Err(Forbidden)` to reject. The
+    /// current implementation is a stub that admits every pod regardless of
+    /// the namespace label — the RED-state tests in
+    /// `tests/pod_security_admission_test.rs` pin the upstream contract that
+    /// this stub does not yet honour.
+    pub async fn admit<S: Storage>(
+        &self,
+        _storage: &Arc<S>,
+        _namespace: &str,
+        _pod: &Pod,
+    ) -> Result<(), rusternetes_common::Error> {
+        // Stub: allow-all. See struct docs for the enforcement roadmap.
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

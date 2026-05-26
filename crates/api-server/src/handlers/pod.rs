@@ -496,7 +496,16 @@ pub async fn create(
         }
     }
 
-    // Check PodSecurity admission — enforce namespace pod security standard
+    // Check PodSecurity admission — enforce namespace pod security standard.
+    //
+    // The PodSecurityAdmission plugin is intentionally an allow-all stub for
+    // now (see `admission::PodSecurityAdmission`). The inline enforcement
+    // below covers a subset of the upstream contract (privileged + host
+    // namespaces) until the stub grows into the full enforcer.
+    {
+        let psa = crate::admission::PodSecurityAdmission::new();
+        psa.admit(&state.storage, &namespace, &pod).await?;
+    }
     {
         let ns_key = rusternetes_storage::build_key("namespaces", None, &namespace);
         if let Ok(ns) = state
