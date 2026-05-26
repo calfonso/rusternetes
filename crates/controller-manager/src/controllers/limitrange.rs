@@ -25,15 +25,18 @@ pub struct LimitRangeController<S: Storage> {
     storage: Arc<S>,
 }
 
+// Allow-dead-code on the whole impl: nothing in
+// `controller_manager::run()` wires this stub yet (LimitRange
+// enforcement currently lives at admission, not in this loop). The
+// watch loop, worker, and `reconcile_all` are kept ready so wiring
+// the controller in is a single-line change in `lib.rs`. Tests in
+// `tests/limitrange_controller_test.rs` exercise the public API.
+#[allow(dead_code)]
 impl<S: Storage + 'static> LimitRangeController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self { storage }
     }
 
-    // Allowed-dead-code: not yet wired into `controller_manager::run()`
-    // because enforcement lives at admission today. The watch loop is
-    // kept so wiring it later is a single-line change in `lib.rs`.
-    #[allow(dead_code)]
     pub async fn run(self: Arc<Self>) -> Result<()> {
         use futures::StreamExt;
 
@@ -91,7 +94,6 @@ impl<S: Storage + 'static> LimitRangeController<S> {
         }
     }
 
-    #[allow(dead_code)]
     async fn worker(&self, queue: WorkQueue) {
         while let Some(key) = queue.get().await {
             // Stub: nothing to do. Enforcement happens in the admission
@@ -104,7 +106,6 @@ impl<S: Storage + 'static> LimitRangeController<S> {
         }
     }
 
-    #[allow(dead_code)]
     async fn enqueue_all(&self, queue: &WorkQueue) {
         match self
             .storage
@@ -131,7 +132,6 @@ impl<S: Storage + 'static> LimitRangeController<S> {
     /// plugin path. This method exists to mirror the API of the other
     /// controllers (e.g. `PVBinderController::reconcile_all`) so future work
     /// can wire in side-effects without changing the public surface.
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         Ok(())
     }
