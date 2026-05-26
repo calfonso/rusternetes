@@ -18,12 +18,11 @@ services:
     volumes:
       - ./target/release/rusternetes:/app/rusternetes:ro
     environment:
-      # Pod-facing endpoint: rusternetes container's docker-bridge IP.
-      # Pods on the same `rusternetes-network` bridge can reach this
-      # directly with no iptables NAT, so we don't need a kube-proxy
-      # sidecar. The cert SANs include 172.20.0.2 (see generate-certs.sh
-      # which adds gateway IPs 1..10 of the bridge subnet).
-      - KUBERNETES_SERVICE_HOST_OVERRIDE=172.20.0.2
+      # Pod-facing endpoint: Docker bridge gateway [subnet].1 (set by
+      # bootstrap at runtime via discover-bridge-gateway.sh). The host's
+      # 6443:6443 port mapping forwards to the in-process api-server —
+      # no known subnet required.
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=${DOCKER_GATEWAY}
     command:
       - "--storage-backend"
       - "sqlite"

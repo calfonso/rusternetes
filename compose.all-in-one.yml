@@ -38,15 +38,11 @@ services:
       - RUST_LOG=info
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-      # Point pods at the rusternetes container's docker-bridge IP. The
-      # in-process kube-proxy task programs iptables inside this
-      # container's net ns, but pod traffic transits the docker bridge
-      # — so DNAT for ClusterIP 10.96.0.1 → 6443 never fires for pod
-      # packets. A direct bridge-IP hop bypasses the kube-proxy gap.
-      # Hardcoded for the default `rusternetes-network` subnet
-      # (172.20.0.0/16, rusternetes is first → .0.2). If the bridge
-      # subnet differs on a given host, override this var.
-      - KUBERNETES_SERVICE_HOST_OVERRIDE=172.20.0.2
+      # Pod-facing endpoint: Docker bridge gateway [subnet].1 (set by
+      # bootstrap at runtime via discover-bridge-gateway.sh). The host's
+      # 6443:6443 port mapping forwards to the in-process api-server —
+      # no known subnet required.
+      - KUBERNETES_SERVICE_HOST_OVERRIDE=${DOCKER_GATEWAY}
     command:
       - "--storage-backend"
       - "sqlite"

@@ -52,6 +52,22 @@ else
     fi
 fi
 
+# Discover the Docker bridge gateway (always [subnet].1) so we can
+# bootstrap CoreDNS and other resources without hardcoding an IP.
+# Uses the discover-bridge-gateway helper; callers can override via
+# RUSTERNETES_BRIDGE_GATEWAY env var if discovery fails.
+if [ -z "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
+    if [ -f "$SCRIPT_DIR/discover-bridge-gateway.sh" ]; then
+        # shellcheck disable=SC1091
+        source "$SCRIPT_DIR/discover-bridge-gateway.sh"
+        export RUSTERNETES_BRIDGE_GATEWAY
+    fi
+fi
+
+if [ -n "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
+    echo "Docker bridge gateway: $RUSTERNETES_BRIDGE_GATEWAY"
+fi
+
 echo "Using container runtime: $CONTAINER_RT"
 
 # Podman needs base images pre-pulled (Docker Desktop caches them)
@@ -133,13 +149,38 @@ $CONTAINER_RT rm -f $($CONTAINER_RT ps -a --filter "name=coredns" --format "{{.I
 $CONTAINER_RT exec rusternetes-etcd etcdctl del /registry/pods/kube-system/coredns 2>/dev/null && echo "  Deleted CoreDNS pod from etcd" || echo "  No CoreDNS pod in etcd"
 
 # Step 4: Apply bootstrap cluster resources
+# Inject the discovered bridge gateway into the bootstrap yaml so CoreDNS
+# can reach the api-server. Uses a temp file so the tracked yaml stays
+# as a template.
 print_step "Applying bootstrap resources (namespaces, services, CoreDNS)..."
 if [ -f "$PROJECT_ROOT/bootstrap-cluster.yaml" ]; then
-    $KUBECTL $KUBECTL_FLAGS apply -f "$PROJECT_ROOT/bootstrap-cluster.yaml"
-    print_success "Bootstrap resources created"
+    # Fail fast if discovery didn't give us a gateway — CoreDNS won't
+    # be able to reach the API server without it after #787.
+    if [ -z "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
+        print_error "Bridge gateway discovery failed. Set RUSTERNETES_BRIDGE_GATEWAY or fix discover-bridge-gateway.sh"
+        exit 1
+    fi
+    TEMP_BOOTSTRAP="$(mktemp)"
+    trap "rm -f '$TEMP_BOOTSTRAP'" EXIT
+    sed "s|\\\${DOCKER_GATEWAY}|${RUSTERNETES_BRIDGE_GATEWAY}|g" \
+        "$PROJECT_ROOT/bootstrap-cluster.yaml" > "$TEMP_BOOTSTRAP"
+    $KUBECTL $KUBECTL_FLAGS apply -f "$TEMP_BOOTSTRAP"
+    print_success "Bootstrap resources created (gateway: $RUSTERNETES_BRIDGE_GATEWAY)"
 else
     print_error "bootstrap-cluster.yaml not found"
     exit 1
+fi
+
+# If the compose files use ${DOCKER_GATEWAY} env var (post-#787), ensure
+# the running cluster container sees the discovered value. Write a .env
+# file and restart so the compose interpolation takes effect.
+if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/null; then
+    print_step "Restarting cluster with discovered gateway..."
+    echo "DOCKER_GATEWAY=${RUSTERNETES_BRIDGE_GATEWAY}" > "$PROJECT_ROOT/.env"
+    echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> "$PROJECT_ROOT/.env"
+    "$CONTAINER_RT" compose -f "$PROJECT_ROOT/compose.all-in-one.yml" -f "$PROJECT_ROOT/compose.dind.all-in-one.yml" up -d
+    print_success "Cluster restarted with gateway $RUSTERNETES_BRIDGE_GATEWAY"
+    echo "  .env file written: $PROJECT_ROOT/.env"
 fi
 
 # Step 5: Wait for CoreDNS to be ready
