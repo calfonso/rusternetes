@@ -52,14 +52,24 @@ else
     fi
 fi
 
+# SCRIPT_DIR / PROJECT_ROOT are needed for the bridge-gateway discovery
+# below (and the later kubectl / yaml-application steps). Define them
+# before any block that depends on them.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 # Discover the Docker bridge gateway (always [subnet].1) so we can
 # bootstrap CoreDNS and other resources without hardcoding an IP.
 # Uses the discover-bridge-gateway helper; callers can override via
 # RUSTERNETES_BRIDGE_GATEWAY env var if discovery fails.
+#
+# Invoke as a subprocess (not `source`): the helper prints the gateway
+# on stdout and ends with `exit 0`, which — if sourced — would terminate
+# this bootstrap script before the actual bootstrap work runs. Capturing
+# stdout gives us the value without that side-effect.
 if [ -z "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
     if [ -f "$SCRIPT_DIR/discover-bridge-gateway.sh" ]; then
-        # shellcheck disable=SC1091
-        source "$SCRIPT_DIR/discover-bridge-gateway.sh"
+        RUSTERNETES_BRIDGE_GATEWAY="$(bash "$SCRIPT_DIR/discover-bridge-gateway.sh" 2>/dev/null || true)"
         export RUSTERNETES_BRIDGE_GATEWAY
     fi
 fi
@@ -91,10 +101,6 @@ print_error() {
 print_success() {
     echo -e "${GREEN}✓${NC} $1"
 }
-
-# Get script directory and project root
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Check if kubectl is available
 KUBECTL=""
@@ -145,8 +151,17 @@ fi
 print_step "Cleaning up existing CoreDNS resources (if any)..."
 # Remove CoreDNS container
 $CONTAINER_RT rm -f $($CONTAINER_RT ps -a --filter "name=coredns" --format "{{.ID}}") 2>/dev/null && echo "  Deleted CoreDNS container" || echo "  No CoreDNS container to delete"
-# Remove CoreDNS pod from etcd
-$CONTAINER_RT exec rusternetes-etcd etcdctl del /registry/pods/kube-system/coredns 2>/dev/null && echo "  Deleted CoreDNS pod from etcd" || echo "  No CoreDNS pod in etcd"
+# Remove CoreDNS pod from the api-server. kubectl works across every
+# storage backend (etcd / sqlite / redis) — the previous variant did
+# `docker exec rusternetes-etcd etcdctl del ...`, which silently no-ops
+# on the all-in-one stack (no etcd container) and lets a stale pod with
+# a bound nodeName survive into the next apply, where it then 422s with
+# "spec.nodeName: Forbidden: field is immutable".
+# --ignore-not-found is the upstream-kubectl flag, but the rusternetes
+# kubectl built in this workspace rejects it (`unexpected argument`).
+# Rely on the `|| echo "No CoreDNS pod..."` fallback to swallow the
+# not-found case instead.
+$KUBECTL $KUBECTL_FLAGS delete pod coredns -n kube-system --grace-period=0 --force 2>/dev/null && echo "  Deleted CoreDNS pod" || echo "  No CoreDNS pod to delete"
 
 # Step 4: Apply bootstrap cluster resources
 # Inject the discovered bridge gateway into the bootstrap yaml so CoreDNS
