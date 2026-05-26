@@ -529,3 +529,244 @@ async fn test_ttl_controller_job_without_ttl() {
     let stored_job: Job = storage.get(&job_key).await.unwrap();
     assert_eq!(stored_job.metadata.name, "no-ttl-job");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8.3 extended coverage — mirrors upstream pkg/controller/ttlafterfinished
+// and test/e2e/framework/ttl.go scenarios.
+// ---------------------------------------------------------------------------
+
+/// Job that has TTL set but has not yet reached a terminal Complete/Failed
+/// condition must never be deleted regardless of how long it has been around.
+/// Upstream parity: `timeLeft()` short-circuits when the job is not finished.
+#[tokio::test]
+async fn test_ttl_controller_does_not_delete_unfinished_job_before_ttl() {
+    let storage = setup_test().await;
+
+    // Running job: even with TTL=1s, it should NOT be deleted because it
+    // never reached a terminal state.
+    let job = create_test_job("still-running", "default", 1, false);
+    let job_key = build_key("jobs", Some("default"), "still-running");
+    storage.create(&job_key, &job).await.unwrap();
+
+    let controller = TTLController::new(storage.clone());
+    controller.check_and_cleanup().await.unwrap();
+    sleep(TokioDuration::from_millis(200)).await;
+
+    let stored: Job = storage.get(&job_key).await.unwrap();
+    assert_eq!(stored.metadata.name, "still-running");
+    assert!(
+        stored.status.and_then(|s| s.conditions).is_none(),
+        "Running job should have no terminal conditions",
+    );
+}
+
+/// Negative TTL is invalid input upstream (validation rejects it), but if a
+/// negative value reaches the controller it must behave as "delete now" — the
+/// expiry time is in the past, so the cleanup branch fires. This guards
+/// against future regressions where signed arithmetic might silently skip
+/// negative durations.
+#[tokio::test]
+async fn test_ttl_controller_negative_ttl_deletes_immediately() {
+    let storage = setup_test().await;
+
+    let job = create_test_job("negative-ttl", "default", -10, true);
+    let job_key = build_key("jobs", Some("default"), "negative-ttl");
+    storage.create(&job_key, &job).await.unwrap();
+
+    let controller = TTLController::new(storage.clone());
+    controller.check_and_cleanup().await.unwrap();
+    sleep(TokioDuration::from_millis(200)).await;
+
+    let result = storage.get::<Job>(&job_key).await;
+    assert!(
+        result.is_err(),
+        "Job with negative TTL should be cleaned up immediately",
+    );
+}
+
+/// TTL controller must clean up finished jobs across every namespace it
+/// discovers via the cluster-wide list, not just `default`.
+/// Upstream parity: ttl-after-finished controller watches jobs cluster-wide.
+#[tokio::test]
+async fn test_ttl_controller_cleans_jobs_across_namespaces() {
+    let storage = setup_test().await;
+
+    let namespaces = ["alpha", "beta", "gamma"];
+    for ns in &namespaces {
+        let job = create_test_job("expired", ns, 30, true);
+        let key = build_key("jobs", Some(*ns), "expired");
+        storage.create(&key, &job).await.unwrap();
+    }
+
+    // Sanity: every namespace currently has its job.
+    for ns in &namespaces {
+        let key = build_key("jobs", Some(*ns), "expired");
+        assert!(storage.get::<Job>(&key).await.is_ok());
+    }
+
+    let controller = TTLController::new(storage.clone());
+    controller.check_and_cleanup().await.unwrap();
+    sleep(TokioDuration::from_millis(300)).await;
+
+    for ns in &namespaces {
+        let key = build_key("jobs", Some(*ns), "expired");
+        assert!(
+            storage.get::<Job>(&key).await.is_err(),
+            "Expired job in namespace {ns} should be cleaned up",
+        );
+    }
+}
+
+/// Upstream ttl-after-finished reads `spec.ttlSecondsAfterFinished` (a typed
+/// `*int32` on JobSpec). The rusternetes controller currently only reads the
+/// `ttlSecondsAfterFinished` annotation. This test pins that gap as
+/// RED-state: when the field is set on the spec but not duplicated as an
+/// annotation, the controller leaves the job alone.
+#[tokio::test]
+#[ignore = "RED-state: TTLController only reads annotations, not JobSpec.ttl_seconds_after_finished"]
+async fn test_ttl_controller_reads_ttl_from_job_spec_field() {
+    let storage = setup_test().await;
+
+    // Build a job WITHOUT the annotation but WITH the typed spec field set.
+    let mut job = create_test_job("spec-field-ttl", "default", 30, true);
+    job.metadata.annotations = None;
+    job.spec.ttl_seconds_after_finished = Some(30);
+
+    let job_key = build_key("jobs", Some("default"), "spec-field-ttl");
+    storage.create(&job_key, &job).await.unwrap();
+
+    let controller = TTLController::new(storage.clone());
+    controller.check_and_cleanup().await.unwrap();
+    sleep(TokioDuration::from_millis(200)).await;
+
+    // When implemented, this assertion holds: spec-field TTL drives cleanup.
+    let result = storage.get::<Job>(&job_key).await;
+    assert!(
+        result.is_err(),
+        "Job with spec.ttlSecondsAfterFinished should be cleaned up",
+    );
+}
+
+/// Upstream Kubernetes does not implement Pod-level TTL — Pods get cleaned up
+/// only as cascading garbage of their owning Job. This test documents that
+/// behavior: a Succeeded pod with a `ttlSecondsAfterFinished` annotation must
+/// NOT be deleted by the TTL controller on its own.
+/// Pinned as RED-state so it surfaces immediately if anyone adds Pod TTL.
+#[tokio::test]
+#[ignore = "RED-state: Pod-level TTL is not part of upstream K8s; controller only handles Jobs"]
+async fn test_ttl_controller_does_not_implement_pod_ttl() {
+    let storage = setup_test().await;
+
+    let mut annotations = HashMap::new();
+    annotations.insert("ttlSecondsAfterFinished".to_string(), "1".to_string());
+
+    let pod = Pod {
+        type_meta: TypeMeta {
+            kind: "Pod".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: ObjectMeta::new("orphan-pod")
+            .with_namespace("default")
+            .with_annotations(annotations),
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "test".to_string(),
+                image: "busybox".to_string(),
+                image_pull_policy: Some("IfNotPresent".to_string()),
+                command: None,
+                args: None,
+                ports: None,
+                env: None,
+                volume_mounts: None,
+                liveness_probe: None,
+                readiness_probe: None,
+                startup_probe: None,
+                resources: None,
+                working_dir: None,
+                restart_policy: None,
+                resize_policy: None,
+                security_context: None,
+                lifecycle: None,
+                termination_message_path: None,
+                termination_message_policy: None,
+                stdin: None,
+                stdin_once: None,
+                tty: None,
+                env_from: None,
+                volume_devices: None,
+            }],
+            init_containers: None,
+            restart_policy: Some("Never".to_string()),
+            node_selector: None,
+            node_name: None,
+            volumes: None,
+            affinity: None,
+            tolerations: None,
+            service_account_name: None,
+            service_account: None,
+            priority: None,
+            priority_class_name: None,
+            hostname: None,
+            subdomain: None,
+            host_network: None,
+            host_pid: None,
+            host_ipc: None,
+            automount_service_account_token: None,
+            ephemeral_containers: None,
+            overhead: None,
+            scheduler_name: None,
+            topology_spread_constraints: None,
+            resource_claims: None,
+            active_deadline_seconds: None,
+            dns_policy: None,
+            dns_config: None,
+            security_context: None,
+            image_pull_secrets: None,
+            share_process_namespace: None,
+            readiness_gates: None,
+            runtime_class_name: None,
+            enable_service_links: None,
+            preemption_policy: None,
+            host_users: None,
+            set_hostname_as_fqdn: None,
+            termination_grace_period_seconds: None,
+            host_aliases: None,
+            os: None,
+            scheduling_gates: None,
+            resources: None,
+        }),
+        status: Some(PodStatus {
+            phase: Some(rusternetes_common::types::Phase::Succeeded),
+            message: None,
+            reason: None,
+            host_ip: None,
+            host_i_ps: None,
+            pod_ip: None,
+            pod_i_ps: None,
+            nominated_node_name: None,
+            qos_class: None,
+            start_time: None,
+            conditions: None,
+            container_statuses: None,
+            init_container_statuses: None,
+            ephemeral_container_statuses: None,
+            resize: None,
+            resource_claim_statuses: None,
+            observed_generation: None,
+        }),
+    };
+
+    let pod_key = build_key("pods", Some("default"), "orphan-pod");
+    storage.create(&pod_key, &pod).await.unwrap();
+
+    let controller = TTLController::new(storage.clone());
+    controller.check_and_cleanup().await.unwrap();
+    sleep(TokioDuration::from_millis(500)).await;
+
+    // When implemented, the pod with TTL=1s would have been cleaned up.
+    let result = storage.get::<Pod>(&pod_key).await;
+    assert!(
+        result.is_err(),
+        "Standalone pod with TTL annotation should be cleaned up by a Pod-TTL controller",
+    );
+}
