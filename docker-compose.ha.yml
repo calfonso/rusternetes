@@ -1,5 +1,3 @@
-version: '3.8'
-
 # High Availability Configuration for Rusternetes
 # This compose file sets up:
 # - 3-node etcd cluster with quorum
