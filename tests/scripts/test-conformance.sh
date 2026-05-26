@@ -34,27 +34,39 @@ if ! command -v sonobuoy &> /dev/null; then
     exit 1
 fi
 
-# Check for docker-compose
-if ! command -v docker-compose &> /dev/null; then
-    echo -e "${RED}Error: docker-compose is not installed${NC}"
-    echo "Install it with: brew install docker-compose (macOS) or see https://docs.docker.com/compose/install/"
+# Detect container runtime + compose command (mirrors Makefile)
+if command -v podman-compose &> /dev/null; then
+    COMPOSE_CMD="podman-compose"
+    COMPOSE_FILE="compose.yml"
+    RUNTIME="podman"
+elif command -v docker-compose &> /dev/null; then
+    COMPOSE_CMD="docker-compose"
+    COMPOSE_FILE="docker-compose.yml"
+    RUNTIME="docker"
+elif docker compose version &> /dev/null; then
+    COMPOSE_CMD="docker compose"
+    COMPOSE_FILE="docker-compose.yml"
+    RUNTIME="docker"
+else
+    echo -e "${RED}Error: no compose command found (podman-compose, docker-compose, or docker compose plugin)${NC}"
     exit 1
 fi
+COMPOSE="$COMPOSE_CMD -f $COMPOSE_FILE"
 
 # Check if cluster is already running
-if docker ps --filter "name=rusternetes" --format "{{.Names}}" | grep -q rusternetes; then
+if $RUNTIME ps --filter "name=rusternetes" --format "{{.Names}}" | grep -q rusternetes; then
     echo -e "${YELLOW}Cluster is already running${NC}"
     read -p "Do you want to restart it? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         echo "Stopping existing cluster..."
-        docker-compose down
+        $COMPOSE down
         echo "Starting fresh cluster..."
-        docker-compose up -d
+        $COMPOSE up -d
     fi
 else
     echo "Starting Rusternetes cluster..."
-    docker-compose up -d
+    $COMPOSE up -d
 fi
 
 # Set up kubectl command with TLS skip

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
 # Conformance test runner for Rusternetes
 # This script handles the full lifecycle of running Kubernetes conformance tests
@@ -13,6 +14,17 @@ echo ""
 # Setup kubeconfig
 export KUBECONFIG=~/.kube/rusternetes-config
 
+# Preflight: API server must be reachable, otherwise the cleanup step
+# silently aborts under `set -e` when kubectl can't connect.
+if ! curl -sk --max-time 5 https://localhost:6443/healthz >/dev/null 2>&1; then
+    echo "ERROR: API server at https://localhost:6443 is not reachable." >&2
+    echo "Start the cluster first, e.g.:" >&2
+    echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes" >&2
+    echo "  docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d" >&2
+    echo "  bash scripts/bootstrap-cluster.sh" >&2
+    exit 1
+fi
+
 # Step 1: Kill any running sonobuoy processes
 echo "[1/5] Cleaning up old sonobuoy processes..."
 pkill -f "sonobuoy run" || true
@@ -22,11 +34,13 @@ sleep 2
 echo "[2/5] Cleaning up sonobuoy resources..."
 timeout 30 sonobuoy delete --wait 2>/dev/null || {
     echo "Sonobuoy delete timed out or failed, force cleaning..."
-    kubectl delete pods --all -n sonobuoy --force --grace-period=0 2>/dev/null
-    kubectl delete jobs --all -n sonobuoy --force --grace-period=0 2>/dev/null
-    kubectl delete daemonsets --all -n sonobuoy --force --grace-period=0 2>/dev/null
-    kubectl delete services --all -n sonobuoy --force --grace-period=0 2>/dev/null
-    timeout 10 kubectl delete namespace sonobuoy --force --grace-period=0 2>/dev/null || true
+    set +e
+    kubectl delete pods        --all -n sonobuoy --force --grace-period=0 2>/dev/null
+    kubectl delete jobs        --all -n sonobuoy --force --grace-period=0 2>/dev/null
+    kubectl delete daemonsets  --all -n sonobuoy --force --grace-period=0 2>/dev/null
+    kubectl delete services    --all -n sonobuoy --force --grace-period=0 2>/dev/null
+    timeout 10 kubectl delete namespace sonobuoy --force --grace-period=0 2>/dev/null
+    set -e
 }
 sleep 2
 

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # etcd - distributed key-value store for cluster state
   etcd:
@@ -37,6 +35,8 @@ services:
       context: .
       dockerfile: Dockerfile.services
       target: api-server
+      additional_contexts:
+        rhino: ../rhino
     container_name: rusternetes-api-server
     ports:
       - "6443:6443"
@@ -77,6 +77,8 @@ services:
       context: .
       dockerfile: Dockerfile.services
       target: scheduler
+      additional_contexts:
+        rhino: ../rhino
     container_name: rusternetes-scheduler
     depends_on:
       - etcd
@@ -93,6 +95,8 @@ services:
       context: .
       dockerfile: Dockerfile.services
       target: controller-manager
+      additional_contexts:
+        rhino: ../rhino
     container_name: rusternetes-controller-manager
     depends_on:
       - etcd
@@ -112,6 +116,8 @@ services:
       context: .
       dockerfile: Dockerfile.services
       target: kubelet
+      additional_contexts:
+        rhino: ../rhino
     container_name: rusternetes-kubelet
     privileged: true
     depends_on:
@@ -167,6 +173,8 @@ services:
       context: .
       dockerfile: Dockerfile.services
       target: kubelet
+      additional_contexts:
+        rhino: ../rhino
     container_name: rusternetes-kubelet2
     privileged: true
     depends_on:
@@ -194,6 +202,8 @@ services:
       context: .
       dockerfile: Dockerfile.services
       target: kube-proxy
+      additional_contexts:
+        rhino: ../rhino
     container_name: rusternetes-kube-proxy
     privileged: true
     network_mode: host

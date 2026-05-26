@@ -2,7 +2,7 @@
 
 # Detect container runtime (podman or docker)
 CONTAINER_RUNTIME := $(shell command -v podman 2> /dev/null || command -v docker 2> /dev/null)
-COMPOSE_CMD := $(shell command -v podman-compose 2> /dev/null || command -v docker-compose 2> /dev/null)
+COMPOSE_CMD := $(shell command -v podman-compose 2> /dev/null || command -v docker-compose 2> /dev/null || (docker compose version > /dev/null 2>&1 && echo "docker compose"))
 
 # Select the right compose file for the runtime
 ifeq ($(findstring podman,$(COMPOSE_CMD)),podman)
