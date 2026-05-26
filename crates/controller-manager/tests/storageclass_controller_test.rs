@@ -119,8 +119,9 @@ async fn test_storageclass_default_designation_single_default() {
     );
 }
 
-/// Two classes with the default annotation set to "false" should remain
-/// untouched — the controller must not promote a non-default to default.
+/// A class with the default annotation explicitly set to `"false"` must
+/// remain untouched — the controller must never promote a non-default to
+/// default on its own.
 #[tokio::test]
 #[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_default_designation_zero_defaults() {
@@ -207,9 +208,13 @@ async fn test_storageclass_provisioner_parameters_preserved() {
     assert_eq!(stored.provisioner, "ebs.csi.aws.com");
 }
 
-/// Mount options declared on the StorageClass must be propagated to PV
-/// objects dynamically provisioned against it. We seed a freshly-created
-/// PV with no mount options and assert the controller fills them in.
+/// Mount options declared on the StorageClass must be reflected on PV
+/// objects bound through it. We assert the steady-state invariant
+/// (PV.spec.mount_options == StorageClass.mount_options) and leave the
+/// mechanism — set-at-provisioning vs. backfill-on-reconcile — to the
+/// GREEN-state implementation. Upstream Kubernetes sets these at
+/// provisioning time via the external provisioner; an in-process port
+/// may legitimately choose to backfill instead.
 #[tokio::test]
 #[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_mount_options_propagation_to_pv() {

@@ -29,7 +29,21 @@ use tracing::info;
 /// At most one `StorageClass` should carry this annotation set to `"true"`
 /// at any given time. Enforcement of that invariant is the responsibility
 /// of this controller.
+///
+/// Note: the api-server admission layer (`crates/api-server/src/admission.rs`)
+/// also honours the legacy beta variant
+/// `storageclass.beta.kubernetes.io/is-default-class`. When this controller
+/// grows real reconcile logic it must inspect *both* annotations to remain
+/// consistent with admission; tracking that as a follow-up.
 pub const IS_DEFAULT_STORAGE_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
+
+/// Legacy beta variant of [`IS_DEFAULT_STORAGE_CLASS_ANNOTATION`]. Still
+/// accepted by the api-server admission layer; kept here so the
+/// controller's RED-state coverage can be extended once it learns to read
+/// it. Not yet referenced by the stub.
+#[allow(dead_code)]
+pub const IS_DEFAULT_STORAGE_CLASS_BETA_ANNOTATION: &str =
+    "storageclass.beta.kubernetes.io/is-default-class";
 
 /// `StorageClassController` reconciles `StorageClass` objects.
 ///
