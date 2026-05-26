@@ -13,6 +13,7 @@ pub mod garbage_collector;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
+pub mod limitrange;
 pub mod loadbalancer;
 pub mod namespace;
 pub mod network_policy;
