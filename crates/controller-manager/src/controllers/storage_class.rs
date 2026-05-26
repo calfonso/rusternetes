@@ -29,8 +29,7 @@ use tracing::info;
 /// At most one `StorageClass` should carry this annotation set to `"true"`
 /// at any given time. Enforcement of that invariant is the responsibility
 /// of this controller.
-pub const IS_DEFAULT_STORAGE_CLASS_ANNOTATION: &str =
-    "storageclass.kubernetes.io/is-default-class";
+pub const IS_DEFAULT_STORAGE_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
 
 /// `StorageClassController` reconciles `StorageClass` objects.
 ///
