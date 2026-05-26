@@ -19,6 +19,7 @@ pub mod network_policy;
 pub mod node;
 pub mod pod_disruption_budget;
 pub mod pv_binder;
+pub mod pvc;
 pub mod replicaset;
 pub mod replicationcontroller;
 pub mod resource_quota;
