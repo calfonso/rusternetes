@@ -586,3 +586,393 @@ async fn test_vpa_with_no_pods() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4.2 extended coverage — mirrors upstream
+// kubernetes/test/e2e/autoscaling/vpa.go scenarios:
+//   - recommendation generation (target/lower/upper bound shape)
+//   - update mode Auto / Initial / Off behavior
+//   - historical usage sample accumulation
+// ---------------------------------------------------------------------------
+
+/// Recommendation output shape: every container in the target spec must surface
+/// a target with both CPU and memory keys, and bounded lower/upper estimates.
+#[tokio::test]
+async fn test_vpa_recommendation_includes_bounds_and_uncapped_target() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = VerticalPodAutoscalerController::new(storage.clone());
+
+    let (deployment, pods) = create_test_deployment_with_pods(&storage, "bounded", "default", 2);
+    storage
+        .create(
+            &build_key("deployments", Some("default"), "bounded"),
+            &deployment,
+        )
+        .await
+        .unwrap();
+    for (i, pod) in pods.iter().enumerate() {
+        storage
+            .create(
+                &build_key("pods", Some("default"), &format!("bounded-pod-{}", i)),
+                pod,
+            )
+            .await
+            .unwrap();
+    }
+
+    let vpa = create_test_vpa(
+        "bounded-vpa",
+        "default",
+        "bounded",
+        "Deployment",
+        Some("Off"),
+    );
+    storage
+        .create(
+            &build_key("verticalpodautoscalers", Some("default"), "bounded-vpa"),
+            &vpa,
+        )
+        .await
+        .unwrap();
+
+    // Need >= 10 usage samples per container before recommendations are emitted.
+    for _ in 0..15 {
+        controller.reconcile_all().await.unwrap();
+    }
+
+    let updated: VerticalPodAutoscaler = storage
+        .get(&build_key(
+            "verticalpodautoscalers",
+            Some("default"),
+            "bounded-vpa",
+        ))
+        .await
+        .unwrap();
+    let containers = updated
+        .status
+        .expect("status")
+        .recommendation
+        .expect("recommendation")
+        .container_recommendations
+        .expect("container_recommendations");
+    let app = containers
+        .iter()
+        .find(|c| c.container_name == "app")
+        .expect("recommendation for 'app' container");
+
+    // Shape: target carries cpu+memory; bounds + uncapped_target are populated.
+    assert!(app.target.contains_key("cpu"), "target.cpu present");
+    assert!(app.target.contains_key("memory"), "target.memory present");
+    let lower = app.lower_bound.as_ref().expect("lower_bound");
+    let upper = app.upper_bound.as_ref().expect("upper_bound");
+    let uncapped = app.uncapped_target.as_ref().expect("uncapped_target");
+    for key in ["cpu", "memory"] {
+        assert!(lower.contains_key(key), "lower_bound.{} present", key);
+        assert!(upper.contains_key(key), "upper_bound.{} present", key);
+        assert!(
+            uncapped.contains_key(key),
+            "uncapped_target.{} present",
+            key
+        );
+    }
+}
+
+/// Update mode "Auto": controller must still emit recommendations and must NOT
+/// mutate pod specs in place (upstream Auto = recreate or in-place; rusternetes
+/// today only logs intent — verify it's non-destructive).
+#[tokio::test]
+async fn test_vpa_update_mode_auto_emits_recommendations_without_mutation() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = VerticalPodAutoscalerController::new(storage.clone());
+
+    let (deployment, pods) = create_test_deployment_with_pods(&storage, "auto-app", "default", 2);
+    storage
+        .create(
+            &build_key("deployments", Some("default"), "auto-app"),
+            &deployment,
+        )
+        .await
+        .unwrap();
+    let mut pod_specs_before: HashMap<String, PodSpec> = HashMap::new();
+    for (i, pod) in pods.iter().enumerate() {
+        storage
+            .create(
+                &build_key("pods", Some("default"), &format!("auto-app-pod-{}", i)),
+                pod,
+            )
+            .await
+            .unwrap();
+        pod_specs_before.insert(pod.metadata.name.clone(), pod.spec.clone().unwrap());
+    }
+
+    let vpa = create_test_vpa(
+        "auto-vpa",
+        "default",
+        "auto-app",
+        "Deployment",
+        Some("Auto"),
+    );
+    storage
+        .create(
+            &build_key("verticalpodautoscalers", Some("default"), "auto-vpa"),
+            &vpa,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..15 {
+        controller.reconcile_all().await.unwrap();
+    }
+
+    // Recommendations exist in status.
+    let updated: VerticalPodAutoscaler = storage
+        .get(&build_key(
+            "verticalpodautoscalers",
+            Some("default"),
+            "auto-vpa",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        updated
+            .status
+            .and_then(|s| s.recommendation)
+            .and_then(|r| r.container_recommendations)
+            .map(|c| !c.is_empty())
+            .unwrap_or(false),
+        "Auto mode VPA should emit recommendations"
+    );
+
+    // Pods present, unchanged spec — rusternetes Auto mode does not in-place
+    // resize today, so the pod specs must be untouched.
+    let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(pods_after.len(), 2, "Auto mode should not evict pods");
+    for pod in &pods_after {
+        let original = pod_specs_before
+            .get(&pod.metadata.name)
+            .expect("original spec for this pod name");
+        let current = pod.spec.as_ref().expect("current pod spec");
+        assert_eq!(
+            current.containers[0].resources, original.containers[0].resources,
+            "Auto mode must not mutate container resources in place"
+        );
+    }
+}
+
+/// Update mode "Initial": recommendations are produced (admission webhook would
+/// inject them on pod creation). Existing running pods must be left alone.
+#[tokio::test]
+async fn test_vpa_update_mode_initial_recommends_without_evicting() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = VerticalPodAutoscalerController::new(storage.clone());
+
+    let (deployment, pods) =
+        create_test_deployment_with_pods(&storage, "initial-app", "default", 3);
+    storage
+        .create(
+            &build_key("deployments", Some("default"), "initial-app"),
+            &deployment,
+        )
+        .await
+        .unwrap();
+    for (i, pod) in pods.iter().enumerate() {
+        storage
+            .create(
+                &build_key("pods", Some("default"), &format!("initial-app-pod-{}", i)),
+                pod,
+            )
+            .await
+            .unwrap();
+    }
+
+    let vpa = create_test_vpa(
+        "initial-vpa",
+        "default",
+        "initial-app",
+        "Deployment",
+        Some("Initial"),
+    );
+    storage
+        .create(
+            &build_key("verticalpodautoscalers", Some("default"), "initial-vpa"),
+            &vpa,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..15 {
+        controller.reconcile_all().await.unwrap();
+    }
+
+    let updated: VerticalPodAutoscaler = storage
+        .get(&build_key(
+            "verticalpodautoscalers",
+            Some("default"),
+            "initial-vpa",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        updated
+            .status
+            .and_then(|s| s.recommendation)
+            .and_then(|r| r.container_recommendations)
+            .map(|c| !c.is_empty())
+            .unwrap_or(false),
+        "Initial mode VPA should emit recommendations for the admission webhook to consume"
+    );
+
+    // Existing pods are left in place under Initial mode.
+    let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(
+        pods_after.len(),
+        3,
+        "Initial mode must not evict already-running pods"
+    );
+}
+
+/// Update mode "Off": recommendations are produced but no apply step runs.
+/// Reinforces the existing test_vpa_respects_update_mode_off by checking the
+/// recommendation payload itself.
+#[tokio::test]
+async fn test_vpa_update_mode_off_produces_recommendation_only() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = VerticalPodAutoscalerController::new(storage.clone());
+
+    let (deployment, pods) = create_test_deployment_with_pods(&storage, "off-app", "default", 2);
+    storage
+        .create(
+            &build_key("deployments", Some("default"), "off-app"),
+            &deployment,
+        )
+        .await
+        .unwrap();
+    for (i, pod) in pods.iter().enumerate() {
+        storage
+            .create(
+                &build_key("pods", Some("default"), &format!("off-app-pod-{}", i)),
+                pod,
+            )
+            .await
+            .unwrap();
+    }
+
+    let vpa = create_test_vpa("off-vpa", "default", "off-app", "Deployment", Some("Off"));
+    storage
+        .create(
+            &build_key("verticalpodautoscalers", Some("default"), "off-vpa"),
+            &vpa,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..15 {
+        controller.reconcile_all().await.unwrap();
+    }
+
+    let updated: VerticalPodAutoscaler = storage
+        .get(&build_key(
+            "verticalpodautoscalers",
+            Some("default"),
+            "off-vpa",
+        ))
+        .await
+        .unwrap();
+
+    // Recommendation present...
+    let containers = updated
+        .status
+        .expect("status")
+        .recommendation
+        .expect("recommendation")
+        .container_recommendations
+        .expect("container_recommendations");
+    assert!(!containers.is_empty(), "Off mode still computes recs");
+
+    // ...but pods are untouched.
+    let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(pods_after.len(), 2, "Off mode must never evict pods");
+}
+
+/// Historical usage tracking: each reconcile must accumulate at least one
+/// sample per container, so successive reconciles strictly increase the
+/// dataset until enough samples (>=10) trigger the first recommendation.
+#[tokio::test]
+async fn test_vpa_history_accumulates_until_recommendation_threshold() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = VerticalPodAutoscalerController::new(storage.clone());
+
+    let (deployment, pods) = create_test_deployment_with_pods(&storage, "hist-app", "default", 1);
+    storage
+        .create(
+            &build_key("deployments", Some("default"), "hist-app"),
+            &deployment,
+        )
+        .await
+        .unwrap();
+    for (i, pod) in pods.iter().enumerate() {
+        storage
+            .create(
+                &build_key("pods", Some("default"), &format!("hist-app-pod-{}", i)),
+                pod,
+            )
+            .await
+            .unwrap();
+    }
+
+    let vpa = create_test_vpa("hist-vpa", "default", "hist-app", "Deployment", Some("Off"));
+    storage
+        .create(
+            &build_key("verticalpodautoscalers", Some("default"), "hist-vpa"),
+            &vpa,
+        )
+        .await
+        .unwrap();
+
+    // The controller requires >=10 samples per container before publishing a
+    // recommendation. After only a few reconciles, status should remain empty.
+    for _ in 0..3 {
+        controller.reconcile_all().await.unwrap();
+    }
+    let early: VerticalPodAutoscaler = storage
+        .get(&build_key(
+            "verticalpodautoscalers",
+            Some("default"),
+            "hist-vpa",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        early
+            .status
+            .and_then(|s| s.recommendation)
+            .and_then(|r| r.container_recommendations)
+            .map(|c| c.is_empty())
+            .unwrap_or(true),
+        "Should not yet have recommendations after <10 samples"
+    );
+
+    // Crossing the sample-count threshold yields recommendations.
+    for _ in 0..15 {
+        controller.reconcile_all().await.unwrap();
+    }
+    let later: VerticalPodAutoscaler = storage
+        .get(&build_key(
+            "verticalpodautoscalers",
+            Some("default"),
+            "hist-vpa",
+        ))
+        .await
+        .unwrap();
+    let recs = later
+        .status
+        .expect("status")
+        .recommendation
+        .expect("recommendation")
+        .container_recommendations
+        .expect("container_recommendations");
+    assert!(
+        !recs.is_empty(),
+        "After accumulating enough history, recommendations should be published"
+    );
+}
