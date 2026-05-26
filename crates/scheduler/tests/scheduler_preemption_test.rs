@@ -15,6 +15,7 @@
 //! - `preemption_test.rs` — focused PDB victim selection (preemption.go:535).
 //! - `conformance_scheduling_priority_preemption_hostport.rs` — basic
 //!   priority/preemption + hostport conformance mirrors.
+//!
 //! This file complements both by adding multi-victim selection, the
 //! lowest-priority-first eviction invariant, the priority-floor / equal-priority
 //! refusal contract, and the scheduling-queue sort the scheduler applies to
@@ -365,7 +366,7 @@ fn priority_based_eviction_refuses_equal_or_lower_priority_preemptor() {
 
     // Equal priority — must not preempt.
     let equal = make_incoming_pod("equal-pri", 500, "1", "1Gi");
-    let (can_eq, victims_eq) = check_preemption(&node, &equal, &[occupant.clone()]);
+    let (can_eq, victims_eq) = check_preemption(&node, &equal, std::slice::from_ref(&occupant));
     assert!(
         !can_eq,
         "equal-priority preemptor must NOT evict; got victims {victims_eq:?}"
@@ -438,7 +439,7 @@ async fn scheduler_queue_sorting_orders_pending_pods_by_priority_desc() {
 
     // The scheduler's queue comparator (paraphrasing `schedule_all_pending`):
     //   pending.sort_by(|a, b| b_pri.cmp(&a_pri))   // descending
-    let mut pending = vec![
+    let mut pending = [
         p_explicit_low.clone(),
         p_class_med.clone(),
         p_explicit_high.clone(),
