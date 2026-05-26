@@ -32,6 +32,8 @@ pub mod statefulset;
 pub mod storage_class;
 pub mod taint_eviction;
 pub mod ttl_controller;
+#[allow(dead_code)]
+pub mod volume_attachment;
 pub mod volume_expansion;
 pub mod volume_snapshot;
 pub mod vpa;
