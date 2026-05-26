@@ -4,6 +4,12 @@
 
 # Build artifacts
 target/
+# Re-include host-built binaries used by Dockerfile.local-binary.services
+!target/release/api-server
+!target/release/kubelet
+!target/release/scheduler
+!target/release/controller-manager
+!target/release/kube-proxy
 # Note: Cargo.lock is needed for reproducible builds in containers
 # So we don't exclude it here
 

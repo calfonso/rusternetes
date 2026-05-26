@@ -59,6 +59,13 @@ metadata:
   labels:
     k8s-app: kube-dns
 spec:
+  # Pin to node-1 to bypass the scheduler. The node-conformance compose
+  # (compose.node-conformance.yml) intentionally omits scheduler and
+  # controller-manager — without a nodeName, CoreDNS stays Pending and
+  # the e2e SynchronizedBeforeSuite times out waiting for kube-system
+  # pods to go Ready. Multi-container and all-in-one stacks both expose
+  # a node-1, so this is safe there too.
+  nodeName: node-1
   serviceAccountName: default
   priorityClassName: system-cluster-critical
   priority: 2000000000

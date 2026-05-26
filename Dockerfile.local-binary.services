@@ -1,0 +1,121 @@
+# Runtime-only images for the multi-container stack — consumes host-built
+# binaries from ./target/release/ instead of compiling inside Docker.
+#
+# Build with:
+#   cargo build --release --bin api-server --bin kubelet --bin scheduler \
+#               --bin controller-manager --bin kube-proxy
+#   docker compose -f compose.node-conformance.yml \
+#                  -f compose.dind.node-conformance.yml \
+#                  -f compose.local-binary.node-conformance.yml \
+#                  build
+#
+# Why: the cargo-builder stage in Dockerfile.services is slow even with
+# the sccache cache mount (sccache server crashes mid-build are not
+# uncommon on a workstation under memory pressure). Host builds use the
+# user's incremental target/ and warm sccache, finishing in seconds for
+# small edits.
+
+# ---------------------------------------------------------------------
+# api-server
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS api-server
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY target/release/api-server /app/api-server
+
+EXPOSE 6443
+
+ENTRYPOINT ["/app/api-server"]
+CMD ["--bind-address", "0.0.0.0:6443", "--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# kubelet
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS kubelet
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    iproute2 \
+    iptables \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN mkdir -p /opt/cni/bin && \
+    ARCH=$(dpkg --print-architecture) && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+        https://github.com/containernetworking/plugins/releases/download/v1.4.0/cni-plugins-linux-${ARCH}-v1.4.0.tgz \
+        -o /tmp/cni-plugins.tgz && \
+    tar -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz && \
+    rm /tmp/cni-plugins.tgz
+
+RUN mkdir -p /etc/cni/net.d
+COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
+
+COPY target/release/kubelet /app/kubelet
+
+VOLUME ["/var/run"]
+
+ENTRYPOINT ["/app/kubelet"]
+CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# scheduler
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS scheduler
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY target/release/scheduler /app/scheduler
+
+ENTRYPOINT ["/app/scheduler"]
+CMD ["--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# controller-manager
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS controller-manager
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY target/release/controller-manager /app/controller-manager
+
+ENTRYPOINT ["/app/controller-manager"]
+CMD ["--etcd-servers", "http://etcd:2379"]
+
+# ---------------------------------------------------------------------
+# kube-proxy
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS kube-proxy
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    iptables \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY target/release/kube-proxy /app/kube-proxy
+
+ENTRYPOINT ["/app/kube-proxy"]
+CMD ["--node-name", "node-1"]

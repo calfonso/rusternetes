@@ -134,11 +134,16 @@ echo "[6/7] Running ginkgo focus=${FOCUS}..."
 # versa) without killing the script. Re-enable immediately after.
 set +e
 set +o pipefail
+FAIL_FAST_FLAG=""
+if [ "${FAIL_FAST:-0}" = "1" ]; then
+    FAIL_FAST_FLAG="--fail-fast"
+fi
 KUBECONFIG="${KUBECONFIG_FILE}" \
 "${BIN_DIR}/ginkgo" \
     --focus="${FOCUS}" \
     --skip="${SKIP}" \
     --no-color \
+    ${FAIL_FAST_FLAG} \
     "${BIN_DIR}/e2e.test" \
     -- \
     --provider=local \
