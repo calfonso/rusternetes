@@ -5956,28 +5956,39 @@ impl ProtoRegistry {
                     ),
                     (10, ("note".into(), FieldType::String)),
                     (11, ("type".into(), FieldType::String)),
+                    // Fields 12-15 must mirror upstream
+                    // `k8s.io/api/events/v1/generated.proto` exactly. Any
+                    // drift here is silent: the WIRE_VARINT branch of
+                    // `decode_with_schema` writes the raw varint into the
+                    // JSON object without checking the declared FieldType,
+                    // so a Message-typed slot fed a varint becomes
+                    // `"<fieldName>": <number>` — which then round-trips
+                    // through the `Event.extra` catch-all and is rejected
+                    // by client-go's typed Event decoder (regression seen
+                    // in [sig-instrumentation] Events API conformance,
+                    // canary run 2026-05-27).
                     (
                         12,
+                        (
+                            "deprecatedSource".into(),
+                            FieldType::Message("EventSource".into()),
+                        ),
+                    ),
+                    (
+                        13,
                         (
                             "deprecatedFirstTimestamp".into(),
                             FieldType::Message("Time".into()),
                         ),
                     ),
                     (
-                        13,
+                        14,
                         (
                             "deprecatedLastTimestamp".into(),
                             FieldType::Message("Time".into()),
                         ),
                     ),
-                    (14, ("deprecatedCount".into(), FieldType::Int)),
-                    (
-                        15,
-                        (
-                            "deprecatedSource".into(),
-                            FieldType::Message("EventSource".into()),
-                        ),
-                    ),
+                    (15, ("deprecatedCount".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -8257,7 +8268,11 @@ impl ProtoRegistry {
                         (
                             "ports".into(),
                             FieldType::Repeated(Box::new(FieldType::Message(
-                                "EndpointPort".into(),
+                                // Group-qualified so the bare `EndpointPort`
+                                // key stays bound to core/v1 (whose field
+                                // 2/3 order is the OPPOSITE of discovery's
+                                // — see the schema registration below).
+                                "discovery.k8s.io/v1.EndpointPort".into(),
                             ))),
                         ),
                     ),
@@ -8336,8 +8351,14 @@ impl ProtoRegistry {
             },
         );
 
+        // discovery.k8s.io/v1.EndpointPort — field 2/3 order is swapped
+        // vs core/v1.EndpointPort. Registered under a group-qualified key
+        // so the bare `EndpointPort` slot (registered earlier with the
+        // core/v1 layout) stays bound to core/v1 — last-writer-wins on a
+        // shared bare key would silently flip the wire layout under
+        // core/v1.Endpoints decode.
         schemas.insert(
-            "EndpointPort".into(),
+            "discovery.k8s.io/v1.EndpointPort".into(),
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("name".into(), FieldType::String)),
