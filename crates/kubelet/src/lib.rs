@@ -38,7 +38,7 @@ impl Default for KubeletConfig {
             network: "rusternetes-network".to_string(),
             sync_interval: 3,
             metrics_port: 10250,
-            kubernetes_service_host: "127.0.0.1".to_string(),
+            kubernetes_service_host: "10.96.0.1".to_string(),
         }
     }
 }
