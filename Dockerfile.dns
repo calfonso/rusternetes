@@ -88,12 +88,26 @@ RUN set -eux; \
 RUN mkdir -p crates/common/benches \
  && echo "fn main(){}" > crates/common/benches/regex_cache.rs
 
-# Pass 1: dependency-only compile.
+# Pass 1: dependency-only compile, then wipe the dummy workspace
+# artefacts so Pass 2 compiles them from real src (see
+# Dockerfile.services for the rationale).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
     cargo build --profile release-fast --bin rusternetes-dns \
+ && cargo clean --profile release-fast \
+        -p rusternetes-api-server \
+        -p rusternetes-cloud-providers \
+        -p rusternetes-common \
+        -p rusternetes-controller-manager \
+        -p rusternetes-dns \
+        -p rusternetes-kubectl \
+        -p rusternetes-kubelet \
+        -p rusternetes-kube-proxy \
+        -p rusternetes \
+        -p rusternetes-scheduler \
+        -p rusternetes-storage \
  && sccache --show-stats
 
 # Pass 2: real sources. Only the dns crate + its dependency chain
@@ -107,7 +121,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
-    find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
     cargo build --profile release-fast --bin rusternetes-dns \
  && sccache --show-stats \
  && mkdir -p /out \

@@ -197,6 +197,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --bin controller-manager \
         --bin kube-proxy \
         --bin rusternetes-dns \
+ && cargo clean --profile release-fast \
+        -p rusternetes-api-server \
+        -p rusternetes-cloud-providers \
+        -p rusternetes-common \
+        -p rusternetes-controller-manager \
+        -p rusternetes-dns \
+        -p rusternetes-kubectl \
+        -p rusternetes-kubelet \
+        -p rusternetes-kube-proxy \
+        -p rusternetes \
+        -p rusternetes-scheduler \
+        -p rusternetes-storage \
  && sccache --show-stats
 
 # ----- PASS 2: real source compile (only changed workspace crates rebuild) -----
@@ -227,20 +239,14 @@ COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
 COPY crates/storage/src              crates/storage/src
 
-# Touch every Cargo.toml AND every workspace .rs file so cargo's
-# fingerprint check notices the source tree has changed.
-#
-# Cargo decides whether to recompile a crate by comparing the mtime
-# of its src/ tree against the mtime of the cached `.fingerprint`
-# entry. Docker's `COPY` preserves the mtime of the source file from
-# the build context (often the original git checkout time), which can
-# be OLDER than the dummy lib.rs Pass 1 just wrote. Without an
-# explicit `touch`, cargo sees "src older than fingerprint" and
-# happily reuses the empty-library .rlib from Pass 1, which makes
-# every dependent crate fail with `unresolved import …`.
-#
-# `touch` with no args bumps mtime to "now", which is always newer
-# than both the dummy artefact and the original source mtime.
+# Rebuild with real sources. Pass 1 already wiped the dummy workspace
+# artefacts via `cargo clean -p`, so cargo compiles every workspace
+# crate from the real src copied in above without trusting any cached
+# dummy rlib. (Previous iterations of this Dockerfile used a
+# `find … -exec touch` hack to force rebuild — that worked but
+# invalidated ALL workspace crates on every edit, even unchanged ones.
+# The cleanup-after-Pass-1 approach scopes the rebuild to genuinely
+# changed crates.)
 #
 # The binaries are copied out of the cache-mounted target/ into /out
 # so the runtime stages can pick them up (cache-mount contents are
@@ -250,7 +256,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
-    find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
     cargo build --profile release-fast $CARGO_FEATURES \
         --bin api-server \
         --bin kubelet \

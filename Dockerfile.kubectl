@@ -95,6 +95,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
     cargo build --profile release-fast --bin kubectl \
+ && cargo clean --profile release-fast \
+        -p rusternetes-api-server \
+        -p rusternetes-cloud-providers \
+        -p rusternetes-common \
+        -p rusternetes-controller-manager \
+        -p rusternetes-dns \
+        -p rusternetes-kubectl \
+        -p rusternetes-kubelet \
+        -p rusternetes-kube-proxy \
+        -p rusternetes \
+        -p rusternetes-scheduler \
+        -p rusternetes-storage \
  && sccache --show-stats
 
 # ----- PASS 2: real source compile -----
@@ -118,14 +130,13 @@ COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
 COPY crates/storage/src              crates/storage/src
 
-# Touch Cargo.toml AND every .rs — see Dockerfile.services for why
-# touching manifests alone is insufficient (cargo fingerprint also
-# tracks src/ mtime, which COPY preserves from the build context).
+# Pass 1 already wiped the dummy workspace artefacts via `cargo
+# clean -p`, so cargo compiles each workspace crate from the real src
+# copied in above. See Dockerfile.services for the rationale.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
-    find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
     cargo build --profile release-fast --bin kubectl && \
     sccache --show-stats && \
     mkdir -p /out && cp target/release-fast/kubectl /out/kubectl
