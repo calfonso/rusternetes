@@ -8268,7 +8268,11 @@ impl ProtoRegistry {
                         (
                             "ports".into(),
                             FieldType::Repeated(Box::new(FieldType::Message(
-                                "EndpointPort".into(),
+                                // Group-qualified so the bare `EndpointPort`
+                                // key stays bound to core/v1 (whose field
+                                // 2/3 order is the OPPOSITE of discovery's
+                                // — see the schema registration below).
+                                "discovery.k8s.io/v1.EndpointPort".into(),
                             ))),
                         ),
                     ),
@@ -8347,8 +8351,14 @@ impl ProtoRegistry {
             },
         );
 
+        // discovery.k8s.io/v1.EndpointPort — field 2/3 order is swapped
+        // vs core/v1.EndpointPort. Registered under a group-qualified key
+        // so the bare `EndpointPort` slot (registered earlier with the
+        // core/v1 layout) stays bound to core/v1 — last-writer-wins on a
+        // shared bare key would silently flip the wire layout under
+        // core/v1.Endpoints decode.
         schemas.insert(
-            "EndpointPort".into(),
+            "discovery.k8s.io/v1.EndpointPort".into(),
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("name".into(), FieldType::String)),

@@ -57,6 +57,7 @@ const PROTO_FILES: &[&str] = &[
     "k8s.io/api/admissionregistration/v1/generated.proto",
     "k8s.io/api/coordination/v1/generated.proto",
     "k8s.io/api/scheduling/v1/generated.proto",
+    "k8s.io/api/events/v1/generated.proto",
     "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto",
     "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/generated.proto",
     "k8s.io/apimachinery/pkg/runtime/generated.proto",
@@ -64,6 +65,49 @@ const PROTO_FILES: &[&str] = &[
     "k8s.io/apimachinery/pkg/runtime/schema/generated.proto",
     "k8s.io/apimachinery/pkg/util/intstr/generated.proto",
 ];
+
+/// Map a bundled proto file's directory path to the registry's qualified
+/// key prefix (i.e. the same `apiVersion` form rusternetes uses for
+/// group-qualified schema lookups). Returned tuple is `(prefix, file_path)`.
+///
+/// `prefix` is `""` for core/v1 (registry uses bare simple names for core
+/// types — they win the unqualified `iter_schemas` slot). For every other
+/// group/version the qualified prefix is the apiVersion that the K8s
+/// client and rusternetes' router both speak (e.g. `events.k8s.io/v1`).
+///
+/// Without this mapping the parity test silently misses any schema whose
+/// registry key is `<group>/<version>.<MessageName>` — `events.k8s.io/v1.Event`
+/// is the canonical example (see the off-by-one regression in fields 12-15
+/// fixed in the same PR that added this helper).
+fn qualified_prefix_for(rel_path: &str) -> &'static str {
+    match rel_path {
+        "k8s.io/api/core/v1/generated.proto" => "",
+        "k8s.io/api/apps/v1/generated.proto" => "apps/v1",
+        "k8s.io/api/batch/v1/generated.proto" => "batch/v1",
+        "k8s.io/api/networking/v1/generated.proto" => "networking.k8s.io/v1",
+        "k8s.io/api/policy/v1/generated.proto" => "policy/v1",
+        "k8s.io/api/rbac/v1/generated.proto" => "rbac.authorization.k8s.io/v1",
+        "k8s.io/api/storage/v1/generated.proto" => "storage.k8s.io/v1",
+        "k8s.io/api/autoscaling/v1/generated.proto" => "autoscaling/v1",
+        "k8s.io/api/autoscaling/v2/generated.proto" => "autoscaling/v2",
+        "k8s.io/api/discovery/v1/generated.proto" => "discovery.k8s.io/v1",
+        "k8s.io/api/admissionregistration/v1/generated.proto" => "admissionregistration.k8s.io/v1",
+        "k8s.io/api/coordination/v1/generated.proto" => "coordination.k8s.io/v1",
+        "k8s.io/api/scheduling/v1/generated.proto" => "scheduling.k8s.io/v1",
+        "k8s.io/api/events/v1/generated.proto" => "events.k8s.io/v1",
+        "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto" => {
+            "apiextensions.k8s.io/v1"
+        }
+        "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/generated.proto" => {
+            "apiregistration.k8s.io/v1"
+        }
+        // apimachinery shared packages — their messages (Time, MicroTime,
+        // ObjectMeta, ListMeta, IntOrString, Quantity, RawExtension, …) are
+        // registered under bare simple names. No qualified-key entries
+        // expected, so prefix is empty.
+        _ => "",
+    }
+}
 
 fn upstream_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(UPSTREAM_DIR)
@@ -84,6 +128,56 @@ fn parse_all_files() -> Vec<FileDescriptorProto> {
                 .unwrap_or_else(|e| panic!("failed to parse {}: {}", rel, e))
         })
         .collect()
+}
+
+/// Build a per-file qualified index keyed by the registry's qualified key
+/// format (e.g. `events.k8s.io/v1.Event`). Messages from files with no
+/// qualified prefix (core/v1, apimachinery) are NOT included — they're
+/// already covered by the bare-name `UpstreamIndex`.
+fn build_qualified_index(files: &[FileDescriptorProto]) -> UpstreamIndex {
+    let map_entries = collect_map_entries(files);
+    let mut index: UpstreamIndex = BTreeMap::new();
+    for file in files {
+        let prefix = qualified_prefix_for(file.name());
+        if prefix.is_empty() {
+            continue;
+        }
+        for msg in &file.message_type {
+            collect_qualified(msg, prefix, &map_entries, &mut index);
+        }
+    }
+    index
+}
+
+fn collect_qualified(
+    msg: &DescriptorProto,
+    prefix: &str,
+    map_entries: &MapEntryNames,
+    out: &mut UpstreamIndex,
+) {
+    if !map_entries.contains(msg.name()) {
+        let mut fields_by_number: BTreeMap<u32, UpstreamField> = BTreeMap::new();
+        for f in &msg.field {
+            let logical = build_logical(f, map_entries);
+            // NB: Map collapsing isn't repeated here — qualified lookups
+            // currently only target leaf resource messages where map<>
+            // semantics aren't on the critical path. If a qualified-key
+            // schema starts using a map field, lift the collapse logic
+            // out of build_upstream_index() into a shared helper.
+            fields_by_number.insert(
+                f.number() as u32,
+                UpstreamField {
+                    name: f.name().to_string(),
+                    logical,
+                },
+            );
+        }
+        let key = format!("{}.{}", prefix, msg.name());
+        out.insert(key, fields_by_number);
+    }
+    for nested in &msg.nested_type {
+        collect_qualified(nested, prefix, map_entries, out);
+    }
 }
 
 // -------- upstream view --------------------------------------------------
@@ -230,8 +324,21 @@ fn build_upstream_index(files: &[FileDescriptorProto]) -> (UpstreamIndex, MapEnt
     // `map<string, bytes>` the collision flips `ConfigMap.data`'s reported
     // value type to bytes. Resolve map entries from the parent message's
     // own nested types so each map keeps its true value side.
+    // The bare-name view is for the registry's UNqualified keys. Those
+    // keys win the namespace for collisions across groups — see the
+    // doc-comment on `qualified_prefix_for`. Messages from a file with a
+    // non-empty qualified prefix (events.k8s.io, networking.k8s.io, …) are
+    // intentionally omitted: they would otherwise overwrite the core/v1
+    // entry under `HashMap` last-writer-wins and silently flip the parity
+    // assertion to the wrong upstream shape (regression first surfaced
+    // 2026-05-27 when events/v1/generated.proto was added to PROTO_FILES
+    // and `Event` started reporting all-fields-mismatched against
+    // core/v1's registry entry).
     let mut by_simple_name: HashMap<String, DescriptorProto> = HashMap::new();
     for file in files {
+        if !qualified_prefix_for(file.name()).is_empty() {
+            continue;
+        }
         for msg in &file.message_type {
             walk_collect(msg, &mut by_simple_name);
         }
@@ -497,6 +604,7 @@ fn upstream_protos_parse_cleanly() {
 fn registry_parity_with_upstream() {
     let files = parse_all_files();
     let (upstream, _map_entries) = build_upstream_index(&files);
+    let qualified_upstream = build_qualified_index(&files);
     let registry = ProtoRegistry::new();
 
     let mut mismatches: Vec<String> = Vec::new();
@@ -506,7 +614,18 @@ fn registry_parity_with_upstream() {
         if REGISTRY_SKIP.contains(&msg_name) {
             continue;
         }
-        let Some(upstream_fields) = upstream.get(msg_name) else {
+        // Qualified registry keys (e.g. `events.k8s.io/v1.Event`) look up
+        // in the per-group index built from the matching `generated.proto`.
+        // Bare keys (`Event`, `Pod`, …) use the legacy by-simple-name view
+        // — for shapes that exist in multiple groups (core's `Event` vs
+        // events.k8s.io's `Event`), the bare registry key represents the
+        // core/v1 shape and matches the corresponding upstream entry.
+        let upstream_fields = if msg_name.contains('/') && msg_name.contains('.') {
+            qualified_upstream.get(msg_name)
+        } else {
+            upstream.get(msg_name)
+        };
+        let Some(upstream_fields) = upstream_fields else {
             // The registry contains messages that upstream does not — these
             // are usually registry-side helper shapes (e.g. our split of
             // VolumeSource into a flat struct). Surface as a single line,
