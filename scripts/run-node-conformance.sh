@@ -112,7 +112,13 @@ fi
 export KUBECONFIG="${KUBECONFIG_FILE}"
 
 echo "[4/7] Bootstrapping cluster (kubernetes service, default ServiceAccounts, CoreDNS)..."
-CONTAINER_RUNTIME="${CONTAINER_RUNTIME}" bash "${PROJECT_ROOT}/scripts/bootstrap-cluster.sh" || {
+# The node-conformance stack uses its own bridge (`rusternetes-nc-net`,
+# pinned in compose.node-conformance.yml) instead of the default
+# `rusternetes-network` the discover-bridge-gateway helper assumes.
+# Point the helper at the right network so CoreDNS gets a valid gateway IP.
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME}" \
+RUSTERNETES_NETWORK_NAME="${RUSTERNETES_NETWORK_NAME:-rusternetes-nc-net}" \
+bash "${PROJECT_ROOT}/scripts/bootstrap-cluster.sh" || {
     echo "WARNING: bootstrap-cluster.sh exited non-zero — continuing anyway, some BeforeSuite checks may fail."
 }
 

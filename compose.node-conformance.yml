@@ -109,4 +109,5 @@ services:
 
 networks:
   nc-net:
+    name: rusternetes-nc-net
     driver: bridge
