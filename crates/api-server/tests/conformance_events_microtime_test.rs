@@ -302,7 +302,8 @@ fn test_events_k8s_io_v1_event_deprecated_fields_match_upstream_wire_layout() {
     inner.extend_from_slice(&t);
 
     // field 15 = deprecatedCount (int32 varint = 7)
-    inner.push((15 << 3) | 0); // wire-type 0 = varint
+    // wire-type 0 = varint; tag = (field_num << 3) | wire_type
+    inner.push(15 << 3);
     inner.push(7);
 
     // Wrap in the `k8s\0` envelope with TypeMeta = events.k8s.io/v1 Event.
