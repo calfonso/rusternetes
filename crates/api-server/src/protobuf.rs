@@ -5956,28 +5956,39 @@ impl ProtoRegistry {
                     ),
                     (10, ("note".into(), FieldType::String)),
                     (11, ("type".into(), FieldType::String)),
+                    // Fields 12-15 must mirror upstream
+                    // `k8s.io/api/events/v1/generated.proto` exactly. Any
+                    // drift here is silent: the WIRE_VARINT branch of
+                    // `decode_with_schema` writes the raw varint into the
+                    // JSON object without checking the declared FieldType,
+                    // so a Message-typed slot fed a varint becomes
+                    // `"<fieldName>": <number>` — which then round-trips
+                    // through the `Event.extra` catch-all and is rejected
+                    // by client-go's typed Event decoder (regression seen
+                    // in [sig-instrumentation] Events API conformance,
+                    // canary run 2026-05-27).
                     (
                         12,
+                        (
+                            "deprecatedSource".into(),
+                            FieldType::Message("EventSource".into()),
+                        ),
+                    ),
+                    (
+                        13,
                         (
                             "deprecatedFirstTimestamp".into(),
                             FieldType::Message("Time".into()),
                         ),
                     ),
                     (
-                        13,
+                        14,
                         (
                             "deprecatedLastTimestamp".into(),
                             FieldType::Message("Time".into()),
                         ),
                     ),
-                    (14, ("deprecatedCount".into(), FieldType::Int)),
-                    (
-                        15,
-                        (
-                            "deprecatedSource".into(),
-                            FieldType::Message("EventSource".into()),
-                        ),
-                    ),
+                    (15, ("deprecatedCount".into(), FieldType::Int)),
                 ]),
             },
         );

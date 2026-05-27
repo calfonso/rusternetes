@@ -250,3 +250,109 @@ fn test_core_v1_event_still_decodes_via_bare_event_schema() {
     assert_eq!(decoded["firstTimestamp"], "2026-05-22T23:06:40Z");
     assert_eq!(decoded["reason"], "CoreV1Event");
 }
+
+/// Pins the wire-layout of `events.k8s.io/v1.Event` fields 12–15 to the
+/// upstream `k8s.io/api/events/v1/generated.proto` (release-1.35).
+///
+/// Pre-fix the schema had:
+///   12 = deprecatedFirstTimestamp, 13 = deprecatedLastTimestamp,
+///   14 = deprecatedCount, 15 = deprecatedSource
+/// — shifted by one slot from upstream:
+///   12 = deprecatedSource, 13 = deprecatedFirstTimestamp,
+///   14 = deprecatedLastTimestamp, 15 = deprecatedCount
+///
+/// A client-go conformance event always sends field 15 with
+/// `WIRE_VARINT 0` (proto2 presence-tracked `DeprecatedCount` defaults to
+/// zero but is still serialized). Our `decode_with_schema` varint branch
+/// blindly inserts the value as a number regardless of the declared
+/// FieldType, so the off-by-one made the response include
+/// `"deprecatedSource": 0`. The conformance binary then failed with
+/// `json: cannot unmarshal number into Go struct field
+/// Event.deprecatedSource of type v1.EventSource`
+/// ([sig-instrumentation] Events API canary 2026-05-27).
+///
+/// This test sends a body that mirrors the upstream wire layout for those
+/// four deprecated fields and asserts each lands in the right JSON shape.
+#[test]
+fn test_events_k8s_io_v1_event_deprecated_fields_match_upstream_wire_layout() {
+    let registry = ProtoRegistry::new();
+
+    // Build an inner Event proto body that uses field numbers 12-15 in
+    // the upstream order.
+    let mut inner = Vec::new();
+
+    // field 12 = deprecatedSource (Message EventSource{component:"src"})
+    let mut ds = Vec::new();
+    ds.push((1 << 3) | 2); // EventSource.component = field 1, length-delimited
+    ds.push(b"src".len() as u8);
+    ds.extend_from_slice(b"src");
+    inner.push((12 << 3) | 2); // wire-type 2 = length-delimited (message)
+    inner.push(ds.len() as u8);
+    inner.extend_from_slice(&ds);
+
+    // field 13 = deprecatedFirstTimestamp (Time)
+    let t = micro_time_bytes(1_505_828_956, 0);
+    inner.push((13 << 3) | 2);
+    inner.push(t.len() as u8);
+    inner.extend_from_slice(&t);
+
+    // field 14 = deprecatedLastTimestamp (Time)
+    inner.push((14 << 3) | 2);
+    inner.push(t.len() as u8);
+    inner.extend_from_slice(&t);
+
+    // field 15 = deprecatedCount (int32 varint = 7)
+    inner.push((15 << 3) | 0); // wire-type 0 = varint
+    inner.push(7);
+
+    // Wrap in the `k8s\0` envelope with TypeMeta = events.k8s.io/v1 Event.
+    let mut envelope = Vec::new();
+    envelope.extend_from_slice(b"k8s\0");
+    let mut typemeta = Vec::new();
+    typemeta.push((1 << 3) | 2);
+    typemeta.push(b"events.k8s.io/v1".len() as u8);
+    typemeta.extend_from_slice(b"events.k8s.io/v1");
+    typemeta.push((2 << 3) | 2);
+    typemeta.push(b"Event".len() as u8);
+    typemeta.extend_from_slice(b"Event");
+    envelope.push((1 << 3) | 2);
+    envelope.push(typemeta.len() as u8);
+    envelope.extend_from_slice(&typemeta);
+    envelope.push((2 << 3) | 2);
+    envelope.push(inner.len() as u8);
+    envelope.extend_from_slice(&inner);
+
+    let json_bytes = registry
+        .decode_k8s_resource(&envelope)
+        .expect("decode_k8s_resource must accept the envelope");
+    let decoded: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+
+    // deprecatedSource MUST be an object — pre-fix this was a number, which
+    // is exactly what made client-go's typed decoder reject the response.
+    assert!(
+        decoded["deprecatedSource"].is_object(),
+        "deprecatedSource must decode as a JSON object (EventSource); got {}",
+        decoded["deprecatedSource"]
+    );
+    assert_eq!(
+        decoded["deprecatedSource"]["component"], "src",
+        "EventSource.component must round-trip; got {}",
+        decoded["deprecatedSource"]
+    );
+
+    // The Time fields must come back as RFC3339 strings (second precision).
+    assert_eq!(
+        decoded["deprecatedFirstTimestamp"], "2017-09-19T13:49:16Z",
+        "deprecatedFirstTimestamp must decode as RFC3339 string"
+    );
+    assert_eq!(
+        decoded["deprecatedLastTimestamp"], "2017-09-19T13:49:16Z",
+        "deprecatedLastTimestamp must decode as RFC3339 string"
+    );
+
+    // deprecatedCount is the only varint among the four — must be the int 7.
+    assert_eq!(
+        decoded["deprecatedCount"], 7,
+        "deprecatedCount must decode as the integer payload"
+    );
+}
