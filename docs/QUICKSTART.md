@@ -76,6 +76,17 @@ See the [Console User Guide](CONSOLE_USER_GUIDE.md) for a full walkthrough of ev
 
 ## Use kubectl
 
+First generate a kubeconfig that embeds the rusternetes CA cert. This
+makes the config work with any Kubernetes tool — `kubectl`, Lens, k9s,
+octant, kubeshark — not just kubectl.
+
+```bash
+bash scripts/generate-kubeconfig.sh
+```
+
+The default output path is `~/.kube/rusternetes-config`; override with
+the first argument or `KUBECONFIG_OUT=`. Then:
+
 ```bash
 export KUBECONFIG=~/.kube/rusternetes-config
 
