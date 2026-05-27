@@ -6,6 +6,7 @@
 
 use crate::{
     middleware::AuthContext,
+    patch::{apply_patch, PatchType},
     response::{negotiate_content_type, ContentType},
     state::ApiServerState,
 };
@@ -204,6 +205,19 @@ pub async fn update_scale(
 /// Same content-negotiation semantics as [`get_scale`] / [`update_scale`]:
 /// a protobuf Accept header produces a `k8s\0`-framed Unknown envelope on
 /// the response side.
+///
+/// Supports all three K8s patch content types:
+/// - `application/strategic-merge-patch+json` (default for `kubectl scale` /
+///   the `Deployment should have a working scale subresource` conformance test)
+/// - `application/merge-patch+json` (RFC 7386)
+/// - `application/json-patch+json` (RFC 6902 — array of ops like
+///   `{"op":"replace","path":"/spec/replicas","value":N}`)
+///
+/// Patches are applied against a virtual `autoscaling/v1.Scale` document
+/// constructed from the parent resource — mirroring upstream behaviour where
+/// the patch operates on the Scale shape, not the full Deployment / RS / SS
+/// body. Only the new replica count is then written back into the parent's
+/// `spec.replicas`; the rest of the parent is left untouched.
 pub async fn patch_scale(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -233,7 +247,23 @@ pub async fn patch_scale(
         }
     }
 
-    // Parse the patch body as JSON
+    // Determine patch type from Content-Type. The normalize middleware preserves
+    // the original patch content type in X-Original-Content-Type when normalising
+    // to application/json for Axum compatibility.
+    let content_type = headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get("content-type"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/strategic-merge-patch+json");
+
+    // Default to strategic merge patch when the content type isn't recognised —
+    // `kubectl scale` uses StrategicMergePatchType, and SMP is a superset of
+    // JSON merge patch for the simple `{spec:{replicas:N}}` shape that the
+    // conformance test sends.
+    let patch_type = PatchType::from_content_type(content_type.split(';').next().unwrap_or(""))
+        .unwrap_or(PatchType::StrategicMergePatch);
+
+    // Parse the patch body as JSON (JSON Patch is also JSON — an array of ops).
     let patch: Value = serde_json::from_str(&body)
         .map_err(|e| Error::InvalidResource(format!("Invalid patch body: {}", e)))?;
 
@@ -241,17 +271,34 @@ pub async fn patch_scale(
     // K8s PATCH reads the latest version and re-applies on RV mismatch.
     let key = build_key(&resource, Some(&namespace), &name);
 
-    // Extract the new replicas from the patch
-    // Patch may be {"spec":{"replicas":N}} or a full Scale object
-    let new_replicas = patch
-        .get("spec")
-        .and_then(|s| s.get("replicas"))
-        .and_then(|r| r.as_i64())
-        .map(|r| r as i32);
-
     let mut updated_resource: Value = Value::Null;
+    let mut last_err: Option<Error> = None;
     for _retry in 0..5 {
         let mut resource_obj: Value = state.storage.get(&key).await?;
+
+        // Build the current Scale shape, apply the patch to it, then read back
+        // the new replicas count. This handles strategic merge / JSON merge /
+        // JSON Patch uniformly — including the RFC 6902 case
+        // `[{"op":"replace","path":"/spec/replicas","value":N}]` which the
+        // previous handler ignored (it only looked for `body.spec.replicas`
+        // in the raw patch document).
+        let current_scale = serde_json::to_value(extract_scale(
+            &resource_obj,
+            &namespace,
+            &name,
+            &group,
+            &version,
+        )?)
+        .map_err(|e| Error::Internal(format!("Failed to serialize Scale: {}", e)))?;
+
+        let patched_scale = apply_patch(&current_scale, &patch, patch_type.clone())
+            .map_err(|e| Error::InvalidResource(format!("Failed to apply scale patch: {}", e)))?;
+
+        let new_replicas = patched_scale
+            .get("spec")
+            .and_then(|s| s.get("replicas"))
+            .and_then(|r| r.as_i64())
+            .map(|r| r as i32);
 
         if let Some(replicas) = new_replicas {
             // Update the replicas in the resource spec
@@ -266,18 +313,19 @@ pub async fn patch_scale(
         match state.storage.update(&key, &resource_obj).await {
             Ok(v) => {
                 updated_resource = v;
+                last_err = None;
                 break;
             }
-            Err(Error::Conflict(_)) => {
+            Err(Error::Conflict(msg)) => {
+                last_err = Some(Error::Conflict(msg));
                 continue;
             }
             Err(e) => return Err(e),
         }
     }
     if updated_resource.is_null() {
-        return Err(Error::Conflict(
-            "scale patch failed after retries".to_string(),
-        ));
+        return Err(last_err
+            .unwrap_or_else(|| Error::Conflict("scale patch failed after retries".to_string())));
     }
 
     // Extract and return the updated scale
@@ -476,5 +524,94 @@ mod tests {
 
         assert_eq!(scale.spec.replicas, 5);
         assert_eq!(scale.status.replicas, 0); // No status, so 0
+    }
+
+    /// Apply a patch against the Scale shape and read back the new replicas count.
+    /// Exercises the same logic that `patch_scale` runs against storage, but
+    /// without the HTTP/storage scaffolding — useful for unit-testing each patch
+    /// type in isolation.
+    fn replicas_after_scale_patch(
+        resource: &Value,
+        patch: &Value,
+        patch_type: PatchType,
+    ) -> Option<i32> {
+        let current_scale =
+            serde_json::to_value(extract_scale(resource, "default", "d", "apps", "v1").unwrap())
+                .unwrap();
+        let patched = apply_patch(&current_scale, patch, patch_type).unwrap();
+        patched
+            .get("spec")
+            .and_then(|s| s.get("replicas"))
+            .and_then(|r| r.as_i64())
+            .map(|r| r as i32)
+    }
+
+    fn sample_deployment(replicas: i32) -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "d", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "replicas": replicas,
+                "selector": {"matchLabels": {"app": "test"}}
+            },
+            "status": {"replicas": replicas}
+        })
+    }
+
+    #[test]
+    fn test_scale_patch_strategic_merge() {
+        // kubectl scale uses StrategicMergePatchType with body
+        // `{"spec":{"replicas":N}}` — this is what the "Deployment should have a
+        // working scale subresource" conformance test sends in its final Patch
+        // step.
+        let resource = sample_deployment(2);
+        let patch = json!({"spec": {"replicas": 4}});
+        assert_eq!(
+            replicas_after_scale_patch(&resource, &patch, PatchType::StrategicMergePatch),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn test_scale_patch_json_merge() {
+        // RFC 7386 merge patch — same wire shape as strategic merge for this case.
+        let resource = sample_deployment(1);
+        let patch = json!({"spec": {"replicas": 7}});
+        assert_eq!(
+            replicas_after_scale_patch(&resource, &patch, PatchType::JsonMergePatch),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn test_scale_patch_json_patch_replace() {
+        // RFC 6902 JSON Patch — the previous handler ignored the array shape
+        // and would leave replicas unchanged. Now we apply the ops against the
+        // virtual Scale document so /spec/replicas resolves correctly.
+        let resource = sample_deployment(2);
+        let patch = json!([
+            {"op": "replace", "path": "/spec/replicas", "value": 5}
+        ]);
+        assert_eq!(
+            replicas_after_scale_patch(&resource, &patch, PatchType::JsonPatch),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn test_scale_patch_unrelated_fields_ignored() {
+        // Patch must only affect replicas; touching status.selector etc. via the
+        // Scale document must not write garbage back to the parent's spec.
+        let resource = sample_deployment(3);
+        let patch = json!({"status": {"selector": "ignored=true"}});
+        // Strategic merge / json merge against the Scale shape will set
+        // status.selector on the patched Scale object, but spec.replicas stays
+        // unchanged — and our handler only writes new_replicas back, so the
+        // parent resource is untouched.
+        assert_eq!(
+            replicas_after_scale_patch(&resource, &patch, PatchType::JsonMergePatch),
+            Some(3)
+        );
     }
 }
