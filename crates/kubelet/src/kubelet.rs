@@ -4175,42 +4175,10 @@ impl Kubelet {
 ///
 /// Mirrors upstream e2e site
 /// `test/e2e/common/node/kubelet_etc_hosts.go:143`.
-///
-/// Thin wrapper kept for tests / external callers that don't need the
-/// API server override injection — production code in this crate uses
-/// [`build_managed_hosts_content_with_api_server`] directly.
-#[allow(dead_code)]
 pub fn build_managed_hosts_content(
     pod: &Pod,
     pod_ip: Option<&str>,
     cluster_domain: &str,
-) -> Option<String> {
-    build_managed_hosts_content_with_api_server(pod, pod_ip, cluster_domain, None)
-}
-
-/// Same as [`build_managed_hosts_content`], but allows the caller to inject
-/// an additional entry mapping the API server override hostname (set via
-/// `KUBERNETES_SERVICE_HOST_OVERRIDE` in the kubelet's environment) to the
-/// IP the kubelet itself uses to reach the API server.
-///
-/// Rationale: in the all-in-one compose stack the API server is reachable
-/// inside the host container via the docker network alias `api-server`,
-/// but pods run in their own network namespace (CNI pod-net) and cannot
-/// reach the docker DNS resolver at 127.0.0.11. Any in-cluster client
-/// (the conformance e2e binary, kubectl-in-a-pod, etc.) that builds its
-/// API URL from the injected `KUBERNETES_SERVICE_HOST=api-server` env var
-/// then fails with `lookup api-server: i/o timeout`.
-///
-/// The fix is to teach the pod's `/etc/hosts` how to resolve the override
-/// name to the same IP the kubelet itself uses. The entry is slotted
-/// AFTER the pod's own hostname line and BEFORE user `spec.hostAliases`,
-/// so a pod that deliberately overrides the API server name via
-/// hostAliases still wins.
-pub fn build_managed_hosts_content_with_api_server(
-    pod: &Pod,
-    pod_ip: Option<&str>,
-    cluster_domain: &str,
-    api_server_alias: Option<(&str, &str)>,
 ) -> Option<String> {
     let spec = pod.spec.as_ref()?;
 
@@ -4256,18 +4224,6 @@ pub fn build_managed_hosts_content_with_api_server(
         content.push_str(&format!("{}\t{}\n", ip, aliases.join("\t")));
     }
 
-    // API server override entry, when the kubelet was started with
-    // KUBERNETES_SERVICE_HOST_OVERRIDE set to a hostname (not a bare IP)
-    // and the host resolved successfully at kubelet startup. The line is
-    // emitted before `spec.hostAliases` so any deliberate user override
-    // for the same name takes precedence (last line wins in glibc's NSS
-    // files-resolver).
-    if let Some((name, ip)) = api_server_alias {
-        if !name.is_empty() && !ip.is_empty() {
-            content.push_str(&format!("{}\t{}\n", ip, name));
-        }
-    }
-
     // spec.hostAliases — one line per IP, hostnames tab-joined.
     // Skip aliases with empty/missing hostnames (upstream behaviour).
     for alias in spec.host_aliases.iter().flatten() {
@@ -4279,71 +4235,6 @@ pub fn build_managed_hosts_content_with_api_server(
     }
 
     Some(content)
-}
-
-/// Resolve the kubelet's API server override hostname (from
-/// `KUBERNETES_SERVICE_HOST_OVERRIDE`) to an IP, so that the resulting
-/// `(hostname, ip)` tuple can be injected into every pod's `/etc/hosts`.
-///
-/// Returns:
-/// - `Some((hostname, ip))` when the override env var is set to a hostname
-///   that resolves to a non-loopback IPv4 address.
-/// - `None` when:
-///   - the env var is unset (multi-container stack — nothing to inject),
-///   - the env var is already a bare IP literal (no DNS lookup would help —
-///     the in-cluster client already has the IP it needs),
-///   - or DNS resolution fails (logged at warn level; pods still start —
-///     the kubelet must not crash when bringing up the cluster against a
-///     misconfigured override).
-pub fn resolve_api_server_host_alias() -> Option<(String, String)> {
-    let override_host = std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok()?;
-    let override_host = override_host.trim();
-    if override_host.is_empty() {
-        return None;
-    }
-
-    // If the operator already gave us a literal IP, there's nothing to
-    // resolve and nothing to add to /etc/hosts — the pod's in-cluster
-    // client will dial the IP directly, no DNS lookup involved.
-    if override_host.parse::<std::net::IpAddr>().is_ok() {
-        return None;
-    }
-
-    match std::net::ToSocketAddrs::to_socket_addrs(&(override_host, 0u16)) {
-        Ok(addrs) => {
-            for addr in addrs {
-                let ip = addr.ip();
-                if ip.is_loopback() {
-                    continue;
-                }
-                // Prefer IPv4 (matches upstream env var precedence — see
-                // `pkg/kubelet/kubelet_pods.go::getServiceEnvVarMap`).
-                if let std::net::IpAddr::V4(v4) = ip {
-                    info!(
-                        "Resolved KUBERNETES_SERVICE_HOST_OVERRIDE={} to {} for pod /etc/hosts \
-                         injection",
-                        override_host, v4
-                    );
-                    return Some((override_host.to_string(), v4.to_string()));
-                }
-            }
-            warn!(
-                "KUBERNETES_SERVICE_HOST_OVERRIDE={} resolved but yielded no non-loopback IPv4 \
-                 address; pods will not get an /etc/hosts entry for this name",
-                override_host
-            );
-            None
-        }
-        Err(e) => {
-            warn!(
-                "Failed to resolve KUBERNETES_SERVICE_HOST_OVERRIDE={} at kubelet startup ({}); \
-                 pods will not get an /etc/hosts entry for this name. In-cluster clients that \
-                 build their API URL from KUBERNETES_SERVICE_HOST may fail DNS lookups.",
-                override_host, e
-            );
-            None
-        }
-    }
 }
 
 #[cfg(test)]

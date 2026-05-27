@@ -229,7 +229,7 @@ async fn main() -> Result<()> {
             .kubernetes_service_host
             .clone()
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
+            .unwrap_or_else(|| "10.96.0.1".to_string()),
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {
