@@ -189,7 +189,16 @@ fi
 # If the compose files use ${DOCKER_GATEWAY} env var (post-#787), ensure
 # the running cluster container sees the discovered value. Write a .env
 # file and restart so the compose interpolation takes effect.
-if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/null; then
+#
+# Only applies to the all-in-one stack — the multi-container stack
+# (compose.yml) doesn't substitute DOCKER_GATEWAY anywhere and the
+# `rusternetes` container doesn't exist there, so attempting the restart
+# would either no-op or, worse, race with a fresh `up -d` and bind-clash
+# on the 6443 host port. Gate the restart on the all-in-one `rusternetes`
+# container actually being up.
+if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/null \
+    && "$CONTAINER_RT" ps --filter "name=^rusternetes$" --format '{{.Names}}' 2>/dev/null \
+        | grep -qx 'rusternetes'; then
     print_step "Restarting cluster with discovered gateway..."
     echo "DOCKER_GATEWAY=${RUSTERNETES_BRIDGE_GATEWAY}" > "$PROJECT_ROOT/.env"
     echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> "$PROJECT_ROOT/.env"
