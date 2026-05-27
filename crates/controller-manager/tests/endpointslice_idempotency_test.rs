@@ -79,6 +79,7 @@ fn ready_pod(name: &str, ns: &str, pod_ip: &str) -> Pod {
                 status: "True".to_string(),
                 reason: None,
                 message: None,
+                last_probe_time: None,
                 last_transition_time: None,
                 observed_generation: None,
             }]),

@@ -964,6 +964,7 @@ mod tests {
                     status: "True".to_string(),
                     reason: None,
                     message: None,
+                    last_probe_time: None,
                     last_transition_time: None,
                     observed_generation: None,
                 }]),
@@ -1012,6 +1013,7 @@ mod tests {
                     status: "False".to_string(),
                     reason: None,
                     message: None,
+                    last_probe_time: None,
                     last_transition_time: None,
                     observed_generation: None,
                 }]),
@@ -1212,6 +1214,7 @@ mod tests {
                 conditions: Some(vec![rusternetes_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
+                    last_probe_time: None,
                     last_transition_time: None,
                     reason: None,
                     message: None,
@@ -1331,6 +1334,7 @@ mod tests {
                 conditions: Some(vec![rusternetes_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
+                    last_probe_time: None,
                     last_transition_time: None,
                     reason: None,
                     message: None,
@@ -1373,6 +1377,7 @@ mod tests {
                 conditions: Some(vec![rusternetes_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
+                    last_probe_time: None,
                     last_transition_time: None,
                     reason: None,
                     message: None,

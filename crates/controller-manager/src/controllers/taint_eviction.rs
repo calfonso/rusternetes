@@ -219,6 +219,7 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
                             message: Some(
                                 "Taint manager: deleting due to NoExecute taint".to_string(),
                             ),
+                            last_probe_time: None,
                             last_transition_time: Some(Utc::now()),
                             observed_generation: None,
                         };

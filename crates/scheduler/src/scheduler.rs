@@ -518,6 +518,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             status: "False".to_string(),
                             reason: Some("Unschedulable".to_string()),
                             message: Some(msg.clone()),
+                            last_probe_time: None,
                             last_transition_time: Some(chrono::Utc::now()),
                             observed_generation: None,
                         };
@@ -825,6 +826,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let scheduled_condition = rusternetes_common::resources::PodCondition {
             condition_type: "PodScheduled".to_string(),
             status: "True".to_string(),
+            last_probe_time: None,
             last_transition_time: Some(chrono::Utc::now()),
             reason: Some("Scheduled".to_string()),
             message: Some(format!("Successfully assigned to {}", node_name)),
@@ -923,6 +925,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 let condition = rusternetes_common::resources::PodCondition {
                     condition_type: "PodScheduled".to_string(),
                     status: "True".to_string(),
+                    last_probe_time: None,
                     last_transition_time: Some(chrono::Utc::now()),
                     reason: Some("Scheduled".to_string()),
                     message: Some(format!("Successfully assigned to {}", node_name)),
@@ -1043,6 +1046,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         let disruption_condition = rusternetes_common::resources::PodCondition {
                             condition_type: "DisruptionTarget".to_string(),
                             status: "True".to_string(),
+                            last_probe_time: None,
                             last_transition_time: Some(Utc::now()),
                             reason: Some("PreemptionByScheduler".to_string()),
                             message: Some("Preempted by a higher-priority pod".to_string()),

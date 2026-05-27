@@ -719,6 +719,7 @@ async fn job_with_pod_failure_policy_ignore_should_continue_on_disruption() {
                 status: "True".to_string(),
                 reason: None,
                 message: None,
+                last_probe_time: None,
                 last_transition_time: None,
                 observed_generation: None,
             }]),

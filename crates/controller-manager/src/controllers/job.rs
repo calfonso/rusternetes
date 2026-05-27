@@ -2456,6 +2456,7 @@ mod tests {
                 status: "True".to_string(),
                 reason: Some("EvictionByEvictionAPI".to_string()),
                 message: None,
+                last_probe_time: None,
                 last_transition_time: None,
                 observed_generation: None,
             }]);

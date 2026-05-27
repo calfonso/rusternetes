@@ -192,6 +192,7 @@ fn make_pod(
                 status: if ready { "True" } else { "False" }.to_string(),
                 reason: None,
                 message: None,
+                last_probe_time: None,
                 last_transition_time: None,
                 observed_generation: None,
             }]),
@@ -347,6 +348,7 @@ async fn test_endpoint_with_multiple_pod_updates() {
             status: "False".to_string(),
             reason: None,
             message: None,
+            last_probe_time: None,
             last_transition_time: None,
             observed_generation: None,
         }]);

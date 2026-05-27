@@ -1516,6 +1516,7 @@ async fn append_disruption_target_condition<S: Storage>(storage: &S, pod_key: &s
         status: "True".to_string(),
         reason: Some("EvictionByEvictionAPI".to_string()),
         message: Some("Eviction API: evicting".to_string()),
+        last_probe_time: None,
         last_transition_time: Some(now),
         observed_generation: None,
     };

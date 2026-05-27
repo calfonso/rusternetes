@@ -2129,6 +2129,7 @@ mod tests {
                     conditions: Some(vec![PodCondition {
                         condition_type: "Ready".to_string(),
                         status: "True".to_string(),
+                        last_probe_time: None,
                         last_transition_time: None,
                         reason: None,
                         message: None,
