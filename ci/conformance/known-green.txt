@@ -23,11 +23,14 @@
 #
 # The runner script consumes this file directly.
 
-[sig-node] ConfigMap should update ConfigMap successfully [NodeConformance]
-[sig-node] Container Runtime blackbox test on terminated container should report termination message from log output if TerminationMessagePolicy FallbackToLogsOnError is set
-[sig-node] Container Runtime blackbox test on terminated container should report termination message as empty when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
-[sig-node] Container Runtime blackbox test on terminated container should report termination message from file when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
 [sig-node] Container Runtime blackbox test on terminated container should report termination message if TerminationMessagePath is set [NodeConformance]
+[sig-node] Container Runtime blackbox test on terminated container should report termination message from log output if TerminationMessagePolicy FallbackToLogsOnError is set
+# closes #436
+[sig-node] ConfigMap should update ConfigMap successfully [NodeConformance]
+# closes #441
+[sig-node] Container Runtime blackbox test on terminated container should report termination message as empty when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
+# closes #442
+[sig-node] Container Runtime blackbox test on terminated container should report termination message from file when pod succeeds and TerminationMessagePolicy FallbackToLogsOnError is set
 # closes #446
 [sig-node] Containers should be able to override the image's default arguments (container cmd)
 # closes #447
@@ -38,3 +41,55 @@
 [sig-node] Downward API should provide host IP as an env var [NodeConformance]
 # closes #492
 [sig-node] Pods should run through the lifecycle of Pods and PodStatus
+# closes #296
+[sig-apps] CronJob should schedule multiple jobs concurrently [Conformance]
+# closes #297
+[sig-apps] CronJob should support CronJob API operations [Conformance]
+# closes #298
+[sig-apps] Daemon set [Serial] should list and delete a collection of DaemonSets [Conformance]
+# closes #364
+[sig-cli] Kubectl client Kubectl api-versions should check if v1 is in available api versions [Conformance]
+# closes #380
+[sig-instrumentation] Events API should delete a collection of events [Conformance]
+# closes #384
+[sig-network] API Server should have Endpoints and EndpointSlices pointing to API Server [Conformance]
+# closes #388
+[sig-network] DNS should provide DNS for pods for Hostname [Conformance]
+# closes #431
+[sig-node] ConfigMap should be consumable as environment variable names with various prefixes [Conformance]
+# closes #432
+[sig-node] ConfigMap should be consumable via environment variable [NodeConformance] [Conformance]
+# closes #435
+[sig-node] ConfigMap should run through a ConfigMap lifecycle [Conformance]
+# closes #437
+[sig-node] Container Lifecycle Hook when create a pod with lifecycle hook should execute poststart exec hook properly [NodeConformance] [Conformance]
+# closes #439
+[sig-node] Container Lifecycle Hook when create a pod with lifecycle hook should execute prestop exec hook properly [NodeConformance] [Conformance]
+# closes #440
+[sig-node] Container Lifecycle Hook when create a pod with lifecycle hook should execute prestop http hook properly [NodeConformance] [Conformance]
+# closes #551
+[sig-storage] ConfigMap binary data should be reflected in volume [NodeConformance] [Conformance]
+# closes #552
+[sig-storage] ConfigMap optional updates should be reflected in volume [NodeConformance] [Conformance]
+# closes #553
+[sig-storage] ConfigMap should be consumable from pods in volume [NodeConformance] [Conformance]
+# closes #554
+[sig-storage] ConfigMap should be consumable from pods in volume as non-root [NodeConformance] [Conformance]
+# closes #555
+[sig-storage] ConfigMap should be consumable from pods in volume with defaultMode set [LinuxOnly] [NodeConformance] [Conformance]
+# closes #556
+[sig-storage] ConfigMap should be consumable from pods in volume with mappings [NodeConformance] [Conformance]
+# closes #557
+[sig-storage] ConfigMap should be consumable from pods in volume with mappings and Item mode set [LinuxOnly] [NodeConformance] [Conformance]
+# closes #558
+[sig-storage] ConfigMap should be consumable from pods in volume with mappings as non-root [NodeConformance] [Conformance]
+# closes #559
+[sig-storage] ConfigMap should be consumable in multiple volumes in the same pod [NodeConformance] [Conformance]
+# closes #387
+[sig-network] DNS should provide DNS for ExternalName services [Conformance]
+# closes #389
+[sig-network] DNS should provide DNS for pods for Subdomain [Conformance]
+# closes #434
+[sig-node] ConfigMap should fail to create ConfigMap with empty key [Conformance]
+# closes #560
+[sig-storage] ConfigMap should be immutable if `immutable` field is set [Conformance]

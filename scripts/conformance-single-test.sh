@@ -16,7 +16,7 @@
 #   --kubeconfig <path>         Override kubeconfig (default: $KUBECONFIG or
 #                               ~/.kube/rusternetes-config).
 #   --conformance-image <img>   Conformance image (default:
-#                               registry.k8s.io/conformance:v1.32.0).
+#                               registry.k8s.io/conformance:v1.35.0).
 #   --no-anchor                 Treat <test-name-or-regex> as a raw regex
 #                               (skip regex escaping + ^…$ anchoring).
 #   -h, --help                  Show this help.
@@ -28,7 +28,7 @@ SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DEFAULT_IMAGE="registry.k8s.io/conformance:v1.32.0"
+DEFAULT_IMAGE="registry.k8s.io/conformance:v1.35.0"
 HYDROPHONE_FALLBACK_IMAGE="registry.k8s.io/hydrophone:latest"
 
 usage() {
@@ -43,7 +43,7 @@ Flags:
   --kubeconfig <path>         Override kubeconfig (default: $KUBECONFIG or
                               ~/.kube/rusternetes-config).
   --conformance-image <img>   Conformance image (default:
-                              registry.k8s.io/conformance:v1.32.0).
+                              registry.k8s.io/conformance:v1.35.0).
   --no-anchor                 Treat <test-name-or-regex> as a raw regex
                               (skip regex escaping). Default already
                               uses substring match (no ^…$ anchors).

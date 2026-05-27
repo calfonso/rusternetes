@@ -26,6 +26,17 @@ name: Conformance canary
 #     and the canary's value (catching ratchet regressions before they
 #     reach main) is preserved by the post-merge run plus operator-
 #     driven manual dispatches when warranted.
+#
+# Open follow-ups (canary backlog):
+#   - [ ] Replace etcd with the embedded SQLite backend for the canary.
+#         compose.dind.yml currently brings up the etcd container; the
+#         all-in-one binary now ships a working sqlite path via rhino
+#         (see compose.all-in-one.yml / Dockerfile.all-in-one), which
+#         removes one network hop + the etcd image pull from the cold
+#         build path. Acceptance: the canary boots without an etcd
+#         service in compose.dind.yml, hydrophone still PASSes the
+#         known-green sig-node pod lifecycle test, and the per-run
+#         wallclock drops by the ~30-60s etcd-pull window.
 
 on:
   workflow_dispatch:
