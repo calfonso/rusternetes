@@ -1189,6 +1189,14 @@ pub struct PodCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
+    /// Last time the condition was probed.
+    /// Mirrors upstream `PodCondition.LastProbeTime` (k8s.io/api/core/v1).
+    /// Optional in the API and currently not populated by the kubelet, but
+    /// strict decoding requires the field to be recognised when clients
+    /// echo it back on Pod updates (e.g. e2e conformance test fixtures).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_probe_time: Option<chrono::DateTime<chrono::Utc>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
