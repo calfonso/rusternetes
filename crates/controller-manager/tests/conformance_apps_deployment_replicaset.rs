@@ -924,6 +924,47 @@ async fn replicaset_should_adopt_matching_pods_and_release_mismatched() {
         2,
         "after adoption RS must hold exactly desired replicas (orphan + 1 new)"
     );
+
+    // ---- Release half of the upstream contract --------------------------
+    // Upstream then mutates the adopted pod's labels so they no longer
+    // match the RS selector and polls until `owner.UID == rs.UID` is gone
+    // from the pod's ownerReferences. The previous Rust mirror only
+    // covered the adoption half; this block locks the release path too so
+    // any regression in `adopt_and_release` is caught locally.
+    let mut mutated: Pod = storage
+        .get(&build_key("pods", Some(ns), "orphan"))
+        .await
+        .unwrap();
+    let mut not_matching = HashMap::new();
+    not_matching.insert("name".to_string(), "not-matching-name".to_string());
+    mutated.metadata.labels = Some(not_matching);
+    storage
+        .update(&build_key("pods", Some(ns), "orphan"), &mutated)
+        .await
+        .unwrap();
+
+    ctrl.reconcile_all().await.unwrap();
+
+    let released: Pod = storage
+        .get(&build_key("pods", Some(ns), "orphan"))
+        .await
+        .unwrap();
+    let still_owned = released
+        .metadata
+        .owner_references
+        .as_ref()
+        .map(|refs| {
+            refs.iter().any(|r| {
+                r.controller == Some(true)
+                    && r.kind == "ReplicaSet"
+                    && (r.uid == "rs-uid-adopt" || r.name == "adopt")
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        !still_owned,
+        "after labels stopped matching, RS controllerRef must be removed (release)"
+    );
 }
 
 /// [sig-apps] Replicaset should have a working scale subresource [Conformance]

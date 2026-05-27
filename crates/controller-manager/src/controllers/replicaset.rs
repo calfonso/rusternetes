@@ -357,16 +357,33 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         false
     }
 
-    /// Check if a pod is owned by this ReplicaSet (has a controller ownerReference pointing to it)
+    /// Check if a pod is owned by this ReplicaSet (has a controller ownerReference pointing to it).
+    ///
+    /// Mirrors `controller.IsControlledBy` from upstream
+    /// `pkg/controller/replicaset/replica_set.go`: a pod is owned iff one of its
+    /// `metadata.ownerReferences` has `controller=true` AND `uid == rs.UID`.
+    /// UID matching is the upstream contract (the conformance test
+    /// `ReplicaSet should adopt matching pods on creation and release no
+    /// longer matching pods` polls for `owner.UID == rs.UID`). When the RS UID
+    /// is empty (in-process tests that never go through the api-server) we
+    /// fall back to name+kind matching so existing reconciler unit-tests still
+    /// pass.
     fn is_owned_by(&self, pod: &Pod, replicaset: &ReplicaSet) -> bool {
         pod.metadata
             .owner_references
             .as_ref()
             .map(|refs| {
                 refs.iter().any(|r| {
-                    r.kind == "ReplicaSet"
-                        && r.name == replicaset.metadata.name
-                        && r.controller == Some(true)
+                    if r.controller != Some(true) {
+                        return false;
+                    }
+                    if !replicaset.metadata.uid.is_empty() {
+                        // UID match is the upstream-strict path
+                        r.uid == replicaset.metadata.uid
+                    } else {
+                        // Fallback for unit-tests where the RS lacks a UID
+                        r.kind == "ReplicaSet" && r.name == replicaset.metadata.name
+                    }
                 })
             })
             .unwrap_or(false)
@@ -439,13 +456,25 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                     }
                 }
             } else if !labels_match && owned {
-                // Release owned pod: labels no longer match
+                // Release owned pod: labels no longer match.
+                // Mirror `is_owned_by` and remove ALL controller refs whose
+                // UID matches this RS (with name fallback for tests without
+                // a UID). Upstream `release()` in `controllerRefManager.go`
+                // uses UID matching exclusively.
                 let mut released_pod = pod.clone();
                 if let Some(refs) = &mut released_pod.metadata.owner_references {
+                    let rs_uid = replicaset.metadata.uid.clone();
+                    let rs_name = replicaset.metadata.name.clone();
                     refs.retain(|r| {
-                        !(r.kind == "ReplicaSet"
-                            && r.name == replicaset.metadata.name
-                            && r.controller == Some(true))
+                        if r.controller != Some(true) {
+                            return true;
+                        }
+                        let points_at_us = if !rs_uid.is_empty() {
+                            r.uid == rs_uid
+                        } else {
+                            r.kind == "ReplicaSet" && r.name == rs_name
+                        };
+                        !points_at_us
                     });
                     if refs.is_empty() {
                         released_pod.metadata.owner_references = None;
@@ -486,32 +515,14 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             return false;
         }
 
-        // Check owner reference — only count pods owned by this ReplicaSet
-        let owned = pod
-            .metadata
-            .owner_references
-            .as_ref()
-            .map(|refs| {
-                refs.iter()
-                    .any(|r| r.kind == "ReplicaSet" && r.name == replicaset.metadata.name)
-            })
-            .unwrap_or(false);
-
-        if !owned {
+        // Check owner reference — only count pods owned by this ReplicaSet.
+        // Delegates to `is_owned_by` so name vs UID matching stays in one
+        // place (upstream conformance polls for `owner.UID == rs.UID`).
+        if !self.is_owned_by(pod, replicaset) {
             return false;
         }
 
-        if let Some(match_labels) = &replicaset.spec.selector.match_labels {
-            if let Some(pod_labels) = &pod.metadata.labels {
-                for (key, value) in match_labels {
-                    if pod_labels.get(key) != Some(value) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-        }
-        false
+        self.labels_match_selector(pod, replicaset)
     }
 
     /// Check if a pod is ready by examining its conditions
