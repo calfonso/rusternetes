@@ -14,7 +14,8 @@ use rusternetes_common::resources::{
 };
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -615,6 +616,56 @@ pub fn decide_next_init_action(pod: &Pod, observed: &[InitContainerObserved]) ->
         next_index: None,
         should_retry: false,
     }
+}
+
+/// Monotonic counter used to pick unique tempfile suffixes for
+/// [`write_file_atomic`]. Combined with the process pid, it gives each
+/// concurrent caller (within the same process or across processes) a
+/// path that is guaranteed not to collide.
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically write `content` to `dest` by writing to a tempfile in the
+/// same directory and renaming it into place.
+///
+/// POSIX `rename(2)` is atomic on the same filesystem: a concurrent
+/// reader either sees the old inode or the new one, never a partial
+/// write. A container that has the previous version bind-mounted into
+/// its filesystem keeps its file descriptor on the old inode (Linux
+/// inode unlink semantics) and is unaffected by the swap — the *next*
+/// container that bind-mounts the file picks up the new content.
+///
+/// Concurrent callers writing the same destination each produce their
+/// own tempfile (suffix = pid + monotonic counter), so the writes
+/// never collide. Whichever rename wins the race is the surviving
+/// content; the loser's rename overwrites the winner's, idempotently
+/// (same content by assumption — the caller is expected to pair this
+/// with an idempotency check upstream).
+///
+/// On rename failure, the orphan tempfile is cleaned up.
+fn write_file_atomic(dest: &Path, content: &[u8]) -> std::io::Result<()> {
+    let dir = dest.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dest path has no parent directory",
+        )
+    })?;
+    let filename = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let suffix = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}.{}",
+        filename,
+        std::process::id(),
+        suffix,
+    ));
+    std::fs::write(&tmp, content)?;
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 impl ContainerRuntime {
@@ -1583,6 +1634,11 @@ impl ContainerRuntime {
     ///
     /// Returns the path to the hosts file, or None if the pod is CoreDNS
     /// (which uses the host's /etc/hosts directly).
+    ///
+    /// Safe to call concurrently for the same pod: an idempotency
+    /// fast-path skips the write when the file already has the desired
+    /// content, and the actual write goes through [`write_file_atomic`]
+    /// so racing writers can't see partial state.
     fn create_pod_hosts_file(&self, pod: &Pod, pod_ip: Option<&str>) -> Result<Option<String>> {
         // hostNetwork pods use the host's /etc/hosts directly — skip.
         let api_server_alias = self
@@ -1604,7 +1660,19 @@ impl ContainerRuntime {
             .context("Failed to create pod directory for /etc/hosts")?;
 
         let hosts_path = format!("{}/hosts", pod_dir);
-        std::fs::write(&hosts_path, &content)
+
+        // Idempotency fast-path: the kubelet's parallel sync workers
+        // frequently call this for the same pod within a few ms of each
+        // other (pod sync, container ready transition, status update —
+        // each can trigger a fresh `start_pod`). If the file already has
+        // the content we'd write, skip — saves the syscall + avoids a
+        // racing rename underneath any container that already has it
+        // bind-mounted.
+        if matches!(std::fs::read(&hosts_path), Ok(existing) if existing == content.as_bytes()) {
+            return Ok(Some(hosts_path));
+        }
+
+        write_file_atomic(Path::new(&hosts_path), content.as_bytes())
             .with_context(|| format!("Failed to write /etc/hosts for pod {}", pod_name))?;
 
         info!(
@@ -8644,9 +8712,63 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::pod_dir_key;
+    use super::{pod_dir_key, write_file_atomic};
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    // --- write_file_atomic tests ---
+
+    #[test]
+    fn test_write_file_atomic_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("hosts");
+        write_file_atomic(&dest, b"hello").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_write_file_atomic_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("hosts");
+        std::fs::write(&dest, b"old").unwrap();
+        write_file_atomic(&dest, b"new").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[test]
+    fn test_write_file_atomic_concurrent_no_partial_state_or_orphan() {
+        // 16 threads racing to write identical content to the same dest.
+        // Properties to verify:
+        //   - Every call succeeds (no spurious EISDIR / partial-write
+        //     failures even though writes race).
+        //   - The final file content is exactly the intended bytes.
+        //   - No tempfile is left behind in the directory after all
+        //     threads complete — every rename either succeeded or
+        //     cleaned up its orphan.
+        use std::sync::Arc;
+        use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = Arc::new(dir.path().join("hosts"));
+        let content = b"# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n10.244.1.5\tpod-x\n";
+        let mut handles = vec![];
+        for _ in 0..16 {
+            let dest = dest.clone();
+            handles.push(thread::spawn(move || {
+                write_file_atomic(&dest, content).expect("atomic write failed under contention");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(std::fs::read(&*dest).unwrap(), content);
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly the dest file, found {} entries — orphan tempfile?",
+            entries.len()
+        );
+    }
 
     fn make_container(name: &str) -> Container {
         Container {
