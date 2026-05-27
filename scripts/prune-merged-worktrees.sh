@@ -62,6 +62,21 @@ git fetch -q "$remote" main
 # the branch's content was merged even though the commit SHAs differ.
 trees_on_main=$(git log "$remote/main" --format='%T' | sort -u)
 
+# Context-free patch-ids for recent main commits. `git diff -U0` strips
+# the @@ hunk headers' line numbers and the surrounding context lines —
+# the parts that drift when nearby code changed between the rebase and
+# the squash-merge. Bounded at 500 commits so the precompute stays cheap
+# (~1 s on a warm cache); branches older than that fall through to the
+# default-context cherry / log checks above.
+echo "==> Indexing context-free patch-ids on $remote/main (last 500 commits)..."
+context_free_ids_on_main=$(
+    git log "$remote/main" --format='%H' -500 \
+        | while read -r c; do
+            git show -U0 "$c" | git patch-id --stable | awk '{print $1}'
+        done \
+        | sort -u
+)
+
 # Current worktree (we never remove ourselves).
 self_path=$(git rev-parse --show-toplevel)
 
@@ -84,6 +99,35 @@ is_merged() {
 
     # Every commit on the branch is already on main (cherry-picked etc).
     if [ -z "$(git log "$remote/main..$branch" --oneline 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    # Squash-merge after intervening main commits: the tree heuristic above
+    # only fires when the branch tip's tree happens to match the squash
+    # commit's tree on main, which breaks the moment another PR lands
+    # between the rebase and the squash-merge (the squash commit picks up
+    # the newer base tree). `git cherry` compares per-commit patch-ids
+    # instead of trees, so it sees through both squash-merges and
+    # identity-rewriting rebases. If no commit on the branch shows up as
+    # `+` (i.e. all are accounted for on main by patch-id), the branch is
+    # merged even though the tip tree differs.
+    if ! git cherry "$remote/main" "$branch" 2>/dev/null | grep -q '^+'; then
+        return 0
+    fi
+
+    # Squash-merge after intervening main commits that *also touched lines
+    # neighboring this branch's changes*. `git cherry` (and default
+    # patch-id) include @@-hunk headers and surrounding context lines in
+    # the hash; those drift when another PR inserts a `pub mod ...` line
+    # near the edit. `git diff -U0` strips both, and the resulting
+    # patch-id matches across the rebase. Compare the branch's combined
+    # context-free patch-id against the precomputed set for recent main.
+    local branch_id_u0
+    branch_id_u0=$(git diff -U0 "$remote/main...$branch" 2>/dev/null \
+        | git patch-id --stable 2>/dev/null \
+        | awk '{print $1}')
+    if [ -n "$branch_id_u0" ] && \
+       printf '%s\n' "$context_free_ids_on_main" | grep -qFx "$branch_id_u0"; then
         return 0
     fi
 
