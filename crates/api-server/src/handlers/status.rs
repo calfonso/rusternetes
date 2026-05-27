@@ -1000,4 +1000,241 @@ mod tests {
             );
         }
     }
+
+    /// Reproduces the body and merge logic of the upstream conformance test
+    /// `[sig-api-machinery] Namespaces [Serial] should apply changes to a
+    /// namespace status [Conformance]` for the PATCH step.
+    ///
+    /// The test sends a merge-patch+json body containing both a metadata
+    /// annotation and a status.conditions array, and expects the response to
+    /// preserve metadata (annotation merged in) AND status.phase while adding
+    /// the new condition.
+    #[test]
+    fn test_namespace_status_merge_patch_conformance_shape() {
+        // Stored Namespace as it would look after CREATE.
+        let current_resource = json!({
+            "kind": "Namespace",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "nsdeletetest-1234",
+                "uid": "abc",
+                "creationTimestamp": "2026-05-27T12:00:00Z",
+                "finalizers": ["kubernetes"],
+                "resourceVersion": "42"
+            },
+            "status": {
+                "phase": "Active"
+            }
+        });
+
+        // The exact body the upstream e2e test sends via merge-patch.
+        let patch_body = json!({
+            "metadata": {
+                "annotations": {
+                    "e2e-patched-ns-status": "nsdeletetest-1234"
+                }
+            },
+            "status": {
+                "conditions": [{
+                    "type": "StatusPatch",
+                    "status": "True",
+                    "reason": "E2E",
+                    "message": "Patched by an e2e test"
+                }]
+            }
+        });
+
+        // --- Reproduce the merge logic from update_cluster_status (merge-patch branch) ---
+
+        // 1. New status: strategic merge of patch_status onto current_status.
+        let patch_status = patch_body
+            .get("status")
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+        let current_status = current_resource
+            .get("status")
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+        let new_status = crate::patch::apply_patch(
+            &current_status,
+            &patch_status,
+            crate::patch::PatchType::StrategicMergePatch,
+        )
+        .expect("strategic merge of namespace status must not fail");
+
+        // 2. Build updated resource: preserve spec (none in this case), set
+        //    new status, merge annotations/labels into metadata.
+        let mut updated_resource = current_resource.clone();
+        if let Some(obj) = updated_resource.as_object_mut() {
+            obj.insert("status".to_string(), new_status);
+            if let Some(current_metadata) =
+                current_resource.get("metadata").and_then(|m| m.as_object())
+            {
+                let mut merged_metadata = current_metadata.clone();
+                merged_metadata.remove("resourceVersion");
+                if let Some(new_meta) = patch_body.get("metadata").and_then(|m| m.as_object()) {
+                    if let Some(new_annotations) =
+                        new_meta.get("annotations").and_then(|a| a.as_object())
+                    {
+                        let annotations = merged_metadata
+                            .entry("annotations")
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let Some(ann_obj) = annotations.as_object_mut() {
+                            for (k, v) in new_annotations {
+                                ann_obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                obj.insert("metadata".to_string(), Value::Object(merged_metadata));
+            }
+        }
+
+        // --- Assertions matching the conformance test expectations ---
+
+        // Annotation must be visible to the typed client (patchedStatus.Annotations).
+        assert_eq!(
+            updated_resource["metadata"]["annotations"]["e2e-patched-ns-status"],
+            "nsdeletetest-1234",
+            "merge-patch must add metadata.annotations entry"
+        );
+
+        // status.phase must survive the merge (Active stays Active).
+        assert_eq!(
+            updated_resource["status"]["phase"], "Active",
+            "merge-patch on status must not wipe phase=Active"
+        );
+
+        // status.conditions must contain the patched condition, and the last
+        // condition must match the test expectations exactly.
+        let conditions = updated_resource["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be an array");
+        assert!(!conditions.is_empty(), "conditions array must be non-empty");
+        let last = &conditions[conditions.len() - 1];
+        assert_eq!(last["type"], "StatusPatch");
+        assert_eq!(last["status"], "True");
+        assert_eq!(
+            last["reason"], "E2E",
+            "Conditions[last].Reason must equal 'E2E'"
+        );
+        assert_eq!(
+            last["message"], "Patched by an e2e test",
+            "Conditions[last].Message must match the exact upstream string"
+        );
+
+        // Kind/apiVersion preserved for typed client decode.
+        assert_eq!(updated_resource["kind"], "Namespace");
+        assert_eq!(updated_resource["apiVersion"], "v1");
+    }
+
+    /// Reproduces the PUT (UpdateStatus) step from the same conformance test.
+    /// The test reads the namespace via the dynamic client, appends a new
+    /// condition, and PUTs the entire object back to /status. The handler
+    /// must replace status from the body, preserve the spec, and keep the
+    /// previously-applied annotation.
+    #[test]
+    fn test_namespace_status_put_update_conformance_shape() {
+        let current_resource = json!({
+            "kind": "Namespace",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "nsdeletetest-1234",
+                "uid": "abc",
+                "annotations": {
+                    "e2e-patched-ns-status": "nsdeletetest-1234"
+                },
+                "resourceVersion": "43"
+            },
+            "status": {
+                "phase": "Active",
+                "conditions": [{
+                    "type": "StatusPatch",
+                    "status": "True",
+                    "reason": "E2E",
+                    "message": "Patched by an e2e test"
+                }]
+            }
+        });
+
+        // The body the upstream test PUTs: the same namespace with one extra
+        // condition appended.
+        let new_body = json!({
+            "kind": "Namespace",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "nsdeletetest-1234",
+                "annotations": {
+                    "e2e-patched-ns-status": "nsdeletetest-1234"
+                }
+            },
+            "status": {
+                "phase": "Active",
+                "conditions": [
+                    {"type": "StatusPatch", "status": "True", "reason": "E2E",
+                     "message": "Patched by an e2e test"},
+                    {"type": "StatusUpdate", "status": "True", "reason": "E2E",
+                     "message": "Updated by an e2e test"}
+                ]
+            }
+        });
+
+        // --- Reproduce the PUT branch of update_cluster_status ---
+        // is_merge_patch = false → status comes straight from the body.
+        let new_status = new_body
+            .get("status")
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+
+        let mut updated_resource = current_resource.clone();
+        if let Some(obj) = updated_resource.as_object_mut() {
+            // Spec preserved (none here).
+            obj.insert("status".to_string(), new_status);
+            // Metadata merged.
+            if let Some(current_metadata) =
+                current_resource.get("metadata").and_then(|m| m.as_object())
+            {
+                let mut merged_metadata = current_metadata.clone();
+                merged_metadata.remove("resourceVersion");
+                if let Some(new_meta) = new_body.get("metadata").and_then(|m| m.as_object()) {
+                    if let Some(new_annotations) =
+                        new_meta.get("annotations").and_then(|a| a.as_object())
+                    {
+                        let annotations = merged_metadata
+                            .entry("annotations")
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let Some(ann_obj) = annotations.as_object_mut() {
+                            for (k, v) in new_annotations {
+                                ann_obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                obj.insert("metadata".to_string(), Value::Object(merged_metadata));
+            }
+        }
+
+        // The conformance test asserts the appended condition is present and
+        // is the last one in the array.
+        let conditions = updated_resource["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be an array");
+        assert_eq!(
+            conditions.len(),
+            2,
+            "PUT body's full conditions array must be preserved"
+        );
+        let last = &conditions[conditions.len() - 1];
+        assert_eq!(last["type"], "StatusUpdate");
+        assert_eq!(last["message"], "Updated by an e2e test");
+
+        // Annotation from the prior patch must still be present.
+        assert_eq!(
+            updated_resource["metadata"]["annotations"]["e2e-patched-ns-status"],
+            "nsdeletetest-1234"
+        );
+
+        // Phase preserved.
+        assert_eq!(updated_resource["status"]["phase"], "Active");
+    }
 }
