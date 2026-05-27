@@ -16,13 +16,18 @@
 //! - [`watcher`] — subscribes to storage list/watch events and rebuilds
 //!   the zone snapshot on every change.
 //!
-//! ### First iteration scope
+//! ### Integration shapes
 //!
-//! See `indy/research/rusternetes-dns.md` for the full background. This
-//! is **Integration Shape (a)**: standalone binary, separate container,
-//! replaces the CoreDNS deployment. Shape (b)/(c) — in-process task,
-//! library extraction — are deliberately deferred. We accept code
-//! duplication with the kube-proxy storage-watch pattern for now.
+//! - **Standalone binary** (`bin/rusternetes-dns`, see `src/main.rs`):
+//!   one container per cluster, the original delivery vehicle.
+//! - **In-process library** ([`run`] called from
+//!   `crates/rusternetes/src/main.rs`): the all-in-one binary spawns the
+//!   DNS server as a tokio task that shares the storage backend with
+//!   apiserver / kubelet / kube-proxy. No extra container.
+//!
+//! Both shapes share the same [`zone`], [`watcher`], and [`server`]
+//! modules — the only difference is whether [`run`] is invoked from a
+//! dedicated `main` or from inside the all-in-one binary.
 //!
 //! ### What this does NOT do
 //!

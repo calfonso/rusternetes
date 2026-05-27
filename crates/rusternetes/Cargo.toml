@@ -19,6 +19,7 @@ sqlite = [
     "rusternetes-controller-manager/sqlite",
     "rusternetes-kubelet/sqlite",
     "rusternetes-kube-proxy/sqlite",
+    "rusternetes-dns/sqlite",
 ]
 redis = [
     "rusternetes-storage/redis",
@@ -27,6 +28,7 @@ redis = [
     "rusternetes-controller-manager/redis",
     "rusternetes-kubelet/redis",
     "rusternetes-kube-proxy/redis",
+    "rusternetes-dns/redis",
 ]
 
 [dependencies]
@@ -35,6 +37,7 @@ rusternetes-scheduler = { path = "../scheduler" }
 rusternetes-controller-manager = { path = "../controller-manager" }
 rusternetes-kubelet = { path = "../kubelet" }
 rusternetes-kube-proxy = { path = "../kube-proxy" }
+rusternetes-dns = { path = "../dns" }
 rusternetes-storage = { path = "../storage" }
 rusternetes-common = { path = "../common" }
 tokio.workspace = true

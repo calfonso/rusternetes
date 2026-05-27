@@ -3898,6 +3898,7 @@ dependencies = [
  "rusternetes-api-server",
  "rusternetes-common",
  "rusternetes-controller-manager",
+ "rusternetes-dns",
  "rusternetes-kube-proxy",
  "rusternetes-kubelet",
  "rusternetes-scheduler",
