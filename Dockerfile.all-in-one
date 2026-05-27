@@ -126,11 +126,30 @@ WORKDIR /build/rusternetes
 
 # Pass 1: compile dep graph with dummy sources. Populates the
 # cache-mounted target/ with every external dep's .rlib.
+#
+# Then wipe the dummy workspace artefacts (the empty stubs cargo built
+# for our own crates) so Pass 2 compiles them from real source without
+# falling for the cached dummy. This replaces the older `find … touch`
+# hack which forced ALL workspace crates to recompile on Pass 2 — even
+# unchanged ones. With the cleanup, only crates whose real src differs
+# from the previous build's cached rlib get recompiled.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/rusternetes/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
     cargo build --profile release-fast --features ${CARGO_FEATURES} -p rusternetes \
+ && cargo clean --profile release-fast \
+        -p rusternetes-api-server \
+        -p rusternetes-cloud-providers \
+        -p rusternetes-common \
+        -p rusternetes-controller-manager \
+        -p rusternetes-dns \
+        -p rusternetes-kubectl \
+        -p rusternetes-kubelet \
+        -p rusternetes-kube-proxy \
+        -p rusternetes \
+        -p rusternetes-scheduler \
+        -p rusternetes-storage \
  && sccache --show-stats
 
 # ----- PASS 2: real source compile -----
@@ -154,16 +173,13 @@ COPY rusternetes/crates/scheduler/src            ./crates/scheduler/src
 COPY rusternetes/crates/scheduler/tests          ./crates/scheduler/tests
 COPY rusternetes/crates/storage/src              ./crates/storage/src
 
-# Pass 2: rebuild with real sources. Touch Cargo.toml AND every .rs
-# file so cargo's fingerprint check notices the source tree changed
-# — see Dockerfile.services for the detailed rationale (COPY
-# preserves source mtime, which can be older than the dummy Pass 1
-# .rlib artefact, fooling cargo into skipping the recompile).
+# Pass 2: rebuild with real sources. No `touch` hack needed — Pass 1
+# already removed the dummy workspace artefacts, so cargo compiles
+# every workspace crate from the real src it just copied in.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/rusternetes/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
-    find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
     cargo build --profile release-fast --features ${CARGO_FEATURES} -p rusternetes && \
     sccache --show-stats && \
     mkdir -p /out && cp target/release-fast/rusternetes /out/rusternetes
