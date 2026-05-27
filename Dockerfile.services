@@ -32,9 +32,10 @@
 #
 #   Pass 1: COPY only Cargo.toml + Cargo.lock + build.rs + proto/ +
 #           dummy src/lib.rs / src/main.rs files for every crate.
-#           Run `cargo build --release ... <bins>`. This compiles the
-#           entire dependency graph (the dominant cost — hundreds of
-#           crates from crates.io) into the cache-mounted target/.
+#           Run `cargo build --profile release-fast ... <bins>`. This
+#           compiles the entire dependency graph (the dominant cost —
+#           hundreds of crates from crates.io) into the cache-mounted
+#           target/.
 #           The Docker layer that caches this RUN is invalidated only
 #           when a Cargo.toml, Cargo.lock, build.rs, or proto/ file
 #           changes — which is rare.
@@ -109,6 +110,8 @@ RUN apt-get update && apt-get install -y \
 
 ENV RUSTC_WRAPPER=sccache \
     SCCACHE_DIR=/sccache \
+    SCCACHE_CACHE_SIZE=20G \
+    SCCACHE_IDLE_TIMEOUT=0 \
     CARGO_INCREMENTAL=0
 
 WORKDIR /app
@@ -186,8 +189,8 @@ ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/sccache,id=sccache-rusternetes \
-    cargo build --release $CARGO_FEATURES \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
+    cargo build --profile release-fast $CARGO_FEATURES \
         --bin api-server \
         --bin kubelet \
         --bin scheduler \
@@ -246,9 +249,9 @@ COPY crates/storage/src              crates/storage/src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/sccache,id=sccache-rusternetes \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
     find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
-    cargo build --release $CARGO_FEATURES \
+    cargo build --profile release-fast $CARGO_FEATURES \
         --bin api-server \
         --bin kubelet \
         --bin scheduler \
@@ -257,12 +260,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --bin rusternetes-dns \
  && sccache --show-stats \
  && mkdir -p /out \
- && cp target/release/api-server         /out/api-server \
- && cp target/release/kubelet            /out/kubelet \
- && cp target/release/scheduler          /out/scheduler \
- && cp target/release/controller-manager /out/controller-manager \
- && cp target/release/kube-proxy         /out/kube-proxy \
- && cp target/release/rusternetes-dns    /out/rusternetes-dns
+ && cp target/release-fast/api-server         /out/api-server \
+ && cp target/release-fast/kubelet            /out/kubelet \
+ && cp target/release-fast/scheduler          /out/scheduler \
+ && cp target/release-fast/controller-manager /out/controller-manager \
+ && cp target/release-fast/kube-proxy         /out/kube-proxy \
+ && cp target/release-fast/rusternetes-dns    /out/rusternetes-dns
 
 # ---------------------------------------------------------------------
 # Stage 3: api-server runtime.

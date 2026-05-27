@@ -78,3 +78,20 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+
+# Faster release profile for dev / canary / CI image builds.
+#
+# Whole-program LTO across our ~300 dep rlibs serialised on a single
+# codegen unit dominates the link step (minutes per image build). For
+# images we don't ship to end users (canary, dev iteration) we trade a
+# few percent of runtime perf and ~10% larger binaries for a 2-3× faster
+# link.
+#
+# Used by Dockerfile.all-in-one, Dockerfile.services, Dockerfile.dns and
+# Dockerfile.kubectl via `cargo build --profile release-fast`. Shipped
+# release artefacts (the indyjonesnl/rusternetes GitHub releases) still
+# build with the regular `release` profile above.
+[profile.release-fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
