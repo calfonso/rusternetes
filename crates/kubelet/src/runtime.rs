@@ -15,8 +15,8 @@ use rusternetes_common::resources::{
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -649,10 +649,7 @@ fn write_file_atomic(dest: &Path, content: &[u8]) -> std::io::Result<()> {
             "dest path has no parent directory",
         )
     })?;
-    let filename = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let filename = dest.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let suffix = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(
         ".{}.tmp.{}.{}",
@@ -8749,7 +8746,8 @@ mod tests {
         use std::thread;
         let dir = tempfile::tempdir().unwrap();
         let dest = Arc::new(dir.path().join("hosts"));
-        let content = b"# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n10.244.1.5\tpod-x\n";
+        let content =
+            b"# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n10.244.1.5\tpod-x\n";
         let mut handles = vec![];
         for _ in 0..16 {
             let dest = dest.clone();
