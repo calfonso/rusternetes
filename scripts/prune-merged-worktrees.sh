@@ -87,6 +87,19 @@ is_merged() {
         return 0
     fi
 
+    # Squash-merge after intervening main commits: the tree heuristic above
+    # only fires when the branch tip's tree happens to match the squash
+    # commit's tree on main, which breaks the moment another PR lands
+    # between the rebase and the squash-merge (the squash commit picks up
+    # the newer base tree). `git cherry` compares per-commit patch-ids
+    # instead of trees, so it sees through both squash-merges and
+    # identity-rewriting rebases. If no commit on the branch shows up as
+    # `+` (i.e. all are accounted for on main by patch-id), the branch is
+    # merged even though the tip tree differs.
+    if ! git cherry "$remote/main" "$branch" 2>/dev/null | grep -q '^+'; then
+        return 0
+    fi
+
     return 1
 }
 
