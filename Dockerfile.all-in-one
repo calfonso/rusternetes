@@ -24,8 +24,8 @@
 #
 # Workspace member list (Cargo.toml [workspace] members) — keep the
 # three CRATE-ENUMERATION blocks below in sync:
-#   api-server, cloud-providers, common, controller-manager, kubectl,
-#   kubelet, kube-proxy, rusternetes, scheduler, storage
+#   api-server, cloud-providers, common, controller-manager, dns,
+#   kubectl, kubelet, kube-proxy, rusternetes, scheduler, storage
 
 # Stage 1: Build the console SPA
 FROM node:24-slim AS console-builder
@@ -85,6 +85,7 @@ COPY rusternetes/crates/api-server/Cargo.toml         ./rusternetes/crates/api-s
 COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud-providers/Cargo.toml
 COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
 COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
+COPY rusternetes/crates/dns/Cargo.toml                ./rusternetes/crates/dns/Cargo.toml
 COPY rusternetes/crates/kubectl/Cargo.toml            ./rusternetes/crates/kubectl/Cargo.toml
 COPY rusternetes/crates/kubelet/Cargo.toml            ./rusternetes/crates/kubelet/Cargo.toml
 COPY rusternetes/crates/kube-proxy/Cargo.toml         ./rusternetes/crates/kube-proxy/Cargo.toml
@@ -99,8 +100,8 @@ COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/prot
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
 #   - lib only:   common, storage, cloud-providers
 #   - bin only:   kubectl, rusternetes
-#   - lib + bin:  api-server, controller-manager, kubelet, kube-proxy,
-#                 scheduler
+#   - lib + bin:  api-server, controller-manager, dns, kubelet,
+#                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
     for c in common storage cloud-providers; do \
@@ -109,7 +110,7 @@ RUN set -eux; \
     for c in kubectl rusternetes; do \
         mkdir -p crates/$c/src && echo "fn main(){}" > crates/$c/src/main.rs; \
     done; \
-    for c in api-server controller-manager kubelet kube-proxy scheduler; do \
+    for c in api-server controller-manager dns kubelet kube-proxy scheduler; do \
         mkdir -p crates/$c/src && \
         : > crates/$c/src/lib.rs && \
         echo "fn main(){}" > crates/$c/src/main.rs; \
@@ -162,6 +163,7 @@ COPY rusternetes/crates/common/src               ./crates/common/src
 COPY rusternetes/crates/common/tests             ./crates/common/tests
 COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src
 COPY rusternetes/crates/controller-manager/tests ./crates/controller-manager/tests
+COPY rusternetes/crates/dns/src                  ./crates/dns/src
 COPY rusternetes/crates/kubectl/src              ./crates/kubectl/src
 COPY rusternetes/crates/kubectl/tests            ./crates/kubectl/tests
 COPY rusternetes/crates/kubelet/src              ./crates/kubelet/src
