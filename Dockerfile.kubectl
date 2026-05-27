@@ -36,6 +36,8 @@ RUN apt-get update && apt-get install -y \
 
 ENV RUSTC_WRAPPER=sccache \
     SCCACHE_DIR=/sccache \
+    SCCACHE_CACHE_SIZE=20G \
+    SCCACHE_IDLE_TIMEOUT=0 \
     CARGO_INCREMENTAL=0
 
 WORKDIR /app
@@ -91,8 +93,8 @@ ENV CARGO_BUILD_JOBS=2
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/sccache,id=sccache-rusternetes \
-    cargo build --release --bin kubectl \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
+    cargo build --profile release-fast --bin kubectl \
  && sccache --show-stats
 
 # ----- PASS 2: real source compile -----
@@ -122,11 +124,11 @@ COPY crates/storage/src              crates/storage/src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/sccache,id=sccache-rusternetes \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
     find crates \( -name "Cargo.toml" -o -name "*.rs" \) -exec touch {} + && \
-    cargo build --release --bin kubectl && \
+    cargo build --profile release-fast --bin kubectl && \
     sccache --show-stats && \
-    mkdir -p /out && cp target/release/kubectl /out/kubectl
+    mkdir -p /out && cp target/release-fast/kubectl /out/kubectl
 
 FROM debian:sid-slim
 
