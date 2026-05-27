@@ -163,3 +163,54 @@
 [sig-storage] Secrets should be consumable from pods in volume with mappings and Item Mode set [LinuxOnly] [NodeConformance] [Conformance]
 [sig-storage] Secrets should be consumable in multiple volumes in a pod [NodeConformance] [Conformance]
 [sig-storage] Secrets should be immutable if `immutable` field is set [Conformance]
+
+# --- Batch 44 (added 2026-05-28; speculative trial run on top of 830). ---
+# Of 75 candidates picked from domains adjacent to existing green tests,
+# 44 actually passed against current main on the multi-container stack.
+# Removed: 31 (18 substrings that didn't match any test in
+# registry.k8s.io/conformance:v1.35.0, 12 real failures filed as
+# follow-up server-side fixes, 1 substring too broad).
+[sig-node] Probing container with readiness probe should not be ready before initial delay and never restart [NodeConformance]
+[sig-node] Probing container with readiness probe that fails should never be ready and never restart [NodeConformance]
+[sig-node] NodeLease NodeLease the kubelet should create and update a lease in the kube-node-lease namespace
+[sig-apps] Deployment should run the lifecycle of a Deployment [Conformance]
+[sig-apps] Deployment RecreateDeployment should delete old pods and create new ones [Conformance]
+[sig-apps] ReplicaSet Replace and Patch tests [Conformance]
+[sig-apps] Daemon set [Serial] should run and stop simple daemon [Conformance]
+[sig-apps] Daemon set [Serial] should rollback without unnecessary restarts [Conformance]
+[sig-cli] Kubectl client Kubectl version should check is all data is printed [Conformance]
+[sig-cli] Kubectl client Kubectl create quota should create a quota without scopes
+[sig-api-machinery] ResourceQuota should be able to update and delete ResourceQuota.
+[sig-api-machinery] ResourceQuota should create a ResourceQuota and capture the life of a configMap. [Conformance]
+[sig-api-machinery] ResourceQuota should create a ResourceQuota and capture the life of a pod. [Conformance]
+[sig-api-machinery] ResourceQuota should create a ResourceQuota and capture the life of a secret. [Conformance]
+[sig-api-machinery] ResourceQuota should create a ResourceQuota and ensure its status is promptly calculated. [Conformance]
+[sig-api-machinery] Watchers should be able to restart watching from the last resource version observed by the previous watch [Conformance]
+[sig-api-machinery] Namespaces [Serial] should apply an update to a Namespace [Conformance]
+[sig-storage] Downward API volume should set DefaultMode on files [LinuxOnly] [NodeConformance]
+[sig-storage] Downward API volume should set mode on item file [LinuxOnly] [NodeConformance]
+[sig-storage] Projected downwardAPI should provide podname only [NodeConformance]
+[sig-storage] Projected downwardAPI should provide container's memory limit [NodeConformance]
+[sig-storage] Projected downwardAPI should provide container's memory request [NodeConformance]
+[sig-storage] Projected downwardAPI should provide container's cpu limit [NodeConformance]
+[sig-storage] Projected downwardAPI should provide container's cpu request [NodeConformance]
+[sig-storage] Projected downwardAPI should set DefaultMode on files [LinuxOnly] [NodeConformance]
+[sig-storage] EmptyDir volumes should support (non-root,0644,default) [LinuxOnly] [NodeConformance]
+[sig-storage] EmptyDir volumes should support (non-root,0666,default) [LinuxOnly] [NodeConformance]
+[sig-storage] EmptyDir volumes should support (non-root,0777,default) [LinuxOnly] [NodeConformance]
+[sig-storage] EmptyDir volumes should support (root,0644,default) [LinuxOnly] [NodeConformance]
+[sig-storage] EmptyDir volumes should support (root,0666,default) [LinuxOnly] [NodeConformance]
+[sig-storage] EmptyDir volumes should support (root,0777,default) [LinuxOnly] [NodeConformance]
+[sig-storage] EmptyDir volumes volume on default medium should have the correct mode
+[sig-storage] HostPath should give a volume the correct mode [LinuxOnly] [NodeConformance]
+[sig-storage] HostPath should support r/w [NodeConformance]
+[sig-storage] HostPath should support subPath [NodeConformance]
+[sig-network] Services should be able to up and down services
+[sig-network] Services should serve multiport endpoints from pods [Conformance]
+[sig-network] DNS should provide DNS for services [Conformance]
+[sig-network] DNS should provide DNS for the cluster [Conformance]
+[sig-network] DNS should resolve DNS of partial qualified names for services [LinuxOnly] [Conformance]
+[sig-instrumentation] Events should delete a collection of events [Conformance]
+[sig-instrumentation] Events API should ensure that an event can be fetched, patched, deleted, and listed [Conformance]
+[sig-storage] Subpath Atomic writer volumes should support subpaths with secret pod [Conformance]
+[sig-storage] Subpath Atomic writer volumes should support subpaths with configmap pod [Conformance]
