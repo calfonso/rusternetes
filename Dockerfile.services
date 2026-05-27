@@ -59,8 +59,8 @@
 # unique to itself, then break the moment someone changes its source.
 #
 # Current workspace members (Cargo.toml [workspace] members):
-#   api-server, cloud-providers, common, controller-manager, kubectl,
-#   kubelet, kube-proxy, rusternetes, scheduler, storage
+#   api-server, cloud-providers, common, controller-manager, dns,
+#   kubectl, kubelet, kube-proxy, rusternetes, scheduler, storage
 
 # ---------------------------------------------------------------------
 # Stage 1: console SPA build (only api-server uses the output, but
@@ -126,12 +126,13 @@ COPY Cargo.toml Cargo.lock* ./
 
 # CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
 # Must mirror `[workspace] members` in Cargo.toml.
-# Crates: api-server, cloud-providers, common, controller-manager,
+# Crates: api-server, cloud-providers, common, controller-manager, dns,
 #         kubectl, kubelet, kube-proxy, rusternetes, scheduler, storage
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
 COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
 COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
 COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
 COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
@@ -149,7 +150,7 @@ COPY crates/api-server/proto    crates/api-server/proto
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
 #   - lib only:   common, storage, cloud-providers
 #   - bin only:   kubectl, rusternetes
-#   - lib + bin:  api-server, controller-manager, kubelet, kube-proxy,
+#   - lib + bin:  api-server, controller-manager, dns, kubelet, kube-proxy,
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
@@ -159,7 +160,7 @@ RUN set -eux; \
     for c in kubectl rusternetes; do \
         mkdir -p crates/$c/src && echo "fn main(){}" > crates/$c/src/main.rs; \
     done; \
-    for c in api-server controller-manager kubelet kube-proxy scheduler; do \
+    for c in api-server controller-manager dns kubelet kube-proxy scheduler; do \
         mkdir -p crates/$c/src && \
         : > crates/$c/src/lib.rs && \
         echo "fn main(){}" > crates/$c/src/main.rs; \
@@ -192,6 +193,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --bin scheduler \
         --bin controller-manager \
         --bin kube-proxy \
+        --bin rusternetes-dns \
  && sccache --show-stats
 
 # ----- PASS 2: real source compile (only changed workspace crates rebuild) -----
@@ -210,6 +212,7 @@ COPY crates/common/src               crates/common/src
 COPY crates/common/tests             crates/common/tests
 COPY crates/controller-manager/src   crates/controller-manager/src
 COPY crates/controller-manager/tests crates/controller-manager/tests
+COPY crates/dns/src                  crates/dns/src
 COPY crates/kubectl/src              crates/kubectl/src
 COPY crates/kubectl/tests            crates/kubectl/tests
 COPY crates/kubelet/src              crates/kubelet/src
@@ -251,13 +254,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --bin scheduler \
         --bin controller-manager \
         --bin kube-proxy \
+        --bin rusternetes-dns \
  && sccache --show-stats \
  && mkdir -p /out \
  && cp target/release/api-server         /out/api-server \
  && cp target/release/kubelet            /out/kubelet \
  && cp target/release/scheduler          /out/scheduler \
  && cp target/release/controller-manager /out/controller-manager \
- && cp target/release/kube-proxy         /out/kube-proxy
+ && cp target/release/kube-proxy         /out/kube-proxy \
+ && cp target/release/rusternetes-dns    /out/rusternetes-dns
 
 # ---------------------------------------------------------------------
 # Stage 3: api-server runtime.
@@ -372,3 +377,29 @@ COPY --from=cargo-builder /out/kube-proxy /app/kube-proxy
 
 ENTRYPOINT ["/app/kube-proxy"]
 CMD ["--node-name", "node-1"]
+
+# ---------------------------------------------------------------------
+# Stage 8: dns runtime. Serves cluster.local on UDP+TCP/53, replaces
+# the CoreDNS pod from bootstrap-cluster.yaml. Stays a separate stage
+# rather than bundling into the api-server / kube-proxy images so the
+# blast radius of a DNS-only restart is one container, matching the
+# CoreDNS pattern it replaces.
+# ---------------------------------------------------------------------
+FROM debian:sid-slim AS dns
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=cargo-builder /out/rusternetes-dns /app/rusternetes-dns
+
+# 53 is privileged on Linux. The compose entry adds NET_BIND_SERVICE
+# (or runs as root) so this works without sysctl knobs.
+EXPOSE 53/udp
+EXPOSE 53/tcp
+
+ENTRYPOINT ["/app/rusternetes-dns"]
+CMD ["--etcd-servers", "http://etcd:2379"]
