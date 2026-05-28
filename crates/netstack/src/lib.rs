@@ -61,6 +61,7 @@ pub mod manager;
 pub mod multi;
 pub mod netns;
 pub mod podnet;
+pub mod proxy;
 pub mod runtime;
 
 /// Re-exports of the smoltcp wire-format types our public APIs hand
