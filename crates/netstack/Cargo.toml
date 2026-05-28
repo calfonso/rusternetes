@@ -50,6 +50,15 @@ async-trait = { workspace = true }
 # (the operations kubelet's CNI runtime today shells out to `ip` to do).
 # Typed errors, no iproute2 host dep.
 rtnetlink = "0.14.1"
+# `nix` for `setns(2)` — `netns::configure_pod_netns` flips a
+# dedicated OS thread into the pod's netns before issuing netlink
+# RPCs there. Rtnetlink pulls nix in transitively but we want it as
+# an explicit dep so the version is pinned to a known-working one.
+nix = { version = "0.27", features = ["sched"] }
+# `libc` for the `EEXIST` errno constant — `configure_pod_netns`
+# squashes "address/route already exists" to Ok so retries don't
+# fail. Transitively present via several deps; pinned explicitly.
+libc = "0.2"
 
 [dev-dependencies]
 serial_test = { workspace = true }
