@@ -1189,6 +1189,14 @@ pub struct PodCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
+    /// Last time the condition was probed.
+    /// Mirrors upstream `PodCondition.LastProbeTime` (k8s.io/api/core/v1).
+    /// Optional in the API and currently not populated by the kubelet, but
+    /// strict decoding requires the field to be recognised when clients
+    /// echo it back on Pod updates (e.g. e2e conformance test fixtures).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_probe_time: Option<chrono::DateTime<chrono::Utc>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
@@ -2831,6 +2839,49 @@ mod tests {
         assert_eq!(
             resolve_probe_port(&IntOrString::String("9000".to_string()), &c),
             Some(9000)
+        );
+    }
+
+    /// Regression test: upstream `PodCondition.LastProbeTime` must round-trip
+    /// through serde so strict-decoding Pod-status updates don't reject the
+    /// field with `unknown field "status.conditions[N].lastProbeTime"`.
+    #[test]
+    fn pod_condition_round_trips_last_probe_time() {
+        let json = r#"{
+            "type": "Ready",
+            "status": "True",
+            "lastProbeTime": "2026-05-27T10:15:30Z",
+            "lastTransitionTime": "2026-05-27T10:15:35Z"
+        }"#;
+
+        let cond: PodCondition =
+            serde_json::from_str(json).expect("PodCondition must accept lastProbeTime");
+        assert_eq!(cond.condition_type, "Ready");
+        assert_eq!(cond.status, "True");
+        assert!(
+            cond.last_probe_time.is_some(),
+            "lastProbeTime must deserialize into Some"
+        );
+        assert!(cond.last_transition_time.is_some());
+
+        let serialized =
+            serde_json::to_value(&cond).expect("PodCondition must serialize back to JSON");
+        assert_eq!(
+            serialized.get("lastProbeTime").and_then(|v| v.as_str()),
+            Some("2026-05-27T10:15:30Z"),
+            "lastProbeTime must round-trip with the upstream camelCase name"
+        );
+
+        // Absent lastProbeTime must remain absent on the wire (skip_serializing_if).
+        let minimal: PodCondition = serde_json::from_str(
+            r#"{"type":"Ready","status":"True","lastTransitionTime":"2026-05-27T10:15:35Z"}"#,
+        )
+        .expect("PodCondition without lastProbeTime must still parse");
+        assert!(minimal.last_probe_time.is_none());
+        let serialized = serde_json::to_value(&minimal).unwrap();
+        assert!(
+            serialized.get("lastProbeTime").is_none(),
+            "absent lastProbeTime must not be serialized"
         );
     }
 }

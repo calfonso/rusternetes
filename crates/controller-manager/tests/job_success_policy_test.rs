@@ -235,6 +235,7 @@ async fn test_success_criteria_met_alone_prevents_status_overwrite() {
             s.conditions = Some(vec![PodCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
+                last_probe_time: None,
                 last_transition_time: None,
                 observed_generation: None,
                 reason: None,

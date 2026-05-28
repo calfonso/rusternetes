@@ -552,6 +552,7 @@ async fn test_3147f7b_cas_reread_uses_fresh_pod_not_stale() {
     let ready_condition = PodCondition {
         condition_type: "Ready".to_string(),
         status: "True".to_string(),
+        last_probe_time: None,
         last_transition_time: None,
         reason: None,
         message: None,
@@ -719,6 +720,7 @@ async fn test_a1d78d8_duplicate_write_causes_conflict_single_write_with_reread_s
         s.conditions = Some(vec![PodCondition {
             condition_type: "Ready".to_string(),
             status: "True".to_string(),
+            last_probe_time: None,
             last_transition_time: None,
             reason: None,
             message: None,
@@ -759,6 +761,7 @@ async fn test_a1d78d8_duplicate_write_causes_conflict_single_write_with_reread_s
             PodCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
+                last_probe_time: None,
                 last_transition_time: None,
                 reason: None,
                 message: None,
@@ -767,6 +770,7 @@ async fn test_a1d78d8_duplicate_write_causes_conflict_single_write_with_reread_s
             PodCondition {
                 condition_type: "ContainersReady".to_string(),
                 status: "True".to_string(),
+                last_probe_time: None,
                 last_transition_time: None,
                 reason: None,
                 message: None,
@@ -823,6 +827,7 @@ async fn test_a1d78d8_duplicate_write_causes_conflict_single_write_with_reread_s
             PodCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
+                last_probe_time: None,
                 last_transition_time: None,
                 reason: None,
                 message: None,
@@ -831,6 +836,7 @@ async fn test_a1d78d8_duplicate_write_causes_conflict_single_write_with_reread_s
             PodCondition {
                 condition_type: "ContainersReady".to_string(),
                 status: "True".to_string(),
+                last_probe_time: None,
                 last_transition_time: None,
                 reason: None,
                 message: None,

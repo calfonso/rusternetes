@@ -70,6 +70,7 @@ fn pod(name: &str, ns: &str, ip: &str, ready: bool) -> Pod {
                 status: if ready { "True" } else { "False" }.to_string(),
                 reason: None,
                 message: None,
+                last_probe_time: None,
                 last_transition_time: None,
                 observed_generation: None,
             }]),
@@ -781,6 +782,7 @@ async fn endpointslice_should_flip_endpoint_ready_on_pod_state_change() {
         status: "False".to_string(),
         reason: None,
         message: None,
+        last_probe_time: None,
         last_transition_time: None,
         observed_generation: None,
     }]);
@@ -1396,6 +1398,7 @@ async fn endpoints_controller_should_drop_address_when_pod_becomes_not_ready() {
         status: "False".to_string(),
         reason: None,
         message: None,
+        last_probe_time: None,
         last_transition_time: None,
         observed_generation: None,
     }]);

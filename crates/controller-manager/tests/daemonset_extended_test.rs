@@ -212,6 +212,7 @@ async fn mark_pod_ready(storage: &Arc<MemoryStorage>, namespace: &str, pod_name:
             status: "True".to_string(),
             reason: None,
             message: None,
+            last_probe_time: None,
             last_transition_time: Some(chrono::Utc::now()),
             observed_generation: None,
         }]),
@@ -848,6 +849,7 @@ async fn daemonset_should_respect_min_ready_seconds() {
                 status: "False".to_string(), // Not yet ready due to minReadySeconds
                 reason: None,
                 message: None,
+                last_probe_time: None,
                 last_transition_time: Some(chrono::Utc::now()),
                 observed_generation: None,
             }]),

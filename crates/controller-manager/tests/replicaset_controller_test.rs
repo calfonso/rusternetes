@@ -538,6 +538,7 @@ async fn test_replicaset_status_with_ready_pods() {
                 status: "True".to_string(),
                 reason: None,
                 message: None,
+                last_probe_time: None,
                 last_transition_time: Some(chrono::Utc::now()),
                 observed_generation: None,
             }]),

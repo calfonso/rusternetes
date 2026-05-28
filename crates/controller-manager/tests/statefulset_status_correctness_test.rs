@@ -170,6 +170,7 @@ async fn seed_pod(
             status: "True".to_string(),
             reason: None,
             message: None,
+            last_probe_time: None,
             last_transition_time: Some(chrono::Utc::now()),
             observed_generation: None,
         }])

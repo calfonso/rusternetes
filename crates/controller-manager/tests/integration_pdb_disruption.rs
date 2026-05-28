@@ -167,6 +167,7 @@ fn create_test_pod(name: &str, namespace: &str, labels: HashMap<String, String>)
                 status: "True".to_string(),
                 reason: None,
                 message: None,
+                last_probe_time: None,
                 last_transition_time: None,
                 observed_generation: None,
             }]),
@@ -769,6 +770,7 @@ async fn test_stale_pod_disruption_condition_round_trip() {
             status: "True".to_string(),
             reason: None,
             message: None,
+            last_probe_time: None,
             last_transition_time: Some(chrono::Utc::now()),
             observed_generation: Some(1),
         });
@@ -810,6 +812,7 @@ fn make_pod_with_disruption_target(
         status: "True".to_string(),
         reason: reason.map(|s| s.to_string()),
         message: None,
+        last_probe_time: None,
         last_transition_time: Some(transition_at),
         observed_generation: Some(1),
     });

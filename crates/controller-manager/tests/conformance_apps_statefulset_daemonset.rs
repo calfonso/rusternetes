@@ -257,6 +257,7 @@ async fn mark_pod_ready(storage: &Arc<MemoryStorage>, namespace: &str, pod_name:
             status: "True".to_string(),
             reason: None,
             message: None,
+            last_probe_time: None,
             last_transition_time: Some(chrono::Utc::now()),
             observed_generation: None,
         }]),
