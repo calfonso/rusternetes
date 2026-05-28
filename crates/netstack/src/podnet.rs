@@ -277,13 +277,13 @@ mod tests {
     use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket};
     use smoltcp::wire::{IpAddress, IpEndpoint};
 
-    /// Test scaffolding: start the netstack with only the Service-CIDR
-    /// routing entry. Each test that needs a VIP added does so via
+    /// Test scaffolding: start the netstack with the Service-CIDR
+    /// routing entry. Per-test VIPs get added dynamically via
     /// `add_host_ip` — same flow the production dispatcher will use.
     ///
-    /// (smoltcp's `IFACE_MAX_ADDR_COUNT` defaults to 2, so we can't
-    /// pre-populate many entries here without a workspace-level env
-    /// bump. Tracked as a separate task on the Phase 3 follow-up list.)
+    /// `IFACE_MAX_ADDR_COUNT` is bumped to 256 via
+    /// `.cargo/config.toml`'s `[env]` block — see
+    /// [`many_host_ips_can_be_added_after_cap_bump`] for the receipt.
     fn default_config() -> PodNetConfig {
         PodNetConfig {
             host_ips: vec![IpCidr::new(IpAddress::v4(10, 96, 0, 1), 12)],
@@ -508,6 +508,24 @@ mod tests {
             !net.remove_host_ip(&new_vip_cidr),
             "second remove returns false"
         );
+    }
+
+    #[test]
+    fn many_host_ips_can_be_added_after_cap_bump() {
+        // Receipts for the workspace's SMOLTCP_IFACE_MAX_ADDR_COUNT
+        // bump (configured in `.cargo/config.toml`). Without the bump
+        // this test fails on the 3rd `add_host_ip` because smoltcp's
+        // default cap is 2. With the bump (256), we can stack a
+        // realistic Service-VIP count without the dispatcher silently
+        // losing entries.
+        //
+        // Start with the /12 routing entry already in default_config,
+        // then add 200 distinct /32 VIPs.
+        let mut net = PodNet::new(&default_config()).unwrap();
+        for i in 0..200u8 {
+            let added = net.add_host_ip(IpCidr::new(IpAddress::v4(10, 96, 1, i), 32));
+            assert!(added, "VIP #{i} must register cleanly (cap = 256)");
+        }
     }
 
     #[test]
