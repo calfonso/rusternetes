@@ -82,6 +82,46 @@ struct ProbeState {
     consecutive_successes: i32,
 }
 
+/// Per-pod networking implementation kubelet uses. Picked via the
+/// all-in-one binary's `--pod-network-mode` flag.
+///
+/// Lives in this module (rather than `lib.rs`) because both the
+/// lib AND the standalone `kubelet` bin include `runtime.rs` via
+/// `mod runtime`; defining the enum here keeps
+/// `crate::runtime::PodNetworkMode` resolvable from BOTH compile
+/// contexts. `lib.rs` re-exports it as `kubelet::PodNetworkMode`
+/// for downstream callers (the all-in-one binary, etc.).
+// The standalone `kubelet` bin only ever constructs `Cni` (it
+// has no embedded netstack), so its compile context flags
+// `NetstackShadow` as unused. The lib compile context uses all
+// three variants through the public API. Allowing dead_code here
+// covers both compile units cleanly.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PodNetworkMode {
+    /// CNI plugins + Docker-bridge fallback. The production path
+    /// today, default for safety.
+    #[default]
+    Cni,
+    /// CNI / Docker bridge **plus** every pod is also registered
+    /// with the embedded netstack (IP allocated, TAP opened,
+    /// runtime notified). Pod traffic still rides the legacy path;
+    /// the netstack just observes. Used to validate the netstack
+    /// data plane in staging without breaking pod networking.
+    NetstackShadow,
+    /// Embedded netstack carries pod traffic. The pod's netns is
+    /// configured by `netstack.start_pod_in_netns` (TAP moved into
+    /// netns, IP + default route assigned) instead of by the CNI
+    /// plugin. Pod containers join the netns the same way as in
+    /// CNI mode (`NetworkMode=ns:`). No Docker bridge involved.
+    ///
+    /// Requires `--cap-add NET_ADMIN` on the rusternetes container,
+    /// a working netstack runtime, AND the Service-watcher
+    /// populating Service VIPs before pods can reach
+    /// `kubernetes.default` etc.
+    NetstackActive,
+}
+
 /// ContainerRuntime manages containers using Docker/Podman with CNI networking
 pub struct ContainerRuntime {
     docker: Docker,
@@ -102,6 +142,12 @@ pub struct ContainerRuntime {
     /// it. The netns wiring that flips kubelet over to actually using
     /// the allocated IP is the next commit on this branch.
     netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
+    /// Picks the per-pod networking implementation
+    /// (CNI / Docker-bridge / netstack shadow / netstack active).
+    /// Plumbed through from `--pod-network-mode` on the all-in-one
+    /// binary; defaults to [`PodNetworkMode::Cni`] for the
+    /// standalone kubelet binary.
+    pod_network_mode: PodNetworkMode,
     kubernetes_service_host: String,
     /// Token manager for generating projected service account tokens
     token_manager: rusternetes_common::auth::TokenManager,
@@ -686,6 +732,7 @@ impl ContainerRuntime {
             cni,
             use_cni,
             netstack: None,
+            pod_network_mode: PodNetworkMode::Cni,
             kubernetes_service_host,
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
@@ -696,10 +743,11 @@ impl ContainerRuntime {
     }
 
     /// Inject the embedded netstack handle. Called by the all-in-one
-    /// binary when `--pod-network-mode=netstack`. While set, every
-    /// pod-create / pod-stop call also `start_pod` / `stop_pod`'s
-    /// the netstack — shadow-mode for now, becomes load-bearing
-    /// once the netns wiring lands.
+    /// binary when `--pod-network-mode` selects any netstack variant.
+    /// On its own this only enables shadow-mode behaviour (every pod
+    /// is registered with the netstack alongside the legacy
+    /// CNI/Docker-bridge flow); to flip the netstack to actually
+    /// carry pod traffic, also call `with_pod_network_mode(NetstackActive)`.
     pub fn with_netstack(
         mut self,
         netstack: Arc<dyn rusternetes_netstack::manager::NetstackHandle>,
@@ -708,14 +756,133 @@ impl ContainerRuntime {
         self
     }
 
-    /// Shadow-mode unregister a pod from the netstack, if one is wired
-    /// up. Centralised so every stop path (`stop_pod_with_grace_period`,
-    /// `stop_and_remove_pod`, `stop_pod_for`) reliably releases the
-    /// netstack IP + closes the TAP. No-op when no netstack is wired.
+    /// Pick the per-pod networking implementation. Defaults to
+    /// [`PodNetworkMode::Cni`]; the all-in-one binary
+    /// overrides via the `--pod-network-mode` flag.
+    pub fn with_pod_network_mode(mut self, mode: PodNetworkMode) -> Self {
+        self.pod_network_mode = mode;
+        self
+    }
+
+    /// Whether the kubelet should bypass CNI / Docker-bridge and use
+    /// `netstack.start_pod_in_netns` for the pod's network. Only true
+    /// when both: a netstack handle is wired AND the mode is
+    /// `NetstackActive`. Without the handle, `NetstackActive` is
+    /// treated as no-op (logged at the call site).
+    fn netstack_active(&self) -> bool {
+        self.netstack.is_some() && self.pod_network_mode == PodNetworkMode::NetstackActive
+    }
+
+    /// Set up a pod's network via the embedded netstack. Mirrors
+    /// `setup_pod_network` (which uses CNI plugins) but configures
+    /// the netns through `netstack.start_pod_in_netns`. Returns
+    /// `(netns_path, pod_ip)` on success — kubelet uses both
+    /// downstream: `netns_path` to wire app containers via
+    /// `NetworkMode=ns:`, `pod_ip` to stamp `pod.status.podIP`.
+    ///
+    /// Returns `None` on any failure; the caller logs and falls
+    /// back to the CNI/Docker-bridge path so misconfiguration of
+    /// netstack-active mode doesn't strand pods.
+    async fn setup_pod_network_via_netstack(&self, pod_name: &str) -> Option<(String, String)> {
+        let ns = self.netstack.as_ref()?;
+        let netns_name = format!("cni-{}", pod_name);
+        let netns_path = format!("/var/run/netns/{}", netns_name);
+
+        // Create the netns. Same incantation as `setup_pod_network`
+        // (the CNI flow); we reuse the path layout so app-container
+        // wiring (`NetworkMode=ns:`) doesn't need to care which mode
+        // we're in.
+        let mkns = match Command::new("ip")
+            .args(["netns", "add", &netns_name])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(
+                    "Netstack-active: `ip netns add {}` failed: {}; pod {} will fall back to CNI",
+                    netns_name, e, pod_name
+                );
+                return None;
+            }
+        };
+        if !mkns.status.success() {
+            let stderr = String::from_utf8_lossy(&mkns.stderr);
+            if !stderr.contains("File exists") {
+                warn!(
+                    "Netstack-active: `ip netns add {}` failed: {}; pod {} will fall back to CNI",
+                    netns_name, stderr, pod_name
+                );
+                return None;
+            }
+        }
+
+        // Hand the netns off to the netstack to allocate IP +
+        // configure interface + routes.
+        let ip = match ns
+            .start_pod_in_netns(pod_name, std::path::Path::new(&netns_path))
+            .await
+        {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!(
+                    "Netstack-active: start_pod_in_netns({}) failed: {}; cleaning up netns + falling back to CNI",
+                    pod_name, e
+                );
+                let _ = Command::new("ip")
+                    .args(["netns", "del", &netns_name])
+                    .output();
+                return None;
+            }
+        };
+
+        info!(
+            "Netstack-active: pod {} allocated {} in netns {}",
+            pod_name, ip, netns_name
+        );
+        Some((netns_path, ip.to_string()))
+    }
+
+    /// Unregister a pod from the netstack (release IP + close TAP).
+    /// Centralised so every stop path
+    /// (`stop_pod_with_grace_period`, `stop_and_remove_pod`,
+    /// `stop_pod_for`) reliably reaches it. No-op when no netstack
+    /// is wired.
+    ///
+    /// In `NetstackActive` mode this also deletes the pod's netns
+    /// (`ip netns del cni-{pod_name}`), which the netstack created
+    /// for us in `setup_pod_network_via_netstack`. Shadow mode skips
+    /// the netns delete — the CNI flow's `teardown_pod_network`
+    /// handles it.
     async fn netstack_release_pod(&self, pod_name: &str) {
         if let Some(ns) = &self.netstack {
             if ns.stop_pod(pod_name).await {
-                debug!("Netstack shadow-mode: released pod {}", pod_name);
+                debug!("Netstack: released pod {}", pod_name);
+            }
+        }
+        if self.netstack_active() {
+            let netns_name = format!("cni-{}", pod_name);
+            match Command::new("ip")
+                .args(["netns", "del", &netns_name])
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    debug!("Netstack-active: deleted netns {}", netns_name);
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    // "Cannot remove ... No such file" is benign — the
+                    // netns may already be gone or never existed.
+                    if !stderr.contains("No such file") {
+                        warn!(
+                            "Netstack-active: `ip netns del {}` failed: {}",
+                            netns_name, stderr
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "Netstack-active: `ip netns del {}` failed to exec: {}",
+                    netns_name, e
+                ),
             }
         }
     }
@@ -1073,12 +1240,38 @@ impl ContainerRuntime {
             let _ = futures_util::future::join_all(remove_futures).await;
         }
 
-        // Create network namespace and setup CNI networking if enabled
-        // If CNI setup fails, netns_path will be None and we fall back to Podman networking
-        let netns_path = if self.use_cni {
-            self.setup_pod_network(pod_name).await
+        // Create the network namespace + configure it. The netns
+        // setup path depends on `pod_network_mode`:
+        //
+        //   - NetstackActive (and netstack handle wired): netstack
+        //     allocates the IP, opens a TAP, moves it into the netns,
+        //     and configures IP/route. Returns `(netns_path, pod_ip)`
+        //     so the downstream pod-IP discovery skips CNI/Docker.
+        //   - Cni / NetstackShadow / NetstackActive-fallback: CNI
+        //     plugins set up the netns; if CNI's unavailable, netns_path
+        //     stays None and we fall back to Podman/Docker-bridge networking.
+        let (netns_path, netstack_pod_ip) = if self.netstack_active() {
+            match self.setup_pod_network_via_netstack(pod_name).await {
+                Some((path, ip)) => (Some(path), Some(ip)),
+                None => {
+                    warn!(
+                        "Netstack-active failed for pod {}; falling back to CNI/Docker path",
+                        pod_name
+                    );
+                    (
+                        if self.use_cni {
+                            self.setup_pod_network(pod_name).await
+                        } else {
+                            None
+                        },
+                        None,
+                    )
+                }
+            }
+        } else if self.use_cni {
+            (self.setup_pod_network(pod_name).await, None)
         } else {
-            None
+            (None, None)
         };
 
         // Ensure the pod has a kube-api-access volume for SA tokens.
@@ -1156,11 +1349,23 @@ impl ContainerRuntime {
             }
         }
 
-        // Get pod IP. For CNI mode, IP is available right after network setup.
-        // For non-CNI (Docker bridge) mode, we start a pause container first so we
-        // can learn the pod's IP before creating real containers (which need the IP
-        // in their environment for Downward API env vars like SONOBUOY_ADVERTISE_IP).
-        let mut pod_ip: Option<String> = if self.use_cni {
+        // Get pod IP. Sources in priority order:
+        //   1. Netstack-active: the IP returned by
+        //      `setup_pod_network_via_netstack` above. The netns is
+        //      already configured; no pause-container or CNI hop.
+        //   2. CNI mode: ask the CNI runtime for the IP it just
+        //      assigned.
+        //   3. Docker-bridge fallback: start a pause container so we
+        //      can learn the bridge-assigned IP before app containers
+        //      that need it for Downward API env vars
+        //      (e.g., SONOBUOY_ADVERTISE_IP).
+        let mut pod_ip: Option<String> = if let Some(ip) = netstack_pod_ip.clone() {
+            info!(
+                "Netstack-active: using {} as pod {}'s status.podIP (no Docker bridge)",
+                ip, pod_name
+            );
+            Some(ip)
+        } else if self.use_cni {
             if let Some(cni) = &self.cni {
                 cni.get_container_ip(pod_name)
             } else {
@@ -1184,27 +1389,33 @@ impl ContainerRuntime {
             }
         };
 
-        // Shadow-mode netstack registration when the binary was
-        // launched with `--pod-network-mode=netstack`. Allocates an
-        // IP from the netstack's unified pool, opens a TAP, and spawns
-        // the per-pod TAP I/O task — but `pod_ip` above still reflects
-        // the CNI / Docker-bridge address until the netns wiring lands
-        // (next commit). Lets us exercise the netstack data plane end
-        // to end in production without breaking pod networking.
+        // Shadow-mode netstack registration. Allocates an IP from
+        // the netstack's unified pool, opens a TAP, spawns the
+        // per-pod TAP I/O task — but `pod_ip` above still reflects
+        // the CNI / Docker-bridge address. Lets operators exercise
+        // the netstack data plane in production without breaking
+        // pod networking.
+        //
+        // Skipped in netstack-active mode (`netstack_pod_ip.is_some()`)
+        // because the active flow already called `start_pod_in_netns`,
+        // which registered the pod with the netstack — a second
+        // `start_pod` call would return `AlreadyRegistered`.
         if let Some(netstack) = &self.netstack {
-            match netstack.start_pod(pod_name).await {
-                Ok(netstack_ip) => {
-                    info!(
-                        "Netstack shadow-mode: allocated {} (TAP up) for pod {}",
-                        netstack_ip, pod_name
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Netstack shadow-mode: start_pod failed for {} ({}); \
-                         pod will continue on the legacy network path",
-                        pod_name, e
-                    );
+            if netstack_pod_ip.is_none() {
+                match netstack.start_pod(pod_name).await {
+                    Ok(netstack_ip) => {
+                        info!(
+                            "Netstack shadow-mode: allocated {} (TAP up) for pod {}",
+                            netstack_ip, pod_name
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Netstack shadow-mode: start_pod failed for {} ({}); \
+                             pod will continue on the legacy network path",
+                            pod_name, e
+                        );
+                    }
                 }
             }
         }

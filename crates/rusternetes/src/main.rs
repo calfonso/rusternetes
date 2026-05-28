@@ -110,17 +110,22 @@ struct Args {
     #[arg(long)]
     disable_proxy: bool,
 
-    /// Pod networking mode. `cni` (default) is the legacy
-    /// CNI/Docker-bridge path that's been carrying production
-    /// conformance for months. `netstack` enables the embedded
-    /// user-space netstack (`crates/netstack`) in *shadow mode*:
-    /// every pod-create / pod-delete is mirrored into the netstack
-    /// (IP allocation, TAP creation, runtime registration) so the
-    /// data plane can be validated end-to-end, but pod traffic still
-    /// rides the legacy path until the netns wiring lands. Flip to
-    /// `netstack` for staging; default stays `cni` until the
-    /// netstack path passes conformance.
-    #[arg(long, default_value = "cni", value_parser = ["cni", "netstack"])]
+    /// Pod networking mode. Three values:
+    ///
+    ///   - `cni` (default): legacy CNI / Docker-bridge path that's
+    ///     been carrying production conformance for months.
+    ///   - `netstack-shadow` (or its alias `netstack`): every pod is
+    ///     also registered with the embedded netstack (IP allocated,
+    ///     TAP opened, runtime notified) but pod traffic still rides
+    ///     the legacy path. Used to validate the netstack data plane
+    ///     in staging without breaking pod networking.
+    ///   - `netstack-active`: pod traffic actually routes through the
+    ///     embedded netstack. Kubelet calls
+    ///     `netstack.start_pod_in_netns` instead of the CNI plugin /
+    ///     Docker bridge. Requires CAP_NET_ADMIN, a working netstack
+    ///     runtime, and the Service-watcher populating VIPs.
+    #[arg(long, default_value = "cni",
+          value_parser = ["cni", "netstack", "netstack-shadow", "netstack-active"])]
     pod_network_mode: String,
 
     /// Pod CIDR for the embedded netstack's IP allocator (only used
@@ -263,19 +268,29 @@ async fn main() -> Result<()> {
     // flag to validate the data plane end-to-end in staging; default
     // stays `cni` until the netns wiring lands and conformance
     // passes on the netstack path.
+    let pod_network_mode = match args.pod_network_mode.as_str() {
+        "cni" => rusternetes_kubelet::PodNetworkMode::Cni,
+        // `netstack` is the legacy alias for `netstack-shadow`.
+        "netstack" | "netstack-shadow" => rusternetes_kubelet::PodNetworkMode::NetstackShadow,
+        "netstack-active" => rusternetes_kubelet::PodNetworkMode::NetstackActive,
+        other => anyhow::bail!(
+            "unknown --pod-network-mode {other:?}; expected cni / netstack-shadow / netstack-active"
+        ),
+    };
+    let want_netstack = !matches!(pod_network_mode, rusternetes_kubelet::PodNetworkMode::Cni);
     let netstack_handle: Option<std::sync::Arc<dyn rusternetes_netstack::manager::NetstackHandle>> =
-        if args.pod_network_mode == "netstack" {
+        if want_netstack {
             info!(
-                "Pod networking: netstack (shadow mode) — pod CIDR {}, service CIDR {}",
-                args.netstack_pod_cidr, args.netstack_service_cidr
+                "Pod networking: {} — pod CIDR {}, service CIDR {}",
+                args.pod_network_mode, args.netstack_pod_cidr, args.netstack_service_cidr
             );
             match build_netstack(&args.netstack_pod_cidr, &args.netstack_service_cidr) {
                 Ok(ns) => Some(ns),
                 Err(e) => {
                     error!(
-                    "Failed to start embedded netstack: {} — falling back to CNI/Docker for this run",
-                    e
-                );
+                        "Failed to start embedded netstack: {} — falling back to CNI/Docker for this run",
+                        e
+                    );
                     None
                 }
             }
@@ -283,6 +298,14 @@ async fn main() -> Result<()> {
             info!("Pod networking: cni (legacy Docker/CNI path)");
             None
         };
+    // If the operator asked for an active netstack but we couldn't
+    // build one, demote to CNI so pods aren't stranded with no
+    // network. Logged loudly above.
+    let effective_pod_network_mode = if netstack_handle.is_none() {
+        rusternetes_kubelet::PodNetworkMode::Cni
+    } else {
+        pod_network_mode
+    };
 
     // --- Service-VIP watcher ---
     //
@@ -331,6 +354,7 @@ async fn main() -> Result<()> {
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
             .unwrap_or_else(|| "10.96.0.1".to_string()),
         netstack: netstack_handle,
+        pod_network_mode: effective_pod_network_mode,
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {

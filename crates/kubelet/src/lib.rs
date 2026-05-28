@@ -16,6 +16,14 @@ use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::info;
 
+// `PodNetworkMode` is defined in `runtime.rs` (where every consumer
+// lives) and re-exported here for the public API. Lives in
+// `runtime` so it's accessible from BOTH the lib crate (via
+// `pub mod runtime`) AND the standalone bin crate (which declares
+// its own `mod runtime`) — `crate::runtime::PodNetworkMode`
+// resolves correctly in both compile contexts.
+pub use runtime::PodNetworkMode;
+
 /// Configuration for the kubelet component.
 pub struct KubeletConfig {
     pub node_name: String,
@@ -27,12 +35,14 @@ pub struct KubeletConfig {
     pub metrics_port: u16,
     pub kubernetes_service_host: String,
     /// Optional embedded-netstack handle. Set by the all-in-one
-    /// binary when launched with `--pod-network-mode=netstack`; in
-    /// shadow mode for now (pod traffic still rides the legacy
-    /// Docker/CNI path, but every pod-create / pod-delete also goes
-    /// through the netstack so we can validate it in production).
-    /// Leave `None` to keep the existing CNI/Docker-bridge behaviour.
+    /// binary when launched with any `--pod-network-mode=netstack*`
+    /// variant. Leave `None` to keep the existing CNI/Docker-bridge
+    /// behaviour.
     pub netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
+    /// Which networking implementation kubelet uses per pod. Only
+    /// honored when `netstack` is also `Some(_)`; otherwise the
+    /// kubelet treats it as [`PodNetworkMode::Cni`].
+    pub pod_network_mode: PodNetworkMode,
 }
 
 impl Default for KubeletConfig {
@@ -47,6 +57,7 @@ impl Default for KubeletConfig {
             metrics_port: 10250,
             kubernetes_service_host: "10.96.0.1".to_string(),
             netstack: None,
+            pod_network_mode: PodNetworkMode::Cni,
         }
     }
 }
@@ -127,6 +138,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             eviction_root,
             eviction::EvictionManager::new(),
             config.netstack,
+            config.pod_network_mode,
         )
         .await?,
     );

@@ -366,9 +366,16 @@ async fn main() -> Result<()> {
             eviction_manager,
             // Standalone kubelet binary doesn't (yet) instantiate
             // an embedded netstack — only the all-in-one binary does.
-            // Pass `None` so the kubelet defaults to its existing
-            // CNI/Docker-bridge networking path.
+            // Pass `None` + `Cni` so the kubelet defaults to its
+            // existing CNI/Docker-bridge networking path.
+            //
+            // `crate::runtime::PodNetworkMode` (not
+            // `rusternetes_kubelet::PodNetworkMode`) because the
+            // standalone bin compiles its own copy of `runtime.rs`
+            // — its `Kubelet::new_with_eviction` expects the
+            // bin-local type, not the lib's re-export.
             None,
+            crate::runtime::PodNetworkMode::Cni,
         )
         .await?,
     );

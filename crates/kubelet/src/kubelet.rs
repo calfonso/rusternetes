@@ -119,6 +119,7 @@ impl Kubelet {
             PathBuf::from("/var/lib/kubelet"),
             EvictionManager::new(),
             None,
+            crate::runtime::PodNetworkMode::Cni,
         )
         .await
     }
@@ -139,6 +140,7 @@ impl Kubelet {
         eviction_root_dir: PathBuf,
         eviction_manager: EvictionManager,
         netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
+        pod_network_mode: crate::runtime::PodNetworkMode,
     ) -> Result<Self> {
         let mut runtime = ContainerRuntime::new(
             volume_dir,
@@ -148,7 +150,8 @@ impl Kubelet {
             kubernetes_service_host,
         )
         .await?
-        .with_storage(storage.clone());
+        .with_storage(storage.clone())
+        .with_pod_network_mode(pod_network_mode);
         if let Some(ns) = netstack {
             runtime = runtime.with_netstack(ns);
         }
