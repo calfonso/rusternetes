@@ -100,6 +100,15 @@ pub async fn create(
     }
 
     // Validate pod spec
+    // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec — `spec.containers`
+    // is required. Upstream uses `field.Required(field.NewPath("spec").Child("containers"), "")`
+    // when spec is missing/null. Reject `spec: null` (and an absent spec) with 422 Invalid
+    // here so we do not persist an empty Pod.
+    if pod.spec.is_none() {
+        return Err(rusternetes_common::Error::InvalidResource(
+            "spec.containers: Required value".to_string(),
+        ));
+    }
     if let Some(ref spec) = pod.spec {
         if spec.containers.is_empty() {
             return Err(rusternetes_common::Error::InvalidResource(
