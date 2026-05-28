@@ -46,15 +46,18 @@
 //!   call `PodNet::register_pod` / `PodNet::unregister_pod` (through
 //!   the runtime wrapper) as pods are scheduled / torn down.
 
+use crate::dispatch::BackendPicker;
 use crate::multi::MultiDevice;
 use anyhow::Result;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
+use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{HardwareAddress, IpCidr};
+use smoltcp::wire::{HardwareAddress, IpCidr, IpEndpoint};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Configuration for a fresh [`PodNet`].
 pub struct PodNetConfig {
@@ -87,6 +90,60 @@ pub struct PodNet {
     iface: Interface,
     device: MultiDevice,
     sockets: SocketSet<'static>,
+    /// Per Service-VIP pool of pre-bound smoltcp TCP listeners.
+    /// Populated by [`PodNet::bind_tcp_service`]; scanned for newly
+    /// accepted connections by [`PodNet::accepted_tcp_connections`]
+    /// after each poll. Empty when the netstack has no Service VIPs
+    /// configured (DNS-only operation).
+    tcp_listeners: HashMap<SocketAddr, TcpListenerPool>,
+}
+
+/// One pre-bound TCP listener pool per Service VIP. Pool size is
+/// chosen at `bind_tcp_service` time; sockets cycle through
+/// listening → established (pumping) → closed → listening again.
+struct TcpListenerPool {
+    /// `(vip_ip, vip_port)` in smoltcp's `IpEndpoint` form — the
+    /// address every socket in the pool listens on.
+    vip: IpEndpoint,
+    /// Backend selector. Shared `Arc` so re-installs from the
+    /// EndpointSlice-watcher (Phase 4b's follow-up commit) can swap
+    /// the picker without rebinding the listener pool.
+    picker: Arc<dyn BackendPicker>,
+    /// Pool entries — one per pre-bound smoltcp TCP socket. Indexed
+    /// by `SocketHandle` for fast scan.
+    entries: Vec<TcpPoolEntry>,
+}
+
+/// One slot in a [`TcpListenerPool`]. Tracks whether the smoltcp
+/// socket is currently listening (waiting for the next pod to
+/// connect) or in-flight (a pump task owns it). On the next scan
+/// after `in_flight` transitions back to false (the pump task
+/// closed), we re-listen on the same handle so the pool size stays
+/// stable.
+struct TcpPoolEntry {
+    handle: SocketHandle,
+    in_flight: bool,
+}
+
+/// A newly-accepted Service-VIP TCP connection — what
+/// [`PodNet::accepted_tcp_connections`] returns for each scan. The
+/// runtime (slice 4c) spawns a pump task per `TcpAccept` to shuffle
+/// bytes between the smoltcp socket (identified by `handle`) and a
+/// fresh `tokio::net::TcpStream` to `backend`.
+#[derive(Debug, Clone)]
+pub struct TcpAccept {
+    /// Handle to the smoltcp TCP socket that accepted this
+    /// connection. After the pump task closes the socket, the next
+    /// `accepted_tcp_connections` scan re-listens on this handle —
+    /// the pump must not delete it from the SocketSet.
+    pub handle: SocketHandle,
+    /// VIP and port the pod connected to (e.g., `10.96.0.1:443`).
+    pub local: IpEndpoint,
+    /// Pod IP and ephemeral port the SYN came from.
+    pub remote: IpEndpoint,
+    /// Backend the picker chose for this connection. The pump opens
+    /// a tokio TcpStream to this address.
+    pub backend: SocketAddr,
 }
 
 impl PodNet {
@@ -115,6 +172,7 @@ impl PodNet {
             iface,
             device,
             sockets: SocketSet::new(vec![]),
+            tcp_listeners: HashMap::new(),
         })
     }
 
@@ -177,6 +235,127 @@ impl PodNet {
         handle: SocketHandle,
     ) -> &mut T {
         self.sockets.get_mut::<T>(handle)
+    }
+
+    /// Bind a Service VIP for TCP. Allocates `pool_size` smoltcp TCP
+    /// sockets all listening on `(vip)` so the netstack can accept
+    /// `pool_size` simultaneous connections per VIP. Connections that
+    /// arrive when all sockets are already pumping get their SYN
+    /// dropped — the pod retries.
+    ///
+    /// `picker` selects a backend per accepted connection. See
+    /// [`crate::dispatch::RoundRobinPicker`] for the default
+    /// implementation.
+    ///
+    /// Typical `pool_size`: 16-64 per Service. Each socket has its
+    /// own TX/RX ring buffer (default 4 KB each), so 64 sockets per
+    /// VIP × 100 Services = 50 MB of socket buffers — well within
+    /// budget even on a small node.
+    pub fn bind_tcp_service(
+        &mut self,
+        vip: SocketAddr,
+        picker: Arc<dyn BackendPicker>,
+        pool_size: usize,
+    ) -> Result<()> {
+        if self.tcp_listeners.contains_key(&vip) {
+            anyhow::bail!("PodNet::bind_tcp_service: VIP {vip} is already bound");
+        }
+        let vip_endpoint = socket_addr_to_endpoint(vip);
+        let mut entries = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let rx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+            let tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+            let mut sock = tcp::Socket::new(rx, tx);
+            sock.listen(vip_endpoint)
+                .map_err(|e| anyhow::anyhow!("smoltcp listen on {vip}: {e:?}"))?;
+            let handle = self.sockets.add(sock);
+            entries.push(TcpPoolEntry {
+                handle,
+                in_flight: false,
+            });
+        }
+        debug!(?vip, pool_size, "PodNet: bound TCP Service VIP");
+        self.tcp_listeners.insert(
+            vip,
+            TcpListenerPool {
+                vip: vip_endpoint,
+                picker,
+                entries,
+            },
+        );
+        Ok(())
+    }
+
+    /// Scan every bound Service-VIP pool for sockets that just
+    /// accepted a connection or just closed one. Newly accepted
+    /// sockets are returned for the runtime to spawn pump tasks
+    /// against; newly closed sockets are re-listened in place so the
+    /// pool size is conserved.
+    ///
+    /// MUST be called after [`Self::poll`] — smoltcp's TCP socket
+    /// state only advances when the Interface polls. Calling this
+    /// before poll is harmless but never returns accepts.
+    ///
+    /// Empty Vec when nothing changed since the last scan, which is
+    /// the steady-state case for an idle Service VIP.
+    pub fn accepted_tcp_connections(&mut self) -> Vec<TcpAccept> {
+        let mut accepted = Vec::new();
+        // Split-borrow `self` so we can iterate `tcp_listeners` while
+        // mutating `sockets` via handle. Without this the borrow
+        // checker rejects `self.sockets.get_mut(entry.handle)`
+        // inside a `self.tcp_listeners.iter_mut()` loop.
+        let Self {
+            tcp_listeners,
+            sockets,
+            ..
+        } = self;
+        for (_vip, pool) in tcp_listeners.iter_mut() {
+            for entry in pool.entries.iter_mut() {
+                let sock = sockets.get_mut::<tcp::Socket>(entry.handle);
+                let state = sock.state();
+                if !entry.in_flight && state == tcp::State::Established {
+                    let (Some(local), Some(remote)) =
+                        (sock.local_endpoint(), sock.remote_endpoint())
+                    else {
+                        // Pre-Established sockets sometimes don't
+                        // have endpoints — skip and re-check on the
+                        // next scan.
+                        continue;
+                    };
+                    let Some(backend) = pool.picker.next() else {
+                        warn!(
+                            ?pool.vip,
+                            "PodNet: Service VIP has zero backends — aborting accepted connection"
+                        );
+                        sock.abort();
+                        continue;
+                    };
+                    accepted.push(TcpAccept {
+                        handle: entry.handle,
+                        local,
+                        remote,
+                        backend,
+                    });
+                    entry.in_flight = true;
+                } else if entry.in_flight && state == tcp::State::Closed {
+                    // Pump task finished. Re-listen on the same
+                    // handle so the pool size stays stable.
+                    if let Err(e) = sock.listen(pool.vip) {
+                        warn!(
+                            ?pool.vip,
+                            "PodNet: re-listen on closed pool socket failed: {e:?}"
+                        );
+                    }
+                    entry.in_flight = false;
+                }
+            }
+        }
+        accepted
+    }
+
+    /// Number of bound Service VIPs. Mostly for tests / observability.
+    pub fn tcp_listener_count(&self) -> usize {
+        self.tcp_listeners.len()
     }
 
     /// Drive one round of smoltcp polling. Inbound packets in the
@@ -264,6 +443,20 @@ impl PodNet {
             }
         }
         out
+    }
+}
+
+fn socket_addr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
+    use smoltcp::wire::IpAddress;
+    match addr {
+        SocketAddr::V4(v4) => {
+            let o = v4.ip().octets();
+            IpEndpoint::new(IpAddress::v4(o[0], o[1], o[2], o[3]), v4.port())
+        }
+        SocketAddr::V6(_) => unreachable!(
+            "PodNet currently supports IPv4 only (smoltcp built without proto-ipv6); \
+             v6 Service VIPs should have been filtered out at the dispatcher level"
+        ),
     }
 }
 
@@ -508,6 +701,45 @@ mod tests {
             !net.remove_host_ip(&new_vip_cidr),
             "second remove returns false"
         );
+    }
+
+    #[test]
+    fn bind_tcp_service_allocates_listening_sockets_and_records_vip() {
+        use crate::dispatch::RoundRobinPicker;
+
+        let mut net = PodNet::new(&default_config()).unwrap();
+        let vip: SocketAddr = "10.96.0.1:443".parse().unwrap();
+        let picker = Arc::new(RoundRobinPicker::new(vec![
+            "10.244.0.5:6443".parse().unwrap(),
+            "10.244.0.6:6443".parse().unwrap(),
+        ]));
+
+        net.bind_tcp_service(vip, picker, 8).unwrap();
+        assert_eq!(net.tcp_listener_count(), 1);
+        // Steady-state scan with no actual TCP traffic returns empty.
+        assert!(net.accepted_tcp_connections().is_empty());
+    }
+
+    #[test]
+    fn bind_tcp_service_rejects_duplicate_vip() {
+        use crate::dispatch::RoundRobinPicker;
+
+        let mut net = PodNet::new(&default_config()).unwrap();
+        let vip: SocketAddr = "10.96.0.1:443".parse().unwrap();
+        let picker = || Arc::new(RoundRobinPicker::new(vec![]));
+
+        net.bind_tcp_service(vip, picker(), 4).unwrap();
+        // Second bind on the same VIP is a caller bug (the
+        // dispatcher's Service-watcher should have unbound first).
+        // Surface it instead of silently leaking the original pool.
+        assert!(net.bind_tcp_service(vip, picker(), 4).is_err());
+        assert_eq!(net.tcp_listener_count(), 1);
+    }
+
+    #[test]
+    fn accepted_tcp_connections_returns_empty_when_no_vips_bound() {
+        let mut net = PodNet::new(&default_config()).unwrap();
+        assert!(net.accepted_tcp_connections().is_empty());
     }
 
     #[test]

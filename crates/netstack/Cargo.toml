@@ -31,6 +31,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "phy-tuntap_interface",
     "proto-ipv4",
     "socket-udp",
+    "socket-tcp",
 ] }
 # tokio_tun gives us an async TAP device (read/write returning Futures).
 # We bridge its packet stream into smoltcp's poll loop in iface.rs.
