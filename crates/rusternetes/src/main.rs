@@ -284,6 +284,37 @@ async fn main() -> Result<()> {
             None
         };
 
+    // --- Service-VIP watcher ---
+    //
+    // When the embedded netstack is up, also spawn the Service-VIP
+    // watcher that reconciles `Service` + `EndpointSlice` cluster
+    // state into `Netstack::bind_tcp_service` / `unbind_tcp_service`
+    // calls. Without this, the netstack's listener pools stay
+    // empty and no Service-VIP TCP can route — even in shadow mode
+    // operators wouldn't see realistic bindings.
+    if let Some(ns) = netstack_handle.clone() {
+        let watcher_storage = storage.clone();
+        let watcher_cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        // No `cancel.notify` wired up yet — the watcher exits when
+        // the tokio runtime drops on process shutdown. Acceptable
+        // since shutdown is process-wide anyway.
+        let _ = &watcher_cancel;
+        let watcher_interval = std::time::Duration::from_secs(args.sync_interval);
+        info!(
+            sync_interval_secs = args.sync_interval,
+            "Netstack: spawning Service-VIP watcher"
+        );
+        tokio::spawn(async move {
+            rusternetes_netstack::service_watcher::run(
+                watcher_storage,
+                ns,
+                watcher_interval,
+                watcher_cancel,
+            )
+            .await;
+        });
+    }
+
     // --- Kubelet ---
     let kubelet_storage = storage.clone();
     let kubelet_config = rusternetes_kubelet::KubeletConfig {
