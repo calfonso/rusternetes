@@ -57,6 +57,10 @@ pub mod alloc;
 pub mod capabilities;
 pub mod dispatch;
 pub mod iface;
+pub mod manager;
 pub mod multi;
 pub mod podnet;
 pub mod runtime;
+
+#[cfg(test)]
+pub(crate) mod test_helpers;

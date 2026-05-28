@@ -353,63 +353,10 @@ async fn poll_loop(
 mod tests {
     use super::*;
     use crate::podnet::PodNetConfig;
+    use crate::test_helpers::FakeTap;
     use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket};
     use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint};
-    use std::io;
-    use tokio::sync::mpsc;
     use tokio::time::timeout;
-
-    /// Channel-backed fake TAP for runtime tests — no kernel TAP, no
-    /// `CAP_NET_ADMIN`. The runtime sees a normal [`PodIo`]; the test
-    /// drives bytes via [`FakeTapHandle`].
-    struct FakeTap {
-        inbox: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
-        outbox: mpsc::UnboundedSender<Vec<u8>>,
-    }
-
-    /// Test-side handle to drive a `FakeTap`: push bytes "from the
-    /// pod" via [`send_in`](Self::send_in), pull bytes "to the pod"
-    /// via [`recv_out`](Self::recv_out).
-    struct FakeTapHandle {
-        send_in: mpsc::UnboundedSender<Vec<u8>>,
-        recv_out: mpsc::UnboundedReceiver<Vec<u8>>,
-    }
-
-    impl FakeTap {
-        fn pair() -> (Arc<FakeTap>, FakeTapHandle) {
-            let (in_tx, in_rx) = mpsc::unbounded_channel();
-            let (out_tx, out_rx) = mpsc::unbounded_channel();
-            let tap = Arc::new(FakeTap {
-                inbox: Mutex::new(in_rx),
-                outbox: out_tx,
-            });
-            let handle = FakeTapHandle {
-                send_in: in_tx,
-                recv_out: out_rx,
-            };
-            (tap, handle)
-        }
-    }
-
-    #[async_trait]
-    impl PodIo for FakeTap {
-        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-            let mut rx = self.inbox.lock().await;
-            let pkt = rx
-                .recv()
-                .await
-                .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "inbox closed"))?;
-            let n = pkt.len().min(buf.len());
-            buf[..n].copy_from_slice(&pkt[..n]);
-            Ok(n)
-        }
-        async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-            self.outbox
-                .send(buf.to_vec())
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "outbox closed"))?;
-            Ok(buf.len())
-        }
-    }
 
     fn default_config() -> PodNetConfig {
         PodNetConfig {
