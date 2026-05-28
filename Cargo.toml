@@ -11,6 +11,7 @@ members = [
     "crates/storage",
     "crates/cloud-providers",
     "crates/dns",
+    "crates/netstack",
     "crates/rusternetes",
 ]
 

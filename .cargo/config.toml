@@ -1,0 +1,40 @@
+# Workspace cargo config.
+#
+# This file is checked in. The `[env]` block below is *mandatory* —
+# without it, smoltcp builds with its 2-IP-per-Interface default,
+# which silently caps the number of Service VIPs the netstack can
+# terminate in-process. Local developer-only customizations
+# (mold linker, sccache, etc.) live in the commented section at the
+# bottom — uncomment locally as you see fit. Cargo merges with
+# `~/.cargo/config.toml`, so per-machine settings can live there
+# instead if you'd rather not edit this file.
+
+[env]
+# Cap on `smoltcp::iface::Interface::ip_addrs`. The netstack uses
+# one entry per terminated Service VIP (kube-dns at 10.96.0.10,
+# kubernetes.default at 10.96.0.1, every user-created ClusterIP …)
+# plus one entry for the Service-CIDR routing prefix. Cluster sizes:
+# a default kubeadm install has ~6 system Services; a real workload
+# cluster has 50-200 Services in steady state. 256 covers the
+# overwhelming majority of deployments and is cheap (heapless::Vec
+# capacity, not heap allocation). Bump if you see "PodNet: smoltcp
+# ip_addrs full" in production logs.
+#
+# Read by smoltcp's build.rs at compile time — changing this value
+# forces a smoltcp recompile.
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "256"
+
+# ────────────────────────────────────────────────────────────────────
+# Local-dev opt-ins — uncomment as desired.
+# ────────────────────────────────────────────────────────────────────
+#
+# mold linker: 3-5x faster incremental rebuilds for the api-server +
+# kubelet binaries. Requires:
+#   sudo apt-get install -y mold clang
+# CI's self-hosted runner has these preinstalled but does NOT set
+# this rustflag — CI compiles with the system ld so we don't paper
+# over any mold-specific issues in release builds.
+#
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]

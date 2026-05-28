@@ -1,6 +1,5 @@
 # Rust
 target/
-.cargo/config.toml
 # Keep Cargo.lock for binary/workspace projects (needed for reproducible builds)
 # Cargo.lock
 **/*.rs.bk

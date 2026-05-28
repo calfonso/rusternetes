@@ -1,0 +1,71 @@
+[package]
+name = "rusternetes-netstack"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "User-space network stack (smoltcp + TAP) for in-process pod traffic dispatch — Phase 2 spike"
+
+[lib]
+name = "rusternetes_netstack"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+rusternetes-common = { path = "../common" }
+rusternetes-dns = { path = "../dns" }
+# Used by `service_watcher::run` to read Services + EndpointSlices
+# and keep the netstack's TCP listener pools in sync with cluster
+# state. The watcher is the only direct user; the rest of the
+# netstack is storage-agnostic.
+rusternetes-storage = { path = "../storage" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+# smoltcp 0.12 — user-space TCP/IP stack. `socket-udp` + `proto-ipv4` are
+# enough for the DNS-over-UDP spike; we'll add TCP / Service-VIP-listener
+# support in Phase 4.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "phy-tuntap_interface",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+] }
+# tokio_tun gives us an async TAP device (read/write returning Futures).
+# We bridge its packet stream into smoltcp's poll loop in iface.rs.
+tokio-tun = "0.13"
+# Linux process-capability querying. Used by `capabilities::require_cap_net_admin`
+# to fail fast at netstack startup if the container was launched without
+# `--cap-add NET_ADMIN` (Docker) / `securityContext.capabilities.add:
+# [NET_ADMIN]` (Kubernetes) — better than waiting for the first TAP open
+# to EPERM with a cryptic message.
+caps = "0.5"
+thiserror = { workspace = true }
+# `async-trait` gives us object-safe `Arc<dyn PodIo>` for the per-pod
+# TAP runtime; native `async fn in trait` is stable but not object-safe.
+async-trait = { workspace = true }
+# `rtnetlink` for cross-namespace netlink RPCs — moving TAPs between
+# netns, assigning pod IPs / default routes inside the pod's netns
+# (the operations kubelet's CNI runtime today shells out to `ip` to do).
+# Typed errors, no iproute2 host dep.
+rtnetlink = "0.14.1"
+# `nix` for `setns(2)` — `netns::configure_pod_netns` flips a
+# dedicated OS thread into the pod's netns before issuing netlink
+# RPCs there. Rtnetlink pulls nix in transitively but we want it as
+# an explicit dep so the version is pinned to a known-working one.
+nix = { version = "0.27", features = ["sched"] }
+# `libc` for the `EEXIST` errno constant — `configure_pod_netns`
+# squashes "address/route already exists" to Ok so retries don't
+# fail. Transitively present via several deps; pinned explicitly.
+libc = "0.2"
+
+[dev-dependencies]
+serial_test = { workspace = true }
+hickory-proto = { version = "0.26", default-features = false }
