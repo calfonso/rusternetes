@@ -202,27 +202,39 @@ impl PodTapRuntime {
     /// Stop the poll task and every per-pod task, then drop the
     /// runtime. `await`s everything so the caller knows nothing is
     /// still running.
+    ///
+    /// ### Why `notify_one` not `notify_waiters`
+    ///
+    /// `Notify::notify_waiters` only wakes tasks *currently at* the
+    /// `.notified()` await point — it does NOT store a permit, so a
+    /// task that hasn't yet polled its select! arm (or that's
+    /// between iterations) misses the cancel forever. `notify_one`
+    /// stores a permit if no waiter is present, so the next
+    /// `.notified()` consumes it.
+    ///
+    /// One permit per fire, so we have to fire once per task and
+    /// `await` the task's `JoinHandle` between fires — that way the
+    /// next `notify_one` lands on the next task's `.notified()`
+    /// without two tasks racing for one permit.
     pub async fn shutdown(mut self) {
         debug!("PodTapRuntime: shutdown initiated");
-        // Fire the global cancel — waiters on `notify_waiters` get woken.
-        self.cancel.notify_waiters();
-        // Each pod task also listens on its own pod_cancel; fire both to
-        // cover the (rare) case where the task arrived at its select
-        // *after* notify_waiters fired and missed the global cancel.
         let handles: Vec<PodHandle> = {
             let mut pods = self.pods.lock().await;
             pods.drain().map(|(_, h)| h).collect()
         };
+        // Cancel + await each pod task in sequence. Each
+        // `notify_one` stores a permit for that task's next
+        // `.notified()`; the subsequent `.await` blocks until the
+        // task drains and exits, freeing the permit slot for the
+        // next iteration.
         for h in handles {
+            self.cancel.notify_one();
             h.pod_cancel.notify_one();
             let _ = h.task.await;
         }
+        // Finally the poll task — same sticky-permit dance.
         if let Some(pt) = self.poll_task.take() {
-            // The poll task is parked on `cancel.notified()` — re-fire
-            // just in case (notify_waiters above only wakes existing
-            // waiters; if the poll task wasn't yet at the await point,
-            // we'd hang).
-            self.cancel.notify_waiters();
+            self.cancel.notify_one();
             let _ = pt.await;
         }
         debug!("PodTapRuntime: shutdown complete");

@@ -68,6 +68,16 @@ pub enum StartPodError {
     /// previous IP).
     #[error("pod_uid {pod_uid:?} is already registered with the netstack")]
     AlreadyRegistered { pod_uid: String },
+
+    /// A netns operation failed — moving the TAP into the pod's
+    /// netns, or configuring its IP / default route inside the
+    /// netns. Only returned from
+    /// [`Netstack::start_pod_in_netns`], not [`Netstack::start_pod`].
+    /// The wrapped detail is `NetnsError::to_string()`; we don't
+    /// embed the typed error to keep `StartPodError` small enough
+    /// for `clippy::result-large-err`.
+    #[error("netns configuration for {pod_uid:?} failed: {detail}")]
+    NetnsFailed { pod_uid: String, detail: String },
 }
 
 /// Pluggable TAP constructor — abstraction over [`open_tap`] so
@@ -207,6 +217,122 @@ impl<F: TapFactory> Netstack<F> {
         Ok(ip)
     }
 
+    /// `start_pod` with full netns wiring — for `--pod-network-mode=
+    /// netstack-active`. Performs the same allocate+TAP+register
+    /// dance, then:
+    ///   3. moves the freshly-opened TAP into `netns_path`
+    ///      ([`crate::netns::move_tap_to_netns`]),
+    ///   4. assigns the pod IP + default route + brings `lo` up
+    ///      inside the netns
+    ///      ([`crate::netns::configure_pod_netns`]).
+    ///
+    /// After this returns, the pod's container (joined to
+    /// `netns_path` via Docker's `--network=none` + manual netns
+    /// share) sees a fully-configured network interface — packets
+    /// it sends arrive at the netstack's MultiDevice; replies the
+    /// netstack emits land on the same TAP.
+    ///
+    /// ### Rollback on failure
+    ///
+    /// Every step before the runtime registration is rollback-safe:
+    /// IP-allocation rollback releases the slot; TAP creation
+    /// failure drops the TAP. The `move_tap_to_netns` and
+    /// `configure_pod_netns` steps move the TAP into the pod netns
+    /// where we no longer own it — on failure of those steps, we
+    /// release the IP but **leak the TAP** (it'll be GC'd by the
+    /// kernel when the netns is destroyed). Document for kubelet's
+    /// cleanup loop: if `start_pod_in_netns` returns Err, kubelet
+    /// must `ip netns del` the pod's netns to reclaim the TAP.
+    ///
+    /// ### Gateway
+    ///
+    /// The pod's default route points at `pod_cidr_base + 1` (the
+    /// `.1` address the allocator reserves). The netstack itself is
+    /// the implicit "router" — every IP in the pod CIDR is on-link
+    /// via the pod's TAP, and the netstack's `MultiDevice` routes
+    /// packets based on their destination IP regardless of the
+    /// gateway-IP convention.
+    pub async fn start_pod_in_netns(
+        &self,
+        pod_uid: &str,
+        netns_path: &std::path::Path,
+    ) -> Result<Ipv4Addr, StartPodError> {
+        {
+            let pods = self.pods.lock().await;
+            if pods.contains_key(pod_uid) {
+                return Err(StartPodError::AlreadyRegistered {
+                    pod_uid: pod_uid.to_string(),
+                });
+            }
+        }
+
+        let ip = self.allocator.allocate()?;
+        let tap_name = tap_name_for(pod_uid);
+        let tap = match self.factory.create_tap(&tap_name) {
+            Ok(tap) => tap,
+            Err(e) => {
+                self.allocator.release(ip);
+                return Err(e.into());
+            }
+        };
+
+        // Step 3: move TAP into pod's netns.
+        if let Err(e) = crate::netns::move_tap_to_netns(&tap_name, netns_path).await {
+            self.allocator.release(ip);
+            // `tap` (Arc<Tun>) drops here; the kernel removes the
+            // TAP from our netns (we didn't .persist()). No leak.
+            return Err(StartPodError::NetnsFailed {
+                pod_uid: pod_uid.to_string(),
+                detail: e.to_string(),
+            });
+        }
+
+        // Step 4: configure pod IP + default route inside netns.
+        let gateway = derive_pod_gateway(self.allocator.cidr_base());
+        if let Err(e) = crate::netns::configure_pod_netns(
+            netns_path,
+            &tap_name,
+            ip,
+            self.allocator.cidr_prefix(),
+            gateway,
+        )
+        .await
+        {
+            self.allocator.release(ip);
+            // TAP is now in pod's netns — we LEAK it here. Kubelet
+            // must `ip netns del` to GC. Documented on the function
+            // contract.
+            warn!(
+                ?pod_uid,
+                error = %e,
+                "Netstack::start_pod_in_netns: configure failed; TAP leaked in netns until kubelet `ip netns del`"
+            );
+            return Err(StartPodError::NetnsFailed {
+                pod_uid: pod_uid.to_string(),
+                detail: e.to_string(),
+            });
+        }
+
+        // Step 5: register with runtime.
+        let new = self.runtime.register_pod(ip, tap).await;
+        debug_assert!(
+            new,
+            "Netstack::start_pod_in_netns: runtime double-register impossible after AlreadyRegistered guard"
+        );
+
+        let mut pods = self.pods.lock().await;
+        pods.insert(
+            pod_uid.to_string(),
+            PodEntry {
+                ip,
+                tap_name: tap_name.clone(),
+            },
+        );
+        debug!(?pod_uid, ?ip, %tap_name, ?netns_path,
+            "Netstack: pod started in netns (active mode)");
+        Ok(ip)
+    }
+
     /// Reverse of [`start_pod`]: detach the pod from the runtime
     /// (closes the TAP as a side effect), release the IP. Returns
     /// `true` if the pod was registered, `false` if it was not
@@ -307,6 +433,17 @@ fn tap_name_for(pod_id: &str) -> String {
     format!("rust{hash:011x}")
 }
 
+/// Derive the pod-side default gateway IP from the pod CIDR base.
+/// Convention: gateway = `network + 1` (the `.1` address the
+/// allocator reserves alongside the network address). The netstack
+/// itself doesn't bind this address — it's a routing anchor that
+/// pods point their default route at. The actual processing happens
+/// in the netstack's MultiDevice, which routes by destination IP.
+fn derive_pod_gateway(cidr_base: Ipv4Addr) -> Ipv4Addr {
+    let bits = u32::from(cidr_base);
+    Ipv4Addr::from(bits + 1)
+}
+
 /// Object-safe trait surface for the kubelet-facing methods of
 /// [`Netstack`]. Kubelet holds an `Arc<dyn NetstackHandle>` so it
 /// doesn't need to be generic over [`TapFactory`].
@@ -318,12 +455,19 @@ fn tap_name_for(pod_id: &str) -> String {
 pub trait NetstackHandle: Send + Sync + 'static {
     /// See [`Netstack::start_pod`].
     async fn start_pod(&self, pod_id: &str) -> Result<Ipv4Addr, StartPodError>;
+    /// See [`Netstack::start_pod_in_netns`]. Used by kubelet in
+    /// `--pod-network-mode=netstack-active`.
+    async fn start_pod_in_netns(
+        &self,
+        pod_id: &str,
+        netns_path: &std::path::Path,
+    ) -> Result<Ipv4Addr, StartPodError>;
     /// See [`Netstack::stop_pod`].
     async fn stop_pod(&self, pod_id: &str) -> bool;
     /// See [`Netstack::pod_count`].
     async fn pod_count(&self) -> usize;
     /// See [`Netstack::bind_tcp_service`]. Used by the Service-watcher
-    /// (Phase 4 follow-up) to install Service-VIP listener pools.
+    /// to install Service-VIP listener pools.
     async fn bind_tcp_service(
         &self,
         vip: std::net::SocketAddr,
@@ -338,6 +482,13 @@ pub trait NetstackHandle: Send + Sync + 'static {
 impl<F: TapFactory> NetstackHandle for Netstack<F> {
     async fn start_pod(&self, pod_id: &str) -> Result<Ipv4Addr, StartPodError> {
         Netstack::start_pod(self, pod_id).await
+    }
+    async fn start_pod_in_netns(
+        &self,
+        pod_id: &str,
+        netns_path: &std::path::Path,
+    ) -> Result<Ipv4Addr, StartPodError> {
+        Netstack::start_pod_in_netns(self, pod_id, netns_path).await
     }
     async fn stop_pod(&self, pod_id: &str) -> bool {
         Netstack::stop_pod(self, pod_id).await
@@ -542,6 +693,40 @@ mod tests {
         assert_eq!(ips.len(), 50, "every pod got a distinct IP");
         assert_eq!(ns.pod_count().await, 50);
         assert_eq!(ns.allocator().allocated_count(), 50);
+        ns.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_pod_in_netns_releases_ip_on_netns_path_missing() {
+        // Calling start_pod_in_netns with a path that doesn't exist
+        // must release the IP it just allocated and drop the TAP —
+        // otherwise misconfigured callers leak the pool one allocation
+        // at a time.
+        let factory = FakeTapFactory::new();
+        let ns = Netstack::new(default_config(), factory).unwrap();
+        let before = ns.allocator().allocated_count();
+        let bogus = std::path::Path::new("/var/run/netns/this-does-not-exist");
+
+        match ns.start_pod_in_netns("pod-abc", bogus).await {
+            Err(StartPodError::NetnsFailed { pod_uid, detail }) => {
+                assert_eq!(pod_uid, "pod-abc");
+                assert!(
+                    detail.contains("does not exist"),
+                    "error names the missing path: {detail}"
+                );
+            }
+            other => panic!("expected NetnsFailed, got {other:?}"),
+        }
+        assert_eq!(
+            ns.allocator().allocated_count(),
+            before,
+            "IP released after netns failure (no leak)"
+        );
+        assert_eq!(
+            ns.pod_count().await,
+            0,
+            "pod not tracked when start_pod_in_netns fails"
+        );
         ns.shutdown().await;
     }
 

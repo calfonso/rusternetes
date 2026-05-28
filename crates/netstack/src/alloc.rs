@@ -65,6 +65,11 @@ pub struct PodIpAllocator {
     /// One past the last usable address. Always `broadcast` (which is
     /// reserved).
     range_end: u32,
+    /// CIDR base (network address) as originally given — exposed via
+    /// [`PodIpAllocator::cidr_base`] so callers can derive the
+    /// gateway / netmask without re-parsing the operator's input.
+    cidr_base: Ipv4Addr,
+    cidr_prefix: u8,
     inner: Mutex<Inner>,
 }
 
@@ -107,11 +112,25 @@ impl PodIpAllocator {
         Ok(Self {
             range_start,
             range_end,
+            cidr_base: Ipv4Addr::from(network),
+            cidr_prefix: prefix_len,
             inner: Mutex::new(Inner {
                 allocated: HashSet::new(),
                 next_hint: range_start,
             }),
         })
+    }
+
+    /// CIDR base (network address) the allocator covers. Always the
+    /// canonical network form (caller-supplied `cidr_base` masked to
+    /// the prefix). Stable across the allocator's lifetime.
+    pub fn cidr_base(&self) -> Ipv4Addr {
+        self.cidr_base
+    }
+
+    /// CIDR prefix length the allocator covers (e.g., 16 for a /16).
+    pub fn cidr_prefix(&self) -> u8 {
+        self.cidr_prefix
     }
 
     /// Allocate the next free address. Returns `Err(Exhausted)` only
