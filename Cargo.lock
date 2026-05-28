@@ -907,6 +907,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4964518bd3b4a8190e832886cdc0da9794f12e8e6c1613a9e90ff331c4c8724b"
 
 [[package]]
+name = "caps"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd1ddba47aba30b6a889298ad0109c3b8dcb0e8fc993b459daa7067d46f865e0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4251,12 +4260,14 @@ name = "rusternetes-netstack"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "caps",
  "futures",
  "hickory-proto",
  "rusternetes-common",
  "rusternetes-dns",
  "serial_test",
  "smoltcp",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-tun",
  "tracing",

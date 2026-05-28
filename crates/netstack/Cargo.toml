@@ -35,6 +35,13 @@ smoltcp = { version = "0.12", default-features = false, features = [
 # tokio_tun gives us an async TAP device (read/write returning Futures).
 # We bridge its packet stream into smoltcp's poll loop in iface.rs.
 tokio-tun = "0.13"
+# Linux process-capability querying. Used by `capabilities::require_cap_net_admin`
+# to fail fast at netstack startup if the container was launched without
+# `--cap-add NET_ADMIN` (Docker) / `securityContext.capabilities.add:
+# [NET_ADMIN]` (Kubernetes) — better than waiting for the first TAP open
+# to EPERM with a cryptic message.
+caps = "0.5"
+thiserror = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

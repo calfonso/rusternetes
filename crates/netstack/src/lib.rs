@@ -17,6 +17,10 @@
 //!
 //! ### Scope of this crate
 //!
+//! - [`capabilities`] — startup preflight: verify
+//!   `CAP_NET_ADMIN` is in the effective capability set so the process
+//!   fails fast at boot with an actionable error instead of `EPERM` on
+//!   the first TAP open.
 //! - [`iface`] — Phase 2 scaffolding that bridges one tokio-async TAP
 //!   device (`tokio_tun::Tun`) to smoltcp's `Device` trait. Single-TAP
 //!   only; superseded by [`multi`] for the multi-pod runtime that
@@ -44,6 +48,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod capabilities;
 pub mod dispatch;
 pub mod iface;
 pub mod multi;
