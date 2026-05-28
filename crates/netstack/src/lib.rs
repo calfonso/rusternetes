@@ -63,6 +63,7 @@ pub mod netns;
 pub mod podnet;
 pub mod proxy;
 pub mod runtime;
+pub mod service_watcher;
 
 /// Re-exports of the smoltcp wire-format types our public APIs hand
 /// out (`IpCidr` lives on `PodNetConfig::host_ips` and

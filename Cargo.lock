@@ -4370,6 +4370,7 @@ dependencies = [
  "rtnetlink",
  "rusternetes-common",
  "rusternetes-dns",
+ "rusternetes-storage",
  "serial_test",
  "smoltcp",
  "thiserror 1.0.69",

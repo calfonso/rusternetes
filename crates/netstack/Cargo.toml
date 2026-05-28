@@ -16,6 +16,11 @@ default = []
 [dependencies]
 rusternetes-common = { path = "../common" }
 rusternetes-dns = { path = "../dns" }
+# Used by `service_watcher::run` to read Services + EndpointSlices
+# and keep the netstack's TCP listener pools in sync with cluster
+# state. The watcher is the only direct user; the rest of the
+# netstack is storage-agnostic.
+rusternetes-storage = { path = "../storage" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
