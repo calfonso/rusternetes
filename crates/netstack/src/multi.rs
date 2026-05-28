@@ -143,18 +143,20 @@ impl MultiDevice {
     /// Receive a packet read from any pod's TAP and route it:
     ///
     /// - If the destination IPv4 address belongs to **another registered
-    ///   pod**, push it straight onto that pod's egress queue — pod-to-pod
-    ///   traffic never touches smoltcp, just one HashMap lookup.
+    ///   pod**, push it straight onto that pod's egress queue and return
+    ///   `Some(dst_pod)` — pod-to-pod traffic never touches smoltcp,
+    ///   just one HashMap lookup. The runtime uses the returned address
+    ///   to signal exactly the destination pod's write task, no
+    ///   notify-everyone broadcast needed.
     /// - Otherwise (destination is one of the netstack's own host IPs,
-    ///   or unparseable), fall through to the shared RX queue so smoltcp
-    ///   gets the packet on its next [`Device::receive`].
+    ///   or unparseable, or self-addressed), fall through to the shared
+    ///   RX queue so smoltcp gets the packet on its next
+    ///   [`Device::receive`], and return `None`.
     ///
     /// `from_pod` is the address of the pod whose TAP this packet was
     /// read from — used to avoid the silly loopback case where a pod
     /// somehow sends a packet to itself and the runtime echoes it back.
-    /// Returns `true` if the packet was forwarded directly to another
-    /// pod (smoltcp will not see it).
-    pub fn forward_or_inject(&mut self, from_pod: Ipv4Addr, packet: Vec<u8>) -> bool {
+    pub fn forward_or_inject(&mut self, from_pod: Ipv4Addr, packet: Vec<u8>) -> Option<Ipv4Addr> {
         if let Some(dst) = parse_ipv4_dst(&packet) {
             if dst != from_pod {
                 if let Some(queue) = self.egress.get_mut(&dst) {
@@ -165,12 +167,19 @@ impl MultiDevice {
                         "MultiDevice: pod-to-pod fast-path forward (bypasses smoltcp)"
                     );
                     queue.push_back(packet);
-                    return true;
+                    return Some(dst);
                 }
             }
         }
         self.rx_queue.push_back(packet);
-        false
+        None
+    }
+
+    /// Current length of `pod_ip`'s egress queue. Returns 0 if the pod
+    /// is not registered. The poll task uses this to decide which pods
+    /// to wake after a `smoltcp::iface::Interface::poll`.
+    pub fn egress_len(&self, pod_ip: Ipv4Addr) -> usize {
+        self.egress.get(&pod_ip).map(VecDeque::len).unwrap_or(0)
     }
 
     /// Drain one packet from `pod_ip`'s egress queue. Used by the
@@ -452,7 +461,12 @@ mod tests {
         let pkt = ipv4_packet([10, 244, 1, 5], [10, 244, 2, 7], b"pod-to-pod");
         let forwarded = dev.forward_or_inject(pod_a, pkt.clone());
 
-        assert!(forwarded, "pod-to-pod traffic returns true");
+        assert_eq!(
+            forwarded,
+            Some(pod_b),
+            "pod-to-pod returns the destination pod's IP"
+        );
+        assert_eq!(dev.egress_len(pod_b), 1);
         assert_eq!(
             dev.take_egress(pod_b).as_deref(),
             Some(&pkt[..]),
@@ -478,7 +492,10 @@ mod tests {
         let pkt = ipv4_packet([10, 244, 1, 5], [10, 96, 0, 10], b"dns?");
         let forwarded = dev.forward_or_inject(pod_a, pkt.clone());
 
-        assert!(!forwarded, "VIP-bound traffic was not forwarded directly");
+        assert_eq!(
+            forwarded, None,
+            "VIP-bound traffic falls through to smoltcp"
+        );
         let (rx_token, _tx) = dev
             .receive(Instant::now())
             .expect("packet enqueued for smoltcp");
@@ -487,11 +504,6 @@ mod tests {
 
     #[test]
     fn forward_or_inject_does_not_loop_packets_back_to_their_source_pod() {
-        // If a misbehaving pod somehow sets src == dst == its own IP,
-        // forwarding back to that pod's TAP would echo the packet and
-        // create a loop. The from_pod guard prevents that — the packet
-        // falls through to the shared rx_queue where smoltcp can drop
-        // it normally.
         let mut dev = MultiDevice::new();
         let pod_a = Ipv4Addr::new(10, 244, 1, 5);
         dev.register_pod(pod_a);
@@ -499,11 +511,11 @@ mod tests {
         let pkt = ipv4_packet([10, 244, 1, 5], [10, 244, 1, 5], b"loop?");
         let forwarded = dev.forward_or_inject(pod_a, pkt.clone());
 
-        assert!(!forwarded, "self-addressed packet must not be forwarded");
-        assert!(
-            dev.take_egress(pod_a).is_none(),
-            "pod's own egress queue stays empty"
+        assert_eq!(
+            forwarded, None,
+            "self-addressed packet must not be forwarded"
         );
+        assert_eq!(dev.egress_len(pod_a), 0);
     }
 
     #[test]
@@ -512,17 +524,25 @@ mod tests {
         let pod_a = Ipv4Addr::new(10, 244, 1, 5);
         dev.register_pod(pod_a);
 
-        // Pod 10.244.3.99 isn't registered — packet must NOT be lost,
-        // it falls through to smoltcp which will drop it via its own
-        // routing (and may emit ICMP destination-unreachable, smoltcp's
-        // call).
         let pkt = ipv4_packet([10, 244, 1, 5], [10, 244, 3, 99], b"orphan");
         let forwarded = dev.forward_or_inject(pod_a, pkt.clone());
 
-        assert!(!forwarded);
+        assert_eq!(forwarded, None);
         assert!(
             dev.receive(Instant::now()).is_some(),
             "smoltcp gets the orphan packet"
+        );
+    }
+
+    #[test]
+    fn egress_len_returns_zero_for_unregistered_pods() {
+        let mut dev = MultiDevice::new();
+        dev.register_pod(Ipv4Addr::new(10, 244, 1, 5));
+        assert_eq!(dev.egress_len(Ipv4Addr::new(10, 244, 1, 5)), 0);
+        assert_eq!(
+            dev.egress_len(Ipv4Addr::new(10, 244, 99, 99)),
+            0,
+            "unregistered pod reports 0 (not a panic)"
         );
     }
 }

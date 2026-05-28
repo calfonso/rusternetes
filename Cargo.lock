@@ -4260,6 +4260,7 @@ name = "rusternetes-netstack"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "caps",
  "futures",
  "hickory-proto",

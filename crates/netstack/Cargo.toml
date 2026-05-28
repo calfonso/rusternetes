@@ -42,6 +42,9 @@ tokio-tun = "0.13"
 # to EPERM with a cryptic message.
 caps = "0.5"
 thiserror = { workspace = true }
+# `async-trait` gives us object-safe `Arc<dyn PodIo>` for the per-pod
+# TAP runtime; native `async fn in trait` is stable but not object-safe.
+async-trait = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

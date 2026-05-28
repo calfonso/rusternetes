@@ -137,11 +137,19 @@ impl PodNet {
     }
 
     /// Receive a packet from a pod's TAP. Pod-to-pod traffic
-    /// short-circuits directly to the destination pod's egress queue
-    /// (returns `true`); pod-to-VIP traffic falls through to smoltcp
-    /// (returns `false`).
-    pub fn forward_or_inject(&mut self, from_pod: Ipv4Addr, packet: Vec<u8>) -> bool {
+    /// short-circuits to the destination pod's egress queue (returns
+    /// `Some(dst_pod)` so the runtime can wake exactly that pod's
+    /// write task); pod-to-VIP traffic falls through to smoltcp
+    /// (returns `None`).
+    pub fn forward_or_inject(&mut self, from_pod: Ipv4Addr, packet: Vec<u8>) -> Option<Ipv4Addr> {
         self.device.forward_or_inject(from_pod, packet)
+    }
+
+    /// Current length of `pod_ip`'s egress queue (0 if not registered).
+    /// The runtime's poll task uses this to decide which pods to wake
+    /// after a `smoltcp::iface::Interface::poll`.
+    pub fn egress_len(&self, pod_ip: Ipv4Addr) -> usize {
+        self.device.egress_len(pod_ip)
     }
 
     /// Drain one packet from `pod_ip`'s egress queue. The runtime's
@@ -355,7 +363,7 @@ mod tests {
 
         let pkt = udp_ipv4_packet([10, 244, 1, 5], 4242, [10, 244, 2, 7], 80, b"hello");
         let forwarded = net.forward_or_inject(pod_a, pkt.clone());
-        assert!(forwarded, "pod-to-pod returns true (short-circuited)");
+        assert_eq!(forwarded, Some(pod_b), "pod-to-pod returns the dst pod");
 
         // Without invoking poll, the packet should already be on pod B's egress.
         let received = net.take_egress(pod_b).expect("pod B got the packet");
@@ -393,8 +401,9 @@ mod tests {
             kube_dns_port,
             query_bytes,
         );
-        assert!(
-            !net.forward_or_inject(pod_a, query_pkt),
+        assert_eq!(
+            net.forward_or_inject(pod_a, query_pkt),
+            None,
             "VIP-bound traffic falls through to smoltcp"
         );
 
