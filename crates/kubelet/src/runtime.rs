@@ -92,6 +92,16 @@ pub struct ContainerRuntime {
     network: String,
     cni: Option<CniRuntime>,
     use_cni: bool,
+    /// Optional handle to the embedded netstack. Set via
+    /// [`ContainerRuntime::with_netstack`] when the all-in-one binary
+    /// is invoked with `--pod-network-mode=netstack`. While set, the
+    /// runtime *shadow-mode* registers every pod with the netstack
+    /// (allocates an IP, opens a TAP, spawns the per-pod TAP task) so
+    /// production deployments can exercise the netstack data plane
+    /// end-to-end without yet routing real container traffic through
+    /// it. The netns wiring that flips kubelet over to actually using
+    /// the allocated IP is the next commit on this branch.
+    netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
     kubernetes_service_host: String,
     /// Token manager for generating projected service account tokens
     token_manager: rusternetes_common::auth::TokenManager,
@@ -675,6 +685,7 @@ impl ContainerRuntime {
             network,
             cni,
             use_cni,
+            netstack: None,
             kubernetes_service_host,
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
@@ -682,6 +693,31 @@ impl ContainerRuntime {
             shell_cache: Mutex::new(HashMap::new()),
             shared_uts_supported,
         })
+    }
+
+    /// Inject the embedded netstack handle. Called by the all-in-one
+    /// binary when `--pod-network-mode=netstack`. While set, every
+    /// pod-create / pod-stop call also `start_pod` / `stop_pod`'s
+    /// the netstack — shadow-mode for now, becomes load-bearing
+    /// once the netns wiring lands.
+    pub fn with_netstack(
+        mut self,
+        netstack: Arc<dyn rusternetes_netstack::manager::NetstackHandle>,
+    ) -> Self {
+        self.netstack = Some(netstack);
+        self
+    }
+
+    /// Shadow-mode unregister a pod from the netstack, if one is wired
+    /// up. Centralised so every stop path (`stop_pod_with_grace_period`,
+    /// `stop_and_remove_pod`, `stop_pod_for`) reliably releases the
+    /// netstack IP + closes the TAP. No-op when no netstack is wired.
+    async fn netstack_release_pod(&self, pod_name: &str) {
+        if let Some(ns) = &self.netstack {
+            if ns.stop_pod(pod_name).await {
+                debug!("Netstack shadow-mode: released pod {}", pod_name);
+            }
+        }
     }
 
     /// Initialize CNI runtime
@@ -1147,6 +1183,31 @@ impl ContainerRuntime {
                 }
             }
         };
+
+        // Shadow-mode netstack registration when the binary was
+        // launched with `--pod-network-mode=netstack`. Allocates an
+        // IP from the netstack's unified pool, opens a TAP, and spawns
+        // the per-pod TAP I/O task — but `pod_ip` above still reflects
+        // the CNI / Docker-bridge address until the netns wiring lands
+        // (next commit). Lets us exercise the netstack data plane end
+        // to end in production without breaking pod networking.
+        if let Some(netstack) = &self.netstack {
+            match netstack.start_pod(pod_name).await {
+                Ok(netstack_ip) => {
+                    info!(
+                        "Netstack shadow-mode: allocated {} (TAP up) for pod {}",
+                        netstack_ip, pod_name
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Netstack shadow-mode: start_pod failed for {} ({}); \
+                         pod will continue on the legacy network path",
+                        pod_name, e
+                    );
+                }
+            }
+        }
 
         // Create /etc/hosts now that we know the pod IP.
         let hosts_file_path = self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
@@ -5436,6 +5497,7 @@ impl ContainerRuntime {
         if self.use_cni {
             let _ = self.teardown_pod_network(pod_name).await;
         }
+        self.netstack_release_pod(pod_name).await;
         self.cleanup_pod_volumes(pod_name).await?;
         Ok(())
     }
@@ -5522,6 +5584,8 @@ impl ContainerRuntime {
                 // Continue with cleanup even if CNI teardown fails
             }
         }
+
+        self.netstack_release_pod(pod_name).await;
 
         // Clean up emptyDir volumes (but keep container data for logs)
         self.cleanup_pod_volumes(pod_name).await?;
@@ -7628,6 +7692,8 @@ impl ContainerRuntime {
                 warn!("Failed to teardown CNI network for pod {}: {}", pod_name, e);
             }
         }
+
+        self.netstack_release_pod(pod_name).await;
 
         // Clean up volumes after all containers are stopped.
         // K8s does this in SyncTerminatedPod, but our sync loop only iterates

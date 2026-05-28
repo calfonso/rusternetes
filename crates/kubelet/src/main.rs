@@ -364,6 +364,11 @@ async fn main() -> Result<()> {
             runtime_config.kubernetes_service_host.clone(),
             runtime_config.root_dir.clone(),
             eviction_manager,
+            // Standalone kubelet binary doesn't (yet) instantiate
+            // an embedded netstack — only the all-in-one binary does.
+            // Pass `None` so the kubelet defaults to its existing
+            // CNI/Docker-bridge networking path.
+            None,
         )
         .await?,
     );

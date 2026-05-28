@@ -38,6 +38,7 @@ rusternetes-controller-manager = { path = "../controller-manager" }
 rusternetes-kubelet = { path = "../kubelet" }
 rusternetes-kube-proxy = { path = "../kube-proxy" }
 rusternetes-dns = { path = "../dns" }
+rusternetes-netstack = { path = "../netstack" }
 rusternetes-storage = { path = "../storage" }
 rusternetes-common = { path = "../common" }
 tokio.workspace = true

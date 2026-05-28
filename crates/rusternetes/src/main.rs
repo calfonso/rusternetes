@@ -110,6 +110,33 @@ struct Args {
     #[arg(long)]
     disable_proxy: bool,
 
+    /// Pod networking mode. `cni` (default) is the legacy
+    /// CNI/Docker-bridge path that's been carrying production
+    /// conformance for months. `netstack` enables the embedded
+    /// user-space netstack (`crates/netstack`) in *shadow mode*:
+    /// every pod-create / pod-delete is mirrored into the netstack
+    /// (IP allocation, TAP creation, runtime registration) so the
+    /// data plane can be validated end-to-end, but pod traffic still
+    /// rides the legacy path until the netns wiring lands. Flip to
+    /// `netstack` for staging; default stays `cni` until the
+    /// netstack path passes conformance.
+    #[arg(long, default_value = "cni", value_parser = ["cni", "netstack"])]
+    pod_network_mode: String,
+
+    /// Pod CIDR for the embedded netstack's IP allocator (only used
+    /// when `--pod-network-mode=netstack`). Must not overlap with the
+    /// host network or `--cluster-cidr`. `10.244.0.0/16` matches the
+    /// Flannel default and gives ~65k pod IPs per node.
+    #[arg(long, default_value = "10.244.0.0/16")]
+    netstack_pod_cidr: String,
+
+    /// Service CIDR the embedded netstack treats as on-link. Should
+    /// match `--cluster-cidr` (kube-proxy's POSTROUTING MASQUERADE
+    /// scope). The first usable address (typically `10.96.0.1`) is
+    /// claimed as the gateway IP for smoltcp's routing decisions.
+    #[arg(long, default_value = "10.96.0.0/12")]
+    netstack_service_cidr: String,
+
     /// Disable the in-process DNS server (fall back to the standalone
     /// rusternetes-dns container, or to the CoreDNS Pod from
     /// bootstrap-cluster.yaml when USE_RUSTERNETES_DNS=0).
@@ -227,6 +254,36 @@ async fn main() -> Result<()> {
         }
     });
 
+    // --- Embedded netstack (Phase 3 shadow mode) ---
+    //
+    // When `--pod-network-mode=netstack`, instantiate the embedded
+    // netstack and pass a handle to the kubelet. The netstack
+    // runs in shadow mode — every pod is registered with it but
+    // pod traffic still rides the legacy Docker/CNI path. Flip the
+    // flag to validate the data plane end-to-end in staging; default
+    // stays `cni` until the netns wiring lands and conformance
+    // passes on the netstack path.
+    let netstack_handle: Option<std::sync::Arc<dyn rusternetes_netstack::manager::NetstackHandle>> =
+        if args.pod_network_mode == "netstack" {
+            info!(
+                "Pod networking: netstack (shadow mode) — pod CIDR {}, service CIDR {}",
+                args.netstack_pod_cidr, args.netstack_service_cidr
+            );
+            match build_netstack(&args.netstack_pod_cidr, &args.netstack_service_cidr) {
+                Ok(ns) => Some(ns),
+                Err(e) => {
+                    error!(
+                    "Failed to start embedded netstack: {} — falling back to CNI/Docker for this run",
+                    e
+                );
+                    None
+                }
+            }
+        } else {
+            info!("Pod networking: cni (legacy Docker/CNI path)");
+            None
+        };
+
     // --- Kubelet ---
     let kubelet_storage = storage.clone();
     let kubelet_config = rusternetes_kubelet::KubeletConfig {
@@ -242,6 +299,7 @@ async fn main() -> Result<()> {
             .clone()
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
             .unwrap_or_else(|| "10.96.0.1".to_string()),
+        netstack: netstack_handle,
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {
@@ -304,4 +362,62 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the embedded netstack from `--pod-network-mode=netstack`
+/// flag inputs. Parses pod and service CIDRs, instantiates the
+/// `Netstack<ProductionTapFactory>`, returns an `Arc<dyn NetstackHandle>`
+/// the kubelet can hold without going generic over `TapFactory`.
+fn build_netstack(
+    pod_cidr: &str,
+    service_cidr: &str,
+) -> Result<std::sync::Arc<dyn rusternetes_netstack::manager::NetstackHandle>> {
+    use rusternetes_netstack::manager::{Netstack, NetstackConfig, ProductionTapFactory};
+    use rusternetes_netstack::wire::{IpAddress, IpCidr};
+
+    let (pod_base, pod_prefix) = parse_cidr(pod_cidr)?;
+    let (svc_base, svc_prefix) = parse_cidr(service_cidr)?;
+
+    // The netstack claims the first usable address of the service
+    // CIDR as its gateway IP (e.g., 10.96.0.1 for `10.96.0.0/12`) —
+    // that's the address `kubernetes.default` resolves to. Smoltcp's
+    // routing table treats the whole CIDR as on-link via this entry,
+    // so packets to every Service ClusterIP route through the
+    // netstack.
+    let gateway = std::net::Ipv4Addr::new(
+        svc_base.octets()[0],
+        svc_base.octets()[1],
+        svc_base.octets()[2],
+        svc_base.octets()[3] | 1,
+    );
+    let host_ips = vec![IpCidr::new(
+        IpAddress::v4(
+            gateway.octets()[0],
+            gateway.octets()[1],
+            gateway.octets()[2],
+            gateway.octets()[3],
+        ),
+        svc_prefix,
+    )];
+
+    let cfg = NetstackConfig {
+        pod_cidr_base: pod_base,
+        pod_cidr_prefix: pod_prefix,
+        host_ips,
+    };
+    let ns = Netstack::new(cfg, ProductionTapFactory)?;
+    Ok(std::sync::Arc::new(ns))
+}
+
+fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("CIDR {cidr:?} missing `/prefix`"))?;
+    let addr: std::net::Ipv4Addr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("CIDR {cidr:?} address not IPv4: {e}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|e| anyhow::anyhow!("CIDR {cidr:?} prefix not a number: {e}"))?;
+    Ok((addr, prefix))
 }

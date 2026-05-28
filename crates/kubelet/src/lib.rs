@@ -26,6 +26,13 @@ pub struct KubeletConfig {
     pub sync_interval: u64,
     pub metrics_port: u16,
     pub kubernetes_service_host: String,
+    /// Optional embedded-netstack handle. Set by the all-in-one
+    /// binary when launched with `--pod-network-mode=netstack`; in
+    /// shadow mode for now (pod traffic still rides the legacy
+    /// Docker/CNI path, but every pod-create / pod-delete also goes
+    /// through the netstack so we can validate it in production).
+    /// Leave `None` to keep the existing CNI/Docker-bridge behaviour.
+    pub netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
 }
 
 impl Default for KubeletConfig {
@@ -39,6 +46,7 @@ impl Default for KubeletConfig {
             sync_interval: 3,
             metrics_port: 10250,
             kubernetes_service_host: "10.96.0.1".to_string(),
+            netstack: None,
         }
     }
 }
@@ -118,6 +126,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             config.kubernetes_service_host,
             eviction_root,
             eviction::EvictionManager::new(),
+            config.netstack,
         )
         .await?,
     );

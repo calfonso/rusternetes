@@ -118,6 +118,7 @@ impl Kubelet {
             kubernetes_service_host,
             PathBuf::from("/var/lib/kubelet"),
             EvictionManager::new(),
+            None,
         )
         .await
     }
@@ -137,8 +138,9 @@ impl Kubelet {
         kubernetes_service_host: String,
         eviction_root_dir: PathBuf,
         eviction_manager: EvictionManager,
+        netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
     ) -> Result<Self> {
-        let runtime = ContainerRuntime::new(
+        let mut runtime = ContainerRuntime::new(
             volume_dir,
             cluster_dns,
             cluster_domain,
@@ -147,6 +149,9 @@ impl Kubelet {
         )
         .await?
         .with_storage(storage.clone());
+        if let Some(ns) = netstack {
+            runtime = runtime.with_netstack(ns);
+        }
 
         // Log the resolved statvfs path once so operators can see which
         // mount we're measuring for eviction. Upstream cadvisor logs this

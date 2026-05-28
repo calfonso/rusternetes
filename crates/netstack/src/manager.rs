@@ -37,7 +37,10 @@ use crate::alloc::{AllocError, PodIpAllocator};
 use crate::iface::{open_tap, OpenTapError};
 use crate::podnet::{PodNet, PodNetConfig};
 use crate::runtime::{PodIo, PodTapRuntime};
+use async_trait::async_trait;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -260,18 +263,49 @@ impl<F: TapFactory> Netstack<F> {
     }
 }
 
-/// Derive a TAP name from a pod UID. Linux TAP names are bounded by
-/// `IFNAMSIZ - 1 == 15`. UUID-style pod UIDs are ~36 chars; we take
-/// the first 10 hex chars of the first segment (enough entropy to
-/// avoid collisions across pods on one node) and prefix with `rust`
-/// for grep-ability.
-fn tap_name_for(pod_uid: &str) -> String {
-    let clean: String = pod_uid
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(10)
-        .collect();
-    format!("rust{clean}")
+/// Derive a TAP name from a pod identifier. Linux TAP names are
+/// bounded by `IFNAMSIZ - 1 == 15`. The identifier can be anything
+/// the caller uses to key the pod — kubelet's `pod_name` strings
+/// (e.g., `"default_coredns-7c4..."`) and short pod UIDs both work;
+/// we hash to 44 bits of entropy, which gives ~10^6 unique pods per
+/// node before collisions become non-trivial. The `rust` prefix
+/// makes the TAPs greppable in `ip link show`.
+fn tap_name_for(pod_id: &str) -> String {
+    let mut h = DefaultHasher::new();
+    pod_id.hash(&mut h);
+    // 11 hex chars = 44 bits of name space (`rust` prefix + 11 chars = 15 = IFNAMSIZ-1).
+    let hash = h.finish() & 0x0fff_ffff_ffff;
+    format!("rust{hash:011x}")
+}
+
+/// Object-safe trait surface for the kubelet-facing methods of
+/// [`Netstack`]. Kubelet holds an `Arc<dyn NetstackHandle>` so it
+/// doesn't need to be generic over [`TapFactory`].
+///
+/// In production the implementor is `Netstack<ProductionTapFactory>`;
+/// in tests it's `Netstack<FakeTapFactory>`. Both go through the same
+/// trait at the call sites.
+#[async_trait]
+pub trait NetstackHandle: Send + Sync + 'static {
+    /// See [`Netstack::start_pod`].
+    async fn start_pod(&self, pod_id: &str) -> Result<Ipv4Addr, StartPodError>;
+    /// See [`Netstack::stop_pod`].
+    async fn stop_pod(&self, pod_id: &str) -> bool;
+    /// See [`Netstack::pod_count`].
+    async fn pod_count(&self) -> usize;
+}
+
+#[async_trait]
+impl<F: TapFactory> NetstackHandle for Netstack<F> {
+    async fn start_pod(&self, pod_id: &str) -> Result<Ipv4Addr, StartPodError> {
+        Netstack::start_pod(self, pod_id).await
+    }
+    async fn stop_pod(&self, pod_id: &str) -> bool {
+        Netstack::stop_pod(self, pod_id).await
+    }
+    async fn pod_count(&self) -> usize {
+        Netstack::pod_count(self).await
+    }
 }
 
 #[cfg(test)]
@@ -319,12 +353,31 @@ mod tests {
     #[test]
     fn tap_name_for_is_within_ifnamsiz_limit() {
         let n = tap_name_for("0a1b2c3d-4e5f-6789-abcd-ef0123456789");
-        assert!(n.len() <= 15, "TAP name {n:?} exceeds IFNAMSIZ-1");
+        assert_eq!(n.len(), 15, "TAP name {n:?} should fill IFNAMSIZ-1");
         assert!(n.starts_with("rust"), "TAP name {n:?} missing rust prefix");
-        // Unique UIDs produce distinct names (no truncation collision
-        // on the first 10 alnum chars).
+        // Distinct pod IDs produce distinct names via hash entropy.
         let m = tap_name_for("1a1b2c3d-4e5f-6789-abcd-ef0123456789");
         assert_ne!(n, m);
+        // Hash-based naming accepts kubelet's `pod_name` strings —
+        // longer than 15 chars, containing '_', '-' — without
+        // truncation collisions or length blowups.
+        let kubelet_name = tap_name_for("default_coredns-7c4a8d9b6f-x2k9p");
+        assert_eq!(kubelet_name.len(), 15);
+        assert!(kubelet_name.starts_with("rust"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn netstack_handle_trait_object_supports_kubelet_call_sites() {
+        // Receipts that `Arc<dyn NetstackHandle>` works — the exact
+        // shape kubelet uses so it doesn't need to be generic over
+        // `TapFactory` everywhere.
+        let factory = FakeTapFactory::new();
+        let ns: Arc<dyn NetstackHandle> =
+            Arc::new(Netstack::new(default_config(), factory).unwrap());
+        let _ip = ns.start_pod("default_pod-abc").await.unwrap();
+        assert_eq!(ns.pod_count().await, 1);
+        assert!(ns.stop_pod("default_pod-abc").await);
+        assert_eq!(ns.pod_count().await, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

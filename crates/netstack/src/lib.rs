@@ -62,5 +62,14 @@ pub mod multi;
 pub mod podnet;
 pub mod runtime;
 
+/// Re-exports of the smoltcp wire-format types our public APIs hand
+/// out (`IpCidr` lives on `PodNetConfig::host_ips` and
+/// `NetstackConfig::host_ips`). Re-exposing them here lets binaries
+/// like the all-in-one build a netstack config without taking a
+/// direct dependency on smoltcp.
+pub mod wire {
+    pub use smoltcp::wire::{IpAddress, IpCidr};
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers;
