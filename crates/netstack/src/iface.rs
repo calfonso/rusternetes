@@ -215,7 +215,9 @@ pub async fn run_interface(
             // Borrow split: hold sockets shorter than iface.
             let ts = Instant::now();
             let NetIf { iface, sockets, .. } = &mut *g;
-            iface.poll_delay(ts, sockets).map(|d| Duration::from_micros(d.total_micros()))
+            iface
+                .poll_delay(ts, sockets)
+                .map(|d| Duration::from_micros(d.total_micros()))
         }
         .unwrap_or(Duration::from_millis(10));
 
@@ -243,7 +245,11 @@ pub async fn run_interface(
         let to_send: Vec<Vec<u8>> = {
             let mut g = netif.lock().await;
             let ts = Instant::now();
-            let NetIf { iface, device, sockets } = &mut *g;
+            let NetIf {
+                iface,
+                device,
+                sockets,
+            } = &mut *g;
             iface.poll(ts, device, sockets);
             std::mem::take(&mut device.tx_queue).into_iter().collect()
         };

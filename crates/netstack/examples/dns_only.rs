@@ -44,8 +44,9 @@ use tracing::info;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rusternetes_netstack=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,rusternetes_netstack=debug")
+            }),
         )
         .init();
 
@@ -68,10 +69,7 @@ async fn main() -> Result<()> {
     let zone = Arc::new(rusternetes_dns::server::SharedZone::new(
         rusternetes_dns::zone::Zone::empty(rusternetes_dns::zone::CLUSTER_ZONE),
     ));
-    dispatcher.bind(
-        "10.96.0.10:53".parse().unwrap(),
-        Handler::Dns(zone),
-    );
+    dispatcher.bind("10.96.0.10:53".parse().unwrap(), Handler::Dns(zone));
 
     // Construct a minimal DNS query for foo.svc.cluster.local A IN.
     let query: Vec<u8> = vec![

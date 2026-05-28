@@ -92,7 +92,10 @@ impl Dispatcher {
                 Ok(Some(resp))
             }
             Handler::Service { .. } => {
-                warn!(?dst, "Service handler hit on UDP path (TCP-only in Phase 4 spike)");
+                warn!(
+                    ?dst,
+                    "Service handler hit on UDP path (TCP-only in Phase 4 spike)"
+                );
                 Ok(None)
             }
         }
@@ -120,10 +123,13 @@ async fn handle_dns_query(_zone: &Arc<SharedZone>, query: &[u8]) -> Result<Vec<u
     // Flags: QR=1 (response), RCODE=3 (NXDOMAIN).
     resp[2] = 0x80; // QR=1, opcode=0, AA=0, TC=0, RD=0
     resp[3] = 0x03; // RA=0, Z=0, RCODE=3 (NXDOMAIN)
-    // Zero out answer/authority/additional counts; keep QDCOUNT.
-    resp[6] = 0; resp[7] = 0;
-    resp[8] = 0; resp[9] = 0;
-    resp[10] = 0; resp[11] = 0;
+                    // Zero out answer/authority/additional counts; keep QDCOUNT.
+    resp[6] = 0;
+    resp[7] = 0;
+    resp[8] = 0;
+    resp[9] = 0;
+    resp[10] = 0;
+    resp[11] = 0;
     // Append the original question section (everything after the header).
     resp.extend_from_slice(&query[12..]);
     Ok(resp)
@@ -159,11 +165,8 @@ mod tests {
             0x00, 0x01, // qdcount=1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar = 0
             // question: foo.svc.cluster.local. A IN
-            3, b'f', b'o', b'o',
-            3, b's', b'v', b'c',
-            7, b'c', b'l', b'u', b's', b't', b'e', b'r',
-            5, b'l', b'o', b'c', b'a', b'l',
-            0, // root
+            3, b'f', b'o', b'o', 3, b's', b'v', b'c', 7, b'c', b'l', b'u', b's', b't', b'e', b'r',
+            5, b'l', b'o', b'c', b'a', b'l', 0, // root
             0x00, 0x01, // type A
             0x00, 0x01, // class IN
         ];
