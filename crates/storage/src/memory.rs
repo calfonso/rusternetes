@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use rusternetes_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
@@ -12,6 +13,9 @@ pub struct MemoryStorage {
     data: Arc<RwLock<HashMap<String, String>>>,
     // Broadcast channel for watch events
     watch_tx: broadcast::Sender<WatchEvent>,
+    /// Number of remaining update() calls that will return Error::Conflict
+    /// before delegating to the real update. Used by tests to inject CAS conflicts.
+    conflict_update_count: Arc<AtomicUsize>,
 }
 
 impl MemoryStorage {
@@ -21,6 +25,7 @@ impl MemoryStorage {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
             watch_tx,
+            conflict_update_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -37,6 +42,12 @@ impl MemoryStorage {
     /// Check if storage is empty
     pub fn is_empty(&self) -> bool {
         self.data.read().unwrap().is_empty()
+    }
+
+    /// Arrange for the next `n` calls to `update()` to return `Error::Conflict`.
+    /// Subsequent calls behave normally. Used by tests to verify retry logic.
+    pub fn inject_conflicts(&self, n: usize) {
+        self.conflict_update_count.store(n, Ordering::SeqCst);
     }
 }
 
@@ -117,6 +128,22 @@ impl Storage for MemoryStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
+        // Inject a Conflict error if requested by a test (see inject_conflicts).
+        if self.conflict_update_count.load(Ordering::SeqCst) > 0 {
+            let prev =
+                self.conflict_update_count
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                        if v > 0 {
+                            Some(v - 1)
+                        } else {
+                            None
+                        }
+                    });
+            if prev.is_ok() {
+                return Err(Error::Conflict("injected conflict for test".to_string()));
+            }
+        }
+
         let serialized = serde_json::to_string(value)?;
 
         let mut data = self.data.write().unwrap();
@@ -218,6 +245,72 @@ impl Storage for MemoryStorage {
 
     async fn is_revision_compacted(&self, _revision: i64) -> Result<bool> {
         Ok(false) // Memory storage never compacts
+    }
+}
+
+// AuthzStorage for MemoryStorage — used when StorageBackend::Memory is selected.
+// The RBAC queries in tests use AlwaysAllowAuthorizer so these methods are
+// typically not called; they're implemented for completeness.
+#[async_trait::async_trait]
+impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
+    async fn get<T>(&self, key: &str, namespace: Option<&str>) -> rusternetes_common::Result<T>
+    where
+        T: serde::de::DeserializeOwned + Send + Sync,
+    {
+        use crate::build_key;
+        // Mirror the EtcdStorage pattern: derive a full /registry path from type name.
+        let full_key = match namespace {
+            Some(ns) => {
+                let tn = std::any::type_name::<T>();
+                if tn.contains("Role") && !tn.contains("Cluster") {
+                    format!("/registry/roles/{}/{}", ns, key)
+                } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
+                    format!("/registry/rolebindings/{}/{}", ns, key)
+                } else {
+                    build_key("unknown", Some(ns), key)
+                }
+            }
+            None => {
+                let tn = std::any::type_name::<T>();
+                if tn.contains("ClusterRole") && !tn.contains("Binding") {
+                    format!("/registry/clusterroles/{}", key)
+                } else if tn.contains("ClusterRoleBinding") {
+                    format!("/registry/clusterrolebindings/{}", key)
+                } else {
+                    format!("/registry/unknown/{}", key)
+                }
+            }
+        };
+        Storage::get(self, &full_key).await
+    }
+
+    async fn list<T>(&self, namespace: Option<&str>) -> rusternetes_common::Result<Vec<T>>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        let prefix = match namespace {
+            Some(ns) => {
+                let tn = std::any::type_name::<T>();
+                if tn.contains("Role") && !tn.contains("Cluster") {
+                    format!("/registry/roles/{}/", ns)
+                } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
+                    format!("/registry/rolebindings/{}/", ns)
+                } else {
+                    format!("/registry/unknown/{}/", ns)
+                }
+            }
+            None => {
+                let tn = std::any::type_name::<T>();
+                if tn.contains("ClusterRole") && !tn.contains("Binding") {
+                    "/registry/clusterroles/".to_string()
+                } else if tn.contains("ClusterRoleBinding") {
+                    "/registry/clusterrolebindings/".to_string()
+                } else {
+                    "/registry/unknown/".to_string()
+                }
+            }
+        };
+        Storage::list(self, &prefix).await
     }
 }
 
