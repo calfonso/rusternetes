@@ -39,12 +39,6 @@ jobs:
         # so every job clones fresh.
         run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
 
-      - name: Enable mold linker
-        # `.cargo/config.toml` is gitignored (so devs without mold
-        # installed can still `cargo build`). CI activates the template
-        # before any cargo invocation.
-        run: cp .cargo/config.toml.example .cargo/config.toml
-
       - name: Cache cargo registry + target
         # ARC runner pods are ephemeral; rust-cache restores ~/.cargo
         # and target/ from the GitHub Actions cache scoped to
@@ -86,9 +80,6 @@ jobs:
 
       - name: Clone rhino adjacent to repo
         run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
-
-      - name: Enable mold linker
-        run: cp .cargo/config.toml.example .cargo/config.toml
 
       - name: Cache cargo registry + target
         # See save-if rationale in the nextest job's cache step.
