@@ -61,7 +61,8 @@
 #
 # Current workspace members (Cargo.toml [workspace] members):
 #   api-server, cloud-providers, common, controller-manager, dns,
-#   kubectl, kubelet, kube-proxy, rusternetes, scheduler, storage
+#   kubectl, kubelet, kube-proxy, netstack, rusternetes, scheduler,
+#   storage
 
 # ---------------------------------------------------------------------
 # Stage 1: console SPA build (only api-server uses the output, but
@@ -130,7 +131,8 @@ COPY Cargo.toml Cargo.lock* ./
 # CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
 # Must mirror `[workspace] members` in Cargo.toml.
 # Crates: api-server, cloud-providers, common, controller-manager, dns,
-#         kubectl, kubelet, kube-proxy, rusternetes, scheduler, storage
+#         kubectl, kubelet, kube-proxy, netstack, rusternetes, scheduler,
+#         storage
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
 COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
@@ -139,6 +141,7 @@ COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
 COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
 COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
 COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
+COPY crates/netstack/Cargo.toml           crates/netstack/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
@@ -151,13 +154,13 @@ COPY crates/api-server/proto    crates/api-server/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
-#   - lib only:   common, storage, cloud-providers
+#   - lib only:   common, storage, cloud-providers, netstack
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet, kube-proxy,
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in common storage cloud-providers; do \
+    for c in common storage cloud-providers netstack; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -234,6 +237,7 @@ COPY crates/kubelet/src              crates/kubelet/src
 COPY crates/kubelet/tests            crates/kubelet/tests
 COPY crates/kube-proxy/src           crates/kube-proxy/src
 COPY crates/kube-proxy/tests         crates/kube-proxy/tests
+COPY crates/netstack/src             crates/netstack/src
 COPY crates/rusternetes/src          crates/rusternetes/src
 COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
