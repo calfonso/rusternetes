@@ -1,7 +1,7 @@
 //! Rusternetes — all-in-one Kubernetes in a single binary.
 //!
-//! Runs the API server, scheduler, controller manager, kubelet, and kube-proxy
-//! as concurrent tokio tasks sharing a single storage backend.
+//! Runs the API server, scheduler, controller manager, kubelet, kube-proxy,
+//! and cluster DNS as concurrent tokio tasks sharing a single storage backend.
 //!
 //! Usage:
 //!   rusternetes                                   # SQLite at ./data/rusternetes.db
@@ -109,6 +109,18 @@ struct Args {
     /// Disable kube-proxy (useful when iptables is not available)
     #[arg(long)]
     disable_proxy: bool,
+
+    /// Disable the in-process DNS server (fall back to the standalone
+    /// rusternetes-dns container, or to the CoreDNS Pod from
+    /// bootstrap-cluster.yaml when USE_RUSTERNETES_DNS=0).
+    #[arg(long)]
+    disable_dns: bool,
+
+    /// Bind address for the in-process DNS server (UDP+TCP). Pods reach
+    /// it via the kube-dns Service ClusterIP; kube-proxy DNATs to this
+    /// address. Default binds all interfaces inside the container.
+    #[arg(long, default_value = "0.0.0.0:53")]
+    dns_bind: String,
 
     /// Path to the console SPA build directory (enables web console at /console/)
     #[arg(long)]
@@ -254,6 +266,27 @@ async fn main() -> Result<()> {
         });
     } else {
         info!("Kube-proxy disabled");
+    }
+
+    // --- DNS ---
+    if !args.disable_dns {
+        let dns_storage = storage.clone();
+        let dns_bind: std::net::SocketAddr = args
+            .dns_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --dns-bind {:?}: {}", args.dns_bind, e))?;
+        let dns_config = rusternetes_dns::DnsConfig {
+            udp_bind: dns_bind,
+            tcp_bind: dns_bind,
+            ..rusternetes_dns::DnsConfig::default()
+        };
+        tokio::spawn(async move {
+            if let Err(e) = rusternetes_dns::run(dns_storage, dns_config).await {
+                error!("DNS server error: {}", e);
+            }
+        });
+    } else {
+        info!("In-process DNS disabled");
     }
 
     info!("All components started");

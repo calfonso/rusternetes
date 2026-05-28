@@ -236,29 +236,37 @@ if [ "$USE_RUSTERNETES_DNS" = "1" ]; then
     # apiserver has not yet observed the delete.
     $CONTAINER_RT exec rusternetes-etcd etcdctl del /registry/pods/kube-system/coredns >/dev/null 2>&1 || true
 
-    # Discover the rusternetes-dns container's IP on the rusternetes
-    # bridge. The compose file pins the network name to
-    # `rusternetes-network` (see compose.yml `networks:` block).
-    DNS_CONTAINER_NAME="rusternetes-dns"
+    # Discover a container on the rusternetes bridge that serves DNS on
+    # :53. Two candidates depending on which stack is up:
+    #   - `rusternetes-dns`  — multi-container stack (compose.yml).
+    #   - `rusternetes`      — all-in-one stack (compose.all-in-one.yml),
+    #                          where the in-process DNS task binds 0.0.0.0:53.
+    # The compose files pin the network name to `rusternetes-network`
+    # (see the `networks:` block in both files).
+    DNS_CANDIDATES="rusternetes-dns rusternetes"
     DNS_NETWORK="rusternetes-network"
+    DNS_CONTAINER_NAME=""
     DNS_IP=""
     for i in $(seq 1 30); do
-        DNS_IP=$($CONTAINER_RT inspect "$DNS_CONTAINER_NAME" \
-            --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
-            2>/dev/null || true)
-        if [ -n "$DNS_IP" ] && [ "$DNS_IP" != "<no value>" ]; then
-            break
-        fi
-        echo "  Waiting for $DNS_CONTAINER_NAME container IP... ($i/30)"
+        for candidate in $DNS_CANDIDATES; do
+            DNS_IP=$($CONTAINER_RT inspect "$candidate" \
+                --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
+                2>/dev/null || true)
+            if [ -n "$DNS_IP" ] && [ "$DNS_IP" != "<no value>" ]; then
+                DNS_CONTAINER_NAME="$candidate"
+                break 2
+            fi
+        done
+        echo "  Waiting for a DNS container ($DNS_CANDIDATES) on $DNS_NETWORK... ($i/30)"
         sleep 1
     done
 
     if [ -z "$DNS_IP" ] || [ "$DNS_IP" = "<no value>" ]; then
-        print_warning "Could not resolve $DNS_CONTAINER_NAME IP on $DNS_NETWORK."
-        print_warning "Is the dns service running? Try: $CONTAINER_RT ps --filter name=$DNS_CONTAINER_NAME"
+        print_warning "No DNS container found on $DNS_NETWORK (tried: $DNS_CANDIDATES)."
+        print_warning "Is the dns service running? Try: $CONTAINER_RT ps --filter name=rusternetes"
         print_warning "Falling back: cluster DNS will NOT be functional until kube-dns has endpoints."
     else
-        echo "  Found rusternetes-dns at $DNS_IP"
+        echo "  Found $DNS_CONTAINER_NAME at $DNS_IP"
 
         # Wire up the EndpointSlice that backs the kube-dns Service.
         # Without this kube-proxy has nothing to DNAT 10.96.0.10:53 to.
@@ -291,7 +299,7 @@ endpoints:
       serving: true
       terminating: false
 EOF
-        print_success "rusternetes-dns wired up at $DNS_IP for kube-dns Service"
+        print_success "$DNS_CONTAINER_NAME wired up at $DNS_IP for kube-dns Service"
     fi
 else
     # Fallback path — original behaviour: wait for the CoreDNS Pod that
