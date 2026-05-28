@@ -108,11 +108,17 @@ impl PodTapRuntime {
         let podnet = Arc::new(Mutex::new(podnet));
         let pods: Arc<Mutex<HashMap<Ipv4Addr, PodHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         let poll_wake = Arc::new(Notify::new());
+        // `pump_wake` lives entirely inside the poll_loop closure +
+        // each spawned proxy task. No external caller fires it
+        // today; if a Service-watcher ever needs to nudge pumps
+        // out-of-band, lift this back onto the struct.
+        let pump_wake = Arc::new(Notify::new());
         let cancel = Arc::new(Notify::new());
         let poll_task = tokio::spawn(poll_loop(
             podnet.clone(),
             pods.clone(),
             poll_wake.clone(),
+            pump_wake,
             cancel.clone(),
         ));
         debug!("PodTapRuntime: spawned");
@@ -309,6 +315,7 @@ async fn poll_loop(
     podnet: Arc<Mutex<PodNet>>,
     pods: Arc<Mutex<HashMap<Ipv4Addr, PodHandle>>>,
     poll_wake: Arc<Notify>,
+    pump_wake: Arc<Notify>,
     cancel: Arc<Notify>,
 ) {
     trace!("poll_loop started");
@@ -329,13 +336,17 @@ async fn poll_loop(
             _ = tokio::time::sleep(delay) => {}
         }
 
-        // Drive smoltcp once + find pods that got egress to wake up.
-        let pods_to_wake: Vec<Ipv4Addr> = {
+        // Drive smoltcp once + find pods that got egress and any
+        // newly-accepted TCP connections that need a proxy pump.
+        let (pods_to_wake, tcp_accepts): (Vec<Ipv4Addr>, Vec<crate::podnet::TcpAccept>) = {
             let mut p = podnet.lock().await;
             p.poll(Instant::now());
-            p.registered_pods()
+            let pods_to_wake = p
+                .registered_pods()
                 .filter(|ip| p.egress_len(*ip) > 0)
-                .collect()
+                .collect();
+            let accepts = p.accepted_tcp_connections();
+            (pods_to_wake, accepts)
         };
 
         if !pods_to_wake.is_empty() {
@@ -345,6 +356,29 @@ async fn poll_loop(
                     handle.egress_wake.notify_one();
                 }
             }
+        }
+
+        // Wake every existing TCP pump so they re-check their
+        // smoltcp sockets for new RX / TX-space-available. Cheap —
+        // pumps that have nothing to do return to the wait
+        // immediately.
+        pump_wake.notify_waiters();
+
+        // Spawn a proxy pump per freshly-accepted connection. The
+        // pump owns the smoltcp socket until it closes; the
+        // listener-pool scan in the next iteration re-listens on
+        // the handle once `proxy_tcp_connection` exits.
+        for accept in tcp_accepts {
+            trace!(
+                ?accept.local, ?accept.remote, ?accept.backend,
+                "poll_loop: spawning TCP pump"
+            );
+            tokio::spawn(crate::proxy::proxy_tcp_connection(
+                podnet.clone(),
+                accept,
+                pump_wake.clone(),
+                cancel.clone(),
+            ));
         }
     }
 }
