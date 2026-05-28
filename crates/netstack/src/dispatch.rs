@@ -108,31 +108,13 @@ impl Dispatcher {
 /// This bypasses hickory's socket layer entirely — the byte path is
 /// `smoltcp UDP socket → here → smoltcp UDP socket` with one function
 /// call's worth of overhead. The zone is the same `SharedZone` that
-/// `rusternetes_dns::server::serve` would feed to a UDP listener.
-async fn handle_dns_query(_zone: &Arc<SharedZone>, query: &[u8]) -> Result<Vec<u8>> {
-    // SPIKE STUB: just echo a NXDOMAIN response with the query ID copied
-    // through. Wiring the real zone in requires constructing a
-    // hickory_server::Request from these bytes and running the
-    // RequestHandler trait — that integration lives in the follow-up
-    // commit. For now, this proves the byte path round-trips through
-    // smoltcp end-to-end without ever hitting a kernel socket.
-    if query.len() < 12 {
-        anyhow::bail!("DNS query too short: {} bytes", query.len());
-    }
-    let mut resp = query[..12].to_vec();
-    // Flags: QR=1 (response), RCODE=3 (NXDOMAIN).
-    resp[2] = 0x80; // QR=1, opcode=0, AA=0, TC=0, RD=0
-    resp[3] = 0x03; // RA=0, Z=0, RCODE=3 (NXDOMAIN)
-                    // Zero out answer/authority/additional counts; keep QDCOUNT.
-    resp[6] = 0;
-    resp[7] = 0;
-    resp[8] = 0;
-    resp[9] = 0;
-    resp[10] = 0;
-    resp[11] = 0;
-    // Append the original question section (everything after the header).
-    resp.extend_from_slice(&query[12..]);
-    Ok(resp)
+/// `rusternetes_dns::server::serve` would feed to a UDP listener;
+/// [`rusternetes_dns::server::respond_bytes`] is the shared
+/// bytes-in/bytes-out responder so both paths emit identical wire
+/// responses for identical queries.
+async fn handle_dns_query(zone: &Arc<SharedZone>, query: &[u8]) -> Result<Vec<u8>> {
+    let snapshot = zone.load().await;
+    rusternetes_dns::server::respond_bytes(&snapshot, query)
 }
 
 #[cfg(test)]
@@ -150,7 +132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_stub_returns_nxdomain_with_query_id_preserved() {
+    async fn dns_dispatch_returns_nxdomain_with_query_id_preserved() {
         let mut d = Dispatcher::new();
         let zone = Arc::new(SharedZone::new(rusternetes_dns::zone::Zone::empty(
             rusternetes_dns::zone::CLUSTER_ZONE,

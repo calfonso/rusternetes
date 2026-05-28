@@ -15,7 +15,7 @@
 //!    lookup outcome.
 
 use crate::zone::{ip_to_arpa, DnsRecord, LookupOutcome, Zone, DEFAULT_TTL};
-use hickory_proto::op::{Header, HeaderCounts, Metadata, ResponseCode};
+use hickory_proto::op::{Header, HeaderCounts, Message, Metadata, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR, SOA, SRV};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_server::net::runtime::Time;
@@ -283,9 +283,151 @@ pub async fn serve(
     Ok(())
 }
 
+/// Bytes-in / bytes-out DNS responder. The wire-protocol counterpart of
+/// [`DnsHandler::handle_request`] — same lookup logic and response shape,
+/// but without the `hickory_server::RequestHandler` /
+/// `ResponseHandler` plumbing. Used by the in-process netstack
+/// (`rusternetes-netstack`) to short-circuit DNS at the smoltcp UDP
+/// layer so the kernel never sees a socket on `10.96.0.10:53`.
+///
+/// Returns well-formed DNS response bytes for every recognised outcome
+/// (`NoError`-with-records, `NoError`-empty / `NoData`, `NXDOMAIN`,
+/// `FormErr`-on-empty-question). The `Err` arm is reserved for inputs
+/// that aren't valid wire-format DNS at all — callers above the netstack
+/// should drop those silently.
+pub fn respond_bytes(zone: &Zone, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let req = Message::from_vec(query).map_err(|e| anyhow::anyhow!("malformed DNS query: {e}"))?;
+
+    let mut resp = Message::response(req.metadata.id, req.metadata.op_code);
+    resp.metadata = Metadata::response_from_request(&req.metadata);
+    resp.metadata.authoritative = true;
+
+    let Some(q) = req.queries.first() else {
+        resp.metadata.response_code = ResponseCode::FormErr;
+        return Ok(resp.to_vec()?);
+    };
+    resp.add_query(q.clone());
+
+    let qname = q.name().to_string();
+    let outcome = lookup_for_type(zone, &qname, q.query_type());
+    debug!(
+        "DNS in-proc query name={qname} type={qtype:?} -> {outcome}",
+        qtype = q.query_type(),
+        outcome = match &outcome {
+            LookupOutcome::Records(r) => format!("Records({})", r.len()),
+            LookupOutcome::NoData => "NoData".to_string(),
+            LookupOutcome::NxDomain => "NxDomain".to_string(),
+        }
+    );
+
+    match &outcome {
+        LookupOutcome::Records(records) => {
+            resp.metadata.response_code = ResponseCode::NoError;
+            for r in records {
+                if let Some(rec) = to_wire_record(&qname, r) {
+                    resp.add_answer(rec);
+                }
+            }
+        }
+        LookupOutcome::NoData => {
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.add_authority(build_soa(zone.suffix()));
+        }
+        LookupOutcome::NxDomain => {
+            resp.metadata.response_code = ResponseCode::NXDomain;
+            resp.add_authority(build_soa(zone.suffix()));
+        }
+    }
+
+    Ok(resp.to_vec()?)
+}
+
 // Silence the unused-import warning when ip_to_arpa isn't referenced
 // here — re-exported for the watcher / future PTR-zone work.
 #[allow(dead_code)]
 fn _ip_to_arpa_used(ip: IpAddr) -> String {
     ip_to_arpa(ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zone::CLUSTER_ZONE;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{DNSClass, Name, RecordType};
+    use rusternetes_common::resources::{Service, ServiceSpec, ServiceType};
+    use std::str::FromStr;
+
+    fn cluster_ip_svc(name: &str, ns: &str, ip: &str) -> Service {
+        let mut s = Service::new(name, ServiceSpec::default());
+        s.metadata.namespace = Some(ns.to_string());
+        s.spec.cluster_ip = Some(ip.to_string());
+        s.spec.service_type = Some(ServiceType::ClusterIP);
+        s
+    }
+
+    fn build_query(id: u16, name: &str, qtype: RecordType) -> Vec<u8> {
+        let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        let mut q = Query::query(Name::from_str(name).unwrap(), qtype);
+        q.set_query_class(DNSClass::IN);
+        msg.add_query(q);
+        msg.to_vec().unwrap()
+    }
+
+    #[test]
+    fn respond_bytes_returns_a_record_for_known_service() {
+        let zone = Zone::build(
+            CLUSTER_ZONE,
+            &[cluster_ip_svc("kubernetes", "default", "10.96.0.1")],
+            &[],
+            &[],
+        );
+
+        let query = build_query(
+            0x4242,
+            "kubernetes.default.svc.cluster.local.",
+            RecordType::A,
+        );
+        let resp_bytes = respond_bytes(&zone, &query).expect("well-formed query must succeed");
+
+        let resp = Message::from_vec(&resp_bytes).expect("response must parse");
+        assert_eq!(resp.metadata.id, 0x4242, "transaction id preserved");
+        assert_eq!(resp.metadata.message_type, MessageType::Response);
+        assert!(resp.metadata.authoritative, "AA flag set");
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1, "exactly one A answer");
+        let answer = &resp.answers[0];
+        assert_eq!(answer.record_type(), RecordType::A);
+        match answer.data {
+            RData::A(a) => assert_eq!(a.0, std::net::Ipv4Addr::new(10, 96, 0, 1)),
+            ref other => panic!("expected RData::A, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn respond_bytes_returns_nxdomain_for_unknown_name() {
+        let zone = Zone::empty(CLUSTER_ZONE);
+        let query = build_query(
+            0x1337,
+            "no-such-service.default.svc.cluster.local.",
+            RecordType::A,
+        );
+
+        let resp_bytes = respond_bytes(&zone, &query).unwrap();
+        let resp = Message::from_vec(&resp_bytes).unwrap();
+        assert_eq!(resp.metadata.id, 0x1337);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+        assert!(resp.answers.is_empty());
+        assert_eq!(resp.authorities.len(), 1, "SOA in authority section");
+        assert_eq!(resp.authorities[0].record_type(), RecordType::SOA);
+    }
+
+    #[test]
+    fn respond_bytes_errors_on_malformed_input() {
+        let zone = Zone::empty(CLUSTER_ZONE);
+        // Not valid wire-format DNS at all (random bytes shorter than a header).
+        let resp = respond_bytes(&zone, &[0xff; 3]);
+        assert!(resp.is_err(), "garbage input must surface as Err");
+    }
 }
