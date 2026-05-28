@@ -45,6 +45,11 @@ thiserror = { workspace = true }
 # `async-trait` gives us object-safe `Arc<dyn PodIo>` for the per-pod
 # TAP runtime; native `async fn in trait` is stable but not object-safe.
 async-trait = { workspace = true }
+# `rtnetlink` for cross-namespace netlink RPCs — moving TAPs between
+# netns, assigning pod IPs / default routes inside the pod's netns
+# (the operations kubelet's CNI runtime today shells out to `ip` to do).
+# Typed errors, no iproute2 host dep.
+rtnetlink = "0.14.1"
 
 [dev-dependencies]
 serial_test = { workspace = true }

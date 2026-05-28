@@ -59,6 +59,7 @@ pub mod dispatch;
 pub mod iface;
 pub mod manager;
 pub mod multi;
+pub mod netns;
 pub mod podnet;
 pub mod runtime;
 
