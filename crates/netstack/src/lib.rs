@@ -24,7 +24,8 @@
 //! - [`iface`] — Phase 2 scaffolding that bridges one tokio-async TAP
 //!   device (`tokio_tun::Tun`) to smoltcp's `Device` trait. Single-TAP
 //!   only; superseded by [`multi`] for the multi-pod runtime that
-//!   follows.
+//!   follows. Also exposes [`iface::open_tap`], the cap-checked TAP
+//!   constructor every netstack code path should go through.
 //! - [`multi`] — Phase 3 primitive: a smoltcp `Device` that fans out
 //!   TX by IPv4 destination across per-pod egress queues, with one
 //!   shared RX queue every per-TAP reader pushes into. The shape kubelet

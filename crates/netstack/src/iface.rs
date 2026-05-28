@@ -36,14 +36,16 @@
 //! will need a multiplexer that handles N TAPs (one per pod) sharing a
 //! single smoltcp `Interface` — but the per-packet path is the same.
 
+use crate::capabilities::{require_cap_net_admin, CapabilityError};
 use anyhow::{Context, Result};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::HardwareAddress;
 use std::collections::VecDeque;
+use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Maximum IP packet size we'll buffer between the TAP and smoltcp.
 /// 1500 (standard Ethernet MTU) is fine for the spike; jumbo frames
@@ -258,6 +260,104 @@ pub async fn run_interface(
             if let Err(e) = t.send(&pkt).await {
                 warn!(error = %e, "TAP send failed; dropping packet");
             }
+        }
+    }
+}
+
+/// Failure modes for [`open_tap`].
+///
+/// Callers above the netstack (the binary's `main`, a runtime supervisor,
+/// the future per-pod TAP creator in kubelet) typically want to log + exit
+/// with different exit codes per arm so ops can tell a misconfigured
+/// deployment apart from a real kernel-side problem.
+#[derive(Debug, Error)]
+pub enum OpenTapError {
+    /// The process lacks `CAP_NET_ADMIN`. The wrapped
+    /// [`CapabilityError`]'s `Display` impl includes copy-pasteable
+    /// remediation for every common container runtime. Treat as a
+    /// configuration error (e.g., exit code `78` / `EX_CONFIG`).
+    #[error(transparent)]
+    MissingCapability(#[from] CapabilityError),
+    /// The `TUNSETIFF` ioctl returned an error other than `EPERM`.
+    /// Usually `EEXIST` (TAP name already in use by another process)
+    /// or `EBUSY`. Treat as a runtime failure.
+    #[error("open TAP {name:?}: {source}")]
+    Build {
+        name: String,
+        #[source]
+        source: tokio_tun::Error,
+    },
+    /// `TunBuilder::build()` returned an empty `Vec<Tun>`. Should not
+    /// happen for single-queue TAPs, but the type lets us return one
+    /// without panicking if upstream ever changes that contract.
+    #[error("open TAP {name:?}: tokio_tun returned no Tun handles")]
+    EmptyResult { name: String },
+}
+/// Open a TAP device by name with the netstack's standard
+/// configuration (single-queue, `up`, default MTU).
+///
+/// **This is the entrypoint every netstack code path should use to
+/// construct a TAP.** It runs [`require_cap_net_admin`] first, so a
+/// container launched without `--cap-add NET_ADMIN` fails fast with a
+/// remediable error before the kernel-side `EPERM` from the TUN
+/// ioctl. Construct a TAP via raw `tokio_tun::TunBuilder` only when
+/// the preflight semantics would be wrong (e.g., inside a child of
+/// `unshare -U -n` where the calling thread's cap set differs from
+/// the host's — call [`require_cap_net_admin`] from inside the
+/// namespaced child instead).
+///
+/// Wrap the returned [`tokio_tun::Tun`] in `Arc<Mutex<…>>` before
+/// handing to [`run_interface`].
+pub fn open_tap(name: &str) -> std::result::Result<tokio_tun::Tun, OpenTapError> {
+    require_cap_net_admin()?;
+    let mut tuns = tokio_tun::TunBuilder::new()
+        .name(name)
+        .tap()
+        .up()
+        .build()
+        .map_err(|e| OpenTapError::Build {
+            name: name.to_string(),
+            source: e,
+        })?;
+    let tun = tuns.pop().ok_or_else(|| OpenTapError::EmptyResult {
+        name: name.to_string(),
+    })?;
+    info!(tap = %name, "netstack: opened TAP device");
+    Ok(tun)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test for the wiring: `open_tap` must call
+    /// `require_cap_net_admin` *first*, so a process without
+    /// `CAP_NET_ADMIN` gets a typed `MissingCapability` arm rather
+    /// than reaching `TunBuilder::build()` and returning a raw IO
+    /// error. The CI runner and a developer's local `cargo test`
+    /// both run without that cap, so this branch is what we want to
+    /// exercise — and the test will only be silently skipped when
+    /// run by a process that genuinely has the cap (e.g., the
+    /// future TAP-creating integration test gated on `unshare -U
+    /// -n` or `sudo`).
+    #[test]
+    fn open_tap_returns_missing_capability_when_cap_net_admin_is_absent() {
+        if require_cap_net_admin().is_ok() {
+            // Whoever's running the tests already has CAP_NET_ADMIN
+            // — the cap-missing branch is unreachable from here.
+            // Don't open a real TAP as a side effect of the test.
+            eprintln!("skipping: process has CAP_NET_ADMIN, cap-missing branch is unreachable");
+            return;
+        }
+        match open_tap("rusternetes-test-should-never-be-created") {
+            Err(OpenTapError::MissingCapability(CapabilityError::MissingCapNetAdmin)) => {}
+            Err(other) => panic!(
+                "expected OpenTapError::MissingCapability(MissingCapNetAdmin), got Err({other:?})"
+            ),
+            Ok(_) => panic!(
+                "open_tap unexpectedly succeeded without CAP_NET_ADMIN — \
+                 the preflight is not wired"
+            ),
         }
     }
 }
