@@ -261,6 +261,35 @@ impl<F: TapFactory> Netstack<F> {
     pub fn allocator(&self) -> &Arc<PodIpAllocator> {
         &self.allocator
     }
+
+    /// Register a Service VIP. The Service-watcher (Phase 4
+    /// follow-up) calls this for each `ClusterIP` Service it sees.
+    /// `backends` is the EndpointSlice-derived list of ready
+    /// `(pod_ip, target_port)` pairs.
+    ///
+    /// Idempotency: re-binding the same VIP is a caller bug
+    /// (Service-watcher should `unbind_tcp_service` first); returns
+    /// `Err` rather than silently leaking the previous listener pool.
+    pub async fn bind_tcp_service(
+        &self,
+        vip: std::net::SocketAddr,
+        backends: Vec<std::net::SocketAddr>,
+        pool_size: usize,
+    ) -> anyhow::Result<()> {
+        let picker = Arc::new(crate::dispatch::RoundRobinPicker::new(backends));
+        let podnet = self.runtime.podnet();
+        let mut net = podnet.lock().await;
+        net.bind_tcp_service(vip, picker, pool_size)
+    }
+
+    /// Tear down a previously-bound Service VIP. Idempotent (returns
+    /// `false` for an unknown VIP). Service-watcher calls this when
+    /// a Service is deleted.
+    pub async fn unbind_tcp_service(&self, vip: std::net::SocketAddr) -> bool {
+        let podnet = self.runtime.podnet();
+        let mut net = podnet.lock().await;
+        net.unbind_tcp_service(vip)
+    }
 }
 
 /// Derive a TAP name from a pod identifier. Linux TAP names are
@@ -293,6 +322,16 @@ pub trait NetstackHandle: Send + Sync + 'static {
     async fn stop_pod(&self, pod_id: &str) -> bool;
     /// See [`Netstack::pod_count`].
     async fn pod_count(&self) -> usize;
+    /// See [`Netstack::bind_tcp_service`]. Used by the Service-watcher
+    /// (Phase 4 follow-up) to install Service-VIP listener pools.
+    async fn bind_tcp_service(
+        &self,
+        vip: std::net::SocketAddr,
+        backends: Vec<std::net::SocketAddr>,
+        pool_size: usize,
+    ) -> anyhow::Result<()>;
+    /// See [`Netstack::unbind_tcp_service`].
+    async fn unbind_tcp_service(&self, vip: std::net::SocketAddr) -> bool;
 }
 
 #[async_trait]
@@ -305,6 +344,17 @@ impl<F: TapFactory> NetstackHandle for Netstack<F> {
     }
     async fn pod_count(&self) -> usize {
         Netstack::pod_count(self).await
+    }
+    async fn bind_tcp_service(
+        &self,
+        vip: std::net::SocketAddr,
+        backends: Vec<std::net::SocketAddr>,
+        pool_size: usize,
+    ) -> anyhow::Result<()> {
+        Netstack::bind_tcp_service(self, vip, backends, pool_size).await
+    }
+    async fn unbind_tcp_service(&self, vip: std::net::SocketAddr) -> bool {
+        Netstack::unbind_tcp_service(self, vip).await
     }
 }
 
@@ -378,6 +428,26 @@ mod tests {
         assert_eq!(ns.pod_count().await, 1);
         assert!(ns.stop_pod("default_pod-abc").await);
         assert_eq!(ns.pod_count().await, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn netstack_handle_bind_unbind_tcp_service_through_trait_object() {
+        // Service-watcher's call sites — same `Arc<dyn NetstackHandle>`
+        // kubelet holds; needs bind/unbind on it.
+        let factory = FakeTapFactory::new();
+        let ns: Arc<dyn NetstackHandle> =
+            Arc::new(Netstack::new(default_config(), factory).unwrap());
+
+        let vip: std::net::SocketAddr = "10.96.0.1:443".parse().unwrap();
+        let backends: Vec<std::net::SocketAddr> = vec!["10.244.0.5:6443".parse().unwrap()];
+
+        ns.bind_tcp_service(vip, backends.clone(), 4).await.unwrap();
+        // Re-bind is a caller bug (Service-watcher must unbind first).
+        assert!(ns.bind_tcp_service(vip, backends, 4).await.is_err());
+
+        // Idempotent unbind.
+        assert!(ns.unbind_tcp_service(vip).await);
+        assert!(!ns.unbind_tcp_service(vip).await);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -358,6 +358,30 @@ impl PodNet {
         self.tcp_listeners.len()
     }
 
+    /// Tear down a previously-bound Service VIP. Aborts every socket
+    /// in the listener pool (in-flight connections get RST) and
+    /// removes the entries from the SocketSet so they free their
+    /// ring buffers. Returns `true` if the VIP was bound.
+    ///
+    /// Service-watcher (Phase 4 follow-up) calls this when a
+    /// Service is deleted from the cluster. Idempotent: returns
+    /// `false` on the second call for the same VIP.
+    pub fn unbind_tcp_service(&mut self, vip: SocketAddr) -> bool {
+        let Some(pool) = self.tcp_listeners.remove(&vip) else {
+            return false;
+        };
+        let Self { sockets, .. } = self;
+        for entry in pool.entries {
+            // abort() flushes any in-flight connection; the next
+            // poll moves the socket to Closed.
+            let sock = sockets.get_mut::<tcp::Socket>(entry.handle);
+            sock.abort();
+            sockets.remove(entry.handle);
+        }
+        debug!(?vip, "PodNet: unbound TCP Service VIP");
+        true
+    }
+
     /// Drive one round of smoltcp polling. Inbound packets in the
     /// shared RX queue get delivered to bound sockets; outbound packets
     /// the sockets produce land on the matching pod's egress queue.
