@@ -195,12 +195,21 @@ pub struct TypeMeta {
 }
 
 /// Resource status phase
+///
+/// `Unknown` carries `#[serde(alias = "")]` because kubectl / client-go send
+/// `status: { phase: "" }` on CREATE for resources where the server assigns
+/// the phase (namespace, pod, etc.). Upstream Kubernetes accepts the empty
+/// string and overwrites it; without this alias `Option<Phase>` rejects the
+/// empty inner string and the api-server returns 422 before any handler
+/// runs, breaking every kubectl-driven CREATE including the one hydrophone
+/// + sonobuoy issue to bootstrap their test namespace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Phase {
     Pending,
     Running,
     Succeeded,
     Failed,
+    #[serde(alias = "")]
     Unknown,
     Active,
     Terminating,
@@ -874,5 +883,51 @@ mod tests {
         // Re-serialize (as our API server does when responding to client)
         let json2 = serde_json::to_string(&meta2).unwrap();
         assert_eq!(json, json2, "Timestamp should survive round-trip");
+    }
+
+    /// Regression: kubectl / client-go send `status: { phase: "" }` on CREATE
+    /// for namespace/pod/etc. — server is meant to assign the phase. Without
+    /// `#[serde(alias = "")]` on `Phase::Unknown` the api-server returned 422
+    /// before any handler ran and `kubectl create ns <X>` was uniformly broken,
+    /// taking hydrophone + sonobuoy down with it.
+    #[test]
+    fn phase_accepts_empty_string_on_input() {
+        let p: Phase = serde_json::from_str(r#""""#).unwrap();
+        assert_eq!(p, Phase::Unknown);
+    }
+
+    #[test]
+    fn phase_named_variants_still_deserialize() {
+        for (input, expected) in [
+            (r#""Pending""#, Phase::Pending),
+            (r#""Running""#, Phase::Running),
+            (r#""Active""#, Phase::Active),
+            (r#""Terminating""#, Phase::Terminating),
+            (r#""Unknown""#, Phase::Unknown),
+        ] {
+            let parsed: Phase = serde_json::from_str(input).unwrap();
+            assert_eq!(
+                parsed, expected,
+                "input {} should yield {:?}",
+                input, expected
+            );
+        }
+    }
+
+    /// Output wire format must NOT change: `Phase::Unknown` still serializes as
+    /// `"Unknown"`, not the empty string. The alias is an input-only synonym so
+    /// upstream-shape persistence is preserved.
+    #[test]
+    fn phase_unknown_serializes_as_unknown_not_empty() {
+        let json = serde_json::to_string(&Phase::Unknown).unwrap();
+        assert_eq!(json, r#""Unknown""#);
+    }
+
+    /// Genuinely invalid variants must still fail loudly — the alias is only
+    /// for the empty string, not a catch-all.
+    #[test]
+    fn phase_rejects_unknown_non_empty_variants() {
+        let r: Result<Phase, _> = serde_json::from_str(r#""NotAPhase""#);
+        assert!(r.is_err(), "unknown non-empty variant must error");
     }
 }

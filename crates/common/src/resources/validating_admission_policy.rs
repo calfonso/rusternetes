@@ -3,6 +3,7 @@
 // This module defines ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding
 // resources that enable CEL-based admission control.
 
+use crate::resources::serde_helpers::empty_string_as_none;
 use crate::resources::{LabelSelector, MatchCondition};
 use crate::types::ObjectMeta;
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,11 @@ pub struct ValidatingAdmissionPolicySpec {
     pub validations: Option<Vec<Validation>>,
 
     /// FailurePolicy defines how to handle failures for the admission policy
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub failure_policy: Option<FailurePolicy>,
 
     /// AuditAnnotations contains CEL expressions which are used to produce audit annotations
@@ -98,7 +103,11 @@ pub struct MatchResources {
     pub exclude_resource_rules: Option<Vec<NamedRuleWithOperations>>,
 
     /// MatchPolicy defines how the "rules" list is used to match incoming requests
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub match_policy: Option<MatchPolicyType>,
 }
 
@@ -368,7 +377,11 @@ pub struct ParamRef {
     pub selector: Option<LabelSelector>,
 
     /// ParameterNotFoundAction controls the behavior when the param resource is not found
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub parameter_not_found_action: Option<ParameterNotFoundAction>,
 }
 
