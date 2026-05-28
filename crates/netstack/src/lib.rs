@@ -17,6 +17,10 @@
 //!
 //! ### Scope of this crate
 //!
+//! - [`alloc`] — `PodIpAllocator`: the unified IP pool kubelet draws
+//!   from when starting a pod. Replaces the per-Docker-bridge IP
+//!   discovery that currently makes cross-kubelet networking
+//!   impossible.
 //! - [`capabilities`] — startup preflight: verify
 //!   `CAP_NET_ADMIN` is in the effective capability set so the process
 //!   fails fast at boot with an actionable error instead of `EPERM` on
@@ -49,6 +53,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod alloc;
 pub mod capabilities;
 pub mod dispatch;
 pub mod iface;
