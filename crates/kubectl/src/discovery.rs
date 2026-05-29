@@ -101,11 +101,10 @@ pub struct RestMapper {
 }
 
 impl RestMapper {
-    pub fn new(mappings: Vec<ResourceMapping>) -> Self {
+    pub fn new(mut mappings: Vec<ResourceMapping>) -> Self {
         // Order so the core group is preferred on key collisions: sort with
         // core ("") first. Insertion is first-writer-wins, so core entries
         // claim shared keys (e.g. "events", "Event") ahead of grouped ones.
-        let mut mappings = mappings;
         mappings.sort_by(|a, b| {
             (!a.group.is_empty())
                 .cmp(&(!b.group.is_empty()))
@@ -134,6 +133,7 @@ impl RestMapper {
             .map(|&i| &self.mappings[i])
     }
 
+    /// Returns all mappings in preference order (core group first).
     pub fn all(&self) -> &[ResourceMapping] {
         &self.mappings
     }
@@ -215,6 +215,7 @@ mod tests {
     #[test]
     fn unknown_resolves_to_none() {
         assert!(mapper().resolve("nonexistentthing").is_none());
+        assert!(mapper().resolve("").is_none());
     }
 
     #[test]
