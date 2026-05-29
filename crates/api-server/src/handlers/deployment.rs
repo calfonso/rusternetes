@@ -60,6 +60,14 @@ pub async fn create(
         crate::handlers::validation::validate_strict_fields(&params, &body, &deployment)?;
     let response_headers = build_warning_headers(&warnings);
 
+    // Field validation (mirrors upstream ValidateDeployment).
+    {
+        let errs = rusternetes_common::validation::apps::validate_deployment(&deployment);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
@@ -220,6 +228,17 @@ pub async fn update(
         deployment.metadata.resource_version.as_deref(),
         &name,
     )?;
+
+    // Field validation (mirrors upstream ValidateDeploymentUpdate).
+    {
+        let errs = rusternetes_common::validation::apps::validate_deployment_update(
+            &deployment,
+            &old_deployment,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     // Selector is immutable post-create (upstream ValidateDeploymentUpdate).
     crate::handlers::lifecycle::validate_selector_immutable(

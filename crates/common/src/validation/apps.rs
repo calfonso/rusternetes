@@ -1,0 +1,373 @@
+//! Deployment field validation — port of upstream Kubernetes
+//! `pkg/apis/apps/validation/validation.go` (release-1.35).
+//!
+//! Two public entry points:
+//! * [`validate_deployment`] — create-path validation (all fields).
+//! * [`validate_deployment_update`] — update-path validation (immutability +
+//!   create checks on the new object).
+//!
+//! Mirrors upstream structure: validators return [`ErrorList`] and *accumulate*
+//! every problem rather than short-circuiting on the first failure. Field paths
+//! and error wording match upstream byte-for-byte so conformance log greps
+//! stay valid.
+//!
+//! Upstream:
+//! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/apps/validation/validation.go>
+
+use crate::resources::deployment::{Deployment, DeploymentStrategy, RollingUpdateDeployment};
+use crate::types::LabelSelector;
+use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::metav1::{validate_label_selector, LabelSelectorValidationOptions};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the selector selects nothing (both fields absent or
+/// empty). An empty selector is forbidden by upstream.
+fn selector_is_empty(sel: &LabelSelector) -> bool {
+    sel.match_labels
+        .as_ref()
+        .is_none_or(|m| m.is_empty())
+        && sel
+            .match_expressions
+            .as_ref()
+            .is_none_or(|m| m.is_empty())
+}
+
+/// Check that template labels contain every key/value from the selector's
+/// `matchLabels`. This is the "template labels must match selector" check.
+/// Upstream in `ValidatePodTemplateSpecForRC` / `ValidateDeploymentSpec`.
+fn template_labels_match_selector(
+    selector: &LabelSelector,
+    template_labels: &std::collections::HashMap<String, String>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(match_labels) = &selector.match_labels {
+        for (k, v) in match_labels {
+            match template_labels.get(k) {
+                None => {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        template_labels
+                            .iter()
+                            .map(|(k2, v2)| format!("{k2}={v2}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        "`selector` does not match template `labels`",
+                    ));
+                    return errs; // one error is enough to convey the mismatch
+                }
+                Some(tv) if tv != v => {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        template_labels
+                            .iter()
+                            .map(|(k2, v2)| format!("{k2}={v2}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        "`selector` does not match template `labels`",
+                    ));
+                    return errs;
+                }
+                _ => {}
+            }
+        }
+    }
+    errs
+}
+
+/// Parse an IntOrString value (serde_json::Value that is either a number or a
+/// percent string like "25%"). Returns `(is_percent, value)` or an error
+/// message.
+fn parse_int_or_string(v: &serde_json::Value) -> Result<(bool, i64), String> {
+    match v {
+        serde_json::Value::Number(n) => {
+            let i = n
+                .as_i64()
+                .ok_or_else(|| "must be an integer or percent string".to_string())?;
+            Ok((false, i))
+        }
+        serde_json::Value::String(s) => {
+            if let Some(pct) = s.strip_suffix('%') {
+                let val: i64 = pct.parse().map_err(|_| format!("invalid percent: {s}"))?;
+                Ok((true, val))
+            } else {
+                // bare string number
+                s.parse::<i64>()
+                    .map(|n| (false, n))
+                    .map_err(|_| format!("must be an integer or percent string, got: {s}"))
+            }
+        }
+        _ => Err("must be an integer or percent string".to_string()),
+    }
+}
+
+/// Validate a single IntOrString field (maxSurge or maxUnavailable).
+/// Returns `(is_zero, errors)`.
+fn validate_int_or_string_field(v: &serde_json::Value, fld_path: &Path) -> (bool, ErrorList) {
+    let mut errs: ErrorList = Vec::new();
+    match parse_int_or_string(v) {
+        Err(msg) => {
+            errs.push(Error::invalid(fld_path, format!("{v}"), msg));
+            (false, errs)
+        }
+        Ok((is_pct, val)) => {
+            if is_pct {
+                if !(0..=100).contains(&val) {
+                    errs.push(Error::invalid(
+                        fld_path,
+                        format!("{v}"),
+                        "must be between 0% and 100%",
+                    ));
+                    return (false, errs);
+                }
+            } else if val < 0 {
+                errs.push(Error::invalid(
+                    fld_path,
+                    val,
+                    "must be greater than or equal to 0",
+                ));
+                return (false, errs);
+            }
+            (val == 0, errs)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strategy validation
+// ---------------------------------------------------------------------------
+
+/// Validate `spec.strategy`. Mirrors upstream `ValidateDeploymentStrategy`.
+fn validate_deployment_strategy(strategy: &DeploymentStrategy, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    match strategy.strategy_type.as_str() {
+        "Recreate" => {
+            // rollingUpdate is forbidden when strategy == Recreate
+            if strategy.rolling_update.is_some() {
+                errs.push(Error::forbidden(
+                    &fld_path.child("rollingUpdate"),
+                    "may not be specified when strategy `type` is `Recreate`",
+                ));
+            }
+        }
+        "RollingUpdate" => {
+            errs.extend(validate_rolling_update_deployment(
+                strategy.rolling_update.as_ref(),
+                &fld_path.child("rollingUpdate"),
+            ));
+        }
+        other => {
+            errs.push(Error::not_supported(
+                &fld_path.child("type"),
+                other.to_string(),
+                &["Recreate", "RollingUpdate"],
+            ));
+        }
+    }
+
+    errs
+}
+
+/// Validate `spec.strategy.rollingUpdate`. Mirrors upstream
+/// `ValidateRollingUpdateDeployment`.
+fn validate_rolling_update_deployment(
+    ru: Option<&RollingUpdateDeployment>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // Default: 25% / 25% (handled upstream by defaulting, but we still
+    // validate whatever is present)
+    let ru = match ru {
+        None => return errs, // nothing to validate if absent
+        Some(r) => r,
+    };
+
+    let max_unavailable_zero;
+    let max_surge_zero;
+
+    // maxUnavailable
+    match &ru.max_unavailable {
+        None => {
+            max_unavailable_zero = true; // treat absent as 0 for the both-zero check
+        }
+        Some(v) => {
+            let (is_zero, sub_errs) =
+                validate_int_or_string_field(v, &fld_path.child("maxUnavailable"));
+            max_unavailable_zero = is_zero;
+            errs.extend(sub_errs);
+        }
+    }
+
+    // maxSurge
+    match &ru.max_surge {
+        None => {
+            max_surge_zero = true; // treat absent as 0 for the both-zero check
+        }
+        Some(v) => {
+            let (is_zero, sub_errs) = validate_int_or_string_field(v, &fld_path.child("maxSurge"));
+            max_surge_zero = is_zero;
+            errs.extend(sub_errs);
+        }
+    }
+
+    // Both cannot be zero simultaneously
+    if max_unavailable_zero && max_surge_zero {
+        errs.push(Error::invalid(
+            fld_path,
+            "".to_string(),
+            "may not be 0 when `maxSurge` is 0",
+        ));
+    }
+
+    errs
+}
+
+// ---------------------------------------------------------------------------
+// Spec validation
+// ---------------------------------------------------------------------------
+
+/// Validate `spec`. Mirrors upstream `ValidateDeploymentSpec`.
+fn validate_deployment_spec(
+    spec: &crate::resources::deployment::DeploymentSpec,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // replicas must be non-negative
+    if let Some(r) = spec.replicas {
+        if r < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("replicas"),
+                r,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // selector is required and must be non-empty
+    if selector_is_empty(&spec.selector) {
+        errs.push(Error::required(
+            &fld_path.child("selector"),
+            "must be specified",
+        ));
+    } else {
+        // validate selector structure
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
+            &fld_path.child("selector"),
+        ));
+
+        // template labels must match selector
+        let template_labels = spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.labels.clone())
+            .unwrap_or_default();
+
+        errs.extend(template_labels_match_selector(
+            &spec.selector,
+            &template_labels,
+            &fld_path.child("template").child("metadata").child("labels"),
+        ));
+    }
+
+    // strategy
+    if let Some(ref strategy) = spec.strategy {
+        errs.extend(validate_deployment_strategy(
+            strategy,
+            &fld_path.child("strategy"),
+        ));
+    }
+
+    // minReadySeconds must be non-negative
+    if let Some(mrs) = spec.min_ready_seconds {
+        if mrs < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("minReadySeconds"),
+                mrs,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // revisionHistoryLimit must be non-negative
+    if let Some(rhl) = spec.revision_history_limit {
+        if rhl < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("revisionHistoryLimit"),
+                rhl,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // progressDeadlineSeconds must be > minReadySeconds
+    if let Some(pds) = spec.progress_deadline_seconds {
+        if pds <= 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("progressDeadlineSeconds"),
+                pds,
+                "must be greater than 0",
+            ));
+        } else {
+            let min_ready = spec.min_ready_seconds.unwrap_or(0);
+            if pds <= min_ready {
+                errs.push(Error::invalid(
+                    &fld_path.child("progressDeadlineSeconds"),
+                    pds,
+                    format!("must be greater than minReadySeconds ({min_ready})"),
+                ));
+            }
+        }
+    }
+
+    errs
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Validate a new `Deployment`. Mirrors upstream `ValidateDeployment`.
+///
+/// Returns an empty `ErrorList` if the object is valid. Each entry in a
+/// non-empty list corresponds to one invalid field.
+pub fn validate_deployment(d: &Deployment) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // spec is effectively required (the struct always has one, but validate it)
+    errs.extend(validate_deployment_spec(&d.spec, &Path::new("spec")));
+
+    errs
+}
+
+/// Validate a `Deployment` update (`new` replaces `old`). Mirrors upstream
+/// `ValidateDeploymentUpdate`.
+///
+/// Checks:
+/// 1. selector is immutable (already enforced by the handler but re-checked
+///    here for completeness / testing).
+/// 2. All create-side constraints on the new object.
+pub fn validate_deployment_update(new: &Deployment, old: &Deployment) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // selector is immutable
+    if new.spec.selector != old.spec.selector {
+        errs.push(Error::forbidden(
+            &Path::new("spec").child("selector"),
+            "field is immutable",
+        ));
+    }
+
+    // Full spec validation on the new object
+    errs.extend(validate_deployment_spec(&new.spec, &Path::new("spec")));
+
+    errs
+}
