@@ -73,9 +73,10 @@ jobs:
     # ~40-50 min cold. Run 26126002894 timed out at the 30-min ceiling
     # on the scheduler build. PR #190 (Dockerfile.services) consolidated
     # those into one shared builder stage; the new steady-state cold
-    # build hasn't been measured yet, so keep 60 until we have a
-    # measurement to ratchet down to.
-    timeout-minutes: 60
+    # build hasn't been measured yet. Build is ~12 min; the conformance
+    # step itself needs up to 90 min (322 focused specs, single ginkgo
+    # thread). Job ceiling must clear build + 90 + teardown, hence 150.
+    timeout-minutes: 150
 
     steps:
       - name: Checkout
@@ -270,7 +271,10 @@ jobs:
         # regex-escaped per entry), runs hydrophone, parses the junit, and
         # exits non-zero if any expected-green test does not pass. Pins the
         # conformance image to v1.35.0 by default — see the script's --help.
-        timeout-minutes: 15
+        # 322 focused specs on a single ginkgo thread; 15 min was too tight
+        # (run 26633232630 ran out mid-suite). Self-hosted runner, no GH
+        # minute cost, so give it room.
+        timeout-minutes: 90
         run: |
           bash scripts/conformance-canary-run.sh \
             --output-dir conformance-out
