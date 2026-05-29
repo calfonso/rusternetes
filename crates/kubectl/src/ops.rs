@@ -42,6 +42,9 @@ pub fn value_namespace(v: &Value) -> Option<String> {
 
 /// Apply a resource Value (create-or-replace). Returns the action taken
 /// ("created" or "configured") and the server response body.
+///
+/// `namespace`: the explicit `-n` flag value, or `None` when unset (falls back
+/// to the body's metadata.namespace, then "default").
 pub async fn apply_value(
     client: &ApiClient,
     m: &ResourceMapping,
@@ -117,5 +120,25 @@ mod tests {
             build_path(&dep, Some("prod"), None),
             "/apis/apps/v1/namespaces/prod/deployments"
         );
+    }
+
+    #[test]
+    fn cluster_collection_path_no_name() {
+        let pv = m("", "persistentvolumes", false);
+        assert_eq!(build_path(&pv, None, None), "/api/v1/persistentvolumes");
+    }
+
+    #[test]
+    fn reads_metadata_name() {
+        let v = serde_json::json!({"metadata": {"name": "foo", "namespace": "bar"}});
+        assert_eq!(value_name(&v).as_deref(), Some("foo"));
+        assert_eq!(value_namespace(&v).as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn missing_metadata_is_none() {
+        let v = serde_json::json!({"spec": {}});
+        assert!(value_name(&v).is_none());
+        assert!(value_namespace(&v).is_none());
     }
 }
