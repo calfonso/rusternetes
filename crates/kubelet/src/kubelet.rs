@@ -194,6 +194,53 @@ impl Kubelet {
         now.saturating_sub(last) <= stale_after
     }
 
+    /// Ensure the node-heartbeat Lease carries an `OwnerReference` back to its
+    /// owning Node.
+    ///
+    /// The conformance test `[sig-node] NodeLease should have OwnerReferences set`
+    /// (k8s.io/kubernetes/test/e2e/common/node/node_lease.go) asserts that every
+    /// kubelet-managed Lease in `kube-node-lease` references its Node via a
+    /// single owner reference with apiVersion `v1`, kind `Node`, the node's
+    /// name, and the node's UID.
+    ///
+    /// Upstream kubelet's `pkg/kubelet/nodelease/controller.go` `setOwnerFunc`
+    /// has the same self-heal semantics that this helper implements: if the
+    /// stored Lease already carries a matching owner reference it is left
+    /// alone, otherwise the field is overwritten with the single canonical
+    /// reference. Returns `true` if the lease metadata was mutated.
+    fn apply_node_lease_owner_ref(
+        lease: &mut rusternetes_common::resources::Lease,
+        node_name: &str,
+        node_uid: &str,
+    ) -> bool {
+        if node_uid.is_empty() {
+            return false;
+        }
+        let matches_existing = lease
+            .metadata
+            .owner_references
+            .as_ref()
+            .and_then(|refs| refs.first())
+            .map(|owner| {
+                owner.api_version == "v1"
+                    && owner.kind == "Node"
+                    && owner.name == node_name
+                    && owner.uid == node_uid
+            })
+            .unwrap_or(false);
+        if matches_existing {
+            return false;
+        }
+        let owner = rusternetes_common::types::OwnerReference::new(
+            "v1",
+            "Node",
+            node_name.to_string(),
+            node_uid.to_string(),
+        );
+        lease.metadata.owner_references = Some(vec![owner]);
+        true
+    }
+
     pub async fn run(self: &Arc<Self>) -> Result<()> {
         info!("Kubelet started for node: {}", self.node_name);
 
@@ -313,6 +360,7 @@ impl Kubelet {
             let lease_node_name = self.node_name.clone();
             tokio::spawn(async move {
                 let lease_key = format!("/registry/leases/kube-node-lease/{}", lease_node_name);
+                let node_key = build_key("nodes", None, &lease_node_name);
                 let mut lease_timer = tokio::time::interval(Duration::from_secs(10));
 
                 // Ensure kube-node-lease namespace exists
@@ -330,9 +378,69 @@ impl Kubelet {
                     let _ = lease_storage.create(ns_key, &ns).await;
                 }
 
+                // Look up and cache the Node UID for OwnerReferences. Conformance
+                // test [sig-node] NodeLease "should have OwnerReferences set"
+                // requires every kubelet-managed Lease to carry an ownerRef
+                // back to its Node. K8s ref:
+                // pkg/kubelet/nodelease/controller.go — setOwnerFunc fetches the
+                // node once and stamps the OwnerReference onto every Lease the
+                // kubelet creates or repairs.
+                //
+                // The node UID is immutable after registration, so caching it
+                // avoids a storage lookup on every 10s heartbeat. Retry a few
+                // times in case the node CREATE hasn't been observed yet (e.g.
+                // an etcd compaction or eventual-consistency window).
+                let mut cached_node_uid: Option<String> = None;
+                for attempt in 0..5 {
+                    match lease_storage
+                        .get::<rusternetes_common::resources::Node>(&node_key)
+                        .await
+                    {
+                        Ok(node) if !node.metadata.uid.is_empty() => {
+                            cached_node_uid = Some(node.metadata.uid);
+                            break;
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "Lease heartbeat: node {} has empty UID on attempt {}",
+                                lease_node_name,
+                                attempt
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Lease heartbeat: failed to read node {} for ownerRef (attempt {}): {}",
+                                lease_node_name,
+                                attempt,
+                                e
+                            );
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                if cached_node_uid.is_none() {
+                    tracing::warn!(
+                        "Lease heartbeat: starting without cached node UID for {}; \
+                         ownerReferences will be populated lazily once the node is readable",
+                        lease_node_name
+                    );
+                }
+
                 loop {
                     lease_timer.tick().await;
                     let now = chrono::Utc::now();
+
+                    // Lazy-load the node UID if it wasn't available at startup.
+                    if cached_node_uid.is_none() {
+                        if let Ok(node) = lease_storage
+                            .get::<rusternetes_common::resources::Node>(&node_key)
+                            .await
+                        {
+                            if !node.metadata.uid.is_empty() {
+                                cached_node_uid = Some(node.metadata.uid);
+                            }
+                        }
+                    }
 
                     // Try to update existing lease
                     match lease_storage
@@ -342,6 +450,14 @@ impl Kubelet {
                         Ok(mut lease) => {
                             if let Some(ref mut spec) = lease.spec {
                                 spec.renew_time = Some(now);
+                            }
+                            // Backfill ownerReferences if the existing lease was
+                            // written by an earlier kubelet that didn't set them.
+                            // Upstream kubelet's setOwnerFunc has the same
+                            // self-heal behaviour so a controller restart fixes
+                            // pre-existing leases without manual intervention.
+                            if let Some(uid) = cached_node_uid.as_deref() {
+                                Self::apply_node_lease_owner_ref(&mut lease, &lease_node_name, uid);
                             }
                             match lease_storage.update(&lease_key, &lease).await {
                                 Ok(_) => {
@@ -361,7 +477,7 @@ impl Kubelet {
                         }
                         Err(_) => {
                             // Lease doesn't exist — create it
-                            let lease = rusternetes_common::resources::Lease::new(
+                            let mut lease = rusternetes_common::resources::Lease::new(
                                 lease_node_name.clone(),
                                 "kube-node-lease",
                             )
@@ -376,6 +492,9 @@ impl Kubelet {
                                     strategy: None,
                                 },
                             );
+                            if let Some(uid) = cached_node_uid.as_deref() {
+                                Self::apply_node_lease_owner_ref(&mut lease, &lease_node_name, uid);
+                            }
                             match lease_storage.create(&lease_key, &lease).await {
                                 Ok(_) => {
                                     tracing::debug!(
@@ -4280,6 +4399,99 @@ mod tests {
             last_transition_time: Some(transition),
             observed_generation: None,
         }
+    }
+
+    fn make_node_lease(node_name: &str) -> rusternetes_common::resources::Lease {
+        rusternetes_common::resources::Lease::new(node_name, "kube-node-lease").with_spec(
+            rusternetes_common::resources::LeaseSpec {
+                holder_identity: Some(node_name.to_string()),
+                lease_duration_seconds: Some(40),
+                acquire_time: Some(chrono::Utc::now()),
+                renew_time: Some(chrono::Utc::now()),
+                lease_transitions: Some(0),
+                preferred_holder: None,
+                strategy: None,
+            },
+        )
+    }
+
+    #[test]
+    fn apply_node_lease_owner_ref_sets_canonical_reference() {
+        let mut lease = make_node_lease("node-a");
+        assert!(lease.metadata.owner_references.is_none());
+
+        let mutated = Kubelet::apply_node_lease_owner_ref(
+            &mut lease,
+            "node-a",
+            "11111111-2222-3333-4444-555555555555",
+        );
+
+        assert!(mutated, "first apply must mutate metadata");
+        let refs = lease
+            .metadata
+            .owner_references
+            .as_ref()
+            .expect("owner_references should be set");
+        assert_eq!(refs.len(), 1, "exactly one owner reference is allowed");
+        let owner = &refs[0];
+        assert_eq!(owner.api_version, "v1");
+        assert_eq!(owner.kind, "Node");
+        assert_eq!(owner.name, "node-a");
+        assert_eq!(owner.uid, "11111111-2222-3333-4444-555555555555");
+        // Per upstream nodelease/controller.go: neither controller nor
+        // blockOwnerDeletion is set — the test only requires the four
+        // identity fields.
+        assert!(owner.controller.is_none());
+        assert!(owner.block_owner_deletion.is_none());
+    }
+
+    #[test]
+    fn apply_node_lease_owner_ref_is_idempotent_when_already_correct() {
+        let mut lease = make_node_lease("node-b");
+        let _ = Kubelet::apply_node_lease_owner_ref(&mut lease, "node-b", "uid-b");
+
+        let mutated_again = Kubelet::apply_node_lease_owner_ref(&mut lease, "node-b", "uid-b");
+
+        assert!(
+            !mutated_again,
+            "second apply with identical owner must not mutate metadata"
+        );
+        assert_eq!(
+            lease
+                .metadata
+                .owner_references
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    #[test]
+    fn apply_node_lease_owner_ref_backfills_stale_uid() {
+        let mut lease = make_node_lease("node-c");
+        lease.metadata.owner_references =
+            Some(vec![rusternetes_common::types::OwnerReference::new(
+                "v1", "Node", "node-c", "old-uid",
+            )]);
+
+        let mutated = Kubelet::apply_node_lease_owner_ref(&mut lease, "node-c", "new-uid");
+
+        assert!(mutated, "stale UID must be overwritten");
+        let refs = lease.metadata.owner_references.as_ref().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].uid, "new-uid");
+    }
+
+    #[test]
+    fn apply_node_lease_owner_ref_noop_for_empty_uid() {
+        let mut lease = make_node_lease("node-d");
+        let mutated = Kubelet::apply_node_lease_owner_ref(&mut lease, "node-d", "");
+        assert!(!mutated);
+        assert!(
+            lease.metadata.owner_references.is_none(),
+            "empty UID must never produce an invalid owner reference"
+        );
     }
 
     #[test]
