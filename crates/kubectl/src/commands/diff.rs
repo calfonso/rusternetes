@@ -61,11 +61,7 @@ async fn diff_resource(
     // Determine the effective namespace.
     let ns: Option<String> = if mapping.namespaced {
         let from_body = metadata.get("namespace").and_then(|n| n.as_str());
-        Some(
-            from_body
-                .map(String::from)
-                .unwrap_or_else(|| default_namespace.to_string()),
-        )
+        Some(from_body.unwrap_or(default_namespace).to_string())
     } else {
         None
     };
@@ -77,6 +73,8 @@ async fn diff_resource(
     // a genuine 404 (resource doesn't exist yet → show a creation diff) from
     // any other error (connection failure, permission denied, etc.) which we
     // propagate to the caller.
+    // Can't use ops::get_value here — it erases GetError::NotFound, which we need
+    // for the creation-diff branch.
     let current_yaml = match client.get::<Value>(&api_path).await {
         Ok(current) => {
             // Convert to YAML for diffing
@@ -85,7 +83,10 @@ async fn diff_resource(
         Err(GetError::NotFound) => {
             println!("--- /dev/null");
             println!("+++ {}/{} (create)", kind, name);
-            let new_yaml = serde_yaml::to_string(value)?;
+            // Round-trip through serde_json::Value so keys sort the same way the
+            // live side does (see the changed-resource branch below).
+            let new_json: serde_json::Value = serde_yaml::from_value(value.clone())?;
+            let new_yaml = serde_yaml::to_string(&new_json)?;
             for line in new_yaml.lines() {
                 println!("+{}", line);
             }
@@ -97,8 +98,12 @@ async fn diff_resource(
         }
     };
 
-    // Prepare new resource YAML
-    let new_yaml = serde_yaml::to_string(value)?;
+    // Prepare new resource YAML. Round-trip the desired object through
+    // serde_json::Value so its keys sort identically to the live side (which is
+    // a serde_json::Value → sorted via BTreeMap). Without this, manifests whose
+    // keys aren't already alphabetical would show spurious diffs every run.
+    let new_json: serde_json::Value = serde_yaml::from_value(value.clone())?;
+    let new_yaml = serde_yaml::to_string(&new_json)?;
 
     // Calculate and display diff
     if current_yaml.trim() == new_yaml.trim() {
