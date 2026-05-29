@@ -1146,7 +1146,6 @@ async fn main() -> Result<()> {
                 grace_period,
                 force,
                 cascade: commands::delete::CascadeStrategy::from_str_value(&cascade)?,
-                delete_all: all,
                 dry_run: dry_run.as_deref() == Some("server"),
                 wait,
                 output,

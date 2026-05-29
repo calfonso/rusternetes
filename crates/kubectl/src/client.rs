@@ -170,29 +170,6 @@ impl ApiClient {
         response.json().await.context("Failed to parse response")
     }
 
-    #[allow(dead_code)]
-    pub async fn delete(&self, path: &str) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.delete(&url);
-
-        if let Some(ref token) = self.token {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let response = request
-            .send()
-            .await
-            .context("Failed to send DELETE request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Request failed with status {}: {}", status, body);
-        }
-
-        Ok(())
-    }
-
     /// DELETE with query parameters and optional JSON body (for DeleteOptions).
     /// Returns the response status code (useful for checking 404 on wait-polling).
     pub async fn delete_with_options(

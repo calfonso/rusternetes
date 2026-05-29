@@ -163,6 +163,7 @@ pub async fn delete_value(
     };
     let path = build_path(m, ns.as_deref(), Some(name));
     let full_path = format!("{path}{query}");
+    // query is already encoded into `full_path`; pass no extra query_params
     client.delete_with_options(&full_path, &[], body).await
 }
 

@@ -48,9 +48,6 @@ pub struct DeleteOptions {
     pub force: bool,
     /// Cascade strategy (foreground, background, orphan).
     pub cascade: CascadeStrategy,
-    /// Delete all resources of the type in the namespace.
-    #[allow(dead_code)]
-    pub delete_all: bool,
     /// Server-side dry run — no changes are persisted.
     pub dry_run: bool,
     /// Wait for resources to be fully deleted before returning.
@@ -65,7 +62,6 @@ impl Default for DeleteOptions {
             grace_period: None,
             force: false,
             cascade: CascadeStrategy::Background,
-            delete_all: false,
             dry_run: false,
             wait: false,
             output: None,
@@ -417,255 +413,9 @@ pub async fn execute_enhanced(
     delete_single_resource(client, resource_type, name, Some(namespace), opts).await
 }
 
-#[allow(dead_code)]
-pub async fn execute(
-    client: &ApiClient,
-    resource_type: &str,
-    name: &str,
-    namespace: Option<&str>,
-) -> Result<()> {
-    let opts = DeleteOptions::default();
-    delete_single_resource(client, resource_type, name, namespace, &opts).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---------------------------------------------------------------------------
-    // Legacy path-building helpers — test-only, kept for path-shape coverage.
-    // Production code now uses RestMapper + ops::build_path instead.
-    // ---------------------------------------------------------------------------
-
-    fn get_delete_api_path(kind: &str, namespace: Option<&str>, name: &str) -> Result<String> {
-        let ns = namespace.unwrap_or("default");
-        Ok(match kind {
-            "Pod" => format!("/api/v1/namespaces/{}/pods/{}", ns, name),
-            "Service" => format!("/api/v1/namespaces/{}/services/{}", ns, name),
-            "Deployment" => format!("/apis/apps/v1/namespaces/{}/deployments/{}", ns, name),
-            "StatefulSet" => format!("/apis/apps/v1/namespaces/{}/statefulsets/{}", ns, name),
-            "DaemonSet" => format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", ns, name),
-            "ReplicaSet" => format!("/apis/apps/v1/namespaces/{}/replicasets/{}", ns, name),
-            "Job" => format!("/apis/batch/v1/namespaces/{}/jobs/{}", ns, name),
-            "CronJob" => format!("/apis/batch/v1/namespaces/{}/cronjobs/{}", ns, name),
-            "ConfigMap" => format!("/api/v1/namespaces/{}/configmaps/{}", ns, name),
-            "Secret" => format!("/api/v1/namespaces/{}/secrets/{}", ns, name),
-            "ServiceAccount" => format!("/api/v1/namespaces/{}/serviceaccounts/{}", ns, name),
-            "Ingress" => format!(
-                "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
-                ns, name
-            ),
-            "PersistentVolumeClaim" => {
-                format!("/api/v1/namespaces/{}/persistentvolumeclaims/{}", ns, name)
-            }
-            "PersistentVolume" => format!("/api/v1/persistentvolumes/{}", name),
-            "StorageClass" => format!("/apis/storage.k8s.io/v1/storageclasses/{}", name),
-            "Namespace" => format!("/api/v1/namespaces/{}", name),
-            "Node" => format!("/api/v1/nodes/{}", name),
-            "Role" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
-                ns, name
-            ),
-            "RoleBinding" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
-                ns, name
-            ),
-            "ClusterRole" => format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{}", name),
-            "ClusterRoleBinding" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
-                name
-            ),
-            _ => anyhow::bail!("Unsupported resource kind for deletion: {}", kind),
-        })
-    }
-
-    fn get_list_api_path(resource_type: &str, namespace: &str) -> Result<String> {
-        Ok(match resource_type {
-            "pod" | "pods" => format!("/api/v1/namespaces/{}/pods", namespace),
-            "service" | "services" | "svc" => {
-                format!("/api/v1/namespaces/{}/services", namespace)
-            }
-            "deployment" | "deployments" | "deploy" => {
-                format!("/apis/apps/v1/namespaces/{}/deployments", namespace)
-            }
-            "statefulset" | "statefulsets" | "sts" => {
-                format!("/apis/apps/v1/namespaces/{}/statefulsets", namespace)
-            }
-            "daemonset" | "daemonsets" | "ds" => {
-                format!("/apis/apps/v1/namespaces/{}/daemonsets", namespace)
-            }
-            "replicaset" | "replicasets" | "rs" => {
-                format!("/apis/apps/v1/namespaces/{}/replicasets", namespace)
-            }
-            "job" | "jobs" => format!("/apis/batch/v1/namespaces/{}/jobs", namespace),
-            "cronjob" | "cronjobs" | "cj" => {
-                format!("/apis/batch/v1/namespaces/{}/cronjobs", namespace)
-            }
-            "configmap" | "configmaps" | "cm" => {
-                format!("/api/v1/namespaces/{}/configmaps", namespace)
-            }
-            "secret" | "secrets" => format!("/api/v1/namespaces/{}/secrets", namespace),
-            "serviceaccount" | "serviceaccounts" | "sa" => {
-                format!("/api/v1/namespaces/{}/serviceaccounts", namespace)
-            }
-            "node" | "nodes" => "/api/v1/nodes".to_string(),
-            "namespace" | "namespaces" | "ns" => "/api/v1/namespaces".to_string(),
-            "persistentvolume" | "persistentvolumes" | "pv" => {
-                "/api/v1/persistentvolumes".to_string()
-            }
-            "clusterrole" | "clusterroles" => {
-                "/apis/rbac.authorization.k8s.io/v1/clusterroles".to_string()
-            }
-            "clusterrolebinding" | "clusterrolebindings" => {
-                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings".to_string()
-            }
-            "role" | "roles" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles",
-                namespace
-            ),
-            "rolebinding" | "rolebindings" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings",
-                namespace
-            ),
-            _ => anyhow::bail!("Unsupported resource type for deletion: {}", resource_type),
-        })
-    }
-
-    fn get_resource_api_path(resource_type: &str, name: &str, namespace: &str) -> Result<String> {
-        Ok(match resource_type {
-            "pod" | "pods" => format!("/api/v1/namespaces/{}/pods/{}", namespace, name),
-            "service" | "services" | "svc" => {
-                format!("/api/v1/namespaces/{}/services/{}", namespace, name)
-            }
-            "deployment" | "deployments" | "deploy" => {
-                format!(
-                    "/apis/apps/v1/namespaces/{}/deployments/{}",
-                    namespace, name
-                )
-            }
-            "statefulset" | "statefulsets" | "sts" => {
-                format!(
-                    "/apis/apps/v1/namespaces/{}/statefulsets/{}",
-                    namespace, name
-                )
-            }
-            "daemonset" | "daemonsets" | "ds" => {
-                format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", namespace, name)
-            }
-            "replicaset" | "replicasets" | "rs" => {
-                format!(
-                    "/apis/apps/v1/namespaces/{}/replicasets/{}",
-                    namespace, name
-                )
-            }
-            "job" | "jobs" => format!("/apis/batch/v1/namespaces/{}/jobs/{}", namespace, name),
-            "cronjob" | "cronjobs" | "cj" => {
-                format!("/apis/batch/v1/namespaces/{}/cronjobs/{}", namespace, name)
-            }
-            "configmap" | "configmaps" | "cm" => {
-                format!("/api/v1/namespaces/{}/configmaps/{}", namespace, name)
-            }
-            "secret" | "secrets" => {
-                format!("/api/v1/namespaces/{}/secrets/{}", namespace, name)
-            }
-            "serviceaccount" | "serviceaccounts" | "sa" => {
-                format!("/api/v1/namespaces/{}/serviceaccounts/{}", namespace, name)
-            }
-            "ingress" | "ingresses" | "ing" => {
-                format!(
-                    "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
-                    namespace, name
-                )
-            }
-            "persistentvolumeclaim" | "persistentvolumeclaims" | "pvc" => {
-                format!(
-                    "/api/v1/namespaces/{}/persistentvolumeclaims/{}",
-                    namespace, name
-                )
-            }
-            "persistentvolume" | "persistentvolumes" | "pv" => {
-                format!("/api/v1/persistentvolumes/{}", name)
-            }
-            "storageclass" | "storageclasses" | "sc" => {
-                format!("/apis/storage.k8s.io/v1/storageclasses/{}", name)
-            }
-            "node" | "nodes" => format!("/api/v1/nodes/{}", name),
-            "namespace" | "namespaces" | "ns" => format!("/api/v1/namespaces/{}", name),
-            "role" | "roles" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
-                namespace, name
-            ),
-            "rolebinding" | "rolebindings" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
-                namespace, name
-            ),
-            "clusterrole" | "clusterroles" => {
-                format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{}", name)
-            }
-            "clusterrolebinding" | "clusterrolebindings" => format!(
-                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
-                name
-            ),
-            _ => anyhow::bail!("Unknown resource type: {}", resource_type),
-        })
-    }
-
-    #[test]
-    fn test_get_delete_api_path_pod() {
-        let path = get_delete_api_path("Pod", Some("default"), "my-pod").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/default/pods/my-pod");
-    }
-
-    #[test]
-    fn test_get_delete_api_path_deployment() {
-        let path = get_delete_api_path("Deployment", Some("prod"), "my-deploy").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/prod/deployments/my-deploy");
-    }
-
-    #[test]
-    fn test_get_delete_api_path_namespace_is_cluster_scoped() {
-        let path = get_delete_api_path("Namespace", None, "kube-system").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/kube-system");
-    }
-
-    #[test]
-    fn test_get_delete_api_path_node_is_cluster_scoped() {
-        let path = get_delete_api_path("Node", None, "node-1").unwrap();
-        assert_eq!(path, "/api/v1/nodes/node-1");
-    }
-
-    #[test]
-    fn test_get_delete_api_path_clusterrole() {
-        let path = get_delete_api_path("ClusterRole", None, "admin").unwrap();
-        assert_eq!(
-            path,
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin"
-        );
-    }
-
-    #[test]
-    fn test_get_delete_api_path_unsupported() {
-        let result = get_delete_api_path("UnknownKind", None, "foo");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_get_delete_api_path_default_namespace() {
-        let path = get_delete_api_path("Pod", None, "my-pod").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/default/pods/my-pod");
-    }
-
-    #[test]
-    fn test_get_list_api_path_pods() {
-        let path = get_list_api_path("pods", "default").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/default/pods");
-    }
-
-    #[test]
-    fn test_get_list_api_path_deploy_alias() {
-        let path = get_list_api_path("deploy", "staging").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/staging/deployments");
-    }
 
     #[test]
     fn test_urlencoding() {
@@ -839,36 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_resource_api_path_pod() {
-        let path = get_resource_api_path("pod", "nginx", "default").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/default/pods/nginx");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_deploy_alias() {
-        let path = get_resource_api_path("deploy", "web", "prod").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/prod/deployments/web");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_cluster_scoped_node() {
-        let path = get_resource_api_path("node", "node-1", "default").unwrap();
-        assert_eq!(path, "/api/v1/nodes/node-1");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_cluster_scoped_namespace() {
-        let path = get_resource_api_path("namespace", "kube-system", "default").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/kube-system");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_unsupported() {
-        let result = get_resource_api_path("unknown", "foo", "default");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_delete_body_includes_kind_and_api_version() {
         let opts = DeleteOptions::default();
         let body = opts.delete_body().unwrap();
@@ -891,18 +611,6 @@ mod tests {
         let opts = DeleteOptions::default();
         let body = opts.delete_body().unwrap();
         assert!(body.get("gracePeriodSeconds").is_none());
-    }
-
-    #[test]
-    fn test_list_api_path_cluster_scoped_nodes() {
-        let path = get_list_api_path("nodes", "default").unwrap();
-        assert_eq!(path, "/api/v1/nodes");
-    }
-
-    #[test]
-    fn test_list_api_path_cluster_scoped_namespaces() {
-        let path = get_list_api_path("namespaces", "default").unwrap();
-        assert_eq!(path, "/api/v1/namespaces");
     }
 
     #[test]
@@ -945,7 +653,6 @@ mod tests {
         assert_eq!(opts.grace_period, None);
         assert!(!opts.force);
         assert_eq!(opts.cascade, CascadeStrategy::Background);
-        assert!(!opts.delete_all);
         assert!(!opts.dry_run);
         assert!(!opts.wait);
         assert!(opts.output.is_none());
@@ -1098,299 +805,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_delete_api_path_all_kinds() {
-        assert_eq!(
-            get_delete_api_path("Service", Some("ns1"), "my-svc").unwrap(),
-            "/api/v1/namespaces/ns1/services/my-svc"
-        );
-        assert_eq!(
-            get_delete_api_path("StatefulSet", Some("ns1"), "web").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/statefulsets/web"
-        );
-        assert_eq!(
-            get_delete_api_path("DaemonSet", Some("ns1"), "agent").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/daemonsets/agent"
-        );
-        assert_eq!(
-            get_delete_api_path("ReplicaSet", Some("ns1"), "rs1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/replicasets/rs1"
-        );
-        assert_eq!(
-            get_delete_api_path("Job", Some("ns1"), "j1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/jobs/j1"
-        );
-        assert_eq!(
-            get_delete_api_path("CronJob", Some("ns1"), "cj1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/cronjobs/cj1"
-        );
-        assert_eq!(
-            get_delete_api_path("ConfigMap", Some("ns1"), "cfg").unwrap(),
-            "/api/v1/namespaces/ns1/configmaps/cfg"
-        );
-        assert_eq!(
-            get_delete_api_path("Secret", Some("ns1"), "sec").unwrap(),
-            "/api/v1/namespaces/ns1/secrets/sec"
-        );
-        assert_eq!(
-            get_delete_api_path("ServiceAccount", Some("ns1"), "sa1").unwrap(),
-            "/api/v1/namespaces/ns1/serviceaccounts/sa1"
-        );
-        assert_eq!(
-            get_delete_api_path("Ingress", Some("ns1"), "ing1").unwrap(),
-            "/apis/networking.k8s.io/v1/namespaces/ns1/ingresses/ing1"
-        );
-        assert_eq!(
-            get_delete_api_path("PersistentVolumeClaim", Some("ns1"), "pvc1").unwrap(),
-            "/api/v1/namespaces/ns1/persistentvolumeclaims/pvc1"
-        );
-        assert_eq!(
-            get_delete_api_path("PersistentVolume", None, "pv1").unwrap(),
-            "/api/v1/persistentvolumes/pv1"
-        );
-        assert_eq!(
-            get_delete_api_path("StorageClass", None, "standard").unwrap(),
-            "/apis/storage.k8s.io/v1/storageclasses/standard"
-        );
-        assert_eq!(
-            get_delete_api_path("Role", Some("ns1"), "role1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns1/roles/role1"
-        );
-        assert_eq!(
-            get_delete_api_path("RoleBinding", Some("ns1"), "rb1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns1/rolebindings/rb1"
-        );
-        assert_eq!(
-            get_delete_api_path("ClusterRoleBinding", None, "crb1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/crb1"
-        );
-    }
-
-    #[test]
-    fn test_get_list_api_path_all_types() {
-        assert_eq!(
-            get_list_api_path("services", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/services"
-        );
-        assert_eq!(
-            get_list_api_path("svc", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/services"
-        );
-        assert_eq!(
-            get_list_api_path("statefulsets", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/statefulsets"
-        );
-        assert_eq!(
-            get_list_api_path("sts", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/statefulsets"
-        );
-        assert_eq!(
-            get_list_api_path("daemonsets", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/daemonsets"
-        );
-        assert_eq!(
-            get_list_api_path("ds", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/daemonsets"
-        );
-        assert_eq!(
-            get_list_api_path("replicasets", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/replicasets"
-        );
-        assert_eq!(
-            get_list_api_path("rs", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/replicasets"
-        );
-        assert_eq!(
-            get_list_api_path("jobs", "ns1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/jobs"
-        );
-        assert_eq!(
-            get_list_api_path("cronjobs", "ns1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/cronjobs"
-        );
-        assert_eq!(
-            get_list_api_path("cj", "ns1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/cronjobs"
-        );
-        assert_eq!(
-            get_list_api_path("configmaps", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/configmaps"
-        );
-        assert_eq!(
-            get_list_api_path("cm", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/configmaps"
-        );
-        assert_eq!(
-            get_list_api_path("secrets", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/secrets"
-        );
-        assert_eq!(
-            get_list_api_path("serviceaccounts", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/serviceaccounts"
-        );
-        assert_eq!(
-            get_list_api_path("sa", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/serviceaccounts"
-        );
-        assert_eq!(
-            get_list_api_path("persistentvolumes", "ns1").unwrap(),
-            "/api/v1/persistentvolumes"
-        );
-        assert_eq!(
-            get_list_api_path("pv", "ns1").unwrap(),
-            "/api/v1/persistentvolumes"
-        );
-        assert_eq!(
-            get_list_api_path("clusterroles", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles"
-        );
-        assert_eq!(
-            get_list_api_path("clusterrolebindings", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings"
-        );
-        assert_eq!(
-            get_list_api_path("roles", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns1/roles"
-        );
-        assert_eq!(
-            get_list_api_path("rolebindings", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns1/rolebindings"
-        );
-    }
-
-    #[test]
-    fn test_get_list_api_path_unsupported() {
-        assert!(get_list_api_path("foobar", "default").is_err());
-    }
-
-    #[test]
-    fn test_get_resource_api_path_all_types() {
-        assert_eq!(
-            get_resource_api_path("service", "svc1", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/services/svc1"
-        );
-        assert_eq!(
-            get_resource_api_path("svc", "svc1", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/services/svc1"
-        );
-        assert_eq!(
-            get_resource_api_path("statefulset", "web", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/statefulsets/web"
-        );
-        assert_eq!(
-            get_resource_api_path("sts", "web", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/statefulsets/web"
-        );
-        assert_eq!(
-            get_resource_api_path("daemonset", "ds1", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/daemonsets/ds1"
-        );
-        assert_eq!(
-            get_resource_api_path("ds", "ds1", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/daemonsets/ds1"
-        );
-        assert_eq!(
-            get_resource_api_path("replicaset", "rs1", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/replicasets/rs1"
-        );
-        assert_eq!(
-            get_resource_api_path("rs", "rs1", "ns1").unwrap(),
-            "/apis/apps/v1/namespaces/ns1/replicasets/rs1"
-        );
-        assert_eq!(
-            get_resource_api_path("job", "j1", "ns1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/jobs/j1"
-        );
-        assert_eq!(
-            get_resource_api_path("cronjob", "cj1", "ns1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/cronjobs/cj1"
-        );
-        assert_eq!(
-            get_resource_api_path("cj", "cj1", "ns1").unwrap(),
-            "/apis/batch/v1/namespaces/ns1/cronjobs/cj1"
-        );
-        assert_eq!(
-            get_resource_api_path("configmap", "cfg", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/configmaps/cfg"
-        );
-        assert_eq!(
-            get_resource_api_path("cm", "cfg", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/configmaps/cfg"
-        );
-        assert_eq!(
-            get_resource_api_path("secret", "sec", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/secrets/sec"
-        );
-        assert_eq!(
-            get_resource_api_path("serviceaccount", "sa1", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/serviceaccounts/sa1"
-        );
-        assert_eq!(
-            get_resource_api_path("sa", "sa1", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/serviceaccounts/sa1"
-        );
-        assert_eq!(
-            get_resource_api_path("ingress", "ing1", "ns1").unwrap(),
-            "/apis/networking.k8s.io/v1/namespaces/ns1/ingresses/ing1"
-        );
-        assert_eq!(
-            get_resource_api_path("ing", "ing1", "ns1").unwrap(),
-            "/apis/networking.k8s.io/v1/namespaces/ns1/ingresses/ing1"
-        );
-        assert_eq!(
-            get_resource_api_path("persistentvolumeclaim", "pvc1", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/persistentvolumeclaims/pvc1"
-        );
-        assert_eq!(
-            get_resource_api_path("pvc", "pvc1", "ns1").unwrap(),
-            "/api/v1/namespaces/ns1/persistentvolumeclaims/pvc1"
-        );
-        assert_eq!(
-            get_resource_api_path("persistentvolume", "pv1", "ns1").unwrap(),
-            "/api/v1/persistentvolumes/pv1"
-        );
-        assert_eq!(
-            get_resource_api_path("pv", "pv1", "ns1").unwrap(),
-            "/api/v1/persistentvolumes/pv1"
-        );
-        assert_eq!(
-            get_resource_api_path("storageclass", "standard", "ns1").unwrap(),
-            "/apis/storage.k8s.io/v1/storageclasses/standard"
-        );
-        assert_eq!(
-            get_resource_api_path("sc", "standard", "ns1").unwrap(),
-            "/apis/storage.k8s.io/v1/storageclasses/standard"
-        );
-        assert_eq!(
-            get_resource_api_path("ns", "kube-system", "default").unwrap(),
-            "/api/v1/namespaces/kube-system"
-        );
-        assert_eq!(
-            get_resource_api_path("role", "r1", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns1/roles/r1"
-        );
-        assert_eq!(
-            get_resource_api_path("rolebinding", "rb1", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns1/rolebindings/rb1"
-        );
-        assert_eq!(
-            get_resource_api_path("clusterrole", "admin", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin"
-        );
-        assert_eq!(
-            get_resource_api_path("clusterroles", "admin", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin"
-        );
-        assert_eq!(
-            get_resource_api_path("clusterrolebinding", "crb1", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/crb1"
-        );
-        assert_eq!(
-            get_resource_api_path("clusterrolebindings", "crb1", "ns1").unwrap(),
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/crb1"
-        );
-    }
-
-    #[test]
     fn test_urlencoding_special_chars() {
         assert_eq!(urlencoding::encode("key/value"), "key%2Fvalue");
         assert_eq!(urlencoding::encode("a&b"), "a%26b");
@@ -1469,13 +883,6 @@ mod tests {
 
     fn make_test_client() -> ApiClient {
         ApiClient::new("http://127.0.0.1:1", true, None).unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_execute_returns_err_on_unreachable() {
-        let client = make_test_client();
-        let result = execute(&client, "pod", "nginx", Some("default")).await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1571,13 +978,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_no_namespace_defaults() {
-        let client = make_test_client();
-        let result = execute(&client, "pod", "nginx", None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_delete_single_resource_unsupported_type() {
         // With RestMapper, an unsupported type fails either at discovery (no server)
         // or at resolve (unknown kind). Either way it must return an error.
@@ -1613,31 +1013,6 @@ mod tests {
         assert!(opts.wait);
         assert!(!opts.dry_run);
         assert!(!opts.force);
-    }
-
-    #[test]
-    fn test_delete_options_delete_all_field() {
-        let opts = DeleteOptions {
-            delete_all: true,
-            ..Default::default()
-        };
-        assert!(opts.delete_all);
-    }
-
-    #[test]
-    fn test_get_list_api_path_ingress_unsupported() {
-        // ingress is not in get_list_api_path
-        let result = get_list_api_path("ingress", "default");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_get_resource_api_path_ingress() {
-        let path = get_resource_api_path("ing", "my-ingress", "default").unwrap();
-        assert_eq!(
-            path,
-            "/apis/networking.k8s.io/v1/namespaces/default/ingresses/my-ingress"
-        );
     }
 
     #[tokio::test]
