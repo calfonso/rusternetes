@@ -357,6 +357,7 @@ impl ApiClient {
             anyhow::bail!("discovery request to {url} failed: {status}: {text}");
         }
 
-        serde_json::from_str(&text).context("Failed to parse discovery response as JSON")
+        serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse discovery response from {url} as JSON"))
     }
 }

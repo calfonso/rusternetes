@@ -1,5 +1,6 @@
 #![allow(dead_code)] // consumed by later tasks in this branch
-use anyhow::Result;
+use crate::client::ApiClient;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -144,8 +145,7 @@ impl RestMapper {
     /// Build a mapper from the api-server's aggregated discovery. Fetches both
     /// the core group (`/api`) and all named groups (`/apis`) — one HTTP call
     /// each — and merges them.
-    pub async fn from_server(client: &crate::client::ApiClient) -> anyhow::Result<Self> {
-        use anyhow::Context;
+    pub async fn from_server(client: &ApiClient) -> anyhow::Result<Self> {
         let core = client
             .get_raw_with_accept("/api", Self::AGG_ACCEPT)
             .await
