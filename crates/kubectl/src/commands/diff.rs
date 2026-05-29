@@ -1,6 +1,9 @@
 use crate::client::{ApiClient, GetError};
+use crate::discovery::RestMapper;
+use crate::ops::build_path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 use std::fs;
 use std::io::{self, Read};
 
@@ -16,6 +19,9 @@ pub async fn execute(client: &ApiClient, file: &str, namespace: &str) -> Result<
         fs::read_to_string(file).context("Failed to read file")?
     };
 
+    // Build the REST mapper once for all documents in this file.
+    let mapper = RestMapper::from_server(client).await?;
+
     // Support for multi-document YAML files
     for document in serde_yaml::Deserializer::from_str(&contents) {
         let value = serde_yaml::Value::deserialize(document)?;
@@ -24,7 +30,7 @@ pub async fn execute(client: &ApiClient, file: &str, namespace: &str) -> Result<
             continue;
         }
 
-        diff_resource(client, &value, namespace).await?;
+        diff_resource(client, &mapper, &value, namespace).await?;
     }
 
     Ok(())
@@ -32,6 +38,7 @@ pub async fn execute(client: &ApiClient, file: &str, namespace: &str) -> Result<
 
 async fn diff_resource(
     client: &ApiClient,
+    mapper: &RestMapper,
     value: &serde_yaml::Value,
     default_namespace: &str,
 ) -> Result<()> {
@@ -46,16 +53,31 @@ async fn diff_resource(
         .and_then(|n| n.as_str())
         .context("Missing 'name' in metadata")?;
 
-    let namespace = metadata
-        .get("namespace")
-        .and_then(|n| n.as_str())
-        .unwrap_or(default_namespace);
+    // Resolve the kind via the server-side REST mapper.
+    let mapping = mapper.resolve(kind).ok_or_else(|| {
+        anyhow::anyhow!("error: the server doesn't have a resource type \"{kind}\"")
+    })?;
 
-    // Construct API path based on resource kind
-    let api_path = get_resource_api_path(kind, namespace, name)?;
+    // Determine the effective namespace.
+    let ns: Option<String> = if mapping.namespaced {
+        let from_body = metadata.get("namespace").and_then(|n| n.as_str());
+        Some(
+            from_body
+                .map(String::from)
+                .unwrap_or_else(|| default_namespace.to_string()),
+        )
+    } else {
+        None
+    };
 
-    // Get current resource
-    let current_yaml = match client.get::<serde_json::Value>(&api_path).await {
+    // Build the item path and fetch the live object.
+    let api_path = build_path(mapping, ns.as_deref(), Some(name));
+
+    // Fetch the live object. We match on GetError so we can cleanly distinguish
+    // a genuine 404 (resource doesn't exist yet → show a creation diff) from
+    // any other error (connection failure, permission denied, etc.) which we
+    // propagate to the caller.
+    let current_yaml = match client.get::<Value>(&api_path).await {
         Ok(current) => {
             // Convert to YAML for diffing
             serde_yaml::to_string(&current)?
@@ -113,149 +135,196 @@ async fn diff_resource(
     Ok(())
 }
 
-fn get_resource_api_path(kind: &str, namespace: &str, name: &str) -> Result<String> {
-    Ok(match kind {
-        "Pod" => format!("/api/v1/namespaces/{}/pods/{}", namespace, name),
-        "Service" => format!("/api/v1/namespaces/{}/services/{}", namespace, name),
-        "Deployment" => format!(
-            "/apis/apps/v1/namespaces/{}/deployments/{}",
-            namespace, name
-        ),
-        "StatefulSet" => format!(
-            "/apis/apps/v1/namespaces/{}/statefulsets/{}",
-            namespace, name
-        ),
-        "DaemonSet" => format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", namespace, name),
-        "ReplicaSet" => format!(
-            "/apis/apps/v1/namespaces/{}/replicasets/{}",
-            namespace, name
-        ),
-        "Job" => format!("/apis/batch/v1/namespaces/{}/jobs/{}", namespace, name),
-        "CronJob" => format!("/apis/batch/v1/namespaces/{}/cronjobs/{}", namespace, name),
-        "ConfigMap" => format!("/api/v1/namespaces/{}/configmaps/{}", namespace, name),
-        "Secret" => format!("/api/v1/namespaces/{}/secrets/{}", namespace, name),
-        "ServiceAccount" => format!("/api/v1/namespaces/{}/serviceaccounts/{}", namespace, name),
-        "Ingress" => format!(
-            "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
-            namespace, name
-        ),
-        "PersistentVolumeClaim" => format!(
-            "/api/v1/namespaces/{}/persistentvolumeclaims/{}",
-            namespace, name
-        ),
-        "PersistentVolume" => format!("/api/v1/persistentvolumes/{}", name),
-        "StorageClass" => format!("/apis/storage.k8s.io/v1/storageclasses/{}", name),
-        "Namespace" => format!("/api/v1/namespaces/{}", name),
-        "Node" => format!("/api/v1/nodes/{}", name),
-        "Role" => format!(
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
-            namespace, name
-        ),
-        "RoleBinding" => format!(
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
-            namespace, name
-        ),
-        "ClusterRole" => format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{}", name),
-        "ClusterRoleBinding" => format!(
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
-            name
-        ),
-        "ResourceQuota" => format!("/api/v1/namespaces/{}/resourcequotas/{}", namespace, name),
-        "LimitRange" => format!("/api/v1/namespaces/{}/limitranges/{}", namespace, name),
-        "PriorityClass" => format!("/apis/scheduling.k8s.io/v1/priorityclasses/{}", name),
-        "CustomResourceDefinition" => format!(
-            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{}",
-            name
-        ),
-        _ => anyhow::bail!("Unsupported resource kind: {}", kind),
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::discovery::{ResourceMapping, RestMapper};
+    use crate::ops::build_path;
 
-    #[test]
-    fn test_get_resource_api_path_pod() {
-        let path = get_resource_api_path("Pod", "default", "nginx").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/default/pods/nginx");
+    fn mapping(
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        namespaced: bool,
+    ) -> ResourceMapping {
+        ResourceMapping {
+            group: group.into(),
+            version: version.into(),
+            kind: kind.into(),
+            plural: plural.into(),
+            singular: kind.to_lowercase(),
+            namespaced,
+            verbs: vec![],
+            short_names: vec![],
+        }
     }
 
-    #[test]
-    fn test_get_resource_api_path_deployment() {
-        let path = get_resource_api_path("Deployment", "prod", "web").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/prod/deployments/web");
+    fn mapper_with(mappings: Vec<ResourceMapping>) -> RestMapper {
+        RestMapper::new(mappings)
     }
 
-    #[test]
-    fn test_get_resource_api_path_cluster_scoped_pv() {
-        let path = get_resource_api_path("PersistentVolume", "ignored", "pv-1").unwrap();
-        assert_eq!(path, "/api/v1/persistentvolumes/pv-1");
-    }
+    // ---------------------------------------------------------------------------
+    // Path-building tests: verify that build_path (used by diff_resource) produces
+    // the correct API paths for a variety of resource kinds via the mapper.
+    // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_get_resource_api_path_crd() {
-        let path = get_resource_api_path("CustomResourceDefinition", "ignored", "foos.example.com")
-            .unwrap();
+    fn pod_path_via_mapper() {
+        let m = mapper_with(vec![mapping("", "v1", "Pod", "pods", true)]);
+        let pod = m.resolve("Pod").unwrap();
         assert_eq!(
-            path,
+            build_path(pod, Some("default"), Some("nginx")),
+            "/api/v1/namespaces/default/pods/nginx"
+        );
+    }
+
+    #[test]
+    fn deployment_path_via_mapper() {
+        let m = mapper_with(vec![mapping(
+            "apps",
+            "v1",
+            "Deployment",
+            "deployments",
+            true,
+        )]);
+        let dep = m.resolve("Deployment").unwrap();
+        assert_eq!(
+            build_path(dep, Some("prod"), Some("web")),
+            "/apis/apps/v1/namespaces/prod/deployments/web"
+        );
+    }
+
+    #[test]
+    fn persistent_volume_cluster_scoped() {
+        let m = mapper_with(vec![mapping(
+            "",
+            "v1",
+            "PersistentVolume",
+            "persistentvolumes",
+            false,
+        )]);
+        let pv = m.resolve("PersistentVolume").unwrap();
+        // namespace argument is ignored for cluster-scoped resources
+        assert_eq!(
+            build_path(pv, Some("ignored"), Some("pv-1")),
+            "/api/v1/persistentvolumes/pv-1"
+        );
+    }
+
+    #[test]
+    fn crd_path_via_mapper() {
+        let m = mapper_with(vec![mapping(
+            "apiextensions.k8s.io",
+            "v1",
+            "CustomResourceDefinition",
+            "customresourcedefinitions",
+            false,
+        )]);
+        let crd = m.resolve("CustomResourceDefinition").unwrap();
+        assert_eq!(
+            build_path(crd, Some("ignored"), Some("foos.example.com")),
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/foos.example.com"
         );
     }
 
     #[test]
-    fn test_get_resource_api_path_unsupported() {
-        let result = get_resource_api_path("Unknown", "default", "x");
-        assert!(result.is_err());
+    fn unknown_kind_resolves_to_none() {
+        let m = mapper_with(vec![mapping("", "v1", "Pod", "pods", true)]);
+        assert!(m.resolve("Unknown").is_none());
     }
 
     #[test]
-    fn test_get_resource_api_path_service() {
-        let path = get_resource_api_path("Service", "prod", "my-svc").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/prod/services/my-svc");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_configmap() {
-        let path = get_resource_api_path("ConfigMap", "default", "cfg").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/default/configmaps/cfg");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_namespace_cluster_scoped() {
-        let path = get_resource_api_path("Namespace", "ignored", "kube-system").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/kube-system");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_statefulset() {
-        let path = get_resource_api_path("StatefulSet", "staging", "mysql").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/staging/statefulsets/mysql");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_cluster_scoped_node() {
-        let path = get_resource_api_path("Node", "ignored", "worker-1").unwrap();
-        assert_eq!(path, "/api/v1/nodes/worker-1");
-    }
-
-    #[test]
-    fn test_get_resource_api_path_rbac_resources() {
-        let path = get_resource_api_path("ClusterRole", "ignored", "admin").unwrap();
+    fn service_path_via_mapper() {
+        let m = mapper_with(vec![mapping("", "v1", "Service", "services", true)]);
+        let svc = m.resolve("Service").unwrap();
         assert_eq!(
-            path,
+            build_path(svc, Some("prod"), Some("my-svc")),
+            "/api/v1/namespaces/prod/services/my-svc"
+        );
+    }
+
+    #[test]
+    fn configmap_path_via_mapper() {
+        let m = mapper_with(vec![mapping("", "v1", "ConfigMap", "configmaps", true)]);
+        let cm = m.resolve("ConfigMap").unwrap();
+        assert_eq!(
+            build_path(cm, Some("default"), Some("cfg")),
+            "/api/v1/namespaces/default/configmaps/cfg"
+        );
+    }
+
+    #[test]
+    fn namespace_cluster_scoped_via_mapper() {
+        let m = mapper_with(vec![mapping("", "v1", "Namespace", "namespaces", false)]);
+        let ns = m.resolve("Namespace").unwrap();
+        assert_eq!(
+            build_path(ns, Some("ignored"), Some("kube-system")),
+            "/api/v1/namespaces/kube-system"
+        );
+    }
+
+    #[test]
+    fn statefulset_path_via_mapper() {
+        let m = mapper_with(vec![mapping(
+            "apps",
+            "v1",
+            "StatefulSet",
+            "statefulsets",
+            true,
+        )]);
+        let ss = m.resolve("StatefulSet").unwrap();
+        assert_eq!(
+            build_path(ss, Some("staging"), Some("mysql")),
+            "/apis/apps/v1/namespaces/staging/statefulsets/mysql"
+        );
+    }
+
+    #[test]
+    fn node_cluster_scoped_via_mapper() {
+        let m = mapper_with(vec![mapping("", "v1", "Node", "nodes", false)]);
+        let node = m.resolve("Node").unwrap();
+        assert_eq!(
+            build_path(node, Some("ignored"), Some("worker-1")),
+            "/api/v1/nodes/worker-1"
+        );
+    }
+
+    #[test]
+    fn rbac_resources_via_mapper() {
+        let mappings = vec![
+            mapping(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "ClusterRole",
+                "clusterroles",
+                false,
+            ),
+            mapping(
+                "rbac.authorization.k8s.io",
+                "v1",
+                "ClusterRoleBinding",
+                "clusterrolebindings",
+                false,
+            ),
+            mapping("rbac.authorization.k8s.io", "v1", "Role", "roles", true),
+        ];
+        let m = mapper_with(mappings);
+
+        let cr = m.resolve("ClusterRole").unwrap();
+        assert_eq!(
+            build_path(cr, Some("ignored"), Some("admin")),
             "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin"
         );
 
-        let path = get_resource_api_path("ClusterRoleBinding", "ignored", "admin-binding").unwrap();
+        let crb = m.resolve("ClusterRoleBinding").unwrap();
         assert_eq!(
-            path,
+            build_path(crb, Some("ignored"), Some("admin-binding")),
             "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/admin-binding"
         );
 
-        let path = get_resource_api_path("Role", "default", "pod-reader").unwrap();
+        let role = m.resolve("Role").unwrap();
         assert_eq!(
-            path,
+            build_path(role, Some("default"), Some("pod-reader")),
             "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles/pod-reader"
         );
     }
