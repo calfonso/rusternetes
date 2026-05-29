@@ -273,6 +273,16 @@ fn preemption_node_critical_preempts_cluster_critical() {
 
 /// Helper that applies the eviction mutation a preempting scheduler would write.
 /// Mirrors `Scheduler::evict_pod` from `crates/scheduler/src/scheduler.rs:1029`.
+///
+/// NOTE: this test helper uses `get_or_insert_with(PodStatus::default)` to
+/// unconditionally initialise the status so that we can assert on the condition
+/// fields below. The production path in `scheduler.rs:1040` uses
+/// `if let Some(ref mut status) = pod.status`, meaning it silently skips
+/// writing `DisruptionTarget` when the pod has no status object.  All callers
+/// of this helper construct pods via `make_running_pod`, which always sets
+/// `status`, so the divergence is never observable in these tests.  A future
+/// test that creates a victim without pre-set status should use the production
+/// guard directly (the `if-let` form) to stay faithful to the spec.
 fn apply_eviction_mutation(pod: &mut Pod) {
     pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
     pod.metadata.deletion_grace_period_seconds = Some(30);
@@ -490,22 +500,26 @@ fn priority_class_endpoints_http_methods() {
 /// Sonobuoy (Round 160+): FAIL (cluster timing / scheduling lifecycle).
 ///
 /// Scheduler-side invariant: `check_host_port_conflicts` reports a conflict
-/// when an existing pod owns the wildcard address (0.0.0.0) on a given
-/// (port, protocol) and a new pod wants to bind the same (port, protocol)
-/// on any specific IP.
+/// when the INCOMING pod requests the wildcard address (0.0.0.0) on a given
+/// (port, protocol) and an existing pod already binds that same (port,
+/// protocol) on a specific IP. This is the reverse direction from the
+/// existing wildcard test in `conformance_scheduling_priority_preemption_hostport.rs`
+/// (which tests an existing 0.0.0.0 pod vs an incoming specific-IP pod).
+/// Both directions must conflict.
 #[test]
-fn hostport_zero_zero_zero_zero_conflicts_with_specific_ip() {
+fn hostport_incoming_wildcard_conflicts_with_existing_specific_ip() {
     let node = make_node("node-1", "4", "8Gi");
-    // pod1 bound 0.0.0.0:54323/TCP — upstream e2e uses port 54323.
-    let pod1 = make_running_hostport_pod("pod1", Some("node-1"), 54323, "TCP", Some("0.0.0.0"));
-    // pod2 wants 172.27.0.4:54323/TCP — must conflict because pod1 holds wildcard.
-    let pod2 = make_running_hostport_pod("pod2", None, 54323, "TCP", Some("172.27.0.4"));
+    // Existing pod binds 172.27.0.4:54323/TCP — a specific interface.
+    let pod1 = make_running_hostport_pod("pod1", Some("node-1"), 54323, "TCP", Some("172.27.0.4"));
+    // Incoming pod requests 0.0.0.0:54323/TCP (wildcard) — must conflict because
+    // pod1 already owns that (port, protocol) on a specific address.
+    let pod2 = make_running_hostport_pod("pod2", None, 54323, "TCP", Some("0.0.0.0"));
 
     let no_conflict = check_host_port_conflicts(&node, &pod2, &[pod1]);
     assert!(
         !no_conflict,
-        "0.0.0.0 (wildcard) hostIP must conflict with any specific IP \
-         on the same (port=54323, protocol=TCP) tuple"
+        "incoming wildcard (0.0.0.0) must conflict with an existing specific-IP \
+         pod on the same (port=54323, protocol=TCP) tuple"
     );
 }
 
