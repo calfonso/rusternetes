@@ -401,13 +401,15 @@ pub async fn execute_enhanced(
         }
 
         // For `get all`, suppress per-kind "No resources found" noise and only
-        // separate kinds that actually produced output. For a normal single /
-        // comma-list invocation, keep the legacy blank-line-before-subsequent
-        // behavior and the empty-collection message.
+        // separate kinds that actually produced output. The separator is
+        // emitted inside execute_with_mapping right before it prints, so an
+        // empty kind between two non-empty kinds never leaves a stray blank
+        // line. For a normal single / comma-list invocation, keep the legacy
+        // blank-line-before-subsequent behavior and the empty-collection
+        // message.
         if is_all {
-            if printed_any {
-                println!();
-            }
+            // Ask the callee to lead with a blank line only if a prior kind
+            // already printed; it will only honor this when it actually prints.
             let printed = execute_with_mapping(
                 client,
                 mapping,
@@ -420,10 +422,13 @@ pub async fn execute_enhanced(
                 show_labels,
                 sort_by,
                 true,
+                printed_any,
             )
             .await?;
             printed_any = printed_any || printed;
         } else {
+            // Legacy comma-list behavior: a blank line before every kind after
+            // the first, printed unconditionally here (not inside the callee).
             if i > 0 {
                 println!();
             }
@@ -438,6 +443,7 @@ pub async fn execute_enhanced(
                 &query_string,
                 show_labels,
                 sort_by,
+                false,
                 false,
             )
             .await?;
@@ -471,8 +477,10 @@ mod urlencoding {
 /// is passed directly to `format_output`.
 ///
 /// When `is_all` is true (invoked via `get all`), empty collections are
-/// silently skipped (no "No resources found" message). Returns whether any
-/// output was produced.
+/// silently skipped (no "No resources found" message). `leading_separator`
+/// requests a blank line before this kind's output; it is honored only when
+/// the kind actually prints, so an empty kind never leaves a stray blank line.
+/// Returns whether any output was produced.
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_mapping(
     client: &ApiClient,
@@ -486,6 +494,7 @@ async fn execute_with_mapping(
     show_labels: bool,
     sort_by: Option<&str>,
     is_all: bool,
+    leading_separator: bool,
 ) -> Result<bool> {
     use crate::ops::{get_value, list_value};
 
@@ -512,8 +521,11 @@ async fn execute_with_mapping(
                     e
                 }
             })?;
-        // Append query to path is handled inside get_value; query params are
-        // not passed for single-item GETs (selectors don't apply).
+        // selectors are not forwarded to single-item by-name GETs (they don't
+        // apply).
+        if leading_separator {
+            println!();
+        }
         format_output(&value, &format)?;
     } else {
         // Collection GET — all path logic (including the all-namespaces
@@ -538,6 +550,11 @@ async fn execute_with_mapping(
 
         if let Some(sort_expr) = sort_by {
             sort_by_jsonpath(&mut items, sort_expr);
+        }
+
+        // Emit the inter-kind separator only now that we know this kind prints.
+        if leading_separator {
+            println!();
         }
 
         // For well-known kinds with typed printers, attempt to deserialize and
@@ -584,28 +601,28 @@ async fn execute_with_mapping(
                     .iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect();
-                print_jobs(&typed, no_headers, false);
+                print_jobs(&typed, no_headers, show_labels);
             }
             ("CronJob", OutputFormat::Table | OutputFormat::Wide) => {
                 let typed: Vec<CronJob> = items
                     .iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect();
-                print_cronjobs(&typed, no_headers, false);
+                print_cronjobs(&typed, no_headers, show_labels);
             }
             ("PersistentVolume", OutputFormat::Table | OutputFormat::Wide) => {
                 let typed: Vec<PersistentVolume> = items
                     .iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect();
-                print_pvs(&typed, no_headers, false);
+                print_pvs(&typed, no_headers, show_labels);
             }
             ("PersistentVolumeClaim", OutputFormat::Table | OutputFormat::Wide) => {
                 let typed: Vec<PersistentVolumeClaim> = items
                     .iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect();
-                print_pvcs(&typed, no_headers, false);
+                print_pvcs(&typed, no_headers, show_labels);
             }
             _ => {
                 // Generic Value output: works for all formats and any kind.
