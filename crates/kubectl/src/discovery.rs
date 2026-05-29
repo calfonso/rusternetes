@@ -48,6 +48,9 @@ pub fn parse_aggregated_discovery(doc: &Value) -> Result<Vec<ResourceMapping>> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if kind.is_empty() {
+                    continue; // skip entries with no kind (garbage mapping / empty API path)
+                }
                 let namespaced = r.get("scope").and_then(|v| v.as_str()) == Some("Namespaced");
                 let singular = r
                     .get("singularResource")
@@ -116,11 +119,28 @@ mod tests {
             .expect("Namespace present");
         assert_eq!(ns.group, ""); // core
         assert!(!ns.namespaced);
+        assert_eq!(ns.short_names, vec!["ns"]); // short names round-trip
     }
 
     #[test]
     fn skips_subresources() {
         let mappings = parse_aggregated_discovery(&fixture()).unwrap();
         assert!(mappings.iter().all(|m| !m.plural.contains('/')));
+    }
+
+    #[test]
+    fn skips_slash_resource_entries() {
+        let doc = serde_json::json!({
+            "items": [{
+                "metadata": {"name": ""},
+                "versions": [{"version": "v1", "resources": [
+                    {"resource": "pods", "responseKind": {"kind": "Pod"}, "scope": "Namespaced", "singularResource": "pod"},
+                    {"resource": "pods/status", "responseKind": {"kind": "Pod"}, "scope": "Namespaced", "singularResource": "pod"}
+                ]}]
+            }]
+        });
+        let mappings = parse_aggregated_discovery(&doc).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].plural, "pods");
     }
 }
