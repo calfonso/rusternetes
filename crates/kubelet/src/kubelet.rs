@@ -1973,14 +1973,115 @@ impl Kubelet {
                                 // Remove failed container so it can be recreated
                                 let cname = format!("{}_{}", pod_name, ic.name);
                                 let _ = self.runtime.remove_terminated_container(&cname).await;
-                                // Update status with CrashLoopBackOff
-                                let init_statuses =
-                                    self.runtime.get_init_container_statuses(pod).await;
+                                // Update status with CrashLoopBackOff AND make sure
+                                // the PodInitialized=False condition + app-container
+                                // Waiting/PodInitializing statuses are present.
+                                //
+                                // K8s conformance ("should not start app containers if
+                                // init containers fail on a RestartAlways pod") asserts:
+                                //   - pod.status.phase == Pending
+                                //   - pod.conditions[Initialized].reason ==
+                                //         "ContainersNotInitialized"
+                                //   - pod.conditions[Initialized].message ==
+                                //         "containers with incomplete status: [<names>]"
+                                //   - every container_status.state.waiting.reason ==
+                                //         "PodInitializing"
+                                //
+                                // start_pod's failure handler sets these on the first
+                                // sync, but every subsequent retry that re-enters via
+                                // should_retry must also assert them so a partial
+                                // status overwrite from any concurrent writer can't
+                                // strip the Initialized condition or leak an app
+                                // container into a non-Waiting state.
+                                // K8s ref: pkg/kubelet/status/generate.go —
+                                //          GeneratePodInitializedCondition
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                                    let init_statuses =
+                                        self.runtime.get_init_container_statuses(&p).await;
+                                    // Names of init containers that did NOT terminate
+                                    // with exit 0 — these are "incomplete" per K8s.
+                                    let incomplete_inits: Vec<String> = p
+                                        .spec
+                                        .as_ref()
+                                        .and_then(|s| s.init_containers.as_ref())
+                                        .map(|ics| {
+                                            ics.iter()
+                                                .filter(|c| {
+                                                    let completed = init_statuses
+                                                        .as_ref()
+                                                        .and_then(|statuses| {
+                                                            statuses
+                                                                .iter()
+                                                                .find(|s| s.name == c.name)
+                                                        })
+                                                        .map(|s| {
+                                                            matches!(
+                                                                &s.state,
+                                                                Some(ContainerState::Terminated {
+                                                                    exit_code: 0,
+                                                                    ..
+                                                                })
+                                                            )
+                                                        })
+                                                        .unwrap_or(false);
+                                                    !completed
+                                                })
+                                                .map(|c| c.name.clone())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let failed_conditions =
+                                        Self::init_failed_pod_conditions(&incomplete_inits);
+                                    // Ensure app containers stay Waiting/PodInitializing.
+                                    // The conformance watch errors out the moment it
+                                    // sees any app container outside that state.
+                                    let app_container_statuses: Option<Vec<ContainerStatus>> =
+                                        p.spec.as_ref().map(|spec| {
+                                            spec.containers
+                                                .iter()
+                                                .map(|c| ContainerStatus {
+                                                    name: c.name.clone(),
+                                                    ready: false,
+                                                    restart_count: 0,
+                                                    state: Some(ContainerState::Waiting {
+                                                        reason: Some("PodInitializing".to_string()),
+                                                        message: None,
+                                                    }),
+                                                    last_state: None,
+                                                    image: Some(c.image.clone()),
+                                                    image_id: None,
+                                                    container_id: None,
+                                                    started: Some(false),
+                                                    allocated_resources: c
+                                                        .resources
+                                                        .as_ref()
+                                                        .and_then(|r| r.requests.clone()),
+                                                    allocated_resources_status: None,
+                                                    resources: c.resources.clone(),
+                                                    user: None,
+                                                    volume_mounts: None,
+                                                    stop_signal: None,
+                                                })
+                                                .collect()
+                                        });
+                                    let status_msg = if !incomplete_inits.is_empty() {
+                                        format!(
+                                            "containers with incomplete status: [{}]",
+                                            incomplete_inits.join(" ")
+                                        )
+                                    } else {
+                                        "Init container failed".to_string()
+                                    };
                                     if let Some(ref mut s) = p.status {
-                                        s.init_container_statuses = init_statuses;
+                                        // Pod stays Pending under RestartAlways — never
+                                        // flip to Failed when an init can still retry.
+                                        s.phase = Some(Phase::Pending);
                                         s.reason = Some("PodInitializing".to_string());
+                                        s.message = Some(status_msg);
+                                        s.init_container_statuses = init_statuses;
+                                        s.container_statuses = app_container_statuses;
+                                        s.conditions = Some(failed_conditions);
                                     }
                                     let _ = self.storage.update(&key, &p).await;
                                 }
@@ -5119,5 +5220,229 @@ mod tests {
         // Step 3: Kubelet completes resize, sets to ""
         pod.status.as_mut().unwrap().resize = Some(String::new());
         assert_eq!(pod.status.as_ref().unwrap().resize.as_deref(), Some(""));
+    }
+
+    // --- Init-container failure conditions (K8s conformance) ---
+    //
+    // K8s conformance test "should not start app containers if init
+    // containers fail on a RestartAlways pod" (init_container.go:446) asserts:
+    //   - pod.conditions[Initialized].Status  == "False"
+    //   - pod.conditions[Initialized].Reason  == "ContainersNotInitialized"
+    //   - pod.conditions[Initialized].Message == "containers with incomplete status: [init1 init2]"
+    //
+    // The kubelet sync loop's should_retry branch builds these conditions
+    // from `init_failed_pod_conditions(&incomplete_inits)` using the same
+    // filter as the start_pod error handler: an init container is
+    // "incomplete" iff its state is NOT Terminated{exit_code:0}.
+
+    /// Mirror the incomplete-init filter that kubelet.rs uses in the
+    /// init-failure status update. Kept in sync with the inline copies in
+    /// the should_retry branch and the start_pod error handler.
+    fn incomplete_init_names(pod: &Pod) -> Vec<String> {
+        let init_statuses = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.init_container_statuses.as_ref());
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.init_containers.as_ref())
+            .map(|ics| {
+                ics.iter()
+                    .filter(|c| {
+                        let completed = init_statuses
+                            .and_then(|statuses| statuses.iter().find(|s| s.name == c.name))
+                            .map(|s| {
+                                matches!(
+                                    &s.state,
+                                    Some(ContainerState::Terminated { exit_code: 0, .. })
+                                )
+                            })
+                            .unwrap_or(false);
+                        !completed
+                    })
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn init_status(name: &str, state: ContainerState) -> ContainerStatus {
+        ContainerStatus {
+            name: name.to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(state),
+            last_state: None,
+            image: Some("busybox:latest".to_string()),
+            image_id: None,
+            container_id: None,
+            started: Some(false),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        }
+    }
+
+    fn restartalways_pod_with_two_inits() -> Pod {
+        // init1 failed (exit 1), init2 never ran (Waiting/PodInitializing)
+        let init_statuses = vec![
+            init_status(
+                "init1",
+                ContainerState::Terminated {
+                    exit_code: 1,
+                    signal: None,
+                    reason: Some("Error".to_string()),
+                    message: None,
+                    started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+                    container_id: Some("docker://abc123".to_string()),
+                },
+            ),
+            init_status(
+                "init2",
+                ContainerState::Waiting {
+                    reason: Some("PodInitializing".to_string()),
+                    message: None,
+                },
+            ),
+        ];
+        let mut pod = make_pod("pod-init", "default", None);
+        if let Some(ref mut spec) = pod.spec {
+            spec.init_containers = Some(vec![make_container("init1"), make_container("init2")]);
+            spec.containers = vec![make_container("run1")];
+            spec.restart_policy = Some("Always".to_string());
+        }
+        pod.status = Some(PodStatus {
+            phase: Some(Phase::Pending),
+            message: None,
+            reason: Some("PodInitializing".to_string()),
+            host_ip: None,
+            host_i_ps: None,
+            pod_ip: None,
+            pod_i_ps: None,
+            nominated_node_name: None,
+            qos_class: None,
+            start_time: None,
+            conditions: None,
+            container_statuses: None,
+            init_container_statuses: Some(init_statuses),
+            ephemeral_container_statuses: None,
+            resize: None,
+            resource_claim_statuses: None,
+            observed_generation: None,
+        });
+        pod
+    }
+
+    #[test]
+    fn test_init_failed_conditions_lists_both_inits_when_first_failed_and_second_not_run() {
+        // The conformance test asserts a specific message format that
+        // includes BOTH init container names — init1 (failed) and init2
+        // (which never had a chance to run) — separated by a single space.
+        let pod = restartalways_pod_with_two_inits();
+        let incomplete = incomplete_init_names(&pod);
+        assert_eq!(
+            incomplete,
+            vec!["init1".to_string(), "init2".to_string()],
+            "both init1 (Terminated with non-zero exit) and init2 (Waiting) must be marked incomplete"
+        );
+
+        let conditions = Kubelet::init_failed_pod_conditions(&incomplete);
+        let initialized = conditions
+            .iter()
+            .find(|c| c.condition_type == "Initialized")
+            .expect("Initialized condition must be present");
+
+        assert_eq!(initialized.status, "False");
+        assert_eq!(
+            initialized.reason.as_deref(),
+            Some("ContainersNotInitialized")
+        );
+        assert_eq!(
+            initialized.message.as_deref(),
+            Some("containers with incomplete status: [init1 init2]"),
+            "K8s conformance asserts this exact message verbatim"
+        );
+    }
+
+    #[test]
+    fn test_init_failed_conditions_drops_successful_init_from_list() {
+        // After init1 succeeds and init2 fails, only init2 must appear in
+        // the conditions message — successful init containers are dropped.
+        let mut pod = restartalways_pod_with_two_inits();
+        if let Some(ref mut status) = pod.status {
+            status.init_container_statuses = Some(vec![
+                init_status(
+                    "init1",
+                    ContainerState::Terminated {
+                        exit_code: 0,
+                        signal: None,
+                        reason: Some("Completed".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    },
+                ),
+                init_status(
+                    "init2",
+                    ContainerState::Terminated {
+                        exit_code: 1,
+                        signal: None,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
+                    },
+                ),
+            ]);
+        }
+        let incomplete = incomplete_init_names(&pod);
+        assert_eq!(
+            incomplete,
+            vec!["init2".to_string()],
+            "successfully terminated (exit 0) init containers must not appear in incomplete list"
+        );
+        let conditions = Kubelet::init_failed_pod_conditions(&incomplete);
+        let initialized = conditions
+            .iter()
+            .find(|c| c.condition_type == "Initialized")
+            .expect("Initialized condition must be present");
+        assert_eq!(
+            initialized.message.as_deref(),
+            Some("containers with incomplete status: [init2]"),
+            "only failing init container must appear in the message"
+        );
+    }
+
+    #[test]
+    fn test_init_failed_conditions_pod_initialized_is_false_with_correct_reason() {
+        // RestartAlways pod whose init container fails must report
+        // PodInitialized=False with reason ContainersNotInitialized.
+        let conditions = Kubelet::init_failed_pod_conditions(&["init1".to_string()]);
+        let initialized = conditions
+            .iter()
+            .find(|c| c.condition_type == "Initialized")
+            .expect("Initialized condition must be present");
+        assert_eq!(initialized.status, "False");
+        assert_eq!(
+            initialized.reason.as_deref(),
+            Some("ContainersNotInitialized")
+        );
+        // Sanity: ContainersReady and Ready also exist and are False.
+        let containers_ready = conditions
+            .iter()
+            .find(|c| c.condition_type == "ContainersReady")
+            .expect("ContainersReady condition must be present");
+        assert_eq!(containers_ready.status, "False");
+        let ready = conditions
+            .iter()
+            .find(|c| c.condition_type == "Ready")
+            .expect("Ready condition must be present");
+        assert_eq!(ready.status, "False");
     }
 }
