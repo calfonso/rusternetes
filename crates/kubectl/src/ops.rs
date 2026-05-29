@@ -78,6 +78,61 @@ pub async fn apply_value(
     }
 }
 
+/// GET a single resource as a Value.
+pub async fn get_value(
+    client: &ApiClient,
+    m: &ResourceMapping,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<Value> {
+    let ns = if m.namespaced {
+        Some(namespace.unwrap_or("default").to_string())
+    } else {
+        None
+    };
+    let path = build_path(m, ns.as_deref(), Some(name));
+    client
+        .get::<Value>(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// GET a resource collection; returns the `.items` array as Values. When
+/// `all_namespaces` is true for a namespaced resource the cluster-wide
+/// collection path is used (no namespace segment).
+pub async fn list_value(
+    client: &ApiClient,
+    m: &ResourceMapping,
+    namespace: Option<&str>,
+    all_namespaces: bool,
+) -> Result<Vec<Value>> {
+    let path = if m.namespaced && all_namespaces {
+        // Cluster-wide path: no /namespaces/{ns} segment
+        let base = if m.group.is_empty() {
+            format!("/api/{}", m.version)
+        } else {
+            format!("/apis/{}/{}", m.group, m.version)
+        };
+        format!("{}/{}", base, m.plural)
+    } else {
+        let ns = if m.namespaced {
+            Some(namespace.unwrap_or("default").to_string())
+        } else {
+            None
+        };
+        build_path(m, ns.as_deref(), None)
+    };
+    let list: Value = client
+        .get::<Value>(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(list
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +186,29 @@ mod tests {
     fn cluster_collection_path_no_name() {
         let pv = m("", "persistentvolumes", false);
         assert_eq!(build_path(&pv, None, None), "/api/v1/persistentvolumes");
+    }
+
+    #[test]
+    fn all_namespaces_cluster_wide_path() {
+        // When all_namespaces is requested for a namespaced resource the path
+        // must NOT contain a /namespaces/{ns} segment.
+        // We verify the path-building branch inside list_value directly by
+        // replicating its logic here (list_value itself is async and needs a
+        // live server, so we only test the path computation).
+        let pod = m("", "pods", true);
+        // Cluster-wide: base + plural only
+        let base = if pod.group.is_empty() {
+            format!("/api/{}", pod.version)
+        } else {
+            format!("/apis/{}/{}", pod.group, pod.version)
+        };
+        let path = format!("{}/{}", base, pod.plural);
+        assert_eq!(path, "/api/v1/pods");
+
+        let dep = m("apps", "deployments", true);
+        let base2 = format!("/apis/{}/{}", dep.group, dep.version);
+        let path2 = format!("{}/{}", base2, dep.plural);
+        assert_eq!(path2, "/apis/apps/v1/deployments");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Generic Kubernetes List wrapper
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubernetesList<T> {
@@ -94,6 +95,7 @@ impl ApiClient {
     }
 
     /// Get a list of resources, automatically unwrapping the Kubernetes List wrapper
+    #[allow(dead_code)]
     pub async fn get_list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, GetError> {
         let list: KubernetesList<T> = self.get(path).await?;
         Ok(list.items)
