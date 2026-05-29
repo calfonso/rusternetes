@@ -170,6 +170,7 @@ impl ApiClient {
         response.json().await.context("Failed to parse response")
     }
 
+    #[allow(dead_code)]
     pub async fn delete(&self, path: &str) -> Result<()> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self.client.delete(&url);

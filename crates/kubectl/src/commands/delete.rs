@@ -211,58 +211,23 @@ async fn delete_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
 
     let namespace = metadata.get("namespace").and_then(|n| n.as_str());
 
-    // Construct API path based on resource kind
-    let api_path = get_delete_api_path(kind, namespace, name)?;
+    let mapper = crate::discovery::RestMapper::from_server(client).await?;
+    let mapping = mapper.resolve(kind).ok_or_else(|| {
+        anyhow::anyhow!(
+            "error: the server doesn't have a resource type \"{}\"",
+            kind
+        )
+    })?;
 
-    client
-        .delete(&api_path)
+    let opts = DeleteOptions::default();
+    let query = build_query_string(&opts);
+    let body = opts.delete_body();
+    crate::ops::delete_value(client, mapping, namespace, name, &query, body.as_ref())
         .await
-        .context(format!("Failed to delete {} {}", kind, name))?;
+        .with_context(|| format!("Failed to delete {} {}", kind, name))?;
 
-    println!("{}/{} deleted", kind.to_lowercase(), name);
+    println!("{}/{} deleted", mapping.singular, name);
     Ok(())
-}
-
-fn get_delete_api_path(kind: &str, namespace: Option<&str>, name: &str) -> Result<String> {
-    let ns = namespace.unwrap_or("default");
-    Ok(match kind {
-        "Pod" => format!("/api/v1/namespaces/{}/pods/{}", ns, name),
-        "Service" => format!("/api/v1/namespaces/{}/services/{}", ns, name),
-        "Deployment" => format!("/apis/apps/v1/namespaces/{}/deployments/{}", ns, name),
-        "StatefulSet" => format!("/apis/apps/v1/namespaces/{}/statefulsets/{}", ns, name),
-        "DaemonSet" => format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", ns, name),
-        "ReplicaSet" => format!("/apis/apps/v1/namespaces/{}/replicasets/{}", ns, name),
-        "Job" => format!("/apis/batch/v1/namespaces/{}/jobs/{}", ns, name),
-        "CronJob" => format!("/apis/batch/v1/namespaces/{}/cronjobs/{}", ns, name),
-        "ConfigMap" => format!("/api/v1/namespaces/{}/configmaps/{}", ns, name),
-        "Secret" => format!("/api/v1/namespaces/{}/secrets/{}", ns, name),
-        "ServiceAccount" => format!("/api/v1/namespaces/{}/serviceaccounts/{}", ns, name),
-        "Ingress" => format!(
-            "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
-            ns, name
-        ),
-        "PersistentVolumeClaim" => {
-            format!("/api/v1/namespaces/{}/persistentvolumeclaims/{}", ns, name)
-        }
-        "PersistentVolume" => format!("/api/v1/persistentvolumes/{}", name),
-        "StorageClass" => format!("/apis/storage.k8s.io/v1/storageclasses/{}", name),
-        "Namespace" => format!("/api/v1/namespaces/{}", name),
-        "Node" => format!("/api/v1/nodes/{}", name),
-        "Role" => format!(
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
-            ns, name
-        ),
-        "RoleBinding" => format!(
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
-            ns, name
-        ),
-        "ClusterRole" => format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{}", name),
-        "ClusterRoleBinding" => format!(
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
-            name
-        ),
-        _ => anyhow::bail!("Unsupported resource kind for deletion: {}", kind),
-    })
 }
 
 pub async fn execute_with_selector(
@@ -272,21 +237,17 @@ pub async fn execute_with_selector(
     namespace: &str,
     opts: &DeleteOptions,
 ) -> Result<()> {
-    // Build the list API path with label selector
-    let api_path = get_list_api_path(resource_type, namespace)?;
+    let mapper = crate::discovery::RestMapper::from_server(client).await?;
+    let mapping = mapper.resolve(resource_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "error: the server doesn't have a resource type \"{}\"",
+            resource_type
+        )
+    })?;
+
     let selector_query = format!("?labelSelector={}", urlencoding::encode(selector));
-    let full_path = format!("{}{}", api_path, selector_query);
-
-    // Fetch resources matching the selector
-    let response: serde_json::Value = client
-        .get(&full_path)
-        .await
-        .context("Failed to list resources with selector")?;
-
-    let items = response
-        .get("items")
-        .and_then(|i| i.as_array())
-        .context("No items in response")?;
+    let items =
+        crate::ops::list_value(client, mapping, Some(namespace), false, &selector_query).await?;
 
     if items.is_empty() {
         println!("No resources found matching selector: {}", selector);
@@ -294,14 +255,14 @@ pub async fn execute_with_selector(
     }
 
     // Delete each resource
-    for item in items {
+    for item in &items {
         let name = item
             .get("metadata")
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
             .context("Missing resource name")?;
 
-        delete_single_resource(client, resource_type, name, Some(namespace), opts).await?;
+        delete_single_resource_with_mapping(client, mapping, name, Some(namespace), opts).await?;
     }
 
     Ok(())
@@ -314,18 +275,16 @@ pub async fn execute_delete_all(
     namespace: &str,
     opts: &DeleteOptions,
 ) -> Result<()> {
-    let collection_path = get_list_api_path(resource_type, namespace)?;
+    let mapper = crate::discovery::RestMapper::from_server(client).await?;
+    let mapping = mapper.resolve(resource_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "error: the server doesn't have a resource type \"{}\"",
+            resource_type
+        )
+    })?;
 
     // List all resources first so we can print their names
-    let response: serde_json::Value = client
-        .get(&collection_path)
-        .await
-        .context("Failed to list resources")?;
-
-    let items = response
-        .get("items")
-        .and_then(|i| i.as_array())
-        .context("No items in response")?;
+    let items = crate::ops::list_value(client, mapping, Some(namespace), false, "").await?;
 
     if items.is_empty() {
         println!("No resources found");
@@ -333,69 +292,17 @@ pub async fn execute_delete_all(
     }
 
     // Delete each individually (to get per-resource output and wait behavior)
-    for item in items {
+    for item in &items {
         let name = item
             .get("metadata")
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
             .context("Missing resource name")?;
 
-        delete_single_resource(client, resource_type, name, Some(namespace), opts).await?;
+        delete_single_resource_with_mapping(client, mapping, name, Some(namespace), opts).await?;
     }
 
     Ok(())
-}
-
-fn get_list_api_path(resource_type: &str, namespace: &str) -> Result<String> {
-    Ok(match resource_type {
-        "pod" | "pods" => format!("/api/v1/namespaces/{}/pods", namespace),
-        "service" | "services" | "svc" => format!("/api/v1/namespaces/{}/services", namespace),
-        "deployment" | "deployments" | "deploy" => {
-            format!("/apis/apps/v1/namespaces/{}/deployments", namespace)
-        }
-        "statefulset" | "statefulsets" | "sts" => {
-            format!("/apis/apps/v1/namespaces/{}/statefulsets", namespace)
-        }
-        "daemonset" | "daemonsets" | "ds" => {
-            format!("/apis/apps/v1/namespaces/{}/daemonsets", namespace)
-        }
-        "replicaset" | "replicasets" | "rs" => {
-            format!("/apis/apps/v1/namespaces/{}/replicasets", namespace)
-        }
-        "job" | "jobs" => format!("/apis/batch/v1/namespaces/{}/jobs", namespace),
-        "cronjob" | "cronjobs" | "cj" => {
-            format!("/apis/batch/v1/namespaces/{}/cronjobs", namespace)
-        }
-        "configmap" | "configmaps" | "cm" => {
-            format!("/api/v1/namespaces/{}/configmaps", namespace)
-        }
-        "secret" | "secrets" => format!("/api/v1/namespaces/{}/secrets", namespace),
-        "serviceaccount" | "serviceaccounts" | "sa" => {
-            format!("/api/v1/namespaces/{}/serviceaccounts", namespace)
-        }
-        "node" | "nodes" => "/api/v1/nodes".to_string(),
-        "namespace" | "namespaces" | "ns" => "/api/v1/namespaces".to_string(),
-        "persistentvolume" | "persistentvolumes" | "pv" => "/api/v1/persistentvolumes".to_string(),
-        "clusterrole" | "clusterroles" => {
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles".to_string()
-        }
-        "clusterrolebinding" | "clusterrolebindings" => {
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings".to_string()
-        }
-        "role" | "roles" => {
-            format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles",
-                namespace
-            )
-        }
-        "rolebinding" | "rolebindings" => {
-            format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings",
-                namespace
-            )
-        }
-        _ => anyhow::bail!("Unsupported resource type for deletion: {}", resource_type),
-    })
 }
 
 mod urlencoding {
@@ -412,93 +319,56 @@ mod urlencoding {
     }
 }
 
-/// Get the API path for a single named resource, given CLI resource type aliases.
-fn get_resource_api_path(resource_type: &str, name: &str, namespace: &str) -> Result<String> {
-    Ok(match resource_type {
-        "pod" | "pods" => format!("/api/v1/namespaces/{}/pods/{}", namespace, name),
-        "service" | "services" | "svc" => {
-            format!("/api/v1/namespaces/{}/services/{}", namespace, name)
-        }
-        "deployment" | "deployments" | "deploy" => {
-            format!(
-                "/apis/apps/v1/namespaces/{}/deployments/{}",
-                namespace, name
-            )
-        }
-        "statefulset" | "statefulsets" | "sts" => {
-            format!(
-                "/apis/apps/v1/namespaces/{}/statefulsets/{}",
-                namespace, name
-            )
-        }
-        "daemonset" | "daemonsets" | "ds" => {
-            format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", namespace, name)
-        }
-        "replicaset" | "replicasets" | "rs" => {
-            format!(
-                "/apis/apps/v1/namespaces/{}/replicasets/{}",
-                namespace, name
-            )
-        }
-        "job" | "jobs" => format!("/apis/batch/v1/namespaces/{}/jobs/{}", namespace, name),
-        "cronjob" | "cronjobs" | "cj" => {
-            format!("/apis/batch/v1/namespaces/{}/cronjobs/{}", namespace, name)
-        }
-        "configmap" | "configmaps" | "cm" => {
-            format!("/api/v1/namespaces/{}/configmaps/{}", namespace, name)
-        }
-        "secret" | "secrets" => {
-            format!("/api/v1/namespaces/{}/secrets/{}", namespace, name)
-        }
-        "serviceaccount" | "serviceaccounts" | "sa" => {
-            format!("/api/v1/namespaces/{}/serviceaccounts/{}", namespace, name)
-        }
-        "ingress" | "ingresses" | "ing" => {
-            format!(
-                "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
-                namespace, name
-            )
-        }
-        "persistentvolumeclaim" | "persistentvolumeclaims" | "pvc" => {
-            format!(
-                "/api/v1/namespaces/{}/persistentvolumeclaims/{}",
-                namespace, name
-            )
-        }
-        "persistentvolume" | "persistentvolumes" | "pv" => {
-            format!("/api/v1/persistentvolumes/{}", name)
-        }
-        "storageclass" | "storageclasses" | "sc" => {
-            format!("/apis/storage.k8s.io/v1/storageclasses/{}", name)
-        }
-        "node" | "nodes" => format!("/api/v1/nodes/{}", name),
-        "namespace" | "namespaces" | "ns" => format!("/api/v1/namespaces/{}", name),
-        "role" | "roles" => {
-            format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
-                namespace, name
-            )
-        }
-        "rolebinding" | "rolebindings" => {
-            format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
-                namespace, name
-            )
-        }
-        "clusterrole" | "clusterroles" => {
-            format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{}", name)
-        }
-        "clusterrolebinding" | "clusterrolebindings" => {
-            format!(
-                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
-                name
-            )
-        }
-        _ => anyhow::bail!("Unknown resource type: {}", resource_type),
-    })
+/// Build a query string from DeleteOptions query params (e.g. `?gracePeriodSeconds=0&dryRun=All`).
+fn build_query_string(opts: &DeleteOptions) -> String {
+    let params = opts.query_params();
+    if params.is_empty() {
+        String::new()
+    } else {
+        let qs: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        format!("?{}", qs.join("&"))
+    }
 }
 
-/// Core single-resource delete with full options support.
+/// Core single-resource delete with full options support (RestMapper-based).
+async fn delete_single_resource_with_mapping(
+    client: &ApiClient,
+    mapping: &crate::discovery::ResourceMapping,
+    name: &str,
+    namespace: Option<&str>,
+    opts: &DeleteOptions,
+) -> Result<()> {
+    let query = build_query_string(opts);
+    let body = opts.delete_body();
+
+    let status = crate::ops::delete_value(client, mapping, namespace, name, &query, body.as_ref())
+        .await
+        .with_context(|| format!("Failed to delete {} {}", mapping.singular, name))?;
+
+    if status == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("{} \"{}\" not found", mapping.singular, name);
+    }
+
+    // Use mapping.singular as the resource_type for format_output so the
+    // display is consistent with the RestMapper-resolved kind.
+    println!("{}", opts.format_output(&mapping.singular, name));
+
+    // --wait: poll until the resource is gone
+    if opts.wait && !opts.dry_run {
+        let ns = if mapping.namespaced {
+            Some(namespace.unwrap_or("default").to_string())
+        } else {
+            None
+        };
+        let api_path = crate::ops::build_path(mapping, ns.as_deref(), Some(name));
+        wait_for_deletion(client, &api_path).await?;
+    }
+
+    Ok(())
+}
+
+/// Core single-resource delete with full options support (legacy CLI-alias-based).
+/// Used by `execute_enhanced` and `execute` which receive a string resource type alias.
 async fn delete_single_resource(
     client: &ApiClient,
     resource_type: &str,
@@ -506,33 +376,14 @@ async fn delete_single_resource(
     namespace: Option<&str>,
     opts: &DeleteOptions,
 ) -> Result<()> {
-    let ns = namespace.unwrap_or("default");
-    let api_path = get_resource_api_path(resource_type, name, ns)?;
-
-    let query_params = opts.query_params();
-    let body = opts.delete_body();
-
-    let status = client
-        .delete_with_options(&api_path, &query_params, body.as_ref())
-        .await
-        .context(format!("Failed to delete {} {}", resource_type, name))?;
-
-    if status == reqwest::StatusCode::NOT_FOUND {
-        anyhow::bail!(
-            "{} \"{}\" not found",
-            resource_type_to_kind(resource_type),
-            name
-        );
-    }
-
-    println!("{}", opts.format_output(resource_type, name));
-
-    // --wait: poll until the resource is gone
-    if opts.wait && !opts.dry_run {
-        wait_for_deletion(client, &api_path).await?;
-    }
-
-    Ok(())
+    let mapper = crate::discovery::RestMapper::from_server(client).await?;
+    let mapping = mapper.resolve(resource_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "error: the server doesn't have a resource type \"{}\"",
+            resource_type
+        )
+    })?;
+    delete_single_resource_with_mapping(client, mapping, name, namespace, opts).await
 }
 
 /// Poll until the resource returns 404 (deleted).
@@ -580,6 +431,184 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Legacy path-building helpers — test-only, kept for path-shape coverage.
+    // Production code now uses RestMapper + ops::build_path instead.
+    // ---------------------------------------------------------------------------
+
+    fn get_delete_api_path(kind: &str, namespace: Option<&str>, name: &str) -> Result<String> {
+        let ns = namespace.unwrap_or("default");
+        Ok(match kind {
+            "Pod" => format!("/api/v1/namespaces/{}/pods/{}", ns, name),
+            "Service" => format!("/api/v1/namespaces/{}/services/{}", ns, name),
+            "Deployment" => format!("/apis/apps/v1/namespaces/{}/deployments/{}", ns, name),
+            "StatefulSet" => format!("/apis/apps/v1/namespaces/{}/statefulsets/{}", ns, name),
+            "DaemonSet" => format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", ns, name),
+            "ReplicaSet" => format!("/apis/apps/v1/namespaces/{}/replicasets/{}", ns, name),
+            "Job" => format!("/apis/batch/v1/namespaces/{}/jobs/{}", ns, name),
+            "CronJob" => format!("/apis/batch/v1/namespaces/{}/cronjobs/{}", ns, name),
+            "ConfigMap" => format!("/api/v1/namespaces/{}/configmaps/{}", ns, name),
+            "Secret" => format!("/api/v1/namespaces/{}/secrets/{}", ns, name),
+            "ServiceAccount" => format!("/api/v1/namespaces/{}/serviceaccounts/{}", ns, name),
+            "Ingress" => format!(
+                "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
+                ns, name
+            ),
+            "PersistentVolumeClaim" => {
+                format!("/api/v1/namespaces/{}/persistentvolumeclaims/{}", ns, name)
+            }
+            "PersistentVolume" => format!("/api/v1/persistentvolumes/{}", name),
+            "StorageClass" => format!("/apis/storage.k8s.io/v1/storageclasses/{}", name),
+            "Namespace" => format!("/api/v1/namespaces/{}", name),
+            "Node" => format!("/api/v1/nodes/{}", name),
+            "Role" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
+                ns, name
+            ),
+            "RoleBinding" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
+                ns, name
+            ),
+            "ClusterRole" => format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{}", name),
+            "ClusterRoleBinding" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
+                name
+            ),
+            _ => anyhow::bail!("Unsupported resource kind for deletion: {}", kind),
+        })
+    }
+
+    fn get_list_api_path(resource_type: &str, namespace: &str) -> Result<String> {
+        Ok(match resource_type {
+            "pod" | "pods" => format!("/api/v1/namespaces/{}/pods", namespace),
+            "service" | "services" | "svc" => {
+                format!("/api/v1/namespaces/{}/services", namespace)
+            }
+            "deployment" | "deployments" | "deploy" => {
+                format!("/apis/apps/v1/namespaces/{}/deployments", namespace)
+            }
+            "statefulset" | "statefulsets" | "sts" => {
+                format!("/apis/apps/v1/namespaces/{}/statefulsets", namespace)
+            }
+            "daemonset" | "daemonsets" | "ds" => {
+                format!("/apis/apps/v1/namespaces/{}/daemonsets", namespace)
+            }
+            "replicaset" | "replicasets" | "rs" => {
+                format!("/apis/apps/v1/namespaces/{}/replicasets", namespace)
+            }
+            "job" | "jobs" => format!("/apis/batch/v1/namespaces/{}/jobs", namespace),
+            "cronjob" | "cronjobs" | "cj" => {
+                format!("/apis/batch/v1/namespaces/{}/cronjobs", namespace)
+            }
+            "configmap" | "configmaps" | "cm" => {
+                format!("/api/v1/namespaces/{}/configmaps", namespace)
+            }
+            "secret" | "secrets" => format!("/api/v1/namespaces/{}/secrets", namespace),
+            "serviceaccount" | "serviceaccounts" | "sa" => {
+                format!("/api/v1/namespaces/{}/serviceaccounts", namespace)
+            }
+            "node" | "nodes" => "/api/v1/nodes".to_string(),
+            "namespace" | "namespaces" | "ns" => "/api/v1/namespaces".to_string(),
+            "persistentvolume" | "persistentvolumes" | "pv" => {
+                "/api/v1/persistentvolumes".to_string()
+            }
+            "clusterrole" | "clusterroles" => {
+                "/apis/rbac.authorization.k8s.io/v1/clusterroles".to_string()
+            }
+            "clusterrolebinding" | "clusterrolebindings" => {
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings".to_string()
+            }
+            "role" | "roles" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles",
+                namespace
+            ),
+            "rolebinding" | "rolebindings" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings",
+                namespace
+            ),
+            _ => anyhow::bail!("Unsupported resource type for deletion: {}", resource_type),
+        })
+    }
+
+    fn get_resource_api_path(resource_type: &str, name: &str, namespace: &str) -> Result<String> {
+        Ok(match resource_type {
+            "pod" | "pods" => format!("/api/v1/namespaces/{}/pods/{}", namespace, name),
+            "service" | "services" | "svc" => {
+                format!("/api/v1/namespaces/{}/services/{}", namespace, name)
+            }
+            "deployment" | "deployments" | "deploy" => {
+                format!(
+                    "/apis/apps/v1/namespaces/{}/deployments/{}",
+                    namespace, name
+                )
+            }
+            "statefulset" | "statefulsets" | "sts" => {
+                format!(
+                    "/apis/apps/v1/namespaces/{}/statefulsets/{}",
+                    namespace, name
+                )
+            }
+            "daemonset" | "daemonsets" | "ds" => {
+                format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", namespace, name)
+            }
+            "replicaset" | "replicasets" | "rs" => {
+                format!(
+                    "/apis/apps/v1/namespaces/{}/replicasets/{}",
+                    namespace, name
+                )
+            }
+            "job" | "jobs" => format!("/apis/batch/v1/namespaces/{}/jobs/{}", namespace, name),
+            "cronjob" | "cronjobs" | "cj" => {
+                format!("/apis/batch/v1/namespaces/{}/cronjobs/{}", namespace, name)
+            }
+            "configmap" | "configmaps" | "cm" => {
+                format!("/api/v1/namespaces/{}/configmaps/{}", namespace, name)
+            }
+            "secret" | "secrets" => {
+                format!("/api/v1/namespaces/{}/secrets/{}", namespace, name)
+            }
+            "serviceaccount" | "serviceaccounts" | "sa" => {
+                format!("/api/v1/namespaces/{}/serviceaccounts/{}", namespace, name)
+            }
+            "ingress" | "ingresses" | "ing" => {
+                format!(
+                    "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
+                    namespace, name
+                )
+            }
+            "persistentvolumeclaim" | "persistentvolumeclaims" | "pvc" => {
+                format!(
+                    "/api/v1/namespaces/{}/persistentvolumeclaims/{}",
+                    namespace, name
+                )
+            }
+            "persistentvolume" | "persistentvolumes" | "pv" => {
+                format!("/api/v1/persistentvolumes/{}", name)
+            }
+            "storageclass" | "storageclasses" | "sc" => {
+                format!("/apis/storage.k8s.io/v1/storageclasses/{}", name)
+            }
+            "node" | "nodes" => format!("/api/v1/nodes/{}", name),
+            "namespace" | "namespaces" | "ns" => format!("/api/v1/namespaces/{}", name),
+            "role" | "roles" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
+                namespace, name
+            ),
+            "rolebinding" | "rolebindings" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
+                namespace, name
+            ),
+            "clusterrole" | "clusterroles" => {
+                format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{}", name)
+            }
+            "clusterrolebinding" | "clusterrolebindings" => format!(
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
+                name
+            ),
+            _ => anyhow::bail!("Unknown resource type: {}", resource_type),
+        })
+    }
 
     #[test]
     fn test_get_delete_api_path_pod() {
@@ -1550,15 +1579,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_single_resource_unsupported_type() {
+        // With RestMapper, an unsupported type fails either at discovery (no server)
+        // or at resolve (unknown kind). Either way it must return an error.
         let client = make_test_client();
         let opts = DeleteOptions::default();
         let result =
             delete_single_resource(&client, "foobar", "name", Some("default"), &opts).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown resource type"));
     }
 
     #[tokio::test]

@@ -142,6 +142,30 @@ pub async fn list_value(
         .unwrap_or_default())
 }
 
+/// DELETE a single resource by name.
+///
+/// `query` is an optional query-string suffix (e.g. `?gracePeriodSeconds=0&dryRun=All`)
+/// appended to the path, consistent with the pattern used by `apply_value` and
+/// `list_value`.  Callers that need propagationPolicy in the request body should
+/// build it separately and call `client.delete_with_options` directly.
+pub async fn delete_value(
+    client: &ApiClient,
+    m: &ResourceMapping,
+    namespace: Option<&str>,
+    name: &str,
+    query: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<reqwest::StatusCode> {
+    let ns = if m.namespaced {
+        Some(namespace.unwrap_or("default").to_string())
+    } else {
+        None
+    };
+    let path = build_path(m, ns.as_deref(), Some(name));
+    let full_path = format!("{path}{query}");
+    client.delete_with_options(&full_path, &[], body).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
