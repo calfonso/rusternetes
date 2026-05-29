@@ -97,16 +97,11 @@ pub async fn get_value(
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// GET a resource collection; returns the `.items` array as Values. When
-/// `all_namespaces` is true for a namespaced resource the cluster-wide
-/// collection path is used (no namespace segment).
-pub async fn list_value(
-    client: &ApiClient,
-    m: &ResourceMapping,
-    namespace: Option<&str>,
-    all_namespaces: bool,
-) -> Result<Vec<Value>> {
-    let path = if m.namespaced && all_namespaces {
+/// Build the collection path for a LIST. When `all_namespaces` is true for a
+/// namespaced resource the cluster-wide path is used (no `/namespaces/{ns}`
+/// segment), e.g. `/api/v1/pods` rather than `/api/v1/namespaces/default/pods`.
+pub fn list_path(m: &ResourceMapping, namespace: Option<&str>, all_namespaces: bool) -> String {
+    if m.namespaced && all_namespaces {
         // Cluster-wide path: no /namespaces/{ns} segment
         let base = if m.group.is_empty() {
             format!("/api/{}", m.version)
@@ -121,7 +116,21 @@ pub async fn list_value(
             None
         };
         build_path(m, ns.as_deref(), None)
-    };
+    }
+}
+
+/// GET a resource collection; returns the `.items` array as Values. When
+/// `all_namespaces` is true for a namespaced resource the cluster-wide
+/// collection path is used (no namespace segment). `query` is an optional
+/// query-string suffix (e.g. `?labelSelector=...`) appended to the path.
+pub async fn list_value(
+    client: &ApiClient,
+    m: &ResourceMapping,
+    namespace: Option<&str>,
+    all_namespaces: bool,
+    query: &str,
+) -> Result<Vec<Value>> {
+    let path = format!("{}{}", list_path(m, namespace, all_namespaces), query);
     let list: Value = client
         .get::<Value>(&path)
         .await
@@ -191,24 +200,38 @@ mod tests {
     #[test]
     fn all_namespaces_cluster_wide_path() {
         // When all_namespaces is requested for a namespaced resource the path
-        // must NOT contain a /namespaces/{ns} segment.
-        // We verify the path-building branch inside list_value directly by
-        // replicating its logic here (list_value itself is async and needs a
-        // live server, so we only test the path computation).
+        // must NOT contain a /namespaces/{ns} segment. This exercises the
+        // actual decision in list_path (the canonical place for LIST paths).
         let pod = m("", "pods", true);
-        // Cluster-wide: base + plural only
-        let base = if pod.group.is_empty() {
-            format!("/api/{}", pod.version)
-        } else {
-            format!("/apis/{}/{}", pod.group, pod.version)
-        };
-        let path = format!("{}/{}", base, pod.plural);
-        assert_eq!(path, "/api/v1/pods");
+        assert_eq!(list_path(&pod, None, true), "/api/v1/pods");
+        assert_eq!(
+            list_path(&pod, Some("kube-system"), true),
+            "/api/v1/pods" // namespace ignored under all_namespaces
+        );
 
         let dep = m("apps", "deployments", true);
-        let base2 = format!("/apis/{}/{}", dep.group, dep.version);
-        let path2 = format!("{}/{}", base2, dep.plural);
-        assert_eq!(path2, "/apis/apps/v1/deployments");
+        assert_eq!(list_path(&dep, None, true), "/apis/apps/v1/deployments");
+    }
+
+    #[test]
+    fn list_path_namespaced_uses_default_when_not_all_namespaces() {
+        let pod = m("", "pods", true);
+        assert_eq!(
+            list_path(&pod, None, false),
+            "/api/v1/namespaces/default/pods"
+        );
+        assert_eq!(
+            list_path(&pod, Some("prod"), false),
+            "/api/v1/namespaces/prod/pods"
+        );
+    }
+
+    #[test]
+    fn list_path_cluster_scoped_ignores_all_namespaces() {
+        // Cluster-scoped resources have no namespace segment either way.
+        let pv = m("", "persistentvolumes", false);
+        assert_eq!(list_path(&pv, None, false), "/api/v1/persistentvolumes");
+        assert_eq!(list_path(&pv, None, true), "/api/v1/persistentvolumes");
     }
 
     #[test]

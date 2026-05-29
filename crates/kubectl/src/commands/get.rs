@@ -306,6 +306,19 @@ async fn watch_resources(client: &ApiClient, api_path: &str, query: &str) -> Res
     Ok(())
 }
 
+/// The curated set of kinds expanded by `get all`. Mirrors the legacy behavior
+/// (pods, services, deployments, statefulsets, daemonsets, jobs, cronjobs).
+/// Kinds the server doesn't serve are skipped at resolve time.
+const ALL_RESOURCE_KINDS: &[&str] = &[
+    "pods",
+    "services",
+    "deployments",
+    "statefulsets",
+    "daemonsets",
+    "jobs",
+    "cronjobs",
+];
+
 /// Enhanced execute with all new parameters — now backed by RestMapper.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_enhanced(
@@ -340,8 +353,21 @@ pub async fn execute_enhanced(
     // Build the REST mapper once per invocation (one discovery round-trip).
     let mapper = crate::discovery::RestMapper::from_server(client).await?;
 
+    // `get all` expands to a curated set of common kinds (mirrors the legacy
+    // behavior). Each is resolved via the mapper; kinds the server doesn't
+    // serve are silently skipped rather than erroring out.
+    let is_all = resource_type.eq_ignore_ascii_case("all");
+
     // Support comma-separated resource types: "pods,services"
-    let resource_types: Vec<&str> = resource_type.split(',').collect();
+    let resource_types: Vec<&str> = if is_all {
+        ALL_RESOURCE_KINDS.to_vec()
+    } else {
+        resource_type.split(',').collect()
+    };
+
+    // Tracks whether any kind under `get all` produced output (drives the
+    // blank-line separators between non-empty kinds).
+    let mut printed_any = false;
 
     for (i, rtype) in resource_types.iter().enumerate() {
         // Support type/name syntax: "pod/nginx"
@@ -352,43 +378,70 @@ pub async fn execute_enhanced(
             None
         });
 
-        // Resolve the resource type via the discovery mapper.
-        let mapping = mapper.resolve(resolved_type).ok_or_else(|| {
-            anyhow::anyhow!(
-                "error: the server doesn't have a resource type \"{}\"",
-                resolved_type
-            )
-        })?;
+        // Resolve the resource type via the discovery mapper. Under `get all`
+        // an unservable kind is skipped instead of failing the whole command.
+        let mapping = match mapper.resolve(resolved_type) {
+            Some(m) => m,
+            None if is_all => continue,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "error: the server doesn't have a resource type \"{}\"",
+                    resolved_type
+                ));
+            }
+        };
 
         if watch {
-            // Build the watch path from the mapping.
-            let watch_ns = if mapping.namespaced && !all_namespaces {
-                Some(namespace.unwrap_or("default"))
-            } else {
-                None
-            };
-            let base_path = crate::ops::build_path(mapping, watch_ns, None);
+            // Build the watch collection path from the mapping. ops::list_path
+            // applies the all-namespaces cluster-wide override (no namespace
+            // segment), so `get pods -A --watch` hits `/api/v1/pods`.
+            let base_path = crate::ops::list_path(mapping, namespace, all_namespaces);
             watch_resources(client, &base_path, &query_string).await?;
             return Ok(());
         }
 
-        if i > 0 {
-            println!();
+        // For `get all`, suppress per-kind "No resources found" noise and only
+        // separate kinds that actually produced output. For a normal single /
+        // comma-list invocation, keep the legacy blank-line-before-subsequent
+        // behavior and the empty-collection message.
+        if is_all {
+            if printed_any {
+                println!();
+            }
+            let printed = execute_with_mapping(
+                client,
+                mapping,
+                effective_name,
+                namespace,
+                all_namespaces,
+                output,
+                no_headers,
+                &query_string,
+                show_labels,
+                sort_by,
+                true,
+            )
+            .await?;
+            printed_any = printed_any || printed;
+        } else {
+            if i > 0 {
+                println!();
+            }
+            execute_with_mapping(
+                client,
+                mapping,
+                effective_name,
+                namespace,
+                all_namespaces,
+                output,
+                no_headers,
+                &query_string,
+                show_labels,
+                sort_by,
+                false,
+            )
+            .await?;
         }
-
-        execute_with_mapping(
-            client,
-            mapping,
-            effective_name,
-            namespace,
-            all_namespaces,
-            output,
-            no_headers,
-            &query_string,
-            show_labels,
-            sort_by,
-        )
-        .await?;
     }
 
     Ok(())
@@ -416,6 +469,10 @@ mod urlencoding {
 /// type so the existing column-aware printers are preserved. For every other
 /// kind — and for all non-table output formats — the raw `serde_json::Value`
 /// is passed directly to `format_output`.
+///
+/// When `is_all` is true (invoked via `get all`), empty collections are
+/// silently skipped (no "No resources found" message). Returns whether any
+/// output was produced.
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_mapping(
     client: &ApiClient,
@@ -428,8 +485,9 @@ async fn execute_with_mapping(
     query: &str,
     show_labels: bool,
     sort_by: Option<&str>,
-) -> Result<()> {
-    use crate::ops::get_value;
+    is_all: bool,
+) -> Result<bool> {
+    use crate::ops::{get_value, list_value};
 
     let format = output
         .map(OutputFormat::from_str)
@@ -458,50 +516,15 @@ async fn execute_with_mapping(
         // not passed for single-item GETs (selectors don't apply).
         format_output(&value, &format)?;
     } else {
-        // Collection GET
-        let full_query = query;
-        // For items we need the query appended to the path. list_value builds
-        // the path internally; we can't append query there easily. Instead we
-        // use a small workaround: append query to the path we'd build, then
-        // call client.get directly.
-        let path_with_query = {
-            let base = crate::ops::build_path(
-                mapping,
-                if mapping.namespaced && !all_namespaces {
-                    Some(namespace.unwrap_or("default"))
-                } else if mapping.namespaced {
-                    // all_namespaces: cluster-wide path
-                    None
-                } else {
-                    None
-                },
-                None,
-            );
-            // For all_namespaces on a namespaced resource, build_path inserts
-            // /namespaces/default — we need the cluster-wide path instead.
-            if mapping.namespaced && all_namespaces {
-                let base_url = if mapping.group.is_empty() {
-                    format!("/api/{}", mapping.version)
-                } else {
-                    format!("/apis/{}/{}", mapping.group, mapping.version)
-                };
-                format!("{}/{}{}", base_url, mapping.plural, full_query)
-            } else {
-                format!("{}{}", base, full_query)
-            }
-        };
-
-        let list: serde_json::Value = client
-            .get::<serde_json::Value>(&path_with_query)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut items: Vec<serde_json::Value> = list
-            .get("items")
-            .and_then(|i| i.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // Collection GET — all path logic (including the all-namespaces
+        // cluster-wide override) lives in ops::list_value / ops::list_path.
+        let mut items = list_value(client, mapping, namespace, all_namespaces, query).await?;
 
         if items.is_empty() {
+            // Under `get all` an empty kind is skipped silently.
+            if is_all {
+                return Ok(false);
+            }
             if all_namespaces {
                 eprintln!("No resources found.");
             } else {
@@ -510,7 +533,7 @@ async fn execute_with_mapping(
                     namespace.unwrap_or("default")
                 );
             }
-            return Ok(());
+            return Ok(false);
         }
 
         if let Some(sort_expr) = sort_by {
@@ -591,7 +614,7 @@ async fn execute_with_mapping(
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Kept for callers that invoke `execute` directly (e.g., describe-fallback).
