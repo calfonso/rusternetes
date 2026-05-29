@@ -1,6 +1,7 @@
 #![allow(dead_code)] // consumed by later tasks in this branch
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// A resolved mapping from a resource (by any of its names) to the
 /// information every kubectl verb needs to build an API path.
@@ -92,6 +93,52 @@ pub fn parse_aggregated_discovery(doc: &Value) -> Result<Vec<ResourceMapping>> {
     Ok(out)
 }
 
+/// Resolves a user-supplied resource reference (plural, singular, short name,
+/// or Kind) to a single `ResourceMapping`.
+pub struct RestMapper {
+    mappings: Vec<ResourceMapping>,
+    by_key: HashMap<String, usize>, // lowercased key -> index, first writer wins
+}
+
+impl RestMapper {
+    pub fn new(mappings: Vec<ResourceMapping>) -> Self {
+        // Order so the core group is preferred on key collisions: sort with
+        // core ("") first. Insertion is first-writer-wins, so core entries
+        // claim shared keys (e.g. "events", "Event") ahead of grouped ones.
+        let mut mappings = mappings;
+        mappings.sort_by(|a, b| {
+            (!a.group.is_empty())
+                .cmp(&(!b.group.is_empty()))
+                .then_with(|| a.group.cmp(&b.group))
+                .then_with(|| a.plural.cmp(&b.plural))
+        });
+        let mut by_key = HashMap::new();
+        for (i, m) in mappings.iter().enumerate() {
+            let mut keys = vec![
+                m.plural.to_lowercase(),
+                m.singular.to_lowercase(),
+                m.kind.to_lowercase(),
+            ];
+            keys.extend(m.short_names.iter().map(|s| s.to_lowercase()));
+            for k in keys {
+                by_key.entry(k).or_insert(i); // first writer (core) wins
+            }
+        }
+        Self { mappings, by_key }
+    }
+
+    /// Resolve by plural / singular / short-name / Kind (case-insensitive).
+    pub fn resolve(&self, reference: &str) -> Option<&ResourceMapping> {
+        self.by_key
+            .get(&reference.to_lowercase())
+            .map(|&i| &self.mappings[i])
+    }
+
+    pub fn all(&self) -> &[ResourceMapping] {
+        &self.mappings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +189,38 @@ mod tests {
         let mappings = parse_aggregated_discovery(&doc).unwrap();
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].plural, "pods");
+    }
+
+    fn mapper() -> RestMapper {
+        RestMapper::new(parse_aggregated_discovery(&fixture()).unwrap())
+    }
+
+    #[test]
+    fn resolves_by_every_key_form() {
+        let m = mapper();
+        assert_eq!(m.resolve("deployments").unwrap().kind, "Deployment");
+        assert_eq!(m.resolve("deployment").unwrap().kind, "Deployment");
+        assert_eq!(m.resolve("Deployment").unwrap().kind, "Deployment");
+        assert_eq!(m.resolve("DEPLOYMENT").unwrap().kind, "Deployment"); // case-insensitive
+    }
+
+    #[test]
+    fn resolves_by_short_name() {
+        // Use a short name that ACTUALLY EXISTS in the fixture. `namespaces`
+        // has shortName "ns".
+        let m = mapper();
+        assert_eq!(m.resolve("ns").unwrap().kind, "Namespace");
+    }
+
+    #[test]
+    fn unknown_resolves_to_none() {
+        assert!(mapper().resolve("nonexistentthing").is_none());
+    }
+
+    #[test]
+    fn event_prefers_core_group() {
+        // "Event" exists in both core and events.k8s.io; core wins.
+        let m = mapper();
+        assert_eq!(m.resolve("Event").unwrap().group, "");
     }
 }
