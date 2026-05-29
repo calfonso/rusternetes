@@ -330,4 +330,33 @@ impl ApiClient {
     pub fn get_token(&self) -> Option<&String> {
         self.token.as_ref()
     }
+
+    /// GET a path with a custom `Accept` header, returning the parsed JSON.
+    /// Used for aggregated API discovery (`APIGroupDiscoveryList`).
+    pub async fn get_raw_with_accept(
+        &self,
+        path: &str,
+        accept: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.get(&url).header("Accept", accept);
+
+        if let Some(ref token) = self.token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request.send().await.context("Failed to send GET request")?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read response body")?;
+
+        if !status.is_success() {
+            anyhow::bail!("discovery request to {url} failed: {status}: {text}");
+        }
+
+        serde_json::from_str(&text).context("Failed to parse discovery response as JSON")
+    }
 }

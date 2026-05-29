@@ -137,6 +137,27 @@ impl RestMapper {
     pub fn all(&self) -> &[ResourceMapping] {
         &self.mappings
     }
+
+    const AGG_ACCEPT: &'static str =
+        "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json";
+
+    /// Build a mapper from the api-server's aggregated discovery. Fetches both
+    /// the core group (`/api`) and all named groups (`/apis`) — one HTTP call
+    /// each — and merges them.
+    pub async fn from_server(client: &crate::client::ApiClient) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let core = client
+            .get_raw_with_accept("/api", Self::AGG_ACCEPT)
+            .await
+            .context("unable to fetch core API discovery")?;
+        let apis = client
+            .get_raw_with_accept("/apis", Self::AGG_ACCEPT)
+            .await
+            .context("unable to fetch API group discovery")?;
+        let mut mappings = parse_aggregated_discovery(&core)?;
+        mappings.extend(parse_aggregated_discovery(&apis)?);
+        Ok(Self::new(mappings))
+    }
 }
 
 #[cfg(test)]
