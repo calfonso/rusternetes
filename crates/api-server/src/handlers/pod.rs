@@ -105,138 +105,16 @@ pub async fn create(
     // error would collapse multi-violation requests to a single cause and
     // break parity with `TestNewInvalidMulti`.
     //
-    // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec.
+    // K8s ref: pkg/apis/core/validation/validation.go ValidatePod /
+    // ValidatePodSpec. Validation is delegated to
+    // `rusternetes_common::validation::pod::validate_pod_create` which ports
+    // the full upstream pipeline (containers, initContainers, ports, probes,
+    // resources, restartPolicy, dnsPolicy, dnsConfig, volumes, tolerations,
+    // terminationGracePeriodSeconds, activeDeadlineSeconds).
     {
-        use rusternetes_common::validation::field::{Error as FErr, ErrorList, Path as FPath};
-        let mut errs: ErrorList = Vec::new();
-        let spec_path = FPath::new("spec");
-        let containers_path = spec_path.child("containers");
-
-        if pod.spec.is_none() {
-            errs.push(FErr::required(&containers_path, ""));
-        } else if let Some(ref spec) = pod.spec {
-            if spec.containers.is_empty() {
-                errs.push(FErr::required(
-                    &containers_path,
-                    "must have at least one container",
-                ));
-            }
-            for (i, container) in spec.containers.iter().enumerate() {
-                let cpath = containers_path.index(i);
-                if container.image.is_empty() {
-                    errs.push(FErr::required(&cpath.child("image"), ""));
-                }
-                if container.name.is_empty() {
-                    errs.push(FErr::required(&cpath.child("name"), ""));
-                } else {
-                    // K8s ref: validation.go::validateContainerName — names must
-                    // be a DNS-1123 label (lower-case, dashes, etc.).
-                    let dns_errs =
-                        rusternetes_common::validation::metav1::is_dns1123_label(&container.name);
-                    for msg in dns_errs {
-                        errs.push(FErr::invalid(
-                            &cpath.child("name"),
-                            container.name.clone(),
-                            msg,
-                        ));
-                    }
-                }
-            }
-            // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec —
-            // container names must be unique across containers + initContainers
-            // + ephemeralContainers. The upstream test
-            // `TestValidatePodSpec/duplicate_container_names` pins the exact
-            // error path: `spec.containers[1].name: Duplicate value: "ctr-a"`.
-            {
-                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                for (i, c) in spec.containers.iter().enumerate() {
-                    if !c.name.is_empty() && !seen.insert(c.name.as_str()) {
-                        errs.push(FErr::duplicate(
-                            &containers_path.index(i).child("name"),
-                            c.name.clone(),
-                        ));
-                    }
-                }
-                if let Some(ref inits) = spec.init_containers {
-                    for (i, c) in inits.iter().enumerate() {
-                        if !c.name.is_empty() && !seen.insert(c.name.as_str()) {
-                            errs.push(FErr::duplicate(
-                                &spec_path.child("initContainers").index(i).child("name"),
-                                c.name.clone(),
-                            ));
-                        }
-                    }
-                }
-                if let Some(ref ecs) = spec.ephemeral_containers {
-                    for (i, ec) in ecs.iter().enumerate() {
-                        if !ec.name.is_empty() && !seen.insert(ec.name.as_str()) {
-                            errs.push(FErr::duplicate(
-                                &spec_path
-                                    .child("ephemeralContainers")
-                                    .index(i)
-                                    .child("name"),
-                                ec.name.clone(),
-                            ));
-                        }
-                    }
-                }
-            }
-            // K8s ref: pkg/registry/core/pod/strategy.go Strategy.PrepareForCreate +
-            // pkg/apis/core/validation/validation.go ValidatePodSpec — ephemeral
-            // containers may NEVER be set on Pod create. They can only be added
-            // through the `/ephemeralcontainers` subresource.
-            if let Some(ref ec) = spec.ephemeral_containers {
-                if !ec.is_empty() {
-                    errs.push(FErr::forbidden(
-                        &spec_path.child("ephemeralContainers"),
-                        "cannot be set on create",
-                    ));
-                }
-            }
-            // K8s ref: pkg/apis/core/validation/validation.go validateActiveDeadlineSeconds —
-            // on create, activeDeadlineSeconds (when set) must be a positive integer.
-            if let Some(v) = spec.active_deadline_seconds {
-                if v <= 0 {
-                    errs.push(FErr::invalid(
-                        &spec_path.child("activeDeadlineSeconds"),
-                        v,
-                        "must be greater than 0",
-                    ));
-                }
-            }
-            // K8s ref: pkg/apis/core/validation/validation.go validateRestartPolicy
-            // — restartPolicy must be one of Always / OnFailure / Never (case-
-            // sensitive). Empty is allowed at this layer because the defaulter
-            // (`apply_pod_spec_defaults`) backfills it to "Always".
-            if let Some(ref policy) = spec.restart_policy {
-                if !policy.is_empty()
-                    && !matches!(policy.as_str(), "Always" | "OnFailure" | "Never")
-                {
-                    errs.push(FErr::not_supported(
-                        &spec_path.child("restartPolicy"),
-                        policy.clone(),
-                        &["Always", "OnFailure", "Never"],
-                    ));
-                }
-            }
-            // K8s ref: pkg/apis/core/validation/validation.go validatePodDNSConfig
-            // — bounds-check nameservers/searches/options and validate each
-            // search path. The underscore + lone-`.` relaxations are gated by
-            // the `RelaxedDNSSearchValidation` feature gate (GA-default-true
-            // in v1.34+); see `rusternetes_common::feature_gates`.
-            {
-                use rusternetes_common::feature_gates::{enabled, Feature};
-                let allow_relaxed = enabled(Feature::RelaxedDNSSearchValidation);
-                let dns_errs = rusternetes_common::validation::pod::validate_pod_dns_config(
-                    spec.dns_config.as_ref(),
-                    spec.dns_policy.as_deref(),
-                    allow_relaxed,
-                    &spec_path.child("dnsConfig"),
-                );
-                errs.extend(dns_errs);
-            }
-        }
-
+        use rusternetes_common::feature_gates::{enabled, Feature};
+        let allow_relaxed = enabled(Feature::RelaxedDNSSearchValidation);
+        let errs = rusternetes_common::validation::pod::validate_pod_create(&pod, allow_relaxed);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }

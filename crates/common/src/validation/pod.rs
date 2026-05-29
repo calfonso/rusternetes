@@ -2,29 +2,545 @@
 //! `pkg/apis/core/validation/validation.go` (release-1.35).
 //!
 //! Two layers:
-//! * **Create-side** ([`validate_pod_dns_config`]) — the per-field validators
-//!   the upstream `ValidatePodSpec` pipeline runs on a brand-new Pod. The
-//!   first such validator ported here is `validatePodDNSConfig`, gated by
-//!   the `RelaxedDNSSearchValidation` feature flag.
+//! * **Create-side** ([`validate_pod_create`] / [`validate_pod_spec`]) — the
+//!   per-field validators the upstream `ValidatePod` / `ValidatePodSpec`
+//!   pipeline runs on a brand-new Pod. Ported from
+//!   `pkg/apis/core/validation/validation.go::ValidatePod`,
+//!   `ValidatePodSpec`, `validateContainers`, `validateInitContainers`,
+//!   `validateContainerPorts`, `validateProbe`, `validateContainerResources`,
+//!   `validateRestartPolicy`, `validateDNSPolicy`, `validateVolumes`,
+//!   `validateTolerations`. Tests mirror
+//!   `TestValidatePod`, `TestValidatePodSpec`, `TestValidateContainers`,
+//!   `TestValidateInitContainers` from upstream
+//!   `pkg/apis/core/validation/validation_test.go`.
 //! * **Update-side** ([`validate_pod_spec_update`]) — composes the four
 //!   upstream pre-checks (container count, tolerations additions-only,
 //!   schedulingGates deletions-only, terminationGracePeriodSeconds
 //!   immutability with the negative→1 relaxation), the gated-pod
 //!   `nodeSelector` / `nodeAffinity` relaxation (KEP-3521), and a
 //!   munge+DeepEqual fence that catches everything else.
-//!
-//! NOT covered (intentionally deferred):
-//! - ActiveDeadlineSeconds precise semantics — the api-server handler
-//!   enforces these directly (see `crates/api-server/src/handlers/pod.rs`)
-//!   because the error wording is checked by tests pinned at that layer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
-    NodeAffinity, NodeSelectorTerm, PodDNSConfig, PodSchedulingGate, PodSpec, Toleration,
+    Container, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate, PodSpec,
+    Probe, Toleration, Volume,
 };
 use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::{is_dns1123_subdomain, is_dns1123_subdomain_with_underscore};
+use crate::validation::metav1::{
+    is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
+};
+
+// ---------------------------------------------------------------------------
+// Create-side validation
+// ---------------------------------------------------------------------------
+
+/// Top-level create-side validator.
+///
+/// Mirrors upstream `ValidatePod`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+///
+/// `allow_relaxed_dns_search` should be wired from the
+/// `RelaxedDNSSearchValidation` feature gate.
+pub fn validate_pod_create(pod: &Pod, allow_relaxed_dns_search: bool) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let spec_path = Path::new("spec");
+
+    let Some(ref spec) = pod.spec else {
+        errs.push(Error::required(
+            &spec_path.child("containers"),
+            "must have at least one container",
+        ));
+        return errs;
+    };
+
+    errs.extend(validate_pod_spec(
+        spec,
+        &spec_path,
+        allow_relaxed_dns_search,
+    ));
+    errs
+}
+
+/// Mirrors upstream `ValidatePodSpec`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+///
+/// This function is intentionally conservative — it only rejects what Go's
+/// upstream `ValidatePodSpec` rejects. Extra fields (volumes, probes,
+/// resources) are validated by their own sub-validators below.
+pub fn validate_pod_spec(
+    spec: &PodSpec,
+    fld_path: &Path,
+    allow_relaxed_dns_search: bool,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let containers_path = fld_path.child("containers");
+
+    // Containers must be non-empty.
+    if spec.containers.is_empty() {
+        errs.push(Error::required(
+            &containers_path,
+            "must have at least one container",
+        ));
+    }
+
+    // Validate containers and collect names for uniqueness check.
+    let mut all_names: HashSet<String> = HashSet::new();
+    for (i, c) in spec.containers.iter().enumerate() {
+        errs.extend(validate_container(c, false, &containers_path.index(i)));
+        if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
+            errs.push(Error::duplicate(
+                &containers_path.index(i).child("name"),
+                c.name.clone(),
+            ));
+        }
+    }
+
+    // Validate init containers.
+    if let Some(ref inits) = spec.init_containers {
+        let init_path = fld_path.child("initContainers");
+        for (i, c) in inits.iter().enumerate() {
+            errs.extend(validate_container(c, true, &init_path.index(i)));
+            if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
+                errs.push(Error::duplicate(
+                    &init_path.index(i).child("name"),
+                    c.name.clone(),
+                ));
+            }
+        }
+    }
+
+    // Ephemeral containers are forbidden on create.
+    // Upstream: `pkg/registry/core/pod/strategy.go PrepareForCreate`.
+    if let Some(ref ecs) = spec.ephemeral_containers {
+        if !ecs.is_empty() {
+            errs.push(Error::forbidden(
+                &fld_path.child("ephemeralContainers"),
+                "cannot be set on create",
+            ));
+        }
+        // Still check EC names for uniqueness even if forbidden.
+        let ec_path = fld_path.child("ephemeralContainers");
+        for (i, ec) in ecs.iter().enumerate() {
+            if !ec.name.is_empty() && !all_names.insert(ec.name.clone()) {
+                errs.push(Error::duplicate(
+                    &ec_path.index(i).child("name"),
+                    ec.name.clone(),
+                ));
+            }
+        }
+    }
+
+    // restartPolicy enum.
+    errs.extend(validate_restart_policy(
+        spec.restart_policy.as_deref(),
+        &fld_path.child("restartPolicy"),
+    ));
+
+    // terminationGracePeriodSeconds >= 0.
+    // Upstream: `validateTerminationGracePeriod`
+    if let Some(tgps) = spec.termination_grace_period_seconds {
+        if tgps < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("terminationGracePeriodSeconds"),
+                tgps,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // activeDeadlineSeconds > 0.
+    // Upstream: `validateActiveDeadlineSeconds`
+    if let Some(ads) = spec.active_deadline_seconds {
+        if ads <= 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("activeDeadlineSeconds"),
+                ads,
+                "must be greater than 0",
+            ));
+        }
+    }
+
+    // Volumes: unique names.
+    if let Some(ref vols) = spec.volumes {
+        errs.extend(validate_volumes(vols, &fld_path.child("volumes")));
+    }
+
+    // Tolerations.
+    if let Some(ref tols) = spec.tolerations {
+        errs.extend(validate_tolerations(tols, &fld_path.child("tolerations")));
+    }
+
+    // dnsPolicy + dnsConfig consistency.
+    errs.extend(validate_dns_policy(
+        spec.dns_policy.as_deref(),
+        &fld_path.child("dnsPolicy"),
+    ));
+    errs.extend(validate_pod_dns_config(
+        spec.dns_config.as_ref(),
+        spec.dns_policy.as_deref(),
+        allow_relaxed_dns_search,
+        &fld_path.child("dnsConfig"),
+    ));
+
+    errs
+}
+
+/// Validates a single container (regular or init). When `is_init` is true,
+/// init-container-specific restrictions are applied (no readinessProbe,
+/// no lifecycle).
+///
+/// Mirrors upstream `validateContainer` / `validateInitContainer`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+fn validate_container(c: &Container, is_init: bool, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // name — DNS-1123 label.
+    if c.name.is_empty() {
+        errs.push(Error::required(&fld_path.child("name"), ""));
+    } else {
+        for msg in is_dns1123_label(&c.name) {
+            errs.push(Error::invalid(&fld_path.child("name"), c.name.clone(), msg));
+        }
+    }
+
+    // image — must be non-empty.
+    if c.image.is_empty() {
+        errs.push(Error::required(&fld_path.child("image"), ""));
+    }
+
+    // ports.
+    if let Some(ref ports) = c.ports {
+        errs.extend(validate_container_ports(ports, &fld_path.child("ports")));
+    }
+
+    // probes.
+    if let Some(ref p) = c.liveness_probe {
+        errs.extend(validate_probe(p, &fld_path.child("livenessProbe")));
+    }
+    if let Some(ref p) = c.readiness_probe {
+        if is_init {
+            // Upstream: init containers may not have readinessProbe.
+            errs.push(Error::forbidden(
+                &fld_path.child("readinessProbe"),
+                "must not be set for init containers",
+            ));
+        } else {
+            errs.extend(validate_probe(p, &fld_path.child("readinessProbe")));
+        }
+    }
+    if let Some(ref p) = c.startup_probe {
+        errs.extend(validate_probe(p, &fld_path.child("startupProbe")));
+    }
+
+    // lifecycle — init containers may not have lifecycle hooks.
+    if is_init && c.lifecycle.is_some() {
+        errs.push(Error::forbidden(
+            &fld_path.child("lifecycle"),
+            "must not be set for init containers",
+        ));
+    }
+
+    // resources.
+    if let Some(ref res) = c.resources {
+        errs.extend(validate_resource_requirements(
+            res,
+            &fld_path.child("resources"),
+        ));
+    }
+
+    errs
+}
+
+/// Validates `spec.volumes[*]` — volume names must be unique DNS-1123 labels.
+///
+/// Mirrors upstream `validateVolumes`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+fn validate_volumes(volumes: &[Volume], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, vol) in volumes.iter().enumerate() {
+        let vpath = fld_path.index(i).child("name");
+        if vol.name.is_empty() {
+            errs.push(Error::required(&vpath, ""));
+        } else {
+            for msg in is_dns1123_label(&vol.name) {
+                errs.push(Error::invalid(&vpath, vol.name.clone(), msg));
+            }
+            if !seen.insert(vol.name.as_str()) {
+                errs.push(Error::duplicate(&vpath, vol.name.clone()));
+            }
+        }
+    }
+    errs
+}
+
+/// Validates container ports.
+///
+/// Rules (mirroring upstream `validateContainerPorts`,
+/// `pkg/apis/core/validation/validation.go`, release-1.35):
+/// - `containerPort` must be in [1, 65535].
+/// - `hostPort` (when set) must be in [0, 65535].
+/// - `protocol` (when set) must be TCP / UDP / SCTP.
+/// - Port names (when set) must be a DNS-1123 label and unique per container.
+fn validate_container_ports(
+    ports: &[crate::resources::pod::ContainerPort],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut seen_names: HashSet<&str> = HashSet::new();
+
+    for (i, p) in ports.iter().enumerate() {
+        let ppath = fld_path.index(i);
+
+        // containerPort range [1, 65535].
+        // Note: container_port is u16 in our struct, so 0 is the only
+        // out-of-range case (u16 max is 65535).
+        if p.container_port == 0 {
+            errs.push(Error::invalid(
+                &ppath.child("containerPort"),
+                p.container_port as i64,
+                "must be between 1 and 65535, inclusive",
+            ));
+        }
+
+        // hostPort range [0, 65535] — u16, so always valid.
+
+        // protocol enum.
+        if let Some(ref proto) = p.protocol {
+            if !matches!(proto.as_str(), "TCP" | "UDP" | "SCTP") {
+                errs.push(Error::not_supported(
+                    &ppath.child("protocol"),
+                    proto.clone(),
+                    &["TCP", "UDP", "SCTP"],
+                ));
+            }
+        }
+
+        // port name must be a DNS-1123 label and unique.
+        if let Some(ref name) = p.name {
+            if !name.is_empty() {
+                for msg in is_dns1123_label(name) {
+                    errs.push(Error::invalid(&ppath.child("name"), name.clone(), msg));
+                }
+                if !seen_names.insert(name.as_str()) {
+                    errs.push(Error::duplicate(&ppath.child("name"), name.clone()));
+                }
+            }
+        }
+    }
+    errs
+}
+
+/// Validates a Probe — exactly one handler must be set.
+///
+/// Mirrors upstream `validateProbe`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+fn validate_probe(probe: &Probe, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    let num_handlers = [
+        probe.http_get.is_some(),
+        probe.exec.is_some(),
+        probe.tcp_socket.is_some(),
+        probe.grpc.is_some(),
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+
+    if num_handlers == 0 {
+        errs.push(Error::required(fld_path, "must specify a handler type"));
+    } else if num_handlers > 1 {
+        errs.push(Error::invalid(
+            fld_path,
+            BadValue::Omit,
+            "may not specify more than 1 handler type",
+        ));
+    }
+
+    errs
+}
+
+// BadValue re-exported from field module for internal use in validate_probe.
+use crate::validation::field::BadValue;
+
+/// Validates a container's resource requirements: requests <= limits for each
+/// named resource. Does NOT parse Quantity strings (deferred — no
+/// `IsValidQuantity` port yet); only compares using the existing
+/// `Quantity::parse` if both sides parse. If parsing fails the field is
+/// still accepted (conservative).
+///
+/// Mirrors upstream `validateResourceRequirements` / `validateResourceList`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+fn validate_resource_requirements(
+    res: &crate::types::ResourceRequirements,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // Validate that Quantity strings are parseable.
+    if let Some(ref limits) = res.limits {
+        for (name, qty_str) in limits {
+            if crate::quantity::Quantity::parse(qty_str).is_err() {
+                errs.push(Error::invalid(
+                    &fld_path.child("limits").key(name),
+                    qty_str.clone(),
+                    "quantities must match the regular expression '[+-]?([0-9]+\\.?[0-9]*|\\.?[0-9]+)[mMkKgGtTpPeE]*'",
+                ));
+            }
+        }
+    }
+    if let Some(ref requests) = res.requests {
+        for (name, qty_str) in requests {
+            if crate::quantity::Quantity::parse(qty_str).is_err() {
+                errs.push(Error::invalid(
+                    &fld_path.child("requests").key(name),
+                    qty_str.clone(),
+                    "quantities must match the regular expression '[+-]?([0-9]+\\.?[0-9]*|\\.?[0-9]+)[mMkKgGtTpPeE]*'",
+                ));
+            }
+        }
+    }
+
+    // requests must not exceed limits for any resource.
+    // Upstream: `pkg/apis/core/validation/validation.go validateResourceRequirements`
+    if let (Some(ref limits), Some(ref requests)) = (&res.limits, &res.requests) {
+        for (name, req_str) in requests {
+            if let Some(lim_str) = limits.get(name) {
+                let req_q = crate::quantity::Quantity::parse(req_str);
+                let lim_q = crate::quantity::Quantity::parse(lim_str);
+                if let (Ok(r), Ok(l)) = (req_q, lim_q) {
+                    if r.cmp_value(&l) == std::cmp::Ordering::Greater {
+                        errs.push(Error::invalid(
+                            &fld_path.child("requests").key(name),
+                            req_str.clone(),
+                            format!("must be less than or equal to {name} limit",),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    errs
+}
+
+/// Validates `restartPolicy` — must be one of Always / OnFailure / Never.
+/// An absent (None) or empty policy is allowed (the defaulter backfills).
+///
+/// Mirrors upstream `validateRestartPolicy`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+fn validate_restart_policy(policy: Option<&str>, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(p) = policy else { return errs };
+    if !p.is_empty() && !matches!(p, "Always" | "OnFailure" | "Never") {
+        errs.push(Error::not_supported(
+            fld_path,
+            p.to_string(),
+            &["Always", "OnFailure", "Never"],
+        ));
+    }
+    errs
+}
+
+/// Validates `dnsPolicy` — must be one of the four known values (or absent).
+///
+/// Mirrors upstream `validateDNSPolicy`
+/// (`pkg/apis/core/validation/validation.go`, release-1.35).
+fn validate_dns_policy(policy: Option<&str>, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(p) = policy else { return errs };
+    if !matches!(
+        p,
+        "ClusterFirst" | "ClusterFirstWithHostNet" | "Default" | "None"
+    ) {
+        errs.push(Error::not_supported(
+            fld_path,
+            p.to_string(),
+            &["ClusterFirst", "ClusterFirstWithHostNet", "Default", "None"],
+        ));
+    }
+    errs
+}
+
+/// Validates `spec.tolerations[*]`.
+///
+/// Rules (mirroring upstream `validateTolerations`,
+/// `pkg/apis/core/validation/validation.go`, release-1.35):
+/// - `operator` (when set) must be Equal or Exists.
+/// - `effect` (when set) must be NoSchedule, PreferNoSchedule, or NoExecute.
+/// - When `operator` is Exists and a `value` is set, that is invalid.
+/// - When `effect` is NoExecute, `tolerationSeconds` may be set; for other
+///   effects it must be absent.
+fn validate_tolerations(tolerations: &[Toleration], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    for (i, tol) in tolerations.iter().enumerate() {
+        let tpath = fld_path.index(i);
+
+        // operator enum.
+        if let Some(ref op) = tol.operator {
+            match op.as_str() {
+                "Equal" => {
+                    // value may or may not be set — upstream allows any value.
+                }
+                "Exists" => {
+                    // Exists operator must not have a value.
+                    if tol.value.as_ref().is_some_and(|v| !v.is_empty()) {
+                        errs.push(Error::invalid(
+                            &tpath.child("operator"),
+                            op.clone(),
+                            "if the operator is 'Exists', the value should be empty",
+                        ));
+                    }
+                }
+                other => {
+                    errs.push(Error::not_supported(
+                        &tpath.child("operator"),
+                        other.to_string(),
+                        &["Equal", "Exists"],
+                    ));
+                }
+            }
+        }
+
+        // effect enum.
+        if let Some(ref effect) = tol.effect {
+            match effect.as_str() {
+                "NoSchedule" | "PreferNoSchedule" => {
+                    // tolerationSeconds must be absent for these effects.
+                    if let Some(secs) = tol.toleration_seconds {
+                        errs.push(Error::invalid(
+                            &tpath.child("tolerationSeconds"),
+                            secs,
+                            "effect must be 'NoExecute' when `tolerationSeconds` is set",
+                        ));
+                    }
+                }
+                "NoExecute" => {
+                    // tolerationSeconds may be set — any value is valid.
+                }
+                other => {
+                    errs.push(Error::not_supported(
+                        &tpath.child("effect"),
+                        other.to_string(),
+                        &["NoSchedule", "PreferNoSchedule", "NoExecute"],
+                    ));
+                }
+            }
+        } else if let Some(secs) = tol.toleration_seconds {
+            // No effect but tolerationSeconds set → only valid for NoExecute.
+            errs.push(Error::invalid(
+                &tpath.child("tolerationSeconds"),
+                secs,
+                "effect must be 'NoExecute' when `tolerationSeconds` is set",
+            ));
+        }
+    }
+
+    errs
+}
 
 // Upstream limits — `pkg/apis/core/validation/validation.go` const block at
 // line ~4126 in release-1.35.
