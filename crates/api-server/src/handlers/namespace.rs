@@ -115,14 +115,19 @@ pub async fn create(
         }
     }
 
-    // Create kube-root-ca.crt ConfigMap (required by Kubernetes conformance)
+    // Create kube-root-ca.crt ConfigMap (required by Kubernetes conformance).
+    // Best-effort: try the well-known filesystem cert paths, then fall back to
+    // `state.ca_cert_pem` (only populated when TLS is enabled). If neither is
+    // present — e.g. a non-TLS deployment — the cert is empty and ConfigMap
+    // creation is skipped below.
     let ca_cert = match tokio::fs::read_to_string("/etc/kubernetes/pki/ca.crt").await {
         Ok(s) => s,
         Err(_) => match tokio::fs::read_to_string("/etc/kubernetes/pki/api-server.crt").await {
             Ok(s) => s,
-            Err(_) => tokio::fs::read_to_string("/root/.rusternetes/certs/ca.crt")
-                .await
-                .unwrap_or_default(),
+            Err(_) => match tokio::fs::read_to_string("/root/.rusternetes/certs/ca.crt").await {
+                Ok(s) => s,
+                Err(_) => state.ca_cert_pem.clone().unwrap_or_default(),
+            },
         },
     };
 
@@ -168,10 +173,12 @@ pub async fn create(
     // Extension API servers (like sample-apiserver) read this on startup
     // to configure authentication delegation. Without it they crash.
     if ns_name == "kube-system" {
+        // Same best-effort cert resolution as kube-root-ca.crt above:
+        // filesystem paths first, then the injected `state.ca_cert_pem`.
         let ca_cert_for_auth = std::fs::read_to_string("/etc/kubernetes/pki/ca.crt")
             .or_else(|_| std::fs::read_to_string("/etc/kubernetes/pki/api-server.crt"))
             .or_else(|_| std::fs::read_to_string("/root/.rusternetes/certs/ca.crt"))
-            .unwrap_or_default();
+            .unwrap_or_else(|_| state.ca_cert_pem.clone().unwrap_or_default());
 
         let auth_cm = rusternetes_common::resources::ConfigMap {
             type_meta: rusternetes_common::types::TypeMeta {
