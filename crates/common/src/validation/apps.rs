@@ -26,13 +26,8 @@ use crate::validation::metav1::{validate_label_selector, LabelSelectorValidation
 /// Returns `true` if the selector selects nothing (both fields absent or
 /// empty). An empty selector is forbidden by upstream.
 fn selector_is_empty(sel: &LabelSelector) -> bool {
-    sel.match_labels
-        .as_ref()
-        .is_none_or(|m| m.is_empty())
-        && sel
-            .match_expressions
-            .as_ref()
-            .is_none_or(|m| m.is_empty())
+    sel.match_labels.as_ref().is_none_or(|m| m.is_empty())
+        && sel.match_expressions.as_ref().is_none_or(|m| m.is_empty())
 }
 
 /// Check that template labels contain every key/value from the selector's
