@@ -45,11 +45,16 @@ pub fn value_namespace(v: &Value) -> Option<String> {
 ///
 /// `namespace`: the explicit `-n` flag value, or `None` when unset (falls back
 /// to the body's metadata.namespace, then "default").
+///
+/// `query`: an optional query-string suffix (e.g. `?dryRun=All&fieldManager=...`)
+/// appended to the PUT/POST URLs. The existence check is performed on the bare
+/// item path so a query string never changes how we detect create-vs-replace.
 pub async fn apply_value(
     client: &ApiClient,
     m: &ResourceMapping,
     namespace: Option<&str>,
     body: &Value,
+    query: &str,
 ) -> Result<(&'static str, Value)> {
     let name = value_name(body).context("resource is missing metadata.name")?;
     let ns = if m.namespaced {
@@ -65,10 +70,10 @@ pub async fn apply_value(
     let item = build_path(m, ns.as_deref(), Some(&name));
     let collection = build_path(m, ns.as_deref(), None);
     if client.resource_exists(&item).await? {
-        let resp: Value = client.put(&item, body).await?;
+        let resp: Value = client.put(&format!("{item}{query}"), body).await?;
         Ok(("configured", resp))
     } else {
-        let resp: Value = client.post(&collection, body).await?;
+        let resp: Value = client.post(&format!("{collection}{query}"), body).await?;
         Ok(("created", resp))
     }
 }

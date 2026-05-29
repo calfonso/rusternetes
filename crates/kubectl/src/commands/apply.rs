@@ -1,4 +1,5 @@
 use crate::client::ApiClient;
+use crate::discovery::RestMapper;
 use crate::types::ApplyCommands;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -80,6 +81,11 @@ pub async fn execute_with_options(client: &ApiClient, options: &ApplyOptions) ->
     // Build query-parameter suffix.
     let query = build_query_string(options);
 
+    // Build the REST mapper once, up front — discovery is a pair of HTTP
+    // round-trips, so re-fetching it per document would be wasteful for
+    // multi-document manifests.
+    let mapper = RestMapper::from_server(client).await?;
+
     for path in &file_paths {
         let contents = if path == "-" {
             let mut buffer = String::new();
@@ -100,7 +106,7 @@ pub async fn execute_with_options(client: &ApiClient, options: &ApplyOptions) ->
                 continue;
             }
 
-            let result = apply_resource(client, &value, &query, options).await?;
+            let result = apply_resource(client, &mapper, &value, &query, options).await?;
 
             // Format output based on --output flag
             format_output(&result, options);
@@ -285,28 +291,22 @@ const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-config
 /// *original* input config (before the annotation itself was added) serialised
 /// as compact JSON, matching the behaviour of real kubectl.
 fn set_last_applied_annotation(value: &mut Value) {
-    // Build the annotation value from the *clean* config (without the
-    // annotation itself) — this prevents recursive growth.
     let clean = strip_last_applied(value);
     let annotation_value = serde_json::to_string(&clean).unwrap_or_default();
 
-    // Ensure metadata.annotations exists.
-    let metadata = value.as_object_mut().and_then(|o| {
-        o.entry("metadata")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .map(|m| m as *mut _)
-    });
-
-    if let Some(metadata) = metadata {
-        let metadata: &mut serde_json::Map<String, Value> = unsafe { &mut *metadata };
-        let annotations = metadata.entry("annotations").or_insert_with(|| json!({}));
-        if let Some(ann) = annotations.as_object_mut() {
-            ann.insert(
-                LAST_APPLIED_ANNOTATION.to_string(),
-                Value::String(annotation_value),
-            );
-        }
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let metadata = obj.entry("metadata").or_insert_with(|| json!({}));
+    let Some(meta_obj) = metadata.as_object_mut() else {
+        return;
+    };
+    let annotations = meta_obj.entry("annotations").or_insert_with(|| json!({}));
+    if let Some(ann) = annotations.as_object_mut() {
+        ann.insert(
+            LAST_APPLIED_ANNOTATION.to_string(),
+            Value::String(annotation_value),
+        );
     }
 }
 
@@ -336,12 +336,11 @@ fn strip_last_applied(value: &Value) -> Value {
 
 async fn apply_resource(
     client: &ApiClient,
+    mapper: &RestMapper,
     value: &serde_yaml::Value,
     query: &str,
     options: &ApplyOptions,
 ) -> Result<ApplyResult> {
-    use crate::discovery::RestMapper;
-
     // YAML doc -> JSON Value.
     let mut json: Value = serde_json::to_value(value)?;
     let kind = json
@@ -350,7 +349,6 @@ async fn apply_resource(
         .context("Missing 'kind' field")?
         .to_string();
 
-    let mapper = RestMapper::from_server(client).await?;
     let mapping = mapper.resolve(&kind).ok_or_else(|| {
         anyhow::anyhow!("error: the server doesn't have a resource type \"{kind}\"")
     })?;
@@ -360,39 +358,22 @@ async fn apply_resource(
 
     let ns = options.namespace.clone();
 
-    // Resolve the effective namespace for namespaced resources.
-    let effective_ns = if mapping.namespaced {
-        Some(
-            ns.clone()
-                .or_else(|| crate::ops::value_namespace(&json))
-                .unwrap_or_else(|| "default".to_string()),
-        )
+    let (action_str, response) =
+        crate::ops::apply_value(client, mapping, ns.as_deref(), &json, query).await?;
+    let action = if action_str == "created" {
+        ApplyAction::Created
     } else {
-        None
+        ApplyAction::Configured
     };
 
-    let name = crate::ops::value_name(&json).context("resource is missing metadata.name")?;
-    let item_path = crate::ops::build_path(mapping, effective_ns.as_deref(), Some(&name));
-    let collection_path = crate::ops::build_path(mapping, effective_ns.as_deref(), None);
-
-    // Append the query string (may contain dryRun=All, fieldManager=..., etc.).
-    let item_url = format!("{}{}", item_path, query);
-    let collection_url = format!("{}{}", collection_path, query);
-
-    let (action, response) = if client.resource_exists(&item_path).await? {
-        let resp: Value = client.put(&item_url, &json).await?;
-        (ApplyAction::Configured, resp)
-    } else {
-        let resp: Value = client.post(&collection_url, &json).await?;
-        (ApplyAction::Created, resp)
-    };
+    let name = crate::ops::value_name(&json).unwrap_or_default();
 
     Ok(ApplyResult {
         kind,
         api_group: mapping.group.clone(),
         name,
         namespace: if mapping.namespaced {
-            effective_ns
+            ns.or_else(|| crate::ops::value_namespace(&json))
         } else {
             None
         },
