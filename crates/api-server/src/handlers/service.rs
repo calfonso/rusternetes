@@ -90,6 +90,16 @@ pub async fn create(
 
     info!("Creating service: {}/{}", namespace, service.metadata.name);
 
+    // Field-level validation — accumulate every violation into a field::ErrorList
+    // and return 422 Invalid if non-empty, mirroring upstream NewInvalid.
+    // K8s ref: pkg/apis/core/validation/validation.go ValidateService.
+    {
+        let errs = rusternetes_common::validation::service::validate_service(&service);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Strict field validation: reject unknown / duplicate fields when requested.
     // Mirrors crates/api-server/src/handlers/pod.rs:38.
     crate::handlers::validation::validate_strict_fields(&params, &body, &service)?;
@@ -533,6 +543,15 @@ pub async fn update(
                     port.node_port = Some(allocate_node_port());
                 }
             }
+        }
+    }
+
+    // Field-level validation on update — same rules as create.
+    // K8s ref: pkg/apis/core/validation/validation.go ValidateServiceUpdate.
+    {
+        let errs = rusternetes_common::validation::service::validate_service(&service);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
