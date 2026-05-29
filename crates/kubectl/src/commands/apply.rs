@@ -1,13 +1,6 @@
-use crate::client::{ApiClient, GetError};
+use crate::client::ApiClient;
 use crate::types::ApplyCommands;
 use anyhow::{Context, Result};
-use rusternetes_common::resources::{
-    ClusterRole, ClusterRoleBinding, ConfigMap, CronJob, CustomResourceDefinition, DaemonSet,
-    Deployment, Endpoints, Ingress, Job, LimitRange, Namespace, Node, PersistentVolume,
-    PersistentVolumeClaim, Pod, PriorityClass, ResourceQuota, Role, RoleBinding, Secret, Service,
-    ServiceAccount, StatefulSet, StorageClass, VolumeSnapshot, VolumeSnapshotClass,
-};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;
@@ -282,18 +275,6 @@ fn format_output(result: &ApplyResult, options: &ApplyOptions) {
 }
 
 // ---------------------------------------------------------------------------
-// Resource existence check
-// ---------------------------------------------------------------------------
-
-async fn resource_exists<T: DeserializeOwned>(client: &ApiClient, path: &str) -> Result<bool> {
-    match client.get::<T>(path).await {
-        Ok(_) => Ok(true),
-        Err(GetError::NotFound) => Ok(false),
-        Err(GetError::Other(e)) => Err(e),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // last-applied-configuration annotation
 // ---------------------------------------------------------------------------
 
@@ -359,502 +340,62 @@ async fn apply_resource(
     query: &str,
     options: &ApplyOptions,
 ) -> Result<ApplyResult> {
-    let kind = value
+    use crate::discovery::RestMapper;
+
+    // YAML doc -> JSON Value.
+    let mut json: Value = serde_json::to_value(value)?;
+    let kind = json
         .get("kind")
         .and_then(|k| k.as_str())
-        .context("Missing 'kind' field")?;
+        .context("Missing 'kind' field")?
+        .to_string();
 
-    let yaml_str = serde_yaml::to_string(value)?;
+    let mapper = RestMapper::from_server(client).await?;
+    let mapping = mapper.resolve(&kind).ok_or_else(|| {
+        anyhow::anyhow!("error: the server doesn't have a resource type \"{kind}\"")
+    })?;
 
-    match kind {
-        "Pod" => {
-            apply_namespaced::<Pod>(
-                client, &yaml_str, kind, "", "pods", "/api/v1", query, options,
-            )
-            .await
-        }
-        "Service" => {
-            apply_namespaced::<Service>(
-                client, &yaml_str, kind, "", "services", "/api/v1", query, options,
-            )
-            .await
-        }
-        "Deployment" => {
-            apply_namespaced::<Deployment>(
-                client,
-                &yaml_str,
-                kind,
-                "apps",
-                "deployments",
-                "/apis/apps/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "StatefulSet" => {
-            apply_namespaced::<StatefulSet>(
-                client,
-                &yaml_str,
-                kind,
-                "apps",
-                "statefulsets",
-                "/apis/apps/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "DaemonSet" => {
-            apply_namespaced::<DaemonSet>(
-                client,
-                &yaml_str,
-                kind,
-                "apps",
-                "daemonsets",
-                "/apis/apps/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "Job" => {
-            apply_namespaced::<Job>(
-                client,
-                &yaml_str,
-                kind,
-                "batch",
-                "jobs",
-                "/apis/batch/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "CronJob" => {
-            apply_namespaced::<CronJob>(
-                client,
-                &yaml_str,
-                kind,
-                "batch",
-                "cronjobs",
-                "/apis/batch/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "ConfigMap" => {
-            apply_namespaced::<ConfigMap>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "configmaps",
-                "/api/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "Secret" => {
-            apply_namespaced::<Secret>(
-                client, &yaml_str, kind, "", "secrets", "/api/v1", query, options,
-            )
-            .await
-        }
-        "ServiceAccount" => {
-            apply_namespaced::<ServiceAccount>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "serviceaccounts",
-                "/api/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "Endpoints" => {
-            apply_namespaced::<Endpoints>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "endpoints",
-                "/api/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "PersistentVolumeClaim" => {
-            apply_namespaced::<PersistentVolumeClaim>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "persistentvolumeclaims",
-                "/api/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "ResourceQuota" => {
-            apply_namespaced::<ResourceQuota>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "resourcequotas",
-                "/api/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "LimitRange" => {
-            apply_namespaced::<LimitRange>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "limitranges",
-                "/api/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "Role" => {
-            apply_namespaced::<Role>(
-                client,
-                &yaml_str,
-                kind,
-                "rbac.authorization.k8s.io",
-                "roles",
-                "/apis/rbac.authorization.k8s.io/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "RoleBinding" => {
-            apply_namespaced::<RoleBinding>(
-                client,
-                &yaml_str,
-                kind,
-                "rbac.authorization.k8s.io",
-                "rolebindings",
-                "/apis/rbac.authorization.k8s.io/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "Ingress" => {
-            apply_namespaced::<Ingress>(
-                client,
-                &yaml_str,
-                kind,
-                "networking.k8s.io",
-                "ingresses",
-                "/apis/networking.k8s.io/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        "VolumeSnapshot" => {
-            apply_namespaced::<VolumeSnapshot>(
-                client,
-                &yaml_str,
-                kind,
-                "snapshot.storage.k8s.io",
-                "volumesnapshots",
-                "/apis/snapshot.storage.k8s.io/v1",
-                query,
-                options,
-            )
-            .await
-        }
-        // Cluster-scoped resources
-        "Namespace" => {
-            apply_cluster::<Namespace>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "namespaces",
-                "/api/v1/namespaces",
-                query,
-                options,
-            )
-            .await
-        }
-        "Node" => {
-            apply_cluster::<Node>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "nodes",
-                "/api/v1/nodes",
-                query,
-                options,
-            )
-            .await
-        }
-        "PersistentVolume" => {
-            apply_cluster::<PersistentVolume>(
-                client,
-                &yaml_str,
-                kind,
-                "",
-                "persistentvolumes",
-                "/api/v1/persistentvolumes",
-                query,
-                options,
-            )
-            .await
-        }
-        "ClusterRole" => {
-            apply_cluster::<ClusterRole>(
-                client,
-                &yaml_str,
-                kind,
-                "rbac.authorization.k8s.io",
-                "clusterroles",
-                "/apis/rbac.authorization.k8s.io/v1/clusterroles",
-                query,
-                options,
-            )
-            .await
-        }
-        "ClusterRoleBinding" => {
-            apply_cluster::<ClusterRoleBinding>(
-                client,
-                &yaml_str,
-                kind,
-                "rbac.authorization.k8s.io",
-                "clusterrolebindings",
-                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
-                query,
-                options,
-            )
-            .await
-        }
-        "StorageClass" => {
-            apply_cluster::<StorageClass>(
-                client,
-                &yaml_str,
-                kind,
-                "storage.k8s.io",
-                "storageclasses",
-                "/apis/storage.k8s.io/v1/storageclasses",
-                query,
-                options,
-            )
-            .await
-        }
-        "VolumeSnapshotClass" => {
-            apply_cluster::<VolumeSnapshotClass>(
-                client,
-                &yaml_str,
-                kind,
-                "snapshot.storage.k8s.io",
-                "volumesnapshotclasses",
-                "/apis/snapshot.storage.k8s.io/v1/volumesnapshotclasses",
-                query,
-                options,
-            )
-            .await
-        }
-        "PriorityClass" => {
-            apply_cluster::<PriorityClass>(
-                client,
-                &yaml_str,
-                kind,
-                "scheduling.k8s.io",
-                "priorityclasses",
-                "/apis/scheduling.k8s.io/v1/priorityclasses",
-                query,
-                options,
-            )
-            .await
-        }
-        "CustomResourceDefinition" => {
-            apply_cluster::<CustomResourceDefinition>(
-                client,
-                &yaml_str,
-                kind,
-                "apiextensions.k8s.io",
-                "customresourcedefinitions",
-                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
-                query,
-                options,
-            )
-            .await
-        }
-        _ => anyhow::bail!("Unsupported resource kind: {}", kind),
-    }
-}
+    // last-applied-configuration annotation (helper already takes &mut Value).
+    set_last_applied_annotation(&mut json);
 
-/// Helper trait to access metadata on any resource.
-trait HasMetadata: serde::Serialize + DeserializeOwned {
-    fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta;
-    fn metadata(&self) -> &rusternetes_common::types::ObjectMeta;
-}
+    let ns = options.namespace.clone();
 
-// Implement for all supported types via a macro.
-macro_rules! impl_has_metadata {
-    ($($ty:ty),+ $(,)?) => {
-        $(
-            impl HasMetadata for $ty {
-                fn metadata_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
-                    &mut self.metadata
-                }
-                fn metadata(&self) -> &rusternetes_common::types::ObjectMeta {
-                    &self.metadata
-                }
-            }
-        )+
-    };
-}
-
-impl_has_metadata!(
-    Pod,
-    Service,
-    Deployment,
-    StatefulSet,
-    DaemonSet,
-    Job,
-    CronJob,
-    ConfigMap,
-    Secret,
-    ServiceAccount,
-    Endpoints,
-    PersistentVolumeClaim,
-    ResourceQuota,
-    LimitRange,
-    Role,
-    RoleBinding,
-    Ingress,
-    VolumeSnapshot,
-    Namespace,
-    Node,
-    PersistentVolume,
-    ClusterRole,
-    ClusterRoleBinding,
-    StorageClass,
-    VolumeSnapshotClass,
-    PriorityClass,
-    CustomResourceDefinition,
-);
-
-/// Apply a namespaced resource.
-#[allow(clippy::too_many_arguments)]
-async fn apply_namespaced<T: HasMetadata>(
-    client: &ApiClient,
-    yaml_str: &str,
-    kind: &str,
-    api_group: &str,
-    resource_plural: &str,
-    api_base: &str,
-    query: &str,
-    options: &ApplyOptions,
-) -> Result<ApplyResult> {
-    let mut resource: T = serde_yaml::from_str(yaml_str)?;
-    let ns = options
-        .namespace
-        .clone()
-        .or_else(|| resource.metadata().namespace.clone())
-        .unwrap_or_else(|| "default".to_string());
-    let name = resource.metadata().name.clone();
-
-    // Set the last-applied-configuration annotation.
-    let mut json_val: Value = serde_json::to_value(&resource)?;
-    set_last_applied_annotation(&mut json_val);
-    // Re-deserialize with annotation applied.
-    resource = serde_json::from_value(json_val)?;
-
-    let item_path = format!(
-        "{}/namespaces/{}/{}/{}",
-        api_base, ns, resource_plural, name
-    );
-    let collection_path = format!("{}/namespaces/{}/{}", api_base, ns, resource_plural);
-
-    let exists = resource_exists::<T>(client, &item_path).await?;
-
-    let (action, response) = if exists {
-        let result: Value = client
-            .put(&format!("{}{}", item_path, query), &resource)
-            .await?;
-        (ApplyAction::Configured, result)
+    // Resolve the effective namespace for namespaced resources.
+    let effective_ns = if mapping.namespaced {
+        Some(
+            ns.clone()
+                .or_else(|| crate::ops::value_namespace(&json))
+                .unwrap_or_else(|| "default".to_string()),
+        )
     } else {
-        resource.metadata_mut().ensure_uid();
-        resource.metadata_mut().ensure_creation_timestamp();
-        let result: Value = client
-            .post(&format!("{}{}", collection_path, query), &resource)
-            .await?;
-        (ApplyAction::Created, result)
+        None
+    };
+
+    let name = crate::ops::value_name(&json).context("resource is missing metadata.name")?;
+    let item_path = crate::ops::build_path(mapping, effective_ns.as_deref(), Some(&name));
+    let collection_path = crate::ops::build_path(mapping, effective_ns.as_deref(), None);
+
+    // Append the query string (may contain dryRun=All, fieldManager=..., etc.).
+    let item_url = format!("{}{}", item_path, query);
+    let collection_url = format!("{}{}", collection_path, query);
+
+    let (action, response) = if client.resource_exists(&item_path).await? {
+        let resp: Value = client.put(&item_url, &json).await?;
+        (ApplyAction::Configured, resp)
+    } else {
+        let resp: Value = client.post(&collection_url, &json).await?;
+        (ApplyAction::Created, resp)
     };
 
     Ok(ApplyResult {
-        kind: kind.to_string(),
-        api_group: api_group.to_string(),
+        kind,
+        api_group: mapping.group.clone(),
         name,
-        namespace: Some(ns),
-        action,
-        response,
-    })
-}
-
-/// Apply a cluster-scoped resource.
-#[allow(clippy::too_many_arguments)]
-async fn apply_cluster<T: HasMetadata>(
-    client: &ApiClient,
-    yaml_str: &str,
-    kind: &str,
-    api_group: &str,
-    _resource_plural: &str,
-    collection_path: &str,
-    query: &str,
-    _options: &ApplyOptions,
-) -> Result<ApplyResult> {
-    let mut resource: T = serde_yaml::from_str(yaml_str)?;
-    let name = resource.metadata().name.clone();
-
-    // Set the last-applied-configuration annotation.
-    let mut json_val: Value = serde_json::to_value(&resource)?;
-    set_last_applied_annotation(&mut json_val);
-    resource = serde_json::from_value(json_val)?;
-
-    let item_path = format!("{}/{}", collection_path, name);
-
-    let exists = resource_exists::<T>(client, &item_path).await?;
-
-    let (action, response) = if exists {
-        let result: Value = client
-            .put(&format!("{}{}", item_path, query), &resource)
-            .await?;
-        (ApplyAction::Configured, result)
-    } else {
-        resource.metadata_mut().ensure_uid();
-        resource.metadata_mut().ensure_creation_timestamp();
-        let result: Value = client
-            .post(&format!("{}{}", collection_path, query), &resource)
-            .await?;
-        (ApplyAction::Created, result)
-    };
-
-    Ok(ApplyResult {
-        kind: kind.to_string(),
-        api_group: api_group.to_string(),
-        name,
-        namespace: None,
+        namespace: if mapping.namespaced {
+            effective_ns
+        } else {
+            None
+        },
         action,
         response,
     })
@@ -2027,19 +1568,38 @@ mod tests {
         assert_eq!(path, "/api/v1/namespaces/ns1/secrets/my-secret");
     }
 
+    /// Replaced test_has_metadata_trait_pod: the typed HasMetadata machinery is
+    /// gone. This test covers the equivalent behavior in the new Value-based
+    /// apply path: set_last_applied_annotation operates on a pod-shaped JSON
+    /// Value and preserves all metadata fields while injecting the annotation.
     #[test]
-    fn test_has_metadata_trait_pod() {
-        let mut pod = Pod {
-            metadata: rusternetes_common::types::ObjectMeta {
-                name: "test".to_string(),
-                ..Default::default()
+    fn test_set_last_applied_annotation_on_pod_shaped_value() {
+        let mut val = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "test",
+                "namespace": "default"
             },
-            spec: None,
-            status: None,
-            type_meta: Default::default(),
-        };
-        assert_eq!(pod.metadata().name, "test");
-        pod.metadata_mut().name = "changed".to_string();
-        assert_eq!(pod.metadata().name, "changed");
+            "spec": {"containers": []}
+        });
+        set_last_applied_annotation(&mut val);
+
+        // The annotation must be present and valid JSON.
+        let ann = val["metadata"]["annotations"][LAST_APPLIED_ANNOTATION]
+            .as_str()
+            .expect("annotation must be set on pod-shaped value");
+        let parsed: Value = serde_json::from_str(ann).expect("annotation must be valid JSON");
+
+        // The stored config must reflect the original resource.
+        assert_eq!(parsed["kind"], "Pod");
+        assert_eq!(parsed["metadata"]["name"], "test");
+        // The annotation must NOT recursively contain itself.
+        assert!(
+            parsed
+                .pointer("/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration")
+                .is_none(),
+            "annotation must not self-reference"
+        );
     }
 }
