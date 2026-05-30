@@ -91,6 +91,35 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
     serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
 }
 
+/// Decide whether a pod that has reached `TerminatedPod` should be removed
+/// from storage, and remove it if so. Returns `Ok(true)` when the object was
+/// deleted, `Ok(false)` when it was intentionally retained.
+///
+/// An explicitly-deleted pod (`deletionTimestamp` set) with no finalizers
+/// MUST be removed: rusternetes has no finalizer-driven tombstone GC, so the
+/// kubelet deletes directly. Leaving it makes the next reconcile default back
+/// to `SyncPod`, which re-detects `deletionTimestamp => needs_terminating` and
+/// re-enters `TerminatingPod` indefinitely (a `pelagos stop` storm).
+///
+/// A naturally-terminated pod (no `deletionTimestamp`) is retained so
+/// `kubectl get pod` keeps showing its terminal status. A pod with an
+/// unresolved finalizer is retained so the finalizer owner can still observe
+/// it. Extracted from `sync_pod` so the decision can be unit-tested against a
+/// real `Storage` backend rather than a predicate recomputed in the test.
+pub async fn finalize_terminated_pod_storage<S: Storage + ?Sized>(
+    storage: &S,
+    key: &str,
+    has_deletion_timestamp: bool,
+    has_finalizers: bool,
+) -> Result<bool> {
+    if has_deletion_timestamp && !has_finalizers {
+        storage.delete(key).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 impl Kubelet {
     /// Construct a Kubelet with upstream-default eviction config and
     /// `root_dir = /var/lib/kubelet`. Kept for library back-compat; the
@@ -1646,19 +1675,30 @@ impl Kubelet {
                         let _ = self.storage.update(&key, &p).await;
                     }
                 }
-                // If the pod was explicitly deleted (deletionTimestamp set), remove it
-                // from storage now that containers are stopped and status is terminal.
-                // Without this, removing pod_states causes the next reconcile to default
-                // back to SyncPod, which detects deletionTimestamp => needs_terminating,
-                // re-entering TerminatingPod indefinitely.
-                if pod.metadata.deletion_timestamp.is_some() {
-                    let _ = self.storage.delete(&key).await;
-                    debug!(
+                // Now that containers are stopped and the terminal status is
+                // persisted, decide whether the object stays or is removed. The
+                // rule lives in `finalize_terminated_pod_storage` so it can be
+                // unit-tested against real storage; see that helper for why an
+                // explicitly-deleted, finalizer-free pod must be removed.
+                match finalize_terminated_pod_storage(
+                    self.storage.as_ref(),
+                    &key,
+                    pod.metadata.deletion_timestamp.is_some(),
+                    has_finalizers,
+                )
+                .await
+                {
+                    Ok(true) => debug!(
                         "Pod {}/{} removed from storage (deletionTimestamp set, no finalizers)",
                         namespace, pod_name
-                    );
-                } else {
-                    debug!("Pod {}/{} marked terminal in storage", namespace, pod_name);
+                    ),
+                    Ok(false) => {
+                        debug!("Pod {}/{} marked terminal in storage", namespace, pod_name)
+                    }
+                    Err(e) => warn!(
+                        "Pod {}/{}: failed to finalize storage state: {}",
+                        namespace, pod_name, e
+                    ),
                 }
             } else {
                 // Pod has finalizers — update status to Failed but don't delete
