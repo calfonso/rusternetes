@@ -2,6 +2,7 @@ mod client;
 mod commands;
 mod discovery;
 mod kubeconfig;
+mod manifest;
 mod ops;
 mod types;
 mod websocket;
@@ -1052,9 +1053,12 @@ async fn main() -> Result<()> {
         let server = config
             .get_server()
             .unwrap_or_else(|_| "https://localhost:6443".to_string());
-        let skip_tls = config
-            .should_skip_tls_verify()
-            .unwrap_or(cli.insecure_skip_tls_verify);
+        // Insecure mode is forced if EITHER the `--insecure-skip-tls-verify`
+        // CLI flag is set OR the kubeconfig cluster has
+        // `insecure-skip-tls-verify: true`. The CLI flag always wins, so it
+        // overrides a kubeconfig that pins a (possibly stale) CA.
+        let skip_tls =
+            cli.insecure_skip_tls_verify || config.should_skip_tls_verify().unwrap_or(false);
         let token = cli.token.or_else(|| config.get_token().ok().flatten());
         let namespace = config
             .get_namespace()
@@ -1153,7 +1157,7 @@ async fn main() -> Result<()> {
             opts.resolve();
 
             if let Some(file_path) = file {
-                commands::delete::execute_from_file(&client, &file_path).await?;
+                commands::delete::execute_from_file(&client, &file_path, &opts).await?;
             } else if all {
                 if let Some(rt) = resource_type {
                     commands::delete::execute_delete_all(

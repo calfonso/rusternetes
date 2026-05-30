@@ -1,4 +1,5 @@
 use crate::client::ApiClient;
+use crate::discovery::ResourceMapping;
 use crate::types::SetCommands;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -105,17 +106,21 @@ pub async fn execute_set(
     }
 }
 
-/// Resolve the API path for a resource type/name via server discovery.
+/// Resolve the API path and mapping for a resource type/name via server
+/// discovery.
 ///
 /// Uses `RestMapper` so any kind the server exposes (plural, singular, short
 /// name, or Kind) is addressable, rather than a hardcoded alias table. Returns
-/// the item path and the resolved plural resource name.
-async fn resolve_resource_path(
+/// the item path plus the resolved `ResourceMapping`, so callers can build a
+/// group-qualified label (via `ops::resource_label`) and apply kind guards
+/// without a second `RestMapper::from_server` round-trip. This is the single
+/// discovery call site shared by every `set` subcommand.
+async fn resolve_resource(
     client: &ApiClient,
     resource_type: &str,
     name: &str,
     namespace: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, ResourceMapping)> {
     let mapper = crate::discovery::RestMapper::from_server(client).await?;
     let mapping = mapper.resolve(resource_type).ok_or_else(|| {
         anyhow::anyhow!("error: the server doesn't have a resource type \"{resource_type}\"")
@@ -126,7 +131,7 @@ async fn resolve_resource_path(
         None
     };
     let path = crate::ops::build_path(mapping, ns, Some(name));
-    Ok((path, mapping.plural.clone()))
+    Ok((path, mapping.clone()))
 }
 
 /// Parse "resource_type/name" format into (type, name).
@@ -151,7 +156,7 @@ pub async fn execute_image(
     namespace: &str,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
+    let (path, mapping) = resolve_resource(client, &resource_type, &name, namespace).await?;
 
     // Parse container=image pairs
     let mut image_updates: Vec<(String, String)> = Vec::new();
@@ -254,17 +259,12 @@ pub async fn execute_image(
         .await
         .context("Failed to update image")?;
 
+    let label = crate::ops::resource_label(&mapping, &name);
     for (container_name, image) in &image_updates {
         if container_name == "*" {
-            println!(
-                "{}/{} image updated to {} (all containers)",
-                resource_type, name, image
-            );
+            println!("{label} image updated to {image} (all containers)");
         } else {
-            println!(
-                "{}/{} container {} image updated to {}",
-                resource_type, name, container_name, image
-            );
+            println!("{label} container {container_name} image updated to {image}");
         }
     }
 
@@ -283,7 +283,7 @@ pub async fn execute_env(
     list: bool,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
+    let (path, mapping) = resolve_resource(client, &resource_type, &name, namespace).await?;
 
     // Get current resource
     let current: Value = client
@@ -411,7 +411,10 @@ pub async fn execute_env(
         .await
         .context("Failed to update environment variables")?;
 
-    println!("{}/{} env updated", resource_type, name);
+    println!(
+        "{} env updated",
+        crate::ops::resource_label(&mapping, &name)
+    );
 
     Ok(())
 }
@@ -428,7 +431,7 @@ pub async fn execute_resources(
     requests: Option<&str>,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
+    let (path, mapping) = resolve_resource(client, &resource_type, &name, namespace).await?;
 
     // Get current resource
     let current: Value = client
@@ -511,7 +514,10 @@ pub async fn execute_resources(
         .await
         .context("Failed to update resource requirements")?;
 
-    println!("{}/{} resource requirements updated", resource_type, name);
+    println!(
+        "{} resource requirements updated",
+        crate::ops::resource_label(&mapping, &name)
+    );
 
     Ok(())
 }
@@ -546,7 +552,7 @@ pub async fn execute_selector(
 
     // Resolve the API path via server discovery (handles services and any
     // other selector-bearing kind).
-    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
+    let (path, mapping) = resolve_resource(client, &resource_type, &name, namespace).await?;
 
     let patch_body = json!({
         "spec": {
@@ -559,7 +565,10 @@ pub async fn execute_selector(
         .await
         .context("Failed to update selector")?;
 
-    println!("{}/{} selector updated", resource_type, name);
+    println!(
+        "{} selector updated",
+        crate::ops::resource_label(&mapping, &name)
+    );
 
     Ok(())
 }
@@ -574,7 +583,7 @@ pub async fn execute_serviceaccount(
     namespace: &str,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
+    let (path, mapping) = resolve_resource(client, &resource_type, &name, namespace).await?;
 
     // Get current resource to determine if it has a template
     let current: Value = client
@@ -611,8 +620,9 @@ pub async fn execute_serviceaccount(
         .context("Failed to update serviceAccountName")?;
 
     println!(
-        "{}/{} serviceaccount updated to {}",
-        resource_type, name, service_account_name
+        "{} serviceaccount updated to {}",
+        crate::ops::resource_label(&mapping, &name),
+        service_account_name
     );
 
     Ok(())
@@ -632,12 +642,10 @@ pub async fn execute_subject(
     let (resource_type, name) = parse_resource_arg(resource)?;
 
     // set subject only operates on (Cluster)RoleBindings. Resolve the type via
-    // server discovery, then guard on the resolved Kind so the path is built by
-    // the shared RestMapper rather than a hardcoded group/version literal.
-    let mapper = crate::discovery::RestMapper::from_server(client).await?;
-    let mapping = mapper.resolve(&resource_type).ok_or_else(|| {
-        anyhow::anyhow!("error: the server doesn't have a resource type \"{resource_type}\"")
-    })?;
+    // the shared discovery resolver, then guard on the resolved Kind so the
+    // path is built by the shared RestMapper rather than a hardcoded
+    // group/version literal.
+    let (path, mapping) = resolve_resource(client, &resource_type, &name, namespace).await?;
     // Guard runs after discovery (we need the resolved Kind); a wrong kind costs one discovery round-trip before rejection.
     if mapping.kind != "RoleBinding" && mapping.kind != "ClusterRoleBinding" {
         anyhow::bail!(
@@ -645,12 +653,6 @@ pub async fn execute_subject(
             resource_type
         );
     }
-    let ns = if mapping.namespaced {
-        Some(namespace)
-    } else {
-        None
-    };
-    let path = crate::ops::build_path(mapping, ns, Some(&name));
 
     // Get current binding
     let mut current: Value = client
@@ -725,7 +727,10 @@ pub async fn execute_subject(
         .await
         .context("Failed to update subjects")?;
 
-    println!("{}/{} subjects updated", resource_type, name);
+    println!(
+        "{} subjects updated",
+        crate::ops::resource_label(&mapping, &name)
+    );
 
     Ok(())
 }

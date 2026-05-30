@@ -1032,7 +1032,7 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
             ),
         ],
         "apps" => vec![
-            res(
+            res_with_short(
                 "deployments",
                 "deployment",
                 "Deployment",
@@ -1042,8 +1042,9 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                     sub("status", "Deployment", status_verbs),
                     sub("scale", "Scale", status_verbs),
                 ],
+                Some(vec!["deploy"]),
             ),
-            res(
+            res_with_short(
                 "replicasets",
                 "replicaset",
                 "ReplicaSet",
@@ -1053,16 +1054,18 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                     sub("status", "ReplicaSet", status_verbs),
                     sub("scale", "Scale", status_verbs),
                 ],
+                Some(vec!["rs"]),
             ),
-            res(
+            res_with_short(
                 "daemonsets",
                 "daemonset",
                 "DaemonSet",
                 true,
                 all_verbs,
                 vec![sub("status", "DaemonSet", status_verbs)],
+                Some(vec!["ds"]),
             ),
-            res(
+            res_with_short(
                 "statefulsets",
                 "statefulset",
                 "StatefulSet",
@@ -1072,6 +1075,7 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                     sub("status", "StatefulSet", status_verbs),
                     sub("scale", "Scale", status_verbs),
                 ],
+                Some(vec!["sts"]),
             ),
             res(
                 "controllerrevisions",
@@ -1091,31 +1095,34 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                 all_verbs,
                 vec![sub("status", "Job", status_verbs)],
             ),
-            res(
+            res_with_short(
                 "cronjobs",
                 "cronjob",
                 "CronJob",
                 true,
                 all_verbs,
                 vec![sub("status", "CronJob", status_verbs)],
+                Some(vec!["cj"]),
             ),
         ],
         "networking.k8s.io" => vec![
-            res(
+            res_with_short(
                 "networkpolicies",
                 "networkpolicy",
                 "NetworkPolicy",
                 true,
                 all_verbs,
                 vec![],
+                Some(vec!["netpol"]),
             ),
-            res(
+            res_with_short(
                 "ingresses",
                 "ingress",
                 "Ingress",
                 true,
                 all_verbs,
                 vec![sub("status", "Ingress", status_verbs)],
+                Some(vec!["ing"]),
             ),
             res(
                 "ingressclasses",
@@ -1154,13 +1161,14 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
             ),
         ],
         "storage.k8s.io" => vec![
-            res(
+            res_with_short(
                 "storageclasses",
                 "storageclass",
                 "StorageClass",
                 false,
                 all_verbs,
                 vec![],
+                Some(vec!["sc"]),
             ),
             res(
                 "volumeattachments",
@@ -1188,13 +1196,14 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                 vec![],
             ),
         ],
-        "scheduling.k8s.io" => vec![res(
+        "scheduling.k8s.io" => vec![res_with_short(
             "priorityclasses",
             "priorityclass",
             "PriorityClass",
             false,
             all_verbs,
             vec![],
+            Some(vec!["pc"]),
         )],
         "apiextensions.k8s.io" => vec![res(
             "customresourcedefinitions",
@@ -1205,7 +1214,7 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
             vec![sub("status", "CustomResourceDefinition", status_verbs)],
         )],
         "coordination.k8s.io" => vec![res("leases", "lease", "Lease", true, all_verbs, vec![])],
-        "certificates.k8s.io" => vec![res(
+        "certificates.k8s.io" => vec![res_with_short(
             "certificatesigningrequests",
             "certificatesigningrequest",
             "CertificateSigningRequest",
@@ -1219,6 +1228,7 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                     &["get", "patch", "update"],
                 ),
             ],
+            Some(vec!["csr"]),
         )],
         "discovery.k8s.io" => vec![res(
             "endpointslices",
@@ -1278,21 +1288,23 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                 vec![],
             ),
         ],
-        "autoscaling" => vec![res(
+        "autoscaling" => vec![res_with_short(
             "horizontalpodautoscalers",
             "horizontalpodautoscaler",
             "HorizontalPodAutoscaler",
             true,
             all_verbs,
             vec![sub("status", "HorizontalPodAutoscaler", status_verbs)],
+            Some(vec!["hpa"]),
         )],
-        "policy" => vec![res(
+        "policy" => vec![res_with_short(
             "poddisruptionbudgets",
             "poddisruptionbudget",
             "PodDisruptionBudget",
             true,
             all_verbs,
             vec![sub("status", "PodDisruptionBudget", status_verbs)],
+            Some(vec!["pdb"]),
         )],
         "flowcontrol.apiserver.k8s.io" => vec![
             res(
@@ -1312,7 +1324,15 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                 vec![sub("status", "PriorityLevelConfiguration", status_verbs)],
             ),
         ],
-        "events.k8s.io" => vec![res("events", "event", "Event", true, all_verbs, vec![])],
+        "events.k8s.io" => vec![res_with_short(
+            "events",
+            "event",
+            "Event",
+            true,
+            all_verbs,
+            vec![],
+            Some(vec!["ev"]),
+        )],
         "snapshot.storage.k8s.io" => vec![
             res(
                 "volumesnapshots",
@@ -3897,6 +3917,48 @@ mod tests {
                 !name.contains('/'),
                 "Resource name '{}' should not contain slash in v2 format",
                 name
+            );
+        }
+    }
+
+    #[test]
+    fn test_aggregated_grouped_resources_advertise_short_names() {
+        // Regression: grouped resources previously returned no shortNames in the
+        // aggregated (APIGroupDiscoveryList) format, breaking `kubectl get deploy`.
+        let expected: &[(&str, &str, &str, &[&str])] = &[
+            ("apps", "v1", "deployments", &["deploy"]),
+            ("apps", "v1", "replicasets", &["rs"]),
+            ("apps", "v1", "daemonsets", &["ds"]),
+            ("apps", "v1", "statefulsets", &["sts"]),
+            ("batch", "v1", "cronjobs", &["cj"]),
+            ("autoscaling", "v2", "horizontalpodautoscalers", &["hpa"]),
+            ("networking.k8s.io", "v1", "networkpolicies", &["netpol"]),
+            ("networking.k8s.io", "v1", "ingresses", &["ing"]),
+            ("policy", "v1", "poddisruptionbudgets", &["pdb"]),
+            (
+                "certificates.k8s.io",
+                "v1",
+                "certificatesigningrequests",
+                &["csr"],
+            ),
+            ("storage.k8s.io", "v1", "storageclasses", &["sc"]),
+            ("scheduling.k8s.io", "v1", "priorityclasses", &["pc"]),
+            ("events.k8s.io", "v1", "events", &["ev"]),
+        ];
+
+        for (group, version, resource, short_names) in expected {
+            let resources = get_aggregated_resources_for_group(group, version);
+            let entry = resources
+                .iter()
+                .find(|r| r.get("resource").and_then(|v| v.as_str()) == Some(*resource))
+                .unwrap_or_else(|| panic!("{group}/{version} should expose {resource}"));
+            let actual = entry["shortNames"].as_array().unwrap_or_else(|| {
+                panic!("{group}/{version} {resource} should advertise shortNames")
+            });
+            let actual: Vec<&str> = actual.iter().filter_map(|v| v.as_str()).collect();
+            assert_eq!(
+                &actual, short_names,
+                "{group}/{version} {resource} shortNames mismatch"
             );
         }
     }
