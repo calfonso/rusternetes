@@ -264,13 +264,21 @@ mod tests {
 
         let mut unresolved: Vec<String> = Vec::new();
         for m in &writable {
-            if mapper.resolve(&m.plural).is_none() {
-                unresolved.push(format!("{} ({}/{})", m.kind, m.group, m.plural));
+            // Stronger than "resolves to SOMETHING": the plural must resolve to
+            // ITS OWN kind. This catches a future shadowing regression where a
+            // writable kind is hidden behind a same-plural sibling.
+            match mapper.resolve(&m.plural) {
+                Some(r) if r.kind == m.kind => { /* ok */ }
+                Some(r) => unresolved.push(format!(
+                    "{} (plural {} shadowed by kind {})",
+                    m.kind, m.plural, r.kind
+                )),
+                None => unresolved.push(format!("{} (plural {} unresolved)", m.kind, m.plural)),
             }
         }
 
         eprintln!(
-            "parity: verified {} writable kinds resolve by plural",
+            "parity: verified {} writable kinds resolve to their own kind by plural",
             writable.len()
         );
 
