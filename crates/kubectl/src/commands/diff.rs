@@ -76,7 +76,10 @@ async fn diff_resource(
     // Can't use ops::get_value here — it erases GetError::NotFound, which we need
     // for the creation-diff branch.
     let current_yaml = match client.get::<Value>(&api_path).await {
-        Ok(current) => {
+        Ok(mut current) => {
+            // Strip server-managed fields the manifest never carries so the diff
+            // shows only meaningful changes.
+            strip_server_managed(&mut current);
             // Convert to YAML for diffing
             serde_yaml::to_string(&current)?
         }
@@ -85,7 +88,8 @@ async fn diff_resource(
             println!("+++ {}/{} (create)", kind, name);
             // Round-trip through serde_json::Value so keys sort the same way the
             // live side does (see the changed-resource branch below).
-            let new_json: serde_json::Value = serde_yaml::from_value(value.clone())?;
+            let mut new_json: serde_json::Value = serde_yaml::from_value(value.clone())?;
+            strip_server_managed(&mut new_json);
             let new_yaml = serde_yaml::to_string(&new_json)?;
             for line in new_yaml.lines() {
                 println!("+{}", line);
@@ -102,7 +106,10 @@ async fn diff_resource(
     // serde_json::Value so its keys sort identically to the live side (which is
     // a serde_json::Value → sorted via BTreeMap). Without this, manifests whose
     // keys aren't already alphabetical would show spurious diffs every run.
-    let new_json: serde_json::Value = serde_yaml::from_value(value.clone())?;
+    let mut new_json: serde_json::Value = serde_yaml::from_value(value.clone())?;
+    // Strip the same server-managed fields from the desired side so a field that
+    // exists only on the live side never renders as a deletion.
+    strip_server_managed(&mut new_json);
     let new_yaml = serde_yaml::to_string(&new_json)?;
 
     // Calculate and display diff
@@ -140,10 +147,42 @@ async fn diff_resource(
     Ok(())
 }
 
+/// Remove server-managed fields that the user's manifest never sets, so `diff`
+/// shows only meaningful changes (approximation of kubectl's server-side-apply
+/// dry-run diff).
+fn strip_server_managed(v: &mut serde_json::Value) {
+    if let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        for k in [
+            "uid",
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+            "managedFields",
+            "selfLink",
+            "ownerReferences",
+        ] {
+            meta.remove(k);
+        }
+        if let Some(ann) = meta.get_mut("annotations").and_then(|a| a.as_object_mut()) {
+            ann.remove("kubectl.kubernetes.io/last-applied-configuration");
+            // drop now-empty annotations to avoid an empty-map diff
+            let empty = ann.is_empty();
+            if empty {
+                meta.remove("annotations");
+            }
+        }
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("status");
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::strip_server_managed;
     use crate::discovery::{ResourceMapping, RestMapper};
     use crate::ops::build_path;
+    use serde_json::json;
 
     fn mapping(
         group: &str,
@@ -172,6 +211,80 @@ mod tests {
     // Path-building tests: verify that build_path (used by diff_resource) produces
     // the correct API paths for a variety of resource kinds via the mapper.
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn strip_server_managed_removes_managed_fields_keeps_real_data() {
+        let mut v = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "f2-cm",
+                "namespace": "default",
+                "labels": { "app": "demo" },
+                "uid": "abc-123",
+                "resourceVersion": "4711",
+                "generation": 3,
+                "creationTimestamp": "2026-05-29T00:00:00Z",
+                "managedFields": [{ "manager": "kubectl" }],
+                "selfLink": "/api/v1/namespaces/default/configmaps/f2-cm",
+                "ownerReferences": [{ "name": "owner" }],
+                "annotations": {
+                    "kubectl.kubernetes.io/last-applied-configuration": "{}"
+                }
+            },
+            "data": { "a": "1", "b": "2" },
+            "status": { "phase": "Active" }
+        });
+
+        strip_server_managed(&mut v);
+
+        let meta = v.get("metadata").unwrap().as_object().unwrap();
+        for k in [
+            "uid",
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+            "managedFields",
+            "selfLink",
+            "ownerReferences",
+        ] {
+            assert!(!meta.contains_key(k), "expected {k} to be stripped");
+        }
+        // last-applied-configuration was the only annotation → annotations map dropped
+        assert!(!meta.contains_key("annotations"));
+        // status is server-populated → stripped
+        assert!(v.get("status").is_none());
+
+        // user-meaningful fields survive
+        assert_eq!(meta.get("name").unwrap(), "f2-cm");
+        assert_eq!(meta.get("namespace").unwrap(), "default");
+        assert_eq!(meta.get("labels").unwrap(), &json!({ "app": "demo" }));
+        assert_eq!(v.get("data").unwrap(), &json!({ "a": "1", "b": "2" }));
+        assert_eq!(v.get("kind").unwrap(), "ConfigMap");
+    }
+
+    #[test]
+    fn strip_server_managed_keeps_other_annotations() {
+        let mut v = json!({
+            "metadata": {
+                "name": "x",
+                "annotations": {
+                    "kubectl.kubernetes.io/last-applied-configuration": "{}",
+                    "team": "infra"
+                }
+            }
+        });
+        strip_server_managed(&mut v);
+        let ann = v
+            .get("metadata")
+            .unwrap()
+            .get("annotations")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(!ann.contains_key("kubectl.kubernetes.io/last-applied-configuration"));
+        assert_eq!(ann.get("team").unwrap(), "infra");
+    }
 
     #[test]
     fn pod_path_via_mapper() {
