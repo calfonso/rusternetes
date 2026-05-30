@@ -1,8 +1,5 @@
 use crate::client::ApiClient;
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use std::fs;
-use std::io::{self, Read};
 
 /// Cascade strategy for delete operations, matching Kubernetes propagation policies.
 #[derive(Debug, Clone, PartialEq)]
@@ -166,26 +163,13 @@ fn resource_type_to_kind(resource_type: &str) -> &str {
 }
 
 pub async fn execute_from_file(client: &ApiClient, file: &str, opts: &DeleteOptions) -> Result<()> {
-    let contents = if file == "-" {
-        let mut buffer = String::new();
-        io::stdin()
-            .read_to_string(&mut buffer)
-            .context("Failed to read from stdin")?;
-        buffer
-    } else {
-        fs::read_to_string(file).context("Failed to read file")?
-    };
+    // Read + split the source into its YAML documents. Empty documents (e.g. a
+    // trailing `---`) are skipped by the shared helper.
+    let documents = crate::manifest::read_documents(file)?;
 
-    // Support for multi-document YAML files
     let mut deleted_count = 0;
-    for document in serde_yaml::Deserializer::from_str(&contents) {
-        let value = serde_yaml::Value::deserialize(document)?;
-
-        if value.is_null() {
-            continue;
-        }
-
-        delete_resource(client, &value, opts).await?;
+    for value in &documents {
+        delete_resource(client, value, opts).await?;
         deleted_count += 1;
     }
 

@@ -3,11 +3,9 @@ use crate::discovery::RestMapper;
 use crate::types::{CreateCommands, SecretCommands, ServiceCommands};
 use anyhow::{Context, Result};
 use base64::Engine;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 // ── Subcommand dispatch ─────────────────────────────────────────────────────
@@ -1406,31 +1404,17 @@ pub async fn execute_inline(_client: &ApiClient, args: &[String], namespace: &st
 }
 
 pub async fn execute(client: &ApiClient, file: &str, namespace: Option<&str>) -> Result<()> {
-    let contents = if file == "-" {
-        let mut buffer = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buffer)
-            .context("Failed to read from stdin")?;
-        buffer
-    } else {
-        fs::read_to_string(file).context("Failed to read file")?
-    };
+    // Read + split the source into its YAML documents. Empty documents (e.g. a
+    // trailing `---`) are skipped by the shared helper.
+    let documents = crate::manifest::read_documents(file)?;
 
     // Discovery is a pair of HTTP round-trips; build the mapper once up front
     // so multi-document manifests do not re-fetch it per document.
     let mapper = RestMapper::from_server(client).await?;
 
-    // Support for multi-document YAML files
-    for document in serde_yaml::Deserializer::from_str(&contents) {
-        let value = serde_yaml::Value::deserialize(document)?;
-
-        // Skip empty documents
-        if value.is_null() {
-            continue;
-        }
-
+    for value in &documents {
         // Normalize to serde_json::Value so we can drive the request generically.
-        let json: Value = serde_json::to_value(&value)?;
+        let json: Value = serde_json::to_value(value)?;
         create_resource(client, &mapper, &json, namespace).await?;
     }
 

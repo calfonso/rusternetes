@@ -2,35 +2,19 @@ use crate::client::{ApiClient, GetError};
 use crate::discovery::RestMapper;
 use crate::ops::build_path;
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::Value;
-use std::fs;
-use std::io::{self, Read};
 
 /// Show diff between current and applied configuration
 pub async fn execute(client: &ApiClient, file: &str, namespace: &str) -> Result<()> {
-    let contents = if file == "-" {
-        let mut buffer = String::new();
-        io::stdin()
-            .read_to_string(&mut buffer)
-            .context("Failed to read from stdin")?;
-        buffer
-    } else {
-        fs::read_to_string(file).context("Failed to read file")?
-    };
+    // Read + split the source into its YAML documents. Empty documents (e.g. a
+    // trailing `---`) are skipped by the shared helper.
+    let documents = crate::manifest::read_documents(file)?;
 
     // Build the REST mapper once for all documents in this file.
     let mapper = RestMapper::from_server(client).await?;
 
-    // Support for multi-document YAML files
-    for document in serde_yaml::Deserializer::from_str(&contents) {
-        let value = serde_yaml::Value::deserialize(document)?;
-
-        if value.is_null() {
-            continue;
-        }
-
-        diff_resource(client, &mapper, &value, namespace).await?;
+    for value in &documents {
+        diff_resource(client, &mapper, value, namespace).await?;
     }
 
     Ok(())

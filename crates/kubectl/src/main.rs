@@ -2,6 +2,7 @@ mod client;
 mod commands;
 mod discovery;
 mod kubeconfig;
+mod manifest;
 mod ops;
 mod types;
 mod websocket;

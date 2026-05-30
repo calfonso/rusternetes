@@ -2,10 +2,8 @@ use crate::client::ApiClient;
 use crate::discovery::RestMapper;
 use crate::types::ApplyCommands;
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{self, Read};
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -87,25 +85,9 @@ pub async fn execute_with_options(client: &ApiClient, options: &ApplyOptions) ->
     let mapper = RestMapper::from_server(client).await?;
 
     for path in &file_paths {
-        let contents = if path == "-" {
-            let mut buffer = String::new();
-            io::stdin()
-                .read_to_string(&mut buffer)
-                .context("Failed to read from stdin")?;
-            buffer
-        } else {
-            fs::read_to_string(path).with_context(|| format!("Failed to read file: {}", path))?
-        };
-
-        // Support for multi-document YAML files
-        for document in serde_yaml::Deserializer::from_str(&contents) {
-            let value = serde_yaml::Value::deserialize(document)?;
-
-            // Skip empty documents
-            if value.is_null() {
-                continue;
-            }
-
+        // Read + split the single source into its YAML documents. Empty
+        // documents (e.g. a trailing `---`) are skipped by the shared helper.
+        for value in crate::manifest::read_documents(path)? {
             let result = apply_resource(client, &mapper, &value, &query, options).await?;
 
             // Format output based on --output flag
