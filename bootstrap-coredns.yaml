@@ -1,0 +1,94 @@
+---
+# CoreDNS Pod + ConfigMap — applied ONLY when USE_RUSTERNETES_DNS=0
+# (A/B comparison against the native rusternetes-dns server).
+#
+# The default bootstrap path uses rusternetes-dns and never creates these
+# resources — it wires the kube-dns Service (defined in bootstrap-cluster.yaml)
+# straight to the rusternetes-dns container via a hand-written EndpointSlice.
+# See scripts/bootstrap-cluster.sh, Step 5.
+#
+# ${DOCKER_GATEWAY} is substituted by bootstrap-cluster.sh at apply time.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+spec:
+  # Pin to node-1 to bypass the scheduler. The node-conformance compose
+  # (compose.node-conformance.yml) intentionally omits scheduler and
+  # controller-manager — without a nodeName, CoreDNS stays Pending and
+  # the e2e SynchronizedBeforeSuite times out waiting for kube-system
+  # pods to go Ready. Multi-container and all-in-one stacks both expose
+  # a node-1, so this is safe there too.
+  nodeName: node-1
+  serviceAccountName: default
+  priorityClassName: system-cluster-critical
+  priority: 2000000000
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: coredns
+    image: coredns/coredns:1.14.3
+    args:
+    - -conf
+    - /etc/coredns/Corefile
+    ports:
+    - containerPort: 53
+      name: dns
+      protocol: UDP
+    - containerPort: 53
+      name: dns-tcp
+      protocol: TCP
+    - containerPort: 9153
+      name: metrics
+      protocol: TCP
+    volumeMounts:
+    - name: config-volume
+      mountPath: /etc/coredns
+      readOnly: true
+  volumes:
+  - name: config-volume
+    configMap:
+      name: coredns
+      items:
+      - key: Corefile
+        path: Corefile
+  dnsPolicy: Default
+  restartPolicy: Always
+---
+# CoreDNS ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+          lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+          ttl 30
+          # Docker bridge gateway (always [subnet].1), discovered at
+          # bootstrap time. Reaches the host where the 6443:6443 port
+          # mapping forwards to the in-process api-server — no known
+          # subnet required.
+          endpoint https://${DOCKER_GATEWAY}:6443
+          tls "" "" /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        }
+        prometheus :9153
+        forward . 8.8.8.8 {
+          max_concurrent 1000
+        }
+        cache 30
+        loop
+        reload
+        loadbalance
+    }

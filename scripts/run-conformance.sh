@@ -53,19 +53,22 @@ curl -sk -X PATCH https://localhost:6443/api/v1/nodes/node-2 \
     -H "Content-Type: application/merge-patch+json" \
     -d '{"metadata":{"labels":{"kubernetes.io/os":"linux","kubernetes.io/arch":"amd64","kubernetes.io/hostname":"node-2"}}}' >/dev/null 2>&1 || echo "Warning: Could not label node-2"
 
-# Step 4: Ensure CoreDNS is running
-echo "[4/5] Checking CoreDNS status..."
-COREDNS_STATUS=$(curl -sk https://localhost:6443/api/v1/namespaces/kube-system/pods/coredns 2>/dev/null | grep -o '"phase":"[^"]*"' | cut -d'"' -f4 || echo "NotFound")
+# Step 4: Ensure cluster DNS has a ready backend.
+# Backend-agnostic: the default path runs rusternetes-dns (no CoreDNS Pod),
+# the A/B path (USE_RUSTERNETES_DNS=0) runs a CoreDNS Pod. Both back the
+# kube-dns Service via EndpointSlices, so check for a ready kube-dns endpoint
+# rather than a CoreDNS Pod (which no longer exists on the default path —
+# probing it would re-bootstrap on every run).
+echo "[4/5] Checking cluster DNS (kube-dns endpoints) status..."
+DNS_READY=$(curl -sk "https://localhost:6443/apis/discovery.k8s.io/v1/namespaces/kube-system/endpointslices?labelSelector=kubernetes.io/service-name%3Dkube-dns" 2>/dev/null | grep -o '"ready":true' | head -n1 || echo "")
 
-if [ "$COREDNS_STATUS" != "Running" ]; then
-    echo "CoreDNS not running (status: $COREDNS_STATUS), recreating..."
-    # Delete if it exists
-    curl -sk -X DELETE https://localhost:6443/api/v1/namespaces/kube-system/pods/coredns >/dev/null 2>&1 || true
-    sleep 2
-    # Recreate via bootstrap script (includes ServiceAccount/token generation)
+if [ -z "$DNS_READY" ]; then
+    echo "kube-dns has no ready endpoints, (re)bootstrapping cluster DNS..."
+    # Recreate via bootstrap script (includes ServiceAccount/token generation
+    # and DNS backend wiring).
     ./scripts/bootstrap-cluster.sh
 else
-    echo "CoreDNS is already running"
+    echo "kube-dns has ready endpoints"
 fi
 
 # Step 5: Pre-pull required images

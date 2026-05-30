@@ -429,8 +429,12 @@ bootstrap_cluster() {
 
     export KUBELET_VOLUMES_PATH="$INSTALL_DIR/.rusternetes/volumes"
 
-    # Expand environment variables
+    # Expand environment variables. This compose stack (docker-compose.yml)
+    # has no rusternetes-dns service, so CoreDNS is the DNS backend here —
+    # apply both the core resources and the CoreDNS Pod/ConfigMap (the latter
+    # now lives in bootstrap-coredns.yaml, split out of bootstrap-cluster.yaml).
     envsubst < bootstrap-cluster.yaml > /tmp/bootstrap-expanded.yaml
+    envsubst < bootstrap-coredns.yaml >> /tmp/bootstrap-expanded.yaml
 
     # Apply bootstrap resources
     KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify apply -f /tmp/bootstrap-expanded.yaml

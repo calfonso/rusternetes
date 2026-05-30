@@ -121,27 +121,31 @@ phase_cluster_up() {
 
 # ------------------------------------------------------------- bootstrap --
 phase_bootstrap() {
-  step "Phase 2 — bootstrap namespaces + CoreDNS"
+  step "Phase 2 — bootstrap namespaces + cluster DNS"
 
   bash "$SCRIPT_DIR/bootstrap-cluster.sh"
 
   export KUBECONFIG="$KUBECONFIG_FILE"
   [ -f "$KUBECONFIG" ] || die "kubeconfig missing at $KUBECONFIG after bootstrap"
 
-  echo -n "  waiting for CoreDNS Ready "
+  # Backend-agnostic readiness: the default path runs rusternetes-dns (no
+  # CoreDNS Pod), the A/B path runs a CoreDNS Pod. Both back the kube-dns
+  # Service, so wait for a ready kube-dns endpoint rather than a Pod phase.
+  echo -n "  waiting for kube-dns endpoints Ready "
   local deadline=$(( $(date +%s) + 120 ))
   while true; do
-    local phase
-    phase=$(kubectl --insecure-skip-tls-verify --server "$API_SERVER" \
-      -n kube-system get pod coredns -o jsonpath='{.status.phase}' 2>/dev/null || true)
-    if [ "$phase" = "Running" ]; then
+    local ready
+    ready=$(kubectl --insecure-skip-tls-verify --server "$API_SERVER" \
+      -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns \
+      -o jsonpath='{.items[*].endpoints[*].conditions.ready}' 2>/dev/null || true)
+    if printf '%s' "$ready" | grep -q true; then
       echo
-      ok "CoreDNS Running"
+      ok "kube-dns endpoints Ready"
       break
     fi
     if [ "$(date +%s)" -gt "$deadline" ]; then
       echo
-      die "CoreDNS did not reach Running within 120s"
+      die "kube-dns endpoints did not become Ready within 120s"
     fi
     echo -n "."
     sleep 2
