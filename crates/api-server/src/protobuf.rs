@@ -2609,6 +2609,9 @@ impl ProtoRegistry {
         Self::register_autoscaling_v1_scale(&mut schemas);
         Self::register_apiextensions_v1_conversion(&mut schemas);
         Self::register_resource_v1(&mut schemas);
+        Self::register_flowcontrol_v1(&mut schemas);
+        Self::register_node_v1(&mut schemas);
+        Self::register_authentication_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -11839,6 +11842,613 @@ impl ProtoRegistry {
                 fields: HashMap::from([
                     (1, ("capacityKey".into(), FieldType::String)),
                     (2, ("allocationMultiplier".into(), FieldType::Quantity)),
+                ]),
+            },
+        );
+    }
+
+    /// `flowcontrol.apiserver.k8s.io/v1` — FlowSchema and
+    /// PriorityLevelConfiguration plus their nested shapes. Field numbers come
+    /// from upstream `k8s.io/api/flowcontrol/v1/generated.proto`. These are the
+    /// API-priority-and-fairness kinds the conformance suite POSTs as native
+    /// protobuf; without these schemas the request decoder dropped `spec` and
+    /// the create failed with a 422.
+    fn register_flowcontrol_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        // ----- FlowSchema -----
+        schemas.insert(
+            "FlowSchema".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("FlowSchemaSpec".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("FlowSchemaStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "FlowSchemaSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "priorityLevelConfiguration".into(),
+                            FieldType::Message("PriorityLevelConfigurationReference".into()),
+                        ),
+                    ),
+                    (2, ("matchingPrecedence".into(), FieldType::Int)),
+                    (
+                        3,
+                        (
+                            "distinguisherMethod".into(),
+                            FieldType::Message("FlowDistinguisherMethod".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PolicyRulesWithSubjects".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PriorityLevelConfigurationReference".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "FlowDistinguisherMethod".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("type".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "PolicyRulesWithSubjects".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "FlowSchemaSubject".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "resourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ResourcePolicyRule".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "nonResourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NonResourcePolicyRule".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "FlowSchemaSubject".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("user".into(), FieldType::Message("UserSubject".into()))),
+                    (
+                        3,
+                        ("group".into(), FieldType::Message("GroupSubject".into())),
+                    ),
+                    (
+                        4,
+                        (
+                            "serviceAccount".into(),
+                            FieldType::Message("ServiceAccountSubject".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "UserSubject".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "GroupSubject".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "ServiceAccountSubject".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ResourcePolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (4, ("clusterScope".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "namespaces".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NonResourcePolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceURLs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "FlowSchemaStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "conditions".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "FlowSchemaCondition".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "FlowSchemaCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (4, ("reason".into(), FieldType::String)),
+                    (5, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+
+        // ----- PriorityLevelConfiguration -----
+        schemas.insert(
+            "PriorityLevelConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("PriorityLevelConfigurationSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("PriorityLevelConfigurationStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PriorityLevelConfigurationSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "limited".into(),
+                            FieldType::Message("LimitedPriorityLevelConfiguration".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "exempt".into(),
+                            FieldType::Message("ExemptPriorityLevelConfiguration".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // Upstream LimitedPriorityLevelConfiguration proto:
+        //   1=nominalConcurrencyShares, 2=limitResponse, 3=lendingLimit,
+        //   4=borrowingLimitPercent. Our resource struct names the lending
+        //   field `lendingConcurrencyLimit`, so field 3 maps to that JSON key.
+        schemas.insert(
+            "LimitedPriorityLevelConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("nominalConcurrencyShares".into(), FieldType::Int)),
+                    (
+                        2,
+                        (
+                            "limitResponse".into(),
+                            FieldType::Message("LimitResponse".into()),
+                        ),
+                    ),
+                    (3, ("lendingConcurrencyLimit".into(), FieldType::Int)),
+                    (4, ("borrowingLimitPercent".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ExemptPriorityLevelConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("nominalConcurrencyShares".into(), FieldType::Int)),
+                    (2, ("lendingConcurrencyLimit".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LimitResponse".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "queuing".into(),
+                            FieldType::Message("QueuingConfiguration".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "QueuingConfiguration".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("queues".into(), FieldType::Int)),
+                    (2, ("handSize".into(), FieldType::Int)),
+                    (3, ("queueLengthLimit".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PriorityLevelConfigurationStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "conditions".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "PriorityLevelConfigurationCondition".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "PriorityLevelConfigurationCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (4, ("reason".into(), FieldType::String)),
+                    (5, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
+    /// `node.k8s.io/v1` — RuntimeClass and its nested Overhead / Scheduling.
+    /// Field numbers from `k8s.io/api/node/v1/generated.proto`.
+    fn register_node_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "RuntimeClass".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("handler".into(), FieldType::String)),
+                    (
+                        3,
+                        ("overhead".into(), FieldType::Message("Overhead".into())),
+                    ),
+                    (
+                        4,
+                        ("scheduling".into(), FieldType::Message("Scheduling".into())),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "Overhead".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("podFixed".into(), FieldType::QuantityMap))]),
+            },
+        );
+        schemas.insert(
+            "Scheduling".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("nodeSelector".into(), FieldType::StringMap)),
+                    (
+                        2,
+                        (
+                            "tolerations".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Toleration".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+    }
+
+    /// `authentication.k8s.io/v1` — TokenReview, SelfSubjectReview and shared
+    /// UserInfo. Field numbers from `k8s.io/api/authentication/v1/generated.proto`.
+    /// TokenRequest is namespaced under the ServiceAccount `token` subresource;
+    /// its request body is decoded the same way so it is registered here too.
+    fn register_authentication_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "TokenReview".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("TokenReviewSpec".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("TokenReviewStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "TokenReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("token".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "audiences".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "TokenReviewStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("authenticated".into(), FieldType::Bool)),
+                    (2, ("user".into(), FieldType::Message("UserInfo".into()))),
+                    (3, ("error".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "audiences".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "UserInfo".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("username".into(), FieldType::String)),
+                    (2, ("uid".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "groups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    // extra is map<string, ExtraValue> where ExtraValue is a
+                    // repeated-string wrapper; omitted from the decode schema
+                    // because no conformance write populates it.
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectReview".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "status".into(),
+                            FieldType::Message("SelfSubjectReviewStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectReviewStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    ("userInfo".into(), FieldType::Message("UserInfo".into())),
+                )]),
+            },
+        );
+        // TokenRequest (POSTed to the ServiceAccount `token` subresource).
+        //   1=metadata, 2=spec, 3=status
+        //
+        // The bare `TokenRequest` key is already taken by the storage/v1 CSI
+        // `TokenRequest` (a {audience, expirationSeconds} pair embedded in
+        // CSIDriver.tokenRequests), which is a DIFFERENT type that shares the
+        // name. `decode_k8s_resource` prefers a group-qualified
+        // `<apiVersion>.<kind>` key, so register this authentication variant
+        // under that qualified name to avoid clobbering the CSI schema.
+        schemas.insert(
+            "authentication.k8s.io/v1.TokenRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("spec".into(), FieldType::Message("TokenRequestSpec".into())),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("TokenRequestStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "TokenRequestSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "audiences".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("expirationSeconds".into(), FieldType::Int)),
+                    (
+                        3,
+                        (
+                            "boundObjectRef".into(),
+                            FieldType::Message("BoundObjectReference".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "BoundObjectReference".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("apiVersion".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                    (4, ("uid".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "TokenRequestStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("token".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "expirationTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
                 ]),
             },
         );
