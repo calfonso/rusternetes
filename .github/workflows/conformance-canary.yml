@@ -4,7 +4,15 @@ name: Conformance canary
 # cluster brought up via `docker compose` inside the
 # `arc-runner-set-conformance` scale set (DinD-enabled).
 #
-# Stack: multi-container (`compose.yml` + `compose.dind.yml`). The
+# Stack: multi-container SQLite (`compose.sqlite.yml` + `compose.dind.yml`).
+# Storage is rhino (etcd-compatible gRPC server backed by SQLite) instead of
+# etcd. rhino's SQLite driver compacts old revisions and reclaims disk on a
+# background loop (`auto_vacuum=incremental` + post-compact `incremental_vacuum`),
+# so unlike etcd's fixed `--quota-backend-bytes` it does NOT raise a hard
+# `NOSPACE` alarm and wedge writes on a long run — a 3h full run against etcd
+# hit the 8 GiB quota and failed 206 tests with cascading `context deadline
+# exceeded` (etcd compaction frees bbolt pages but never shrinks the file).
+# The
 # all-in-one stack was tried first (cheaper, ~400-600 MB) but its kube-
 # proxy runs inside the same container netns as the rusternetes process
 # and writes iptables rules that the host kernel never consults, so any
@@ -28,15 +36,9 @@ name: Conformance canary
 #     driven manual dispatches when warranted.
 #
 # Open follow-ups (canary backlog):
-#   - [ ] Replace etcd with the embedded SQLite backend for the canary.
-#         compose.dind.yml currently brings up the etcd container; the
-#         all-in-one binary now ships a working sqlite path via rhino
-#         (see compose.all-in-one.yml / Dockerfile.all-in-one), which
-#         removes one network hop + the etcd image pull from the cold
-#         build path. Acceptance: the canary boots without an etcd
-#         service in compose.dind.yml, hydrophone still PASSes the
-#         known-green sig-node pod lifecycle test, and the per-run
-#         wallclock drops by the ~30-60s etcd-pull window.
+#   - [x] Replace etcd with the SQLite backend for the canary (done: now uses
+#         compose.sqlite.yml + rhino). This also removes the etcd 8 GiB
+#         NOSPACE wedge that capped long runs — see Stack note above.
 
 on:
   workflow_dispatch:
@@ -46,14 +48,15 @@ on:
       - '.github/workflows/conformance-canary.yml'
       - 'ci/conformance/known-green.txt'
       - 'scripts/conformance-canary-run.sh'
-      - 'compose.yml'
+      - 'compose.sqlite.yml'
       - 'compose.dind.yml'
       - 'Dockerfile.services'
+      - 'Dockerfile.rhino'
 
 env:
   # The dind sidecar exposes the daemon at this canonical path; the
   # compose.dind.yml override makes every service use it instead of the
-  # podman socket compose.yml hardcodes for dev-laptop parity.
+  # podman socket compose.sqlite.yml hardcodes for dev-laptop parity.
   DOCKER_HOST: unix:///var/run/docker.sock
   # Pin Hydrophone to a known release so a tag-rename upstream doesn't
   # silently break the workflow. The conformance image itself is pinned
@@ -129,7 +132,7 @@ jobs:
         # one for the runner. Inside the runner pod (which shares its
         # network namespace with the dind sidecar), the api-server's
         # published port 6443 is reachable on localhost. `--skip-auth`
-        # on the api-server (compose.yml) means any bearer token is
+        # on the api-server (compose.sqlite.yml) means any bearer token is
         # accepted, so the placeholder works.
         run: |
           mkdir -p "$HOME/.kube"
@@ -178,15 +181,15 @@ jobs:
         # rather than a slow build. Parallel build keeps wall time
         # reasonable on the 3-core conformance tier.
         run: |
-          docker compose -f compose.yml -f compose.dind.yml build --parallel
+          docker compose -f compose.sqlite.yml -f compose.dind.yml build --parallel
 
       - name: Bring up cluster
         run: |
           # Initial up creates the bridge network (needed before we can
           # discover the gateway.  KUBERNETES_SERVICE_HOST_OVERRIDE will
           # be wrong until the restart step below.
-          docker compose -f compose.yml -f compose.dind.yml up -d
-          docker compose -f compose.yml -f compose.dind.yml ps
+          docker compose -f compose.sqlite.yml -f compose.dind.yml up -d
+          docker compose -f compose.sqlite.yml -f compose.dind.yml ps
 
       - id: discover-gateway
         name: Discover docker bridge gateway
@@ -209,8 +212,8 @@ jobs:
         run: |
           echo "DOCKER_GATEWAY=${{ steps.discover-gateway.outputs.gateway }}" > .env
           echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> .env
-          docker compose -f compose.yml -f compose.dind.yml up -d
-          docker compose -f compose.yml -f compose.dind.yml ps
+          docker compose -f compose.sqlite.yml -f compose.dind.yml up -d
+          docker compose -f compose.sqlite.yml -f compose.dind.yml ps
 
       - name: Wait for api-server health
         timeout-minutes: 3
@@ -238,8 +241,8 @@ jobs:
             sleep 2
           done
           echo "api-server never became healthy — dumping diagnostics:"
-          docker compose -f compose.yml -f compose.dind.yml ps || true
-          docker compose -f compose.yml -f compose.dind.yml logs --tail=50 rusternetes || true
+          docker compose -f compose.sqlite.yml -f compose.dind.yml ps || true
+          docker compose -f compose.sqlite.yml -f compose.dind.yml logs --tail=50 rusternetes || true
           curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
           curl -kv --max-time 5 https://localhost:6443/healthz || true
           exit 1
@@ -283,5 +286,5 @@ jobs:
       - name: Tear down cluster
         if: always()
         run: |
-          docker compose -f compose.yml -f compose.dind.yml logs --tail=200 || true
-          docker compose -f compose.yml -f compose.dind.yml down -v || true
+          docker compose -f compose.sqlite.yml -f compose.dind.yml logs --tail=200 || true
+          docker compose -f compose.sqlite.yml -f compose.dind.yml down -v || true
