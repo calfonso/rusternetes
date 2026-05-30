@@ -164,10 +164,15 @@ $CONTAINER_RT rm -f $($CONTAINER_RT ps -a --filter "name=coredns" --format "{{.I
 $KUBECTL $KUBECTL_FLAGS delete pod coredns -n kube-system --grace-period=0 --force 2>/dev/null && echo "  Deleted CoreDNS pod" || echo "  No CoreDNS pod to delete"
 
 # Step 4: Apply bootstrap cluster resources
-# Inject the discovered bridge gateway into the bootstrap yaml so CoreDNS
-# can reach the api-server. Uses a temp file so the tracked yaml stays
-# as a template.
-print_step "Applying bootstrap resources (namespaces, services, CoreDNS)..."
+# bootstrap-cluster.yaml carries namespaces, the kubernetes + kube-dns
+# Services, and PriorityClasses — but NOT the CoreDNS Pod/ConfigMap. Those
+# live in bootstrap-coredns.yaml and are applied only on the
+# USE_RUSTERNETES_DNS=0 path (Step 5). The default rusternetes-dns path
+# never creates a CoreDNS Pod.
+#
+# The gateway is still injected so the USE_RUSTERNETES_DNS=0 path can reuse
+# the discovered value, and to fail fast early if discovery broke (#787).
+print_step "Applying bootstrap resources (namespaces, services, priority classes)..."
 if [ -f "$PROJECT_ROOT/bootstrap-cluster.yaml" ]; then
     # Fail fast if discovery didn't give us a gateway — CoreDNS won't
     # be able to reach the API server without it after #787.
@@ -175,11 +180,7 @@ if [ -f "$PROJECT_ROOT/bootstrap-cluster.yaml" ]; then
         print_error "Bridge gateway discovery failed. Set RUSTERNETES_BRIDGE_GATEWAY or fix discover-bridge-gateway.sh"
         exit 1
     fi
-    TEMP_BOOTSTRAP="$(mktemp)"
-    trap "rm -f '$TEMP_BOOTSTRAP'" EXIT
-    sed "s|\\\${DOCKER_GATEWAY}|${RUSTERNETES_BRIDGE_GATEWAY}|g" \
-        "$PROJECT_ROOT/bootstrap-cluster.yaml" > "$TEMP_BOOTSTRAP"
-    $KUBECTL $KUBECTL_FLAGS apply -f "$TEMP_BOOTSTRAP"
+    $KUBECTL $KUBECTL_FLAGS apply -f "$PROJECT_ROOT/bootstrap-cluster.yaml"
     print_success "Bootstrap resources created (gateway: $RUSTERNETES_BRIDGE_GATEWAY)"
 else
     print_error "bootstrap-cluster.yaml not found"
@@ -207,34 +208,30 @@ if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/nu
     echo "  .env file written: $PROJECT_ROOT/.env"
 fi
 
-# Step 5: Swap the CoreDNS Pod for the rusternetes-dns container.
+# Step 5: Wire the kube-dns Service to a DNS backend.
 #
 # When USE_RUSTERNETES_DNS=1 (default), the script:
-#   1. Deletes the CoreDNS Pod and ConfigMap that bootstrap-cluster.yaml
-#      just created. The kube-dns Service stays — its ClusterIP
-#      (10.96.0.10) is what every Pod's `/etc/resolv.conf` references
-#      via kubelet's --cluster-dns flag, and we want to keep it stable.
-#   2. Resolves the rusternetes-dns container's IP on the
-#      rusternetes-network bridge.
-#   3. Creates a hand-written EndpointSlice in kube-system that points
+#   1. Resolves the rusternetes-dns container's IP on the
+#      rusternetes-network bridge. (No CoreDNS Pod is ever created on this
+#      path — bootstrap-cluster.yaml only creates the kube-dns Service,
+#      whose ClusterIP 10.96.0.10 every Pod's /etc/resolv.conf references
+#      via kubelet's --cluster-dns flag, and which we keep stable.)
+#   2. Creates a hand-written EndpointSlice in kube-system that points
 #      `kube-dns` at that container IP, so kube-proxy DNATs cluster DNS
 #      queries (10.96.0.10:53) onto the standalone DNS server.
 #
-# To run with the original CoreDNS Pod (e.g. for A/B comparison), set
-# USE_RUSTERNETES_DNS=0 in the environment and the script falls back
-# to waiting for the CoreDNS Pod to come up.
+# To run with a CoreDNS Pod instead (e.g. for A/B comparison), set
+# USE_RUSTERNETES_DNS=0 in the environment; the script then applies
+# bootstrap-coredns.yaml and waits for the CoreDNS Pod to come up.
 USE_RUSTERNETES_DNS="${USE_RUSTERNETES_DNS:-1}"
 
 if [ "$USE_RUSTERNETES_DNS" = "1" ]; then
-    print_step "Swapping CoreDNS Pod for rusternetes-dns container..."
+    print_step "Wiring kube-dns Service to rusternetes-dns container..."
 
-    # Tear down the CoreDNS Pod + ConfigMap created above. The Service
-    # stays so the ClusterIP is stable.
-    $KUBECTL $KUBECTL_FLAGS delete pod coredns -n kube-system --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    $KUBECTL $KUBECTL_FLAGS delete configmap coredns -n kube-system --ignore-not-found >/dev/null 2>&1 || true
-    # Belt and braces: also nuke the pod object from etcd in case the
-    # apiserver has not yet observed the delete.
-    $CONTAINER_RT exec rusternetes-etcd etcdctl del /registry/pods/kube-system/coredns >/dev/null 2>&1 || true
+    # No CoreDNS Pod/ConfigMap to tear down on this path — bootstrap-cluster.yaml
+    # no longer creates them. The Step 3 cleanup above already removed any stale
+    # CoreDNS Pod left over from a previous USE_RUSTERNETES_DNS=0 run. The
+    # kube-dns Service stays (created in Step 4) so the ClusterIP is stable.
 
     # Discover a container on the rusternetes bridge that serves DNS on
     # :53. Two candidates depending on which stack is up:
@@ -302,8 +299,21 @@ EOF
         print_success "$DNS_CONTAINER_NAME wired up at $DNS_IP for kube-dns Service"
     fi
 else
-    # Fallback path — original behaviour: wait for the CoreDNS Pod that
-    # bootstrap-cluster.yaml created to come up.
+    # Fallback path (USE_RUSTERNETES_DNS=0): apply the CoreDNS Pod + ConfigMap
+    # from bootstrap-coredns.yaml (with the discovered gateway injected so
+    # CoreDNS can reach the api-server, #787), then wait for the Pod.
+    print_step "Applying CoreDNS Pod + ConfigMap (USE_RUSTERNETES_DNS=0)..."
+    if [ -f "$PROJECT_ROOT/bootstrap-coredns.yaml" ]; then
+        TEMP_COREDNS="$(mktemp)"
+        trap "rm -f '$TEMP_COREDNS'" EXIT
+        sed "s|\\\${DOCKER_GATEWAY}|${RUSTERNETES_BRIDGE_GATEWAY}|g" \
+            "$PROJECT_ROOT/bootstrap-coredns.yaml" > "$TEMP_COREDNS"
+        $KUBECTL $KUBECTL_FLAGS apply -f "$TEMP_COREDNS"
+    else
+        print_error "bootstrap-coredns.yaml not found (required for USE_RUSTERNETES_DNS=0)"
+        exit 1
+    fi
+
     print_step "Waiting for CoreDNS to be ready (USE_RUSTERNETES_DNS=0)..."
     MAX_WAIT=30
     for i in $(seq 1 $MAX_WAIT); do
