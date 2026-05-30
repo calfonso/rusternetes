@@ -1153,7 +1153,7 @@ async fn main() -> Result<()> {
             opts.resolve();
 
             if let Some(file_path) = file {
-                commands::delete::execute_from_file(&client, &file_path).await?;
+                commands::delete::execute_from_file(&client, &file_path, &opts).await?;
             } else if all {
                 if let Some(rt) = resource_type {
                     commands::delete::execute_delete_all(

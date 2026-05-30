@@ -165,7 +165,7 @@ fn resource_type_to_kind(resource_type: &str) -> &str {
     }
 }
 
-pub async fn execute_from_file(client: &ApiClient, file: &str) -> Result<()> {
+pub async fn execute_from_file(client: &ApiClient, file: &str, opts: &DeleteOptions) -> Result<()> {
     let contents = if file == "-" {
         let mut buffer = String::new();
         io::stdin()
@@ -185,7 +185,7 @@ pub async fn execute_from_file(client: &ApiClient, file: &str) -> Result<()> {
             continue;
         }
 
-        delete_resource(client, &value).await?;
+        delete_resource(client, &value, opts).await?;
         deleted_count += 1;
     }
 
@@ -193,7 +193,11 @@ pub async fn execute_from_file(client: &ApiClient, file: &str) -> Result<()> {
     Ok(())
 }
 
-async fn delete_resource(client: &ApiClient, value: &serde_yaml::Value) -> Result<()> {
+async fn delete_resource(
+    client: &ApiClient,
+    value: &serde_yaml::Value,
+    opts: &DeleteOptions,
+) -> Result<()> {
     let kind = value
         .get("kind")
         .and_then(|k| k.as_str())
@@ -215,15 +219,9 @@ async fn delete_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
         )
     })?;
 
-    let opts = DeleteOptions::default();
-    let query = build_query_string(&opts);
-    let body = opts.delete_body();
-    crate::ops::delete_value(client, mapping, namespace, name, &query, body.as_ref())
-        .await
-        .with_context(|| format!("Failed to delete {} {}", kind, name))?;
-
-    println!("{}/{} deleted", mapping.singular, name);
-    Ok(())
+    // Reuse the shared opts-aware delete core so grace-period/force/cascade/
+    // dry-run/wait all apply, exactly like the named-resource path.
+    delete_single_resource_with_mapping(client, mapping, name, namespace, opts).await
 }
 
 pub async fn execute_with_selector(
@@ -920,15 +918,17 @@ mod tests {
     #[tokio::test]
     async fn test_execute_from_file_nonexistent_returns_err() {
         let client = make_test_client();
-        let result = execute_from_file(&client, "/nonexistent/file.yaml").await;
+        let opts = DeleteOptions::default();
+        let result = execute_from_file(&client, "/nonexistent/file.yaml", &opts).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_delete_resource_missing_kind_returns_err() {
         let client = make_test_client();
+        let opts = DeleteOptions::default();
         let value = serde_yaml::from_str::<serde_yaml::Value>("metadata:\n  name: test").unwrap();
-        let result = delete_resource(&client, &value).await;
+        let result = delete_resource(&client, &value, &opts).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("kind"));
     }
@@ -936,8 +936,9 @@ mod tests {
     #[tokio::test]
     async fn test_delete_resource_missing_metadata_returns_err() {
         let client = make_test_client();
+        let opts = DeleteOptions::default();
         let value = serde_yaml::from_str::<serde_yaml::Value>("kind: Pod").unwrap();
-        let result = delete_resource(&client, &value).await;
+        let result = delete_resource(&client, &value, &opts).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("metadata"));
     }
@@ -945,12 +946,33 @@ mod tests {
     #[tokio::test]
     async fn test_delete_resource_missing_name_returns_err() {
         let client = make_test_client();
+        let opts = DeleteOptions::default();
         let value =
             serde_yaml::from_str::<serde_yaml::Value>("kind: Pod\nmetadata:\n  namespace: default")
                 .unwrap();
-        let result = delete_resource(&client, &value).await;
+        let result = delete_resource(&client, &value, &opts).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("name"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_resource_threads_opts_unreachable() {
+        // With a valid kind/name/namespace but an unreachable server, the file
+        // path now routes through the shared opts-aware core (which performs
+        // discovery), so it must return an error rather than succeed.
+        let client = make_test_client();
+        let mut opts = DeleteOptions {
+            force: true,
+            dry_run: true,
+            ..Default::default()
+        };
+        opts.resolve();
+        let value = serde_yaml::from_str::<serde_yaml::Value>(
+            "kind: ConfigMap\nmetadata:\n  name: cm1\n  namespace: default",
+        )
+        .unwrap();
+        let result = delete_resource(&client, &value, &opts).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
