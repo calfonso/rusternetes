@@ -1107,7 +1107,7 @@ async fn main() -> Result<()> {
             args,
         } => {
             if let Some(file_path) = file {
-                commands::create::execute(&client, &file_path).await?;
+                commands::create::execute(&client, &file_path, namespace.as_deref()).await?;
             } else if let Some(ref sub) = subcommand {
                 commands::create::execute_subcommand(
                     &client,
