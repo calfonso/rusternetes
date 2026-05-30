@@ -20,10 +20,16 @@ pub struct PersistentVolume {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeSpec {
-    /// Storage capacity
+    /// Storage capacity. Optional on the wire: upstream
+    /// `PersistentVolumeSpec.Capacity` is `+optional` / `json:",omitempty"`,
+    /// so a PV may be posted without it (e.g. the CSI status conformance
+    /// test). Default to an empty map rather than failing to decode.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub capacity: HashMap<String, String>,
 
-    /// Access modes
+    /// Access modes. Optional on the wire (`+optional` upstream); default to
+    /// an empty list so decode never fails on its absence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_modes: Vec<PersistentVolumeAccessMode>,
 
     /// Reclaim policy
