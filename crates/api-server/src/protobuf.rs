@@ -5710,12 +5710,14 @@ impl ProtoRegistry {
         // override (or any future flip to protobuf-by-default) would
         // lose every container status field.
         //
-        // Field 10 (allocatedResources) is `map<string, Quantity>`;
-        // omitted because the registry has no `FieldType::Quantity`
-        // variant yet (consistent with how PR #141 treats Quantity
-        // fields elsewhere).
+        // Field 10 (allocatedResources) is `map<string, Quantity>`,
+        // encoded with the QuantityMap codec (the same one
+        // ResourceRequirements.requests/limits uses). Without it the
+        // KEP-1287 in-place-resize conformance tests, which fetch the pod
+        // over protobuf, see `allocatedResources: nil` and fail with
+        // "status allocatedResources mismatch".
         //
-        // K8s ref: k8s.io/api/core/v1/generated.proto:1095 (release-1.35).
+        // K8s ref: k8s.io/api/core/v1/generated.proto:1137 (release-1.35).
         schemas.insert(
             "ContainerStatus".into(),
             MessageSchema {
@@ -5738,8 +5740,15 @@ impl ProtoRegistry {
                     (7, ("imageID".into(), FieldType::String)),
                     (8, ("containerID".into(), FieldType::String)),
                     (9, ("started".into(), FieldType::Bool)),
-                    // 10: allocatedResources — map<string, Quantity>, not
-                    //     representable; intentionally skipped.
+                    // 10: allocatedResources — map<string, Quantity>. The
+                    //     kubelet sets this to the accepted resource requests
+                    //     for KEP-1287 in-place pod resize; the conformance
+                    //     `[sig-node] Pod InPlace Resize Container` tests read
+                    //     it back over protobuf (client-go default) and assert
+                    //     it equals `spec.resources.requests`. Encoding it via
+                    //     the QuantityMap codec (same as ResourceRequirements)
+                    //     keeps it from decoding as `nil`.
+                    (10, ("allocatedResources".into(), FieldType::QuantityMap)),
                     (
                         11,
                         (
