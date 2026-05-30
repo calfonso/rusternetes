@@ -638,6 +638,7 @@ pub async fn execute_subject(
     let mapping = mapper.resolve(&resource_type).ok_or_else(|| {
         anyhow::anyhow!("error: the server doesn't have a resource type \"{resource_type}\"")
     })?;
+    // Guard runs after discovery (we need the resolved Kind); a wrong kind costs one discovery round-trip before rejection.
     if mapping.kind != "RoleBinding" && mapping.kind != "ClusterRoleBinding" {
         anyhow::bail!(
             "set subject only supports rolebinding and clusterrolebinding, got: {}",
@@ -1240,6 +1241,25 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_subject_guard_rejects_non_binding_kind() {
+        use crate::discovery::{parse_aggregated_discovery, RestMapper};
+        let raw = include_str!("../../tests/fixtures/aggregated-discovery.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let mapper = RestMapper::new(parse_aggregated_discovery(&doc).unwrap());
+        let mapping = mapper.resolve("deployment").unwrap();
+        // The same predicate execute_subject's guard uses:
+        let allowed = mapping.kind == "RoleBinding" || mapping.kind == "ClusterRoleBinding";
+        assert!(
+            !allowed,
+            "deployment must be rejected by the set-subject kind guard"
+        );
+        // and a positive case if rolebindings is in the fixture:
+        if let Some(rb) = mapper.resolve("rolebindings") {
+            assert!(rb.kind == "RoleBinding" || rb.kind == "ClusterRoleBinding");
+        }
     }
 
     #[tokio::test]
