@@ -141,7 +141,6 @@ services:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - DOCKER_HOST=unix:///run/podman/podman.sock
-      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
@@ -168,7 +167,6 @@ services:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - DOCKER_HOST=unix:///run/podman/podman.sock
-      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command: ["--node-name", "node-2", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10251", "--sync-interval", "3"]
 
@@ -193,6 +191,35 @@ services:
     environment:
       - RUST_LOG=info
     command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
+
+  dns:
+    build:
+      context: .
+      dockerfile: Dockerfile.services
+      target: dns
+      additional_contexts:
+        rhino: ./rhino
+    container_name: rusternetes-dns
+    depends_on:
+      rhino:
+        condition: service_healthy
+    networks:
+      rusternetes-net:
+        aliases:
+          - dns
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      - RUST_LOG=info
+    command:
+      - "--etcd-servers"
+      - "http://rhino:2379"
+      - "--cluster-zone"
+      - "cluster.local"
+      - "--udp-bind"
+      - "0.0.0.0:53"
+      - "--tcp-bind"
+      - "0.0.0.0:53"
 
 networks:
   rusternetes-net:
