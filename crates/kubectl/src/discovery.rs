@@ -1,4 +1,3 @@
-#![allow(dead_code)] // consumed by later tasks in this branch
 use crate::client::ApiClient;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -135,6 +134,10 @@ impl RestMapper {
     }
 
     /// Returns all mappings in preference order (core group first).
+    // Public accessor for the full resolved set; currently exercised only by
+    // the discovery parity test. Kept on the API surface for future callers
+    // (e.g. an `api-resources`-style command).
+    #[allow(dead_code)]
     pub fn all(&self) -> &[ResourceMapping] {
         &self.mappings
     }

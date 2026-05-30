@@ -1,4 +1,3 @@
-#![allow(dead_code)] // consumed by command migrations in later tasks
 use crate::client::ApiClient;
 use crate::discovery::ResourceMapping;
 use anyhow::{Context, Result};
