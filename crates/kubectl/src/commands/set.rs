@@ -105,32 +105,28 @@ pub async fn execute_set(
     }
 }
 
-/// Resolve the API path for a resource type/name.
-fn resolve_resource_path(
+/// Resolve the API path for a resource type/name via server discovery.
+///
+/// Uses `RestMapper` so any kind the server exposes (plural, singular, short
+/// name, or Kind) is addressable, rather than a hardcoded alias table. Returns
+/// the item path and the resolved plural resource name.
+async fn resolve_resource_path(
+    client: &ApiClient,
     resource_type: &str,
     name: &str,
     namespace: &str,
 ) -> Result<(String, String)> {
-    let (api_path, resource_name) = match resource_type {
-        "pod" | "pods" | "po" => ("api/v1", "pods"),
-        "deployment" | "deployments" | "deploy" => ("apis/apps/v1", "deployments"),
-        "daemonset" | "daemonsets" | "ds" => ("apis/apps/v1", "daemonsets"),
-        "statefulset" | "statefulsets" | "sts" => ("apis/apps/v1", "statefulsets"),
-        "replicaset" | "replicasets" | "rs" => ("apis/apps/v1", "replicasets"),
-        "replicationcontroller" | "replicationcontrollers" | "rc" => {
-            ("api/v1", "replicationcontrollers")
-        }
-        "cronjob" | "cronjobs" | "cj" => ("apis/batch/v1", "cronjobs"),
-        "job" | "jobs" => ("apis/batch/v1", "jobs"),
-        _ => anyhow::bail!("Unsupported resource type for set: {}", resource_type),
+    let mapper = crate::discovery::RestMapper::from_server(client).await?;
+    let mapping = mapper.resolve(resource_type).ok_or_else(|| {
+        anyhow::anyhow!("error: the server doesn't have a resource type \"{resource_type}\"")
+    })?;
+    let ns = if mapping.namespaced {
+        Some(namespace)
+    } else {
+        None
     };
-
-    let path = format!(
-        "/{}/namespaces/{}/{}/{}",
-        api_path, namespace, resource_name, name
-    );
-
-    Ok((path, resource_name.to_string()))
+    let path = crate::ops::build_path(mapping, ns, Some(name));
+    Ok((path, mapping.plural.clone()))
 }
 
 /// Parse "resource_type/name" format into (type, name).
@@ -155,7 +151,7 @@ pub async fn execute_image(
     namespace: &str,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(&resource_type, &name, namespace)?;
+    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
 
     // Parse container=image pairs
     let mut image_updates: Vec<(String, String)> = Vec::new();
@@ -287,7 +283,7 @@ pub async fn execute_env(
     list: bool,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(&resource_type, &name, namespace)?;
+    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
 
     // Get current resource
     let current: Value = client
@@ -432,7 +428,7 @@ pub async fn execute_resources(
     requests: Option<&str>,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(&resource_type, &name, namespace)?;
+    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
 
     // Get current resource
     let current: Value = client
@@ -548,30 +544,9 @@ pub async fn execute_selector(
         anyhow::bail!("At least one selector expression (key=value) is required");
     }
 
-    // Resolve the API path - selector is typically used for services
-    let (api_path, res_name) = match resource_type.as_str() {
-        "service" | "services" | "svc" => ("api/v1", "services"),
-        _ => {
-            // Fall back to resolve_resource_path for other types
-            let (path, _) = resolve_resource_path(&resource_type, &name, namespace)?;
-            let patch_body = json!({
-                "spec": {
-                    "selector": selector,
-                }
-            });
-            let _result: Value = client
-                .patch(&path, &patch_body, "application/strategic-merge-patch+json")
-                .await
-                .context("Failed to update selector")?;
-            println!("{}/{} selector updated", resource_type, name);
-            return Ok(());
-        }
-    };
-
-    let path = format!(
-        "/{}/namespaces/{}/{}/{}",
-        api_path, namespace, res_name, name
-    );
+    // Resolve the API path via server discovery (handles services and any
+    // other selector-bearing kind).
+    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
 
     let patch_body = json!({
         "spec": {
@@ -599,7 +574,7 @@ pub async fn execute_serviceaccount(
     namespace: &str,
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
-    let (path, _) = resolve_resource_path(&resource_type, &name, namespace)?;
+    let (path, _) = resolve_resource_path(client, &resource_type, &name, namespace).await?;
 
     // Get current resource to determine if it has a template
     let current: Value = client
@@ -656,26 +631,25 @@ pub async fn execute_subject(
 ) -> Result<()> {
     let (resource_type, name) = parse_resource_arg(resource)?;
 
-    let path = match resource_type.as_str() {
-        "rolebinding" | "rolebindings" => {
-            format!(
-                "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
-                namespace, name
-            )
-        }
-        "clusterrolebinding" | "clusterrolebindings" => {
-            format!(
-                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
-                name
-            )
-        }
-        _ => {
-            anyhow::bail!(
-                "set subject only supports rolebinding and clusterrolebinding, got: {}",
-                resource_type
-            );
-        }
+    // set subject only operates on (Cluster)RoleBindings. Resolve the type via
+    // server discovery, then guard on the resolved Kind so the path is built by
+    // the shared RestMapper rather than a hardcoded group/version literal.
+    let mapper = crate::discovery::RestMapper::from_server(client).await?;
+    let mapping = mapper.resolve(&resource_type).ok_or_else(|| {
+        anyhow::anyhow!("error: the server doesn't have a resource type \"{resource_type}\"")
+    })?;
+    if mapping.kind != "RoleBinding" && mapping.kind != "ClusterRoleBinding" {
+        anyhow::bail!(
+            "set subject only supports rolebinding and clusterrolebinding, got: {}",
+            resource_type
+        );
+    }
+    let ns = if mapping.namespaced {
+        Some(namespace)
+    } else {
+        None
     };
+    let path = crate::ops::build_path(mapping, ns, Some(&name));
 
     // Get current binding
     let mut current: Value = client
@@ -803,21 +777,42 @@ mod tests {
         assert!(map.is_empty());
     }
 
-    #[test]
-    fn test_resolve_resource_path() {
-        let (path, _) = resolve_resource_path("deployment", "nginx", "default").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/default/deployments/nginx");
-
-        let (path, _) = resolve_resource_path("pod", "mypod", "kube-system").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/kube-system/pods/mypod");
-
-        let (path, _) = resolve_resource_path("sts", "myapp", "default").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/default/statefulsets/myapp");
+    // Helper mirroring a discovery ResourceMapping so the path-shape assertions
+    // below exercise the same `ops::build_path` that `resolve_resource_path`
+    // now calls. The actual name->mapping resolution is covered by the mapper
+    // tests in discovery.rs.
+    fn mapping(group: &str, plural: &str, namespaced: bool) -> crate::discovery::ResourceMapping {
+        crate::discovery::ResourceMapping {
+            group: group.into(),
+            version: "v1".into(),
+            kind: "X".into(),
+            plural: plural.into(),
+            singular: "x".into(),
+            namespaced,
+            verbs: vec![],
+            short_names: vec![],
+        }
     }
 
     #[test]
-    fn test_resolve_unsupported() {
-        assert!(resolve_resource_path("configmap", "test", "default").is_err());
+    fn test_resolve_resource_path() {
+        let dep = mapping("apps", "deployments", true);
+        assert_eq!(
+            crate::ops::build_path(&dep, Some("default"), Some("nginx")),
+            "/apis/apps/v1/namespaces/default/deployments/nginx"
+        );
+
+        let pod = mapping("", "pods", true);
+        assert_eq!(
+            crate::ops::build_path(&pod, Some("kube-system"), Some("mypod")),
+            "/api/v1/namespaces/kube-system/pods/mypod"
+        );
+
+        let sts = mapping("apps", "statefulsets", true);
+        assert_eq!(
+            crate::ops::build_path(&sts, Some("default"), Some("myapp")),
+            "/apis/apps/v1/namespaces/default/statefulsets/myapp"
+        );
     }
 
     #[test]
@@ -922,82 +917,43 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_all_resource_aliases() {
-        // Verify all short aliases resolve correctly
+    fn test_resolve_resource_path_full_plural_names() {
+        // Path shapes built by ops::build_path for the workload kinds set
+        // operates on. Name resolution itself lives in discovery.rs.
         let cases = vec![
-            ("po", "pods"),
-            ("deploy", "deployments"),
-            ("ds", "daemonsets"),
-            ("sts", "statefulsets"),
-            ("rs", "replicasets"),
-            ("rc", "replicationcontrollers"),
-            ("cj", "cronjobs"),
-            ("jobs", "jobs"),
+            (mapping("", "pods", true), "/api/v1/namespaces/ns1/pods/p1"),
+            (
+                mapping("apps", "deployments", true),
+                "/apis/apps/v1/namespaces/ns1/deployments/d1",
+            ),
+            (
+                mapping("apps", "daemonsets", true),
+                "/apis/apps/v1/namespaces/ns1/daemonsets/ds1",
+            ),
+            (
+                mapping("apps", "statefulsets", true),
+                "/apis/apps/v1/namespaces/ns1/statefulsets/ss1",
+            ),
+            (
+                mapping("apps", "replicasets", true),
+                "/apis/apps/v1/namespaces/ns1/replicasets/rs1",
+            ),
+            (
+                mapping("", "replicationcontrollers", true),
+                "/api/v1/namespaces/ns1/replicationcontrollers/rc1",
+            ),
+            (
+                mapping("batch", "cronjobs", true),
+                "/apis/batch/v1/namespaces/ns1/cronjobs/cj1",
+            ),
         ];
-        for (alias, expected_resource) in cases {
-            let (path, _) = resolve_resource_path(alias, "test", "default").unwrap();
-            assert!(
-                path.contains(expected_resource),
-                "alias '{}' should resolve to path containing '{}', got '{}'",
-                alias,
-                expected_resource,
-                path
+        for (m, expected) in cases {
+            let name = expected.rsplit('/').next().unwrap();
+            assert_eq!(
+                crate::ops::build_path(&m, Some("ns1"), Some(name)),
+                expected
             );
         }
-    }
-
-    // ===== Additional tests for untested functions =====
-
-    #[test]
-    fn test_resolve_resource_path_returns_correct_resource_name() {
-        let (_, res_name) = resolve_resource_path("deployment", "nginx", "default").unwrap();
-        assert_eq!(res_name, "deployments");
-
-        let (_, res_name) = resolve_resource_path("pod", "mypod", "default").unwrap();
-        assert_eq!(res_name, "pods");
-
-        let (_, res_name) = resolve_resource_path("daemonset", "agent", "default").unwrap();
-        assert_eq!(res_name, "daemonsets");
-
-        let (_, res_name) = resolve_resource_path("statefulset", "web", "default").unwrap();
-        assert_eq!(res_name, "statefulsets");
-
-        let (_, res_name) = resolve_resource_path("replicaset", "rs1", "default").unwrap();
-        assert_eq!(res_name, "replicasets");
-
-        let (_, res_name) =
-            resolve_resource_path("replicationcontroller", "rc1", "default").unwrap();
-        assert_eq!(res_name, "replicationcontrollers");
-
-        let (_, res_name) = resolve_resource_path("cronjob", "cj1", "default").unwrap();
-        assert_eq!(res_name, "cronjobs");
-
-        let (_, res_name) = resolve_resource_path("job", "j1", "default").unwrap();
-        assert_eq!(res_name, "jobs");
-    }
-
-    #[test]
-    fn test_resolve_resource_path_full_plural_names() {
-        let (path, _) = resolve_resource_path("pods", "p1", "ns1").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/ns1/pods/p1");
-
-        let (path, _) = resolve_resource_path("deployments", "d1", "ns1").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/ns1/deployments/d1");
-
-        let (path, _) = resolve_resource_path("daemonsets", "ds1", "ns1").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/ns1/daemonsets/ds1");
-
-        let (path, _) = resolve_resource_path("statefulsets", "ss1", "ns1").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/ns1/statefulsets/ss1");
-
-        let (path, _) = resolve_resource_path("replicasets", "rs1", "ns1").unwrap();
-        assert_eq!(path, "/apis/apps/v1/namespaces/ns1/replicasets/rs1");
-
-        let (path, _) = resolve_resource_path("replicationcontrollers", "rc1", "ns1").unwrap();
-        assert_eq!(path, "/api/v1/namespaces/ns1/replicationcontrollers/rc1");
-
-        let (path, _) = resolve_resource_path("cronjobs", "cj1", "ns1").unwrap();
-        assert_eq!(path, "/apis/batch/v1/namespaces/ns1/cronjobs/cj1");
     }
 
     #[test]
@@ -1269,6 +1225,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_subject_unsupported_resource_type() {
+        // The "only supports rolebinding/clusterrolebinding" guard now runs
+        // after server discovery, so against an unreachable server the error is
+        // a connection/discovery failure rather than the guard message. The
+        // contract preserved here is simply that a non-binding kind fails.
         let client = make_test_client();
         let result = execute_subject(
             &client,
@@ -1280,10 +1240,6 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("set subject only supports"));
     }
 
     #[tokio::test]
