@@ -1,0 +1,4 @@
+[submodule "rhino"]
+	path = rhino
+	url = https://github.com/indyjonesnl/rhino.git
+	branch = main

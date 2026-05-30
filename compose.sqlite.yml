@@ -17,8 +17,8 @@ services:
   # Rhino - etcd-compatible gRPC server backed by SQLite
   rhino:
     build:
-      context: ../rhino
-      dockerfile: ../rusternetes/Dockerfile.rhino
+      context: ./rhino
+      dockerfile: ../Dockerfile.rhino
     container_name: rusternetes-rhino
     ports:
       - "2379:2379"
@@ -45,6 +45,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      additional_contexts:
+        rhino: ./rhino
       target: api-server
     container_name: rusternetes-api-server
     ports:
@@ -83,6 +85,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      additional_contexts:
+        rhino: ./rhino
       target: scheduler
     container_name: rusternetes-scheduler
     depends_on:
@@ -99,6 +103,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      additional_contexts:
+        rhino: ./rhino
       target: controller-manager
     container_name: rusternetes-controller-manager
     depends_on:
@@ -117,6 +123,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      additional_contexts:
+        rhino: ./rhino
       target: kubelet
     container_name: rusternetes-kubelet
     privileged: true
@@ -142,6 +150,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      additional_contexts:
+        rhino: ./rhino
       target: kubelet
     container_name: rusternetes-kubelet2
     privileged: true
@@ -167,6 +177,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      additional_contexts:
+        rhino: ./rhino
       target: kube-proxy
     container_name: rusternetes-kube-proxy
     privileged: true

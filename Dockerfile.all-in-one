@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.6
 # Dockerfile for the all-in-one rusternetes binary.
 #
-# Build context must be the PARENT directory of both rusternetes/ and rhino/
-# so that the rhino crate path (../../../rhino from crates/storage) resolves.
+# Build context is the PARENT directory of rusternetes/ (which now vendors
+# rhino in-tree as rusternetes/rhino) so the rhino crate path (../../rhino
+# from crates/storage) resolves.
 #
 # Build args:
 #   CARGO_FEATURES — cargo features to enable (default: "sqlite")
@@ -67,13 +68,12 @@ ENV RUSTC_WRAPPER=sccache \
 
 WORKDIR /build
 
-# Copy rhino crate first (dependency). Rhino sits at /build/rhino and
-# the workspace lives under /build/rusternetes/ so the relative path
-# `../../../rhino` from /build/rusternetes/crates/storage resolves
-# correctly.
-COPY rhino/Cargo.toml rhino/Cargo.lock rhino/build.rs ./rhino/
-COPY rhino/proto/ ./rhino/proto/
-COPY rhino/src/ ./rhino/src/
+# Copy the rhino submodule first (dependency). With rhino vendored in-tree as
+# rusternetes/rhino, it lands at /build/rusternetes/rhino so the relative path
+# `../../rhino` from /build/rusternetes/crates/storage resolves correctly.
+COPY rusternetes/rhino/Cargo.toml rusternetes/rhino/Cargo.lock rusternetes/rhino/build.rs ./rusternetes/rhino/
+COPY rusternetes/rhino/proto/ ./rusternetes/rhino/proto/
+COPY rusternetes/rhino/src/ ./rusternetes/rhino/src/
 
 # ----- PASS 1: dependency-only compile (cache-friendly) -----
 
