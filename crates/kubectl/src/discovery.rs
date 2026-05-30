@@ -245,4 +245,133 @@ mod tests {
         let m = mapper();
         assert_eq!(m.resolve("Event").unwrap().group, "");
     }
+
+    fn is_writable(m: &ResourceMapping) -> bool {
+        m.verbs.iter().any(|v| v == "create" || v == "update")
+    }
+
+    /// Anti-drift parity guard: every WRITABLE kind the server serves (per the
+    /// discovery fixture) must be resolvable by its plural. This structurally
+    /// catches any parse/index regression that silently drops a served kind —
+    /// the exact class of bug that motivated the discovery-driven RestMapper
+    /// (the client used to lag the server by 31 writable kinds).
+    #[test]
+    fn mapper_resolves_every_served_writable_kind() {
+        let mappings = parse_aggregated_discovery(&fixture()).unwrap();
+        let mapper = RestMapper::new(mappings.clone());
+
+        let writable: Vec<&ResourceMapping> = mappings.iter().filter(|m| is_writable(m)).collect();
+
+        let mut unresolved: Vec<String> = Vec::new();
+        for m in &writable {
+            if mapper.resolve(&m.plural).is_none() {
+                unresolved.push(format!("{} ({}/{})", m.kind, m.group, m.plural));
+            }
+        }
+
+        eprintln!(
+            "parity: verified {} writable kinds resolve by plural",
+            writable.len()
+        );
+
+        assert!(
+            unresolved.is_empty(),
+            "RestMapper failed to resolve {} served writable kind(s) by plural: {:?}",
+            unresolved.len(),
+            unresolved
+        );
+        // A healthy server surface has dozens of writable kinds. If this drops
+        // to a handful the fixture is truncated / parsing broke wholesale.
+        assert!(
+            writable.len() >= 30,
+            "expected >=30 writable kinds in fixture, found {} (stale/truncated fixture?)",
+            writable.len()
+        );
+    }
+
+    /// Explicit regression guard for the specific kinds that the legacy
+    /// hardcoded table could not touch. Each present one must resolve by BOTH
+    /// its plural and its Kind. At least 6 of the 8 must exist in the fixture
+    /// (fewer => stale fixture).
+    #[test]
+    fn previously_unsupported_kinds_resolve() {
+        let m = mapper();
+        // plural -> Kind for the kinds that motivated the migration.
+        let explicit: &[(&str, &str)] = &[
+            ("networkpolicies", "NetworkPolicy"),
+            ("poddisruptionbudgets", "PodDisruptionBudget"),
+            ("endpointslices", "EndpointSlice"),
+            ("horizontalpodautoscalers", "HorizontalPodAutoscaler"),
+            ("replicasets", "ReplicaSet"),
+            ("ingresses", "Ingress"),
+            ("runtimeclasses", "RuntimeClass"),
+            (
+                "validatingwebhookconfigurations",
+                "ValidatingWebhookConfiguration",
+            ),
+        ];
+
+        let mut asserted = 0usize;
+        for (plural, kind) in explicit {
+            // Only kinds actually present in the fixture are asserted; missing
+            // ones are skipped (the >=6 floor below catches a stale fixture).
+            if m.resolve(plural).is_none() && m.resolve(kind).is_none() {
+                continue;
+            }
+            assert!(
+                m.resolve(plural).is_some(),
+                "expected to resolve previously-unsupported plural {plural:?}",
+            );
+            assert!(
+                m.resolve(kind).is_some(),
+                "expected to resolve previously-unsupported Kind {kind:?}",
+            );
+            asserted += 1;
+        }
+
+        eprintln!("parity: asserted {asserted} previously-unsupported kinds");
+        assert!(
+            asserted >= 6,
+            "only {asserted} of the previously-unsupported kinds present in the \
+             fixture — expected >=6 (stale fixture?)",
+        );
+    }
+
+    /// Optional live-surface parity: if an api-server is reachable, run the same
+    /// writable-kind parity assertion against the real discovery surface. Skips
+    /// cleanly (green) when no server is up, so CI without a cluster passes.
+    #[tokio::test]
+    async fn live_server_writable_parity() {
+        let client = match ApiClient::new("https://localhost:6443", true, None) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("parity(live): skipping — could not build client ({e:#})");
+                return;
+            }
+        };
+        let mapper = match RestMapper::from_server(&client).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("parity(live): skipping — no reachable server ({e:#})");
+                return;
+            }
+        };
+
+        let writable: Vec<&ResourceMapping> =
+            mapper.all().iter().filter(|m| is_writable(m)).collect();
+        let mut unresolved: Vec<String> = Vec::new();
+        for m in &writable {
+            if mapper.resolve(&m.plural).is_none() {
+                unresolved.push(format!("{} ({}/{})", m.kind, m.group, m.plural));
+            }
+        }
+        eprintln!(
+            "parity(live): verified {} writable kinds resolve by plural",
+            writable.len()
+        );
+        assert!(
+            unresolved.is_empty(),
+            "live RestMapper failed to resolve writable kind(s): {unresolved:?}",
+        );
+    }
 }
