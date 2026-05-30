@@ -167,6 +167,16 @@ pub async fn delete_value(
     client.delete_with_options(&full_path, &[], body).await
 }
 
+/// Format a resource label the way kubectl does: "pod/name" for core-group
+/// resources, "deployment.apps/name" for grouped resources.
+pub fn resource_label(m: &ResourceMapping, name: &str) -> String {
+    if m.group.is_empty() {
+        format!("{}/{}", m.singular, name)
+    } else {
+        format!("{}.{}/{}", m.singular, m.group, name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +267,38 @@ mod tests {
         let pv = m("", "persistentvolumes", false);
         assert_eq!(list_path(&pv, None, false), "/api/v1/persistentvolumes");
         assert_eq!(list_path(&pv, None, true), "/api/v1/persistentvolumes");
+    }
+
+    #[test]
+    fn resource_label_core_and_grouped() {
+        // The local m() helper hardcodes singular to "x", so build literals with
+        // the real singular to keep both assertions meaningful.
+
+        // Core-group resource: no group qualifier.
+        let pod = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+            plural: "pods".into(),
+            singular: "pod".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec![],
+        };
+        assert_eq!(resource_label(&pod, "nginx"), "pod/nginx");
+
+        // Grouped resource: label must be "<singular>.<group>/name".
+        let dep = ResourceMapping {
+            group: "apps".into(),
+            version: "v1".into(),
+            kind: "Deployment".into(),
+            plural: "deployments".into(),
+            singular: "deployment".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec![],
+        };
+        assert_eq!(resource_label(&dep, "nginx"), "deployment.apps/nginx");
     }
 
     #[test]

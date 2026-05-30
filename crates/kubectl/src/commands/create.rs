@@ -1472,7 +1472,7 @@ async fn create_resource(
     let name = crate::ops::value_name(&resp)
         .or_else(|| crate::ops::value_name(json))
         .unwrap_or_default();
-    println!("{}/{} created", mapping.singular, name);
+    println!("{} created", crate::ops::resource_label(mapping, &name));
 
     Ok(())
 }
