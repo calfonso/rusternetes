@@ -3,8 +3,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use rusternetes_common::resources::{
-    CronJob, Deployment, Job, Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod,
-    Service,
+    CronJob, DaemonSet, Deployment, Job, Namespace, Node, PersistentVolume, PersistentVolumeClaim,
+    Pod, Service, StatefulSet,
 };
 use serde::Serialize;
 
@@ -596,6 +596,20 @@ async fn execute_with_mapping(
                     .collect();
                 print_namespaces(&typed, no_headers, show_labels);
             }
+            ("StatefulSet", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<StatefulSet> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_statefulsets(&typed, no_headers, show_labels);
+            }
+            ("DaemonSet", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<DaemonSet> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_daemonsets(&typed, no_headers, show_labels);
+            }
             ("Job", OutputFormat::Table | OutputFormat::Wide) => {
                 let typed: Vec<Job> = items
                     .iter()
@@ -801,6 +815,130 @@ fn print_deployments(deployments: &[Deployment], no_headers: bool, show_labels: 
                 updated,
                 available,
                 age
+            );
+        }
+    }
+}
+
+fn print_statefulsets(statefulsets: &[StatefulSet], no_headers: bool, show_labels: bool) {
+    if !no_headers {
+        if show_labels {
+            println!("{:<30} {:<10} {:<10} LABELS", "NAME", "READY", "AGE");
+        } else {
+            println!("{:<30} {:<10} {:<10}", "NAME", "READY", "AGE");
+        }
+    }
+    for sts in statefulsets {
+        let desired = sts.spec.replicas.unwrap_or(0);
+        let ready = sts
+            .status
+            .as_ref()
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0);
+        let age = sts
+            .metadata
+            .creation_timestamp
+            .map(|ts| format_duration(Utc::now().signed_duration_since(ts)))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        if show_labels {
+            println!(
+                "{:<30} {:<10} {:<10} {}",
+                sts.metadata.name,
+                format!("{}/{}", ready, desired),
+                age,
+                format_labels(&sts.metadata.labels)
+            );
+        } else {
+            println!(
+                "{:<30} {:<10} {:<10}",
+                sts.metadata.name,
+                format!("{}/{}", ready, desired),
+                age
+            );
+        }
+    }
+}
+
+fn print_daemonsets(daemonsets: &[DaemonSet], no_headers: bool, show_labels: bool) {
+    if !no_headers {
+        if show_labels {
+            println!(
+                "{:<30} {:<9} {:<9} {:<7} {:<12} {:<11} {:<20} {:<10} LABELS",
+                "NAME",
+                "DESIRED",
+                "CURRENT",
+                "READY",
+                "UP-TO-DATE",
+                "AVAILABLE",
+                "NODE SELECTOR",
+                "AGE"
+            );
+        } else {
+            println!(
+                "{:<30} {:<9} {:<9} {:<7} {:<12} {:<11} {:<20} {:<10}",
+                "NAME",
+                "DESIRED",
+                "CURRENT",
+                "READY",
+                "UP-TO-DATE",
+                "AVAILABLE",
+                "NODE SELECTOR",
+                "AGE"
+            );
+        }
+    }
+    for ds in daemonsets {
+        let desired = ds
+            .status
+            .as_ref()
+            .map(|s| s.desired_number_scheduled)
+            .unwrap_or(0);
+        let current = ds
+            .status
+            .as_ref()
+            .map(|s| s.current_number_scheduled)
+            .unwrap_or(0);
+        let ready = ds.status.as_ref().map(|s| s.number_ready).unwrap_or(0);
+        let updated = ds
+            .status
+            .as_ref()
+            .and_then(|s| s.updated_number_scheduled)
+            .unwrap_or(0);
+        let available = ds
+            .status
+            .as_ref()
+            .and_then(|s| s.number_available)
+            .unwrap_or(0);
+        let node_selector = match &ds.spec.template.spec.node_selector {
+            Some(sel) if !sel.is_empty() => {
+                let mut pairs: Vec<_> = sel.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                pairs.sort();
+                pairs.join(",")
+            }
+            _ => "<none>".to_string(),
+        };
+        let age = ds
+            .metadata
+            .creation_timestamp
+            .map(|ts| format_duration(Utc::now().signed_duration_since(ts)))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        if show_labels {
+            println!(
+                "{:<30} {:<9} {:<9} {:<7} {:<12} {:<11} {:<20} {:<10} {}",
+                ds.metadata.name,
+                desired,
+                current,
+                ready,
+                updated,
+                available,
+                node_selector,
+                age,
+                format_labels(&ds.metadata.labels)
+            );
+        } else {
+            println!(
+                "{:<30} {:<9} {:<9} {:<7} {:<12} {:<11} {:<20} {:<10}",
+                ds.metadata.name, desired, current, ready, updated, available, node_selector, age
             );
         }
     }
@@ -1468,6 +1606,74 @@ mod tests {
         let jobs: Vec<Job> = vec![];
         print_jobs(&jobs, false, false);
         print_jobs(&jobs, true, false);
+    }
+
+    #[test]
+    fn test_print_statefulsets_no_panic() {
+        let statefulsets: Vec<StatefulSet> = vec![];
+        print_statefulsets(&statefulsets, false, false);
+        print_statefulsets(&statefulsets, true, false);
+        print_statefulsets(&statefulsets, false, true);
+    }
+
+    #[test]
+    fn test_print_statefulsets_ready_column() {
+        // A StatefulSet with no status should render 0/<replicas> without panic.
+        let sts: StatefulSet = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "serviceName": "web",
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [ { "name": "c", "image": "busybox" } ] }
+                }
+            }
+        }))
+        .expect("statefulset should deserialize");
+        assert_eq!(sts.spec.replicas, Some(3));
+        assert!(sts.status.is_none());
+        // ready defaults to 0 when status is absent
+        let ready = sts
+            .status
+            .as_ref()
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0);
+        assert_eq!(ready, 0);
+        print_statefulsets(std::slice::from_ref(&sts), false, false);
+    }
+
+    #[test]
+    fn test_print_daemonsets_no_panic() {
+        let daemonsets: Vec<DaemonSet> = vec![];
+        print_daemonsets(&daemonsets, false, false);
+        print_daemonsets(&daemonsets, true, false);
+        print_daemonsets(&daemonsets, false, true);
+    }
+
+    #[test]
+    fn test_print_daemonsets_missing_status() {
+        // A DaemonSet with no status should render zeros and <none> node
+        // selector without panicking (the server may not populate status).
+        let ds: DaemonSet = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "fluentd", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "fluentd" } },
+                "template": {
+                    "metadata": { "labels": { "app": "fluentd" } },
+                    "spec": { "containers": [ { "name": "c", "image": "busybox" } ] }
+                }
+            }
+        }))
+        .expect("daemonset should deserialize");
+        assert!(ds.status.is_none());
+        assert!(ds.spec.template.spec.node_selector.is_none());
+        print_daemonsets(std::slice::from_ref(&ds), false, false);
     }
 
     #[test]
