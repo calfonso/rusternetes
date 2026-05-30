@@ -38,6 +38,27 @@ impl std::fmt::Display for GetError {
 
 impl std::error::Error for GetError {}
 
+/// Format a non-2xx HTTP response into a readable error.
+///
+/// The Kubernetes API server returns a `Status` object on failures, e.g.
+/// `{"kind":"Status","status":"Failure","reason":"AlreadyExists","message":"...","code":409}`.
+/// When the body parses as such, surface a clean upstream-`kubectl`-style
+/// message: `Error from server (AlreadyExists): <message>`. Otherwise fall
+/// back to the raw status + body text.
+fn format_status_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if v.get("kind").and_then(|k| k.as_str()) == Some("Status") {
+            let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+            let message = v.get("message").and_then(|m| m.as_str()).unwrap_or(body);
+            if !reason.is_empty() {
+                return anyhow::anyhow!("Error from server ({reason}): {message}");
+            }
+            return anyhow::anyhow!("Error from server: {message}");
+        }
+    }
+    anyhow::anyhow!("request failed with status {status}: {body}")
+}
+
 impl ApiClient {
     pub fn new(
         base_url: &str,
@@ -81,11 +102,7 @@ impl ApiClient {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GetError::Other(anyhow::anyhow!(
-                "Request failed with status {}: {}",
-                status,
-                body
-            )));
+            return Err(GetError::Other(format_status_error(status, &body)));
         }
 
         response
@@ -145,7 +162,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Request failed with status {}: {}", status, body);
+            return Err(format_status_error(status, &body));
         }
 
         response.json().await.context("Failed to parse response")
@@ -164,7 +181,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Request failed with status {}: {}", status, body);
+            return Err(format_status_error(status, &body));
         }
 
         response.json().await.context("Failed to parse response")
@@ -208,7 +225,7 @@ impl ApiClient {
 
         if !status.is_success() && status != StatusCode::NOT_FOUND {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Request failed with status {}: {}", status, body);
+            return Err(format_status_error(status, &body));
         }
 
         Ok(status)
@@ -253,7 +270,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Request failed with status {}: {}", status, body);
+            return Err(format_status_error(status, &body));
         }
 
         response.json().await.context("Failed to parse response")
@@ -339,5 +356,58 @@ impl ApiClient {
 
         serde_json::from_str(&text)
             .with_context(|| format!("failed to parse discovery response from {url} as JSON"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_status_error_already_exists() {
+        let body = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"AlreadyExists","message":"configmaps \"f5-cm\" already exists","code":409}"#;
+        let err = format_status_error(StatusCode::CONFLICT, body);
+        assert_eq!(
+            err.to_string(),
+            "Error from server (AlreadyExists): configmaps \"f5-cm\" already exists"
+        );
+    }
+
+    #[test]
+    fn test_format_status_error_not_found() {
+        let body = r#"{"kind":"Status","status":"Failure","reason":"NotFound","message":"pods \"x\" not found","code":404}"#;
+        let err = format_status_error(StatusCode::NOT_FOUND, body);
+        assert_eq!(
+            err.to_string(),
+            "Error from server (NotFound): pods \"x\" not found"
+        );
+    }
+
+    #[test]
+    fn test_format_status_error_no_reason() {
+        // A Status object without a reason field still surfaces the message.
+        let body = r#"{"kind":"Status","status":"Failure","message":"something bad","code":500}"#;
+        let err = format_status_error(StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(err.to_string(), "Error from server: something bad");
+    }
+
+    #[test]
+    fn test_format_status_error_non_status_body_falls_back() {
+        let body = "plain text gateway error";
+        let err = format_status_error(StatusCode::BAD_GATEWAY, body);
+        assert_eq!(
+            err.to_string(),
+            "request failed with status 502 Bad Gateway: plain text gateway error"
+        );
+    }
+
+    #[test]
+    fn test_format_status_error_non_json_body_falls_back() {
+        let body = "<html>503</html>";
+        let err = format_status_error(StatusCode::SERVICE_UNAVAILABLE, body);
+        assert_eq!(
+            err.to_string(),
+            "request failed with status 503 Service Unavailable: <html>503</html>"
+        );
     }
 }

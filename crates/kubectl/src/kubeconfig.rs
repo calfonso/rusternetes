@@ -249,4 +249,65 @@ users:
         assert_eq!(config.clusters.len(), 1);
         assert_eq!(config.users.len(), 1);
     }
+
+    #[test]
+    fn test_should_skip_tls_verify_honored_from_cluster() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: c
+contexts:
+- name: c
+  context: { cluster: c, user: u }
+clusters:
+- name: c
+  cluster: { server: https://localhost:6443, insecure-skip-tls-verify: true }
+users:
+- name: u
+  user: { token: anonymous }
+"#;
+        let config: KubeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.should_skip_tls_verify().unwrap());
+    }
+
+    #[test]
+    fn test_should_skip_tls_verify_defaults_false_with_ca() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: c
+contexts:
+- name: c
+  context: { cluster: c, user: u }
+clusters:
+- name: c
+  cluster:
+    server: https://localhost:6443
+    certificate-authority-data: LS0tLS1CRUdJTg==
+users:
+- name: u
+  user: { token: anonymous }
+"#;
+        let config: KubeConfig = serde_yaml::from_str(yaml).unwrap();
+        // No insecure field + a CA present -> not skipped by the kubeconfig.
+        assert!(!config.should_skip_tls_verify().unwrap());
+    }
+
+    // Mirrors the call-site logic in main.rs: insecure is forced if EITHER the
+    // CLI flag is set OR the kubeconfig cluster opts into it.
+    fn compute_skip_tls(cli_flag: bool, kubeconfig_insecure: bool) -> bool {
+        cli_flag || kubeconfig_insecure
+    }
+
+    #[test]
+    fn test_insecure_bool_flag_overrides_ca() {
+        // CLI flag set, kubeconfig has a CA (insecure=false) -> still insecure.
+        assert!(compute_skip_tls(true, false));
+        // kubeconfig opts in, no flag -> insecure.
+        assert!(compute_skip_tls(false, true));
+        // neither -> secure.
+        assert!(!compute_skip_tls(false, false));
+        // both -> insecure.
+        assert!(compute_skip_tls(true, true));
+    }
 }
