@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Generic Kubernetes List wrapper
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubernetesList<T> {
@@ -94,6 +95,7 @@ impl ApiClient {
     }
 
     /// Get a list of resources, automatically unwrapping the Kubernetes List wrapper
+    #[allow(dead_code)]
     pub async fn get_list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, GetError> {
         let list: KubernetesList<T> = self.get(path).await?;
         Ok(list.items)
@@ -166,28 +168,6 @@ impl ApiClient {
         }
 
         response.json().await.context("Failed to parse response")
-    }
-
-    pub async fn delete(&self, path: &str) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.delete(&url);
-
-        if let Some(ref token) = self.token {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let response = request
-            .send()
-            .await
-            .context("Failed to send DELETE request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Request failed with status {}: {}", status, body);
-        }
-
-        Ok(())
     }
 
     /// DELETE with query parameters and optional JSON body (for DeleteOptions).
@@ -329,5 +309,35 @@ impl ApiClient {
 
     pub fn get_token(&self) -> Option<&String> {
         self.token.as_ref()
+    }
+
+    /// GET a path with a custom `Accept` header, returning the parsed JSON.
+    /// Used for aggregated API discovery (`APIGroupDiscoveryList`).
+    pub async fn get_raw_with_accept(
+        &self,
+        path: &str,
+        accept: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.get(&url).header("Accept", accept);
+
+        if let Some(ref token) = self.token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request.send().await.context("Failed to send GET request")?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read response body")?;
+
+        if !status.is_success() {
+            anyhow::bail!("discovery request to {url} failed: {status}: {text}");
+        }
+
+        serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse discovery response from {url} as JSON"))
     }
 }

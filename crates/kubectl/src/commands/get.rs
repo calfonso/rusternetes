@@ -3,15 +3,13 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use rusternetes_common::resources::{
-    ClusterRole, ClusterRoleBinding, ConfigMap, CronJob, CustomResourceDefinition, DaemonSet,
-    Deployment, Endpoints, HorizontalPodAutoscaler, Ingress, Job, LimitRange, Namespace, Node,
-    PersistentVolume, PersistentVolumeClaim, Pod, PodDisruptionBudget, PriorityClass,
-    ResourceQuota, Role, RoleBinding, Secret, Service, ServiceAccount, StatefulSet, StorageClass,
-    VerticalPodAutoscaler, VolumeSnapshot, VolumeSnapshotClass,
+    CronJob, Deployment, Job, Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod,
+    Service,
 };
 use serde::Serialize;
 
-// Helper to convert GetError to anyhow::Error
+// Helper to convert GetError to anyhow::Error (used in tests)
+#[allow(dead_code)]
 fn map_get_error(err: GetError) -> anyhow::Error {
     match err {
         GetError::NotFound => anyhow::anyhow!("Resource not found"),
@@ -308,14 +306,27 @@ async fn watch_resources(client: &ApiClient, api_path: &str, query: &str) -> Res
     Ok(())
 }
 
-/// Enhanced execute with all new parameters
+/// The curated set of kinds expanded by `get all`. Mirrors the legacy behavior
+/// (pods, services, deployments, statefulsets, daemonsets, jobs, cronjobs).
+/// Kinds the server doesn't serve are skipped at resolve time.
+const ALL_RESOURCE_KINDS: &[&str] = &[
+    "pods",
+    "services",
+    "deployments",
+    "statefulsets",
+    "daemonsets",
+    "jobs",
+    "cronjobs",
+];
+
+/// Enhanced execute with all new parameters — now backed by RestMapper.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_enhanced(
     client: &ApiClient,
     resource_type: &str,
     name: Option<&str>,
     namespace: Option<&str>,
-    _all_namespaces: bool,
+    all_namespaces: bool,
     output: Option<&str>,
     no_headers: bool,
     selector: Option<&str>,
@@ -339,8 +350,24 @@ pub async fn execute_enhanced(
         format!("?{}", query_params.join("&"))
     };
 
+    // Build the REST mapper once per invocation (one discovery round-trip).
+    let mapper = crate::discovery::RestMapper::from_server(client).await?;
+
+    // `get all` expands to a curated set of common kinds (mirrors the legacy
+    // behavior). Each is resolved via the mapper; kinds the server doesn't
+    // serve are silently skipped rather than erroring out.
+    let is_all = resource_type.eq_ignore_ascii_case("all");
+
     // Support comma-separated resource types: "pods,services"
-    let resource_types: Vec<&str> = resource_type.split(',').collect();
+    let resource_types: Vec<&str> = if is_all {
+        ALL_RESOURCE_KINDS.to_vec()
+    } else {
+        resource_type.split(',').collect()
+    };
+
+    // Tracks whether any kind under `get all` produced output (drives the
+    // blank-line separators between non-empty kinds).
+    let mut printed_any = false;
 
     for (i, rtype) in resource_types.iter().enumerate() {
         // Support type/name syntax: "pod/nginx"
@@ -351,61 +378,79 @@ pub async fn execute_enhanced(
             None
         });
 
-        if watch {
-            // For watch mode, build the API path and stream
-            let api_path = build_list_api_path(resolved_type, namespace.unwrap_or("default"));
-            if let Some(path) = api_path {
-                watch_resources(client, &path, &query_string).await?;
-            } else {
-                anyhow::bail!("Watch not supported for resource type: {}", resolved_type);
+        // Resolve the resource type via the discovery mapper. Under `get all`
+        // an unservable kind is skipped instead of failing the whole command.
+        let mapping = match mapper.resolve(resolved_type) {
+            Some(m) => m,
+            None if is_all => continue,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "error: the server doesn't have a resource type \"{}\"",
+                    resolved_type
+                ));
             }
+        };
+
+        if watch {
+            // Build the watch collection path from the mapping. ops::list_path
+            // applies the all-namespaces cluster-wide override (no namespace
+            // segment), so `get pods -A --watch` hits `/api/v1/pods`.
+            let base_path = crate::ops::list_path(mapping, namespace, all_namespaces);
+            watch_resources(client, &base_path, &query_string).await?;
             return Ok(());
         }
 
-        if i > 0 {
-            println!();
+        // For `get all`, suppress per-kind "No resources found" noise and only
+        // separate kinds that actually produced output. The separator is
+        // emitted inside execute_with_mapping right before it prints, so an
+        // empty kind between two non-empty kinds never leaves a stray blank
+        // line. For a normal single / comma-list invocation, keep the legacy
+        // blank-line-before-subsequent behavior and the empty-collection
+        // message.
+        if is_all {
+            // Ask the callee to lead with a blank line only if a prior kind
+            // already printed; it will only honor this when it actually prints.
+            let printed = execute_with_mapping(
+                client,
+                mapping,
+                effective_name,
+                namespace,
+                all_namespaces,
+                output,
+                no_headers,
+                &query_string,
+                show_labels,
+                sort_by,
+                true,
+                printed_any,
+            )
+            .await?;
+            printed_any = printed_any || printed;
+        } else {
+            // Legacy comma-list behavior: a blank line before every kind after
+            // the first, printed unconditionally here (not inside the callee).
+            if i > 0 {
+                println!();
+            }
+            execute_with_mapping(
+                client,
+                mapping,
+                effective_name,
+                namespace,
+                all_namespaces,
+                output,
+                no_headers,
+                &query_string,
+                show_labels,
+                sort_by,
+                false,
+                false,
+            )
+            .await?;
         }
-
-        execute_with_query(
-            client,
-            resolved_type,
-            effective_name,
-            namespace,
-            output,
-            no_headers,
-            &query_string,
-            show_labels,
-            sort_by,
-        )
-        .await?;
     }
 
     Ok(())
-}
-
-/// Build the list API path for a given resource type (for watch mode)
-fn build_list_api_path(resource_type: &str, ns: &str) -> Option<String> {
-    match resource_type {
-        "pod" | "pods" => Some(format!("/api/v1/namespaces/{}/pods", ns)),
-        "service" | "services" | "svc" => Some(format!("/api/v1/namespaces/{}/services", ns)),
-        "deployment" | "deployments" | "deploy" => {
-            Some(format!("/apis/apps/v1/namespaces/{}/deployments", ns))
-        }
-        "node" | "nodes" => Some("/api/v1/nodes".to_string()),
-        "namespace" | "namespaces" | "ns" => Some("/api/v1/namespaces".to_string()),
-        "configmap" | "configmaps" | "cm" => Some(format!("/api/v1/namespaces/{}/configmaps", ns)),
-        "secret" | "secrets" => Some(format!("/api/v1/namespaces/{}/secrets", ns)),
-        "endpoints" | "ep" => Some(format!("/api/v1/namespaces/{}/endpoints", ns)),
-        "job" | "jobs" => Some(format!("/apis/batch/v1/namespaces/{}/jobs", ns)),
-        "cronjob" | "cronjobs" | "cj" => Some(format!("/apis/batch/v1/namespaces/{}/cronjobs", ns)),
-        "statefulset" | "statefulsets" | "sts" => {
-            Some(format!("/apis/apps/v1/namespaces/{}/statefulsets", ns))
-        }
-        "daemonset" | "daemonsets" | "ds" => {
-            Some(format!("/apis/apps/v1/namespaces/{}/daemonsets", ns))
-        }
-        _ => None,
-    }
 }
 
 mod urlencoding {
@@ -422,161 +467,175 @@ mod urlencoding {
     }
 }
 
+/// Inner dispatcher: fetch and render a single resolved resource kind.
+///
+/// For the well-known kinds that have typed table printers (Pod, Service,
+/// Deployment, Node, Namespace, Job, CronJob, PersistentVolume,
+/// PersistentVolumeClaim) the fetched JSON is deserialized into the concrete
+/// type so the existing column-aware printers are preserved. For every other
+/// kind — and for all non-table output formats — the raw `serde_json::Value`
+/// is passed directly to `format_output`.
+///
+/// When `is_all` is true (invoked via `get all`), empty collections are
+/// silently skipped (no "No resources found" message). `leading_separator`
+/// requests a blank line before this kind's output; it is honored only when
+/// the kind actually prints, so an empty kind never leaves a stray blank line.
+/// Returns whether any output was produced.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_with_query(
+async fn execute_with_mapping(
     client: &ApiClient,
-    resource_type: &str,
+    mapping: &crate::discovery::ResourceMapping,
     name: Option<&str>,
     namespace: Option<&str>,
+    all_namespaces: bool,
     output: Option<&str>,
     no_headers: bool,
     query: &str,
     show_labels: bool,
     sort_by: Option<&str>,
-) -> Result<()> {
-    let default_namespace = "default";
-    let ns = namespace.unwrap_or(default_namespace);
+    is_all: bool,
+    leading_separator: bool,
+) -> Result<bool> {
+    use crate::ops::{get_value, list_value};
+
     let format = output
         .map(OutputFormat::from_str)
         .transpose()?
         .unwrap_or(OutputFormat::Table);
 
-    // Helper macro to reduce code duplication
-    macro_rules! get_resources {
-        ($path:expr, $type:ty, $print_fn:expr) => {{
-            let full_path = format!("{}{}", $path, query);
-            if name.is_some() {
-                let resource: $type = client.get(&full_path).await.map_err(map_get_error)?;
-                format_output(&resource, &format)?;
-            } else {
-                let mut resources: Vec<$type> =
-                    client.get_list(&full_path).await.map_err(map_get_error)?;
-                if let Some(sort_expr) = sort_by {
-                    sort_by_jsonpath(&mut resources, sort_expr);
+    if let Some(n) = name {
+        // Single-resource GET
+        let value = get_value(client, mapping, namespace, n)
+            .await
+            .map_err(|e| {
+                // Mirror kubectl's "Error from server (NotFound)" message when the
+                // underlying error string contains "not found".
+                let s = e.to_string();
+                if s.to_lowercase().contains("not found") {
+                    anyhow::anyhow!(
+                        "Error from server (NotFound): {} \"{}\" not found",
+                        mapping.kind.to_lowercase() + "s",
+                        n
+                    )
+                } else {
+                    e
                 }
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        $print_fn(&resources, no_headers, show_labels)
-                    }
-                    _ => format_output(&resources, &format)?,
-                }
+            })?;
+        // selectors are not forwarded to single-item by-name GETs (they don't
+        // apply).
+        if leading_separator {
+            println!();
+        }
+        format_output(&value, &format)?;
+    } else {
+        // Collection GET — all path logic (including the all-namespaces
+        // cluster-wide override) lives in ops::list_value / ops::list_path.
+        let mut items = list_value(client, mapping, namespace, all_namespaces, query).await?;
+
+        if items.is_empty() {
+            // Under `get all` an empty kind is skipped silently.
+            if is_all {
+                return Ok(false);
             }
-        }};
-    }
+            if all_namespaces {
+                eprintln!("No resources found.");
+            } else {
+                eprintln!(
+                    "No resources found in {} namespace.",
+                    namespace.unwrap_or("default")
+                );
+            }
+            return Ok(false);
+        }
 
-    match resource_type {
-        "pod" | "pods" => {
-            get_resources!(
-                format!(
-                    "/api/v1/namespaces/{}/pods{}",
-                    ns,
-                    if let Some(n) = name {
-                        format!("/{}", n)
-                    } else {
-                        String::new()
-                    }
-                ),
-                Pod,
-                print_pods
-            );
+        if let Some(sort_expr) = sort_by {
+            sort_by_jsonpath(&mut items, sort_expr);
         }
-        "service" | "services" | "svc" => {
-            get_resources!(
-                format!(
-                    "/api/v1/namespaces/{}/services{}",
-                    ns,
-                    if let Some(n) = name {
-                        format!("/{}", n)
-                    } else {
-                        String::new()
-                    }
-                ),
-                Service,
-                print_services
-            );
+
+        // Emit the inter-kind separator only now that we know this kind prints.
+        if leading_separator {
+            println!();
         }
-        "deployment" | "deployments" | "deploy" => {
-            get_resources!(
-                format!(
-                    "/apis/apps/v1/namespaces/{}/deployments{}",
-                    ns,
-                    if let Some(n) = name {
-                        format!("/{}", n)
-                    } else {
-                        String::new()
-                    }
-                ),
-                Deployment,
-                print_deployments
-            );
-        }
-        "job" | "jobs" => {
-            get_resources!(
-                format!(
-                    "/apis/batch/v1/namespaces/{}/jobs{}",
-                    ns,
-                    if let Some(n) = name {
-                        format!("/{}", n)
-                    } else {
-                        String::new()
-                    }
-                ),
-                Job,
-                print_jobs
-            );
-        }
-        "cronjob" | "cronjobs" | "cj" => {
-            get_resources!(
-                format!(
-                    "/apis/batch/v1/namespaces/{}/cronjobs{}",
-                    ns,
-                    if let Some(n) = name {
-                        format!("/{}", n)
-                    } else {
-                        String::new()
-                    }
-                ),
-                CronJob,
-                print_cronjobs
-            );
-        }
-        "node" | "nodes" => {
-            get_resources!(
-                format!(
-                    "/api/v1/nodes{}",
-                    if let Some(n) = name {
-                        format!("/{}", n)
-                    } else {
-                        String::new()
-                    }
-                ),
-                Node,
-                print_nodes
-            );
-        }
-        "namespace" | "namespaces" | "ns" => {
-            get_resources!(
-                format!(
-                    "/api/v1/namespaces{}",
-                    if let Some(n) = name {
-                        format!("/{}", n)
-                    } else {
-                        String::new()
-                    }
-                ),
-                Namespace,
-                print_namespaces
-            );
-        }
-        _ => {
-            // Fall back to original execute for other resource types
-            return execute(client, resource_type, name, namespace, output, no_headers).await;
+
+        // For well-known kinds with typed printers, attempt to deserialize and
+        // use the column-aware printer. Fall back to generic Value output if
+        // deserialization fails or the kind isn't recognized.
+        match (mapping.kind.as_str(), &format) {
+            ("Pod", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<Pod> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_pods(&typed, no_headers, show_labels);
+            }
+            ("Service", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<Service> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_services(&typed, no_headers, show_labels);
+            }
+            ("Deployment", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<Deployment> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_deployments(&typed, no_headers, show_labels);
+            }
+            ("Node", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<Node> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_nodes(&typed, no_headers, show_labels);
+            }
+            ("Namespace", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<Namespace> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_namespaces(&typed, no_headers, show_labels);
+            }
+            ("Job", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<Job> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_jobs(&typed, no_headers, show_labels);
+            }
+            ("CronJob", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<CronJob> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_cronjobs(&typed, no_headers, show_labels);
+            }
+            ("PersistentVolume", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<PersistentVolume> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_pvs(&typed, no_headers, show_labels);
+            }
+            ("PersistentVolumeClaim", OutputFormat::Table | OutputFormat::Wide) => {
+                let typed: Vec<PersistentVolumeClaim> = items
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                print_pvcs(&typed, no_headers, show_labels);
+            }
+            _ => {
+                // Generic Value output: works for all formats and any kind.
+                format_output(&items, &format)?;
+            }
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
+/// Kept for callers that invoke `execute` directly (e.g., describe-fallback).
+#[allow(dead_code)]
 pub async fn execute(
     client: &ApiClient,
     resource_type: &str,
@@ -585,668 +644,22 @@ pub async fn execute(
     output: Option<&str>,
     no_headers: bool,
 ) -> Result<()> {
-    let default_namespace = "default";
-    let ns = namespace.unwrap_or(default_namespace);
-    let format = output
-        .map(OutputFormat::from_str)
-        .transpose()?
-        .unwrap_or(OutputFormat::Table);
-
-    match resource_type {
-        "all" => {
-            // Get all common resources
-            println!("Fetching all resources in namespace {}...\n", ns);
-
-            // Pods
-            let pods: Vec<Pod> = client
-                .get_list(&format!("/api/v1/namespaces/{}/pods", ns))
-                .await
-                .unwrap_or_default();
-            if !pods.is_empty() {
-                print_pods(&pods, no_headers, false);
-                println!();
-            }
-
-            // Services
-            let services: Vec<Service> = client
-                .get_list(&format!("/api/v1/namespaces/{}/services", ns))
-                .await
-                .unwrap_or_default();
-            if !services.is_empty() {
-                print_services(&services, no_headers, false);
-                println!();
-            }
-
-            // Deployments
-            let deployments: Vec<Deployment> = client
-                .get_list(&format!("/apis/apps/v1/namespaces/{}/deployments", ns))
-                .await
-                .unwrap_or_default();
-            if !deployments.is_empty() {
-                print_deployments(&deployments, no_headers, false);
-                println!();
-            }
-
-            // StatefulSets
-            let statefulsets: Vec<StatefulSet> = client
-                .get_list(&format!("/apis/apps/v1/namespaces/{}/statefulsets", ns))
-                .await
-                .unwrap_or_default();
-            if !statefulsets.is_empty() {
-                println!("{:<30} {:<15}", "NAME", "READY");
-                for sts in &statefulsets {
-                    println!("{:<30} {:<15}", sts.metadata.name, "statefulset");
-                }
-                println!();
-            }
-
-            // DaemonSets
-            let daemonsets: Vec<DaemonSet> = client
-                .get_list(&format!("/apis/apps/v1/namespaces/{}/daemonsets", ns))
-                .await
-                .unwrap_or_default();
-            if !daemonsets.is_empty() {
-                println!("{:<30} {:<15}", "NAME", "TYPE");
-                for ds in &daemonsets {
-                    println!("{:<30} {:<15}", ds.metadata.name, "daemonset");
-                }
-                println!();
-            }
-
-            // Jobs
-            let jobs: Vec<Job> = client
-                .get_list(&format!("/apis/batch/v1/namespaces/{}/jobs", ns))
-                .await
-                .unwrap_or_default();
-            if !jobs.is_empty() {
-                print_jobs(&jobs, no_headers, false);
-                println!();
-            }
-
-            // CronJobs
-            let cronjobs: Vec<CronJob> = client
-                .get_list(&format!("/apis/batch/v1/namespaces/{}/cronjobs", ns))
-                .await
-                .unwrap_or_default();
-            if !cronjobs.is_empty() {
-                print_cronjobs(&cronjobs, no_headers, false);
-            }
-        }
-        "pod" | "pods" => {
-            if let Some(name) = name {
-                let pod: Pod = client
-                    .get(&format!("/api/v1/namespaces/{}/pods/{}", ns, name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&pod, &format)?;
-            } else {
-                let pods: Vec<Pod> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/pods", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_pods(&pods, no_headers, false)
-                    }
-                    _ => format_output(&pods, &format)?,
-                }
-            }
-        }
-        "service" | "services" | "svc" => {
-            if let Some(name) = name {
-                let service: Service = client
-                    .get(&format!("/api/v1/namespaces/{}/services/{}", ns, name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&service, &format)?;
-            } else {
-                let services: Vec<Service> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/services", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_services(&services, no_headers, false)
-                    }
-                    _ => format_output(&services, &format)?,
-                }
-            }
-        }
-        "deployment" | "deployments" | "deploy" => {
-            if let Some(name) = name {
-                let deployment: Deployment = client
-                    .get(&format!(
-                        "/apis/apps/v1/namespaces/{}/deployments/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&deployment, &format)?;
-            } else {
-                let deployments: Vec<Deployment> = client
-                    .get_list(&format!("/apis/apps/v1/namespaces/{}/deployments", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_deployments(&deployments, no_headers, false)
-                    }
-                    _ => format_output(&deployments, &format)?,
-                }
-            }
-        }
-        "statefulset" | "statefulsets" | "sts" => {
-            if let Some(name) = name {
-                let statefulset: StatefulSet = client
-                    .get(&format!(
-                        "/apis/apps/v1/namespaces/{}/statefulsets/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&statefulset, &format)?;
-            } else {
-                let statefulsets: Vec<StatefulSet> = client
-                    .get_list(&format!("/apis/apps/v1/namespaces/{}/statefulsets", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&statefulsets, &format)?;
-            }
-        }
-        "daemonset" | "daemonsets" | "ds" => {
-            if let Some(name) = name {
-                let daemonset: DaemonSet = client
-                    .get(&format!(
-                        "/apis/apps/v1/namespaces/{}/daemonsets/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&daemonset, &format)?;
-            } else {
-                let daemonsets: Vec<DaemonSet> = client
-                    .get_list(&format!("/apis/apps/v1/namespaces/{}/daemonsets", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&daemonsets, &format)?;
-            }
-        }
-        "job" | "jobs" => {
-            if let Some(name) = name {
-                let job: Job = client
-                    .get(&format!("/apis/batch/v1/namespaces/{}/jobs/{}", ns, name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&job, &format)?;
-            } else {
-                let jobs: Vec<Job> = client
-                    .get_list(&format!("/apis/batch/v1/namespaces/{}/jobs", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_jobs(&jobs, no_headers, false)
-                    }
-                    _ => format_output(&jobs, &format)?,
-                }
-            }
-        }
-        "cronjob" | "cronjobs" | "cj" => {
-            if let Some(name) = name {
-                let cronjob: CronJob = client
-                    .get(&format!(
-                        "/apis/batch/v1/namespaces/{}/cronjobs/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&cronjob, &format)?;
-            } else {
-                let cronjobs: Vec<CronJob> = client
-                    .get_list(&format!("/apis/batch/v1/namespaces/{}/cronjobs", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_cronjobs(&cronjobs, no_headers, false)
-                    }
-                    _ => format_output(&cronjobs, &format)?,
-                }
-            }
-        }
-        "node" | "nodes" => {
-            if let Some(name) = name {
-                let node: Node = client
-                    .get(&format!("/api/v1/nodes/{}", name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&node, &format)?;
-            } else {
-                let nodes: Vec<Node> = client
-                    .get_list("/api/v1/nodes")
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_nodes(&nodes, no_headers, false)
-                    }
-                    _ => format_output(&nodes, &format)?,
-                }
-            }
-        }
-        "namespace" | "namespaces" | "ns" => {
-            if let Some(name) = name {
-                let namespace: Namespace = client
-                    .get(&format!("/api/v1/namespaces/{}", name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&namespace, &format)?;
-            } else {
-                let namespaces: Vec<Namespace> = client
-                    .get_list("/api/v1/namespaces")
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_namespaces(&namespaces, no_headers, false)
-                    }
-                    _ => format_output(&namespaces, &format)?,
-                }
-            }
-        }
-        "persistentvolume" | "persistentvolumes" | "pv" => {
-            if let Some(name) = name {
-                let pv: PersistentVolume = client
-                    .get(&format!("/api/v1/persistentvolumes/{}", name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&pv, &format)?;
-            } else {
-                let pvs: Vec<PersistentVolume> = client
-                    .get_list("/api/v1/persistentvolumes")
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => print_pvs(&pvs, no_headers, false),
-                    _ => format_output(&pvs, &format)?,
-                }
-            }
-        }
-        "persistentvolumeclaim" | "persistentvolumeclaims" | "pvc" => {
-            if let Some(name) = name {
-                let pvc: PersistentVolumeClaim = client
-                    .get(&format!(
-                        "/api/v1/namespaces/{}/persistentvolumeclaims/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&pvc, &format)?;
-            } else {
-                let pvcs: Vec<PersistentVolumeClaim> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/persistentvolumeclaims", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                match format {
-                    OutputFormat::Table | OutputFormat::Wide => {
-                        print_pvcs(&pvcs, no_headers, false)
-                    }
-                    _ => format_output(&pvcs, &format)?,
-                }
-            }
-        }
-        "storageclass" | "storageclasses" | "sc" => {
-            if let Some(name) = name {
-                let sc: StorageClass = client
-                    .get(&format!("/apis/storage.k8s.io/v1/storageclasses/{}", name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&sc, &format)?;
-            } else {
-                let scs: Vec<StorageClass> = client
-                    .get_list("/apis/storage.k8s.io/v1/storageclasses")
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&scs, &format)?;
-            }
-        }
-        "volumesnapshot" | "volumesnapshots" | "vs" => {
-            if let Some(name) = name {
-                let vs: VolumeSnapshot = client
-                    .get(&format!(
-                        "/apis/snapshot.storage.k8s.io/v1/namespaces/{}/volumesnapshots/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&vs, &format)?;
-            } else {
-                let vss: Vec<VolumeSnapshot> = client
-                    .get_list(&format!(
-                        "/apis/snapshot.storage.k8s.io/v1/namespaces/{}/volumesnapshots",
-                        ns
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&vss, &format)?;
-            }
-        }
-        "volumesnapshotclass" | "volumesnapshotclasses" | "vsc" => {
-            if let Some(name) = name {
-                let vsc: VolumeSnapshotClass = client
-                    .get(&format!(
-                        "/apis/snapshot.storage.k8s.io/v1/volumesnapshotclasses/{}",
-                        name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&vsc, &format)?;
-            } else {
-                let vscs: Vec<VolumeSnapshotClass> = client
-                    .get_list("/apis/snapshot.storage.k8s.io/v1/volumesnapshotclasses")
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&vscs, &format)?;
-            }
-        }
-        "endpoints" | "ep" => {
-            if let Some(name) = name {
-                let ep: Endpoints = client
-                    .get(&format!("/api/v1/namespaces/{}/endpoints/{}", ns, name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&ep, &format)?;
-            } else {
-                let eps: Vec<Endpoints> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/endpoints", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&eps, &format)?;
-            }
-        }
-        "configmap" | "configmaps" | "cm" => {
-            if let Some(name) = name {
-                let cm: ConfigMap = client
-                    .get(&format!("/api/v1/namespaces/{}/configmaps/{}", ns, name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&cm, &format)?;
-            } else {
-                let cms: Vec<ConfigMap> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/configmaps", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&cms, &format)?;
-            }
-        }
-        "secret" | "secrets" => {
-            if let Some(name) = name {
-                let secret: Secret = client
-                    .get(&format!("/api/v1/namespaces/{}/secrets/{}", ns, name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&secret, &format)?;
-            } else {
-                let secrets: Vec<Secret> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/secrets", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&secrets, &format)?;
-            }
-        }
-        "ingress" | "ingresses" | "ing" => {
-            if let Some(name) = name {
-                let ing: Ingress = client
-                    .get(&format!(
-                        "/apis/networking.k8s.io/v1/namespaces/{}/ingresses/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&ing, &format)?;
-            } else {
-                let ings: Vec<Ingress> = client
-                    .get_list(&format!(
-                        "/apis/networking.k8s.io/v1/namespaces/{}/ingresses",
-                        ns
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&ings, &format)?;
-            }
-        }
-        "serviceaccount" | "serviceaccounts" | "sa" => {
-            if let Some(name) = name {
-                let sa: ServiceAccount = client
-                    .get(&format!(
-                        "/api/v1/namespaces/{}/serviceaccounts/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&sa, &format)?;
-            } else {
-                let sas: Vec<ServiceAccount> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/serviceaccounts", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&sas, &format)?;
-            }
-        }
-        "role" | "roles" => {
-            if let Some(name) = name {
-                let role: Role = client
-                    .get(&format!(
-                        "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&role, &format)?;
-            } else {
-                let roles: Vec<Role> = client
-                    .get_list(&format!(
-                        "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/roles",
-                        ns
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&roles, &format)?;
-            }
-        }
-        "rolebinding" | "rolebindings" => {
-            if let Some(name) = name {
-                let rb: RoleBinding = client
-                    .get(&format!(
-                        "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&rb, &format)?;
-            } else {
-                let rbs: Vec<RoleBinding> = client
-                    .get_list(&format!(
-                        "/apis/rbac.authorization.k8s.io/v1/namespaces/{}/rolebindings",
-                        ns
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&rbs, &format)?;
-            }
-        }
-        "clusterrole" | "clusterroles" => {
-            if let Some(name) = name {
-                let cr: ClusterRole = client
-                    .get(&format!(
-                        "/apis/rbac.authorization.k8s.io/v1/clusterroles/{}",
-                        name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&cr, &format)?;
-            } else {
-                let crs: Vec<ClusterRole> = client
-                    .get_list("/apis/rbac.authorization.k8s.io/v1/clusterroles")
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&crs, &format)?;
-            }
-        }
-        "clusterrolebinding" | "clusterrolebindings" => {
-            if let Some(name) = name {
-                let crb: ClusterRoleBinding = client
-                    .get(&format!(
-                        "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{}",
-                        name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&crb, &format)?;
-            } else {
-                let crbs: Vec<ClusterRoleBinding> = client
-                    .get_list("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings")
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&crbs, &format)?;
-            }
-        }
-        "resourcequota" | "resourcequotas" | "quota" => {
-            if let Some(name) = name {
-                let rq: ResourceQuota = client
-                    .get(&format!(
-                        "/api/v1/namespaces/{}/resourcequotas/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&rq, &format)?;
-            } else {
-                let rqs: Vec<ResourceQuota> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/resourcequotas", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&rqs, &format)?;
-            }
-        }
-        "limitrange" | "limitranges" | "limits" => {
-            if let Some(name) = name {
-                let lr: LimitRange = client
-                    .get(&format!("/api/v1/namespaces/{}/limitranges/{}", ns, name))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&lr, &format)?;
-            } else {
-                let lrs: Vec<LimitRange> = client
-                    .get_list(&format!("/api/v1/namespaces/{}/limitranges", ns))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&lrs, &format)?;
-            }
-        }
-        "priorityclass" | "priorityclasses" | "pc" => {
-            if let Some(name) = name {
-                let pc: PriorityClass = client
-                    .get(&format!(
-                        "/apis/scheduling.k8s.io/v1/priorityclasses/{}",
-                        name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&pc, &format)?;
-            } else {
-                let pcs: Vec<PriorityClass> = client
-                    .get_list("/apis/scheduling.k8s.io/v1/priorityclasses")
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&pcs, &format)?;
-            }
-        }
-        "customresourcedefinition" | "customresourcedefinitions" | "crd" | "crds" => {
-            if let Some(name) = name {
-                let crd: CustomResourceDefinition = client
-                    .get(&format!(
-                        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{}",
-                        name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&crd, &format)?;
-            } else {
-                let crds: Vec<CustomResourceDefinition> = client
-                    .get_list("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&crds, &format)?;
-            }
-        }
-        "poddisruptionbudget" | "poddisruptionbudgets" | "pdb" => {
-            if let Some(name) = name {
-                let pdb: PodDisruptionBudget = client
-                    .get(&format!(
-                        "/apis/policy/v1/namespaces/{}/poddisruptionbudgets/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&pdb, &format)?;
-            } else {
-                let pdbs: Vec<PodDisruptionBudget> = client
-                    .get_list(&format!(
-                        "/apis/policy/v1/namespaces/{}/poddisruptionbudgets",
-                        ns
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&pdbs, &format)?;
-            }
-        }
-        "horizontalpodautoscaler" | "horizontalpodautoscalers" | "hpa" => {
-            if let Some(name) = name {
-                let hpa: HorizontalPodAutoscaler = client
-                    .get(&format!(
-                        "/apis/autoscaling/v2/namespaces/{}/horizontalpodautoscalers/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&hpa, &format)?;
-            } else {
-                let hpas: Vec<HorizontalPodAutoscaler> = client
-                    .get_list(&format!(
-                        "/apis/autoscaling/v2/namespaces/{}/horizontalpodautoscalers",
-                        ns
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&hpas, &format)?;
-            }
-        }
-        "verticalpodautoscaler" | "verticalpodautoscalers" | "vpa" => {
-            if let Some(name) = name {
-                let vpa: VerticalPodAutoscaler = client
-                    .get(&format!(
-                        "/apis/autoscaling.k8s.io/v1/namespaces/{}/verticalpodautoscalers/{}",
-                        ns, name
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&vpa, &format)?;
-            } else {
-                let vpas: Vec<VerticalPodAutoscaler> = client
-                    .get_list(&format!(
-                        "/apis/autoscaling.k8s.io/v1/namespaces/{}/verticalpodautoscalers",
-                        ns
-                    ))
-                    .await
-                    .map_err(map_get_error)?;
-                format_output(&vpas, &format)?;
-            }
-        }
-        _ => anyhow::bail!("Unknown resource type: {}", resource_type),
-    }
-
-    Ok(())
+    // Route everything through the mapper-based path.
+    execute_enhanced(
+        client,
+        resource_type,
+        name,
+        namespace,
+        false,
+        output,
+        no_headers,
+        None,
+        None,
+        false,
+        false,
+        None,
+    )
+    .await
 }
 
 fn print_pods(pods: &[Pod], no_headers: bool, show_labels: bool) {
@@ -1727,24 +1140,81 @@ mod tests {
     }
 
     #[test]
-    fn test_build_list_api_path() {
+    fn test_mapper_build_path_pods() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let pod_mapping = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+            plural: "pods".into(),
+            singular: "pod".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec![],
+        };
         assert_eq!(
-            build_list_api_path("pods", "default"),
-            Some("/api/v1/namespaces/default/pods".to_string())
+            build_path(&pod_mapping, Some("default"), None),
+            "/api/v1/namespaces/default/pods"
         );
         assert_eq!(
-            build_list_api_path("services", "kube-system"),
-            Some("/api/v1/namespaces/kube-system/services".to_string())
+            build_path(&pod_mapping, Some("kube-system"), None),
+            "/api/v1/namespaces/kube-system/pods"
         );
+    }
+
+    #[test]
+    fn test_mapper_build_path_deployments() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let dep_mapping = ResourceMapping {
+            group: "apps".into(),
+            version: "v1".into(),
+            kind: "Deployment".into(),
+            plural: "deployments".into(),
+            singular: "deployment".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec![],
+        };
         assert_eq!(
-            build_list_api_path("deploy", "default"),
-            Some("/apis/apps/v1/namespaces/default/deployments".to_string())
+            build_path(&dep_mapping, Some("default"), None),
+            "/apis/apps/v1/namespaces/default/deployments"
         );
-        assert_eq!(
-            build_list_api_path("nodes", "default"),
-            Some("/api/v1/nodes".to_string())
-        );
-        assert_eq!(build_list_api_path("unknown-type", "default"), None);
+    }
+
+    #[test]
+    fn test_mapper_build_path_nodes() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let node_mapping = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Node".into(),
+            plural: "nodes".into(),
+            singular: "node".into(),
+            namespaced: false,
+            verbs: vec![],
+            short_names: vec![],
+        };
+        assert_eq!(build_path(&node_mapping, None, None), "/api/v1/nodes");
+    }
+
+    #[test]
+    fn test_mapper_build_path_namespaces() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let ns_mapping = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Namespace".into(),
+            plural: "namespaces".into(),
+            singular: "namespace".into(),
+            namespaced: false,
+            verbs: vec![],
+            short_names: vec!["ns".into()],
+        };
+        assert_eq!(build_path(&ns_mapping, None, None), "/api/v1/namespaces");
     }
 
     #[test]
@@ -2008,94 +1478,126 @@ mod tests {
     }
 
     #[test]
-    fn test_build_list_api_path_pod_alias() {
+    fn test_mapper_build_path_services() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let svc_mapping = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "Service".into(),
+            plural: "services".into(),
+            singular: "service".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec!["svc".into()],
+        };
         assert_eq!(
-            build_list_api_path("pod", "test-ns"),
-            Some("/api/v1/namespaces/test-ns/pods".to_string())
+            build_path(&svc_mapping, Some("default"), None),
+            "/api/v1/namespaces/default/services"
+        );
+        assert_eq!(
+            build_path(&svc_mapping, Some("test-ns"), None),
+            "/api/v1/namespaces/test-ns/services"
         );
     }
 
     #[test]
-    fn test_build_list_api_path_svc_alias() {
+    fn test_mapper_build_path_configmaps() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let cm_mapping = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "ConfigMap".into(),
+            plural: "configmaps".into(),
+            singular: "configmap".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec!["cm".into()],
+        };
         assert_eq!(
-            build_list_api_path("svc", "default"),
-            Some("/api/v1/namespaces/default/services".to_string())
+            build_path(&cm_mapping, Some("default"), None),
+            "/api/v1/namespaces/default/configmaps"
         );
     }
 
     #[test]
-    fn test_build_list_api_path_deployment_alias() {
+    fn test_mapper_build_path_jobs() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let job_mapping = ResourceMapping {
+            group: "batch".into(),
+            version: "v1".into(),
+            kind: "Job".into(),
+            plural: "jobs".into(),
+            singular: "job".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec![],
+        };
         assert_eq!(
-            build_list_api_path("deployment", "prod"),
-            Some("/apis/apps/v1/namespaces/prod/deployments".to_string())
+            build_path(&job_mapping, Some("default"), None),
+            "/apis/batch/v1/namespaces/default/jobs"
         );
     }
 
     #[test]
-    fn test_build_list_api_path_namespaces_aliases() {
+    fn test_mapper_build_path_cronjobs() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let cj_mapping = ResourceMapping {
+            group: "batch".into(),
+            version: "v1".into(),
+            kind: "CronJob".into(),
+            plural: "cronjobs".into(),
+            singular: "cronjob".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec!["cj".into()],
+        };
         assert_eq!(
-            build_list_api_path("namespaces", "ignored"),
-            Some("/api/v1/namespaces".to_string())
-        );
-        assert_eq!(
-            build_list_api_path("ns", "ignored"),
-            Some("/api/v1/namespaces".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_list_api_path_configmaps() {
-        assert_eq!(
-            build_list_api_path("cm", "default"),
-            Some("/api/v1/namespaces/default/configmaps".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_list_api_path_secrets() {
-        assert_eq!(
-            build_list_api_path("secrets", "default"),
-            Some("/api/v1/namespaces/default/secrets".to_string())
+            build_path(&cj_mapping, Some("default"), None),
+            "/apis/batch/v1/namespaces/default/cronjobs"
         );
     }
 
     #[test]
-    fn test_build_list_api_path_endpoints() {
+    fn test_mapper_build_path_statefulsets() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let sts_mapping = ResourceMapping {
+            group: "apps".into(),
+            version: "v1".into(),
+            kind: "StatefulSet".into(),
+            plural: "statefulsets".into(),
+            singular: "statefulset".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec!["sts".into()],
+        };
         assert_eq!(
-            build_list_api_path("ep", "default"),
-            Some("/api/v1/namespaces/default/endpoints".to_string())
+            build_path(&sts_mapping, Some("default"), None),
+            "/apis/apps/v1/namespaces/default/statefulsets"
         );
     }
 
     #[test]
-    fn test_build_list_api_path_jobs() {
+    fn test_mapper_build_path_daemonsets() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let ds_mapping = ResourceMapping {
+            group: "apps".into(),
+            version: "v1".into(),
+            kind: "DaemonSet".into(),
+            plural: "daemonsets".into(),
+            singular: "daemonset".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec!["ds".into()],
+        };
         assert_eq!(
-            build_list_api_path("job", "default"),
-            Some("/apis/batch/v1/namespaces/default/jobs".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_list_api_path_cronjobs() {
-        assert_eq!(
-            build_list_api_path("cj", "default"),
-            Some("/apis/batch/v1/namespaces/default/cronjobs".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_list_api_path_statefulsets() {
-        assert_eq!(
-            build_list_api_path("sts", "default"),
-            Some("/apis/apps/v1/namespaces/default/statefulsets".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_list_api_path_daemonsets() {
-        assert_eq!(
-            build_list_api_path("ds", "default"),
-            Some("/apis/apps/v1/namespaces/default/daemonsets".to_string())
+            build_path(&ds_mapping, Some("default"), None),
+            "/apis/apps/v1/namespaces/default/daemonsets"
         );
     }
 
@@ -2232,20 +1734,64 @@ mod tests {
     }
 
     #[test]
-    fn test_build_list_api_path_sa() {
-        // serviceaccounts are not in the map, should return None
-        assert_eq!(build_list_api_path("serviceaccounts", "default"), None);
+    fn test_mapper_build_path_serviceaccounts() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let sa_mapping = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "ServiceAccount".into(),
+            plural: "serviceaccounts".into(),
+            singular: "serviceaccount".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec!["sa".into()],
+        };
+        assert_eq!(
+            build_path(&sa_mapping, Some("default"), None),
+            "/api/v1/namespaces/default/serviceaccounts"
+        );
     }
 
     #[test]
-    fn test_build_list_api_path_pv() {
-        // persistentvolumes not in the map
-        assert_eq!(build_list_api_path("persistentvolumes", "default"), None);
+    fn test_mapper_build_path_persistentvolumes() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let pv_mapping = ResourceMapping {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "PersistentVolume".into(),
+            plural: "persistentvolumes".into(),
+            singular: "persistentvolume".into(),
+            namespaced: false,
+            verbs: vec![],
+            short_names: vec!["pv".into()],
+        };
+        // Cluster-scoped: no namespace segment
+        assert_eq!(
+            build_path(&pv_mapping, None, None),
+            "/api/v1/persistentvolumes"
+        );
     }
 
     #[test]
-    fn test_build_list_api_path_ingresses() {
-        assert_eq!(build_list_api_path("ingresses", "default"), None);
+    fn test_mapper_build_path_ingresses() {
+        use crate::discovery::ResourceMapping;
+        use crate::ops::build_path;
+        let ing_mapping = ResourceMapping {
+            group: "networking.k8s.io".into(),
+            version: "v1".into(),
+            kind: "Ingress".into(),
+            plural: "ingresses".into(),
+            singular: "ingress".into(),
+            namespaced: true,
+            verbs: vec![],
+            short_names: vec!["ing".into()],
+        };
+        assert_eq!(
+            build_path(&ing_mapping, Some("default"), None),
+            "/apis/networking.k8s.io/v1/namespaces/default/ingresses"
+        );
     }
 
     #[test]

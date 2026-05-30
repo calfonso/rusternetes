@@ -1,6 +1,8 @@
 mod client;
 mod commands;
+mod discovery;
 mod kubeconfig;
+mod ops;
 mod types;
 mod websocket;
 
@@ -1105,7 +1107,7 @@ async fn main() -> Result<()> {
             args,
         } => {
             if let Some(file_path) = file {
-                commands::create::execute(&client, &file_path).await?;
+                commands::create::execute(&client, &file_path, namespace.as_deref()).await?;
             } else if let Some(ref sub) = subcommand {
                 commands::create::execute_subcommand(
                     &client,
@@ -1144,7 +1146,6 @@ async fn main() -> Result<()> {
                 grace_period,
                 force,
                 cascade: commands::delete::CascadeStrategy::from_str_value(&cascade)?,
-                delete_all: all,
                 dry_run: dry_run.as_deref() == Some("server"),
                 wait,
                 output,

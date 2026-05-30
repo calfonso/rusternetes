@@ -1,15 +1,13 @@
 use crate::client::ApiClient;
+use crate::discovery::RestMapper;
 use crate::types::{CreateCommands, SecretCommands, ServiceCommands};
 use anyhow::{Context, Result};
 use base64::Engine;
-use rusternetes_common::resources::{
-    Deployment, Endpoints, LimitRange, Namespace, Node, Pod, PriorityClass, ResourceQuota, Service,
-    StorageClass, VolumeSnapshot, VolumeSnapshotClass,
-};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 // ── Subcommand dispatch ─────────────────────────────────────────────────────
@@ -1407,8 +1405,20 @@ pub async fn execute_inline(_client: &ApiClient, args: &[String], namespace: &st
     Ok(())
 }
 
-pub async fn execute(client: &ApiClient, file: &str) -> Result<()> {
-    let contents = fs::read_to_string(file).context("Failed to read file")?;
+pub async fn execute(client: &ApiClient, file: &str, namespace: Option<&str>) -> Result<()> {
+    let contents = if file == "-" {
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("Failed to read from stdin")?;
+        buffer
+    } else {
+        fs::read_to_string(file).context("Failed to read file")?
+    };
+
+    // Discovery is a pair of HTTP round-trips; build the mapper once up front
+    // so multi-document manifests do not re-fetch it per document.
+    let mapper = RestMapper::from_server(client).await?;
 
     // Support for multi-document YAML files
     for document in serde_yaml::Deserializer::from_str(&contents) {
@@ -1419,136 +1429,50 @@ pub async fn execute(client: &ApiClient, file: &str) -> Result<()> {
             continue;
         }
 
-        create_resource(client, &value).await?;
+        // Normalize to serde_json::Value so we can drive the request generically.
+        let json: Value = serde_json::to_value(&value)?;
+        create_resource(client, &mapper, &json, namespace).await?;
     }
 
     Ok(())
 }
 
-async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Result<()> {
-    // Get the kind field
-    let kind = value
+async fn create_resource(
+    client: &ApiClient,
+    mapper: &RestMapper,
+    json: &Value,
+    namespace: Option<&str>,
+) -> Result<()> {
+    let kind = json
         .get("kind")
         .and_then(|k| k.as_str())
-        .context("Missing 'kind' field")?;
+        .context("Missing 'kind' field")?
+        .to_string();
 
-    let yaml_str = serde_yaml::to_string(value)?;
+    let mapping = mapper.resolve(&kind).ok_or_else(|| {
+        anyhow::anyhow!("error: the server doesn't have a resource type \"{kind}\"")
+    })?;
 
-    match kind {
-        "Pod" => {
-            let pod: Pod = serde_yaml::from_str(&yaml_str)?;
-            let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
-            let _result: Pod = client
-                .post(&format!("/api/v1/namespaces/{}/pods", namespace), &pod)
-                .await?;
-            println!("Pod '{}' created", pod.metadata.name);
-        }
-        "Service" => {
-            let service: Service = serde_yaml::from_str(&yaml_str)?;
-            let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
-            let _result: Service = client
-                .post(
-                    &format!("/api/v1/namespaces/{}/services", namespace),
-                    &service,
-                )
-                .await?;
-            println!("Service '{}' created", service.metadata.name);
-        }
-        "Deployment" => {
-            let deployment: Deployment = serde_yaml::from_str(&yaml_str)?;
-            let namespace = deployment
-                .metadata
-                .namespace
-                .as_deref()
-                .unwrap_or("default");
-            let _result: Deployment = client
-                .post(
-                    &format!("/apis/apps/v1/namespaces/{}/deployments", namespace),
-                    &deployment,
-                )
-                .await?;
-            println!("Deployment '{}' created", deployment.metadata.name);
-        }
-        "Node" => {
-            let node: Node = serde_yaml::from_str(&yaml_str)?;
-            let _result: Node = client.post("/api/v1/nodes", &node).await?;
-            println!("Node '{}' created", node.metadata.name);
-        }
-        "Namespace" => {
-            let namespace: Namespace = serde_yaml::from_str(&yaml_str)?;
-            let _result: Namespace = client.post("/api/v1/namespaces", &namespace).await?;
-            println!("Namespace '{}' created", namespace.metadata.name);
-        }
-        "StorageClass" => {
-            let sc: StorageClass = serde_yaml::from_str(&yaml_str)?;
-            let _result: StorageClass = client
-                .post("/apis/storage.k8s.io/v1/storageclasses", &sc)
-                .await?;
-            println!("StorageClass '{}' created", sc.metadata.name);
-        }
-        "VolumeSnapshot" => {
-            let vs: VolumeSnapshot = serde_yaml::from_str(&yaml_str)?;
-            let namespace = vs.metadata.namespace.as_deref().unwrap_or("default");
-            let _result: VolumeSnapshot = client
-                .post(
-                    &format!(
-                        "/apis/snapshot.storage.k8s.io/v1/namespaces/{}/volumesnapshots",
-                        namespace
-                    ),
-                    &vs,
-                )
-                .await?;
-            println!("VolumeSnapshot '{}' created", vs.metadata.name);
-        }
-        "VolumeSnapshotClass" => {
-            let vsc: VolumeSnapshotClass = serde_yaml::from_str(&yaml_str)?;
-            let _result: VolumeSnapshotClass = client
-                .post(
-                    "/apis/snapshot.storage.k8s.io/v1/volumesnapshotclasses",
-                    &vsc,
-                )
-                .await?;
-            println!("VolumeSnapshotClass '{}' created", vsc.metadata.name);
-        }
-        "Endpoints" => {
-            let ep: Endpoints = serde_yaml::from_str(&yaml_str)?;
-            let namespace = ep.metadata.namespace.as_deref().unwrap_or("default");
-            let _result: Endpoints = client
-                .post(&format!("/api/v1/namespaces/{}/endpoints", namespace), &ep)
-                .await?;
-            println!("Endpoints '{}' created", ep.metadata.name);
-        }
-        "ResourceQuota" => {
-            let rq: ResourceQuota = serde_yaml::from_str(&yaml_str)?;
-            let namespace = rq.metadata.namespace.as_deref().unwrap_or("default");
-            let _result: ResourceQuota = client
-                .post(
-                    &format!("/api/v1/namespaces/{}/resourcequotas", namespace),
-                    &rq,
-                )
-                .await?;
-            println!("ResourceQuota '{}' created", rq.metadata.name);
-        }
-        "LimitRange" => {
-            let lr: LimitRange = serde_yaml::from_str(&yaml_str)?;
-            let namespace = lr.metadata.namespace.as_deref().unwrap_or("default");
-            let _result: LimitRange = client
-                .post(
-                    &format!("/api/v1/namespaces/{}/limitranges", namespace),
-                    &lr,
-                )
-                .await?;
-            println!("LimitRange '{}' created", lr.metadata.name);
-        }
-        "PriorityClass" => {
-            let pc: PriorityClass = serde_yaml::from_str(&yaml_str)?;
-            let _result: PriorityClass = client
-                .post("/apis/scheduling.k8s.io/v1/priorityclasses", &pc)
-                .await?;
-            println!("PriorityClass '{}' created", pc.metadata.name);
-        }
-        _ => anyhow::bail!("Unsupported resource kind: {}", kind),
-    }
+    let ns = if mapping.namespaced {
+        Some(
+            namespace
+                .map(|s| s.to_string())
+                .or_else(|| crate::ops::value_namespace(json))
+                .unwrap_or_else(|| "default".to_string()),
+        )
+    } else {
+        None
+    };
+
+    // create == POST only. If the object already exists the server returns
+    // 409 Conflict, which propagates as an error (unlike apply's upsert).
+    let collection = crate::ops::build_path(mapping, ns.as_deref(), None);
+    let resp: Value = client.post(&collection, json).await?;
+
+    let name = crate::ops::value_name(&resp)
+        .or_else(|| crate::ops::value_name(json))
+        .unwrap_or_default();
+    println!("{} created", crate::ops::resource_label(mapping, &name));
 
     Ok(())
 }
