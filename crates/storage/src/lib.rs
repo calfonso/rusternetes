@@ -7,6 +7,7 @@ use std::sync::Arc;
 pub mod concurrency;
 pub mod etcd;
 pub mod memory;
+pub mod metadata;
 #[cfg(any(feature = "sqlite", feature = "redis"))]
 pub mod rhino;
 pub mod workqueue;
