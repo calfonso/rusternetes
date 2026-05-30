@@ -45,6 +45,11 @@ macro_rules! skip_if_empty {
 pub struct Pod {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
+    /// ObjectMeta is `+optional` upstream; a body that omits `metadata`
+    /// (e.g. some PreStop e2e payloads) must still decode and let validation
+    /// report the missing name, rather than failing with a raw serde
+    /// `missing field 'metadata'`.
+    #[serde(default)]
     pub metadata: ObjectMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<PodSpec>,
