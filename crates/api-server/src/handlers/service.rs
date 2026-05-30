@@ -62,8 +62,12 @@ fn apply_session_affinity_defaults(
 /// `intstr.FromString("")` is treated as unset (Go's typed clients serialize an
 /// omitted targetPort as the zero IntOrString `0`) and defaulted to `port`.
 /// Protocol defaults to TCP. Must run before validation.
-fn default_service_ports(spec: &mut rusternetes_common::resources::ServiceSpec) {
+///
+/// Returns `true` if any field was changed, so callers on the patch path can
+/// force a re-save (the merge layer does no Service-specific defaulting).
+fn default_service_ports(spec: &mut rusternetes_common::resources::ServiceSpec) -> bool {
     use rusternetes_common::resources::IntOrString;
+    let mut changed = false;
     for port in &mut spec.ports {
         let target_port_unset = match &port.target_port {
             None => true,
@@ -73,11 +77,14 @@ fn default_service_ports(spec: &mut rusternetes_common::resources::ServiceSpec) 
         };
         if target_port_unset {
             port.target_port = Some(IntOrString::Int(port.port as i32));
+            changed = true;
         }
         if port.protocol.is_none() {
             port.protocol = Some("TCP".to_string());
+            changed = true;
         }
     }
+    changed
 }
 
 pub async fn create(
@@ -481,6 +488,11 @@ pub async fn update(
     // the stored object matches the K8s API contract.
     apply_session_affinity_defaults(&mut service.spec, true);
 
+    // Default ServicePort.targetPort / protocol before validation, same as the
+    // create path — upstream runs SetDefaults_Service on update too, and Go's
+    // typed clients send an unset targetPort as the zero IntOrString `0`.
+    default_service_ports(&mut service.spec);
+
     let key = build_key("services", Some(&namespace), &name);
 
     // Get the old service for concurrency control, generation tracking, and
@@ -824,6 +836,15 @@ pub async fn patch(
     let mut service = result.0;
     let key = rusternetes_storage::build_key("services", Some(&namespace), &name);
     let mut needs_update = false;
+
+    // Re-default ServicePort.targetPort / protocol after the merge. generic_patch
+    // is type-generic and performs no Service-specific defaulting, so a patch
+    // that sets targetPort to the zero IntOrString `0` (or clears protocol) would
+    // otherwise persist an invalid `0`. Force a re-save when defaulting changed
+    // anything. Mirrors the create/update paths.
+    if default_service_ports(&mut service.spec) {
+        needs_update = true;
+    }
 
     if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
         // Changing TO ExternalName — clear ClusterIP and NodePorts

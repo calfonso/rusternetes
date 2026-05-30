@@ -123,6 +123,23 @@ async fn update_service(router: axum::Router, name: &str, body: &Value) -> (u16,
     send_json(router, Method::PUT, &service_item_uri(name), body).await
 }
 
+/// PATCH a service with a JSON merge patch and return `(status, body)`.
+async fn patch_service_merge(router: axum::Router, name: &str, patch: &Value) -> (u16, Value) {
+    let req = Request::builder()
+        .method(Method::PATCH)
+        .uri(service_item_uri(name))
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(serde_json::to_vec(patch).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, v)
+}
+
 // ---------------------------------------------------------------------------
 // ClusterIP immutability — upstream
 // `TestServiceStrategy_PrepareForUpdate` / `TestServiceClusterIPMutability`.
@@ -466,6 +483,106 @@ async fn test_service_strategy_explicit_zero_target_port_is_defaulted() {
     let persisted = stored(&mem, "tpzero").await.expect("persisted");
     assert_eq!(persisted["spec"]["ports"][0]["targetPort"], 80);
     assert_eq!(persisted["spec"]["ports"][1]["targetPort"], 443);
+}
+
+/// Explicit `targetPort: 0` on UPDATE must be defaulted to `port`, just like
+/// CREATE. Upstream runs SetDefaults_Service on the update path too, so a PUT
+/// carrying a zero IntOrString targetPort must not be rejected with
+/// `targetPort: Invalid value: 0`.
+#[tokio::test]
+async fn test_service_strategy_explicit_zero_target_port_is_defaulted_on_update() {
+    let (mem, router) = spawn_router();
+
+    // Create with two ports (targetPort defaults applied on create).
+    let create_body = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "tpupd", "namespace": NS},
+        "spec": {
+            "type": "ClusterIP",
+            "ports": [
+                {"name": "a", "port": 80, "targetPort": 80},
+                {"name": "b", "port": 443, "targetPort": 443}
+            ],
+            "selector": {"app": "tpupd"}
+        }
+    });
+    let (status, created) = create_service(router.clone(), &create_body).await;
+    assert!(
+        (200..300).contains(&status),
+        "create got {status}: {created}"
+    );
+
+    // PUT the full object back with both targetPorts reset to an explicit 0
+    // (what a Go typed client sends when targetPort is left unset on update).
+    let mut updated = created.clone();
+    updated["spec"]["ports"][0]["targetPort"] = json!(0);
+    updated["spec"]["ports"][1]["targetPort"] = json!(0);
+
+    let (status, response) = update_service(router, "tpupd", &updated).await;
+    assert!(
+        (200..300).contains(&status),
+        "update got {status}: {response}"
+    );
+
+    assert_eq!(
+        response["spec"]["ports"][0]["targetPort"], 80,
+        "explicit targetPort 0 on update must default to its port value"
+    );
+    assert_eq!(
+        response["spec"]["ports"][1]["targetPort"], 443,
+        "explicit targetPort 0 on update must default to its port value"
+    );
+
+    let persisted = stored(&mem, "tpupd").await.expect("persisted");
+    assert_eq!(persisted["spec"]["ports"][0]["targetPort"], 80);
+    assert_eq!(persisted["spec"]["ports"][1]["targetPort"], 443);
+}
+
+/// A merge PATCH that rewrites `spec.ports` with an explicit `targetPort: 0`
+/// must default it to `port`, not silently persist a zero targetPort. The
+/// patch path delegates to generic_patch (no Service-specific defaulting), so
+/// the Service handler must re-default after the merge.
+#[tokio::test]
+async fn test_service_strategy_explicit_zero_target_port_is_defaulted_on_patch() {
+    let (mem, router) = spawn_router();
+
+    let create_body = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "tppatch", "namespace": NS},
+        "spec": {
+            "type": "ClusterIP",
+            "ports": [{"name": "a", "port": 80, "targetPort": 80}],
+            "selector": {"app": "tppatch"}
+        }
+    });
+    let (status, created) = create_service(router.clone(), &create_body).await;
+    assert!(
+        (200..300).contains(&status),
+        "create got {status}: {created}"
+    );
+
+    // Merge patch replaces the ports array with a port carrying targetPort 0.
+    let patch = json!({
+        "spec": {"ports": [{"name": "a", "port": 80, "targetPort": 0}]}
+    });
+    let (status, response) = patch_service_merge(router, "tppatch", &patch).await;
+    assert!(
+        (200..300).contains(&status),
+        "patch got {status}: {response}"
+    );
+
+    assert_eq!(
+        response["spec"]["ports"][0]["targetPort"], 80,
+        "explicit targetPort 0 via patch must default to its port value"
+    );
+
+    let persisted = stored(&mem, "tppatch").await.expect("persisted");
+    assert_eq!(
+        persisted["spec"]["ports"][0]["targetPort"], 80,
+        "persisted targetPort must be defaulted, not stored as 0"
+    );
 }
 
 /// Explicit UDP and named targetPort must NOT be overridden.
