@@ -1,11 +1,11 @@
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     resources::ReplicationController,
@@ -20,12 +20,26 @@ pub async fn create_replicationcontroller(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
-    DumpingJson(mut rc): DumpingJson<ReplicationController>,
-) -> Result<(StatusCode, Json<ReplicationController>)> {
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Json<ReplicationController>)> {
+    // Decode the body manually so any deserialization failure is surfaced as a
+    // proper `metav1.Status` (HTTP 400 / reason=BadRequest) rather than the bare
+    // plain-text rejection axum's `Json`/`DumpingJson` extractor produces.
+    // client-go translates a missing Status body into the opaque "the server
+    // rejected our request due to an error in our request (post
+    // replicationcontrollers)" message, which previously masked every malformed
+    // POST here. Mirrors the deployment handler.
+    let mut rc: ReplicationController = decode_rc_body(&body)?;
+
     info!(
         "Creating replicationcontroller: {} in namespace: {}",
         rc.metadata.name, namespace
     );
+
+    // Strict field validation: reject/warn on unknown fields when requested.
+    let warnings = crate::handlers::validation::validate_strict_fields(&params, &body, &rc)?;
+    let response_headers = build_warning_headers(&warnings);
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "replicationcontrollers")
@@ -67,7 +81,54 @@ pub async fn create_replicationcontroller(
     );
     let created = state.storage.create(&key, &rc).await?;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    Ok((StatusCode::CREATED, response_headers, Json(created)))
+}
+
+/// Decode a ReplicationController request body into the typed struct, mapping
+/// any deserialization failure to `Error::BadRequest` so the client receives a
+/// proper `metav1.Status` instead of a bare plain-text 400. Preserves the
+/// `RUSTERNETES_DUMP_PAYLOADS` conformance-debugging dump that the `DumpingJson`
+/// extractor would otherwise have emitted.
+fn decode_rc_body(body: &[u8]) -> Result<ReplicationController> {
+    match serde_json::from_slice::<ReplicationController>(body) {
+        Ok(rc) => Ok(rc),
+        Err(e) => {
+            let msg = e.to_string();
+            // Retry duplicate-field failures via Value so they decode (strict
+            // duplicate-key detection happens in validate_strict_fields).
+            if msg.contains("duplicate field") {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+                    if let Ok(rc) = serde_json::from_value::<ReplicationController>(value) {
+                        return Ok(rc);
+                    }
+                }
+            }
+            if rusternetes_common::dump::dumps_enabled() {
+                let redacted = rusternetes_common::dump::redact_secret_like(body);
+                tracing::error!(
+                    rejection = %msg,
+                    payload = %String::from_utf8_lossy(&redacted),
+                    "ReplicationController JSON body decode failed"
+                );
+            }
+            Err(rusternetes_common::Error::BadRequest(format!(
+                "failed to decode: {}",
+                msg
+            )))
+        }
+    }
+}
+
+/// Build `Warning` response headers from strict field-validation warnings.
+fn build_warning_headers(warnings: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for warning in warnings {
+        let value = crate::handlers::validation::format_warning_header(warning);
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&value) {
+            headers.append(axum::http::header::WARNING, hv);
+        }
+    }
+    headers
 }
 
 pub async fn get_replicationcontroller(
@@ -103,8 +164,12 @@ pub async fn update_replicationcontroller(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    DumpingJson(mut rc): DumpingJson<ReplicationController>,
+    body: Bytes,
 ) -> Result<Json<ReplicationController>> {
+    // Decode manually so a malformed PUT yields a proper `metav1.Status`
+    // instead of a bare plain-text rejection (see create handler).
+    let mut rc: ReplicationController = decode_rc_body(&body)?;
+
     info!(
         "Updating replicationcontroller: {} in namespace: {}",
         name, namespace
