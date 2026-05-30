@@ -425,6 +425,49 @@ async fn test_service_strategy_ports_default_protocol_tcp_and_target_port() {
     assert_eq!(persisted["spec"]["ports"][0]["targetPort"], 8080);
 }
 
+/// Explicit `targetPort: 0` must be treated as unset and defaulted to `port`.
+///
+/// Upstream `SetDefaults_Service` defaults targetPort when it equals
+/// `intstr.FromInt32(0)` or `intstr.FromString("")`, not only when the field
+/// is absent. Go's typed e2e clients (k8s.io/api ServicePort) serialize an
+/// unset targetPort as the zero IntOrString `0`, so every e2e Service that
+/// omits targetPort arrives here as an explicit `0`. Without this defaulting
+/// the request is rejected with `targetPort: Invalid value: 0`.
+/// K8s ref: pkg/apis/core/v1/defaults.go (SetDefaults_Service port loop).
+#[tokio::test]
+async fn test_service_strategy_explicit_zero_target_port_is_defaulted() {
+    let (mem, router) = spawn_router();
+    let body = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "tpzero", "namespace": NS},
+        "spec": {
+            "type": "ClusterIP",
+            "ports": [
+                {"name": "a", "port": 80, "targetPort": 0},
+                {"name": "b", "port": 443, "targetPort": 0}
+            ],
+            "selector": {"app": "tpzero"}
+        }
+    });
+
+    let (status, response) = create_service(router, &body).await;
+    assert!((200..300).contains(&status), "got {status}: {response}");
+
+    assert_eq!(
+        response["spec"]["ports"][0]["targetPort"], 80,
+        "explicit targetPort 0 on port[0] must default to its port value"
+    );
+    assert_eq!(
+        response["spec"]["ports"][1]["targetPort"], 443,
+        "explicit targetPort 0 on port[1] must default to its port value"
+    );
+
+    let persisted = stored(&mem, "tpzero").await.expect("persisted");
+    assert_eq!(persisted["spec"]["ports"][0]["targetPort"], 80);
+    assert_eq!(persisted["spec"]["ports"][1]["targetPort"], 443);
+}
+
 /// Explicit UDP and named targetPort must NOT be overridden.
 #[tokio::test]
 async fn test_service_strategy_ports_preserve_explicit_protocol_and_target_port() {

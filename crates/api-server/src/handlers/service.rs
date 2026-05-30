@@ -57,6 +57,29 @@ fn apply_session_affinity_defaults(
     }
 }
 
+/// Default each ServicePort's `targetPort` and `protocol`, mirroring upstream
+/// `SetDefaults_Service`. A `targetPort` of `intstr.FromInt32(0)` or
+/// `intstr.FromString("")` is treated as unset (Go's typed clients serialize an
+/// omitted targetPort as the zero IntOrString `0`) and defaulted to `port`.
+/// Protocol defaults to TCP. Must run before validation.
+fn default_service_ports(spec: &mut rusternetes_common::resources::ServiceSpec) {
+    use rusternetes_common::resources::IntOrString;
+    for port in &mut spec.ports {
+        let target_port_unset = match &port.target_port {
+            None => true,
+            Some(IntOrString::Int(0)) => true,
+            Some(IntOrString::String(s)) => s.is_empty(),
+            _ => false,
+        };
+        if target_port_unset {
+            port.target_port = Some(IntOrString::Int(port.port as i32));
+        }
+        if port.protocol.is_none() {
+            port.protocol = Some("TCP".to_string());
+        }
+    }
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -89,6 +112,17 @@ pub async fn create(
     };
 
     info!("Creating service: {}/{}", namespace, service.metadata.name);
+
+    // Default ServicePort.targetPort / protocol BEFORE validation.
+    //
+    // Upstream runs SetDefaults_Service before ValidateService, and treats a
+    // targetPort of `intstr.FromInt32(0)` or `intstr.FromString("")` as unset,
+    // not just an absent field. Go's typed e2e clients serialize an omitted
+    // targetPort as the zero IntOrString `0`, so without this every such
+    // Service would be rejected by validation with
+    // `targetPort: Invalid value: 0` before defaulting could run.
+    // K8s ref: pkg/apis/core/v1/defaults.go (SetDefaults_Service port loop).
+    default_service_ports(&mut service.spec);
 
     // Field-level validation — accumulate every violation into a field::ErrorList
     // and return 422 Invalid if non-empty, mirroring upstream NewInvalid.
@@ -138,19 +172,6 @@ pub async fn create(
     }
 
     apply_session_affinity_defaults(&mut service.spec, false);
-
-    // Default target_port to port value if not set
-    for port in &mut service.spec.ports {
-        if port.target_port.is_none() {
-            port.target_port = Some(rusternetes_common::resources::IntOrString::Int(
-                port.port as i32,
-            ));
-        }
-        // Default protocol to TCP if not set
-        if port.protocol.is_none() {
-            port.protocol = Some("TCP".to_string());
-        }
-    }
 
     // Default internalTrafficPolicy to "Cluster" for ClusterIP/NodePort/LoadBalancer
     // K8s ref: pkg/apis/core/v1/defaults.go:141-146
