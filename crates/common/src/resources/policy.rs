@@ -668,7 +668,10 @@ mod tests {
         let dp = status.disrupted_pods.expect("disruptedPods present");
         assert!(dp.contains_key("pod-0"));
         assert_eq!(
-            dp.get("pod-0").unwrap().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            dp.get("pod-0")
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
             "2026-05-31T21:33:36Z"
         );
     }
@@ -691,7 +694,10 @@ mod tests {
         let status: PodDisruptionBudgetStatus = serde_json::from_str(json).unwrap();
         let out = serde_json::to_string(&status).unwrap();
         // Values must serialize back as RFC3339 strings, never objects.
-        assert!(out.contains(r#""pod-0":"2026-05-31T21:33:36Z""#), "got: {out}");
+        assert!(
+            out.contains(r#""pod-0":"2026-05-31T21:33:36Z""#),
+            "got: {out}"
+        );
     }
 
     #[test]

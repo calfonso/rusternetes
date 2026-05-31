@@ -63,7 +63,7 @@ pub mod k8s_time {
 pub mod k8s_time_map {
     use chrono::{DateTime, Utc};
     use serde::de::{MapAccess, Visitor};
-    use serde::{self, Deserialize, Deserializer, Serializer, ser::SerializeMap};
+    use serde::{self, ser::SerializeMap, Deserialize, Deserializer, Serializer};
     use std::collections::HashMap;
     use std::fmt;
 
