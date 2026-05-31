@@ -61,10 +61,12 @@ pub struct ReplicationControllerSpec {
 }
 
 /// ReplicationControllerStatus represents the current state of a ReplicationController
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicationControllerStatus {
-    /// Number of replicas
+    /// Number of replicas (Go: int32, json:"replicas" — no omitempty, so Go leaves absent
+    /// fields at zero value; we must do the same via #[serde(default)])
+    #[serde(default)]
     pub replicas: i32,
 
     /// Number of fully labeled replicas
@@ -169,10 +171,12 @@ fn default_one_replica() -> i32 {
 }
 
 /// ReplicaSetStatus represents the current state of a ReplicaSet
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaSetStatus {
-    /// Number of replicas
+    /// Number of replicas (Go: int32, json:"replicas" — no omitempty, Go leaves absent
+    /// fields at zero value; we match with #[serde(default)])
+    #[serde(default)]
     pub replicas: i32,
 
     /// Number of fully labeled replicas
@@ -346,10 +350,12 @@ pub struct StatefulSetPersistentVolumeClaimRetentionPolicy {
 }
 
 /// StatefulSetStatus represents the current state of a StatefulSet
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StatefulSetStatus {
-    /// Number of replicas
+    /// Number of replicas (Go: int32, json:"replicas" — no omitempty, Go leaves absent
+    /// fields at zero value; we match with #[serde(default)])
+    #[serde(default)]
     pub replicas: i32,
 
     /// Number of ready replicas
@@ -1164,5 +1170,148 @@ mod tests {
 
         assert_eq!(job.metadata.name, "test-job");
         assert_eq!(job.type_meta.api_version, "batch/v1");
+    }
+
+    /// Reproducing the "missing field `replicas`" conformance failure.
+    /// A conformance test creates an RC without specifying replicas.
+    /// Go's json.Unmarshal leaves *int32 at nil; we must also accept absence.
+    #[test]
+    fn test_rc_decode_without_replicas() {
+        // Typical RC body sent by k8s conformance tests (no `replicas` field)
+        let json = r#"{
+            "kind": "ReplicationController",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "e2e-test-rc",
+                "namespace": "replication-controller-9005",
+                "labels": {"app": "e2e-test-rc"},
+                "creationTimestamp": null
+            },
+            "spec": {
+                "selector": {"app": "e2e-test-rc"},
+                "template": {
+                    "metadata": {
+                        "labels": {"app": "e2e-test-rc"},
+                        "creationTimestamp": null
+                    },
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "busybox",
+                                "image": "registry.k8s.io/e2e-test-images/busybox:1.36.1-2",
+                                "resources": {}
+                            }
+                        ],
+                        "restartPolicy": "Always",
+                        "terminationGracePeriodSeconds": 30,
+                        "dnsPolicy": "ClusterFirst"
+                    }
+                }
+            }
+        }"#;
+
+        let rc: ReplicationController =
+            serde_json::from_str(json).expect("RC without replicas must decode");
+        // replicas absent → None (Go: *int32 nil → defaults to 1 in registry)
+        assert!(
+            rc.spec.replicas.is_none(),
+            "replicas absent in wire body should decode as None"
+        );
+    }
+
+    /// ReplicationControllerStatus.replicas is `int32` in Go (no omitempty),
+    /// so Go leaves it at 0 when absent — we must decode it to 0 too.
+    /// This reproduces the "missing field `replicas`" 400 BadRequest that
+    /// blocked ~30 conformance specs (garbage_collector, rc lifecycle, etc.)
+    #[test]
+    fn test_rc_status_replicas_defaults_to_zero() {
+        // status present but replicas absent — the exact shape sent by
+        // many conformance tests.
+        let json = r#"{
+            "kind": "ReplicationController",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "test-rc",
+                "namespace": "default",
+                "creationTimestamp": null
+            },
+            "spec": {
+                "selector": {"app": "test"},
+                "template": {
+                    "metadata": {"labels": {"app": "test"}, "creationTimestamp": null},
+                    "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+                }
+            },
+            "status": {
+                "readyReplicas": 0,
+                "availableReplicas": 0
+            }
+        }"#;
+
+        let rc: ReplicationController = serde_json::from_str(json)
+            .expect("RC with status missing replicas must decode (Go zero-value parity)");
+        let status = rc.status.expect("status must be present");
+        assert_eq!(
+            status.replicas, 0,
+            "status.replicas absent on wire must decode as 0"
+        );
+    }
+
+    /// ReplicaSetStatus.replicas is `int32` in Go (no omitempty).
+    #[test]
+    fn test_replicaset_status_replicas_defaults_to_zero() {
+        let json = r#"{
+            "kind": "ReplicaSet",
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "test-rs"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "test"}},
+                "template": {
+                    "metadata": {"labels": {"app": "test"}},
+                    "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+                }
+            },
+            "status": {
+                "readyReplicas": 0,
+                "availableReplicas": 0
+            }
+        }"#;
+
+        let rs: ReplicaSet = serde_json::from_str(json)
+            .expect("ReplicaSet with status missing replicas must decode");
+        let status = rs.status.expect("status must be present");
+        assert_eq!(
+            status.replicas, 0,
+            "status.replicas absent on wire must decode as 0"
+        );
+    }
+
+    /// StatefulSetStatus.replicas is `int32` in Go (no omitempty).
+    #[test]
+    fn test_statefulset_status_replicas_defaults_to_zero() {
+        let json = r#"{
+            "kind": "StatefulSet",
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "test-ss"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "test"}},
+                "template": {
+                    "metadata": {"labels": {"app": "test"}},
+                    "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+                },
+                "serviceName": "test"
+            },
+            "status": {
+                "readyReplicas": 0
+            }
+        }"#;
+
+        let ss: StatefulSet = serde_json::from_str(json)
+            .expect("StatefulSet with status missing replicas must decode");
+        let status = ss.status.expect("status must be present");
+        assert_eq!(
+            status.replicas, 0,
+            "status.replicas absent on wire must decode as 0"
+        );
     }
 }

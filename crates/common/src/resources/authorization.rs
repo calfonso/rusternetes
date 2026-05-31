@@ -15,7 +15,14 @@ pub struct SubjectAccessReview {
     pub api_version: String,
     #[serde(default = "default_kind_subject_access_review")]
     pub kind: String,
+    /// Go: metav1.ObjectMeta — absent in wire body leaves zero value; #[serde(default)]
+    /// prevents decode failure when metadata is omitted (common in conformance tests).
+    #[serde(default)]
     pub metadata: ObjectMeta,
+    /// Go: SubjectAccessReviewSpec — absent leaves zero value; #[serde(default)] matches.
+    /// Conformance tests (e.g. sig-auth SubjectReview) send a SubjectAccessReview with
+    /// only apiVersion/kind/metadata and no spec field at all.
+    #[serde(default)]
     pub spec: SubjectAccessReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SubjectAccessReviewStatus>,
@@ -30,7 +37,7 @@ fn default_kind_subject_access_review() -> String {
 }
 
 /// SubjectAccessReviewSpec is a description of the access request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SubjectAccessReviewSpec {
     /// Extra corresponds to the user.Info.GetExtra() method from the authenticator.
@@ -200,7 +207,9 @@ pub struct SelfSubjectAccessReview {
     pub api_version: String,
     #[serde(default = "default_kind_self_subject_access_review")]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: SelfSubjectAccessReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SubjectAccessReviewStatus>,
@@ -215,7 +224,7 @@ fn default_kind_self_subject_access_review() -> String {
 }
 
 /// SelfSubjectAccessReviewSpec is a description of the access request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SelfSubjectAccessReviewSpec {
     /// NonResourceAttributes describes information for a non-resource access request.
@@ -239,7 +248,9 @@ pub struct LocalSubjectAccessReview {
     pub api_version: String,
     #[serde(default = "default_kind_local_subject_access_review")]
     pub kind: String,
+    #[serde(default)]
     pub metadata: ObjectMeta,
+    #[serde(default)]
     pub spec: SubjectAccessReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SubjectAccessReviewStatus>,
@@ -298,17 +309,23 @@ pub struct SubjectRulesReviewStatus {
     pub evaluation_error: Option<String>,
 
     /// Incomplete is true when the rules returned by this call are incomplete.
+    /// Go: bool — absent in wire leaves false; #[serde(default)] matches.
+    #[serde(default)]
     pub incomplete: bool,
 
     /// NonResourceRules is the list of actions the subject is allowed to perform on non-resources.
+    /// Go: []NonResourceRule — absent leaves empty slice; #[serde(default)] matches.
+    #[serde(default)]
     pub non_resource_rules: Vec<NonResourceRule>,
 
     /// ResourceRules is the list of actions the subject is allowed to perform on resources.
+    /// Go: []ResourceRule — absent leaves empty slice; #[serde(default)] matches.
+    #[serde(default)]
     pub resource_rules: Vec<ResourceRule>,
 }
 
 /// NonResourceRule holds information that describes a rule for the non-resource.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NonResourceRule {
     /// NonResourceURLs is a set of partial urls that a user should have access to.
@@ -320,11 +337,13 @@ pub struct NonResourceRule {
     pub non_resource_urls: Option<Vec<String>>,
 
     /// Verb is a list of kubernetes non-resource API verbs.
+    /// Go: []string — absent leaves empty slice; #[serde(default)] matches.
+    #[serde(default)]
     pub verbs: Vec<String>,
 }
 
 /// ResourceRule is the list of actions the subject is allowed to perform on resources.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRule {
     /// APIGroups is the name of the APIGroup that contains the resources.
@@ -340,6 +359,8 @@ pub struct ResourceRule {
     pub resources: Option<Vec<String>>,
 
     /// Verb is a list of kubernetes resource API verbs.
+    /// Go: []string — absent leaves empty slice; #[serde(default)] matches.
+    #[serde(default)]
     pub verbs: Vec<String>,
 }
 
@@ -470,5 +491,38 @@ mod tests {
         let json = serde_json::to_string(&ssrr).unwrap();
         assert!(json.contains("authorization.k8s.io/v1"));
         assert!(json.contains("SelfSubjectRulesReview"));
+    }
+
+    /// SubjectAccessReview without spec must decode (Go-parity).
+    /// Reproduces sig-auth SubjectReview 422 "missing field `spec`" from the
+    /// 2026-05-31 conformance run (subjectreviews.go:101).
+    #[test]
+    fn test_subject_access_review_without_spec_decodes() {
+        let json = r#"{
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SubjectAccessReview",
+            "metadata": {}
+        }"#;
+
+        let sar: SubjectAccessReview =
+            serde_json::from_str(json).expect("SAR without spec must decode (Go zero-value)");
+        // spec defaults to zero-value: all None fields
+        assert!(sar.spec.user.is_none());
+        assert!(sar.spec.resource_attributes.is_none());
+    }
+
+    /// SubjectRulesReviewStatus with missing list fields must decode.
+    /// Go: []NonResourceRule, []ResourceRule — absent leaves empty slice.
+    #[test]
+    fn test_subject_rules_review_status_without_lists_decodes() {
+        let json = r#"{
+            "incomplete": false
+        }"#;
+
+        let status: SubjectRulesReviewStatus =
+            serde_json::from_str(json).expect("status without rule lists must decode");
+        assert!(!status.incomplete);
+        assert!(status.non_resource_rules.is_empty());
+        assert!(status.resource_rules.is_empty());
     }
 }
