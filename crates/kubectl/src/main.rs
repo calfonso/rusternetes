@@ -1022,11 +1022,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load kubeconfig or use CLI flags
-    let (server, skip_tls, token, default_namespace) = if let Some(server_url) = cli.server {
-        // CLI flags override kubeconfig
+    let (server, skip_tls, ca_pem, token, default_namespace) = if let Some(server_url) = cli.server
+    {
+        // CLI flags override kubeconfig. No CA source on the bare --server path,
+        // so secure mode there relies on the system trust store.
         (
             server_url,
             cli.insecure_skip_tls_verify,
+            None,
             cli.token,
             "default".to_string(),
         )
@@ -1059,15 +1062,22 @@ async fn main() -> Result<()> {
         // overrides a kubeconfig that pins a (possibly stale) CA.
         let skip_tls =
             cli.insecure_skip_tls_verify || config.should_skip_tls_verify().unwrap_or(false);
+        // Trust the kubeconfig CA in secure mode so the api-server's
+        // self-signed cert verifies. Skipped when insecure (CA is irrelevant).
+        let ca_pem = if skip_tls {
+            None
+        } else {
+            config.get_ca_cert_pem().unwrap_or(None)
+        };
         let token = cli.token.or_else(|| config.get_token().ok().flatten());
         let namespace = config
             .get_namespace()
             .unwrap_or_else(|_| "default".to_string());
 
-        (server, skip_tls, token, namespace)
+        (server, skip_tls, ca_pem, token, namespace)
     };
 
-    let client = ApiClient::new(&server, skip_tls, token)?;
+    let client = ApiClient::with_tls(&server, skip_tls, ca_pem, token)?;
 
     match cli.command {
         Commands::Get {

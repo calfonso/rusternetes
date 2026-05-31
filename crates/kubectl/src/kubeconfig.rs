@@ -198,6 +198,29 @@ impl KubeConfig {
         Ok(user.token.clone())
     }
 
+    /// Get the cluster CA certificate as PEM bytes, if the kubeconfig provides
+    /// one. Prefers inline `certificate-authority-data` (base64-encoded PEM);
+    /// otherwise reads the `certificate-authority` file path. Returns `None`
+    /// when neither is set (e.g. an insecure cluster).
+    pub fn get_ca_cert_pem(&self) -> Result<Option<Vec<u8>>> {
+        use anyhow::Context as _;
+        let context = self.get_current_context()?;
+        let cluster = self.get_cluster(context)?;
+        if let Some(data) = &cluster.certificate_authority_data {
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .context("decoding certificate-authority-data")?;
+            return Ok(Some(decoded));
+        }
+        if let Some(path) = &cluster.certificate_authority {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading certificate-authority file {path}"))?;
+            return Ok(Some(bytes));
+        }
+        Ok(None)
+    }
+
     /// Get client certificate data if available (base64 encoded)
     #[allow(dead_code)]
     pub fn get_client_cert_data(&self) -> Result<Option<String>> {
@@ -291,6 +314,58 @@ users:
         let config: KubeConfig = serde_yaml::from_str(yaml).unwrap();
         // No insecure field + a CA present -> not skipped by the kubeconfig.
         assert!(!config.should_skip_tls_verify().unwrap());
+    }
+
+    #[test]
+    fn test_get_ca_cert_pem_decodes_inline_data() {
+        use base64::Engine;
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pem);
+        let yaml = format!(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: c
+contexts:
+- name: c
+  context: {{ cluster: c, user: u }}
+clusters:
+- name: c
+  cluster:
+    server: https://localhost:6443
+    certificate-authority-data: {b64}
+users:
+- name: u
+  user: {{ token: anonymous }}
+"#
+        );
+        let config: KubeConfig = serde_yaml::from_str(&yaml).unwrap();
+        let ca = config.get_ca_cert_pem().unwrap();
+        assert_eq!(
+            ca.as_deref(),
+            Some(pem.as_bytes()),
+            "inline certificate-authority-data must base64-decode to the CA PEM",
+        );
+    }
+
+    #[test]
+    fn test_get_ca_cert_pem_none_when_absent() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: c
+contexts:
+- name: c
+  context: { cluster: c, user: u }
+clusters:
+- name: c
+  cluster: { server: https://localhost:6443, insecure-skip-tls-verify: true }
+users:
+- name: u
+  user: { token: anonymous }
+"#;
+        let config: KubeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.get_ca_cert_pem().unwrap().is_none());
     }
 
     // Mirrors the call-site logic in main.rs: insecure is forced if EITHER the
