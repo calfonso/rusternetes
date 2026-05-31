@@ -1075,6 +1075,7 @@ pub async fn delete_pod(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "pods")
         .with_namespace(&namespace)
         .with_api_group("")
@@ -1092,6 +1093,28 @@ pub async fn delete_pod(
     // Get the pod to check for finalizers
     let pod: Pod = state.storage.get(&key).await?;
 
+    // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
+    // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls
+    // preconditions.Check() before invoking storage.Delete; a mismatch returns
+    // 409 Conflict with reason `Conflict`.
+    crate::handlers::lifecycle::check_delete_preconditions(&body, &pod.metadata, &name)?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=pod).
+    // Runs before the dry-run short-circuit so a deny is observed in dry-run too.
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "Pod",
+        "pods",
+        Some(&namespace),
+        &name,
+        &pod,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
+
     // If dry-run, skip delete operation
     if is_dry_run {
         info!(
@@ -1100,12 +1123,6 @@ pub async fn delete_pod(
         );
         return Ok(Json(pod));
     }
-
-    // Enforce deleteOptions.preconditions.{resourceVersion,uid} before mutating
-    // anything. Upstream: pkg/registry/generic/registry/store.go::Delete calls
-    // preconditions.Check() before invoking storage.Delete; a mismatch returns
-    // 409 Conflict with reason `Conflict`.
-    crate::handlers::lifecycle::check_delete_preconditions(&body, &pod.metadata, &name)?;
 
     // Parse DeleteOptions from request body (gracePeriodSeconds, propagationPolicy, etc.)
     let body_delete_options: Option<serde_json::Value> = if !body.is_empty() {

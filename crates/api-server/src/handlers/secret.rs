@@ -293,6 +293,7 @@ pub async fn delete_secret(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "secrets")
         .with_api_group("")
         .with_namespace(&namespace)
@@ -315,6 +316,21 @@ pub async fn delete_secret(
     // preconditions.Check() before invoking storage.Delete; a mismatch returns
     // 409 Conflict with reason `Conflict`.
     crate::handlers::lifecycle::check_delete_preconditions(&body, &secret.metadata, &name)?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=secret).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "Secret",
+        "secrets",
+        Some(&namespace),
+        &name,
+        &secret,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {

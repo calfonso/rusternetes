@@ -346,6 +346,7 @@ pub async fn delete_configmap(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "configmaps")
         .with_api_group("")
         .with_namespace(&namespace)
@@ -368,6 +369,21 @@ pub async fn delete_configmap(
     // preconditions.Check() before invoking storage.Delete; a mismatch returns
     // 409 Conflict with reason `Conflict`.
     crate::handlers::lifecycle::check_delete_preconditions(&body, &configmap.metadata, &name)?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=configmap).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "ConfigMap",
+        "configmaps",
+        Some(&namespace),
+        &name,
+        &configmap,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
