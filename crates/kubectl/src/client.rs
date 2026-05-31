@@ -60,9 +60,28 @@ fn format_status_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error
 }
 
 impl ApiClient {
+    /// Ergonomic constructor without a CA (system trust store / insecure).
+    /// Used widely by tests; production wiring uses [`Self::with_tls`].
+    #[allow(dead_code)]
     pub fn new(
         base_url: &str,
         insecure_skip_tls_verify: bool,
+        token: Option<String>,
+    ) -> Result<Self> {
+        Self::with_tls(base_url, insecure_skip_tls_verify, None, token)
+    }
+
+    /// Build a client, optionally trusting a kubeconfig-supplied CA certificate.
+    ///
+    /// TLS precedence mirrors upstream kubectl:
+    ///   1. `insecure_skip_tls_verify` — accept any cert (skips CA entirely).
+    ///   2. `ca_pem` present — verify against that CA (added to the default
+    ///      roots), which is how we trust the api-server's self-signed cert.
+    ///   3. neither — verify against the system roots only.
+    pub fn with_tls(
+        base_url: &str,
+        insecure_skip_tls_verify: bool,
+        ca_pem: Option<Vec<u8>>,
         token: Option<String>,
     ) -> Result<Self> {
         let client = if insecure_skip_tls_verify {
@@ -70,6 +89,13 @@ impl ApiClient {
                 .danger_accept_invalid_certs(true)
                 .build()
                 .context("Failed to build HTTP client")?
+        } else if let Some(ca) = ca_pem {
+            let cert = reqwest::Certificate::from_pem(&ca)
+                .context("parsing kubeconfig CA certificate (certificate-authority-data)")?;
+            Client::builder()
+                .add_root_certificate(cert)
+                .build()
+                .context("Failed to build HTTP client with kubeconfig CA")?
         } else {
             Client::new()
         };
