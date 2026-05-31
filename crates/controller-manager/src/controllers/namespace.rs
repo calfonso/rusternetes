@@ -1079,6 +1079,74 @@ mod tests {
         assert_eq!(content_failure.reason.as_deref(), Some("ContentDeleted"));
     }
 
+    /// End-to-end regression for the "namespace stuck Terminating" hang.
+    ///
+    /// Finalization is a TWO-cycle process: cycle 1 deletes content and sets
+    /// the deletion conditions; cycle 2 (re-triggered when the controller
+    /// observes that status write) removes the `kubernetes` finalizer and
+    /// deletes the namespace. That re-trigger rides on `Storage::watch` — when
+    /// the backend watch stopped delivering events (the rhino/SQLite
+    /// create-vs-update version bug, fixed in rhino) cycle 2 never fired and
+    /// the namespace hung Terminating forever, wedging conformance cleanup.
+    ///
+    /// This drives the real `run()` loop over `MemoryStorage` (whose watch
+    /// works) and asserts a marked namespace — with content — actually
+    /// disappears from storage. It guards the controller's reconcile →
+    /// finalize → delete completion, so a regression in the two-cycle gate or
+    /// the re-enqueue path fails here instead of silently hanging a cluster.
+    #[tokio::test]
+    async fn test_controller_run_finalizes_and_deletes_terminating_namespace() {
+        let storage = Arc::new(MemoryStorage::new());
+
+        // A namespace marked for deletion, with the kubernetes finalizer.
+        let mut ns = Namespace::new("term-ns");
+        ns.metadata.deletion_timestamp = Some(Utc::now());
+        ns.metadata.finalizers = Some(vec!["kubernetes".to_string()]);
+        ns.status = Some(NamespaceStatus {
+            phase: Some(Phase::Terminating),
+            conditions: None,
+        });
+        let key = build_key("namespaces", None, "term-ns");
+        storage.create(&key, &ns).await.unwrap();
+
+        // Some content (no finalizer) the controller must delete first.
+        let cm = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "c", "namespace": "term-ns"}, "data": {"k": "v"}
+        });
+        storage
+            .create(&build_key("configmaps", Some("term-ns"), "c"), &cm)
+            .await
+            .unwrap();
+
+        // Spawn the real controller run loop.
+        let controller = Arc::new(NamespaceController::new(storage.clone()));
+        let handle = tokio::spawn({
+            let c = controller.clone();
+            async move {
+                let _ = c.run().await;
+            }
+        });
+
+        // The namespace must be fully removed from storage (not just left
+        // Terminating). 5s budget — well past the watch-driven re-enqueue.
+        let mut deleted = false;
+        for _ in 0..50 {
+            if storage.get::<Namespace>(&key).await.is_err() {
+                deleted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        handle.abort();
+
+        assert!(
+            deleted,
+            "namespace controller must finalize and DELETE a Terminating namespace, \
+             not leave it stuck (watch-driven re-enqueue / two-cycle gate regression)"
+        );
+    }
+
     #[tokio::test]
     async fn test_finalize_namespace_sets_conditions() {
         let storage = Arc::new(MemoryStorage::new());
