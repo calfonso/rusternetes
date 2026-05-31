@@ -77,8 +77,20 @@ pub async fn list_volumesnapshotclasses(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<VolumeSnapshotClass>>> {
+) -> Result<axum::response::Response> {
     debug!("Listing all VolumeSnapshotClasses");
+
+    // Honor `?watch=true` on the collection endpoint (informer/Lens path).
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_cluster_scoped::<VolumeSnapshotClass>(
+            state,
+            auth_ctx,
+            "volumesnapshotclasses",
+            "snapshot.storage.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
 
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "volumesnapshotclasses")
         .with_api_group("snapshot.storage.k8s.io");
@@ -91,7 +103,7 @@ pub async fn list_volumesnapshotclasses(
     }
 
     let prefix = build_prefix("volumesnapshotclasses", None);
-    let mut vscs = state.storage.list(&prefix).await?;
+    let mut vscs = state.storage.list::<VolumeSnapshotClass>(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vscs, &params)?;
@@ -101,7 +113,7 @@ pub async fn list_volumesnapshotclasses(
         "snapshot.storage.k8s.io/v1",
         vscs,
     );
-    Ok(Json(list))
+    Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
 pub async fn update_volumesnapshotclass(
