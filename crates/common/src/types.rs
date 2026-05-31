@@ -11,6 +11,46 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+/// Serde for `metav1.Time` fields (creationTimestamp, deletionTimestamp, ...).
+///
+/// Upstream `metav1.Time.MarshalJSON` formats as RFC3339 with **second**
+/// precision (`time.RFC3339`, no fractional seconds), e.g. `2026-05-31T08:00:43Z`.
+/// We emit the same so responses match k8s exactly (sub-second precision is a
+/// non-conformance and breaks proto Timestamp round-tripping). Deserialize is
+/// lenient and accepts timestamps with or without fractional seconds.
+pub mod k8s_time {
+    use chrono::{DateTime, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(dt) => serializer.serialize_str(&dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+                    return Ok(Some(dt.with_timezone(&Utc)));
+                }
+                s.parse::<DateTime<Utc>>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 /// ObjectMeta is metadata that all persisted resources must have
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -46,11 +86,21 @@ pub struct ObjectMeta {
     pub managed_fields: Option<Vec<ManagedFieldsEntry>>,
 
     /// CreationTimestamp is the creation time
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "k8s_time::serialize",
+        deserialize_with = "k8s_time::deserialize",
+        default
+    )]
     pub creation_timestamp: Option<DateTime<Utc>>,
 
     /// DeletionTimestamp is the time when the resource will be deleted
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "k8s_time::serialize",
+        deserialize_with = "k8s_time::deserialize",
+        default
+    )]
     pub deletion_timestamp: Option<DateTime<Utc>>,
 
     /// DeletionGracePeriodSeconds is the number of seconds before the object should be deleted
@@ -863,29 +913,33 @@ mod tests {
     }
 
     #[test]
-    fn test_creation_timestamp_nanosecond_preservation() {
+    fn test_creation_timestamp_serializes_at_second_precision() {
         use chrono::{DateTime, Utc};
-        // K8s client sends nanosecond-precision timestamps
-        let ts_str = "2026-03-29T21:05:27.270173921Z";
-        let ts: DateTime<Utc> = ts_str.parse().unwrap();
+        // Upstream metav1.Time.MarshalJSON formats at SECOND precision
+        // (time.RFC3339, no fractional seconds). A client may *send* sub-second
+        // precision, but we must serialize responses at second precision to
+        // match k8s — emitting nanoseconds is a non-conformance and breaks
+        // proto Timestamp round-tripping.
+        let ts: DateTime<Utc> = "2026-03-29T21:05:27.270173921Z".parse().unwrap();
         let meta = ObjectMeta {
             name: "test".to_string(),
             creation_timestamp: Some(ts),
             ..Default::default()
         };
-        // Serialize (as our API server does when writing to etcd)
         let json = serde_json::to_string(&meta).unwrap();
-        // The timestamp should contain fractional seconds
         assert!(
-            json.contains(".270173921") || json.contains(".27017392"),
-            "Timestamp should preserve sub-second precision: {}",
+            json.contains("\"2026-03-29T21:05:27Z\""),
+            "creationTimestamp must serialize at second precision: {}",
             json
         );
-        // Deserialize (as our API server does when reading from etcd)
+        assert!(
+            !json.contains(".270"),
+            "must not emit sub-second precision: {}",
+            json
+        );
+        // Lenient deserialize still accepts sub-second input; re-serialize is stable.
         let meta2: ObjectMeta = serde_json::from_str(&json).unwrap();
-        // Re-serialize (as our API server does when responding to client)
-        let json2 = serde_json::to_string(&meta2).unwrap();
-        assert_eq!(json, json2, "Timestamp should survive round-trip");
+        assert_eq!(json, serde_json::to_string(&meta2).unwrap());
     }
 
     /// Regression: kubectl / client-go send `status: { phase: "" }` on CREATE
