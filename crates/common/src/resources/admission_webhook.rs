@@ -168,7 +168,9 @@ pub struct MutatingWebhook {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleWithOperations {
-    /// Operations is the list of operations the webhook cares about
+    /// Operations is the list of operations the webhook cares about.
+    /// `#[serde(default)]` for Go-parity: upstream `operations` is `omitempty`.
+    #[serde(default)]
     pub operations: Vec<OperationType>,
 
     /// Rule is embedded, it describes other criteria
@@ -176,19 +178,26 @@ pub struct RuleWithOperations {
     pub rule: Rule,
 }
 
-/// Rule describes what resources and scopes to match
+/// Rule describes what resources and scopes to match.
+///
+/// The list fields are `#[serde(default)]` to match Go's `json.Unmarshal`:
+/// upstream `admissionregistration.Rule` marks `apiGroups`/`apiVersions`/
+/// `resources` as `omitempty`, so a client (e.g. the sig-api-machinery webhook
+/// e2e) may omit any of them. Decode must admit the object and let validation
+/// enforce requirements, rather than erroring with "missing field `apiGroups`".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
     /// APIGroups is the API groups the resources belong to ('*' means all)
-    #[serde(rename = "apiGroups")]
+    #[serde(rename = "apiGroups", default)]
     pub api_groups: Vec<String>,
 
     /// APIVersions is the API versions the resources belong to ('*' means all)
-    #[serde(rename = "apiVersions")]
+    #[serde(rename = "apiVersions", default)]
     pub api_versions: Vec<String>,
 
     /// Resources is a list of resources this rule applies to ('*' means all)
+    #[serde(default)]
     pub resources: Vec<String>,
 
     /// Scope specifies the scope of this rule (Cluster, Namespaced, or *)
@@ -299,6 +308,47 @@ pub struct MatchCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Go-parity decode: a webhook `rule` that omits `apiGroups` (and other
+    /// list fields) must deserialize. Upstream `admissionregistration.Rule`
+    /// has `apiGroups`/`apiVersions`/`resources` as `omitempty`, and the
+    /// sig-api-machinery AdmissionWebhook conformance e2e sends rules without
+    /// `apiGroups` — our required `Vec` field made MutatingWebhookConfiguration
+    /// create 422 ("webhooks[0].rules[0]: missing field `apiGroups`"), blocking
+    /// every core-resource webhook spec at registration.
+    #[test]
+    fn rule_with_operations_decodes_without_apigroups() {
+        let v = serde_json::json!({
+            "operations": ["CREATE"],
+            "apiVersions": ["v1"],
+            "resources": ["configmaps"]
+            // apiGroups intentionally omitted
+        });
+        let r: RuleWithOperations =
+            serde_json::from_value(v).expect("rule without apiGroups must decode (Go-parity)");
+        assert!(r.rule.api_groups.is_empty());
+        assert_eq!(r.rule.resources, vec!["configmaps".to_string()]);
+    }
+
+    /// And a full webhook config whose rule omits apiGroups must decode too.
+    #[test]
+    fn webhook_config_with_rule_missing_apigroups_decodes() {
+        let v = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "webhook-x"},
+            "webhooks": [{
+                "name": "m.example.com",
+                "clientConfig": {"service": {"namespace": "ns", "name": "svc", "path": "/mutate"}},
+                "rules": [{"operations": ["CREATE"], "apiVersions": ["v1"], "resources": ["configmaps"]}],
+                "admissionReviewVersions": ["v1"],
+                "sideEffects": "None"
+            }]
+        });
+        let cfg: MutatingWebhookConfiguration = serde_json::from_value(v)
+            .expect("webhook config with rule missing apiGroups must decode");
+        assert_eq!(cfg.metadata.name, "webhook-x");
+    }
 
     #[test]
     fn test_validating_webhook_config_creation() {
