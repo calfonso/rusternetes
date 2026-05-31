@@ -165,6 +165,37 @@ pub fn decode_protobuf<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<(T, 
     Ok((obj, type_meta))
 }
 
+/// Decode a k8s `Unknown` envelope into its `TypeMeta` and the raw inner
+/// payload bytes, WITHOUT assuming the payload is JSON.
+///
+/// [`decode_protobuf`] deserializes `Unknown.raw` as JSON, which only holds for
+/// kinds with no registered protobuf schema. For schema-registered kinds (Scale,
+/// Pod, …) the api-server now emits NATIVE protobuf in `raw` — decode those via
+/// the proto registry. This helper exposes the envelope split so callers choose
+/// the right inner decoder.
+pub fn decode_unknown_raw(data: &[u8]) -> Result<(TypeMeta, Vec<u8>), String> {
+    if data.len() < PROTOBUF_MAGIC.len() || &data[0..PROTOBUF_MAGIC.len()] != PROTOBUF_MAGIC {
+        return Err("Invalid magic number".to_string());
+    }
+
+    let unknown = Unknown::decode(&data[PROTOBUF_MAGIC.len()..])
+        .map_err(|e| format!("Failed to decode protobuf: {}", e))?;
+
+    let type_meta = unknown
+        .type_meta
+        .as_ref()
+        .map(|tm| TypeMeta {
+            api_version: tm.api_version.clone(),
+            kind: tm.kind.clone(),
+        })
+        .unwrap_or_else(|| TypeMeta {
+            api_version: String::new(),
+            kind: String::new(),
+        });
+
+    Ok((type_meta, unknown.raw))
+}
+
 /// Check if data appears to be protobuf-encoded (has magic number)
 pub fn is_protobuf(data: &[u8]) -> bool {
     data.len() >= PROTOBUF_MAGIC.len() && &data[0..PROTOBUF_MAGIC.len()] == PROTOBUF_MAGIC

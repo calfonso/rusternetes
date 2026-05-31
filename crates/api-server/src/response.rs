@@ -271,17 +271,31 @@ pub struct NativePodProtoEncoder;
 
 impl ProtoEncoder for NativePodProtoEncoder {
     fn encode(&self, json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
-        // Parse JSON. Failure here means a handler produced a non-JSON body;
-        // fall back to the wrapped-JSON encoder so we still emit a valid
-        // envelope rather than panic.
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) else {
-            return wrap_json_in_protobuf_envelope(json, api_version, kind);
-        };
+        encode_native_or_wrapped(json, api_version, kind)
+    }
+}
 
-        match crate::protobuf::PROTO_REGISTRY.encode_message(kind, &value) {
-            Some(raw) => wrap_native_proto_in_envelope(&raw, api_version, kind),
-            None => wrap_json_in_protobuf_envelope(json, api_version, kind),
-        }
+/// Encode a JSON resource body as **native** Kubernetes protobuf using the
+/// registered schema.
+///
+/// Protobuf responses are native-or-nothing: once the response advertises
+/// `Content-Type: application/vnd.kubernetes.protobuf`, `Unknown.raw` MUST be
+/// native protobuf — client-go's protobuf serializer proto-decodes it directly
+/// and a JSON-in-`raw` body fails with `proto: illegal wireType`. (Official k8s
+/// confirms this: it emits native protobuf for marshalable types and
+/// `errNotMarshalable` otherwise — never JSON-in-raw.) So a partial/round-trip
+/// fallback to JSON is impossible here; encoding a kind via this path requires
+/// its schema to be complete enough for clients.
+///
+/// The only fallback is for a kind with NO registered schema at all (which no
+/// current opt-in hits): we still emit a parsable envelope rather than 500.
+pub fn encode_native_or_wrapped(json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return wrap_json_in_protobuf_envelope(json, api_version, kind);
+    };
+    match crate::protobuf::PROTO_REGISTRY.encode_message(kind, &value) {
+        Some(raw) => wrap_native_proto_in_envelope(&raw, api_version, kind),
+        None => wrap_json_in_protobuf_envelope(json, api_version, kind),
     }
 }
 
@@ -314,13 +328,17 @@ pub fn wrap_native_proto_in_envelope(raw: &[u8], api_version: &str, kind: &str) 
 }
 
 /// Pick the [`ProtoEncoder`] best suited to a given opt-in. Kinds with a
-/// native encoder (Pod / PodList today) get one; everything else falls back
-/// to the JSON-wrapping default.
-pub fn encoder_for(opt_in: &NativeProtoOptIn) -> &'static dyn ProtoEncoder {
-    match opt_in.kind {
-        "Pod" | "PodList" => &NativePodProtoEncoder,
-        _ => default_proto_encoder(),
-    }
+/// registered protobuf schema get native encoding (via
+/// [`NativePodProtoEncoder`], which is schema-generic despite its name);
+/// everything else falls back to the JSON-wrapping default.
+pub fn encoder_for(_opt_in: &NativeProtoOptIn) -> &'static dyn ProtoEncoder {
+    // Schema-driven: always attempt native encoding. The encoder emits native
+    // protobuf only when the registered schema round-trips losslessly, and
+    // transparently falls back to the JSON-in-`Unknown.raw` envelope otherwise
+    // (no schema, or an incomplete one). This mirrors official k8s ("native
+    // for marshalable types") while staying safe against rusternetes's
+    // hand-written schemas — no per-kind allowlist to maintain.
+    &NativePodProtoEncoder
 }
 
 #[cfg(test)]
@@ -332,6 +350,73 @@ mod tests {
     struct TestData {
         name: String,
         value: i32,
+    }
+
+    /// Parse a `k8s\0`-framed Unknown envelope and return its `contentType`
+    /// (field 4). Native proto envelopes advertise the protobuf content type;
+    /// the JSON-in-raw fallback advertises `application/json`.
+    fn envelope_content_type(out: &[u8]) -> String {
+        assert_eq!(&out[..4], b"k8s\0", "missing magic prefix");
+        let mut i = 4usize;
+        let rv = |d: &[u8], i: &mut usize| -> u64 {
+            let (mut s, mut r) = (0u32, 0u64);
+            loop {
+                let b = d[*i];
+                *i += 1;
+                r |= ((b & 0x7f) as u64) << s;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                s += 7;
+            }
+            r
+        };
+        let mut ct = String::new();
+        while i < out.len() {
+            let tag = rv(out, &mut i);
+            let (fnum, wt) = (tag >> 3, tag & 7);
+            if wt != 2 {
+                break;
+            }
+            let len = rv(out, &mut i) as usize;
+            let val = &out[i..i + len];
+            i += len;
+            if fnum == 4 {
+                ct = String::from_utf8_lossy(val).to_string();
+            }
+        }
+        ct
+    }
+
+    #[test]
+    fn scale_encodes_as_native_protobuf_not_json_fallback() {
+        // A realistic autoscaling/v1 Scale body as the handler serializes it.
+        // Second-precision creationTimestamp (as ObjectMeta now serializes it):
+        // it must round-trip through the proto Timestamp so the guard accepts it
+        // WITHOUT special-casing metadata.
+        let scale = br#"{"apiVersion":"autoscaling/v1","kind":"Scale","metadata":{"name":"rs","namespace":"default","uid":"abc","resourceVersion":"42","creationTimestamp":"2026-05-31T08:00:43Z"},"spec":{"replicas":3},"status":{"replicas":3,"selector":"app=rs"}}"#;
+        let out = encode_native_or_wrapped(scale, "autoscaling/v1", "Scale");
+        let ct = envelope_content_type(&out);
+        assert_eq!(
+            ct, "application/vnd.kubernetes.protobuf",
+            "Scale must encode as NATIVE protobuf (the scale client rejects the JSON fallback); got contentType={ct}"
+        );
+        // The raw must NOT contain the JSON key "replicas" — native proto carries
+        // field numbers, not JSON keys.
+        assert!(
+            !String::from_utf8_lossy(&out).contains("\"replicas\""),
+            "native raw should not contain JSON keys"
+        );
+    }
+
+    #[test]
+    fn lossy_schema_falls_back_to_json() {
+        // A kind with no registered schema must fall back to the JSON envelope
+        // rather than emit empty/garbage native bytes.
+        let body =
+            br#"{"apiVersion":"example.com/v1","kind":"DefinitelyNotRegistered","spec":{"x":1}}"#;
+        let out = encode_native_or_wrapped(body, "example.com/v1", "DefinitelyNotRegistered");
+        assert_eq!(envelope_content_type(&out), "application/json");
     }
 
     #[test]

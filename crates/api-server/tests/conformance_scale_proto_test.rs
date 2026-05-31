@@ -25,9 +25,9 @@
 //! 2. **Handler round-trip** — `GET /apis/apps/v1/namespaces/{ns}/{kind}/
 //!    {name}/scale` with `Accept: application/vnd.kubernetes.protobuf` must
 //!    return `Content-Type: application/vnd.kubernetes.protobuf` and a body
-//!    that decodes via [`decode_protobuf::<Scale>`]. The decoded TypeMeta
-//!    must report `autoscaling/v1` / `Scale` and the Scale payload must
-//!    surface the seeded Deployment's replicas.
+//!    whose Unknown envelope splits via `decode_unknown_raw` into TypeMeta
+//!    (`autoscaling/v1` / `Scale`) plus NATIVE-protobuf `raw` bytes that the
+//!    proto registry decodes to surface the seeded Deployment's replicas.
 //!
 //! The handler-level coverage uses the same in-process axum harness as
 //! `decoder_accept_header_test.rs` so that the entire request pipeline
@@ -43,7 +43,7 @@ use rusternetes_api_server::{
 };
 use rusternetes_common::{
     auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-    protobuf::decode_protobuf,
+    protobuf::decode_unknown_raw,
 };
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
 use serde_json::json;
@@ -291,8 +291,11 @@ async fn get_scale_with_protobuf_accept_returns_k8s_envelope() {
         &body[..body.len().min(8)],
     );
 
-    let (scale, type_meta) = decode_protobuf::<Scale>(&body)
-        .expect("body must decode via common::protobuf::decode_protobuf::<Scale>");
+    // Scale is a schema-registered kind, so the envelope carries NATIVE
+    // protobuf in `raw` (not JSON). Split the envelope, then decode the inner
+    // bytes via the proto registry.
+    let (type_meta, raw) = decode_unknown_raw(&body)
+        .expect("body must decode as a k8s Unknown envelope via decode_unknown_raw");
 
     assert_eq!(
         type_meta.api_version, "autoscaling/v1",
@@ -302,22 +305,31 @@ async fn get_scale_with_protobuf_accept_returns_k8s_envelope() {
         type_meta.kind, "Scale",
         "TypeMeta.kind must be Scale; got {type_meta:?}",
     );
+
+    let scale = ProtoRegistry::new()
+        .decode_message("Scale", &raw)
+        .expect("Unknown.raw must decode as native Scale protobuf");
     assert_eq!(
-        scale.metadata.name, "scale-proto",
-        "decoded Scale.metadata.name must echo the parent kind; got {:?}",
-        scale.metadata.name,
+        scale.pointer("/metadata/name").and_then(|v| v.as_str()),
+        Some("scale-proto"),
+        "decoded Scale.metadata.name must echo the parent kind; got {scale}",
     );
     assert_eq!(
-        scale.metadata.namespace, TEST_NS,
+        scale
+            .pointer("/metadata/namespace")
+            .and_then(|v| v.as_str()),
+        Some(TEST_NS),
         "decoded Scale.metadata.namespace must echo the parent namespace",
     );
     assert_eq!(
-        scale.spec.replicas, 4,
-        "decoded Scale.spec.replicas must mirror the seeded Deployment",
+        scale.pointer("/spec/replicas").and_then(|v| v.as_i64()),
+        Some(4),
+        "decoded Scale.spec.replicas must mirror the seeded Deployment; got {scale}",
     );
     assert_eq!(
-        scale.status.replicas, 4,
-        "decoded Scale.status.replicas must mirror the seeded Deployment",
+        scale.pointer("/status/replicas").and_then(|v| v.as_i64()),
+        Some(4),
+        "decoded Scale.status.replicas must mirror the seeded Deployment; got {scale}",
     );
 }
 
@@ -420,13 +432,17 @@ async fn put_scale_with_protobuf_accept_returns_k8s_envelope() {
         &bytes[..bytes.len().min(4)],
     );
 
-    let (scale, type_meta) =
-        decode_protobuf::<Scale>(&bytes).expect("PUT response must decode as Scale");
+    let (type_meta, raw) =
+        decode_unknown_raw(&bytes).expect("PUT response must decode as a k8s Unknown envelope");
     assert_eq!(type_meta.api_version, "autoscaling/v1");
     assert_eq!(type_meta.kind, "Scale");
+
+    let scale = ProtoRegistry::new()
+        .decode_message("Scale", &raw)
+        .expect("Unknown.raw must decode as native Scale protobuf");
     assert_eq!(
-        scale.spec.replicas, 9,
-        "PUT must persist the new replica count; got {}",
-        scale.spec.replicas,
+        scale.pointer("/spec/replicas").and_then(|v| v.as_i64()),
+        Some(9),
+        "PUT must persist the new replica count; got {scale}",
     );
 }
