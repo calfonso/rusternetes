@@ -26,7 +26,11 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout repository
+        # rhino is an in-tree submodule (./rhino) that the storage crate's
+        # `../../rhino` path dep needs on disk for `cargo metadata`.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
 
       - name: Tool prereqs (fail fast on missing — no apt-get install)
         # Per project convention: self-hosted runner does not get sudo / apt-get
@@ -37,16 +41,6 @@ jobs:
               command -v "$t" >/dev/null 2>&1 || { echo "missing required tool: $t"; exit 1; }
           done
 
-      - name: Clone rhino adjacent to repo
-        # rusternetes/Cargo.toml's `sqlite` feature pulls rhino in as a path
-        # dep at ../../../rhino. Without it `cargo metadata` (used by the
-        # runner script's build step) fails.
-        run: |
-          if [ ! -d ../rhino ]; then
-            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
-          else
-            echo "rhino already present at ../rhino"
-          fi
 
       - name: Install kubectl
         # bootstrap-cluster.sh (invoked from run-node-conformance.sh) shells

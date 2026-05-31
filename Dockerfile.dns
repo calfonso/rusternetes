@@ -43,12 +43,13 @@ ENV RUSTC_WRAPPER=sccache \
 
 WORKDIR /app
 
-# Pull in the adjacent rhino crate (named build context). crates/storage/
-# Cargo.toml declares `rhino = { path = "../../../rhino", optional = true }`
-# which from /app/crates/storage resolves to /rhino, so land it there.
+# Pull in the rhino submodule (named build context, pointed at the in-tree
+# `./rhino` submodule). crates/storage/Cargo.toml declares
+# `rhino = { path = "../../rhino", optional = true }` which from
+# /app/crates/storage resolves to /app/rhino, so land it there.
 # We need this even when building without the sqlite/redis features
 # because `cargo metadata` resolves all optional dependencies up-front.
-COPY --from=rhino . /rhino
+COPY --from=rhino . /app/rhino
 
 # Workspace manifest + lockfile.
 COPY Cargo.toml Cargo.lock* ./

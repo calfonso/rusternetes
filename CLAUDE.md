@@ -50,7 +50,7 @@ Rust reimplementation of Kubernetes. Workspace with 10 crates:
 
 - **`common`** - Shared resource types (Pod, Deployment, Service, etc.), error types, utilities. All resource structs live in `src/resources/`. Error type in `src/error.rs` maps to Kubernetes StatusReason and implements Axum's `IntoResponse`.
 - **`api-server`** - Axum-based REST API. Routes in `src/router.rs` (~9400 lines). One handler file per resource type in `src/handlers/`. State in `src/state.rs` holds storage, auth, IP allocator, webhook manager, watch cache.
-- **`storage`** - `Storage` trait in `src/lib.rs` with etcd backend (`src/etcd.rs`), SQLite backend via rhino (`src/rhino.rs`, behind `sqlite` feature), Redis backend via rhino (`src/rhino.rs`, behind `redis` feature), and memory backend (`src/memory.rs`). `StorageBackend` enum dispatches to the selected backend. Keys follow `/registry/{resource_type}/{namespace}/{name}`. Resource versions map to backend revision numbers. The rhino dependency uses a local path (`../../../rhino`).
+- **`storage`** - `Storage` trait in `src/lib.rs` with etcd backend (`src/etcd.rs`), SQLite backend via rhino (`src/rhino.rs`, behind `sqlite` feature), Redis backend via rhino (`src/rhino.rs`, behind `redis` feature), and memory backend (`src/memory.rs`). `StorageBackend` enum dispatches to the selected backend. Keys follow `/registry/{resource_type}/{namespace}/{name}`. Resource versions map to backend revision numbers. The rhino dependency uses an in-tree submodule path (`../../rhino` from `crates/storage`, i.e. the `./rhino` submodule).
 - **`controller-manager`** - 31 controllers in `src/controllers/`. Each has a struct with `storage: Arc<S>` + `interval: Duration`, an infinite `run()` loop, and `reconcile_one()` per resource.
 - **`kubelet`** - Container runtime via bollard (Docker API). Manages pod lifecycle, volumes, probes, networking.
 - **`kube-proxy`** - iptables-based service routing. Runs in host network mode. Reads both Endpoints and EndpointSlices.
@@ -130,4 +130,4 @@ Single `rusternetes` binary container + optional Redis container. All components
 - kube-proxy needs `CAP_NET_ADMIN` for iptables; runs host network mode
 - `KUBERNETES_SERVICE_HOST_OVERRIDE` env var sets the API server address for pods
 - CoreDNS ClusterIP pinned to 10.96.0.10
-- Rhino repo must be adjacent (`../rhino`) for SQLite/Redis embedded builds
+- Rhino is an in-tree git submodule at `./rhino` (pinned to `indyjonesnl/rhino`) for SQLite/Redis embedded builds. Clone with `git clone --recurse-submodules`, or run `git submodule update --init` in an existing checkout.
