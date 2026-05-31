@@ -442,11 +442,15 @@ async fn test_pod_metadata_immutability() {
 
     let pod = create_test_pod("immutable-pod", "default");
     let key = build_key("pods", Some("default"), "immutable-pod");
-    let original_uid = pod.metadata.uid.clone();
-    let original_creation = pod.metadata.creation_timestamp;
 
     // Create pod
     storage.create(&key, &pod).await.unwrap();
+
+    // Baseline is the stored value (creationTimestamp serialized at second
+    // precision per k8s metav1.Time), not the in-memory nanosecond value.
+    let stored: Pod = storage.get(&key).await.unwrap();
+    let original_uid = stored.metadata.uid.clone();
+    let original_creation = stored.metadata.creation_timestamp;
 
     // Update pod
     let mut updated_pod: Pod = storage.get(&key).await.unwrap();
