@@ -1418,13 +1418,22 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
 }
 
 /// GET /apis/{group}/
-/// Returns the APIGroup resource for a specific API group
+/// Returns the APIGroup resource for a specific API group.
+///
+/// Built-in groups come from the static `get_api_group_names()` table. For any
+/// other group name we consult stored CustomResourceDefinitions so that a CRD's
+/// group becomes discoverable here *immediately* after the CRD is created —
+/// this is the trailing-slash path that client-go's RESTMapper hits while a
+/// dynamic client waits for a freshly-created CRD to be served. Upstream
+/// apiextensions-apiserver registers CRD API groups dynamically; we synthesize
+/// the same APIGroup document on read.
 pub async fn get_api_group(
+    state: Option<axum::extract::State<std::sync::Arc<crate::state::ApiServerState>>>,
     axum::extract::Path(group): axum::extract::Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    // Find the group in our known groups
+    // Find the group in our known built-in groups first.
     let groups = get_api_group_names();
     let found = groups.iter().find(|(name, _)| *name == group.as_str());
 
@@ -1466,21 +1475,71 @@ pub async fn get_api_group(
                 "version": api_group.preferred_version.version,
             }
         });
-        (StatusCode::OK, axum::Json(response)).into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({
-                "kind": "Status",
-                "apiVersion": "v1",
-                "status": "Failure",
-                "message": format!("the server could not find the requested resource"),
-                "reason": "NotFound",
-                "code": 404
-            })),
-        )
-            .into_response()
+        return (StatusCode::OK, axum::Json(response)).into_response();
     }
+
+    // Not a built-in group: see whether a CRD declares this group. Collect every
+    // served version across all CRDs sharing the group, de-duplicated, so a CRD
+    // with multiple versions (or several CRDs in the same group) all surface.
+    if let Some(axum::extract::State(ref st)) = state {
+        use rusternetes_storage::Storage;
+        let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
+        if let Ok(crds) = st.storage.list::<serde_json::Value>(&crd_prefix).await {
+            let mut versions: Vec<GroupVersionForDiscovery> = Vec::new();
+            for crd in &crds {
+                if crd.pointer("/spec/group").and_then(|v| v.as_str()) != Some(group.as_str()) {
+                    continue;
+                }
+                if let Some(vers) = crd.pointer("/spec/versions").and_then(|v| v.as_array()) {
+                    for ver in vers {
+                        let served = ver.get("served").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if !served {
+                            continue;
+                        }
+                        if let Some(ver_name) = ver.get("name").and_then(|v| v.as_str()) {
+                            if versions.iter().any(|v| v.version == ver_name) {
+                                continue;
+                            }
+                            versions.push(GroupVersionForDiscovery {
+                                group_version: format!("{}/{}", group, ver_name),
+                                version: ver_name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            if !versions.is_empty() {
+                let preferred = versions[0].clone();
+                let response = serde_json::json!({
+                    "kind": "APIGroup",
+                    "apiVersion": "v1",
+                    "name": group,
+                    "versions": versions.iter().map(|v| serde_json::json!({
+                        "groupVersion": v.group_version,
+                        "version": v.version,
+                    })).collect::<Vec<_>>(),
+                    "preferredVersion": {
+                        "groupVersion": preferred.group_version,
+                        "version": preferred.version,
+                    }
+                });
+                return (StatusCode::OK, axum::Json(response)).into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "message": "the server could not find the requested resource".to_string(),
+            "reason": "NotFound",
+            "code": 404
+        })),
+    )
+        .into_response()
 }
 
 /// GET /version
