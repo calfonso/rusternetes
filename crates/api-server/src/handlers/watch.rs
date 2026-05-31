@@ -1523,6 +1523,9 @@ impl_has_metadata!(
     rusternetes_common::resources::CSINode,
     rusternetes_common::resources::VolumeAttachment,
     rusternetes_common::resources::VolumeAttributesClass,
+    rusternetes_common::resources::VolumeSnapshot,
+    rusternetes_common::resources::VolumeSnapshotClass,
+    rusternetes_common::resources::VolumeSnapshotContent,
     rusternetes_common::resources::CustomResource
 );
 

@@ -85,7 +85,19 @@ pub async fn list_volumesnapshots(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<VolumeSnapshot>>> {
+) -> Result<axum::response::Response> {
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_namespaced::<VolumeSnapshot>(
+            state,
+            auth_ctx,
+            namespace,
+            "volumesnapshots",
+            "snapshot.storage.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
+
     debug!("Listing VolumeSnapshots in namespace: {}", namespace);
 
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "volumesnapshots")
@@ -100,20 +112,31 @@ pub async fn list_volumesnapshots(
     }
 
     let prefix = build_prefix("volumesnapshots", Some(&namespace));
-    let mut vss = state.storage.list(&prefix).await?;
+    let mut vss = state.storage.list::<VolumeSnapshot>(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vss, &params)?;
 
     let list = List::new("VolumeSnapshotList", "snapshot.storage.k8s.io/v1", vss);
-    Ok(Json(list))
+    Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
 pub async fn list_all_volumesnapshots(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<VolumeSnapshot>>> {
+) -> Result<axum::response::Response> {
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_cluster_scoped::<VolumeSnapshot>(
+            state,
+            auth_ctx,
+            "volumesnapshots",
+            "snapshot.storage.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
+
     debug!("Listing all VolumeSnapshots");
 
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "volumesnapshots")
@@ -127,13 +150,13 @@ pub async fn list_all_volumesnapshots(
     }
 
     let prefix = build_prefix("volumesnapshots", None);
-    let mut vss = state.storage.list(&prefix).await?;
+    let mut vss = state.storage.list::<VolumeSnapshot>(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vss, &params)?;
 
     let list = List::new("VolumeSnapshotList", "snapshot.storage.k8s.io/v1", vss);
-    Ok(Json(list))
+    Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
 pub async fn update_volumesnapshot(
