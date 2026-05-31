@@ -77,8 +77,20 @@ pub async fn list_volumeattachments(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<VolumeAttachment>>> {
+) -> Result<axum::response::Response> {
     debug!("Listing all VolumeAttachments");
+
+    // Honor `?watch=true` on the collection endpoint (informer/Lens path).
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_cluster_scoped::<VolumeAttachment>(
+            state,
+            auth_ctx,
+            "volumeattachments",
+            "storage.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
 
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "volumeattachments")
         .with_api_group("storage.k8s.io");
@@ -91,13 +103,13 @@ pub async fn list_volumeattachments(
     }
 
     let prefix = build_prefix("volumeattachments", None);
-    let mut vas = state.storage.list(&prefix).await?;
+    let mut vas = state.storage.list::<VolumeAttachment>(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vas, &params)?;
 
     let list = List::new("VolumeAttachmentList", "storage.k8s.io/v1", vas);
-    Ok(Json(list))
+    Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
 pub async fn update_volumeattachment(

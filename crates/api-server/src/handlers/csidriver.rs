@@ -77,8 +77,20 @@ pub async fn list_csidrivers(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<CSIDriver>>> {
+) -> Result<axum::response::Response> {
     debug!("Listing all CSIDrivers");
+
+    // Honor `?watch=true` on the collection endpoint (informer/Lens path).
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_cluster_scoped::<CSIDriver>(
+            state,
+            auth_ctx,
+            "csidrivers",
+            "storage.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
 
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "csidrivers")
         .with_api_group("storage.k8s.io");
@@ -91,13 +103,13 @@ pub async fn list_csidrivers(
     }
 
     let prefix = build_prefix("csidrivers", None);
-    let mut drivers = state.storage.list(&prefix).await?;
+    let mut drivers = state.storage.list::<CSIDriver>(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut drivers, &params)?;
 
     let list = List::new("CSIDriverList", "storage.k8s.io/v1", drivers);
-    Ok(Json(list))
+    Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
 pub async fn update_csidriver(
