@@ -779,6 +779,33 @@ mod tests {
         assert_eq!(conditions[0]["type"], "StatusPatched");
     }
 
+    // `[sig-apps] Job should apply changes to a job status` patches /status with
+    // a custom condition type via a JSON merge-patch and expects it preserved in
+    // the response. The status subresource must merge the patch into the current
+    // status and keep arbitrary user conditions (it operates on raw JSON, so a
+    // condition type unknown to the controller is still round-tripped).
+    #[test]
+    fn test_job_status_merge_patch_keeps_custom_condition() {
+        let current = json!({
+            "kind":"Job","apiVersion":"batch/v1",
+            "metadata":{"name":"j","namespace":"n","resourceVersion":"5"},
+            "spec":{"parallelism":2},
+            "status":{"active":2,"ready":2}
+        });
+        let patch = json!({"status":{"conditions":[{"type":"CustomConditionType","status":"True","reason":"E2E","message":"set"}]}});
+        let out = super::build_updated_resource_for_status(&current, &patch, true, "jobs").unwrap();
+        let conds = out["status"]["conditions"]
+            .as_array()
+            .expect("conditions array");
+        assert!(
+            conds.iter().any(|c| c["type"] == "CustomConditionType"),
+            "custom condition must survive the /status merge patch, out={out}"
+        );
+        // The pre-existing status fields must be preserved by the merge.
+        assert_eq!(out["status"]["active"], 2);
+        assert_eq!(out["status"]["ready"], 2);
+    }
+
     #[test]
     fn test_status_merge_patch_null_removes_field() {
         let current_status = json!({

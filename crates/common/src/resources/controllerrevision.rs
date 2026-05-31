@@ -10,13 +10,19 @@ pub struct ControllerRevision {
     #[serde(flatten)]
     pub type_meta: TypeMeta,
 
+    // ObjectMeta is `omitempty` in upstream Kubernetes and the apiserver fills in
+    // defaults, so tolerate a body that omits it rather than rejecting with a 422.
+    // `#[serde(default)]` also guards against the serde-flatten quirk where a
+    // failure in a sibling field gets misreported as `missing field metadata`.
+    #[serde(default)]
     pub metadata: ObjectMeta,
 
     /// Data is the serialized representation of the state
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 
     /// Revision indicates the revision of the state represented by Data
+    #[serde(default)]
     pub revision: i64,
 }
 
@@ -177,6 +183,36 @@ mod tests {
         assert_eq!(refs[0].name, "my-daemonset");
         assert_eq!(refs[0].uid, "abc-123");
         assert_eq!(refs[0].controller, Some(true));
+    }
+
+    #[test]
+    fn test_controller_revision_deserialize_without_metadata() {
+        // ObjectMeta is omitempty upstream; a body that omits it must not 422.
+        let json_str = r#"{
+            "kind": "ControllerRevision",
+            "apiVersion": "apps/v1",
+            "data": {"spec": {"template": {"metadata": {"labels": {"app": "x"}}}}},
+            "revision": 2
+        }"#;
+        let cr: ControllerRevision =
+            serde_json::from_str(json_str).expect("metadata should default");
+        assert_eq!(cr.revision, 2);
+        assert!(cr.metadata.name.is_empty());
+        assert!(cr.data.is_some());
+    }
+
+    #[test]
+    fn test_controller_revision_deserialize_without_revision() {
+        let json_str = r#"{
+            "kind": "ControllerRevision",
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "r", "namespace": "n"},
+            "data": {"x": 1}
+        }"#;
+        let cr: ControllerRevision =
+            serde_json::from_str(json_str).expect("revision should default to 0");
+        assert_eq!(cr.revision, 0);
+        assert_eq!(cr.metadata.name, "r");
     }
 
     #[test]
