@@ -264,14 +264,21 @@ impl Subject {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleRef {
-    /// APIGroup is the group for the resource being referenced
-    #[serde(alias = "apiGroup")]
+    /// APIGroup is the group for the resource being referenced.
+    ///
+    /// `#[serde(default)]` mirrors Go's `json.Unmarshal`, which leaves a
+    /// missing scalar at its zero value rather than erroring. A client that
+    /// omits `apiGroup` (e.g. the sig-auth webhook BeforeEach) must decode and
+    /// be enforced by validation, not rejected at the decode layer.
+    #[serde(default)]
     pub api_group: String,
 
     /// Kind is the type of resource being referenced
+    #[serde(default)]
     pub kind: String,
 
     /// Name is the name of resource being referenced
+    #[serde(default)]
     pub name: String,
 }
 

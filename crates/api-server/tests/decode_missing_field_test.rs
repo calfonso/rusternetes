@@ -213,7 +213,51 @@ async fn test_pv_without_capacity_decodes() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. PreStop: a Pod body that omits a section must report the *right* field,
+// 3. RoleBinding whose roleRef omits apiGroup must decode (Go-parity).
+//    Reproduces the [sig-auth] webhook/SubjectReview BeforeEach failure:
+//      POST rolebindings -> 422 "roleRef: missing field `apiGroup`"
+//    Go's json.Unmarshal leaves a missing scalar at its zero value; our
+//    required String errored. Decode must admit it and let validation enforce.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_rolebinding_roleref_without_apigroup_decodes() {
+    let router = spawn_router();
+
+    let rb = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {"name": "webhook-rb", "namespace": "default"},
+        // roleRef intentionally omits apiGroup (the wire shape that broke us).
+        "roleRef": {"kind": "Role", "name": "webhook-role"},
+        "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "default"}]
+    });
+
+    let (status, body) = send_json(
+        router,
+        Method::POST,
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings",
+        &rb,
+    )
+    .await;
+
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("missing field"),
+        "RoleBinding decode must not reject a roleRef missing apiGroup (status {}): {}",
+        status,
+        body
+    );
+    assert!(
+        status.is_success(),
+        "RoleBinding with roleRef.apiGroup omitted should be accepted, got {}: {}",
+        status,
+        body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. PreStop: a Pod body that omits a section must report the *right* field,
 //    not a confusing "missing field 'metadata'".
 // ---------------------------------------------------------------------------
 
