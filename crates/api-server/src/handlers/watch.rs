@@ -244,8 +244,25 @@ where
         crate::watch_cache::broadcast_to_stream(rx)
     };
 
-    // List existing resources to send as initial ADDED events
-    let existing_resources = state.storage.list::<T>(&prefix).await?;
+    // List existing resources to send as initial ADDED events.
+    // List as raw JSON Values first so that one undeserializable stored
+    // object (e.g. a Deployment missing `spec`) does not abort the entire
+    // watch with HTTP 400. Upstream Kubernetes skips bad objects and
+    // continues streaming valid ones.
+    let raw_existing: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    let existing_resources: Vec<T> = raw_existing
+        .into_iter()
+        .filter_map(|v| match serde_json::from_value::<T>(v) {
+            Ok(obj) => Some(obj),
+            Err(e) => {
+                debug!(
+                    "watch initial-events: skipping undeserializable object in prefix={}: {}",
+                    prefix, e
+                );
+                None
+            }
+        })
+        .collect();
 
     // Get the current revision from storage for bookmark fallback.
     // This prevents sending bookmark RV "0" which confuses client-go.
@@ -741,8 +758,25 @@ where
         crate::watch_cache::broadcast_to_stream(rx)
     };
 
-    // List existing resources to send as initial ADDED events
-    let existing_resources = state.storage.list::<T>(&prefix).await?;
+    // List existing resources to send as initial ADDED events.
+    // List as raw JSON Values first so that one undeserializable stored
+    // object (e.g. a Deployment missing `spec`) does not abort the entire
+    // watch with HTTP 400. Upstream Kubernetes skips bad objects and
+    // continues streaming valid ones.
+    let raw_existing: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    let existing_resources: Vec<T> = raw_existing
+        .into_iter()
+        .filter_map(|v| match serde_json::from_value::<T>(v) {
+            Ok(obj) => Some(obj),
+            Err(e) => {
+                debug!(
+                    "watch initial-events: skipping undeserializable object in prefix={}: {}",
+                    prefix, e
+                );
+                None
+            }
+        })
+        .collect();
 
     // Get the current revision from storage for bookmark fallback.
     let current_rev = state.storage.current_revision().await.unwrap_or(1);
