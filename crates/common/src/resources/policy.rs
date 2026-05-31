@@ -354,7 +354,12 @@ pub struct PodDisruptionBudgetStatus {
     /// eviction request to the time when the pod is seen by PDB controller
     /// as having been marked for deletion (or after a timeout). The key in the map is the name of the pod
     /// and the value is the time when the API server processed the eviction request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time_map::serialize",
+        deserialize_with = "crate::types::k8s_time_map::deserialize"
+    )]
     pub disrupted_pods: Option<HashMap<String, DateTime<Utc>>>,
 }
 
@@ -644,5 +649,69 @@ mod tests {
             Some(IntOrString::String(s)) => assert_eq!(s, "25%"),
             _ => panic!("Expected IntOrString::String"),
         }
+    }
+
+    // The `should update/patch PodDisruptionBudget status` conformance test sends
+    // a `disruptedPods` whose values are metav1.Time. Different clients encode a
+    // zero/empty Time differently (string, empty object, or null). The status
+    // update path must accept all of them instead of returning a 422.
+    #[test]
+    fn test_pdb_status_disrupted_pods_string_form() {
+        let json = r#"{
+            "currentHealthy": 1,
+            "desiredHealthy": 1,
+            "disruptionsAllowed": 0,
+            "expectedPods": 1,
+            "disruptedPods": {"pod-0": "2026-05-31T21:33:36Z"}
+        }"#;
+        let status: PodDisruptionBudgetStatus = serde_json::from_str(json).unwrap();
+        let dp = status.disrupted_pods.expect("disruptedPods present");
+        assert!(dp.contains_key("pod-0"));
+        assert_eq!(
+            dp.get("pod-0")
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+            "2026-05-31T21:33:36Z"
+        );
+    }
+
+    #[test]
+    fn test_pdb_status_disrupted_pods_object_form() {
+        // A zero metav1.Time emitted by an apply configuration serializes as `{}`.
+        let json = r#"{
+            "currentHealthy": 1,
+            "disruptedPods": {"pod-0": {}}
+        }"#;
+        let status: PodDisruptionBudgetStatus = serde_json::from_str(json).unwrap();
+        let dp = status.disrupted_pods.expect("disruptedPods present");
+        assert!(dp.contains_key("pod-0"));
+    }
+
+    #[test]
+    fn test_pdb_status_disrupted_pods_roundtrip_serializes_as_string() {
+        let json = r#"{"disruptedPods": {"pod-0": "2026-05-31T21:33:36Z"}}"#;
+        let status: PodDisruptionBudgetStatus = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_string(&status).unwrap();
+        // Values must serialize back as RFC3339 strings, never objects.
+        assert!(
+            out.contains(r#""pod-0":"2026-05-31T21:33:36Z""#),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_pdb_status_no_disrupted_pods_omitted() {
+        let status = PodDisruptionBudgetStatus {
+            current_healthy: 1,
+            desired_healthy: 1,
+            disruptions_allowed: 0,
+            expected_pods: 1,
+            observed_generation: None,
+            conditions: None,
+            disrupted_pods: None,
+        };
+        let out = serde_json::to_string(&status).unwrap();
+        assert!(!out.contains("disruptedPods"), "got: {out}");
     }
 }

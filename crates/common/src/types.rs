@@ -51,6 +51,105 @@ pub mod k8s_time {
     }
 }
 
+/// Serde for `map[string]metav1.Time` fields (e.g. `PodDisruptionBudgetStatus.disruptedPods`).
+///
+/// Upstream `metav1.Time` normally marshals to an RFC3339 string, but apply
+/// configurations and some clients emit a *zero* `metav1.Time` as an empty JSON
+/// object `{}` (and a zero time marshals to `null`). chrono's `DateTime`
+/// deserializer rejects both the object form and `null`, which made the
+/// PodDisruptionBudget `UpdateStatus` path reject otherwise-valid requests with
+/// a 422. This module accepts a string, an object, or null per value, mirroring
+/// `metav1.Time.UnmarshalJSON`'s leniency.
+pub mod k8s_time_map {
+    use chrono::{DateTime, Utc};
+    use serde::de::{MapAccess, Visitor};
+    use serde::{self, ser::SerializeMap, Deserialize, Deserializer, Serializer};
+    use std::collections::HashMap;
+    use std::fmt;
+
+    pub fn serialize<S>(
+        map: &Option<HashMap<String, DateTime<Utc>>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match map {
+            Some(m) => {
+                let mut ser = serializer.serialize_map(Some(m.len()))?;
+                for (k, v) in m {
+                    ser.serialize_entry(k, &v.format("%Y-%m-%dT%H:%M:%SZ").to_string())?;
+                }
+                ser.end()
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<HashMap<String, DateTime<Utc>>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// Accepts a string (RFC3339), an object (zero `metav1.Time` -> now), or
+        /// null (zero time -> now), matching upstream leniency.
+        struct TimeValue(DateTime<Utc>);
+
+        impl<'de> serde::Deserialize<'de> for TimeValue {
+            fn deserialize<D>(d: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct V;
+                impl<'de> Visitor<'de> for V {
+                    type Value = DateTime<Utc>;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("an RFC3339 time string, an object, or null")
+                    }
+                    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        DateTime::parse_from_rfc3339(s)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .or_else(|_| s.parse::<DateTime<Utc>>())
+                            .map_err(serde::de::Error::custom)
+                    }
+                    fn visit_unit<E>(self) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(Utc::now())
+                    }
+                    fn visit_none<E>(self) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(Utc::now())
+                    }
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        // Drain the (empty) object form of a zero metav1.Time.
+                        while map
+                            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                            .is_some()
+                        {}
+                        Ok(Utc::now())
+                    }
+                }
+                d.deserialize_any(V).map(TimeValue)
+            }
+        }
+
+        let opt: Option<HashMap<String, TimeValue>> =
+            Option::deserialize(deserializer).map_err(serde::de::Error::custom)?;
+        Ok(opt.map(|m| m.into_iter().map(|(k, v)| (k, v.0)).collect()))
+    }
+}
+
 /// ObjectMeta is metadata that all persisted resources must have
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
