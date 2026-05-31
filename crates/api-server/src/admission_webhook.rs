@@ -435,44 +435,47 @@ impl AdmissionWebhookClient {
 
         // K8s resolves webhook services via DNS → ClusterIP → kube-proxy.
         // See: staging/src/k8s.io/apiserver/pkg/util/webhook/serviceresolver.go
-        // The API server connects to <name>.<namespace>.svc:<port> which resolves
-        // to the ClusterIP. kube-proxy iptables then DNAT to the pod endpoint.
+        // The real apiserver connects to the ClusterIP and kube-proxy iptables
+        // DNATs to a ready pod endpoint.
         //
-        // We can't use DNS (.svc names), so we resolve ClusterIP from storage.
-        // This matches K8s behavior: traffic goes through ClusterIP/kube-proxy,
-        // which only routes to READY endpoints.
+        // Rusternetes' api-server runs on the cluster bridge network, but
+        // kube-proxy runs in the HOST network namespace — so its iptables DNAT
+        // rules for ClusterIPs are NOT present in the api-server's netns. A call
+        // to a webhook's ClusterIP from inside the api-server container therefore
+        // gets connection-refused / times out, which is exactly why core-resource
+        // admission webhooks (e.g. the conformance sample-webhook) never fired.
+        //
+        // The api-server CAN reach pod IPs directly on the bridge network, so we
+        // resolve the service to a READY pod endpoint first (this is the same
+        // destination kube-proxy would DNAT to). ClusterIP is only used as a
+        // last-resort fallback. This makes webhook invocation work for core
+        // resources without depending on iptables in the api-server netns.
         let svc_key = format!("/registry/services/{}/{}", svc_namespace, svc_name);
-        if let Ok(svc) = storage
+        let service = storage
             .get::<rusternetes_common::resources::Service>(&svc_key)
             .await
-        {
-            if let Some(cluster_ip) = &svc.spec.cluster_ip {
-                if !cluster_ip.is_empty() && cluster_ip != "None" {
-                    // Use the service's target port if available
-                    let _target_port = svc
-                        .spec
-                        .ports
-                        .first()
-                        .and_then(|p| p.target_port.as_ref())
-                        .and_then(|tp| match tp {
-                            rusternetes_common::resources::IntOrString::Int(p) => Some(*p as u16),
-                            rusternetes_common::resources::IntOrString::String(s) => {
-                                s.parse::<u16>().ok()
-                            }
-                        });
-                    // Route through ClusterIP like K8s does
-                    let service_port = svc
-                        .spec
-                        .ports
-                        .first()
-                        .map(|p| p.port)
-                        .unwrap_or_else(|| port.parse::<u16>().unwrap_or(443));
-                    return format!("https://{}:{}{}", cluster_ip, service_port, path);
-                }
-            }
-        }
+            .ok();
 
-        // Fall back to direct endpoint lookup (for headless services without ClusterIP)
+        // Map the webhook clientConfig port (a service *port*) to the matching
+        // backend targetPort so the endpoint connection hits the right container
+        // port. K8s does this translation in the service/endpoint controllers.
+        let want_port: u16 = port.parse::<u16>().unwrap_or(443);
+        let target_port: Option<u16> = service.as_ref().and_then(|svc| {
+            svc.spec
+                .ports
+                .iter()
+                .find(|p| p.port == want_port)
+                .or_else(|| svc.spec.ports.first())
+                .and_then(|p| p.target_port.as_ref())
+                .and_then(|tp| match tp {
+                    rusternetes_common::resources::IntOrString::Int(p) => Some(*p as u16),
+                    rusternetes_common::resources::IntOrString::String(s) => s.parse::<u16>().ok(),
+                })
+        });
+
+        // Preferred path: resolve to a ready pod endpoint IP (reachable on the
+        // bridge network from the api-server). Works for both ClusterIP and
+        // headless services.
         let es_prefix = format!("/registry/endpointslices/{}/", svc_namespace);
         if let Ok(slices) = storage
             .list::<rusternetes_common::resources::EndpointSlice>(&es_prefix)
@@ -489,18 +492,41 @@ impl AdmissionWebhookClient {
                 if !matches {
                     continue;
                 }
+                // Prefer the EndpointSlice port (already resolved to the
+                // container port), then the service targetPort, then the
+                // requested service port.
                 let ep_port = slice
                     .ports
                     .first()
                     .and_then(|p| p.port)
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| port.to_string());
+                    .map(|p| p as u16)
+                    .or(target_port)
+                    .unwrap_or(want_port);
                 for ep in &slice.endpoints {
                     if ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
                         if let Some(addr) = ep.addresses.first() {
                             return format!("https://{}:{}{}", addr, ep_port, path);
                         }
                     }
+                }
+            }
+        }
+
+        // Fallback: route through ClusterIP like the real apiserver. This only
+        // works if the api-server netns has kube-proxy DNAT rules (e.g. host
+        // network mode); otherwise the call will fail and failurePolicy decides.
+        if let Some(svc) = &service {
+            if let Some(cluster_ip) = &svc.spec.cluster_ip {
+                if !cluster_ip.is_empty() && cluster_ip != "None" {
+                    let service_port = svc
+                        .spec
+                        .ports
+                        .iter()
+                        .find(|p| p.port == want_port)
+                        .map(|p| p.port)
+                        .or_else(|| svc.spec.ports.first().map(|p| p.port))
+                        .unwrap_or(want_port);
+                    return format!("https://{}:{}{}", cluster_ip, service_port, path);
                 }
             }
         }
@@ -2841,6 +2867,161 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must specify either url or service"));
+    }
+
+    // ===== resolve_service_url Tests =====
+    //
+    // These guard the core fix for admission-webhook invocation on CORE
+    // resources: the api-server runs on the cluster bridge network but
+    // kube-proxy runs in the host netns, so the api-server cannot reach a
+    // webhook service's ClusterIP. resolve_service_url must prefer a READY pod
+    // endpoint IP (reachable on the bridge) over the ClusterIP.
+
+    use rusternetes_common::resources::endpointslice::{
+        Endpoint, EndpointConditions, EndpointPort, EndpointSlice,
+    };
+    use rusternetes_common::resources::{IntOrString, Service, ServicePort, ServiceSpec};
+
+    fn webhook_service(name: &str, ns: &str, cluster_ip: &str) -> Service {
+        let mut svc = Service::new(
+            name,
+            ServiceSpec {
+                cluster_ip: Some(cluster_ip.to_string()),
+                ports: vec![ServicePort {
+                    name: None,
+                    port: 443,
+                    target_port: Some(IntOrString::Int(8443)),
+                    protocol: Some("TCP".to_string()),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                ..Default::default()
+            },
+        );
+        svc.metadata.namespace = Some(ns.to_string());
+        svc
+    }
+
+    fn webhook_endpointslice(svc_name: &str, ns: &str, ip: &str, ready: bool) -> EndpointSlice {
+        let mut slice = EndpointSlice::new(format!("{svc_name}-abc"), "IPv4");
+        slice.metadata.namespace = Some(ns.to_string());
+        slice.metadata.labels = Some(
+            [(
+                "kubernetes.io/service-name".to_string(),
+                svc_name.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        slice.ports = vec![EndpointPort {
+            name: None,
+            port: Some(8443),
+            protocol: Some("TCP".to_string()),
+            app_protocol: None,
+        }];
+        slice.endpoints = vec![Endpoint {
+            addresses: vec![ip.to_string()],
+            conditions: Some(EndpointConditions {
+                ready: Some(ready),
+                serving: Some(ready),
+                terminating: Some(false),
+            }),
+            hostname: None,
+            target_ref: None,
+            node_name: None,
+            zone: None,
+            hints: None,
+            deprecated_topology: None,
+        }];
+        slice
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_url_prefers_ready_endpoint_over_cluster_ip() {
+        // The api-server can't reach a ClusterIP (no kube-proxy in its netns),
+        // so resolution must point at the ready pod endpoint instead.
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                "/registry/services/kube-system/sample-webhook",
+                &webhook_service("sample-webhook", "kube-system", "10.96.1.5"),
+            )
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/endpointslices/kube-system/sample-webhook-abc",
+                &webhook_endpointslice("sample-webhook", "kube-system", "172.18.0.9", true),
+            )
+            .await
+            .unwrap();
+
+        let resolved = AdmissionWebhookClient::resolve_service_url(
+            "https://sample-webhook.kube-system.svc:443/mutating",
+            &storage,
+        )
+        .await;
+
+        // Endpoint IP + container (target) port, NOT the ClusterIP.
+        assert_eq!(resolved, "https://172.18.0.9:8443/mutating");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_url_skips_unready_endpoints() {
+        // An unready endpoint must not be used; with no ready endpoint we fall
+        // back to the ClusterIP (best effort).
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                "/registry/services/kube-system/sample-webhook",
+                &webhook_service("sample-webhook", "kube-system", "10.96.1.5"),
+            )
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/endpointslices/kube-system/sample-webhook-abc",
+                &webhook_endpointslice("sample-webhook", "kube-system", "172.18.0.9", false),
+            )
+            .await
+            .unwrap();
+
+        let resolved = AdmissionWebhookClient::resolve_service_url(
+            "https://sample-webhook.kube-system.svc:443/mutating",
+            &storage,
+        )
+        .await;
+
+        assert_eq!(resolved, "https://10.96.1.5:443/mutating");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_url_cluster_ip_fallback_when_no_slices() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                "/registry/services/kube-system/sample-webhook",
+                &webhook_service("sample-webhook", "kube-system", "10.96.1.5"),
+            )
+            .await
+            .unwrap();
+
+        let resolved = AdmissionWebhookClient::resolve_service_url(
+            "https://sample-webhook.kube-system.svc:443/mutating",
+            &storage,
+        )
+        .await;
+
+        assert_eq!(resolved, "https://10.96.1.5:443/mutating");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_url_passthrough_for_direct_url() {
+        let storage = Arc::new(MemoryStorage::new());
+        let resolved =
+            AdmissionWebhookClient::resolve_service_url("https://1.2.3.4:9443/admit", &storage)
+                .await;
+        assert_eq!(resolved, "https://1.2.3.4:9443/admit");
     }
 
     // ===== ValidatingAdmissionPolicy Tests =====
