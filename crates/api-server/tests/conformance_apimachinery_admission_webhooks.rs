@@ -2511,3 +2511,394 @@ async fn delete_webhook_scoped_to_secrets_does_not_block_deployment_delete() {
         "deployment delete must succeed when webhook targets secrets, got {status}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CREATE-path invocation through the real HTTP handler.
+//
+// The pre-existing `should_mutate_configmap` / `should_be_able_to_deny_*`
+// tests invoke `AdmissionWebhookManager::run_*_webhooks(...)` DIRECTLY — they
+// never exercise the configmap/pod POST handler. That left a gap: live
+// conformance showed core ConfigMaps/Pods coming back UNMUTATED even though
+// the manager unit tests were green, because nothing verified that the
+// `create` handler (a) calls the webhook and (b) PERSISTS the mutated object.
+//
+// These tests drive a real `POST /api/v1/namespaces/.../{configmaps,pods}`
+// through `build_router`, then assert on both the HTTP response body AND the
+// stored object. They are the regression guard for "core resources are not
+// actually mutated/denied" (k8s webhook.go:226/240, deny pod+configmap).
+// ---------------------------------------------------------------------------
+
+/// [sig-api-machinery] AdmissionWebhook should mutate configmap [Conformance]
+/// — but driven through the real HTTP create handler, asserting the mutation
+/// is applied BEFORE persistence (response body + stored object both carry the
+/// injected label).
+#[tokio::test]
+async fn mutating_webhook_mutates_configmap_through_http_create() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_mutator_label("mutated-by-webhook".into(), "yes".into()).await;
+
+    let cfg = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("mutate-cm-http"),
+        webhooks: Some(vec![MutatingWebhook {
+            rules: vec![rule_for("", "v1", "configmaps")],
+            ..mutating(
+                "mutate.cm.http.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("mutatingwebhookconfigurations", None, "mutate-cm-http"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "cm-http", "namespace": "default", "labels": {}},
+        "data": {"k": "v"},
+    });
+    let (status, body) = post_json(router, "/api/v1/namespaces/default/configmaps", &cm).await;
+
+    assert_eq!(status, StatusCode::CREATED, "create must succeed: {body}");
+    assert_eq!(
+        body["metadata"]["labels"]["mutated-by-webhook"],
+        json!("yes"),
+        "response body must carry the webhook-injected label: {body}"
+    );
+
+    // Crucially: the PERSISTED object must also carry the mutation.
+    let stored: rusternetes_common::resources::ConfigMap = mem
+        .get(&build_key("configmaps", Some("default"), "cm-http"))
+        .await
+        .expect("configmap must be stored");
+    assert_eq!(
+        stored
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("mutated-by-webhook"))
+            .map(String::as_str),
+        Some("yes"),
+        "stored configmap must carry the webhook mutation, not just the response"
+    );
+}
+
+/// Mutation must reach a Pod through the real HTTP create handler too
+/// (k8s webhook.go:240 "should mutate pod and apply defaults after mutation").
+#[tokio::test]
+async fn mutating_webhook_mutates_pod_through_http_create() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_mutator_label("mutated-by-webhook".into(), "yes".into()).await;
+
+    let cfg = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("mutate-pod-http"),
+        webhooks: Some(vec![MutatingWebhook {
+            rules: vec![rule_for("", "v1", "pods")],
+            ..mutating(
+                "mutate.pod.http.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("mutatingwebhookconfigurations", None, "mutate-pod-http"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "pod-http", "namespace": "default", "labels": {}},
+        "spec": {"containers": [{"name": "main", "image": "nginx"}]},
+    });
+    let (status, body) = post_json(router, "/api/v1/namespaces/default/pods", &pod).await;
+
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pod create must succeed: {body}"
+    );
+    assert_eq!(
+        body["metadata"]["labels"]["mutated-by-webhook"],
+        json!("yes"),
+        "pod response must carry the webhook-injected label: {body}"
+    );
+
+    let stored: rusternetes_common::resources::Pod = mem
+        .get(&build_key("pods", Some("default"), "pod-http"))
+        .await
+        .expect("pod must be stored");
+    assert_eq!(
+        stored
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("mutated-by-webhook"))
+            .map(String::as_str),
+        Some("yes"),
+        "stored pod must carry the webhook mutation"
+    );
+}
+
+/// A validating webhook denial on ConfigMap CREATE must return 403 from the
+/// real HTTP handler and must NOT persist the object
+/// (k8s webhook.go: "should be able to deny pod and configmap creation").
+#[tokio::test]
+async fn validating_webhook_denies_configmap_through_http_create() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_deny_validator("configmap rejected by webhook".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-cm-create-http"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![rule_for("", "v1", "configmaps")],
+            ..validating(
+                "deny.cm.create.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key(
+            "validatingwebhookconfigurations",
+            None,
+            "deny-cm-create-http",
+        ),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "denied-cm", "namespace": "default"},
+        "data": {"k": "v"},
+    });
+    let (status, body) = post_json(router, "/api/v1/namespaces/default/configmaps", &cm).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "create must be denied by webhook: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("configmap rejected by webhook"),
+        "deny message must carry the webhook reason: {body}"
+    );
+    assert!(
+        mem.get::<rusternetes_common::resources::ConfigMap>(&build_key(
+            "configmaps",
+            Some("default"),
+            "denied-cm"
+        ))
+        .await
+        .is_err(),
+        "denied configmap must NOT be persisted"
+    );
+}
+
+/// Sibling deny test for Pod CREATE through the real HTTP handler.
+#[tokio::test]
+async fn validating_webhook_denies_pod_through_http_create() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_deny_validator("pod rejected by webhook".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-pod-create-http"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![rule_for("", "v1", "pods")],
+            ..validating(
+                "deny.pod.create.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key(
+            "validatingwebhookconfigurations",
+            None,
+            "deny-pod-create-http",
+        ),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "denied-pod", "namespace": "default"},
+        "spec": {"containers": [{"name": "c", "image": "nginx"}]},
+    });
+    let (status, body) = post_json(router, "/api/v1/namespaces/default/pods", &pod).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "pod create must be denied by webhook: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pod rejected by webhook"),
+        "deny message must carry the webhook reason: {body}"
+    );
+    assert!(
+        mem.get::<rusternetes_common::resources::Pod>(&build_key(
+            "pods",
+            Some("default"),
+            "denied-pod"
+        ))
+        .await
+        .is_err(),
+        "denied pod must NOT be persisted"
+    );
+}
+
+/// failurePolicy=Fail: when the validating webhook backend is unreachable, a
+/// ConfigMap CREATE must be REJECTED (fail-closed), not silently admitted.
+/// This is the regression for "unconditionally reject operations on fail
+/// closed webhook" on a core resource going through the HTTP handler.
+#[tokio::test]
+async fn fail_closed_validating_webhook_rejects_configmap_create_when_unreachable() {
+    let (mem, router) = spawn_router();
+
+    // Point at a closed port so the call errors; failurePolicy=Fail => reject.
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("fail-closed-cm"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![rule_for("", "v1", "configmaps")],
+            ..validating(
+                "fail.closed.cm.io",
+                "https://127.0.0.1:1/admit".to_string(),
+                vec![],
+                Some(FailurePolicy::Fail),
+                Some(2),
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("validatingwebhookconfigurations", None, "fail-closed-cm"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "fail-closed-cm-obj", "namespace": "default"},
+        "data": {"k": "v"},
+    });
+    let (status, _body) = post_json(router, "/api/v1/namespaces/default/configmaps", &cm).await;
+
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "fail-closed webhook with unreachable backend must block the create, got {status}"
+    );
+    assert!(
+        mem.get::<rusternetes_common::resources::ConfigMap>(&build_key(
+            "configmaps",
+            Some("default"),
+            "fail-closed-cm-obj"
+        ))
+        .await
+        .is_err(),
+        "configmap must NOT be persisted when a fail-closed webhook is unreachable"
+    );
+}
+
+/// objectSelector gating: a mutating webhook scoped by objectSelector must NOT
+/// fire for an object whose labels don't match, so the ConfigMap is created
+/// UNMUTATED (k8s "should mutate everything except 'skip-me' configmaps"). The
+/// no-call path is what lets `skip-me` configmaps pass through unchanged.
+#[tokio::test]
+async fn object_selector_skips_webhook_for_nonmatching_configmap() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_mutator_label("should-not-appear".into(), "yes".into()).await;
+
+    let mut webhook = MutatingWebhook {
+        rules: vec![rule_for("", "v1", "configmaps")],
+        ..mutating("skip.cm.io", url, vec![], Some(FailurePolicy::Fail), None)
+    };
+    // Only fire for configmaps labelled mutate=please.
+    webhook.object_selector = Some(rusternetes_common::resources::LabelSelector {
+        match_labels: Some(
+            [("mutate".to_string(), "please".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        match_expressions: None,
+    });
+
+    let cfg = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("skip-cm"),
+        webhooks: Some(vec![webhook]),
+    };
+    mem.create(
+        &build_key("mutatingwebhookconfigurations", None, "skip-cm"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    // This configmap does NOT carry the mutate=please label → webhook skipped.
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "skip-me", "namespace": "default", "labels": {"other": "x"}},
+        "data": {"k": "v"},
+    });
+    let (status, body) = post_json(router, "/api/v1/namespaces/default/configmaps", &cm).await;
+
+    assert_eq!(status, StatusCode::CREATED, "create must succeed: {body}");
+    assert!(
+        body["metadata"]["labels"]["should-not-appear"].is_null(),
+        "webhook must be skipped for non-matching objectSelector: {body}"
+    );
+    let stored: rusternetes_common::resources::ConfigMap = mem
+        .get(&build_key("configmaps", Some("default"), "skip-me"))
+        .await
+        .expect("configmap must be stored");
+    assert!(
+        stored
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("should-not-appear"))
+            .is_none(),
+        "stored configmap must be unmutated when objectSelector does not match"
+    );
+}
