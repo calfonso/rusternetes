@@ -899,6 +899,7 @@ pub async fn deletecollection_configmaps(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "configmaps")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -928,6 +929,21 @@ pub async fn deletecollection_configmaps(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("configmaps", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "ConfigMap",
+            "configmaps",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

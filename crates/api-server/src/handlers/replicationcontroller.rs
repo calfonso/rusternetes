@@ -218,6 +218,7 @@ pub async fn delete_replicationcontroller(
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "replicationcontrollers")
         .with_api_group("")
         .with_namespace(&namespace)
@@ -234,6 +235,21 @@ pub async fn delete_replicationcontroller(
 
     // Get the resource to check if it exists
     let rc: ReplicationController = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=rc).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "ReplicationController",
+        "replicationcontrollers",
+        Some(&namespace),
+        &name,
+        &rc,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -416,6 +432,7 @@ pub async fn deletecollection_replicationcontrollers(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "replicationcontrollers")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -449,6 +466,21 @@ pub async fn deletecollection_replicationcontrollers(
             Some(&namespace),
             &item.metadata.name,
         );
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "ReplicationController",
+            "replicationcontrollers",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

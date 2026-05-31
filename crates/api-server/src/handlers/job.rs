@@ -213,6 +213,7 @@ pub async fn delete_job(
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "jobs")
         .with_namespace(&namespace)
         .with_api_group("batch")
@@ -229,6 +230,21 @@ pub async fn delete_job(
 
     // Get the resource to check if it exists
     let job: Job = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=job).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "batch",
+        "v1",
+        "Job",
+        "jobs",
+        Some(&namespace),
+        &name,
+        &job,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -398,6 +414,7 @@ pub async fn deletecollection_jobs(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "jobs")
         .with_namespace(&namespace)
         .with_api_group("batch");
@@ -427,6 +444,21 @@ pub async fn deletecollection_jobs(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("jobs", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "batch",
+            "v1",
+            "Job",
+            "jobs",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

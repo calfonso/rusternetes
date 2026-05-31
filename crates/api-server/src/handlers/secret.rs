@@ -797,6 +797,7 @@ pub async fn deletecollection_secrets(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "secrets")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -826,6 +827,21 @@ pub async fn deletecollection_secrets(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("secrets", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "Secret",
+            "secrets",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

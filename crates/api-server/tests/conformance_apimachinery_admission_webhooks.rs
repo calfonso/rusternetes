@@ -2187,3 +2187,327 @@ async fn harness_request_builder_compiles_an_admission_request() {
     assert_eq!(req.namespace.as_deref(), Some("default"));
     assert!(matches!(req.operation, Operation::Create));
 }
+
+// ===========================================================================
+// DELETE admission webhook wiring — extended resource coverage (PR #901).
+// These mirror the configmap/pod/secret delete-deny tests above but exercise
+// the newly wired handlers: deployments (apps/v1), services (core v1),
+// jobs (batch/v1), and namespaces (cluster-scoped core v1).
+// ===========================================================================
+
+/// A validating webhook scoped to DELETE on apps/v1 deployments must be
+/// invoked by `delete_deployment` and its denial must produce 403.
+#[tokio::test]
+async fn should_deny_deployment_deletion_via_http_handler() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("no deployers allowed".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-deploy-delete"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![delete_rule_for("apps", "v1", "deployments")],
+            ..validating(
+                "deny.deploy.delete.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key(
+            "validatingwebhookconfigurations",
+            None,
+            "deny-deploy-delete",
+        ),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let deploy = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "my-deploy", "namespace": "default"},
+        "spec": {
+            "selector": {"matchLabels": {"app": "x"}},
+            "template": {
+                "metadata": {"labels": {"app": "x"}},
+                "spec": {"containers": [{"name": "c", "image": "nginx"}]}
+            }
+        }
+    });
+    let typed: rusternetes_common::resources::Deployment = serde_json::from_value(deploy).unwrap();
+    mem.create(
+        &build_key("deployments", Some("default"), "my-deploy"),
+        &typed,
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = delete_json(
+        router,
+        "/apis/apps/v1/namespaces/default/deployments/my-deploy",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "deployment delete must be denied by webhook: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("admission webhook denied the request")
+            && msg.contains("no deployers allowed"),
+        "deny message should carry the webhook reason: {body}"
+    );
+
+    // Deployment must still exist.
+    let _: rusternetes_common::resources::Deployment = mem
+        .get(&build_key("deployments", Some("default"), "my-deploy"))
+        .await
+        .expect("deployment must survive a denied delete");
+}
+
+/// A validating webhook scoped to DELETE on core/v1 services must be invoked
+/// by `delete_service` and its denial must produce 403.
+#[tokio::test]
+async fn should_deny_service_deletion_via_http_handler() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("service is precious".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-svc-delete"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![delete_rule_for("", "v1", "services")],
+            ..validating(
+                "deny.svc.delete.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("validatingwebhookconfigurations", None, "deny-svc-delete"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let svc = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "my-svc", "namespace": "default"},
+        "spec": {"selector": {"app": "x"}, "ports": [{"port": 80}]}
+    });
+    let typed: rusternetes_common::resources::Service = serde_json::from_value(svc).unwrap();
+    mem.create(&build_key("services", Some("default"), "my-svc"), &typed)
+        .await
+        .unwrap();
+
+    let (status, body) = delete_json(router, "/api/v1/namespaces/default/services/my-svc").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "service delete must be denied by webhook: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("admission webhook denied the request") && msg.contains("service is precious"),
+        "deny message should carry the webhook reason: {body}"
+    );
+
+    let _: rusternetes_common::resources::Service = mem
+        .get(&build_key("services", Some("default"), "my-svc"))
+        .await
+        .expect("service must survive a denied delete");
+}
+
+/// A validating webhook scoped to DELETE on batch/v1 jobs must be invoked
+/// by `delete_job` and its denial must produce 403.
+#[tokio::test]
+async fn should_deny_job_deletion_via_http_handler() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("job is still running".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-job-delete"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![delete_rule_for("batch", "v1", "jobs")],
+            ..validating(
+                "deny.job.delete.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("validatingwebhookconfigurations", None, "deny-job-delete"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let job = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {"name": "my-job", "namespace": "default"},
+        "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "busybox"}], "restartPolicy": "Never"}}}
+    });
+    let typed: rusternetes_common::resources::Job = serde_json::from_value(job).unwrap();
+    mem.create(&build_key("jobs", Some("default"), "my-job"), &typed)
+        .await
+        .unwrap();
+
+    let (status, body) = delete_json(router, "/apis/batch/v1/namespaces/default/jobs/my-job").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "job delete must be denied by webhook: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("admission webhook denied the request")
+            && msg.contains("job is still running"),
+        "deny message should carry the webhook reason: {body}"
+    );
+
+    let _: rusternetes_common::resources::Job = mem
+        .get(&build_key("jobs", Some("default"), "my-job"))
+        .await
+        .expect("job must survive a denied delete");
+}
+
+/// A validating webhook scoped to DELETE on cluster-scoped namespaces must
+/// be invoked by `delete_ns` and its denial must produce 403.
+#[tokio::test]
+async fn should_deny_namespace_deletion_via_http_handler() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("namespace is protected".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-ns-delete"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![delete_rule_for("", "v1", "namespaces")],
+            ..validating(
+                "deny.ns.delete.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("validatingwebhookconfigurations", None, "deny-ns-delete"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let ns = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": "my-ns"},
+    });
+    let typed: rusternetes_common::resources::Namespace = serde_json::from_value(ns).unwrap();
+    mem.create(&build_key("namespaces", None, "my-ns"), &typed)
+        .await
+        .unwrap();
+
+    let (status, body) = delete_json(router, "/api/v1/namespaces/my-ns").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "namespace delete must be denied by webhook: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("admission webhook denied the request")
+            && msg.contains("namespace is protected"),
+        "deny message should carry the webhook reason: {body}"
+    );
+
+    let _: rusternetes_common::resources::Namespace = mem
+        .get(&build_key("namespaces", None, "my-ns"))
+        .await
+        .expect("namespace must survive a denied delete");
+}
+
+/// Control: a DELETE webhook scoped to a *different* resource (secrets) must
+/// NOT fire when deleting a deployment. The deployment delete must succeed.
+#[tokio::test]
+async fn delete_webhook_scoped_to_secrets_does_not_block_deployment_delete() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("should not fire".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-secret-not-deploy"),
+        webhooks: Some(vec![ValidatingWebhook {
+            // Scoped to secrets, NOT deployments.
+            rules: vec![delete_rule_for("", "v1", "secrets")],
+            ..validating(
+                "deny.secret.not.deploy.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key(
+            "validatingwebhookconfigurations",
+            None,
+            "deny-secret-not-deploy",
+        ),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let deploy = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "free-deploy", "namespace": "default"},
+        "spec": {
+            "selector": {"matchLabels": {"app": "x"}},
+            "template": {
+                "metadata": {"labels": {"app": "x"}},
+                "spec": {"containers": [{"name": "c", "image": "nginx"}]}
+            }
+        }
+    });
+    let typed: rusternetes_common::resources::Deployment = serde_json::from_value(deploy).unwrap();
+    mem.create(
+        &build_key("deployments", Some("default"), "free-deploy"),
+        &typed,
+    )
+    .await
+    .unwrap();
+
+    let status = delete_status(
+        router,
+        "/apis/apps/v1/namespaces/default/deployments/free-deploy",
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "deployment delete must succeed when webhook targets secrets, got {status}"
+    );
+}

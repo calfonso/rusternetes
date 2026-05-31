@@ -177,6 +177,7 @@ pub async fn delete(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "resourcequotas")
         .with_api_group("")
         .with_namespace(&namespace)
@@ -193,6 +194,21 @@ pub async fn delete(
 
     // Get the resource quota for finalizer handling
     let quota: ResourceQuota = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=quota).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "ResourceQuota",
+        "resourcequotas",
+        Some(&namespace),
+        &name,
+        &quota,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -314,6 +330,7 @@ pub async fn deletecollection_resourcequotas(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "resourcequotas")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -343,6 +360,21 @@ pub async fn deletecollection_resourcequotas(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("resourcequotas", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "ResourceQuota",
+            "resourcequotas",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

@@ -632,6 +632,7 @@ pub async fn delete_service(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "services")
         .with_namespace(&namespace)
         .with_api_group("")
@@ -647,6 +648,21 @@ pub async fn delete_service(
     // Get the service to validate it exists and potentially release its ClusterIP
     let key = build_key("services", Some(&namespace), &name);
     let service = state.storage.get::<Service>(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=service).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "Service",
+        "services",
+        Some(&namespace),
+        &name,
+        &service,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -903,6 +919,7 @@ pub async fn deletecollection_services(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "services")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -932,6 +949,21 @@ pub async fn deletecollection_services(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("services", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "Service",
+            "services",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

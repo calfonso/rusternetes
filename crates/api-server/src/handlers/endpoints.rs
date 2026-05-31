@@ -247,6 +247,7 @@ pub async fn delete_endpoints(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "endpoints")
         .with_namespace(&namespace)
         .with_api_group("")
@@ -263,6 +264,21 @@ pub async fn delete_endpoints(
 
     // Get the resource to check if it exists
     let endpoints: Endpoints = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=endpoints).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "Endpoints",
+        "endpoints",
+        Some(&namespace),
+        &name,
+        &endpoints,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -304,6 +320,7 @@ pub async fn deletecollection_endpoints(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "endpoints")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -333,6 +350,21 @@ pub async fn deletecollection_endpoints(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("endpoints", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "Endpoints",
+            "endpoints",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
