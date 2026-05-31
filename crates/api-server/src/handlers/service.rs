@@ -232,6 +232,9 @@ pub async fn create(
         // ExternalName services don't need ClusterIP allocation - use empty string per K8s API convention
         service.spec.cluster_ip = Some("".to_string());
     } else {
+        // Non-ExternalName types must not carry externalName — drop it (upstream
+        // dropServiceDisabledFields) rather than rejecting a stray value.
+        service.spec.external_name = None;
         // Only allocate ClusterIP for ClusterIP, NodePort, and LoadBalancer services
         if matches!(
             service_type,
@@ -546,6 +549,12 @@ pub async fn update(
     // on a plain update — that would silently mask the immutability violation
     // we just rejected above.
     else {
+        // Drop externalName whenever the type is not ExternalName, mirroring
+        // upstream's dropServiceDisabledFields / type-dependent field clearing.
+        // The DNS e2e flips an ExternalName Service to ClusterIP via a full PUT
+        // that leaves spec.externalName populated; upstream silently clears it
+        // rather than rejecting with "may not be set for non-ExternalName".
+        service.spec.external_name = None;
         let needs_ip = service
             .spec
             .cluster_ip
