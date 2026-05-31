@@ -6,6 +6,20 @@
 
 This isn't a wrapper around the Go codebase or a partial mock. Every component — API server, scheduler, controller manager, kubelet, kube-proxy — is written from scratch in Rust, implementing the actual Kubernetes API surface, wire format, and behavioral semantics.
 
+## The Goal
+
+Rūsternetes exists to answer one concrete question: **can a fully conformant Kubernetes run on hardware this small?**
+
+The north star is a **four-node cluster of Raspberry Pi 3A+ boards** — 512 MB of RAM each, a quad-core Cortex-A53, wired networking over **USB-ethernet adapters**, and a single **128 GB micro SD card** per node holding the OS, the binary, and all cluster state. No etcd quorum, no gigabyte-per-node control plane, no external dependencies. Just four tiny boards behind an ordinary **home ISP router**, passing the official Kubernetes conformance suite and running a real homelab.
+
+That constraint drives the architecture:
+
+- **Rust, from scratch** — a control plane measured in hundreds of MB, not gigabytes, so a 512 MB node still has room for actual workloads.
+- **Embedded SQLite storage, no etcd** — the all-in-one `rusternetes` binary keeps cluster state in a single SQLite file on the SD card, shedding etcd's RAM cost and write amplification (which is brutal on flash).
+- **One process, every component** — API server, scheduler, controller manager, kubelet, and kube-proxy run as concurrent async tasks in a single binary sized for a board you can power off a USB port.
+
+Conformance on commodity x86 is the proving ground. The Pi cluster is the destination.
+
 ## Web Console
 
 Rūsternetes includes a built-in web console with real-time cluster topology visualization, live metrics, pod log streaming, and full resource management. It deploys automatically — embedded in the API server, no separate installation.
