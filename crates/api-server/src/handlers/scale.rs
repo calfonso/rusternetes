@@ -20,7 +20,6 @@ use axum::{
 use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    protobuf::encode_protobuf,
     Error, Result,
 };
 use rusternetes_storage::{build_key, Storage};
@@ -349,21 +348,28 @@ pub async fn patch_scale(
 /// for clients that decode the proto bytes back to a typed Go/Rust struct.
 fn scale_response(scale: &Scale, headers: &HeaderMap, status: StatusCode) -> Response {
     match negotiate_content_type(headers) {
-        ContentType::Protobuf => match encode_protobuf(scale, &scale.api_version, &scale.kind) {
-            Ok(bytes) => Response::builder()
+        ContentType::Protobuf => {
+            // Encode the Scale as NATIVE protobuf via the registered schema.
+            // The polymorphic scale client (k8s.io/client-go/scale) uses a
+            // protobuf-only codec that proto-decodes `Unknown.raw` directly, so
+            // the JSON-in-raw fallback fails with `proto: illegal wireType`.
+            // `encode_native_or_wrapped` emits native bytes when the Scale
+            // schema round-trips and only falls back to JSON if it can't.
+            let json = match serde_json::to_vec(scale) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::warn!("scale JSON serialize failed; returning JSON body: {}", e);
+                    return json_response(scale, status);
+                }
+            };
+            let bytes =
+                crate::response::encode_native_or_wrapped(&json, &scale.api_version, &scale.kind);
+            Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, ContentType::Protobuf.mime_type())
                 .body(Body::from(bytes))
-                .unwrap(),
-            Err(e) => {
-                // Encoding a Scale message should never fail (JSON serialization
-                // of an i32 + selector string), but if it does we fall back to
-                // JSON so the client at least sees the payload rather than a
-                // 500 with an empty body.
-                tracing::warn!("scale proto encode failed; falling back to JSON: {}", e);
-                json_response(scale, status)
-            }
-        },
+                .unwrap()
+        }
         ContentType::Json => json_response(scale, status),
     }
 }
