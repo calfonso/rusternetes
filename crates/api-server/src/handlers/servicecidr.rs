@@ -182,8 +182,21 @@ pub async fn delete_servicecidr(
 pub async fn list_servicecidrs(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     debug!("Listing ServiceCIDRs");
+
+    // Honor `?watch=true` on the collection endpoint (informer/Lens path).
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_cluster_scoped::<ServiceCIDR>(
+            state,
+            auth_ctx,
+            "servicecidrs",
+            "networking.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "servicecidrs")

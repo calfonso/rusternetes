@@ -1519,6 +1519,10 @@ impl_has_metadata!(
     rusternetes_common::resources::PriorityLevelConfiguration,
     rusternetes_common::resources::IngressClass,
     rusternetes_common::resources::CSIStorageCapacity,
+    rusternetes_common::resources::CSIDriver,
+    rusternetes_common::resources::CSINode,
+    rusternetes_common::resources::VolumeAttachment,
+    rusternetes_common::resources::VolumeAttributesClass,
     rusternetes_common::resources::CustomResource
 );
 

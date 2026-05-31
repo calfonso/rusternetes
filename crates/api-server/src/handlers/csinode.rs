@@ -81,8 +81,20 @@ pub async fn list_csinodes(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<CSINode>>> {
+) -> Result<axum::response::Response> {
     debug!("Listing all CSINodes");
+
+    // Honor `?watch=true` on the collection endpoint (informer/Lens path).
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_cluster_scoped::<CSINode>(
+            state,
+            auth_ctx,
+            "csinodes",
+            "storage.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
 
     let attrs =
         RequestAttributes::new(auth_ctx.user, "list", "csinodes").with_api_group("storage.k8s.io");
@@ -95,13 +107,13 @@ pub async fn list_csinodes(
     }
 
     let prefix = build_prefix("csinodes", None);
-    let mut nodes = state.storage.list(&prefix).await?;
+    let mut nodes = state.storage.list::<CSINode>(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut nodes, &params)?;
 
     let list = List::new("CSINodeList", "storage.k8s.io/v1", nodes);
-    Ok(Json(list))
+    Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
 pub async fn update_csinode(
