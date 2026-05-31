@@ -12,7 +12,7 @@ Rusternetes is a from-scratch Rust reimplementation of Kubernetes. This document
 |------|---------|-------|--------|------|------|-----|-----------|
 | 2026-05-31 | SQLite / rhino | `conformance:v1.35.0` | `e9c9f507` | 347 | 99 | 446 | 77.8% |
 
-Hydrophone, full `[Conformance]` suite, multi-container SQLite stack (`compose.sqlite.yml` + `compose.dind.yml`), rhino submodule `7ec61cb`.
+Hydrophone, full `[Conformance]` suite, multi-container SQLite stack (`compose.sqlite.yml` + `compose.dind.yml`), rhino submodule `7ec61cb`. Per-test PASS/FAIL for this run (one column per run, verbatim ginkgo keys): [`conformance/PER_TEST_RESULTS.md`](conformance/PER_TEST_RESULTS.md).
 
 This is the first full conformance run on the SQLite/rhino backend after migrating off etcd and landing a batch of breaking storage/watch changes. It is **not** comparable to the historical etcd peak below (Round 160, 94.1%): a different backend, and many fixes for SQLite-specific behaviour are still in flight. The 99 failures cluster tightly, and most are already being addressed:
 
