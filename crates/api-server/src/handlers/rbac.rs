@@ -488,7 +488,21 @@ pub async fn list_all_rolebindings(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<List<RoleBinding>>> {
+) -> Result<axum::response::Response> {
+    // Honor `?watch=true` on the all-namespaces collection (informer/Lens path).
+    // Mirrors list_all_roles: the all-NS watch is just the no-namespace prefix,
+    // so it routes through watch_cluster_scoped.
+    if crate::handlers::watch::is_watch_request(&params) {
+        return crate::handlers::watch::watch_cluster_scoped::<RoleBinding>(
+            state,
+            auth_ctx,
+            "rolebindings",
+            "rbac.authorization.k8s.io",
+            crate::handlers::watch::watch_params_from_query(&params),
+        )
+        .await;
+    }
+
     debug!("Listing all rolebindings");
 
     // Check authorization (cluster-wide list)
@@ -513,7 +527,7 @@ pub async fn list_all_rolebindings(
         "rbac.authorization.k8s.io/v1",
         rolebindings,
     );
-    Ok(Json(list))
+    Ok(Json(list).into_response())
 }
 
 // ClusterRole handlers
