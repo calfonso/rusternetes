@@ -4,7 +4,7 @@ use axum::{
     http::{Method, StatusCode, Uri},
     middleware as axum_middleware,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{any, get, post, put},
     Extension, Router,
 };
 use rusternetes_common::dump::DumpingJson;
@@ -911,27 +911,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/proxy",
-            get(handlers::proxy::proxy_pod_root)
-                .post(handlers::proxy::proxy_pod_root)
-                .put(handlers::proxy::proxy_pod_root)
-                .patch(handlers::proxy::proxy_pod_root)
-                .delete(handlers::proxy::proxy_pod_root),
+            any(handlers::proxy::proxy_pod_root),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/proxy/",
-            get(handlers::proxy::proxy_pod_root)
-                .post(handlers::proxy::proxy_pod_root)
-                .put(handlers::proxy::proxy_pod_root)
-                .patch(handlers::proxy::proxy_pod_root)
-                .delete(handlers::proxy::proxy_pod_root),
+            any(handlers::proxy::proxy_pod_root),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/proxy/*path",
-            get(handlers::proxy::proxy_pod)
-                .post(handlers::proxy::proxy_pod)
-                .put(handlers::proxy::proxy_pod)
-                .patch(handlers::proxy::proxy_pod)
-                .delete(handlers::proxy::proxy_pod),
+            any(handlers::proxy::proxy_pod),
         )
         // Watch pods in a namespace
         .route(
@@ -963,27 +951,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/namespaces/:namespace/services/:name/proxy",
-            get(handlers::proxy::proxy_service_root)
-                .post(handlers::proxy::proxy_service_root)
-                .put(handlers::proxy::proxy_service_root)
-                .patch(handlers::proxy::proxy_service_root)
-                .delete(handlers::proxy::proxy_service_root),
+            any(handlers::proxy::proxy_service_root),
         )
         .route(
             "/api/v1/namespaces/:namespace/services/:name/proxy/",
-            get(handlers::proxy::proxy_service_root)
-                .post(handlers::proxy::proxy_service_root)
-                .put(handlers::proxy::proxy_service_root)
-                .patch(handlers::proxy::proxy_service_root)
-                .delete(handlers::proxy::proxy_service_root),
+            any(handlers::proxy::proxy_service_root),
         )
         .route(
             "/api/v1/namespaces/:namespace/services/:name/proxy/*path",
-            get(handlers::proxy::proxy_service)
-                .post(handlers::proxy::proxy_service)
-                .put(handlers::proxy::proxy_service)
-                .patch(handlers::proxy::proxy_service)
-                .delete(handlers::proxy::proxy_service),
+            any(handlers::proxy::proxy_service),
         )
         // Watch services in a namespace
         .route(
@@ -1080,11 +1056,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         )
         .route(
             "/api/v1/nodes/:name/proxy/*path",
-            get(handlers::proxy::proxy_node)
-                .post(handlers::proxy::proxy_node)
-                .put(handlers::proxy::proxy_node)
-                .patch(handlers::proxy::proxy_node)
-                .delete(handlers::proxy::proxy_node),
+            any(handlers::proxy::proxy_node),
         )
         // Watch nodes (cluster-scoped)
         .route(
