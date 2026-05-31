@@ -102,9 +102,12 @@ print_success() {
     echo -e "${GREEN}✓${NC} $1"
 }
 
-# Check if kubectl is available
-KUBECTL=""
-if [ -f "$PROJECT_ROOT/target/release/kubectl" ]; then
+# Check if kubectl is available. A pre-set $KUBECTL env var wins so callers can
+# pin a specific binary (e.g. the system kubectl when the in-tree one lacks a
+# feature). Otherwise prefer the freshly-built in-tree kubectl, then $PATH.
+if [ -n "${KUBECTL:-}" ]; then
+    :
+elif [ -f "$PROJECT_ROOT/target/release/kubectl" ]; then
     KUBECTL="$PROJECT_ROOT/target/release/kubectl"
 elif command -v kubectl &> /dev/null; then
     KUBECTL="kubectl"

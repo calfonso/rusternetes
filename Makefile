@@ -216,6 +216,26 @@ dev-full: ## Build images and start development cluster
 	@echo "  - List pods: make kubectl-get-pods"
 	@echo "  - Stop cluster: make dev-down"
 
+# Omnipotent cluster lifecycle (see scripts/cluster-up.sh --help)
+# Tear down (if up) -> build -> up -> wait -> certs -> bootstrap -> [conformance].
+# Idempotent and runtime-aware (Docker DinD override applied automatically).
+# Override knobs via CLUSTER_ARGS, e.g.:
+#   make cluster-up CLUSTER_ARGS="--backend etcd --no-build"
+#   make e2e        CLUSTER_ARGS="--backend etcd"
+CLUSTER_ARGS ?=
+
+cluster-up: ## Recreate a cluster end-to-end (build, up, bootstrap). Args: CLUSTER_ARGS=
+	./scripts/cluster-up.sh $(CLUSTER_ARGS)
+
+cluster-down: ## Tear down the cluster (containers, volumes, pod containers, network)
+	./scripts/cluster-up.sh --down-only $(CLUSTER_ARGS)
+
+e2e: ## Full automated end-to-end: recreate cluster + run Hydrophone conformance
+	./scripts/cluster-up.sh --conformance hydrophone $(CLUSTER_ARGS)
+
+e2e-sonobuoy: ## Full automated end-to-end: recreate cluster + run Sonobuoy conformance
+	./scripts/cluster-up.sh --conformance sonobuoy $(CLUSTER_ARGS)
+
 # Quick start
 quick-start: ## Interactive setup using dev-setup.sh script
 	./scripts/dev-setup.sh
