@@ -4,9 +4,27 @@ Rusternetes is a from-scratch Rust reimplementation of Kubernetes. This document
 
 > **Faster signal for kubelet-only regressions:** see [`docs/NODE_CONFORMANCE.md`](NODE_CONFORMANCE.md) — a single-kubelet harness that runs the `[NodeConformance]`-tagged subset in minutes, scoped to catch kubelet bugs without scheduler / controller-manager / kube-proxy noise.
 
-## Conformance Test Results
+## Current snapshot
 
-We run the official Kubernetes conformance test suite (441 tests) via Sonobuoy against a Rusternetes cluster running on Docker Desktop.
+**Every conformance figure in this repo is dated and tagged with the storage backend it was measured on.** etcd and the SQLite/rhino backend exercise different code paths and do not produce the same numbers — never treat an older etcd figure (e.g. the Round 160 / 94.1% below) as the current baseline.
+
+| Date | Backend | Image | Commit | Pass | Fail | Ran | Pass rate |
+|------|---------|-------|--------|------|------|-----|-----------|
+| 2026-05-31 | SQLite / rhino | `conformance:v1.35.0` | `e9c9f507` | 347 | 99 | 446 | 77.8% |
+
+Hydrophone, full `[Conformance]` suite, multi-container SQLite stack (`compose.sqlite.yml` + `compose.dind.yml`), rhino submodule `7ec61cb`.
+
+This is the first full conformance run on the SQLite/rhino backend after migrating off etcd and landing a batch of breaking storage/watch changes. It is **not** comparable to the historical etcd peak below (Round 160, 94.1%): a different backend, and many fixes for SQLite-specific behaviour are still in flight. The 99 failures cluster tightly, and most are already being addressed:
+
+- **~22 AdmissionWebhook** — all fail in setup creating a RoleBinding whose `roleRef` omits `apiGroup`; the decode layer rejected it. Fixed by the RoleRef Go-parity decode change (PR #890).
+- **~20 CRD family** — CustomResourceDefinition, CustomResourcePublishOpenAPI, FieldValidation, AggregatedDiscovery, ConversionWebhook (CRD decode/handling).
+- Remainder — garbage collector, FlowSchema, Aggregator, ResourceQuota, status subresources, API-chunking, Table 406.
+
+## Historical rounds (etcd backend, pre-SQLite migration)
+
+> These rounds ran on the **etcd** backend via Sonobuoy on Docker Desktop, March–April 2026. They predate the SQLite/rhino migration and the breaking storage/watch changes, so **Round 160's 94.1% is a historical etcd figure, not the current baseline** — see the dated snapshot above.
+
+The official Kubernetes conformance suite is 441 `[Conformance]` tests.
 
 | Round | Date       | Pass | Fail | Pass Rate | Notes |
 |-------|------------|------|------|-----------|-------|
@@ -33,9 +51,7 @@ We run the official Kubernetes conformance test suite (441 tests) via Sonobuoy a
 | 159   | 2026-04-25 | 410  | 31   | 93.0%     | Previous high score |
 | 160   | 2026-04-26 | 415  | 26   | 94.1%     | New high score |
 
-**Current best deployed**: Round 160 at 94.1% (415/441).
-
-**Latest status (Round 160)**: 415/441 conformance tests passing with 26 failures.
+**Historical etcd peak**: Round 160 at 94.1% (415/441) on 2026-04-26 — superseded as the reference point by the dated [Current snapshot](#current-snapshot) above. This number reflects the etcd backend before the SQLite migration and is no longer the baseline.
 
 **Total commits**: 1,534+ across 30+ rounds of iterative testing and debugging.
 
