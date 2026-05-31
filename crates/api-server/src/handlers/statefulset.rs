@@ -241,6 +241,7 @@ pub async fn delete_statefulset(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "statefulsets")
         .with_namespace(&namespace)
         .with_api_group("apps")
@@ -257,6 +258,21 @@ pub async fn delete_statefulset(
 
     // Get the resource to check if it exists
     let statefulset: StatefulSet = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=statefulset).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "apps",
+        "v1",
+        "StatefulSet",
+        "statefulsets",
+        Some(&namespace),
+        &name,
+        &statefulset,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -427,6 +443,7 @@ pub async fn deletecollection_statefulsets(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "statefulsets")
         .with_namespace(&namespace)
         .with_api_group("apps");
@@ -459,6 +476,21 @@ pub async fn deletecollection_statefulsets(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("statefulsets", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "apps",
+            "v1",
+            "StatefulSet",
+            "statefulsets",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

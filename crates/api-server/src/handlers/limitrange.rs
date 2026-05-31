@@ -153,6 +153,7 @@ pub async fn delete(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "limitranges")
         .with_api_group("")
         .with_namespace(&namespace)
@@ -169,6 +170,21 @@ pub async fn delete(
 
     // Get the limit range for finalizer handling
     let limit_range: LimitRange = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=limit_range).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "",
+        "v1",
+        "LimitRange",
+        "limitranges",
+        Some(&namespace),
+        &name,
+        &limit_range,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -293,6 +309,7 @@ pub async fn deletecollection_limitranges(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "limitranges")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -322,6 +339,21 @@ pub async fn deletecollection_limitranges(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("limitranges", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "LimitRange",
+            "limitranges",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

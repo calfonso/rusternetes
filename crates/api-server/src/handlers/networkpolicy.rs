@@ -151,6 +151,7 @@ pub async fn delete_networkpolicy(
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "networkpolicies")
         .with_namespace(&namespace)
         .with_api_group("networking.k8s.io")
@@ -167,6 +168,21 @@ pub async fn delete_networkpolicy(
 
     // Get the resource to check if it exists
     let networkpolicy: NetworkPolicy = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=networkpolicy).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "networking.k8s.io",
+        "v1",
+        "NetworkPolicy",
+        "networkpolicies",
+        Some(&namespace),
+        &name,
+        &networkpolicy,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -340,6 +356,7 @@ pub async fn deletecollection_networkpolicies(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "networkpolicies")
         .with_namespace(&namespace)
         .with_api_group("networking.k8s.io");
@@ -369,6 +386,21 @@ pub async fn deletecollection_networkpolicies(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("networkpolicies", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "networking.k8s.io",
+            "v1",
+            "NetworkPolicy",
+            "networkpolicies",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

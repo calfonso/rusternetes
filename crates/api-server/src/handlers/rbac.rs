@@ -137,6 +137,7 @@ pub async fn delete_role(
     info!("Deleting role: {}/{}", namespace, name);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "roles")
         .with_namespace(&namespace)
         .with_api_group("rbac.authorization.k8s.io")
@@ -156,6 +157,22 @@ pub async fn delete_role(
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=role).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "Role",
+        "roles",
+        Some(&namespace),
+        &name,
+        &role,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
+
     if is_dry_run {
         info!("Dry-run: Role validated successfully (not deleted)");
         return Ok(Json(role));
@@ -395,6 +412,7 @@ pub async fn delete_rolebinding(
     info!("Deleting rolebinding: {}/{}", namespace, name);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "rolebindings")
         .with_namespace(&namespace)
         .with_api_group("rbac.authorization.k8s.io")
@@ -414,6 +432,22 @@ pub async fn delete_rolebinding(
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=rolebinding).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "RoleBinding",
+        "rolebindings",
+        Some(&namespace),
+        &name,
+        &rolebinding,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
+
     if is_dry_run {
         info!("Dry-run: RoleBinding validated successfully (not deleted)");
         return Ok(Json(rolebinding));
@@ -652,6 +686,7 @@ pub async fn delete_clusterrole(
     info!("Deleting clusterrole: {}", name);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "clusterroles")
         .with_api_group("rbac.authorization.k8s.io")
         .with_name(&name);
@@ -670,6 +705,22 @@ pub async fn delete_clusterrole(
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=clusterrole).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRole",
+        "clusterroles",
+        None,
+        &name,
+        &clusterrole,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
+
     if is_dry_run {
         info!("Dry-run: ClusterRole validated successfully (not deleted)");
         return Ok(Json(clusterrole));
@@ -879,6 +930,7 @@ pub async fn delete_clusterrolebinding(
     info!("Deleting clusterrolebinding: {}", name);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "clusterrolebindings")
         .with_api_group("rbac.authorization.k8s.io")
         .with_name(&name);
@@ -897,6 +949,22 @@ pub async fn delete_clusterrolebinding(
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=clusterrolebinding).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRoleBinding",
+        "clusterrolebindings",
+        None,
+        &name,
+        &clusterrolebinding,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
+
     if is_dry_run {
         info!("Dry-run: ClusterRoleBinding validated successfully (not deleted)");
         return Ok(Json(clusterrolebinding));
@@ -975,6 +1043,7 @@ pub async fn deletecollection_roles(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "roles")
         .with_namespace(&namespace)
         .with_api_group("rbac.authorization.k8s.io");
@@ -1004,6 +1073,21 @@ pub async fn deletecollection_roles(
     let mut deleted_count = 0;
     for role in roles {
         let key = build_key("roles", Some(&namespace), &role.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "rbac.authorization.k8s.io",
+            "v1",
+            "Role",
+            "roles",
+            Some(&namespace),
+            &role.metadata.name,
+            &role,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
@@ -1037,6 +1121,7 @@ pub async fn deletecollection_rolebindings(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "rolebindings")
         .with_namespace(&namespace)
         .with_api_group("rbac.authorization.k8s.io");
@@ -1067,6 +1152,21 @@ pub async fn deletecollection_rolebindings(
     for rolebinding in rolebindings {
         let key = build_key("rolebindings", Some(&namespace), &rolebinding.metadata.name);
 
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "rbac.authorization.k8s.io",
+            "v1",
+            "RoleBinding",
+            "rolebindings",
+            Some(&namespace),
+            &rolebinding.metadata.name,
+            &rolebinding,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
+
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
             &state.storage,
@@ -1095,6 +1195,7 @@ pub async fn deletecollection_clusterroles(
     info!("DeleteCollection clusterroles with params: {:?}", params);
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "clusterroles")
         .with_api_group("rbac.authorization.k8s.io");
 
@@ -1123,6 +1224,21 @@ pub async fn deletecollection_clusterroles(
     let mut deleted_count = 0;
     for clusterrole in clusterroles {
         let key = build_key("clusterroles", None, &clusterrole.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "rbac.authorization.k8s.io",
+            "v1",
+            "ClusterRole",
+            "clusterroles",
+            None,
+            &clusterrole.metadata.name,
+            &clusterrole,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
@@ -1155,6 +1271,7 @@ pub async fn deletecollection_clusterrolebindings(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "clusterrolebindings")
         .with_api_group("rbac.authorization.k8s.io");
 
@@ -1187,6 +1304,21 @@ pub async fn deletecollection_clusterrolebindings(
             None,
             &clusterrolebinding.metadata.name,
         );
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "rbac.authorization.k8s.io",
+            "v1",
+            "ClusterRoleBinding",
+            "clusterrolebindings",
+            None,
+            &clusterrolebinding.metadata.name,
+            &clusterrolebinding,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(

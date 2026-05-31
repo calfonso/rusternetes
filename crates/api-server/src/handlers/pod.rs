@@ -1763,6 +1763,7 @@ pub async fn deletecollection_pods(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "pods")
         .with_namespace(&namespace)
         .with_api_group("");
@@ -1792,6 +1793,21 @@ pub async fn deletecollection_pods(
     let mut deleted_count = 0;
     for pod in pods {
         let key = build_key("pods", Some(&namespace), &pod.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "",
+            "v1",
+            "Pod",
+            "pods",
+            Some(&namespace),
+            &pod.metadata.name,
+            &pod,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately =

@@ -144,6 +144,7 @@ pub async fn delete_cronjob(
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "delete", "cronjobs")
         .with_namespace(&namespace)
         .with_api_group("batch")
@@ -160,6 +161,21 @@ pub async fn delete_cronjob(
 
     // Get the resource to check if it exists
     let cronjob: CronJob = state.storage.get(&key).await?;
+
+    // Run validating admission webhooks for DELETE (object=nil, oldObject=cronjob).
+    crate::handlers::admission_helper::run_delete_validating_webhooks(
+        &state,
+        "batch",
+        "v1",
+        "CronJob",
+        "cronjobs",
+        Some(&namespace),
+        &name,
+        &cronjob,
+        &user_for_webhook,
+        is_dry_run,
+    )
+    .await?;
 
     // If dry-run, skip delete operation
     if is_dry_run {
@@ -329,6 +345,7 @@ pub async fn deletecollection_cronjobs(
     );
 
     // Check authorization
+    let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "cronjobs")
         .with_namespace(&namespace)
         .with_api_group("batch");
@@ -358,6 +375,21 @@ pub async fn deletecollection_cronjobs(
     let mut deleted_count = 0;
     for item in items {
         let key = build_key("cronjobs", Some(&namespace), &item.metadata.name);
+
+        // Run validating admission webhooks for DELETE per item.
+        crate::handlers::admission_helper::run_delete_validating_webhooks(
+            &state,
+            "batch",
+            "v1",
+            "CronJob",
+            "cronjobs",
+            Some(&namespace),
+            &item.metadata.name,
+            &item,
+            &user_for_webhook,
+            false,
+        )
+        .await?;
 
         // Handle deletion with finalizers
         let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
