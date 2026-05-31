@@ -1,3 +1,4 @@
+pub mod admission_helper;
 pub mod admission_webhook;
 pub mod apply;
 pub mod authentication;

@@ -132,6 +132,23 @@ async fn delete_status(router: axum::Router, uri: &str) -> StatusCode {
     router.oneshot(req).await.unwrap().status()
 }
 
+/// HTTP helper: DELETE, return `(status, body)` so the caller can assert on the
+/// webhook-denial Status payload.
+async fn delete_json(router: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, v)
+}
+
 // ---------------------------------------------------------------------------
 // Webhook backend mocks (warp). These mirror the `sample-webhook-deployment`
 // behaviours used by the upstream Ginkgo tests — allow, deny, mutate, slow.
@@ -154,6 +171,40 @@ async fn start_deny_validator(reason: String) -> (String, oneshot::Sender<()>) {
         .map(move |r: AdmissionReview| {
             let uid = r.request.map(|req| req.uid).unwrap_or_else(|| "u".into());
             warp::reply::json(&wrap(AdmissionReviewResponse::deny(uid, reason.clone())))
+        });
+    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+        rx.await.ok();
+    });
+    tokio::spawn(srv);
+    (format!("http://{}", addr), tx)
+}
+
+/// Validating mock used for DELETE admission. It denies only when the request
+/// carries an `oldObject` and no `object` (the K8s DELETE AdmissionReview
+/// shape), which lets the test assert both the deny *and* that the api-server
+/// populated the review correctly. Any other shape is allowed.
+async fn start_delete_deny_validator(reason: String) -> (String, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel();
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(move |r: AdmissionReview| {
+            let request = match r.request {
+                Some(req) => req,
+                None => {
+                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
+                }
+            };
+            let is_delete = matches!(request.operation, Operation::Delete);
+            let has_old = request.old_object.is_some();
+            let no_new = request.object.is_none();
+            if is_delete && has_old && no_new {
+                warp::reply::json(&wrap(AdmissionReviewResponse::deny(
+                    request.uid,
+                    reason.clone(),
+                )))
+            } else {
+                warp::reply::json(&wrap(AdmissionReviewResponse::allow(request.uid)))
+            }
         });
     let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
         rx.await.ok();
@@ -312,6 +363,18 @@ async fn start_slow_validator(delay: std::time::Duration) -> (String, oneshot::S
 fn rule_for(api_group: &str, version: &str, resource: &str) -> RuleWithOperations {
     RuleWithOperations {
         operations: vec![OperationType::Create],
+        rule: Rule {
+            api_groups: vec![api_group.to_string()],
+            api_versions: vec![version.to_string()],
+            resources: vec![resource.to_string()],
+            scope: None,
+        },
+    }
+}
+
+fn delete_rule_for(api_group: &str, version: &str, resource: &str) -> RuleWithOperations {
+    RuleWithOperations {
+        operations: vec![OperationType::Delete],
         rule: Rule {
             api_groups: vec![api_group.to_string()],
             api_versions: vec![version.to_string()],
@@ -1914,6 +1977,193 @@ async fn should_mutate_everything_except_skip_me_configmaps() {
         .unwrap();
     let obj2 = mutated2.expect("matching object must be mutated");
     assert_eq!(obj2["metadata"]["labels"]["mutated"], json!("1"));
+}
+
+/// [sig-api-machinery] AdmissionWebhook — a validating webhook scoped to the
+/// DELETE operation on a CORE resource must be invoked when that resource is
+/// deleted through the HTTP DELETE handler, and its denial must turn into a
+/// 403 with the upstream "admission webhook denied the request" prefix.
+///
+/// This exercises the api-server's *handler wiring* (not just the manager):
+/// before this change, only custom resources ran webhooks on DELETE, so core
+/// resources (configmaps/pods/secrets) silently skipped DELETE admission.
+///
+/// Upstream parity: webhook.go's "deny creation/deletion" specs configure rules
+/// with both CREATE and DELETE; the DELETE AdmissionReview sets `object=nil`
+/// and `oldObject=<resource>`. The mock here asserts exactly that shape.
+#[tokio::test]
+async fn should_deny_configmap_deletion_via_http_handler() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("nope, keep it".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-cm-delete"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![delete_rule_for("", "v1", "configmaps")],
+            ..validating(
+                "deny.delete.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("validatingwebhookconfigurations", None, "deny-cm-delete"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    // Seed a configmap directly in storage.
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "protected", "namespace": "default"},
+        "data": {"k": "v"},
+    });
+    let cm_typed: rusternetes_common::resources::ConfigMap = serde_json::from_value(cm).unwrap();
+    mem.create(
+        &build_key("configmaps", Some("default"), "protected"),
+        &cm_typed,
+    )
+    .await
+    .unwrap();
+
+    let (status, body) =
+        delete_json(router, "/api/v1/namespaces/default/configmaps/protected").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "delete must be denied by webhook: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("admission webhook denied the request") && msg.contains("nope, keep it"),
+        "deny message should carry the webhook reason: {body}"
+    );
+
+    // The configmap must still exist (deletion was rejected pre-storage).
+    let still: rusternetes_common::resources::ConfigMap = mem
+        .get(&build_key("configmaps", Some("default"), "protected"))
+        .await
+        .expect("configmap must survive a denied delete");
+    assert_eq!(still.metadata.name, "protected");
+}
+
+/// Sibling of the above for pods, going through `delete_pod`. A DELETE-scoped
+/// webhook must reject the pod deletion with 403; the pod stays in storage and
+/// never gets a `deletionTimestamp`.
+#[tokio::test]
+async fn should_deny_pod_deletion_via_http_handler() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("pod is load-bearing".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-pod-delete"),
+        webhooks: Some(vec![ValidatingWebhook {
+            rules: vec![delete_rule_for("", "v1", "pods")],
+            ..validating(
+                "deny.pod.delete.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key("validatingwebhookconfigurations", None, "deny-pod-delete"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "keepme", "namespace": "default"},
+        "spec": {"containers": [{"name": "c", "image": "nginx"}]},
+    });
+    let pod_typed: rusternetes_common::resources::Pod = serde_json::from_value(pod).unwrap();
+    mem.create(&build_key("pods", Some("default"), "keepme"), &pod_typed)
+        .await
+        .unwrap();
+
+    let (status, body) = delete_json(router, "/api/v1/namespaces/default/pods/keepme").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "pod delete must be denied: {body}"
+    );
+
+    // The pod must still exist with no deletionTimestamp (delete was blocked).
+    let still: rusternetes_common::resources::Pod = mem
+        .get(&build_key("pods", Some("default"), "keepme"))
+        .await
+        .expect("pod must survive a denied delete");
+    assert!(
+        still.metadata.deletion_timestamp.is_none(),
+        "denied delete must not set deletionTimestamp"
+    );
+}
+
+/// Control case: with a DELETE webhook configured but scoped to a *different*
+/// resource, deleting a configmap is unaffected and succeeds. Guards against an
+/// over-broad matcher that would invoke the webhook for every resource.
+#[tokio::test]
+async fn delete_webhook_scoped_to_other_resource_does_not_block() {
+    let (mem, router) = spawn_router();
+    let (url, _shutdown) = start_delete_deny_validator("should not fire".into()).await;
+
+    let cfg = ValidatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "ValidatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("deny-secret-delete"),
+        webhooks: Some(vec![ValidatingWebhook {
+            // Scoped to secrets, NOT configmaps.
+            rules: vec![delete_rule_for("", "v1", "secrets")],
+            ..validating(
+                "deny.secret.delete.io",
+                url,
+                vec![],
+                Some(FailurePolicy::Fail),
+                None,
+            )
+        }]),
+    };
+    mem.create(
+        &build_key(
+            "validatingwebhookconfigurations",
+            None,
+            "deny-secret-delete",
+        ),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "free", "namespace": "default"},
+        "data": {},
+    });
+    let cm_typed: rusternetes_common::resources::ConfigMap = serde_json::from_value(cm).unwrap();
+    mem.create(&build_key("configmaps", Some("default"), "free"), &cm_typed)
+        .await
+        .unwrap();
+
+    let status = delete_status(router, "/api/v1/namespaces/default/configmaps/free").await;
+    assert!(
+        status.is_success(),
+        "configmap delete must succeed when webhook targets a different resource, got {status}"
+    );
 }
 
 // ===========================================================================
