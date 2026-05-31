@@ -99,6 +99,13 @@ pub struct CustomResourceDefinitionSpec {
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionNames {
     /// Plural is the plural name of the resource (used in URLs: /apis/<group>/<version>/<plural>)
+    ///
+    /// `#[serde(default)]` mirrors Go's `json.Unmarshal`: a missing scalar
+    /// decodes to its zero value rather than erroring. This struct is reused for
+    /// `status.acceptedNames`, which clients send empty/partial (no `plural`) on
+    /// create — that must decode, with `spec.names.plural` emptiness enforced by
+    /// validation (see handlers::crd) rather than at the decode layer.
+    #[serde(default)]
     pub plural: String,
 
     /// Singular is the singular name of the resource (used as an alias on CLI)
@@ -106,6 +113,7 @@ pub struct CustomResourceDefinitionNames {
     pub singular: Option<String>,
 
     /// Kind is the serialized kind of the resource (PascalCase)
+    #[serde(default)]
     pub kind: String,
 
     /// ShortNames are short names for the resource (used as aliases on CLI)

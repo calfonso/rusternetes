@@ -127,6 +127,103 @@ async fn test_crd_with_plural_is_accepted() {
     );
 }
 
+/// The `missing field plural` failure observed ~30× in the conformance suite
+/// is NOT a missing `spec.names.plural` — that path already decodes (above).
+/// It comes from `status.acceptedNames`, which is also a
+/// `CustomResourceDefinitionNames`. client-go sends a CRD whose status carries
+/// a partial/empty `acceptedNames` (no `plural` key), and the required field
+/// errored the whole decode. Go leaves it zero-valued; we must too.
+#[tokio::test]
+async fn test_crd_with_empty_accepted_names_decodes() {
+    let router = spawn_router();
+
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "widgets.example.com"},
+        "spec": {
+            "group": "example.com",
+            "names": {"plural": "widgets", "singular": "widget", "kind": "Widget", "listKind": "WidgetList"},
+            "scope": "Namespaced",
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
+            }]
+        },
+        // status.acceptedNames is empty — the shape that broke decode.
+        "status": {"acceptedNames": {}, "conditions": null, "storedVersions": null}
+    });
+
+    let (status, body) = send_json(
+        router,
+        Method::POST,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("missing field"),
+        "CRD with empty status.acceptedNames must not error on missing plural \
+         (status {}): {}",
+        status,
+        body
+    );
+    assert!(
+        status.is_success(),
+        "CRD with empty status.acceptedNames should be accepted, got {}: {}",
+        status,
+        body
+    );
+}
+
+/// Safety net for the `#[serde(default)]` on plural: making decode lenient must
+/// NOT let a CRD with an empty `spec.names.plural` through — validation owns
+/// that. The decode now succeeds (plural defaults to ""), then the handler
+/// rejects it with a real validation message, not a raw serde error.
+#[tokio::test]
+async fn test_crd_with_empty_spec_plural_is_rejected_by_validation() {
+    let router = spawn_router();
+
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": ".example.com"},
+        "spec": {
+            "group": "example.com",
+            // plural intentionally empty — must be rejected, but as validation.
+            "names": {"plural": "", "kind": "Widget"},
+            "scope": "Namespaced",
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
+            }]
+        }
+    });
+
+    let (status, body) = send_json(
+        router,
+        Method::POST,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+
+    assert!(
+        !status.is_success(),
+        "CRD with empty spec.names.plural must be rejected, got {}: {}",
+        status,
+        body
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("missing field"),
+        "rejection must be a validation message, not a raw serde missing-field error: {}",
+        body
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. PersistentVolume with spec.capacity present must not report
 //    "missing field capacity"
