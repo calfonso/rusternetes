@@ -98,6 +98,36 @@ async fn post_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16,
     (status, body_json)
 }
 
+/// Like [`post_json`] but attaches arbitrary request headers. Used to drive
+/// inbound impersonation (`Impersonate-*`) through the auth middleware. Header
+/// names may repeat (e.g. multiple `Impersonate-Group`), which `append`
+/// preserves.
+async fn post_json_with_headers(
+    state: Arc<ApiServerState>,
+    uri: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+) -> (u16, Value) {
+    let router = build_router(state, None);
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, body_json)
+}
+
 async fn get_json(state: Arc<ApiServerState>, uri: &str) -> (u16, Value) {
     let router = build_router(state, None);
     let req = Request::builder()
@@ -795,20 +825,175 @@ async fn subject_access_review_non_resource_url_returns_allowed() {
     );
 }
 
-/// GAP: the full SubjectReview conformance test creates an impersonated client
-/// for the service account subject, exercises real RBAC checks, and verifies
-/// the impersonated-client call matches the SAR decision. Impersonated HTTP
-/// clients cannot be constructed in the unit-test harness.
+/// The full SubjectReview conformance test creates an impersonated client for
+/// the service account subject and verifies the impersonated identity is what
+/// the API server acts as. This exercises inbound impersonation: a request
+/// carrying the standard `Impersonate-User` header (plus optional
+/// `Impersonate-Group` / `Impersonate-Uid` / `Impersonate-Extra-*`) makes the
+/// effective request user the impersonated ServiceAccount. A SelfSubjectReview
+/// then reflects that impersonated identity in `status.userInfo`, mirroring
+/// what an impersonated client would observe end-to-end.
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:50
-/// Sonobuoy (batch-64, 2026-05-28): FAIL
+/// Upstream impersonation filter:
+///   staging/src/k8s.io/apiserver/pkg/endpoints/filters/impersonation
+/// Upstream e2e: k8s.io/kubernetes/test/e2e/auth/subjectreviews.go:50
 #[tokio::test]
-#[ignore = "GAP: full SubjectReview conformance requires impersonated SA client; \
-            upstream test/e2e/auth/subjectreviews.go:50"]
 async fn subject_review_full_conformance_with_impersonated_client() {
-    // Impersonated-SA HTTP client construction is not supported in the
-    // unit-test harness. The non-impersonated SAR paths are GREEN in
-    // `conformance_auth_rbac_serviceaccount.rs`.
+    let (state, mem) = spawn_state();
+    let ns = "subjectreview-impersonation-ns";
+    let sa = "e2e-impersonated";
+    seed_service_account(&mem, ns, sa).await;
+
+    let impersonated_user = format!("system:serviceaccount:{ns}:{sa}");
+
+    // A SelfSubjectReview issued by an impersonated ServiceAccount client.
+    // The request body carries no identity — the identity comes purely from
+    // the impersonation headers, exactly like a real impersonated client.
+    let review = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "SelfSubjectReview",
+        "metadata": {},
+    });
+
+    let (status, body) = post_json_with_headers(
+        state.clone(),
+        "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+        &review,
+        &[("Impersonate-User", impersonated_user.as_str())],
+    )
+    .await;
+
+    assert_eq!(
+        status, 200,
+        "impersonated SelfSubjectReview must return 200: {body}"
+    );
+
+    // The effective (impersonated) identity must be reflected back.
+    assert_eq!(
+        body["status"]["userInfo"]["username"], impersonated_user,
+        "userInfo.username must be the impersonated SA: {body}"
+    );
+
+    // A ServiceAccount with no explicit Impersonate-Group headers inherits the
+    // fixed SA group mapping plus system:authenticated, matching upstream
+    // `serviceaccount.MakeGroupNames` + the added authenticated group.
+    let groups: Vec<String> = body["status"]["userInfo"]["groups"]
+        .as_array()
+        .expect("groups must be present")
+        .iter()
+        .map(|g| g.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        groups.contains(&"system:serviceaccounts".to_string()),
+        "impersonated SA must be in system:serviceaccounts: {groups:?}"
+    );
+    assert!(
+        groups.contains(&format!("system:serviceaccounts:{ns}")),
+        "impersonated SA must be in the namespace SA group: {groups:?}"
+    );
+    assert!(
+        groups.contains(&"system:authenticated".to_string()),
+        "impersonated non-anonymous user must be system:authenticated: {groups:?}"
+    );
+
+    // The admin identity (the original caller in skip-auth mode) must NOT leak
+    // into the impersonated review — the switch must be complete.
+    assert_ne!(
+        body["status"]["userInfo"]["username"], "admin",
+        "original caller identity must not leak through impersonation: {body}"
+    );
+    assert!(
+        !groups.contains(&"system:masters".to_string()),
+        "original caller's groups must not leak through impersonation: {groups:?}"
+    );
+}
+
+/// Explicit `Impersonate-Group`, `Impersonate-Uid`, and `Impersonate-Extra-*`
+/// headers must all be reflected in the effective identity. When groups are
+/// specified explicitly the synthetic SA group mapping is NOT applied (the
+/// supplied groups are authoritative), matching upstream `groupsSpecified`.
+#[tokio::test]
+async fn impersonation_applies_groups_uid_and_extra() {
+    let (state, mem) = spawn_state();
+    let ns = "impersonation-extra-ns";
+    let sa = "extra-sa";
+    seed_service_account(&mem, ns, sa).await;
+    let impersonated_user = format!("system:serviceaccount:{ns}:{sa}");
+
+    let review = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "SelfSubjectReview",
+        "metadata": {},
+    });
+
+    let (status, body) = post_json_with_headers(
+        state.clone(),
+        "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+        &review,
+        &[
+            ("Impersonate-User", impersonated_user.as_str()),
+            ("Impersonate-Group", "developers"),
+            ("Impersonate-Group", "qa"),
+            ("Impersonate-Uid", "abc-123-uid"),
+            ("Impersonate-Extra-scopes", "read"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 200, "impersonated review must return 200: {body}");
+    assert_eq!(body["status"]["userInfo"]["username"], impersonated_user);
+    assert_eq!(
+        body["status"]["userInfo"]["uid"], "abc-123-uid",
+        "impersonated uid must be reflected: {body}"
+    );
+
+    let groups: Vec<String> = body["status"]["userInfo"]["groups"]
+        .as_array()
+        .expect("groups present")
+        .iter()
+        .map(|g| g.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(groups.contains(&"developers".to_string()), "{groups:?}");
+    assert!(groups.contains(&"qa".to_string()), "{groups:?}");
+    // Explicit groups → synthetic SA groups are NOT injected.
+    assert!(
+        !groups.contains(&"system:serviceaccounts".to_string()),
+        "explicit groups must suppress synthetic SA groups: {groups:?}"
+    );
+    // But system:authenticated is still appended for a non-anonymous user.
+    assert!(
+        groups.contains(&"system:authenticated".to_string()),
+        "{groups:?}"
+    );
+
+    assert_eq!(
+        body["status"]["userInfo"]["extra"]["scopes"][0], "read",
+        "impersonated extra must be reflected: {body}"
+    );
+}
+
+/// Requesting `Impersonate-Group` / `Impersonate-Uid` / `Impersonate-Extra-*`
+/// without an accompanying `Impersonate-User` is a BadRequest, matching
+/// upstream `buildImpersonationRequests`.
+#[tokio::test]
+async fn impersonation_group_without_user_is_bad_request() {
+    let (state, _) = spawn_state();
+    let review = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "SelfSubjectReview",
+        "metadata": {},
+    });
+    let (status, _body) = post_json_with_headers(
+        state.clone(),
+        "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+        &review,
+        &[("Impersonate-Group", "developers")],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "groups without a user must be rejected with 400"
+    );
 }
 
 // ---------------------------------------------------------------------------
