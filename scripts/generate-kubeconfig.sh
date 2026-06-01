@@ -35,7 +35,9 @@ if [ ! -f "$CA_CERT" ]; then
     exit 1
 fi
 
-CA_DATA="$(base64 -w0 < "$CA_CERT")"
+# `base64 -w0` is a GNU coreutils extension; macOS/BSD base64 rejects -w.
+# Strip newlines with tr instead so this works on both GNU and BSD.
+CA_DATA="$(base64 < "$CA_CERT" | tr -d '\n')"
 mkdir -p "$(dirname "$KUBECONFIG_OUT")"
 
 # Back up an existing kubeconfig so a user can recover if they ran this

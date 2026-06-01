@@ -55,6 +55,15 @@ if ! check_command "cargo"; then
     MISSING_DEPS=1
 fi
 
+# protoc is required for host-side `cargo build`/`cargo test` (the
+# etcd-client build script compiles .proto files). The containerized
+# cluster builds bring their own protoc, so this is a warning, not a
+# hard failure — but local builds fail without it.
+if ! check_command "protoc"; then
+    print_warning "protoc not found — needed for local 'cargo build'/'cargo test'"
+    echo "  Install with: brew install protobuf"
+fi
+
 # Check for Docker or Podman (prefer Docker on macOS)
 CONTAINER_RUNTIME=""
 if check_command "docker"; then

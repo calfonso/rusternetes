@@ -205,6 +205,14 @@ fi
 step "Ensuring TLS certificates and ServiceAccount signing key..."
 bash "$SCRIPT_DIR/generate-certs.sh"
 
+# ---- kubeconfig -----------------------------------------------------------
+# On a fresh checkout the kubeconfig does not exist yet, so the health check
+# and bootstrap below would fail with "no such file". generate-certs.sh may
+# also have just (re)generated the CA, so regenerate the kubeconfig to embed
+# the current CA and point at the host-published API server.
+step "Writing kubeconfig ($KUBECONFIG_PATH)..."
+KUBECONFIG_OUT="$KUBECONFIG_PATH" bash "$SCRIPT_DIR/generate-kubeconfig.sh" >/dev/null
+
 # ---- build ----------------------------------------------------------------
 if [[ "$DO_BUILD" == 1 ]]; then
     step "Building container images..."
