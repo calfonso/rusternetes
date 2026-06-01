@@ -389,3 +389,241 @@ async fn test_pod_missing_metadata_reports_clear_error() {
         body
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. ReplicationControllerStatus.replicas: i32 Go-parity decode fix.
+//
+//    Conformance tests (e.g. sig-apps ReplicationController lifecycle,
+//    sig-api-machinery GarbageCollector) create RCs whose serialised body
+//    includes a `status` sub-object that omits `replicas` (they only send
+//    `readyReplicas`/`availableReplicas`).  Go leaves the missing `int32`
+//    at its zero value; our required `i32` errored with 400 BadRequest
+//    "missing field `replicas`" — blocking ~30 conformance specs.
+//
+//    Upstream Go type: `ReplicationControllerStatus.Replicas int32 json:"replicas"`
+//    (no omitempty) → zero-value 0 when absent; fixed with `#[serde(default)]`.
+// ---------------------------------------------------------------------------
+
+/// RC body where `status.replicas` is absent must decode with `replicas == 0`.
+/// Reproduces the 30-occurrence "missing field `replicas`" failure from the
+/// 2026-05-31 conformance run (e.g. garbage_collector.go:734, rc.go:158).
+#[tokio::test]
+async fn test_rc_status_without_replicas_decodes() {
+    let router = spawn_router();
+
+    // Shape: status present but replicas field absent (only readyReplicas + availableReplicas).
+    let rc = json!({
+        "kind": "ReplicationController",
+        "apiVersion": "v1",
+        "metadata": {
+            "name": "gc-test-rc",
+            "namespace": "default",
+            "labels": {"app": "gc-test"},
+            "creationTimestamp": null
+        },
+        "spec": {
+            "replicas": 1,
+            "selector": {"app": "gc-test"},
+            "template": {
+                "metadata": {
+                    "labels": {"app": "gc-test"},
+                    "creationTimestamp": null
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "c",
+                        "image": "registry.k8s.io/e2e-test-images/busybox:1.36.1-2",
+                        "resources": {}
+                    }],
+                    "restartPolicy": "Always",
+                    "terminationGracePeriodSeconds": 30,
+                    "dnsPolicy": "ClusterFirst",
+                    "securityContext": {},
+                    "schedulerName": "default-scheduler"
+                }
+            }
+        },
+        // status.replicas absent — the conformance-test shape that previously 400'd.
+        "status": {
+            "readyReplicas": 0,
+            "availableReplicas": 0
+        }
+    });
+
+    let (status, body) = send_json(
+        router,
+        Method::POST,
+        "/api/v1/namespaces/default/replicationcontrollers",
+        &rc,
+    )
+    .await;
+
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("missing field"),
+        "RC with partial status must not fail with missing field (status {}): {}",
+        status,
+        body
+    );
+    assert!(
+        status.is_success(),
+        "RC with status missing replicas should be accepted (replicas defaults to 0), got {}: {}",
+        status,
+        body
+    );
+    // Confirm that replicas was decoded as 0 (Go zero-value parity)
+    let status_replicas = body["status"]["replicas"].as_i64().unwrap_or(-1);
+    assert_eq!(
+        status_replicas, 0,
+        "status.replicas absent on wire must decode as 0: {}",
+        body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. SubjectAccessReview.spec: SubjectAccessReviewSpec Go-parity decode fix.
+//
+//    sig-auth SubjectReview conformance test posts a SubjectAccessReview with
+//    only apiVersion/kind/metadata but NO spec field. Go leaves the struct
+//    at zero value; our required field errored with 422 "missing field `spec`".
+//
+//    Upstream: SubjectAccessReviewSpec has all-optional fields (user/groups/etc.)
+//    and the spec itself is not pointer-typed in Go, but json.Unmarshal leaves
+//    it at zero. Fixed by adding #[serde(default)] + Default derive.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_subject_access_review_without_spec_decodes() {
+    let router = spawn_router();
+
+    // Minimal SubjectAccessReview with no spec — the conformance-test shape
+    // that previously 422'd with "missing field `spec`".
+    let sar = json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SubjectAccessReview",
+        "metadata": {}
+    });
+
+    let (status, body) = send_json(
+        router,
+        Method::POST,
+        "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+        &sar,
+    )
+    .await;
+
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("missing field"),
+        "SubjectAccessReview without spec must not fail with missing-field (status {}): {}",
+        status,
+        body
+    );
+    // The request decodes successfully — the "missing field `spec`" error is gone.
+    // The handler may still reject with a validation error (e.g. missing
+    // resourceAttributes/nonResourceAttributes), but that is NOT a decode error.
+    assert!(
+        msg != "failed to decode: missing field `spec` at line 1 column 83",
+        "SAR must not 400 with raw serde error, got {}: {}",
+        status,
+        body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. ControllerRevision.metadata Go-parity decode fix.
+//
+//    sig-apps ControllerRevision conformance test posts a ControllerRevision
+//    where metadata is an empty object {}. Our required ObjectMeta field
+//    errored with 422 "missing field `metadata`" at the position of the
+//    closing `}` of the payload.
+//
+//    Upstream: metav1.ObjectMeta zero-value is valid; fixed with #[serde(default)].
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_controller_revision_without_metadata_decodes() {
+    let router = spawn_router();
+
+    // ControllerRevision with empty metadata — the shape that previously 422'd.
+    let cr = json!({
+        "apiVersion": "apps/v1",
+        "kind": "ControllerRevision",
+        "metadata": {"name": "rev-1", "namespace": "default"},
+        "revision": 1
+    });
+
+    let (status, body) = send_json(
+        router,
+        Method::POST,
+        "/apis/apps/v1/namespaces/default/controllerrevisions",
+        &cr,
+    )
+    .await;
+
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("missing field"),
+        "ControllerRevision must not fail with missing-field (status {}): {}",
+        status,
+        body
+    );
+    assert!(
+        status.is_success(),
+        "ControllerRevision should be accepted, got {}: {}",
+        status,
+        body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. FlowSchema NonResourcePolicyRule.nonResourceURLs Go-parity decode fix.
+//
+//    sig-api-machinery FlowControl conformance test posts a FlowSchema whose
+//    spec.rules[0].nonResourceRules[0] omits nonResourceURLs. Go leaves the
+//    field at [] (empty slice); our required Vec<String> errored with 422
+//    "missing field `nonResourceURLs`".
+//
+//    Upstream: []string json:"nonResourceURLs" — absent leaves empty slice;
+//    fixed with #[serde(default)].
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_flow_schema_non_resource_rule_without_urls_decodes() {
+    let router = spawn_router();
+
+    // FlowSchema with nonResourceRules that omit nonResourceURLs.
+    let fs = json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": {"name": "test-flow-schema"},
+        "spec": {
+            "priorityLevelConfiguration": {"name": "exempt"},
+            "matchingPrecedence": 1,
+            "rules": [{
+                "subjects": [{"kind": "User", "user": {"name": "system:admin"}}],
+                "nonResourceRules": [{
+                    "verbs": ["get"]
+                    // nonResourceURLs intentionally absent
+                }]
+            }]
+        }
+    });
+
+    let (status, body) = send_json(
+        router,
+        Method::POST,
+        "/apis/flowcontrol.apiserver.k8s.io/v1/flowschemas",
+        &fs,
+    )
+    .await;
+
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("missing field"),
+        "FlowSchema with missing nonResourceURLs must not fail with missing-field \
+         (status {}): {}",
+        status,
+        body
+    );
+}
