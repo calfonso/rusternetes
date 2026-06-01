@@ -327,13 +327,33 @@ pub fn find_duplicate_json_key_public(json_str: &str) -> Option<String> {
     find_duplicate_json_key(json_str)
 }
 
-/// Returns true if the JSON value is an object containing no entries.
-/// Mirrors the empty-Go-struct shape (`{}`) that client-go emits when a
-/// nested message has all zero-valued fields — our typed deserialiser
-/// collapses these to `None` and the round-trip drops the key, so the
-/// strict differ must treat them the same as `null`.
-fn is_empty_object(value: &serde_json::Value) -> bool {
-    matches!(value, serde_json::Value::Object(map) if map.is_empty())
+/// Returns true if `value` is one that our resource structs' `skip_serializing_if`
+/// helpers legitimately DROP on serialize: `null` (`Option::is_none`), `false`
+/// (`skip_false_or_none`), `""` (`skip_empty_string`), `[]` (`skip_empty_vec`),
+/// and `{}` (`skip_empty_map` / collapsed empty struct).
+///
+/// When the canonical round-trip omits a key whose original value is one of
+/// these, the absence is AMBIGUOUS — it could be a genuinely-unknown field OR a
+/// known field whose zero value was dropped. The diff-based detector cannot
+/// tell the two apart, so it must defer to the schema-aware (`serde_ignored`)
+/// pass, which inspects the target type's field declarations directly and never
+/// mistakes a modelled-but-zero-valued field (e.g. JSONSchemaProps'
+/// `exclusiveMaximum: false`) for an unknown one. Without this, a CRD whose
+/// validation schema explicitly sets such fields to their zero value was
+/// rejected with a spurious `strict decoding error: unknown field ...`.
+///
+/// Numbers are intentionally excluded: no struct field drops a numeric zero
+/// (those use `Option::is_none`, not a value-based skip), so an omitted numeric
+/// key genuinely is unknown.
+fn is_droppable_default(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::Number(_) => false,
+    }
 }
 
 /// Render a `serde_ignored::Path` chain into the dotted+bracket format the
@@ -437,11 +457,14 @@ fn find_unknown_fields_via_diff(
                 };
                 if let Some(canon_val) = canon_map.get(key) {
                     find_unknown_fields_via_diff(orig_val, canon_val, &field_path, unknown);
-                } else if orig_val.is_null() || is_empty_object(orig_val) {
-                    // Ambiguous case — let the schema-aware helper decide
-                    // (it sees `Option<...>` field declarations directly
-                    // via serde and won't be fooled by the round-trip
-                    // dropping `None` values).
+                } else if is_droppable_default(orig_val) {
+                    // Ambiguous case — the canonical round-trip dropped this key,
+                    // but its value (null / false / "" / [] / {}) is exactly what
+                    // a `skip_serializing_if` helper drops for a KNOWN field. Let
+                    // the schema-aware helper decide: it reads the target type's
+                    // field declarations directly via serde and won't be fooled
+                    // by a modelled-but-zero-valued field whose round-trip drops
+                    // the key (e.g. JSONSchemaProps' `exclusiveMaximum: false`).
                 } else {
                     unknown.push(field_path);
                 }
@@ -709,6 +732,95 @@ pub fn validate_resource_name(name: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CRD whose validation schema sets standard JSON-Schema fields to their
+    /// zero value (`exclusiveMaximum: false`, `nullable: false`,
+    /// `x-kubernetes-int-or-string: false`, `uniqueItems: false`) and uses an
+    /// array property with `items` must pass strict field validation — those
+    /// fields ARE modelled on JSONSchemaProps. They were falsely reported as
+    /// `unknown field` because the diff-based detector re-serialises the parsed
+    /// CRD (which drops `false`/empty values via `skip_serializing_if`) and
+    /// flagged every dropped-but-known key.
+    ///
+    /// Reproduces the CustomResourcePublishOpenAPI / CustomResourceDefinition /
+    /// FieldValidation conformance cluster, all of which failed at CRD creation
+    /// with `strict decoding error: unknown field
+    /// "spec.versions[0].schema.openAPIV3Schema.exclusiveMaximum", ...`.
+    #[test]
+    fn crd_with_zero_valued_schema_fields_passes_strict() {
+        use rusternetes_common::resources::CustomResourceDefinition;
+
+        let body = br#"{
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foos.stable.example.com"},
+            "spec": {
+                "group": "stable.example.com",
+                "names": {"plural": "foos", "singular": "foo", "kind": "Foo", "listKind": "FooList"},
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "nullable": false,
+                            "exclusiveMaximum": false,
+                            "exclusiveMinimum": false,
+                            "uniqueItems": false,
+                            "x-kubernetes-int-or-string": false,
+                            "x-kubernetes-embedded-resource": false,
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "nullable": false,
+                                    "exclusiveMaximum": false,
+                                    "properties": {
+                                        "cronSpec": {"type": "string", "nullable": false, "exclusiveMaximum": false},
+                                        "bars": {
+                                            "description": "List of Bars and their specs.",
+                                            "type": "array",
+                                            "nullable": false,
+                                            "items": {
+                                                "type": "object",
+                                                "nullable": false,
+                                                "uniqueItems": false,
+                                                "x-kubernetes-int-or-string": false,
+                                                "required": ["name"],
+                                                "properties": {
+                                                    "name": {"type": "string", "nullable": false},
+                                                    "feeling": {"type": "string", "enum": ["Great", "Down"]},
+                                                    "bazs": {
+                                                        "description": "List of Bazs.",
+                                                        "type": "array",
+                                                        "nullable": false,
+                                                        "items": {"type": "string", "nullable": false}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        }"#;
+
+        let parsed: CustomResourceDefinition =
+            serde_json::from_slice(body).expect("CRD must deserialize");
+        let mut params = HashMap::new();
+        params.insert("fieldValidation".to_string(), "Strict".to_string());
+
+        let result = validate_strict_fields(&params, body, &parsed);
+        assert!(
+            result.is_ok() && result.as_ref().unwrap().is_empty(),
+            "CRD with zero-valued JSONSchemaProps fields must pass strict validation, got: {:?}",
+            result
+        );
+    }
 
     #[test]
     fn test_valid_names() {
