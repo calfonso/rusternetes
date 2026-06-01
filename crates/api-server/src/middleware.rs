@@ -1261,10 +1261,15 @@ fn kind_has_table_converter(kind: &str) -> bool {
 }
 
 /// Convert a single object or List into a `meta.k8s.io/v1.Table`.
-/// Upstream's Table builder picks columnDefinitions per resource type;
-/// rusternetes ships the minimum columns kubectl needs (Name, Age) plus
-/// the underlying object in each row so callers can still introspect.
+///
+/// Column and row definitions come from the canonical printers in
+/// [`crate::handlers::table`], the same source the resource LIST handlers use,
+/// so a single-resource GET (which lands here) renders identically to its LIST
+/// — including the `-o wide` columns. Kinds without a rich printer fall back to
+/// the minimal NAME/AGE table.
 fn convert_to_table(value: serde_json::Value) -> serde_json::Value {
+    use crate::handlers::table;
+
     let (items, list_metadata) = extract_items(&value);
     let kind_hint = items
         .first()
@@ -1272,11 +1277,21 @@ fn convert_to_table(value: serde_json::Value) -> serde_json::Value {
         .and_then(|k| k.as_str())
         .or_else(|| value.get("kind").and_then(|k| k.as_str()))
         .unwrap_or("");
-    let columns = table_columns_for(kind_hint);
+
+    let columns = match table::printer_columns(kind_hint) {
+        Some(cols) => serde_json::to_value(cols).unwrap_or_else(|_| generic_table_columns()),
+        None => generic_table_columns(),
+    };
+
     let rows: Vec<serde_json::Value> = items
         .iter()
-        .map(|obj| table_row_for(kind_hint, obj))
+        .map(|obj| {
+            let cells = table::printer_row_cells(kind_hint, obj)
+                .unwrap_or_else(|| generic_table_cells(obj));
+            serde_json::json!({ "cells": cells, "object": obj })
+        })
         .collect();
+
     serde_json::json!({
         "kind": "Table",
         "apiVersion": "meta.k8s.io/v1",
@@ -1284,6 +1299,29 @@ fn convert_to_table(value: serde_json::Value) -> serde_json::Value {
         "columnDefinitions": columns,
         "rows": rows,
     })
+}
+
+/// Minimal NAME/AGE columns for kinds without a dedicated printer.
+fn generic_table_columns() -> serde_json::Value {
+    serde_json::json!([
+        {"name": "Name", "type": "string", "format": "name", "description": "Name of the resource", "priority": 0},
+        {"name": "Age", "type": "string", "format": "", "description": "Time since creation", "priority": 0},
+    ])
+}
+
+/// Minimal NAME/AGE cells for kinds without a dedicated printer.
+fn generic_table_cells(obj: &serde_json::Value) -> Vec<serde_json::Value> {
+    let name = obj
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let creation = obj
+        .get("metadata")
+        .and_then(|m| m.get("creationTimestamp"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    vec![serde_json::Value::String(name.into()), creation]
 }
 
 /// Convert a single object into a `meta.k8s.io/v1.PartialObjectMetadata`
@@ -1342,57 +1380,6 @@ fn extract_items(value: &serde_json::Value) -> (Vec<serde_json::Value>, serde_js
     } else {
         (vec![value.clone()], serde_json::json!({}))
     }
-}
-
-/// Default column set for a Table row. Kubernetes' apiserver ships
-/// per-kind printer columns; rusternetes returns the minimum that
-/// kubectl's columnar output needs to render. Resource-specific
-/// printers can extend this table without changing the surrounding
-/// negotiation surface.
-fn table_columns_for(kind: &str) -> serde_json::Value {
-    match kind {
-        "Pod" | "PodList" => serde_json::json!([
-            {"name": "Name", "type": "string", "format": "name", "description": "Name of the pod"},
-            {"name": "Status", "type": "string", "description": "Pod phase"},
-            {"name": "Age", "type": "date", "description": "Time since creation"},
-        ]),
-        _ => serde_json::json!([
-            {"name": "Name", "type": "string", "format": "name", "description": "Name of the resource"},
-            {"name": "Age", "type": "date", "description": "Time since creation"},
-        ]),
-    }
-}
-
-fn table_row_for(kind: &str, obj: &serde_json::Value) -> serde_json::Value {
-    let name = obj
-        .get("metadata")
-        .and_then(|m| m.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let creation = obj
-        .get("metadata")
-        .and_then(|m| m.get("creationTimestamp"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let cells: Vec<serde_json::Value> = match kind {
-        "Pod" | "PodList" => {
-            let phase = obj
-                .get("status")
-                .and_then(|s| s.get("phase"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            vec![
-                serde_json::Value::String(name.into()),
-                serde_json::Value::String(phase.into()),
-                creation,
-            ]
-        }
-        _ => vec![serde_json::Value::String(name.into()), creation],
-    };
-    serde_json::json!({
-        "cells": cells,
-        "object": obj,
-    })
 }
 
 /// Extract apiVersion and kind from JSON bytes without full parsing.
