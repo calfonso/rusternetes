@@ -147,7 +147,6 @@ async fn assert_pod_rejected(router: axum::Router, ns: &str, pod_body: &Value, s
 //   with `.spec.containers[*].securityContext.privileged == true`.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "RED-state: PodSecurityAdmission is a stub (allow-all)"]
 async fn psp_privileged_containers_blocked() {
     let (router, _mem) = spawn_router();
     let ns = "psa-privileged";
@@ -176,7 +175,6 @@ async fn psp_privileged_containers_blocked() {
 // host namespace fields. `restricted` is a strict superset.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "RED-state: PodSecurityAdmission is a stub (allow-all)"]
 async fn psp_host_namespaces() {
     let (router, _mem) = spawn_router();
     let ns = "psa-host-ns";
@@ -235,7 +233,6 @@ async fn psp_host_namespaces() {
 // `hostPath`, `nfs`, `iscsi`, etc. volume must be rejected.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "RED-state: PodSecurityAdmission is a stub (allow-all)"]
 async fn psp_volume_types() {
     let (router, _mem) = spawn_router();
     let ns = "psa-volumes";
@@ -275,7 +272,6 @@ async fn psp_volume_types() {
 // (root) or omits `runAsNonRoot` while running as UID 0 must be rejected.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "RED-state: PodSecurityAdmission is a stub (allow-all)"]
 async fn psp_run_as_user() {
     let (router, _mem) = spawn_router();
     let ns = "psa-runasuser";
@@ -330,7 +326,6 @@ async fn psp_run_as_user() {
 // rejected — silence is not consent.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "RED-state: PodSecurityAdmission is a stub (allow-all)"]
 async fn psp_restricted_requires_run_as_non_root() {
     let (router, _mem) = spawn_router();
     let ns = "psa-runasnonroot";
@@ -361,7 +356,6 @@ async fn psp_restricted_requires_run_as_non_root() {
 // set it true must be rejected.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "RED-state: PodSecurityAdmission is a stub (allow-all)"]
 async fn psp_restricted_forbids_privilege_escalation() {
     let (router, _mem) = spawn_router();
     let ns = "psa-privesc";
