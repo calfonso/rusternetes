@@ -730,7 +730,23 @@ pub fn build_thresholds(
     out
 }
 
-/// Determine QoS class for a pod
+/// Determine QoS class for a pod.
+///
+/// Mirrors upstream Kubernetes' `ComputePodQOS`
+/// (`pkg/apis/core/v1/helper/qos/qos.go`):
+///
+/// - **BestEffort** – no container (init or regular) requests or limits any
+///   CPU/memory.
+/// - **Guaranteed** – every container has explicit CPU **and** memory limits
+///   and the effective requests equal those limits for every resource. A
+///   container that sets limits but no requests is treated as if its requests
+///   equal its limits (upstream defaults a missing request to the limit).
+/// - **Burstable** – has some requests/limits but does not qualify as
+///   Guaranteed.
+///
+/// Both `spec.containers` and `spec.init_containers` participate in the
+/// classification. Ephemeral containers are excluded (they cannot declare
+/// resources).
 pub fn get_qos_class(pod: &Pod) -> QoSClass {
     let spec = match &pod.spec {
         Some(s) => s,
@@ -741,31 +757,55 @@ pub fn get_qos_class(pod: &Pod) -> QoSClass {
     let mut has_requests = false;
     let mut all_guaranteed = true;
 
-    for container in &spec.containers {
-        if let Some(ref resources) = container.resources {
-            if let Some(ref limits) = resources.limits {
+    // Upstream folds init containers into the same set as regular containers.
+    let all_containers = spec
+        .containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten());
+
+    for container in all_containers {
+        let resources = match &container.resources {
+            Some(r) => r,
+            None => {
+                // No resources at all: cannot be Guaranteed.
+                all_guaranteed = false;
+                continue;
+            }
+        };
+
+        // A container is Guaranteed only when it declares both CPU and memory
+        // limits.
+        match &resources.limits {
+            Some(limits) => {
                 has_limits = true;
                 if !limits.contains_key("cpu") || !limits.contains_key("memory") {
                     all_guaranteed = false;
                 }
-            } else {
-                all_guaranteed = false;
             }
+            None => all_guaranteed = false,
+        }
 
-            if let Some(ref requests) = resources.requests {
+        // Effective requests default to the limits when requests are absent
+        // (upstream defaults a missing request to the matching limit before
+        // classifying, so a limits-only container is Guaranteed).
+        match (&resources.requests, &resources.limits) {
+            (Some(requests), Some(limits)) => {
                 has_requests = true;
-                if let Some(ref limits) = resources.limits {
-                    if requests != limits {
-                        all_guaranteed = false;
-                    }
-                } else {
+                if requests != limits {
                     all_guaranteed = false;
                 }
-            } else {
+            }
+            (Some(_requests), None) => {
+                has_requests = true;
+                // Requests without limits can never be Guaranteed.
                 all_guaranteed = false;
             }
-        } else {
-            all_guaranteed = false;
+            (None, Some(_limits)) => {
+                // Limits-only: treat requests as equal to limits. This still
+                // counts as having requests for the Guaranteed check.
+                has_requests = true;
+            }
+            (None, None) => all_guaranteed = false,
         }
     }
 

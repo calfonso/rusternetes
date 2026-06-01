@@ -1,39 +1,23 @@
 //! Unit tests for Pod QoS class determination.
 //!
-//! These tests pin the behaviour of [`rusternetes_kubelet::eviction::get_qos_class`].
-//! The high-level algorithm is modelled on upstream Kubernetes' `GetPodQOS` in
+//! These tests pin the behaviour of [`rusternetes_kubelet::eviction::get_qos_class`],
+//! which mirrors upstream Kubernetes' `ComputePodQOS` in
 //! <https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/v1/helper/qos/qos.go>
 //! (test suite at
-//! <https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/v1/helper/qos/qos_test.go>),
-//! but the Rusternetes implementation is **not** a faithful port — see the
-//! divergences below. Only cases that genuinely match upstream carry a
-//! `Mirrors:` reference.
+//! <https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/v1/helper/qos/qos_test.go>).
 //!
 //! `get_qos_class` classifies a pod into one of three QoS classes, inspecting
-//! **only the regular (app) containers in `spec.containers`**:
+//! both the regular containers in `spec.containers` **and** the init containers
+//! in `spec.init_containers` (ephemeral containers are excluded — they cannot
+//! declare resources):
 //!
-//! - **Guaranteed** – every app container has explicit CPU **and** memory
-//!   limits, AND explicit requests, AND requests equal limits for every
-//!   resource.
-//! - **Burstable** – at least one app container has some resource request or
-//!   limit, but the pod does not qualify as Guaranteed. In particular, a
-//!   container with limits but **no** requests is **Burstable** here: the
-//!   function requires both to be set explicitly and does not apply the
-//!   "missing request defaults to the limit" rule before classifying.
-//! - **BestEffort** – no app container has any resource requests or limits.
-//!
-//! ## Known divergences from upstream Go
-//!
-//! 1. **Init / sidecar containers are ignored.** Upstream `GetPodQOS` folds
-//!    init containers into the QoS calculation; `get_qos_class` only inspects
-//!    `spec.containers`. The `#[ignore]`d tests below assert the
-//!    upstream-correct expectation and document the gap; companion live tests
-//!    assert the actual current Rusternetes behaviour so the divergence is
-//!    visible rather than hidden.
-//! 2. **Requests do not default to limits.** Upstream defaults a missing
-//!    request to the matching limit before classifying, so a limits-only
-//!    container is Guaranteed upstream. `get_qos_class` treats a missing
-//!    request as non-Guaranteed, yielding Burstable.
+//! - **Guaranteed** – every container has explicit CPU **and** memory limits,
+//!   and its effective requests equal those limits for every resource. A
+//!   container that sets limits but no requests is treated as if its requests
+//!   equal its limits (upstream defaults a missing request to the limit).
+//! - **Burstable** – at least one container has some resource request or limit,
+//!   but the pod does not qualify as Guaranteed.
+//! - **BestEffort** – no container has any resource requests or limits.
 
 use rusternetes_common::resources::{Container, EphemeralContainer, PodSpec};
 use rusternetes_common::resources::{Pod, PodStatus};
@@ -98,10 +82,9 @@ fn guaranteed_resources(cpu: &str, memory: &str) -> ResourceRequirements {
 
 /// Build a `ResourceRequirements` with only limits set (no explicit requests).
 ///
-/// Upstream Kubernetes would default the missing request to the limit and
-/// classify this as Guaranteed. `get_qos_class` in `eviction.rs` does NOT
-/// apply that defaulting: it requires both requests and limits to be set
-/// explicitly, so a limits-only container is classified Burstable.
+/// `get_qos_class` defaults the missing request to the matching limit before
+/// classifying, so a limits-only container (cpu + memory limits) is
+/// Guaranteed, matching upstream.
 fn limits_only_resources(cpu: &str, memory: &str) -> ResourceRequirements {
     ResourceRequirements {
         requests: None,
@@ -295,11 +278,8 @@ fn guaranteed_multiple_containers_all_matching() {
 
 /// Guaranteed app containers plus Guaranteed init containers → Guaranteed.
 ///
-/// Rusternetes and upstream agree on the *result* here, but for different
-/// reasons: upstream folds the (also-Guaranteed) init container into the
-/// calculation; `get_qos_class` ignores init containers and classifies on the
-/// Guaranteed app container alone. See the `#[ignore]`d divergence tests below
-/// for cases where the two implementations disagree.
+/// `get_qos_class` folds the (also-Guaranteed) init container into the
+/// calculation, matching upstream `ComputePodQOS`.
 #[test]
 fn guaranteed_app_containers_with_guaranteed_init_containers() {
     let app = vec![with_resources(
@@ -398,32 +378,25 @@ fn burstable_requests_only_no_limits() {
     assert_eq!(get_qos_class(&pod), QoSClass::Burstable);
 }
 
-/// DIVERGENCE (live test, current Rusternetes behaviour): a container with
-/// limits but no requests is classified **Burstable** by `get_qos_class`,
-/// because the function requires both requests and limits to be set explicitly
-/// and does not default a missing request to the limit.
+/// A container with a single limits-only entry (cpu + memory limits, no
+/// requests) is **Guaranteed**: `get_qos_class` defaults the missing request to
+/// the matching limit before classifying, matching upstream.
 ///
-/// Upstream Kubernetes classifies this as **Guaranteed** (it defaults the
-/// missing request to the limit first). See
-/// `upstream_limits_only_should_be_guaranteed` below for the upstream-correct
-/// expectation.
-#[test]
-fn burstable_limits_only_no_requests_current_behaviour() {
-    let c = with_resources(make_container("c1"), limits_only_resources("100m", "128Mi"));
-    let pod = make_pod("pod", vec![c], None, None);
-    assert_eq!(get_qos_class(&pod), QoSClass::Burstable);
-}
-
-/// GAP: upstream Kubernetes defaults a missing request to the matching limit
-/// before classifying, so a limits-only container is **Guaranteed**.
-/// `get_qos_class` does not apply that defaulting and returns Burstable, so
-/// this assertion of the upstream-correct expectation currently fails.
-///
-/// Upstream reference: `GetPodQOS` in
+/// Upstream reference: `ComputePodQOS` in
 /// `pkg/apis/core/v1/helper/qos/qos.go`.
 #[test]
-#[ignore = "GAP: Rusternetes get_qos_class does not default missing requests to limits; \
-            upstream pkg/apis/core/v1/helper/qos classifies limits-only as Guaranteed"]
+fn limits_only_one_resource_is_guaranteed() {
+    let c = with_resources(make_container("c1"), limits_only_resources("100m", "128Mi"));
+    let pod = make_pod("pod", vec![c], None, None);
+    assert_eq!(get_qos_class(&pod), QoSClass::Guaranteed);
+}
+
+/// Upstream Kubernetes defaults a missing request to the matching limit before
+/// classifying, so a limits-only container (cpu + memory limits) is
+/// **Guaranteed**. `get_qos_class` mirrors that defaulting.
+///
+/// Mirrors: `ComputePodQOS` in `pkg/apis/core/v1/helper/qos/qos.go`.
+#[test]
 fn upstream_limits_only_should_be_guaranteed() {
     let c = with_resources(make_container("c1"), limits_only_resources("100m", "128Mi"));
     let pod = make_pod("pod", vec![c], None, None);
@@ -492,38 +465,33 @@ fn burstable_one_of_two_containers_not_guaranteed() {
 }
 
 // ---------------------------------------------------------------------------
-// Init-container contribution — DIVERGENCE from upstream
+// Init-container contribution
 //
-// Upstream `GetPodQOS` (pkg/apis/core/v1/helper/qos/qos.go) folds init
-// containers into the QoS calculation. Rusternetes' `get_qos_class` looks only
-// at `spec.containers` and ignores init containers entirely. The pairs below
-// pin both sides: a live test asserting the actual current behaviour, and an
-// `#[ignore]`d test asserting the upstream-correct expectation, so the gap is
-// documented rather than silently baked in.
+// Upstream `ComputePodQOS` (pkg/apis/core/v1/helper/qos/qos.go) folds init
+// containers into the QoS calculation alongside regular containers, and
+// `get_qos_class` mirrors that: init containers participate in the
+// classification.
 // ---------------------------------------------------------------------------
 
-/// LIVE (current Rusternetes behaviour): a BestEffort app container with a
-/// Guaranteed init container stays BestEffort, because init containers are
-/// ignored by `get_qos_class`.
+/// A BestEffort app container with a Guaranteed init container is **Burstable**:
+/// the init container contributes requests/limits, but the app container has
+/// none, so the pod is not Guaranteed. Mirrors upstream.
 #[test]
-fn init_containers_guaranteed_ignored_app_stays_best_effort() {
+fn guaranteed_init_makes_best_effort_app_burstable() {
     let app = vec![make_container("app")]; // no resources
     let init = vec![with_resources(
         make_container("init"),
         guaranteed_resources("100m", "128Mi"),
     )];
     let pod = make_pod("pod", app, Some(init), None);
-    assert_eq!(get_qos_class(&pod), QoSClass::BestEffort);
+    assert_eq!(get_qos_class(&pod), QoSClass::Burstable);
 }
 
-/// GAP (upstream-correct expectation): upstream folds the Guaranteed init
-/// container into the calculation, so a BestEffort app container plus a
-/// Guaranteed init container is **Burstable** (the pod has some requests/limits
-/// overall but not on every container). `get_qos_class` ignores init containers
-/// and returns BestEffort, so this assertion currently fails.
+/// Upstream folds the Guaranteed init container into the calculation, so a
+/// BestEffort app container plus a Guaranteed init container is **Burstable**
+/// (the pod has some requests/limits overall but not on every container).
+/// `get_qos_class` includes init containers and mirrors this.
 #[test]
-#[ignore = "GAP: Rusternetes QoS ignores init containers; \
-            upstream pkg/apis/core/v1/helper/qos includes them"]
 fn upstream_guaranteed_init_makes_best_effort_app_burstable() {
     let app = vec![make_container("app")]; // no resources
     let init = vec![with_resources(
@@ -534,11 +502,11 @@ fn upstream_guaranteed_init_makes_best_effort_app_burstable() {
     assert_eq!(get_qos_class(&pod), QoSClass::Burstable);
 }
 
-/// LIVE (current Rusternetes behaviour): a Guaranteed app container with a
-/// Burstable init container stays Guaranteed, because init containers are
-/// ignored by `get_qos_class`.
+/// A Guaranteed app container with a Burstable init container is **Burstable**:
+/// the init container's mismatched requests/limits downgrade the whole pod.
+/// Mirrors upstream.
 #[test]
-fn init_containers_burstable_ignored_app_stays_guaranteed() {
+fn burstable_init_downgrades_guaranteed_app_to_burstable() {
     let app = vec![with_resources(
         make_container("app"),
         guaranteed_resources("100m", "128Mi"),
@@ -548,16 +516,13 @@ fn init_containers_burstable_ignored_app_stays_guaranteed() {
         burstable_resources("50m", "64Mi", "100m", "128Mi"),
     )];
     let pod = make_pod("pod", app, Some(init), None);
-    assert_eq!(get_qos_class(&pod), QoSClass::Guaranteed);
+    assert_eq!(get_qos_class(&pod), QoSClass::Burstable);
 }
 
-/// GAP (upstream-correct expectation): upstream folds the Burstable init
-/// container into the calculation, so a Guaranteed app container plus a
-/// Burstable init container is **Burstable**. `get_qos_class` ignores init
-/// containers and returns Guaranteed, so this assertion currently fails.
+/// Upstream folds the Burstable init container into the calculation, so a
+/// Guaranteed app container plus a Burstable init container is **Burstable**.
+/// `get_qos_class` includes init containers and mirrors this.
 #[test]
-#[ignore = "GAP: Rusternetes QoS ignores init containers; \
-            upstream pkg/apis/core/v1/helper/qos includes them"]
 fn upstream_burstable_init_downgrades_guaranteed_app_to_burstable() {
     let app = vec![with_resources(
         make_container("app"),
@@ -579,11 +544,10 @@ fn upstream_burstable_init_downgrades_guaranteed_app_to_burstable() {
 // ---------------------------------------------------------------------------
 
 /// Table-driven sweep covering all three QoS classes with multiple container
-/// configurations, asserting the **current** `get_qos_class` behaviour in a
-/// single pass. Structured like upstream's table-driven `TestGetPodQOS`
-/// (<https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/v1/helper/qos/qos_test.go>),
-/// but the "limits only" row encodes the Rusternetes divergence (Burstable),
-/// not the upstream result (Guaranteed).
+/// configurations in a single pass. Structured like upstream's table-driven
+/// `TestGetPodQOS`
+/// (<https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/v1/helper/qos/qos_test.go>);
+/// `get_qos_class` mirrors upstream, so the "limits only" row is Guaranteed.
 #[test]
 fn qos_classify_table() {
     struct Case {
@@ -633,12 +597,12 @@ fn qos_classify_table() {
             expected: QoSClass::Burstable,
         },
         Case {
-            label: "limits only → Burstable (Rusternetes divergence; upstream Guaranteed)",
+            label: "limits only → Guaranteed (missing requests default to limits)",
             containers: vec![with_resources(
                 make_container("c"),
                 limits_only_resources("100m", "128Mi"),
             )],
-            expected: QoSClass::Burstable,
+            expected: QoSClass::Guaranteed,
         },
         Case {
             label: "requests < limits → Burstable",
