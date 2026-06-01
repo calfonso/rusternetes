@@ -374,56 +374,13 @@ pub async fn create(
         }
     }
 
-    // Check PodSecurity admission — enforce namespace pod security standard.
-    //
-    // The PodSecurityAdmission plugin is intentionally an allow-all stub for
-    // now (see `admission::PodSecurityAdmission`). The inline enforcement
-    // below covers a subset of the upstream contract (privileged + host
-    // namespaces) until the stub grows into the full enforcer.
+    // Check PodSecurity admission — enforce the namespace's Pod Security
+    // Standard (privileged / baseline / restricted). All enforcement lives in
+    // `admission::PodSecurityAdmission::admit`, the single PSA enforcement
+    // path.
     {
         let psa = crate::admission::PodSecurityAdmission::new();
         psa.admit(&state.storage, &namespace, &pod).await?;
-    }
-    {
-        let ns_key = rusternetes_storage::build_key("namespaces", None, &namespace);
-        if let Ok(ns) = state
-            .storage
-            .get::<rusternetes_common::resources::Namespace>(&ns_key)
-            .await
-        {
-            let enforce_level = ns
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get("pod-security.kubernetes.io/enforce"))
-                .map(|s| s.as_str())
-                .unwrap_or("privileged");
-            if enforce_level == "restricted" || enforce_level == "baseline" {
-                if let Some(spec) = &pod.spec {
-                    // Check for privileged containers
-                    for c in &spec.containers {
-                        if let Some(sc) = &c.security_context {
-                            if sc.privileged == Some(true) {
-                                return Err(rusternetes_common::Error::Forbidden(format!(
-                                    "pod {} violates PodSecurity \"{}\": privileged containers are not allowed",
-                                    pod.metadata.name, enforce_level
-                                )));
-                            }
-                        }
-                    }
-                    // Check for host namespaces
-                    if spec.host_network == Some(true)
-                        || spec.host_pid == Some(true)
-                        || spec.host_ipc == Some(true)
-                    {
-                        return Err(rusternetes_common::Error::Forbidden(format!(
-                            "pod {} violates PodSecurity \"{}\": host namespaces are not allowed",
-                            pod.metadata.name, enforce_level
-                        )));
-                    }
-                }
-            }
-        }
     }
 
     // Check RuntimeClass exists if specified, and inject overhead

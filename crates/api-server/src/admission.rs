@@ -1290,18 +1290,153 @@ impl PodSecurityAdmission {
     /// Evaluate a pod against the namespace's enforced Pod Security
     /// Standard.
     ///
-    /// Returns `Ok(())` to admit the pod, `Err(Forbidden)` to reject. The
-    /// current implementation is a stub that admits every pod regardless of
-    /// the namespace label — the RED-state tests in
-    /// `tests/pod_security_admission_test.rs` pin the upstream contract that
-    /// this stub does not yet honour.
+    /// Returns `Ok(())` to admit the pod, `Err(Forbidden)` to reject.
+    ///
+    /// Enforcement keys off the namespace's
+    /// `pod-security.kubernetes.io/enforce` label. An absent label or
+    /// `privileged` admits everything. `baseline` and `restricted` apply the
+    /// baseline check set (no privileged containers, no host namespaces, no
+    /// hostPath volumes); `restricted` additionally requires non-root
+    /// execution and forbids privilege escalation.
+    ///
+    /// Upstream parity:
+    /// `staging/src/k8s.io/pod-security-admission/policy/` (release-1.35).
     pub async fn admit<S: Storage>(
         &self,
-        _storage: &Arc<S>,
-        _namespace: &str,
-        _pod: &Pod,
+        storage: &Arc<S>,
+        namespace: &str,
+        pod: &Pod,
     ) -> Result<(), rusternetes_common::Error> {
-        // Stub: allow-all. See struct docs for the enforcement roadmap.
+        let ns_key = rusternetes_storage::build_key("namespaces", None, namespace);
+        let level = match storage
+            .get::<rusternetes_common::resources::Namespace>(&ns_key)
+            .await
+        {
+            Ok(ns) => ns
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("pod-security.kubernetes.io/enforce"))
+                .cloned()
+                .unwrap_or_else(|| "privileged".to_string()),
+            // If the namespace can't be read, fall back to allow-all rather
+            // than blocking pod creation on a storage hiccup.
+            Err(_) => "privileged".to_string(),
+        };
+
+        let (baseline, restricted) = match level.as_str() {
+            "restricted" => (true, true),
+            "baseline" => (true, false),
+            // "privileged" or any unknown level: admit everything.
+            _ => (false, false),
+        };
+
+        if !baseline {
+            return Ok(());
+        }
+
+        let Some(spec) = &pod.spec else {
+            return Ok(());
+        };
+        let pod_name = &pod.metadata.name;
+
+        // Iterator over every workload container (regular + init), so the
+        // checks apply uniformly.
+        let regular = spec.containers.iter();
+        let init = spec.init_containers.iter().flatten();
+        let all_security_contexts = regular
+            .chain(init)
+            .map(|c| (c.name.as_str(), c.security_context.as_ref()));
+
+        // --- Baseline: privileged containers ---
+        for (name, sc) in all_security_contexts.clone() {
+            if let Some(sc) = sc {
+                if sc.privileged == Some(true) {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "pod {pod_name} violates PodSecurity \"{level}\": privileged \
+                         (container \"{name}\" must not set securityContext.privileged=true)"
+                    )));
+                }
+            }
+        }
+
+        // --- Baseline: host namespaces ---
+        if spec.host_network == Some(true)
+            || spec.host_pid == Some(true)
+            || spec.host_ipc == Some(true)
+        {
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "pod {pod_name} violates PodSecurity \"{level}\": host namespaces \
+                 (hostNetwork, hostPID, and hostIPC must be unset or false)"
+            )));
+        }
+
+        // --- Baseline: hostPath volumes ---
+        if let Some(volumes) = &spec.volumes {
+            for v in volumes {
+                if v.host_path.is_some() {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "pod {pod_name} violates PodSecurity \"{level}\": hostPath volumes \
+                         (volume \"{}\" uses a forbidden hostPath volume type)",
+                        v.name
+                    )));
+                }
+            }
+        }
+
+        if !restricted {
+            return Ok(());
+        }
+
+        let pod_sc = spec.security_context.as_ref();
+        let pod_run_as_non_root = pod_sc.and_then(|sc| sc.run_as_non_root);
+        let pod_run_as_user = pod_sc.and_then(|sc| sc.run_as_user);
+
+        // --- Restricted: runAsUser must not be 0 (root) ---
+        if pod_run_as_user == Some(0) {
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "pod {pod_name} violates PodSecurity \"{level}\": runAsUser=0 \
+                 (pod must not set securityContext.runAsUser=0)"
+            )));
+        }
+        for (name, sc) in all_security_contexts.clone() {
+            if let Some(sc) = sc {
+                if sc.run_as_user == Some(0) {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "pod {pod_name} violates PodSecurity \"{level}\": runAsUser=0 \
+                         (container \"{name}\" must not set securityContext.runAsUser=0)"
+                    )));
+                }
+            }
+        }
+
+        // --- Restricted: runAsNonRoot must be true (silence is not consent) ---
+        // Satisfied if the pod-level securityContext sets runAsNonRoot=true,
+        // or every container sets it to true. A container with no explicit
+        // value falls back to the pod-level value.
+        if pod_run_as_non_root != Some(true) {
+            for (name, sc) in all_security_contexts.clone() {
+                let effective = sc.and_then(|sc| sc.run_as_non_root).or(pod_run_as_non_root);
+                if effective != Some(true) {
+                    return Err(rusternetes_common::Error::Forbidden(format!(
+                        "pod {pod_name} violates PodSecurity \"{level}\": runAsNonRoot != true \
+                         (pod or container \"{name}\" must set securityContext.runAsNonRoot=true)"
+                    )));
+                }
+            }
+        }
+
+        // --- Restricted: allowPrivilegeEscalation must be false ---
+        for (name, sc) in all_security_contexts {
+            let allowed = sc.and_then(|sc| sc.allow_privilege_escalation);
+            if allowed != Some(false) {
+                return Err(rusternetes_common::Error::Forbidden(format!(
+                    "pod {pod_name} violates PodSecurity \"{level}\": allowPrivilegeEscalation != false \
+                     (container \"{name}\" must set securityContext.allowPrivilegeEscalation=false)"
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1763,5 +1898,103 @@ mod tests {
         };
         let result = validate_max_resources(&resources, &max, "test").unwrap();
         assert!(result, "400m CPU should be within max of 500m");
+    }
+
+    // ----- PodSecurityAdmission allow-case coverage -----
+    //
+    // The reject paths are pinned by the HTTP-level tests in
+    // `tests/pod_security_admission_test.rs`. These unit tests cover the
+    // admit (allow) paths the integration tests don't assert.
+
+    async fn put_namespace<S: Storage>(storage: &Arc<S>, name: &str, enforce: Option<&str>) {
+        let mut labels = std::collections::BTreeMap::new();
+        if let Some(level) = enforce {
+            labels.insert(
+                "pod-security.kubernetes.io/enforce".to_string(),
+                level.to_string(),
+            );
+        }
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": name, "labels": labels },
+        });
+        let ns: rusternetes_common::resources::Namespace = serde_json::from_value(ns).unwrap();
+        let key = rusternetes_storage::build_key("namespaces", None, name);
+        storage.create(&key, &ns).await.unwrap();
+    }
+
+    fn pod_from_spec(name: &str, spec: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": name },
+            "spec": spec,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn psa_privileged_namespace_allows_privileged_pod() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_namespace(&storage, "ns", Some("privileged")).await;
+        let pod = pod_from_spec(
+            "p",
+            serde_json::json!({
+                "hostPID": true,
+                "containers": [{
+                    "name": "main", "image": "busybox",
+                    "securityContext": { "privileged": true },
+                }],
+            }),
+        );
+        PodSecurityAdmission::new()
+            .admit(&storage, "ns", &pod)
+            .await
+            .expect("privileged namespace must admit everything");
+    }
+
+    #[tokio::test]
+    async fn psa_missing_enforce_label_allows() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_namespace(&storage, "ns", None).await;
+        let pod = pod_from_spec(
+            "p",
+            serde_json::json!({
+                "containers": [{
+                    "name": "main", "image": "busybox",
+                    "securityContext": { "privileged": true },
+                }],
+            }),
+        );
+        PodSecurityAdmission::new()
+            .admit(&storage, "ns", &pod)
+            .await
+            .expect("absent enforce label must admit everything");
+    }
+
+    #[tokio::test]
+    async fn psa_restricted_admits_compliant_pod() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_namespace(&storage, "ns", Some("restricted")).await;
+        let pod = pod_from_spec(
+            "p",
+            serde_json::json!({
+                "securityContext": { "runAsNonRoot": true },
+                "volumes": [{ "name": "data", "emptyDir": {} }],
+                "containers": [{
+                    "name": "main", "image": "busybox",
+                    "securityContext": {
+                        "runAsNonRoot": true,
+                        "runAsUser": 1000,
+                        "allowPrivilegeEscalation": false,
+                    },
+                }],
+            }),
+        );
+        PodSecurityAdmission::new()
+            .admit(&storage, "ns", &pod)
+            .await
+            .expect("compliant restricted pod must be admitted");
     }
 }
