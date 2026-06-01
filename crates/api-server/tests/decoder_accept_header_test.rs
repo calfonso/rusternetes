@@ -406,6 +406,62 @@ async fn accept_as_table_returns_table() {
     );
 }
 
+/// A pod LIST whose handler already produced a `kind: "Table"` body (its list
+/// path branches on `wants_table`) must be passed through verbatim — one row
+/// per pod. Regression guard against the response middleware re-wrapping the
+/// whole Table as a single row of an outer generic Table.
+#[tokio::test]
+async fn accept_as_table_pod_list_is_not_double_wrapped() {
+    let (mem, router) = spawn_router();
+    seed_pod(&mem, "pl-a").await;
+    seed_pod(&mem, "pl-b").await;
+
+    let (status, _ct, body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/pods",
+        "application/json;as=Table;v=v1;g=meta.k8s.io",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_slice(&body).expect("Table body is JSON");
+    assert_eq!(v["kind"], "Table", "kind must be Table; got {}", v);
+    let rows = v["rows"].as_array().expect("rows must be array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "pod-list Table must have one row per pod, not one row wrapping the Table; got {}",
+        v
+    );
+    // The inner object of each row is a Pod, never another Table.
+    assert_ne!(
+        rows[0]["object"]["kind"], "Table",
+        "row.object must be the source resource, not a nested Table; got {}",
+        rows[0]
+    );
+}
+
+/// `Accept: application/json;as=Table` for a resource without a registered
+/// Table converter (ConfigMap) must return 406 Not Acceptable, matching the
+/// upstream contract in `test/e2e/apimachinery/table.go`.
+#[tokio::test]
+async fn accept_as_table_returns_406_for_resource_without_converter() {
+    let (_mem, router) = spawn_router();
+
+    let (status, _ct, _body) = get_with_accept(
+        router,
+        "/api/v1/namespaces/default/configmaps",
+        "application/json;as=Table;v=v1;g=meta.k8s.io",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::NOT_ACCEPTABLE,
+        "configmaps have no Table converter; must return 406"
+    );
+}
+
 /// `Accept: application/json;as=PartialObjectMetadata;v=v1;g=meta.k8s.io`.
 /// Upstream strips `spec` and `status`, returning just TypeMeta +
 /// ObjectMeta to keep watch traffic light. Rusternetes' middleware

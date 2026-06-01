@@ -555,7 +555,6 @@ async fn vap_should_validate_against_a_deployment() {
 /// Full CRUD on PriorityLevelConfiguration via
 /// `/apis/flowcontrol.apiserver.k8s.io/v1/prioritylevelconfigurations`.
 #[tokio::test]
-#[ignore = "GAP: PriorityLevelConfiguration CRUD missing from conformance; upstream flowcontrol.go:56"]
 async fn apf_should_support_priority_level_configuration_api_operations() {
     let (router, _mem) = spawn_router();
     let base = "/apis/flowcontrol.apiserver.k8s.io/v1/prioritylevelconfigurations";
@@ -653,7 +652,6 @@ async fn apf_should_support_priority_level_configuration_api_operations() {
 /// Full CRUD on FlowSchema via
 /// `/apis/flowcontrol.apiserver.k8s.io/v1/flowschemas`.
 #[tokio::test]
-#[ignore = "GAP: FlowSchema CRUD missing from conformance; upstream flowcontrol.go:134"]
 async fn apf_should_support_flow_schema_api_operations() {
     let (router, _mem) = spawn_router();
     let base = "/apis/flowcontrol.apiserver.k8s.io/v1/flowschemas";
@@ -871,7 +869,6 @@ async fn watchers_should_restart_from_last_resource_version_observed() {
 /// Rusternetes currently ignores the `as=Table` part of the Accept header
 /// and serves plain JSON, so this test is a GAP marker.
 #[tokio::test]
-#[ignore = "GAP: Table transformer not implemented; server returns 200 JSON instead of 406; upstream table.go:92"]
 async fn table_transformation_should_return_406_for_backend_without_metadata() {
     let (router, _mem) = spawn_router();
 
