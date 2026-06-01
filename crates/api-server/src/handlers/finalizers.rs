@@ -86,78 +86,108 @@ where
     S: Storage,
     T: HasMetadata + Serialize + DeserializeOwned + Clone + Send + Sync,
 {
-    let metadata = resource.metadata();
+    // Retry the finalizer-add update on optimistic-concurrency conflicts. The
+    // `resource` handed to us was read at the start of the delete handler; a
+    // controller (e.g. the RC controller bumping `status`) may bump its
+    // resourceVersion before we write the deletionTimestamp + propagation
+    // finalizer. The etcd backend rejects the stale-RV write with
+    // `Error::Conflict`; upstream performs this as a GuaranteedUpdate that
+    // re-reads and retries. We re-read the latest object each attempt and
+    // re-apply, so a lost CAS race no longer surfaces as a failed DELETE.
+    const MAX_ATTEMPTS: usize = 5;
+    let mut current = resource.clone();
 
-    // If already marked for deletion, handle as before
-    if metadata.deletion_timestamp.is_some() {
-        let has_finalizers = metadata.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+    for attempt in 0..MAX_ATTEMPTS {
+        let metadata = current.metadata();
 
-        if has_finalizers {
-            debug!(
-                "Resource {} already marked for deletion at {:?}, waiting for finalizers to be removed",
-                key, metadata.deletion_timestamp
-            );
-            info!(
-                "Resource {} has {} finalizers remaining: {:?}",
-                key,
-                metadata.finalizers.as_ref().unwrap().len(),
-                metadata.finalizers.as_ref().unwrap()
-            );
-            return Ok(true);
-        } else {
-            // No finalizers left, delete now
-            debug!("Resource {} has no finalizers remaining, deleting", key);
+        // If already marked for deletion, handle as before
+        if metadata.deletion_timestamp.is_some() {
+            let has_finalizers = metadata.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+
+            if has_finalizers {
+                debug!(
+                    "Resource {} already marked for deletion at {:?}, waiting for finalizers to be removed",
+                    key, metadata.deletion_timestamp
+                );
+                info!(
+                    "Resource {} has {} finalizers remaining: {:?}",
+                    key,
+                    metadata.finalizers.as_ref().unwrap().len(),
+                    metadata.finalizers.as_ref().unwrap()
+                );
+                return Ok(true);
+            } else {
+                // No finalizers left, delete now
+                debug!("Resource {} has no finalizers remaining, deleting", key);
+                storage.delete(key).await?;
+                return Ok(false);
+            }
+        }
+
+        // Not yet marked for deletion — apply propagation policy finalizers first
+        let mut updated_resource = current.clone();
+        let meta = updated_resource.metadata_mut();
+
+        // Add propagation policy finalizer if needed
+        match propagation_policy {
+            Some("Foreground") => {
+                let finalizers = meta.finalizers.get_or_insert_with(Vec::new);
+                if !finalizers.contains(&"foregroundDeletion".to_string()) {
+                    finalizers.push("foregroundDeletion".to_string());
+                    info!("Added foregroundDeletion finalizer to {}", key);
+                }
+            }
+            Some("Orphan") => {
+                let finalizers = meta.finalizers.get_or_insert_with(Vec::new);
+                if !finalizers.contains(&"orphan".to_string()) {
+                    finalizers.push("orphan".to_string());
+                    info!("Added orphan finalizer to {}", key);
+                }
+            }
+            _ => {
+                // Background or unspecified — no extra finalizer
+            }
+        }
+
+        // Check if the resource has finalizers (including any we just added)
+        let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+
+        if !has_finalizers {
+            // No finalizers - delete immediately
+            debug!("Resource {} has no finalizers, deleting immediately", key);
             storage.delete(key).await?;
             return Ok(false);
         }
-    }
 
-    // Not yet marked for deletion — apply propagation policy finalizers first
-    let mut updated_resource = resource.clone();
-    let meta = updated_resource.metadata_mut();
+        // Resource has finalizers — set deletionTimestamp and update in storage
+        meta.deletion_timestamp = Some(Utc::now());
 
-    // Add propagation policy finalizer if needed
-    match propagation_policy {
-        Some("Foreground") => {
-            let finalizers = meta.finalizers.get_or_insert_with(Vec::new);
-            if !finalizers.contains(&"foregroundDeletion".to_string()) {
-                finalizers.push("foregroundDeletion".to_string());
-                info!("Added foregroundDeletion finalizer to {}", key);
+        info!(
+            "Resource {} marked for deletion with finalizers: {:?}",
+            key, meta.finalizers
+        );
+
+        match storage.update(key, &updated_resource).await {
+            Ok(_) => return Ok(true),
+            Err(rusternetes_common::Error::Conflict(msg)) if attempt + 1 < MAX_ATTEMPTS => {
+                debug!(
+                    "Conflict marking {} for deletion (attempt {}), re-reading and retrying: {}",
+                    key,
+                    attempt + 1,
+                    msg
+                );
+                // Re-read the latest version so the next attempt's CAS uses a
+                // fresh resourceVersion (and observes any concurrent changes,
+                // including a deletionTimestamp set by another writer).
+                current = storage.get(key).await?;
             }
-        }
-        Some("Orphan") => {
-            let finalizers = meta.finalizers.get_or_insert_with(Vec::new);
-            if !finalizers.contains(&"orphan".to_string()) {
-                finalizers.push("orphan".to_string());
-                info!("Added orphan finalizer to {}", key);
-            }
-        }
-        _ => {
-            // Background or unspecified — no extra finalizer
+            Err(e) => return Err(e),
         }
     }
 
-    // Check if the resource has finalizers (including any we just added)
-    let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
-
-    if !has_finalizers {
-        // No finalizers - delete immediately
-        debug!("Resource {} has no finalizers, deleting immediately", key);
-        storage.delete(key).await?;
-        return Ok(false);
-    }
-
-    // Resource has finalizers — set deletionTimestamp and update in storage
-    meta.deletion_timestamp = Some(Utc::now());
-
-    info!(
-        "Resource {} marked for deletion with finalizers: {:?}",
-        key, meta.finalizers
-    );
-
-    storage.update(key, &updated_resource).await?;
-
-    Ok(true)
+    Err(rusternetes_common::Error::Conflict(format!(
+        "failed to mark {key} for deletion after {MAX_ATTEMPTS} attempts due to repeated conflicts"
+    )))
 }
 
 /// Trait for resources that have metadata with finalizers.
@@ -841,6 +871,50 @@ mod tests {
         assert!(marked_again, "Resource should still be marked for deletion");
 
         storage.delete(key).await.unwrap();
+    }
+
+    /// A delete that adds a propagation finalizer (Orphan/Foreground) must
+    /// survive an optimistic-concurrency conflict on the finalizer-add update.
+    ///
+    /// Reproduces `[sig-api-machinery] Garbage collector should orphan pods
+    /// created by rc if delete options say so` (garbage_collector.go:407),
+    /// which failed with the DELETE call itself returning an error: the etcd
+    /// backend does a resourceVersion CAS on `update`, and the RC controller
+    /// bumps `rc.status` between the delete handler's read and the
+    /// finalizer-add write, so the stale-RV write loses with `Error::Conflict`.
+    /// Background delete uses `storage.delete` (no CAS), which is why only the
+    /// Orphan/Foreground paths were affected. Upstream performs this as a
+    /// GuaranteedUpdate that retries on conflict.
+    #[tokio::test]
+    async fn orphan_delete_retries_on_conflict() {
+        let storage = MemoryStorage::new();
+        let rc = make_test_pod("rc-orphan");
+        let key = "test/pods/default/rc-orphan";
+        storage.create(key, &rc).await.unwrap();
+
+        // Force the first finalizer-add update() to conflict, mimicking a
+        // concurrent status bump by the RC controller under the etcd CAS.
+        storage.inject_conflicts(1);
+
+        let marked =
+            handle_delete_with_finalizers_and_propagation(&storage, key, &rc, Some("Orphan"))
+                .await
+                .expect("orphan delete must succeed despite a concurrent-update conflict");
+        assert!(
+            marked,
+            "orphan delete must mark the resource for deletion (true)"
+        );
+
+        let updated: Pod = storage.get(key).await.unwrap();
+        assert!(
+            updated.metadata.deletion_timestamp.is_some(),
+            "deletionTimestamp must be set after the retried finalizer-add"
+        );
+        assert_eq!(
+            updated.metadata.finalizers,
+            Some(vec!["orphan".to_string()]),
+            "orphan finalizer must be present after the retried finalizer-add"
+        );
     }
 
     #[tokio::test]

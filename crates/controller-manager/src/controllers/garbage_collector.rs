@@ -496,9 +496,27 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         match propagation_policy {
             DeletionPropagation::Foreground => {
                 // In foreground deletion, we must delete all dependents first,
-                // then remove the foregroundDeletion finalizer
+                // then remove the foregroundDeletion finalizer.
                 self.delete_dependents_foreground(resource, dependent_map)
                     .await?;
+
+                // GATE: only remove the foregroundDeletion finalizer once every
+                // blocking dependent is actually gone from storage.
+                // `delete_dependents_foreground` operates on a snapshot, so pods
+                // that were still draining (or created after the snapshot) can
+                // outlive a single pass. Removing the finalizer now would delete
+                // the owner while dependents remain — the exact failure the
+                // "keep the rc around until all its pods are deleted" conformance
+                // test catches. Upstream keeps the finalizer until all blocking
+                // dependents are removed (garbagecollector.go attemptToDeleteItem);
+                // we re-check and wait for the next scan instead.
+                if self.still_has_dependents(&resource.metadata.uid).await? {
+                    debug!(
+                        "Foreground deletion of {} waiting: dependents still present in storage",
+                        resource.key
+                    );
+                    return Ok(());
+                }
 
                 // Remove the foregroundDeletion finalizer from the resource
                 self.remove_finalizer(resource, "foregroundDeletion")
@@ -681,6 +699,24 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         }
 
         Ok(())
+    }
+
+    /// Returns true if any resource in storage still lists `owner_uid` in its
+    /// ownerReferences — i.e. the owner still has blocking dependents.
+    ///
+    /// Used to gate foreground-deletion finalizer removal: the owner's
+    /// `foregroundDeletion` finalizer must stay (and the owner must not be
+    /// deleted) until every dependent has actually been removed from storage,
+    /// not merely had a delete issued against it. Mirrors upstream GC, which
+    /// keeps the owner blocked until its dependent set is empty.
+    async fn still_has_dependents(&self, owner_uid: &str) -> rusternetes_common::Result<bool> {
+        let all_resources = self.get_all_resources().await?;
+        Ok(all_resources.iter().any(|r| {
+            r.metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|refs| refs.iter().any(|oref| oref.uid == owner_uid))
+        }))
     }
 
     /// Orphan dependents by removing owner references.
@@ -1137,6 +1173,246 @@ mod tests {
         // Test remove_finalizer
         metadata.remove_finalizer("my-finalizer");
         assert!(!metadata.has_finalizers());
+    }
+
+    /// Foreground deletion must NOT remove the `foregroundDeletion` finalizer
+    /// (and thus must not delete the owner) while any blocking dependent still
+    /// exists in storage.
+    ///
+    /// Reproduces `[sig-api-machinery] Garbage collector should keep the rc
+    /// around until all its pods are deleted if the deleteOptions says so`
+    /// (garbage_collector.go:711), which deletes the rc with
+    /// PropagationPolicy=Foreground and then asserts there are zero pods once
+    /// the rc is gone. The previous code removed the finalizer in the same pass
+    /// it issued the dependent deletes — gated only on the delete calls
+    /// returning, not on the dependents actually being gone — so a stale
+    /// snapshot (pods still draining or created after the snapshot) let the rc
+    /// be deleted while pods remained. `still_has_dependents` is the gate.
+    #[tokio::test]
+    async fn still_has_dependents_blocks_until_dependent_gone() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let owner_uid = "rc-foreground-uid";
+
+        let mut pod_meta = ObjectMeta::new("dependent-pod");
+        pod_meta.namespace = Some("default".to_string());
+        pod_meta.owner_references = Some(vec![OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "ReplicationController".to_string(),
+            name: "simpletest.rc".to_string(),
+            uid: owner_uid.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: pod_meta,
+            spec: None,
+            status: None,
+        };
+        let pod_key = "/registry/pods/default/dependent-pod";
+        storage.create(pod_key, &pod).await.unwrap();
+
+        assert!(
+            gc.still_has_dependents(owner_uid).await.unwrap(),
+            "owner with an owned pod still in storage must report remaining dependents"
+        );
+
+        // Pod drained — gate must clear so the owner can be finalized/deleted.
+        storage.delete(pod_key).await.unwrap();
+        assert!(
+            !gc.still_has_dependents(owner_uid).await.unwrap(),
+            "once the owned pod is gone, the owner must report no remaining dependents"
+        );
+    }
+
+    /// Once all dependents drain, the foreground gate must clear: the owner's
+    /// `foregroundDeletion` finalizer is removed and the owner deleted. Guards
+    /// the gate against deadlocking the happy path.
+    #[tokio::test]
+    async fn foreground_owner_deleted_after_dependents_drain() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let owner_uid = "rc-fg-complete-uid";
+
+        // Owner rc: being foreground-deleted (deletionTimestamp + finalizer).
+        let mut rc_meta = ObjectMeta::new("simpletest.rc");
+        rc_meta.namespace = Some("default".to_string());
+        rc_meta.uid = owner_uid.to_string();
+        rc_meta.deletion_timestamp = Some(chrono::Utc::now());
+        rc_meta.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+        let rc = serde_json::json!({
+            "apiVersion": "v1", "kind": "ReplicationController",
+            "metadata": serde_json::to_value(&rc_meta).unwrap(),
+            "spec": {"replicas": 1},
+        });
+        let rc_key = "/registry/replicationcontrollers/default/simpletest.rc";
+        storage.create(rc_key, &rc).await.unwrap();
+
+        // One pod owned solely by the rc.
+        let mut pod_meta = ObjectMeta::new("rc-pod");
+        pod_meta.namespace = Some("default".to_string());
+        pod_meta.owner_references = Some(vec![OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "ReplicationController".to_string(),
+            name: "simpletest.rc".to_string(),
+            uid: owner_uid.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: pod_meta,
+            spec: None,
+            status: None,
+        };
+        storage
+            .create("/registry/pods/default/rc-pod", &pod)
+            .await
+            .unwrap();
+
+        // First scan: deletes the pod, gate clears (0 dependents), finalizer
+        // removed, rc deleted — all in one scan since the snapshot is complete.
+        gc.scan_and_collect().await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list("/registry/pods/default/")
+            .await
+            .unwrap_or_default();
+        assert!(
+            pods.is_empty(),
+            "dependent pod must be deleted, {} left",
+            pods.len()
+        );
+
+        let rc_after: rusternetes_common::Result<Value> = storage.get(rc_key).await;
+        assert!(
+            rc_after.is_err(),
+            "rc must be deleted once its dependents are gone (foreground complete)"
+        );
+    }
+
+    /// The exact Bug-B race: an in-flight pod the RC controller created just
+    /// before observing the owner's deletion lands AFTER the foreground delete
+    /// pass took its snapshot. The owner's `foregroundDeletion` finalizer must
+    /// NOT be removed (owner must NOT be deleted) while that pod still exists —
+    /// only once it drains. This is what
+    /// `[sig-api-machinery] Garbage collector should keep the rc around until
+    /// all its pods are deleted` (garbage_collector.go:711) asserts; the old
+    /// code removed the finalizer in the same pass and deleted the rc with pods
+    /// still present.
+    #[tokio::test]
+    async fn foreground_gate_holds_for_inflight_pod_after_delete_pass() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+        let owner_uid = "rc-fg-inflight-uid";
+
+        // rc being foreground-deleted.
+        let mut rc_meta = ObjectMeta::new("simpletest.rc");
+        rc_meta.namespace = Some("default".to_string());
+        rc_meta.uid = owner_uid.to_string();
+        rc_meta.deletion_timestamp = Some(chrono::Utc::now());
+        rc_meta.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+        let rc_key = "/registry/replicationcontrollers/default/simpletest.rc";
+        let rc_val = serde_json::json!({
+            "apiVersion": "v1", "kind": "ReplicationController",
+            "metadata": serde_json::to_value(&rc_meta).unwrap(),
+            "spec": {"replicas": 1},
+        });
+        storage.create(rc_key, &rc_val).await.unwrap();
+
+        // Helper: a pod owned solely by the rc.
+        let mk_pod = |name: &str| Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: {
+                let mut m = ObjectMeta::new(name);
+                m.namespace = Some("default".to_string());
+                m.owner_references = Some(vec![OwnerReference {
+                    api_version: "v1".to_string(),
+                    kind: "ReplicationController".to_string(),
+                    name: "simpletest.rc".to_string(),
+                    uid: owner_uid.to_string(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }]);
+                m
+            },
+            spec: None,
+            status: None,
+        };
+
+        // pod_a is present when the foreground delete pass takes its snapshot.
+        let pod_a_key = "/registry/pods/default/rc-pod-a";
+        storage
+            .create(pod_a_key, &mk_pod("rc-pod-a"))
+            .await
+            .unwrap();
+
+        let rc_info = ResourceInfo {
+            key: rc_key.to_string(),
+            metadata: rc_meta.clone(),
+            resource_type: "replicationcontrollers".to_string(),
+            value: rc_val.clone(),
+        };
+        let empty_dep_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        // 1) Foreground delete pass: deletes the dependents it saw (pod_a).
+        gc.delete_dependents_foreground(&rc_info, &empty_dep_map)
+            .await
+            .unwrap();
+        assert!(
+            storage.get::<Value>(pod_a_key).await.is_err(),
+            "pod_a should have been deleted by the foreground pass"
+        );
+
+        // 2) An in-flight pod the RC controller created before noticing the
+        //    deletion lands AFTER the delete pass's snapshot.
+        let pod_b_key = "/registry/pods/default/rc-pod-b";
+        storage
+            .create(pod_b_key, &mk_pod("rc-pod-b"))
+            .await
+            .unwrap();
+
+        // 3) GATE (the protection this pass provides): a dependent still exists,
+        //    so the foreground finalizer must NOT be removed and the rc must be
+        //    retained. The old code removed it here and deleted the rc.
+        assert!(
+            gc.still_has_dependents(owner_uid).await.unwrap(),
+            "gate must report remaining dependents while the in-flight pod exists"
+        );
+        assert!(
+            storage.get::<Value>(rc_key).await.is_ok(),
+            "rc must be retained while the in-flight pod_b still exists"
+        );
+
+        // 4) pod_b drains; a subsequent scan deletes any remaining dependent and,
+        //    finding the gate clear, finally collects the rc.
+        storage.delete(pod_b_key).await.unwrap();
+        gc.scan_and_collect().await.unwrap();
+        assert!(
+            storage.get::<Value>(rc_key).await.is_err(),
+            "rc must be collected once every dependent has drained"
+        );
     }
 
     /// A single GC scan must remove an orphan whose owner is already gone.
