@@ -127,7 +127,12 @@ pub fn check_node_affinity(node: &Node, pod: &Pod) -> (bool, i32) {
 
 /// Check pod affinity requirements
 /// Returns (passes_hard_requirements, score)
-pub fn check_pod_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, i32) {
+pub fn check_pod_affinity(
+    node: &Node,
+    pod: &Pod,
+    all_pods: &[Pod],
+    all_nodes: &[Node],
+) -> (bool, i32) {
     let affinity = match &pod.spec.as_ref().unwrap().affinity {
         Some(a) => a,
         None => return (true, 0), // No affinity requirements
@@ -141,7 +146,7 @@ pub fn check_pod_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, i3
     // Check required pod affinity (hard requirement)
     if let Some(ref required) = pod_affinity.required_during_scheduling_ignored_during_execution {
         for term in required {
-            if !matches_pod_affinity_term(node, pod, term, all_pods, true) {
+            if !matches_pod_affinity_term(node, pod, term, all_pods, all_nodes, true) {
                 debug!(
                     "Pod {} does not meet hard pod affinity requirement on node {}",
                     pod.metadata.name, node.metadata.name
@@ -160,6 +165,7 @@ pub fn check_pod_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, i3
                 pod,
                 &weighted_term.pod_affinity_term,
                 all_pods,
+                all_nodes,
                 true,
             ) {
                 score += weighted_term.weight;
@@ -172,7 +178,12 @@ pub fn check_pod_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, i3
 
 /// Check pod anti-affinity requirements
 /// Returns (passes_hard_requirements, score_penalty)
-pub fn check_pod_anti_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, i32) {
+pub fn check_pod_anti_affinity(
+    node: &Node,
+    pod: &Pod,
+    all_pods: &[Pod],
+    all_nodes: &[Node],
+) -> (bool, i32) {
     let affinity = match &pod.spec.as_ref().unwrap().affinity {
         Some(a) => a,
         None => return (true, 0), // No anti-affinity requirements
@@ -188,9 +199,10 @@ pub fn check_pod_anti_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (boo
         pod_anti_affinity.required_during_scheduling_ignored_during_execution
     {
         for term in required {
-            // For anti-affinity, we check if matching pods exist
-            // If they do, we CANNOT schedule on this node
-            if matches_pod_affinity_term(node, pod, term, all_pods, false) {
+            // For anti-affinity, a conflict exists only when a matching pod runs
+            // in the SAME topology domain as the candidate node. A matching pod
+            // in a different domain must not block scheduling.
+            if matches_pod_affinity_term(node, pod, term, all_pods, all_nodes, false) {
                 debug!(
                     "Pod {} violates hard pod anti-affinity requirement on node {}",
                     pod.metadata.name, node.metadata.name
@@ -211,6 +223,7 @@ pub fn check_pod_anti_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (boo
                 pod,
                 &weighted_term.pod_affinity_term,
                 all_pods,
+                all_nodes,
                 false,
             ) {
                 penalty += weighted_term.weight;
@@ -369,57 +382,78 @@ fn match_selector(
     true
 }
 
-/// Check if a pod affinity term matches
-/// For affinity (is_affinity=true): returns true if matching pods exist on node's topology
-/// For anti-affinity (is_affinity=false): returns true if matching pods exist (indicating a conflict)
+/// Check if a pod affinity term is satisfied by the candidate `node`.
+///
+/// A term is satisfied when there is at least one already-scheduled pod that
+/// (a) matches the term's label selector and namespace constraint, and
+/// (b) runs on a node that shares the **same** `topologyKey` label value as the
+/// candidate node. This mirrors upstream Kubernetes
+/// (`pkg/scheduler/framework/plugins/interpodaffinity/filtering.go`), where a
+/// matching pod only contributes a count to the `topologyPair{key, value}` of
+/// the node it runs on, and the candidate node satisfies the term iff the count
+/// for *its own* topology pair is positive.
+///
+/// For affinity this means: schedule only where a matching pod already exists in
+/// the same topology domain. For anti-affinity the same predicate is used to
+/// detect a *conflict*: a matching pod in the candidate node's topology domain
+/// means the candidate node violates the anti-affinity term.
+///
+/// A matching pod whose node cannot be resolved in `all_nodes`, or whose node
+/// lacks the `topologyKey` label, contributes nothing (it cannot define a
+/// topology pair) — exactly as in upstream's `update`/`append` helpers.
 fn matches_pod_affinity_term(
     node: &Node,
     _pod: &Pod,
     term: &rusternetes_common::resources::PodAffinityTerm,
     all_pods: &[Pod],
+    all_nodes: &[Node],
     _is_affinity: bool,
 ) -> bool {
-    // Get the topology key value from the node
-    let _topology_value = match node.metadata.labels.as_ref() {
+    // Get the topology key value from the candidate node. If the candidate node
+    // does not carry the topology label, it cannot belong to any topology domain
+    // for this term, so the term is not satisfied.
+    let candidate_topology_value = match node.metadata.labels.as_ref() {
         Some(labels) => match labels.get(&term.topology_key) {
-            Some(v) => v,
-            None => {
-                // Node doesn't have the topology key label
-                return false;
-            }
+            Some(v) => v.as_str(),
+            None => return false,
         },
         None => return false,
     };
 
-    // Find all pods scheduled on nodes with the same topology value
-    let matching_pods: Vec<&Pod> = all_pods
-        .iter()
-        .filter(|p| {
-            // Skip pods that aren't scheduled yet
-            if p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none() {
+    all_pods.iter().any(|p| {
+        // Skip pods that aren't scheduled yet.
+        let node_name = match p.spec.as_ref().and_then(|s| s.node_name.as_ref()) {
+            Some(name) => name,
+            None => return false,
+        };
+
+        // Check if pod matches the label selector.
+        if !match_selector(&term.label_selector, &p.metadata.labels) {
+            return false;
+        }
+
+        // Check namespace constraint.
+        if let Some(ref namespaces) = term.namespaces {
+            let pod_ns = p.metadata.namespace.as_deref().unwrap_or("default");
+            if !namespaces.contains(&pod_ns.to_string()) {
                 return false;
             }
+        }
 
-            // Check if pod matches the label selector
-            if !match_selector(&term.label_selector, &p.metadata.labels) {
-                return false;
-            }
-
-            // Check namespace constraint
-            if let Some(ref namespaces) = term.namespaces {
-                let pod_ns = p.metadata.namespace.as_deref().unwrap_or("default");
-                if !namespaces.contains(&pod_ns.to_string()) {
-                    return false;
-                }
-            }
-
-            // TODO: Check if the pod is on a node with matching topology value
-            // For now, we simplify by checking if any matching pod exists
-            true
-        })
-        .collect();
-
-    !matching_pods.is_empty()
+        // Resolve the node the matching pod runs on, then read its topology
+        // value. The matching pod only counts when its node shares the same
+        // topology value as the candidate node.
+        let pod_node = match all_nodes.iter().find(|n| &n.metadata.name == node_name) {
+            Some(n) => n,
+            None => return false,
+        };
+        let pod_topology_value = pod_node
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(&term.topology_key));
+        pod_topology_value.map(|v| v.as_str()) == Some(candidate_topology_value)
+    })
 }
 
 /// Check if a pod's hostPort requirements conflict with pods already scheduled on the node.

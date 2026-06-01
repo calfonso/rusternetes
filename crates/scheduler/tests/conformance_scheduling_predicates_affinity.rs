@@ -640,7 +640,7 @@ async fn pod_affinity_preferred_returns_positive_score() {
         preferred_pod_affinity(30, "topology.kubernetes.io/zone", &[("app", "cache")]),
     );
 
-    let (passes, score) = check_pod_affinity(&node, &pod, &[target]);
+    let (passes, score) = check_pod_affinity(&node, &pod, &[target], std::slice::from_ref(&node));
     assert!(passes, "no required term so the node must remain feasible");
     assert_eq!(
         score, 30,
