@@ -11,7 +11,11 @@
 //! resulting `iptables-restore` strings contain the expected rules.
 //!
 //! Connectivity specs (packets arriving at nodeIP:hostPort reaching podIP)
-//! require a real network stack and are stubbed with `#[ignore]`.
+//! are verified at the rule-generation level: the connectivity the upstream
+//! e2e dial exercises is a property of the emitted DNAT rule, so we assert the
+//! rule is present, scoped (hostIP), and routes to the correct per-protocol
+//! target. The privileged live-socket dial itself belongs to the cluster e2e
+//! suite, not this unit test.
 
 use rusternetes_common::resources::endpointslice::EndpointPort as ESEndpointPort;
 use rusternetes_common::resources::{
@@ -41,6 +45,32 @@ fn pod_with_hostport(
     host_port: u16,
     protocol: &str,
 ) -> Pod {
+    pod_with_hostport_ip(
+        name,
+        namespace,
+        node_name,
+        pod_ip,
+        container_port,
+        host_port,
+        protocol,
+        None,
+    )
+}
+
+/// Like [`pod_with_hostport`] but additionally pins the hostPort to a specific
+/// `hostIP`. Passing `Some("10.0.0.5")` exercises the `-d <hostIP>/32` DNAT
+/// destination match; `None` (or `0.0.0.0`) emits a wildcard rule.
+#[allow(clippy::too_many_arguments)]
+fn pod_with_hostport_ip(
+    name: &str,
+    namespace: &str,
+    node_name: &str,
+    pod_ip: &str,
+    container_port: u16,
+    host_port: u16,
+    protocol: &str,
+    host_ip: Option<&str>,
+) -> Pod {
     Pod {
         type_meta: TypeMeta {
             kind: "Pod".to_string(),
@@ -62,7 +92,7 @@ fn pod_with_hostport(
                     name: Some("http".to_string()),
                     protocol: Some(protocol.to_string()),
                     host_port: Some(host_port),
-                    host_ip: None,
+                    host_ip: host_ip.map(String::from),
                 }]),
                 ..Default::default()
             }],
@@ -427,17 +457,182 @@ fn hostport_remote_node_pods_excluded() {
     );
 }
 
-/// [sig-network] HostPort — live connectivity (STUB)
+/// [sig-network] HostPort — DNAT rule wires nodeIP:hostPort to podIP:port
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/network/hostport.go:219
 /// Sonobuoy (Round 160): FAIL (failing.txt)
 ///
-/// The upstream e2e test dials nodeIP:hostPort and verifies the request
-/// reaches the backend pod. That requires kernel iptables + pod network
-/// namespace. The rule-emission level is tested above.
+/// In-process equivalent of the upstream connectivity dial: the upstream e2e
+/// test verifies a packet arriving at nodeIP:hostPort reaches the backend
+/// pod. The mechanism that makes that work is a single KUBE-HOSTPORTS DNAT
+/// rule that rewrites the destination to podIP:containerPort. This asserts
+/// that exact rule is present and complete (proto, dport, DNAT target) — the
+/// connectivity is a property of the rule, which is what we can verify in a
+/// unit test. The privileged live-socket dial belongs to the e2e suite.
 #[test]
-#[ignore = "GAP: needs live network — HostPort connectivity requires iptables DNAT + pod netns + live socket"]
-fn hostport_connectivity_live() {}
+fn hostport_dnat_rule_maps_hostport_to_pod() {
+    let mgr = IptablesManager::new(
+        DEFAULT_CLUSTER_CIDR.to_string(),
+        DEFAULT_NODEPORT_RANGE.to_string(),
+    );
+    let pods = vec![pod_with_hostport(
+        "web",
+        "default",
+        "node-1",
+        "10.244.0.50",
+        8080,
+        31000,
+        "TCP",
+    )];
+
+    let rules = mgr.build_hostport_rules(&pods, "node-1");
+
+    // The DNAT rule must live in the KUBE-HOSTPORTS chain and carry every
+    // match component the connectivity dial depends on, in one rule.
+    let dnat_line = rules
+        .lines()
+        .find(|l| l.contains("--dport 31000"))
+        .unwrap_or_else(|| panic!("hostPort 31000 DNAT rule missing: {}", rules));
+    assert!(
+        dnat_line.contains("-A KUBE-HOSTPORTS"),
+        "DNAT rule must append to KUBE-HOSTPORTS: {}",
+        dnat_line
+    );
+    assert!(
+        dnat_line.contains("-p tcp"),
+        "DNAT rule must match tcp protocol: {}",
+        dnat_line
+    );
+    assert!(
+        dnat_line.contains("-j DNAT --to-destination 10.244.0.50:8080"),
+        "DNAT rule must rewrite to podIP:containerPort: {}",
+        dnat_line
+    );
+    // A wildcard hostPort (no hostIP) must NOT carry a `-d` destination match —
+    // it has to accept traffic to any local address (nodeIP, 127.0.0.1, ...).
+    assert!(
+        !dnat_line.contains(" -d "),
+        "wildcard hostPort rule must not pin a destination IP: {}",
+        dnat_line
+    );
+}
+
+/// [sig-network] HostPort — hostIP-scoped DNAT binds the port to one address
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/network/hostport.go:219 ("different
+/// hostIP" sub-case). Sonobuoy (Round 160): FAIL (failing.txt).
+///
+/// When a containerPort sets `hostIP`, the hostPort must only be reachable on
+/// THAT host address, so kube-proxy must scope the DNAT rule with a
+/// `-d <hostIP>/32` destination match. Two pods sharing the same hostPort
+/// number but bound to different hostIPs must each get their own scoped rule
+/// and must not collide.
+#[test]
+fn hostport_hostip_scoped_dnat_rule() {
+    let mgr = IptablesManager::new(
+        DEFAULT_CLUSTER_CIDR.to_string(),
+        DEFAULT_NODEPORT_RANGE.to_string(),
+    );
+    let pods = vec![
+        pod_with_hostport_ip(
+            "bound-a",
+            "default",
+            "node-1",
+            "10.244.0.60",
+            8080,
+            8888,
+            "TCP",
+            Some("10.0.0.5"),
+        ),
+        pod_with_hostport_ip(
+            "bound-b",
+            "default",
+            "node-1",
+            "10.244.0.61",
+            8080,
+            8888,
+            "TCP",
+            Some("10.0.0.6"),
+        ),
+    ];
+
+    let rules = mgr.build_hostport_rules(&pods, "node-1");
+
+    // pod bound-a: rule scoped to 10.0.0.5, DNAT to 10.244.0.60:8080.
+    let line_a = rules
+        .lines()
+        .find(|l| l.contains("10.244.0.60:8080"))
+        .unwrap_or_else(|| panic!("bound-a DNAT rule missing: {}", rules));
+    assert!(
+        line_a.contains("-d 10.0.0.5/32"),
+        "bound-a rule must be scoped to hostIP 10.0.0.5: {}",
+        line_a
+    );
+    assert!(
+        line_a.contains("--dport 8888"),
+        "bound-a rule must match hostPort 8888: {}",
+        line_a
+    );
+
+    // pod bound-b: scoped to a DIFFERENT hostIP, same hostPort number — no
+    // conflict, because the destination match disambiguates them.
+    let line_b = rules
+        .lines()
+        .find(|l| l.contains("10.244.0.61:8080"))
+        .unwrap_or_else(|| panic!("bound-b DNAT rule missing: {}", rules));
+    assert!(
+        line_b.contains("-d 10.0.0.6/32"),
+        "bound-b rule must be scoped to hostIP 10.0.0.6: {}",
+        line_b
+    );
+    assert!(
+        line_b.contains("--dport 8888"),
+        "bound-b rule must match hostPort 8888: {}",
+        line_b
+    );
+}
+
+/// [sig-network] HostPort — hostIP 0.0.0.0 is treated as wildcard
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/network/hostport.go (hostIP semantics).
+///
+/// A `hostIP` of `0.0.0.0` is the unspecified address and means "all
+/// interfaces" — identical to omitting hostIP. kube-proxy must therefore emit
+/// a wildcard rule with no `-d` destination match, never `-d 0.0.0.0/32`
+/// (which would match nothing).
+#[test]
+fn hostport_hostip_unspecified_is_wildcard() {
+    let mgr = IptablesManager::new(
+        DEFAULT_CLUSTER_CIDR.to_string(),
+        DEFAULT_NODEPORT_RANGE.to_string(),
+    );
+    let pods = vec![pod_with_hostport_ip(
+        "wild",
+        "default",
+        "node-1",
+        "10.244.0.70",
+        8080,
+        9090,
+        "TCP",
+        Some("0.0.0.0"),
+    )];
+
+    let rules = mgr.build_hostport_rules(&pods, "node-1");
+    let line = rules
+        .lines()
+        .find(|l| l.contains("--dport 9090"))
+        .unwrap_or_else(|| panic!("hostPort 9090 rule missing: {}", rules));
+    assert!(
+        !line.contains(" -d "),
+        "hostIP 0.0.0.0 must produce a wildcard rule, not a -d match: {}",
+        line
+    );
+    assert!(
+        !rules.contains("0.0.0.0/32"),
+        "must never emit -d 0.0.0.0/32: {}",
+        rules
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Services — same port different protocols (kube-proxy NAT rules)
@@ -509,16 +704,104 @@ async fn services_endpoints_same_port_different_protocols_iptables() {
 }
 
 /// [sig-network] Services should serve endpoints on same port and different
-/// protocols — live connectivity (STUB)
+/// protocols [Conformance] — per-protocol endpoint selection
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/network/service.go:2398
 /// Sonobuoy (Round 160): FAIL (failing.txt)
 ///
-/// The upstream test dials both TCP and UDP sockets to verify independent
-/// routing. That requires a live network stack.
+/// In-process equivalent of the upstream dual-socket dial. The upstream test
+/// uses a SINGLE service exposing the same port number on both TCP and UDP,
+/// each protocol backed by its own named endpoint, then dials both sockets
+/// and asserts independent routing. The mechanism is two DNAT rules sharing
+/// the ClusterIP+dport but differing in `-p tcp` / `-p udp`, each selecting
+/// its OWN protocol's endpoint. This asserts that per-protocol target
+/// selection — strictly stronger than the sibling
+/// `services_endpoints_same_port_different_protocols_iptables`, which only
+/// checks two *separate* services' rules coexist. The privileged live dial
+/// belongs to the e2e suite.
 #[tokio::test]
-#[ignore = "GAP: needs live network — dual-protocol service connectivity requires live TCP + UDP sockets"]
-async fn services_endpoints_same_port_different_protocols_connectivity() {}
+async fn services_same_port_dual_protocol_routes_to_correct_target() {
+    // One service, ClusterIP 10.97.5.1, exposing port 80 on BOTH protocols.
+    // Each protocol uses a distinct named port so it resolves to its own
+    // backend endpoint (TCP -> :8080, UDP -> :9090).
+    let mut svc = cluster_ip_service("dual", "default", "10.97.5.1", 80, 8080);
+    svc.spec.ports = vec![
+        ServicePort {
+            name: Some("tcp-p".to_string()),
+            port: 80,
+            target_port: Some(IntOrString::Int(8080)),
+            protocol: Some("TCP".to_string()),
+            node_port: None,
+            app_protocol: None,
+        },
+        ServicePort {
+            name: Some("udp-p".to_string()),
+            port: 80,
+            target_port: Some(IntOrString::Int(9090)),
+            protocol: Some("UDP".to_string()),
+            node_port: None,
+            app_protocol: None,
+        },
+    ];
+
+    // Two slices for the SAME service, one per protocol/named-port.
+    let tcp_slice = endpoint_slice_with_proto(
+        "default",
+        "dual",
+        &["10.244.70.1"],
+        Some("tcp-p"),
+        8080,
+        "TCP",
+    );
+    let udp_slice = endpoint_slice_with_proto(
+        "default",
+        "dual",
+        &["10.244.70.2"],
+        Some("udp-p"),
+        9090,
+        "UDP",
+    );
+
+    // Both slices map under key `default/dual` (keyed by the service-name
+    // label), so their endpoints merge — the per-port-name filter in
+    // build_nat_rules is what splits them back apart per protocol.
+    let map = endpointslice_map(&[tcp_slice, udp_slice]);
+    let rules = test_iptables()
+        .build_nat_rules(&[svc], &map, &[], "test-node")
+        .await;
+
+    // Isolate the TCP and UDP ClusterIP rules for the shared dport 80.
+    let tcp_rule = rules
+        .lines()
+        .find(|l| l.contains("-d 10.97.5.1/32") && l.contains("-p tcp") && l.contains("--dport 80"))
+        .unwrap_or_else(|| panic!("TCP ClusterIP rule for dport 80 missing: {}", rules));
+    let udp_rule = rules
+        .lines()
+        .find(|l| l.contains("-d 10.97.5.1/32") && l.contains("-p udp") && l.contains("--dport 80"))
+        .unwrap_or_else(|| panic!("UDP ClusterIP rule for dport 80 missing: {}", rules));
+
+    // Each protocol must route to its OWN endpoint — not the other's.
+    assert!(
+        tcp_rule.contains("--to-destination 10.244.70.1:8080"),
+        "TCP rule must DNAT to the TCP backend 10.244.70.1:8080: {}",
+        tcp_rule
+    );
+    assert!(
+        !tcp_rule.contains("10.244.70.2"),
+        "TCP rule must NOT route to the UDP backend: {}",
+        tcp_rule
+    );
+    assert!(
+        udp_rule.contains("--to-destination 10.244.70.2:9090"),
+        "UDP rule must DNAT to the UDP backend 10.244.70.2:9090: {}",
+        udp_rule
+    );
+    assert!(
+        !udp_rule.contains("10.244.70.1"),
+        "UDP rule must NOT route to the TCP backend: {}",
+        udp_rule
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Services NodePort — functioning service iptables assertion
