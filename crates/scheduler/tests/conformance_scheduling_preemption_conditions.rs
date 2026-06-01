@@ -466,25 +466,12 @@ fn preemption_disruption_target_condition_has_all_required_fields() {
 // PriorityClass endpoints — different HTTP methods [Conformance]
 // ---------------------------------------------------------------------------
 
-/// [sig-scheduling] SchedulerPreemption PriorityClass endpoints verify
-/// PriorityClass endpoints can be operated with different HTTP methods
-/// [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/scheduling/priorities.go
-/// Sonobuoy (Round 160+): FAIL.
-///
-/// GAP: requires full api-server HTTP harness
-/// (`/apis/scheduling.k8s.io/v1/priorityclasses`). The scheduler unit-test
-/// layer has no HTTP server. Tracked in the api-server conformance suite.
-/// Upstream: k8s.io/kubernetes/test/e2e/scheduling/priorities.go
-/// `PriorityClass endpoints verify PriorityClass endpoints can be operated
-/// with different HTTP methods`
-#[test]
-#[ignore = "GAP: PriorityClass HTTP CRUD requires api-server harness; \
-            upstream: k8s.io/kubernetes/test/e2e/scheduling/priorities.go"]
-fn priority_class_endpoints_http_methods() {
-    unimplemented!("requires api-server HTTP harness");
-}
+// PriorityClass HTTP CRUD coverage (POST/GET/LIST/PUT/PATCH/DELETE against the
+// real `scheduling.k8s.io/v1` routes) now lives in the api-server in-process
+// router test: `crates/api-server/tests/priorityclass_http_crud_test.rs`.
+// The scheduler unit-test layer has no HTTP server, so the conformance
+// scenario `PriorityClass endpoints ... different HTTP methods` (upstream
+// k8s.io/kubernetes/test/e2e/scheduling/priorities.go) is exercised there.
 
 // ---------------------------------------------------------------------------
 // [sig-scheduling] SchedulerPredicates [Serial]
