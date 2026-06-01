@@ -8,13 +8,322 @@ use axum::{
 use rusternetes_common::dump::DumpingJson;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
+    resources::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding},
+    types::LabelSelector,
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// Test whether `labels` satisfies a `types::LabelSelector` (matchLabels +
+/// matchExpressions). Mirrors upstream `apimachinery/pkg/apis/meta/v1`
+/// `LabelSelectorAsSelector` semantics used by the ClusterRole aggregation
+/// controller. An empty selector (no matchLabels, no matchExpressions) matches
+/// nothing here — upstream's aggregation controller skips empty selectors
+/// rather than selecting everything.
+fn label_selector_matches(selector: &LabelSelector, labels: &HashMap<String, String>) -> bool {
+    let has_match_labels = selector
+        .match_labels
+        .as_ref()
+        .is_some_and(|m| !m.is_empty());
+    let has_match_exprs = selector
+        .match_expressions
+        .as_ref()
+        .is_some_and(|e| !e.is_empty());
+    if !has_match_labels && !has_match_exprs {
+        return false;
+    }
+
+    if let Some(match_labels) = &selector.match_labels {
+        for (k, v) in match_labels {
+            if labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+    }
+
+    if let Some(exprs) = &selector.match_expressions {
+        for req in exprs {
+            let present = labels.contains_key(&req.key);
+            let matched = match req.operator.as_str() {
+                "In" => req
+                    .values
+                    .as_ref()
+                    .is_some_and(|vals| labels.get(&req.key).is_some_and(|v| vals.contains(v))),
+                "NotIn" => !req
+                    .values
+                    .as_ref()
+                    .is_some_and(|vals| labels.get(&req.key).is_some_and(|v| vals.contains(v))),
+                "Exists" => present,
+                "DoesNotExist" => !present,
+                _ => false,
+            };
+            if !matched {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Whether `set` contains `ele`.
+fn has(set: &[String], ele: &str) -> bool {
+    set.iter().any(|s| s == ele)
+}
+
+/// Whether every element of `contains` is present in `set`.
+fn has_all(set: &[String], contains: &[String]) -> bool {
+    contains.iter().all(|ele| set.contains(ele))
+}
+
+/// Whether `owner` fully covers `servant` for the resource axis. Mirrors
+/// upstream `resourceCoversAll`: an owner `*` covers everything, otherwise the
+/// owner must list every requested resource explicitly.
+fn resource_covers_all(owner: &[String], servant: &[String]) -> bool {
+    has(owner, "*") || has_all(owner, servant)
+}
+
+/// Whether owner rule `owner` covers the (already broken-down) servant rule.
+/// Mirrors upstream `ruleCovers` in
+/// `component-helpers/auth/rbac/validation/policy_comparator.go` (release-1.35),
+/// restricted to the resource axes RBAC RoleBindings care about.
+fn rule_covers(owner: &PolicyRule, servant: &PolicyRule) -> bool {
+    let owner_verbs = &owner.verbs;
+    let verb_matches = has(owner_verbs, "*") || has_all(owner_verbs, &servant.verbs);
+
+    let owner_groups = owner.api_groups.clone().unwrap_or_default();
+    let servant_groups = servant.api_groups.clone().unwrap_or_default();
+    let group_matches = has(&owner_groups, "*") || has_all(&owner_groups, &servant_groups);
+
+    let owner_resources = owner.resources.clone().unwrap_or_default();
+    let servant_resources = servant.resources.clone().unwrap_or_default();
+    let resource_matches = resource_covers_all(&owner_resources, &servant_resources);
+
+    let owner_names = owner.resource_names.clone().unwrap_or_default();
+    let servant_names = servant.resource_names.clone().unwrap_or_default();
+    let resource_name_matches = if servant_names.is_empty() {
+        owner_names.is_empty()
+    } else {
+        owner_names.is_empty() || has_all(&owner_names, &servant_names)
+    };
+
+    verb_matches && group_matches && resource_matches && resource_name_matches
+}
+
+/// Break a PolicyRule down into atomic (verb x group x resource x resourceName)
+/// tuples so that coverage can be decided against a single owner rule per
+/// subrule. Mirrors upstream `BreakdownRule`. Only the resource axes are
+/// modelled (non-resource URLs are not bound by RoleBindings).
+fn breakdown_rule(rule: &PolicyRule) -> Vec<PolicyRule> {
+    let mut out = Vec::new();
+    let groups = rule.api_groups.clone().unwrap_or_default();
+    let resources = rule.resources.clone().unwrap_or_default();
+    let names = rule.resource_names.clone().unwrap_or_default();
+    for verb in &rule.verbs {
+        for group in &groups {
+            for resource in &resources {
+                if names.is_empty() {
+                    out.push(PolicyRule {
+                        verbs: vec![verb.clone()],
+                        api_groups: Some(vec![group.clone()]),
+                        resources: Some(vec![resource.clone()]),
+                        resource_names: None,
+                        non_resource_urls: None,
+                    });
+                } else {
+                    for name in &names {
+                        out.push(PolicyRule {
+                            verbs: vec![verb.clone()],
+                            api_groups: Some(vec![group.clone()]),
+                            resources: Some(vec![resource.clone()]),
+                            resource_names: Some(vec![name.clone()]),
+                            non_resource_urls: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `owner_rules` fully cover every rule in `servant_rules`. Mirrors
+/// upstream `Covers`: each servant rule is broken into atomic subrules and each
+/// subrule must be covered by at least one owner rule.
+fn rules_cover(owner_rules: &[PolicyRule], servant_rules: &[PolicyRule]) -> bool {
+    for servant in servant_rules {
+        for subrule in breakdown_rule(servant) {
+            if !owner_rules.iter().any(|owner| rule_covers(owner, &subrule)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Convert resolved `ResourceRule`s (from `Authorizer::get_user_rules`) into
+/// `PolicyRule`s so they can be fed to the coverage comparator.
+fn resource_rules_to_policy_rules(
+    rules: &[rusternetes_common::resources::ResourceRule],
+) -> Vec<PolicyRule> {
+    rules
+        .iter()
+        .map(|r| PolicyRule {
+            verbs: r.verbs.clone(),
+            api_groups: r.api_groups.clone(),
+            resources: r.resources.clone(),
+            resource_names: r.resource_names.clone(),
+            non_resource_urls: None,
+        })
+        .collect()
+}
+
+/// Materialise the `rules` of a ClusterRole carrying an `aggregationRule` by
+/// unioning the rules of every ClusterRole whose labels match any of the
+/// `clusterRoleSelectors`. Mirrors upstream
+/// `pkg/controller/clusterroleaggregation` + the `clusterrole/policybased`
+/// storage layer (release-1.35): the aggregated `rules` field is recomputed
+/// server-side from the matching child ClusterRoles. The parent's own name is
+/// excluded to avoid self-aggregation loops.
+///
+/// No-op when `aggregation_rule` is `None`.
+async fn materialise_aggregated_rules<S: Storage>(storage: &Arc<S>, clusterrole: &mut ClusterRole) {
+    let Some(aggregation_rule) = clusterrole.aggregation_rule.clone() else {
+        return;
+    };
+    let Some(selectors) = aggregation_rule.cluster_role_selectors else {
+        clusterrole.rules = Vec::new();
+        return;
+    };
+
+    let prefix = build_prefix("clusterroles", None);
+    let candidates = match storage.list::<ClusterRole>(&prefix).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to list ClusterRoles for aggregation of {}: {}",
+                clusterrole.metadata.name,
+                e
+            );
+            return;
+        }
+    };
+
+    let mut aggregated: Vec<PolicyRule> = Vec::new();
+    for candidate in &candidates {
+        // Skip the parent itself and any other aggregating ClusterRole — upstream
+        // only collects rules from leaf (non-aggregating) ClusterRoles.
+        if candidate.metadata.name == clusterrole.metadata.name {
+            continue;
+        }
+        if candidate.aggregation_rule.is_some() {
+            continue;
+        }
+        let labels = candidate.metadata.labels.clone().unwrap_or_default();
+        let matches = selectors
+            .iter()
+            .any(|selector| label_selector_matches(selector, &labels));
+        if !matches {
+            continue;
+        }
+        for rule in &candidate.rules {
+            if !aggregated.contains(rule) {
+                aggregated.push(rule.clone());
+            }
+        }
+    }
+
+    clusterrole.rules = aggregated;
+}
+
+/// Resolve the PolicyRules granted by a binding's `roleRef`. A `Role` is looked
+/// up in `binding_namespace`; a `ClusterRole` is looked up cluster-wide.
+/// Returns an empty rule set if the referenced role does not exist (upstream's
+/// `GetRoleReferenceRules` returns the rules it can resolve; a missing role
+/// grants nothing, so an empty set is trivially covered).
+async fn resolve_role_ref_rules(
+    state: &Arc<ApiServerState>,
+    role_ref: &rusternetes_common::resources::RoleRef,
+    binding_namespace: &str,
+) -> Vec<PolicyRule> {
+    match role_ref.kind.as_str() {
+        "ClusterRole" => {
+            let key = build_key("clusterroles", None, &role_ref.name);
+            match state.storage.get::<ClusterRole>(&key).await {
+                Ok(cr) => cr.rules,
+                Err(_) => Vec::new(),
+            }
+        }
+        "Role" => {
+            let key = build_key("roles", Some(binding_namespace), &role_ref.name);
+            match state.storage.get::<Role>(&key).await {
+                Ok(role) => role.rules,
+                Err(_) => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Enforce the privilege-escalation prevention rule on (Cluster)RoleBinding
+/// create. Mirrors upstream `pkg/registry/rbac/rolebinding/policybased`:
+///
+///   1. If the caller already holds every PolicyRule granted by the referenced
+///      role (superset / `Covers`), the binding is allowed.
+///   2. Otherwise the caller must hold the synthetic `escalate` verb on the
+///      referenced `roles`/`clusterroles` resource.
+///   3. If neither holds, return `403 Forbidden`.
+///
+/// `binding_namespace` is the namespace the binding lives in (empty for a
+/// ClusterRoleBinding); it scopes both the caller's resolved rules and the
+/// `escalate` authorization check.
+async fn confirm_no_escalation(
+    state: &Arc<ApiServerState>,
+    user: &rusternetes_common::auth::UserInfo,
+    role_ref: &rusternetes_common::resources::RoleRef,
+    binding_namespace: &str,
+    binding_name: &str,
+) -> Result<()> {
+    let granted_rules = resolve_role_ref_rules(state, role_ref, binding_namespace).await;
+    if granted_rules.is_empty() {
+        return Ok(());
+    }
+
+    // (1) Superset check: does the caller already hold every granted rule?
+    let (caller_resource_rules, _caller_non_resource_rules) = state
+        .authorizer
+        .get_user_rules(user, binding_namespace)
+        .await?;
+    let caller_rules = resource_rules_to_policy_rules(&caller_resource_rules);
+    if rules_cover(&caller_rules, &granted_rules) {
+        return Ok(());
+    }
+
+    // (2) `escalate` verb check on the referenced role resource.
+    let escalate_resource = match role_ref.kind.as_str() {
+        "ClusterRole" => "clusterroles",
+        _ => "roles",
+    };
+    let mut escalate_attrs = RequestAttributes::new(user.clone(), "escalate", escalate_resource)
+        .with_api_group("rbac.authorization.k8s.io")
+        .with_name(&role_ref.name);
+    if !binding_namespace.is_empty() {
+        escalate_attrs = escalate_attrs.with_namespace(binding_namespace);
+    }
+    if let Decision::Allow = state.authorizer.authorize(&escalate_attrs).await? {
+        return Ok(());
+    }
+
+    // (3) Neither holds — reject, mirroring upstream's Forbidden message shape.
+    Err(rusternetes_common::Error::Forbidden(format!(
+        "user \"{}\" (groups={:?}) is attempting to grant RBAC permissions not currently held \
+         and is not authorized to escalate {} \"{}\"",
+        user.username, user.groups, escalate_resource, binding_name
+    )))
+}
 
 // Role handlers
 pub async fn create_role(
@@ -290,6 +599,7 @@ pub async fn create_rolebinding(
     );
 
     // Check authorization
+    let user = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "rolebindings")
         .with_namespace(&namespace)
         .with_api_group("rbac.authorization.k8s.io");
@@ -300,6 +610,17 @@ pub async fn create_rolebinding(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // Privilege-escalation prevention: the caller must already hold the rules
+    // granted by the referenced role, or hold the `escalate` verb on it.
+    confirm_no_escalation(
+        &state,
+        &user,
+        &rolebinding.role_ref,
+        &namespace,
+        &rolebinding.metadata.name,
+    )
+    .await?;
 
     rolebinding.metadata.namespace = Some(namespace.clone());
 
@@ -588,6 +909,10 @@ pub async fn create_clusterrole(
     clusterrole.metadata.ensure_uid();
     clusterrole.metadata.ensure_creation_timestamp();
 
+    // Materialise aggregationRule.clusterRoleSelectors into `rules` (upstream
+    // `pkg/controller/clusterroleaggregation` + `clusterrole/policybased`).
+    materialise_aggregated_rules(&state.storage, &mut clusterrole).await;
+
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
@@ -663,6 +988,10 @@ pub async fn update_clusterrole(
     }
 
     clusterrole.metadata.name = name.clone();
+
+    // Recompute aggregated rules on update (upstream re-aggregates whenever the
+    // parent or any matching child ClusterRole changes).
+    materialise_aggregated_rules(&state.storage, &mut clusterrole).await;
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);

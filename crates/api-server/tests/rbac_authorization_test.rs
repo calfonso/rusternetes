@@ -138,6 +138,115 @@ async fn seed_bootstrap_cluster_admin(mem: &Arc<MemoryStorage>) {
     .unwrap();
 }
 
+/// Like [`spawn_state`], but the seeded bootstrap binding grants the calling
+/// `admin`/`system:masters` identity only the rights needed to *manage* RBAC
+/// objects and create `SubjectAccessReview`s — explicitly NOT a `*/*/*`
+/// cluster-admin. This models upstream's privilege-escalation scenario where
+/// the caller can POST a RoleBinding (passing the outer `create rolebindings`
+/// authorization) yet does not already hold the rules contained in the bound
+/// role and lacks the `escalate` verb. With a full cluster-admin bootstrap the
+/// escalation superset check is trivially satisfied, so this scoped caller is
+/// required to exercise the 403 path.
+async fn spawn_state_rbac_admin_only(
+) -> (Arc<ApiServerState>, Arc<MemoryStorage>, Arc<StorageBackend>) {
+    let mem = Arc::new(MemoryStorage::new());
+    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
+    let token_manager = Arc::new(TokenManager::new(b"rbac-authz-test-secret"));
+    let authorizer = Arc::new(RBACAuthorizer::new(backend.clone()));
+    let metrics = Arc::new(MetricsRegistry::new());
+    let state = Arc::new(ApiServerState::new(
+        backend.clone(),
+        token_manager,
+        authorizer,
+        metrics,
+        true, // skip_auth — injects admin/system:masters
+    ));
+
+    let cr = ClusterRole {
+        type_meta: TypeMeta {
+            kind: "ClusterRole".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta {
+            name: "test-bootstrap-rbac-admin".into(),
+            ..Default::default()
+        },
+        rules: vec![
+            // Manage RBAC objects (lets the caller POST the RoleBinding) — but
+            // crucially withOUT the `escalate` verb, so binding a role whose
+            // rules the caller lacks must be rejected.
+            PolicyRule {
+                verbs: vec![
+                    "get".into(),
+                    "list".into(),
+                    "watch".into(),
+                    "create".into(),
+                    "update".into(),
+                    "delete".into(),
+                ],
+                api_groups: Some(vec!["rbac.authorization.k8s.io".into()]),
+                resources: Some(vec![
+                    "roles".into(),
+                    "rolebindings".into(),
+                    "clusterroles".into(),
+                    "clusterrolebindings".into(),
+                ]),
+                resource_names: None,
+                non_resource_urls: None,
+            },
+            // Allow the SAR endpoint's caller-side authorize check.
+            PolicyRule {
+                verbs: vec!["create".into()],
+                api_groups: Some(vec!["authorization.k8s.io".into()]),
+                resources: Some(vec!["subjectaccessreviews".into()]),
+                resource_names: None,
+                non_resource_urls: None,
+            },
+        ],
+        aggregation_rule: None,
+    };
+    mem.create(
+        &build_key("clusterroles", None, "test-bootstrap-rbac-admin"),
+        &cr,
+    )
+    .await
+    .unwrap();
+
+    let crb = ClusterRoleBinding {
+        type_meta: TypeMeta {
+            kind: "ClusterRoleBinding".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta {
+            name: "test-bootstrap-rbac-admin-binding".into(),
+            ..Default::default()
+        },
+        subjects: vec![Subject {
+            kind: "Group".into(),
+            name: "system:masters".into(),
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            namespace: None,
+        }],
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".into(),
+            kind: "ClusterRole".into(),
+            name: "test-bootstrap-rbac-admin".into(),
+        },
+    };
+    mem.create(
+        &build_key(
+            "clusterrolebindings",
+            None,
+            "test-bootstrap-rbac-admin-binding",
+        ),
+        &crb,
+    )
+    .await
+    .unwrap();
+
+    (state, mem, backend)
+}
+
 async fn post_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
     let router = build_router(state, None);
     let req = Request::builder()
@@ -224,7 +333,6 @@ async fn ask_sar(
 /// performs aggregation, the parent stores empty `rules` and a SAR against the
 /// aggregated verb falls through to deny.
 #[tokio::test]
-#[ignore = "RED-state: api-server does not materialise aggregationRule.clusterRoleSelectors into parent rules yet"]
 async fn clusterrole_aggregation_collects_rules_from_labelled_clusterroles() {
     let (state, _mem, _backend) = spawn_state().await;
 
@@ -322,9 +430,8 @@ async fn clusterrole_aggregation_collects_rules_from_labelled_clusterroles() {
 /// `escalate` verb. The api-server should respond with `403 Forbidden`. Our
 /// handler currently accepts the binding unconditionally, so this is RED-state.
 #[tokio::test]
-#[ignore = "RED-state: api-server does not enforce escalate-verb / superset-rules check on RoleBinding create"]
 async fn rolebinding_create_blocked_when_caller_lacks_escalate() {
-    let (state, _mem, _backend) = spawn_state().await;
+    let (state, _mem, _backend) = spawn_state_rbac_admin_only().await;
     let ns = "rbac-escalation";
 
     // A powerful Role: full secret access in the namespace.
