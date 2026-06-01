@@ -2359,7 +2359,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
-            .layer(axum_middleware::from_fn(middleware::skip_auth_middleware));
+            .layer(axum_middleware::from_fn(middleware::skip_auth_middleware))
+            // The impersonation gate inside skip_auth_middleware authorizes the
+            // `impersonate` verb against this authorizer.
+            .layer(Extension(state.authorizer.clone()));
     } else {
         // In normal mode, apply full authentication
         protected_routes = protected_routes
@@ -2369,7 +2372,8 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(middleware::auth_middleware))
             .layer(Extension(state.token_manager.clone()))
             .layer(Extension(state.bootstrap_token_manager.clone()))
-            .layer(Extension(state.storage.clone()));
+            .layer(Extension(state.storage.clone()))
+            .layer(Extension(state.authorizer.clone()));
     }
 
     // Combine routes and add shared state.

@@ -7,7 +7,9 @@ use axum::{
     Extension,
 };
 use rusternetes_common::auth::{BootstrapTokenManager, TokenManager, UserInfo};
+use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
 
@@ -17,14 +19,350 @@ use crate::cbor;
 static PROTO_REGISTRY: LazyLock<crate::protobuf::ProtoRegistry> =
     LazyLock::new(crate::protobuf::ProtoRegistry::new);
 
+/// Standard Kubernetes impersonation request headers. Mirrors the constants in
+/// upstream `k8s.io/api/authentication/v1/types.go` and the filter in
+/// `staging/src/k8s.io/apiserver/pkg/endpoints/filters/impersonation`.
+const IMPERSONATE_USER_HEADER: &str = "Impersonate-User";
+const IMPERSONATE_GROUP_HEADER: &str = "Impersonate-Group";
+const IMPERSONATE_UID_HEADER: &str = "Impersonate-Uid";
+const IMPERSONATE_EXTRA_PREFIX: &str = "Impersonate-Extra-";
+
 /// Extension type to carry UserInfo through the request
 #[derive(Clone, Debug)]
 pub struct AuthContext {
     pub user: UserInfo,
 }
 
+/// One thing the caller is asking to impersonate, paired with the authorization
+/// attributes that must be allowed against the *original* caller before the
+/// switch is applied. Mirrors `buildImpersonationRequests` upstream.
+struct ImpersonationRequest {
+    /// The `impersonate` resource to authorize against
+    /// (`users` / `groups` / `serviceaccounts` / `userextras` / `uids`).
+    resource: &'static str,
+    /// Namespace, used for ServiceAccount impersonation only.
+    namespace: Option<String>,
+    /// Name (username, group name, SA name, extra value, or uid).
+    name: String,
+    /// Subresource (the extra key) for `userextras` requests.
+    subresource: Option<String>,
+}
+
+/// Parsed impersonation intent extracted from the request headers, before the
+/// authorization gate is applied.
+struct ImpersonationIntent {
+    /// The effective username being requested. For a ServiceAccount this is the
+    /// canonical `system:serviceaccount:<ns>:<name>` form.
+    username: String,
+    /// Explicitly requested groups.
+    groups: Vec<String>,
+    /// Whether the caller specified any `Impersonate-Group` header. When false
+    /// for a ServiceAccount we synthesize the fixed SA group mapping, matching
+    /// upstream.
+    groups_specified: bool,
+    /// `Some(namespace)` when the impersonated user is a ServiceAccount (drives
+    /// synthetic group injection).
+    sa_namespace: Option<String>,
+    /// Extra attributes.
+    extra: HashMap<String, Vec<String>>,
+    /// Requested UID.
+    uid: String,
+    /// The per-item authorization requests to run against the original caller.
+    auth_requests: Vec<ImpersonationRequest>,
+}
+
+/// Reason an impersonation request is malformed. Kept small (clippy
+/// `result_large_err`) and translated into a `metav1.Status` response at the
+/// middleware boundary.
+enum ImpersonationParseError {
+    /// Groups / extra / uid requested without an accompanying user header.
+    GroupsWithoutUser,
+}
+
+/// Parse the `Impersonate-*` headers into an [`ImpersonationIntent`]. Returns
+/// `Ok(None)` when no impersonation headers are present.
+///
+/// Mirrors upstream `buildImpersonationRequests`: requesting any of groups,
+/// extra, or uid without also requesting a user is a BadRequest.
+fn parse_impersonation_headers(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<ImpersonationIntent>, ImpersonationParseError> {
+    let requested_user = headers
+        .get(IMPERSONATE_USER_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string);
+
+    let group_values: Vec<String> = headers
+        .get_all(IMPERSONATE_GROUP_HEADER)
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .map(str::to_string)
+        .collect();
+
+    // Collect extra values, keyed by the (lowercased, percent-decoded) suffix
+    // after the `Impersonate-Extra-` prefix. Header names are case-insensitive.
+    let mut extra: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        // HeaderName is already lowercased; compare case-insensitively anyway.
+        if name_str.len() <= IMPERSONATE_EXTRA_PREFIX.len()
+            || !name_str
+                .get(..IMPERSONATE_EXTRA_PREFIX.len())
+                .map(|p| p.eq_ignore_ascii_case(IMPERSONATE_EXTRA_PREFIX))
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let raw_key = &name_str[IMPERSONATE_EXTRA_PREFIX.len()..];
+        let key = percent_decode_extra_key(&raw_key.to_ascii_lowercase());
+        if let Ok(v) = value.to_str() {
+            extra.entry(key).or_default().push(v.to_string());
+        }
+    }
+
+    let requested_uid = headers
+        .get(IMPERSONATE_UID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+
+    let has_groups = !group_values.is_empty();
+    let has_extra = !extra.is_empty();
+    let has_uid = requested_uid.is_some();
+
+    let requested_user = match requested_user.filter(|s| !s.is_empty()) {
+        Some(u) => u,
+        None => {
+            if has_groups || has_extra || has_uid {
+                // Groups / extra / uid without a user is a hard error upstream.
+                return Err(ImpersonationParseError::GroupsWithoutUser);
+            }
+            return Ok(None);
+        }
+    };
+
+    let mut auth_requests = Vec::new();
+
+    // A username of the form `system:serviceaccount:<ns>:<name>` impersonates a
+    // ServiceAccount; everything else is a plain user.
+    let (username, sa_namespace) = if let Some((ns, name)) = split_sa_username(&requested_user) {
+        auth_requests.push(ImpersonationRequest {
+            resource: "serviceaccounts",
+            namespace: Some(ns.clone()),
+            name: name.clone(),
+            subresource: None,
+        });
+        (requested_user.clone(), Some(ns))
+    } else {
+        auth_requests.push(ImpersonationRequest {
+            resource: "users",
+            namespace: None,
+            name: requested_user.clone(),
+            subresource: None,
+        });
+        (requested_user.clone(), None)
+    };
+
+    for group in &group_values {
+        auth_requests.push(ImpersonationRequest {
+            resource: "groups",
+            namespace: None,
+            name: group.clone(),
+            subresource: None,
+        });
+    }
+
+    for (key, values) in &extra {
+        for value in values {
+            auth_requests.push(ImpersonationRequest {
+                resource: "userextras",
+                namespace: None,
+                name: value.clone(),
+                subresource: Some(key.clone()),
+            });
+        }
+    }
+
+    if let Some(ref uid) = requested_uid {
+        auth_requests.push(ImpersonationRequest {
+            resource: "uids",
+            namespace: None,
+            name: uid.clone(),
+            subresource: None,
+        });
+    }
+
+    Ok(Some(ImpersonationIntent {
+        username,
+        groups: group_values,
+        groups_specified: has_groups,
+        sa_namespace,
+        extra,
+        uid: requested_uid.unwrap_or_default(),
+        auth_requests,
+    }))
+}
+
+/// Split a `system:serviceaccount:<namespace>:<name>` username into its parts.
+fn split_sa_username(username: &str) -> Option<(String, String)> {
+    let rest = username.strip_prefix("system:serviceaccount:")?;
+    let (ns, name) = rest.split_once(':')?;
+    if ns.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((ns.to_string(), name.to_string()))
+}
+
+/// Best-effort percent-decode of an impersonation extra key. Upstream
+/// `url.PathUnescape`s the suffix; on malformed input it keeps the raw value.
+fn percent_decode_extra_key(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| encoded.to_string())
+}
+
+/// Build a `metav1.Status`-shaped 400 response.
+fn bad_request(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        format!(
+            r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","message":"{}","reason":"BadRequest","code":400}}"#,
+            message.replace('"', "'")
+        ),
+    )
+        .into_response()
+}
+
+/// Build a `metav1.Status`-shaped 403 response.
+fn forbidden(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        format!(
+            r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","message":"{}","reason":"Forbidden","code":403}}"#,
+            message.replace('"', "'")
+        ),
+    )
+        .into_response()
+}
+
+/// Apply inbound impersonation to `requestor` if the request carries the
+/// `Impersonate-*` headers. The original caller must hold the `impersonate`
+/// verb on every requested subject (authorized via `authorizer`) before the
+/// identity is switched, matching upstream `WithImpersonation`.
+///
+/// Returns the effective [`UserInfo`] for the request. On a missing-user or
+/// authorization failure it returns the appropriate `Err(Response)`.
+async fn apply_impersonation(
+    headers: &axum::http::HeaderMap,
+    requestor: UserInfo,
+    authorizer: &Arc<dyn Authorizer>,
+) -> Result<UserInfo, Response> {
+    let intent = match parse_impersonation_headers(headers) {
+        Ok(Some(intent)) => intent,
+        Ok(None) => return Ok(requestor),
+        Err(ImpersonationParseError::GroupsWithoutUser) => {
+            return Err(bad_request(
+                "requested impersonation without impersonating a user",
+            ));
+        }
+    };
+
+    // Gate: the original caller must be allowed to impersonate each subject.
+    for req in &intent.auth_requests {
+        let mut attrs = RequestAttributes::new(requestor.clone(), "impersonate", req.resource);
+        if let Some(ref ns) = req.namespace {
+            attrs = attrs.with_namespace(ns.clone());
+        }
+        if !req.name.is_empty() {
+            attrs = attrs.with_name(req.name.clone());
+        }
+        if let Some(ref sub) = req.subresource {
+            attrs = attrs.with_subresource(sub.clone());
+        }
+        match authorizer.authorize(&attrs).await {
+            Ok(Decision::Allow) => {}
+            Ok(Decision::Deny(reason)) => {
+                warn!(
+                    "Impersonation of {} {} denied for {}: {}",
+                    req.resource, req.name, requestor.username, reason
+                );
+                return Err(forbidden(&format!(
+                    "{} is not allowed to impersonate {}",
+                    requestor.username, req.resource
+                )));
+            }
+            Err(e) => {
+                warn!("Impersonation authorization error: {}", e);
+                return Err(forbidden("impersonation authorization failed"));
+            }
+        }
+    }
+
+    // Build the impersonated identity's group set, mirroring upstream:
+    //   - ServiceAccount with no explicit groups → the fixed SA group mapping.
+    //   - otherwise → exactly the requested groups.
+    let mut groups = intent.groups.clone();
+    if let Some(ref ns) = intent.sa_namespace {
+        if !intent.groups_specified {
+            groups = vec![
+                "system:serviceaccounts".to_string(),
+                format!("system:serviceaccounts:{ns}"),
+            ];
+        }
+    }
+
+    // Mirror upstream's group-marker injection:
+    //   - a non-anonymous impersonated user gets `system:authenticated`
+    //   - the anonymous user (`system:anonymous`) gets `system:unauthenticated`
+    // unless the requested groups already carry an authenticated/unauthenticated
+    // marker, in which case the explicit choice is honored.
+    let has_unauthenticated = groups.iter().any(|g| g == "system:unauthenticated");
+    if intent.username == "system:anonymous" {
+        if !has_unauthenticated {
+            groups.push("system:unauthenticated".to_string());
+        }
+    } else {
+        let has_marker = groups.iter().any(|g| g == "system:authenticated") || has_unauthenticated;
+        if !has_marker {
+            groups.push("system:authenticated".to_string());
+        }
+    }
+
+    debug!(
+        "{} is impersonating {}",
+        requestor.username, intent.username
+    );
+
+    Ok(UserInfo {
+        username: intent.username,
+        uid: intent.uid,
+        groups,
+        extra: intent.extra,
+    })
+}
+
 /// Middleware that adds a default admin AuthContext when skip_auth is enabled
-pub async fn skip_auth_middleware(mut request: Request, next: Next) -> Result<Response, Response> {
+pub async fn skip_auth_middleware(
+    Extension(authorizer): Extension<Arc<dyn Authorizer>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, Response> {
     debug!(
         "skip_auth_middleware called for: {} {}",
         request.method(),
@@ -39,10 +377,12 @@ pub async fn skip_auth_middleware(mut request: Request, next: Next) -> Result<Re
         extra: std::collections::HashMap::new(),
     };
 
+    // Honor inbound impersonation headers even in skip-auth mode so that
+    // SubjectReview / SelfSubjectReview reflect the impersonated identity.
+    let user = apply_impersonation(request.headers(), admin_user, &authorizer).await?;
+
     // Insert AuthContext into request extensions
-    request
-        .extensions_mut()
-        .insert(AuthContext { user: admin_user });
+    request.extensions_mut().insert(AuthContext { user });
 
     debug!("AuthContext inserted into request extensions");
 
@@ -60,6 +400,7 @@ pub async fn auth_middleware(
     Extension(token_manager): Extension<Arc<TokenManager>>,
     Extension(bootstrap_token_manager): Extension<Arc<BootstrapTokenManager>>,
     Extension(storage): Extension<Arc<StorageBackend>>,
+    Extension(authorizer): Extension<Arc<dyn Authorizer>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, Response> {
@@ -146,6 +487,11 @@ pub async fn auth_middleware(
         debug!("Anonymous request");
         UserInfo::anonymous()
     };
+
+    // Apply inbound impersonation headers. The authenticated caller must hold
+    // the `impersonate` verb on each requested subject; on success the
+    // effective user becomes the impersonated identity.
+    let user = apply_impersonation(request.headers(), user, &authorizer).await?;
 
     // Insert UserInfo into request extensions
     request.extensions_mut().insert(AuthContext { user });
