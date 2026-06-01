@@ -837,7 +837,10 @@ fn node_affinity_required_fails_preferred_irrelevant() {
 fn pod_affinity_no_affinity_passes() {
     let n = node_with_labels("n1", &[("kubernetes.io/hostname", "n1")]);
     let pod = pod_bare("p1");
-    assert_eq!(check_pod_affinity(&n, &pod, &[]), (true, 0));
+    assert_eq!(
+        check_pod_affinity(&n, &pod, &[], std::slice::from_ref(&n)),
+        (true, 0)
+    );
 }
 
 /// Upstream ref: filtering_test.go — "required affinity: node missing topology key fails"
@@ -852,18 +855,16 @@ fn pod_affinity_required_node_missing_topology_key_fails() {
         None,
     );
     let cache_pod = scheduled_pod("cache", "n1", &[("app", "cache")]);
-    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod]);
+    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod], std::slice::from_ref(&n));
     assert!(!passes);
 }
 
 /// Upstream ref: filtering_test.go — "required affinity: a matching scheduled pod exists".
 ///
-/// NOTE: this verifies only that a matching, already-scheduled pod is found — it
-/// does NOT verify topology-key correctness. Rusternetes' `matches_pod_affinity_term`
-/// (advanced.rs ~395-422) does not compare the matching pod's topology domain to
-/// the candidate node's, so this test would pass identically even if `cache` were
-/// on a completely different node. The topology-correct behaviour is pinned by the
-/// `#[ignore]` GAP test below.
+/// The matching `cache` pod runs on n1, the SAME topology domain as the candidate
+/// node, so `matches_pod_affinity_term` finds it satisfies the hostname-scoped
+/// affinity term. The companion `..._different_topology_should_fail` test below
+/// pins the negative case where the matching pod is in a different domain.
 #[test]
 fn pod_affinity_required_matching_scheduled_pod_found() {
     let n = node_with_labels("n1", &[("kubernetes.io/hostname", "n1")]);
@@ -874,7 +875,7 @@ fn pod_affinity_required_matching_scheduled_pod_found() {
         None,
     );
     let cache_pod = scheduled_pod("cache", "n1", &[("app", "cache")]);
-    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod]);
+    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod], std::slice::from_ref(&n));
     assert!(passes);
 }
 
@@ -883,9 +884,9 @@ fn pod_affinity_required_matching_scheduled_pod_found() {
 /// so scheduling onto n1 (which has no co-located matching pod) should FAIL.
 /// Rusternetes currently treats it as satisfied because it ignores topologyKey.
 #[test]
-#[ignore = "GAP: pod (anti-)affinity not topology-aware; advanced.rs matches_pod_affinity_term ignores the matching pod's node/topologyKey"]
 fn pod_affinity_required_matching_pod_different_topology_should_fail() {
     let n = node_with_labels("n1", &[("kubernetes.io/hostname", "n1")]);
+    let n2 = node_with_labels("n2", &[("kubernetes.io/hostname", "n2")]);
     let pod = pod_with_required_pod_affinity(
         "incoming",
         label_sel(&[("app", "cache")]),
@@ -894,7 +895,7 @@ fn pod_affinity_required_matching_pod_different_topology_should_fail() {
     );
     // The only matching pod is in the n2 topology domain, not n1's.
     let cache_pod = scheduled_pod("cache", "n2", &[("app", "cache")]);
-    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod]);
+    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod], &[n.clone(), n2]);
     assert!(
         !passes,
         "hostname-scoped affinity must not be satisfied by a pod in a different topology domain"
@@ -912,7 +913,7 @@ fn pod_affinity_required_no_matching_pods_fails() {
         None,
     );
     // No existing pods in the cluster
-    let (passes, _) = check_pod_affinity(&n, &pod, &[]);
+    let (passes, _) = check_pod_affinity(&n, &pod, &[], std::slice::from_ref(&n));
     assert!(!passes);
 }
 
@@ -928,7 +929,7 @@ fn pod_affinity_required_unscheduled_pod_not_counted() {
     );
     // Matching pod exists but is NOT scheduled (no node_name)
     let unscheduled = pod_bare("cache");
-    let (passes, _) = check_pod_affinity(&n, &pod, &[unscheduled]);
+    let (passes, _) = check_pod_affinity(&n, &pod, &[unscheduled], std::slice::from_ref(&n));
     assert!(!passes);
 }
 
@@ -946,7 +947,7 @@ fn pod_affinity_required_namespace_filtering() {
     // Matching pod is in "ns-b" — should not count
     let mut cache_pod = scheduled_pod("cache", "n1", &[("app", "cache")]);
     cache_pod.metadata.namespace = Some("ns-b".to_string());
-    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod]);
+    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod], std::slice::from_ref(&n));
     assert!(!passes);
 }
 
@@ -961,7 +962,7 @@ fn pod_affinity_required_match_expressions_in() {
         None,
     );
     let cache_pod = scheduled_pod("cache", "n1", &[("app", "cache")]);
-    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod]);
+    let (passes, _) = check_pod_affinity(&n, &pod, &[cache_pod], std::slice::from_ref(&n));
     assert!(passes);
 }
 
@@ -976,7 +977,7 @@ fn pod_affinity_preferred_matching_pod_scores() {
         "kubernetes.io/hostname",
     );
     let backend_pod = scheduled_pod("backend", "n1", &[("tier", "backend")]);
-    let (passes, score) = check_pod_affinity(&n, &pod, &[backend_pod]);
+    let (passes, score) = check_pod_affinity(&n, &pod, &[backend_pod], std::slice::from_ref(&n));
     assert!(passes);
     assert_eq!(score, 80);
 }
@@ -992,7 +993,7 @@ fn pod_affinity_preferred_no_match_scores_zero() {
         "kubernetes.io/hostname",
     );
     // No existing backend pods
-    let (passes, score) = check_pod_affinity(&n, &pod, &[]);
+    let (passes, score) = check_pod_affinity(&n, &pod, &[], std::slice::from_ref(&n));
     assert!(passes);
     assert_eq!(score, 0);
 }
@@ -1006,7 +1007,10 @@ fn pod_affinity_preferred_no_match_scores_zero() {
 fn pod_anti_affinity_no_anti_affinity_passes() {
     let n = node_with_labels("n1", &[("kubernetes.io/hostname", "n1")]);
     let pod = pod_bare("p1");
-    assert_eq!(check_pod_anti_affinity(&n, &pod, &[]), (true, 0));
+    assert_eq!(
+        check_pod_anti_affinity(&n, &pod, &[], std::slice::from_ref(&n)),
+        (true, 0)
+    );
 }
 
 /// Upstream ref: filtering_test.go — "required anti-affinity: matching pod on node fails"
@@ -1019,7 +1023,7 @@ fn pod_anti_affinity_required_matching_pod_blocks() {
         "kubernetes.io/hostname",
     );
     let web_pod = scheduled_pod("web-1", "n1", &[("app", "web")]);
-    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod]);
+    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod], std::slice::from_ref(&n));
     assert!(!passes);
 }
 
@@ -1033,7 +1037,7 @@ fn pod_anti_affinity_required_no_matching_pods_passes() {
         "kubernetes.io/hostname",
     );
     // No existing web pods
-    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[]);
+    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[], std::slice::from_ref(&n));
     assert!(passes);
 }
 
@@ -1049,44 +1053,21 @@ fn pod_anti_affinity_required_node_missing_topology_key_passes() {
     );
     let web_pod = scheduled_pod("web-1", "n1-no-labels", &[("app", "web")]);
     // Because the node lacks the topology key, matches_pod_affinity_term returns false
-    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod]);
+    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod], std::slice::from_ref(&n));
     assert!(passes);
 }
 
-/// Upstream ref: filtering_test.go — "required anti-affinity: matching pod on different node".
+/// Topology-CORRECT expectation: in real Kubernetes a pod in a different topology
+/// domain (different hostname) must NOT trigger hostname-scoped anti-affinity, so
+/// scheduling onto n1 should PASS. `matches_pod_affinity_term` resolves the
+/// conflicting pod's node (n2) and compares its `kubernetes.io/hostname` value to
+/// the candidate node's; since they differ, the term is not violated.
 ///
-/// Asserts the ACTUAL (and incorrect) Rusternetes behaviour: the existing "web"
-/// pod is scheduled on a DIFFERENT node (n2), yet anti-affinity still BLOCKS
-/// scheduling onto n1. This happens because `matches_pod_affinity_term`
-/// (advanced.rs ~395-422) ignores the matching pod's node/topologyKey — it only
-/// checks whether the candidate node carries the topology label and whether ANY
-/// scheduled pod matches the selector, then returns `!matching_pods.is_empty()`.
-/// The `#[ignore]` test below pins the topology-correct expectation.
+/// Upstream ref: filtering_test.go — "required anti-affinity: matching pod on different node".
 #[test]
-fn pod_anti_affinity_required_matching_pod_different_node_blocks_current_behaviour() {
-    let n = node_with_labels("n1", &[("kubernetes.io/hostname", "n1")]);
-    let pod = pod_with_required_anti_affinity(
-        "incoming",
-        label_sel(&[("app", "web")]),
-        "kubernetes.io/hostname",
-    );
-    // Existing "web" pod is scheduled on n2 (a different topology domain).
-    let web_pod = scheduled_pod("web-1", "n2", &[("app", "web")]);
-    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod]);
-    // Current impl is NOT topology-aware, so it incorrectly blocks scheduling.
-    assert!(
-        !passes,
-        "current (non-topology-aware) impl blocks even when the conflicting pod is on a different node"
-    );
-}
-
-/// Topology-CORRECT expectation for the case above. In real Kubernetes a pod in
-/// a different topology domain (different hostname) must NOT trigger
-/// hostname-scoped anti-affinity, so scheduling onto n1 should PASS.
-#[test]
-#[ignore = "GAP: pod (anti-)affinity not topology-aware; advanced.rs matches_pod_affinity_term ignores the matching pod's node/topologyKey"]
 fn pod_anti_affinity_required_matching_pod_different_node_should_pass_topology_aware() {
     let n = node_with_labels("n1", &[("kubernetes.io/hostname", "n1")]);
+    let n2 = node_with_labels("n2", &[("kubernetes.io/hostname", "n2")]);
     let pod = pod_with_required_anti_affinity(
         "incoming",
         label_sel(&[("app", "web")]),
@@ -1094,7 +1075,7 @@ fn pod_anti_affinity_required_matching_pod_different_node_should_pass_topology_a
     );
     // Conflicting "web" pod lives in the n2 topology domain, not n1's.
     let web_pod = scheduled_pod("web-1", "n2", &[("app", "web")]);
-    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod]);
+    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod], &[n.clone(), n2]);
     assert!(
         passes,
         "hostname-scoped anti-affinity must not block when the conflicting pod is in a different topology domain"
@@ -1112,7 +1093,7 @@ fn pod_anti_affinity_required_unscheduled_pod_not_counted() {
     );
     // Matching pod exists but is NOT scheduled
     let unscheduled = pod_bare("web-unscheduled");
-    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[unscheduled]);
+    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[unscheduled], std::slice::from_ref(&n));
     assert!(passes);
 }
 
@@ -1126,7 +1107,7 @@ fn pod_anti_affinity_required_match_expressions_exists() {
         "kubernetes.io/hostname",
     );
     let web_pod = scheduled_pod("web-1", "n1", &[("app", "web")]);
-    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod]);
+    let (passes, _) = check_pod_anti_affinity(&n, &pod, &[web_pod], std::slice::from_ref(&n));
     assert!(!passes);
 }
 
@@ -1141,7 +1122,7 @@ fn pod_anti_affinity_preferred_matching_pod_penalises() {
         "kubernetes.io/hostname",
     );
     let db_pod = scheduled_pod("db-1", "n1", &[("app", "db")]);
-    let (passes, penalty) = check_pod_anti_affinity(&n, &pod, &[db_pod]);
+    let (passes, penalty) = check_pod_anti_affinity(&n, &pod, &[db_pod], std::slice::from_ref(&n));
     assert!(passes);
     assert_eq!(penalty, 60);
 }
@@ -1156,7 +1137,7 @@ fn pod_anti_affinity_preferred_no_match_scores_zero() {
         label_sel(&[("app", "db")]),
         "kubernetes.io/hostname",
     );
-    let (passes, penalty) = check_pod_anti_affinity(&n, &pod, &[]);
+    let (passes, penalty) = check_pod_anti_affinity(&n, &pod, &[], std::slice::from_ref(&n));
     assert!(passes);
     assert_eq!(penalty, 0);
 }
@@ -1201,7 +1182,8 @@ fn pod_anti_affinity_preferred_multiple_terms_accumulate() {
     let db_pod = scheduled_pod("db-1", "n1", &[("app", "db")]);
     let be_pod = scheduled_pod("be-1", "n1", &[("tier", "backend")]);
 
-    let (passes, penalty) = check_pod_anti_affinity(&n, &pod, &[db_pod, be_pod]);
+    let (passes, penalty) =
+        check_pod_anti_affinity(&n, &pod, &[db_pod, be_pod], std::slice::from_ref(&n));
     assert!(passes);
     assert_eq!(penalty, 50);
 }

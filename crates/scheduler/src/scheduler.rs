@@ -681,14 +681,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             }
 
             // Check pod affinity (hard requirements and scoring)
-            let (pod_affinity_ok, pod_affinity_score) = check_pod_affinity(node, pod, all_pods);
+            let (pod_affinity_ok, pod_affinity_score) =
+                check_pod_affinity(node, pod, all_pods, nodes);
             if !pod_affinity_ok {
                 continue; // Skip nodes that don't meet hard pod affinity requirements
             }
 
             // Check pod anti-affinity (hard requirements and penalty scoring)
             let (pod_anti_affinity_ok, pod_anti_affinity_penalty) =
-                check_pod_anti_affinity(node, pod, all_pods);
+                check_pod_anti_affinity(node, pod, all_pods, nodes);
             if !pod_anti_affinity_ok {
                 continue; // Skip nodes that violate hard pod anti-affinity requirements
             }

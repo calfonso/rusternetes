@@ -244,7 +244,7 @@ impl FilterPlugin for PodAffinityPlugin {
         node: &Node,
         handle: &FrameworkHandle,
     ) -> PluginResult {
-        let (passes, _score) = check_pod_affinity(node, pod, &handle.all_pods);
+        let (passes, _score) = check_pod_affinity(node, pod, &handle.all_pods, &handle.all_nodes);
         if passes {
             PluginResult::success()
         } else {
@@ -272,7 +272,8 @@ impl FilterPlugin for PodAntiAffinityPlugin {
         node: &Node,
         handle: &FrameworkHandle,
     ) -> PluginResult {
-        let (passes, _penalty) = check_pod_anti_affinity(node, pod, &handle.all_pods);
+        let (passes, _penalty) =
+            check_pod_anti_affinity(node, pod, &handle.all_pods, &handle.all_nodes);
         if passes {
             PluginResult::success()
         } else {
@@ -406,7 +407,7 @@ impl ScorePlugin for PodAffinityScoringPlugin {
         node: &Node,
         handle: &FrameworkHandle,
     ) -> Result<i64, String> {
-        let (_passes, score) = check_pod_affinity(node, pod, &handle.all_pods);
+        let (_passes, score) = check_pod_affinity(node, pod, &handle.all_pods, &handle.all_nodes);
         Ok(score as i64)
     }
 }
@@ -427,7 +428,8 @@ impl ScorePlugin for PodAntiAffinityScoringPlugin {
         node: &Node,
         handle: &FrameworkHandle,
     ) -> Result<i64, String> {
-        let (_passes, penalty) = check_pod_anti_affinity(node, pod, &handle.all_pods);
+        let (_passes, penalty) =
+            check_pod_anti_affinity(node, pod, &handle.all_pods, &handle.all_nodes);
         // Return negative score (penalty)
         Ok(-(penalty as i64))
     }
