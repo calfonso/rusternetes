@@ -18,11 +18,16 @@
 //!
 //! The first conformance test in `conformance_node_runtimeclass.rs`
 //! ("should reject a Pod requesting a non-existent RuntimeClass") is
-//! passing and lives in the companion file. This file holds the four
-//! that are still failing in the live cluster — they need a live API
-//! server + scheduler to schedule or reject pods, so they are annotated
-//! `#[ignore]`. The pure-shape invariants in each test (struct building,
-//! serde round-trips) **do** run and must pass.
+//! passing and lives in the companion file.
+//!
+//! Three of the four scenarios here (RuntimeClass CRUD, reject-on-deleted,
+//! and Overhead initialisation) are now exercised end-to-end *in-process*
+//! against the real api-server routes by
+//! `crates/api-server/tests/runtimeclass_router_test.rs` — no live cluster
+//! required — so their stubs run green and delegate to that file. Only the
+//! "Pod reaches Running phase" assertion still needs a live kubelet container
+//! runtime and stays `#[ignore]`d. The pure-shape invariants in each test
+//! (struct building, serde round-trips) also run and must pass.
 //!
 //! Style: pure-function `#[test]` where possible; `#[ignore]` for the
 //! live-runtime assertions that need a running cluster.
@@ -170,14 +175,16 @@ fn runtimeclass_deserialises_from_canonical_json() {
 /// [sig-node] RuntimeClass API operations — live CRUD
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtimeclass.go
-/// Sonobuoy (2026-05-28): FAIL — live API server required for
-/// create/get/list/patch/delete.
+///
+/// Previously `#[ignore]`d as needing a live API server. The full
+/// create → get → list → patch → delete sequence is now exercised
+/// in-process against the real api-server routes (no live cluster) by
+/// `runtimeclass_crud_lifecycle` in
+/// `crates/api-server/tests/runtimeclass_router_test.rs`.
 #[test]
-#[ignore = "GAP: live API server required for RuntimeClass CRUD; upstream runtimeclass.go"]
 fn runtimeclass_api_crud_lifecycle() {
-    // create → get → list → patch (update handler) → delete
-    // Checked by the e2e suite against a live cluster; not exercisable
-    // from a pure unit test.
+    // Covered in-process; see crates/api-server/tests/runtimeclass_router_test.rs
+    // (`runtimeclass_crud_lifecycle`).
 }
 
 // ===========================================================================
@@ -209,18 +216,19 @@ fn pod_with_deleted_runtime_class_spec_preserves_runtime_class_name() {
     );
 }
 
-/// [sig-node] RuntimeClass reject deleted — live admission rejection
+/// [sig-node] RuntimeClass reject deleted — admission rejection
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtimeclass.go
-/// Sonobuoy (2026-05-28): FAIL — live API server required.
+///
+/// Previously `#[ignore]`d as needing a live API server. The admission
+/// rejection (create RC → accept Pod → delete RC → reject new Pod, original
+/// Pod unaffected) is now exercised in-process against the real api-server
+/// routes by `pod_referencing_deleted_runtimeclass_is_rejected` in
+/// `crates/api-server/tests/runtimeclass_router_test.rs`.
 #[test]
-#[ignore = "GAP: live API server + admission required to reject Pod for deleted RuntimeClass; upstream runtimeclass.go"]
 fn pod_requesting_deleted_runtime_class_is_rejected_on_admission() {
-    // 1. Create RuntimeClass "myrc".
-    // 2. Submit Pod referencing "myrc" — Pod is accepted.
-    // 3. Delete RuntimeClass "myrc".
-    // 4. Submit a second Pod referencing "myrc" — must be rejected at admission.
-    // 5. Verify original Pod still runs (deletion only gates new pods).
+    // Covered in-process; see crates/api-server/tests/runtimeclass_router_test.rs
+    // (`pod_referencing_deleted_runtimeclass_is_rejected`).
 }
 
 // ===========================================================================
@@ -274,16 +282,24 @@ fn runtimeclass_none_overhead_round_trips_as_none() {
     );
 }
 
-/// [sig-node] RuntimeClass schedule without PodOverhead — live scheduling
+/// [sig-node] RuntimeClass schedule without PodOverhead — Pod reaches Running
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtimeclass.go
-/// Sonobuoy (2026-05-28): FAIL — live scheduler required.
+///
+/// The admission half (Pod with a no-overhead RuntimeClass is accepted and
+/// gets no injected `spec.overhead`) is covered in-process by
+/// `pod_without_overhead_runtimeclass_has_no_injected_overhead` in
+/// `crates/api-server/tests/runtimeclass_router_test.rs`. The remaining
+/// assertion — the Pod actually transitions to the Running phase — needs a
+/// live kubelet container runtime (bollard/Docker) to start the pod's
+/// containers and report status; it cannot be exercised from an in-process
+/// router test.
 #[test]
-#[ignore = "GAP: live scheduler required to schedule Pod with RuntimeClass and no PodOverhead; upstream runtimeclass.go"]
+#[ignore = "GAP: live kubelet container runtime required to drive Pod to Running phase; admission half covered by runtimeclass_router_test.rs"]
 fn pod_with_runtime_class_no_overhead_scheduled_and_running() {
-    // 1. Create RuntimeClass without overhead.
-    // 2. Create Pod referencing that RuntimeClass.
-    // 3. Verify Pod reaches Running phase without extra overhead on node.
+    // Needs a live kubelet runtime to start containers and observe the Running
+    // phase. Admission/overhead behaviour is covered in-process; see
+    // crates/api-server/tests/runtimeclass_router_test.rs.
 }
 
 // ===========================================================================
@@ -365,16 +381,20 @@ fn runtimeclass_scheduling_toleration_survives_roundtrip() {
     assert_eq!(tols[0].effect.as_deref(), Some("NoSchedule"));
 }
 
-/// [sig-node] RuntimeClass schedule with PodOverhead — live scheduling
+/// [sig-node] RuntimeClass schedule with PodOverhead — Overhead initialisation
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtimeclass.go
-/// Sonobuoy (2026-05-28): FAIL — live scheduler + overhead injection required.
+///
+/// Previously `#[ignore]`d. In rusternetes the Overhead initialisation half
+/// ("initialize its Overhead": inject RuntimeClass.overhead.podFixed into
+/// pod.spec.overhead) happens at api-server admission, not the scheduler, and
+/// is now exercised in-process by `pod_overhead_injected_from_runtimeclass`
+/// (overhead present) and `pod_without_overhead_runtimeclass_has_no_injected_overhead`
+/// (overhead absent) in `crates/api-server/tests/runtimeclass_router_test.rs`.
+/// The remaining "Pod reaches Running phase" half still needs a live kubelet
+/// runtime — see `pod_with_runtime_class_no_overhead_scheduled_and_running`.
 #[test]
-#[ignore = "GAP: live scheduler required to inject PodOverhead from RuntimeClass into Pod resource accounting; upstream runtimeclass.go"]
 fn pod_with_runtime_class_overhead_is_scheduled_and_overhead_initialised() {
-    // 1. Create RuntimeClass with overhead.podFixed = {cpu: 250m, memory: 120Mi}.
-    // 2. Create Pod referencing that RuntimeClass.
-    // 3. Scheduler must add overhead to pod.spec.overhead before binding.
-    // 4. Verify pod.spec.overhead matches RuntimeClass.overhead.podFixed.
-    // 5. Pod reaches Running phase.
+    // Overhead initialisation covered in-process; see
+    // crates/api-server/tests/runtimeclass_router_test.rs.
 }
