@@ -1328,7 +1328,15 @@ async fn should_mutate_custom_resource_with_pruning() {
 async fn should_honor_timeout() {
     let mem = Arc::new(MemoryStorage::new());
     let manager = AdmissionWebhookManager::new(mem.clone());
-    let (url, _shutdown) = start_slow_validator(std::time::Duration::from_secs(5)).await;
+    // The webhook's own response latency. The 1s `timeoutSeconds` below must
+    // abort the call long before this elapses. Keeping a wide gap lets the
+    // wall-clock assertion tolerate tokio-timer wakeup jitter under
+    // CPU-saturated parallel test load — the old fixed `< 3s` bound flaked at
+    // ~3.1s on a loaded runner even though the deadline fired correctly. When
+    // the timeout works the test still returns in ~1s; this longer sleep only
+    // matters as an upper bound if the timeout regresses.
+    let slow_webhook_sleep = std::time::Duration::from_secs(10);
+    let (url, _shutdown) = start_slow_validator(slow_webhook_sleep).await;
 
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".to_string(),
@@ -1370,10 +1378,17 @@ async fn should_honor_timeout() {
         .await;
     let elapsed = started.elapsed();
 
+    // Primary, load-independent proof the deadline fired: the slow validator
+    // only ever returns `allow`, so an Err can only originate from the 1s
+    // timeout aborting the call (the message assertion below pins it to the
+    // timeout specifically). The wall-clock check is a secondary guard that the
+    // call was aborted *early* rather than blocking for the webhook's full
+    // response — asserted relative to `slow_webhook_sleep` so it does not flake
+    // when the runtime's timers are delayed under parallel-test CPU pressure.
     assert!(res.is_err(), "slow webhook + FailurePolicy=Fail must error");
     assert!(
-        elapsed < std::time::Duration::from_secs(3),
-        "deadline must be enforced; took {elapsed:?}"
+        elapsed < slow_webhook_sleep,
+        "1s deadline must abort before the {slow_webhook_sleep:?} webhook response; took {elapsed:?}"
     );
     // Upstream expects the literal substring "HTTP/dial timeout" — the gap.
     let msg = format!("{}", res.unwrap_err()).to_lowercase();
