@@ -223,9 +223,13 @@ async fn create_namespace(router: &axum::Router, name: &str) {
 ///      label, the *pod's* value wins over the node's (and unrelated keys on
 ///      the pod are preserved).
 ///
-/// RED: `handlers::pod_subresources::create_binding` currently only writes
-/// `spec.nodeName`; it does not touch labels. The first assertion will fail.
+/// `#[serial]` because this test depends on the process-wide
+/// `PodTopologyLabelsAdmission` feature gate being at its default (on).
+/// `serial_test` only serialises among `#[serial]`-marked tests, so without
+/// this a sibling test that flips the gate to off (also `#[serial]`) can land
+/// mid-binding and skip the label copy — making this test flake.
 #[tokio::test]
+#[serial_test::serial]
 async fn test_pod_topology_labels() {
     let (_, router) = spawn_router();
     let ns = "pod-topology-labels";
@@ -307,9 +311,15 @@ async fn test_pod_topology_labels() {
 }
 
 /// Mirrors upstream `TestPodTopologyLabels`'s "subdomains and custom keys are
-/// not copied" sub-cases. Pre-existing labels on the pod must also win over
-/// node-derived labels.
+/// not copied" sub-cases. The node's `zone`/`region` overwrite the pod's own
+/// values (`mergeLabels` is node-authoritative), subdomain/custom topology
+/// keys are not copied, and the pod's unrelated labels survive untouched.
+///
+/// `#[serial]` for the same reason as `test_pod_topology_labels`: it reads the
+/// process-wide `PodTopologyLabelsAdmission` gate and must not race a sibling
+/// that flips it.
 #[tokio::test]
+#[serial_test::serial]
 async fn test_pod_topology_labels_filters_and_preserves_existing() {
     let (_, router) = spawn_router();
     let ns = "pod-topology-labels-filter";
