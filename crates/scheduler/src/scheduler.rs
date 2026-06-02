@@ -1,10 +1,10 @@
 use chrono::Utc;
 use rusternetes_common::{
-    resources::{Node, Pod, PriorityClass},
+    resources::{EventSource, EventType, Node, ObjectReference, Pod, PriorityClass},
     types::Phase,
 };
 use rusternetes_storage::{
-    build_key, build_prefix, extract_key, Storage, StorageBackend, WorkQueue,
+    build_key, build_prefix, extract_key, EventRecorder, Storage, StorageBackend, WorkQueue,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
@@ -19,6 +19,11 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     interval: Duration,
     /// Name of this scheduler (default "default-scheduler")
     scheduler_name: String,
+    /// Unified event recorder — the scheduler is the source of truth for the
+    /// `Scheduled` / `FailedScheduling` events, routed through the shared
+    /// `EventCorrelator` (dedup/count/series + spam-filter) like upstream's
+    /// `recorder.Eventf` after bind. Mirrors the kubelet's wiring.
+    recorder: EventRecorder<S>,
 }
 
 impl Scheduler<StorageBackend> {
@@ -30,9 +35,40 @@ impl Scheduler<StorageBackend> {
 impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     pub fn new_with_name(storage: Arc<S>, interval_secs: u64, scheduler_name: String) -> Self {
         Self {
+            recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
+        }
+    }
+
+    /// Emit a pod-scoped event through the unified recorder, sourced from this
+    /// scheduler (`source.component = scheduler_name`). Errors are logged, never
+    /// propagated — a failed event must not abort a bind/scheduling decision.
+    async fn emit_pod_event(&self, pod: &Pod, event_type: EventType, reason: &str, message: &str) {
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let involved = ObjectReference {
+            kind: Some("Pod".to_string()),
+            namespace: Some(ns.to_string()),
+            name: Some(pod.metadata.name.clone()),
+            uid: Some(pod.metadata.uid.clone()),
+            api_version: Some("v1".to_string()),
+            resource_version: pod.metadata.resource_version.clone(),
+            field_path: None,
+        };
+        let source = EventSource {
+            component: self.scheduler_name.clone(),
+            host: None,
+        };
+        if let Err(e) = self
+            .recorder
+            .event(&involved, &source, event_type, reason, message)
+            .await
+        {
+            warn!(
+                "Failed to record {} event for pod {}/{}: {}",
+                reason, ns, pod.metadata.name, e
+            );
         }
     }
 
@@ -530,39 +566,18 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     })
                     .await;
 
-                    // Emit FailedScheduling event — K8s conformance tests wait for this
-                    let event_name = format!(
-                        "{}.{:x}",
-                        pod.metadata.name,
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64
-                    );
-                    let event = serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "Event",
-                        "metadata": {
-                            "name": event_name,
-                            "namespace": pod_ns,
-                        },
-                        "involvedObject": {
-                            "apiVersion": "v1",
-                            "kind": "Pod",
-                            "name": pod.metadata.name,
-                            "namespace": pod_ns,
-                            "uid": pod.metadata.uid,
-                        },
-                        "reason": "FailedScheduling",
-                        "message": sched_message,
-                        "type": "Warning",
-                        "source": {
-                            "component": "default-scheduler",
-                        },
-                        "firstTimestamp": chrono::Utc::now().to_rfc3339(),
-                        "lastTimestamp": chrono::Utc::now().to_rfc3339(),
-                        "count": 1,
-                    });
-                    let event_key =
-                        rusternetes_storage::build_key("events", Some(pod_ns), &event_name);
-                    let _ = self.storage.create(&event_key, &event).await;
+                    // Emit FailedScheduling via the unified recorder — its
+                    // correlator dedups + bumps `count` across scheduling cycles
+                    // for a stuck pod (instead of flooding one event per cycle),
+                    // matching upstream's `recorder.Eventf(pod, Warning,
+                    // "FailedScheduling", …)`.
+                    self.emit_pod_event(
+                        &pod,
+                        EventType::Warning,
+                        "FailedScheduling",
+                        &sched_message,
+                    )
+                    .await;
                 }
             }
         }
@@ -876,45 +891,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             &pod.metadata.name,
         );
 
-        match self.storage.update(&key, &pod).await {
+        let bound_pod = match self.storage.update(&key, &pod).await {
             Ok(_) => {
                 info!("Successfully bound pod to node {}", node_name);
-
-                // Create a Scheduled event (K8s scheduler always creates this)
-                let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-                let event_name = format!(
-                    "{}.sched.{}",
-                    pod.metadata.name,
-                    chrono::Utc::now().format("%Y%m%d%H%M%S")
-                );
-                let event = serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "Event",
-                    "metadata": {
-                        "name": event_name,
-                        "namespace": pod_ns,
-                    },
-                    "involvedObject": {
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "name": pod.metadata.name,
-                        "namespace": pod_ns,
-                        "uid": pod.metadata.uid,
-                    },
-                    "reason": "Scheduled",
-                    "message": format!("Successfully assigned {}/{} to {}", pod_ns, pod.metadata.name, node_name),
-                    "type": "Normal",
-                    "source": {
-                        "component": "default-scheduler",
-                    },
-                    "firstTimestamp": chrono::Utc::now().to_rfc3339(),
-                    "lastTimestamp": chrono::Utc::now().to_rfc3339(),
-                    "count": 1,
-                });
-                let event_key = rusternetes_storage::build_key("events", Some(pod_ns), &event_name);
-                let _ = self.storage.create(&event_key, &event).await;
-
-                Ok(())
+                pod
             }
             Err(rusternetes_common::Error::Conflict(_)) => {
                 // ResourceVersion conflict — re-read and retry once
@@ -945,10 +925,25 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
                 self.storage.update(&key, &fresh_pod).await?;
                 info!("Successfully bound pod to node {} (retry)", node_name);
-                Ok(())
+                fresh_pod
             }
-            Err(e) => Err(e),
-        }
+            Err(e) => return Err(e),
+        };
+
+        // Emit the Scheduled event once on successful bind via the unified
+        // recorder, regardless of which attempt succeeded — upstream's
+        // default-scheduler always records `recorder.Eventf(pod, Normal,
+        // "Scheduled", "Successfully assigned %v/%v to %v")` after bind. The
+        // recorder routes it through the correlator and stores it at the stable
+        // (object.reason.uid) key so it deduplicates against any other source.
+        let ns = bound_pod.metadata.namespace.as_deref().unwrap_or("default");
+        let message = format!(
+            "Successfully assigned {}/{} to {}",
+            ns, bound_pod.metadata.name, node_name
+        );
+        self.emit_pod_event(&bound_pod, EventType::Normal, "Scheduled", &message)
+            .await;
+        Ok(())
     }
 
     /// Try to preempt lower-priority pods to make room for a high-priority pod
