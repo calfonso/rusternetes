@@ -34,23 +34,18 @@ pub struct CertificateAuthority {
     /// the real CA key — i.e. they chain to the on-disk CA certificate.
     issuer: Certificate,
     ca_key: KeyPair,
-    ca_cert_pem: String,
 }
 
 impl CertificateAuthority {
     /// Build a CA from the cluster CA certificate and private key, both PEM.
     pub fn from_pem(ca_cert_pem: &str, ca_key_pem: &str) -> Result<Self> {
         let ca_key = KeyPair::from_pem(ca_key_pem).context("parsing CA private key PEM")?;
-        let params =
-            CertificateParams::from_ca_cert_pem(ca_cert_pem).context("parsing CA certificate PEM")?;
+        let params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
+            .context("parsing CA certificate PEM")?;
         let issuer = params
             .self_signed(&ca_key)
             .context("reconstructing CA issuer certificate")?;
-        Ok(Self {
-            issuer,
-            ca_key,
-            ca_cert_pem: ca_cert_pem.to_string(),
-        })
+        Ok(Self { issuer, ca_key })
     }
 
     /// Sign an approved CSR, returning the issued leaf certificate as PEM.
@@ -107,9 +102,32 @@ impl CertificateAuthority {
         Ok(cert.pem())
     }
 
-    /// The CA certificate PEM this authority signs with.
-    pub fn ca_cert_pem(&self) -> &str {
-        &self.ca_cert_pem
+    /// Build a CA by reading the cert + key PEM from the given file paths.
+    pub fn from_files(cert_path: &str, key_path: &str) -> Result<Self> {
+        let cert = std::fs::read_to_string(cert_path)
+            .with_context(|| format!("reading CA certificate {cert_path}"))?;
+        let key = std::fs::read_to_string(key_path)
+            .with_context(|| format!("reading CA private key {key_path}"))?;
+        Self::from_pem(&cert, &key)
+    }
+}
+
+/// Load the cluster CA from the `RUSTERNETES_CA_CERT_FILE` +
+/// `RUSTERNETES_CA_KEY_FILE` environment variables, enabling the in-process CSR
+/// signer. Returns `None` (signer disabled, issuance left to an external signer)
+/// when either var is unset or the material cannot be loaded.
+pub fn load_cluster_ca_from_env() -> Option<std::sync::Arc<CertificateAuthority>> {
+    let cert_path = std::env::var("RUSTERNETES_CA_CERT_FILE").ok()?;
+    let key_path = std::env::var("RUSTERNETES_CA_KEY_FILE").ok()?;
+    match CertificateAuthority::from_files(&cert_path, &key_path) {
+        Ok(ca) => {
+            tracing::info!("CSR signer enabled (cluster CA loaded from {cert_path})");
+            Some(std::sync::Arc::new(ca))
+        }
+        Err(e) => {
+            tracing::warn!("CSR signer disabled — failed to load cluster CA: {e:#}");
+            None
+        }
     }
 }
 
@@ -123,7 +141,9 @@ fn map_usages(usages: &[KeyUsage]) -> (Vec<KeyUsagePurpose>, Vec<ExtendedKeyUsag
     let mut eku = Vec::new();
     for usage in usages {
         match usage {
-            K::Signing | K::DigitalSignature => push_unique(&mut ku, KeyUsagePurpose::DigitalSignature),
+            K::Signing | K::DigitalSignature => {
+                push_unique(&mut ku, KeyUsagePurpose::DigitalSignature)
+            }
             K::ContentCommitment => push_unique(&mut ku, KeyUsagePurpose::ContentCommitment),
             K::KeyEncipherment => push_unique(&mut ku, KeyUsagePurpose::KeyEncipherment),
             K::KeyAgreement => push_unique(&mut ku, KeyUsagePurpose::KeyAgreement),
@@ -159,6 +179,9 @@ mod tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, DnType, KeyPair};
     use x509_parser::prelude::*;
+    // Disambiguate from `x509_parser::prelude::KeyUsage` (a different type that
+    // the glob above also brings into scope).
+    use rusternetes_common::resources::KeyUsage;
 
     /// Generate a self-signed CA, returning `(cert_pem, key_pem)`.
     fn make_ca() -> (String, String) {
@@ -248,8 +271,14 @@ mod tests {
             .unwrap()
             .expect("issued cert must carry extended key usage")
             .value;
-        assert!(eku.server_auth, "server auth EKU must be set from spec.usages");
-        assert!(!eku.client_auth, "client auth must NOT be set (not requested)");
+        assert!(
+            eku.server_auth,
+            "server auth EKU must be set from spec.usages"
+        );
+        assert!(
+            !eku.client_auth,
+            "client auth must NOT be set (not requested)"
+        );
 
         let ku = leaf
             .key_usage()
@@ -264,7 +293,11 @@ mod tests {
     fn sign_rejects_a_malformed_request() {
         let (ca_cert_pem, ca_key_pem) = make_ca();
         let ca = CertificateAuthority::from_pem(&ca_cert_pem, &ca_key_pem).unwrap();
-        let err = ca.sign("-----BEGIN CERTIFICATE REQUEST-----\nnot-a-csr\n-----END CERTIFICATE REQUEST-----\n", &[KeyUsage::ClientAuth], None);
+        let err = ca.sign(
+            "-----BEGIN CERTIFICATE REQUEST-----\nnot-a-csr\n-----END CERTIFICATE REQUEST-----\n",
+            &[KeyUsage::ClientAuth],
+            None,
+        );
         assert!(err.is_err(), "a malformed CSR must be rejected, not signed");
     }
 }

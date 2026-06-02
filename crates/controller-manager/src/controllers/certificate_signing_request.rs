@@ -236,10 +236,8 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
             info!("Auto-approving CSR {}", csr_name);
             self.approve_csr(csr).await?;
             if self.ca.is_some() {
-                let key =
-                    format!("/registry/certificatesigningrequests/{}", csr.metadata.name);
-                if let Ok(approved_csr) =
-                    self.storage.get::<CertificateSigningRequest>(&key).await
+                let key = format!("/registry/certificatesigningrequests/{}", csr.metadata.name);
+                if let Ok(approved_csr) = self.storage.get::<CertificateSigningRequest>(&key).await
                 {
                     return self.issue_certificate(&approved_csr).await;
                 }
@@ -353,7 +351,7 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
         let mut updated = csr.clone();
         let status = updated
             .status
-            .get_or_insert_with(|| CertificateSigningRequestStatus {
+            .get_or_insert(CertificateSigningRequestStatus {
                 conditions: None,
                 certificate: None,
             });
@@ -581,7 +579,12 @@ mod tests {
 
     /// Build a self-signed CA and return `(CertificateAuthority, base64-PEM CSR
     /// for `cn`)` ready to drop into a CSR `spec.request`.
-    fn ca_and_request(cn: &str) -> (Arc<crate::controllers::cert_authority::CertificateAuthority>, String) {
+    fn ca_and_request(
+        cn: &str,
+    ) -> (
+        Arc<crate::controllers::cert_authority::CertificateAuthority>,
+        String,
+    ) {
         use base64::{engine::general_purpose, Engine as _};
 
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();

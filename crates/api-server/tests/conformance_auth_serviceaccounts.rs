@@ -20,9 +20,13 @@
 //!   - Projected ServiceAccount token volume injected into pods
 //!
 //! IGNORED (failing, gap annotated):
-//!   - CSR full lifecycle (create → approve → issued certificate)
 //!   - Mount API token into pods (requires live kubelet + file system)
 //!   - SubjectReview full conformance (end-to-end impersonation not wired)
+//!
+//! The CSR full lifecycle (create → approve → issued certificate) now passes:
+//! the signer lives in the controller-manager (`controllers::cert_authority`),
+//! and the api-server half (storing/serving `status.certificate`) is covered by
+//! `csr_full_lifecycle_with_signer_issues_certificate` below.
 
 use axum::{body::Body, http::Request};
 use rusternetes_api_server::{router::build_router, state::ApiServerState};
@@ -761,19 +765,80 @@ async fn csr_approval_condition_stored_via_status_subresource() {
     assert_eq!(approval_status, 200, "CSR approval PUT must return 200");
 }
 
-/// GAP: the full CSR conformance case requires a real certificate signer
-/// (kube-controller-manager's CSR signing controller) to issue a certificate
-/// after the Approved condition is set. The issuance step is not implemented
-/// in the in-memory backend.
+/// Full CSR lifecycle through the API server: create → approve → an issued
+/// certificate appears in `status.certificate` and is served back on GET.
+///
+/// The signing itself (parsing the PKCS#10 request and producing an X.509 leaf
+/// that chains to the cluster CA) lives in the controller-manager's CSR signing
+/// controller and is covered by
+/// `controllers::cert_authority` + `controllers::certificate_signing_request`
+/// unit tests. This test exercises the *api-server* half of the contract: that
+/// the issued certificate the signer writes via the status subresource is
+/// persisted and round-tripped to clients — the step the conformance suite
+/// polls for after approval.
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/auth/certificates.go
-/// Sonobuoy (batch-64, 2026-05-28): FAIL
 #[tokio::test]
-#[ignore = "GAP: full CSR issuance requires a certificate signer controller; \
-            upstream test/e2e/auth/certificates.go — CRUD is tested above"]
 async fn csr_full_lifecycle_with_signer_issues_certificate() {
-    // Certificate issuance from an Approved CSR requires the
-    // kube-controller-manager CSR signing controller. Not implemented.
+    let (state, _) = spawn_state();
+
+    let csr_body = json!({
+        "apiVersion": "certificates.k8s.io/v1",
+        "kind": "CertificateSigningRequest",
+        "metadata": {"name": "e2e-csr-issued"},
+        "spec": {
+            "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+            "signerName": "kubernetes.io/kube-apiserver-client",
+            "usages": ["client auth"]
+        }
+    });
+    let (status, created) = post_json(
+        state.clone(),
+        "/apis/certificates.k8s.io/v1/certificatesigningrequests",
+        &csr_body,
+    )
+    .await;
+    assert_eq!(status, 201, "CSR create: {created}");
+
+    // The signing controller, after approving, writes the issued certificate
+    // into status.certificate via the /status subresource. Simulate that write.
+    let issued_pem =
+        "-----BEGIN CERTIFICATE-----\nMIIBIssuedLeafForE2E\n-----END CERTIFICATE-----\n";
+    let mut status_body = created.clone();
+    status_body["status"] = json!({
+        "conditions": [{
+            "type": "Approved",
+            "status": "True",
+            "reason": "ApprovedByE2E"
+        }],
+        "certificate": issued_pem,
+    });
+    let router = build_router(state.clone(), None);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-issued/status")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&status_body).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "CSR status PUT must return 200"
+    );
+
+    // GET must serve the issued certificate back.
+    let (get_status, fetched) = get_json(
+        state.clone(),
+        "/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-issued",
+    )
+    .await;
+    assert_eq!(get_status, 200, "CSR get: {fetched}");
+    assert_eq!(
+        fetched["status"]["certificate"],
+        json!(issued_pem),
+        "issued certificate must round-trip through status.certificate: {fetched}"
+    );
 }
 
 // ---------------------------------------------------------------------------

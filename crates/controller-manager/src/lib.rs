@@ -248,8 +248,13 @@ pub async fn run(
     });
 
     let s = storage.clone();
+    let csr_ca = controllers::cert_authority::load_cluster_ca_from_env();
     tokio::spawn(async move {
-        let c = Arc::new(CertificateSigningRequestController::new(s));
+        let mut controller = CertificateSigningRequestController::new(s);
+        if let Some(ca) = csr_ca {
+            controller = controller.with_certificate_authority(ca);
+        }
+        let c = Arc::new(controller);
         if let Err(e) = c.run().await {
             error!("CertificateSigningRequest controller error: {}", e);
         }
