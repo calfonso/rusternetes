@@ -721,7 +721,11 @@ async fn clusterrolebinding_update_blocked_when_caller_lacks_escalate() {
         },
     };
     mem.create(
-        &build_key("clusterrolebindings", None, "mallory-cluster-secret-binding"),
+        &build_key(
+            "clusterrolebindings",
+            None,
+            "mallory-cluster-secret-binding",
+        ),
         &existing,
     )
     .await

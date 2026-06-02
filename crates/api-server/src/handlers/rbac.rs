@@ -688,6 +688,7 @@ pub async fn update_rolebinding(
     info!("Updating rolebinding: {}/{}", namespace, name);
 
     // Check authorization
+    let user = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "update", "rolebindings")
         .with_namespace(&namespace)
         .with_api_group("rbac.authorization.k8s.io")
@@ -715,6 +716,11 @@ pub async fn update_rolebinding(
             ));
         }
     }
+
+    // Privilege-escalation prevention on update: upstream's `rolebinding/policybased`
+    // runs the same ConfirmNoEscalation check on UPDATE as on CREATE, since the
+    // bound role's rules can be granted to new subjects.
+    confirm_no_escalation(&state, &user, &rolebinding.role_ref, &namespace, &name).await?;
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -1141,6 +1147,7 @@ pub async fn create_clusterrolebinding(
     );
 
     // Check authorization
+    let user = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "clusterrolebindings")
         .with_api_group("rbac.authorization.k8s.io");
 
@@ -1150,6 +1157,18 @@ pub async fn create_clusterrolebinding(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // Privilege-escalation prevention: the caller must already hold the rules
+    // granted by the referenced ClusterRole, or hold the `escalate` verb on it.
+    // Cluster-scoped, so the binding namespace is empty.
+    confirm_no_escalation(
+        &state,
+        &user,
+        &clusterrolebinding.role_ref,
+        "",
+        &clusterrolebinding.metadata.name,
+    )
+    .await?;
 
     // Enrich metadata with system fields
     clusterrolebinding.metadata.ensure_uid();
@@ -1222,6 +1241,7 @@ pub async fn update_clusterrolebinding(
     info!("Updating clusterrolebinding: {}", name);
 
     // Check authorization
+    let user = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "update", "clusterrolebindings")
         .with_api_group("rbac.authorization.k8s.io")
         .with_name(&name);
@@ -1247,6 +1267,10 @@ pub async fn update_clusterrolebinding(
             ));
         }
     }
+
+    // Privilege-escalation prevention on update: same ConfirmNoEscalation check
+    // as create, mirroring upstream's `clusterrolebinding/policybased`.
+    confirm_no_escalation(&state, &user, &clusterrolebinding.role_ref, "", &name).await?;
 
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
