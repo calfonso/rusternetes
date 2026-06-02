@@ -547,7 +547,7 @@ pub async fn list(
     // Check if this is a watch request
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         debug!("Watching namespaces");

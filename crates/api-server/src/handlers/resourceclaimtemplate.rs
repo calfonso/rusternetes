@@ -115,7 +115,7 @@ pub async fn list_resourceclaimtemplates(
 ) -> Result<axum::response::Response> {
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         info!(
@@ -181,7 +181,7 @@ pub async fn list_all_resourceclaimtemplates(
 ) -> Result<axum::response::Response> {
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         info!("Starting watch for all resourceclaimtemplates");

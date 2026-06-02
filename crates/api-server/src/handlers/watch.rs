@@ -95,10 +95,24 @@ pub fn normalize_resource_version(rv: Option<String>) -> Option<String> {
 }
 
 /// Check if a query param map indicates a watch request
+/// Parse a query-parameter boolean the way Kubernetes does — Go's
+/// `strconv.ParseBool`, which accepts `1/t/T/TRUE/true/True` as true and
+/// `0/f/F/FALSE/false/False` as false. Rust's `str::parse::<bool>()` only
+/// accepts `"true"`/`"false"`, so clients that send `?watch=1` (Lens and other
+/// non-client-go informers) were silently treated as plain LIST requests —
+/// causing their reflectors to relist-loop (poll) instead of watching.
+pub fn parse_k8s_bool(v: &str) -> Option<bool> {
+    match v {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn is_watch_request(params: &std::collections::HashMap<String, String>) -> bool {
     params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| parse_k8s_bool(v))
         .unwrap_or(false)
 }
 
@@ -2739,4 +2753,48 @@ pub async fn watch_namespaced_json(
         .header(header::TRANSFER_ENCODING, "chunked")
         .body(body)
         .unwrap())
+}
+
+#[cfg(test)]
+mod watch_bool_tests {
+    use super::{is_watch_request, parse_k8s_bool};
+    use std::collections::HashMap;
+
+    /// Kubernetes accepts Go `strconv.ParseBool` spellings on `?watch=`.
+    /// Rust's `str::parse::<bool>()` only accepts "true"/"false", so clients
+    /// that send `?watch=1` (Lens and other non-client-go informers) were
+    /// silently served a plain LIST instead of a watch stream — making their
+    /// reflectors relist-loop (poll) instead of watching.
+    #[test]
+    fn parse_k8s_bool_accepts_go_spellings() {
+        for t in ["1", "t", "T", "true", "True", "TRUE"] {
+            assert_eq!(parse_k8s_bool(t), Some(true), "{t} should be true");
+        }
+        for f in ["0", "f", "F", "false", "False", "FALSE"] {
+            assert_eq!(parse_k8s_bool(f), Some(false), "{f} should be false");
+        }
+        assert_eq!(parse_k8s_bool("yes"), None);
+        assert_eq!(parse_k8s_bool(""), None);
+    }
+
+    #[test]
+    fn is_watch_request_recognizes_watch_eq_1() {
+        let mut p = HashMap::new();
+        p.insert("watch".to_string(), "1".to_string());
+        assert!(
+            is_watch_request(&p),
+            "?watch=1 must be a watch (Lens uses this)"
+        );
+
+        p.insert("watch".to_string(), "true".to_string());
+        assert!(
+            is_watch_request(&p),
+            "?watch=true must be a watch (kubectl)"
+        );
+
+        p.insert("watch".to_string(), "0".to_string());
+        assert!(!is_watch_request(&p), "?watch=0 is not a watch");
+
+        assert!(!is_watch_request(&HashMap::new()), "no watch param = list");
+    }
 }
