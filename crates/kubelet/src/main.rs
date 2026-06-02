@@ -376,6 +376,7 @@ async fn main() -> Result<()> {
             // bin-local type, not the lib's re-export.
             None,
             crate::runtime::PodNetworkMode::Cni,
+            runtime_config.metrics_bind_port,
         )
         .await?,
     );
