@@ -66,6 +66,16 @@ jobs:
         # separate `cargo test --doc` step if that changes.
         run: cargo nextest run --workspace --locked --no-fail-fast --status-level fail
 
+      - name: sccache stats
+        # Compilation cache hit-rate, for visibility. sccache itself is
+        # configured cluster-side via the runner pod env (RUSTC_WRAPPER +
+        # SCCACHE_* → the in-cluster MinIO; see indy/arc-runner/sccache-minio
+        # + values-*.yaml). It shares rustc artifacts between this job and the
+        # clippy job and across successive pushes to a PR. `|| true` keeps a
+        # missing/unconfigured sccache from failing the job.
+        if: always()
+        run: sccache --show-stats || true
+
   clippy:
     name: cargo clippy
     # Clippy peaks at ~250 MiB resident, so it runs on the light-tier
@@ -103,3 +113,9 @@ jobs:
         # every target before lint, so any compile error in a bin fails
         # this step.
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: sccache stats
+        # See the nextest job's sccache-stats step. This job populates the
+        # shared cache that nextest then reads (and vice-versa).
+        if: always()
+        run: sccache --show-stats || true
