@@ -549,7 +549,24 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
         };
         let event_name = Event::generate_name(&involved, reason);
         let key = format!("/registry/events/{}/{}", namespace, event_name);
-        if self.storage.get::<Event>(&key).await.is_ok() {
+        if let Ok(mut existing) = self.storage.get::<Event>(&key).await {
+            // Recurring warning for the same (service, reason): de-duplicate by
+            // bumping the count / lastTimestamp and keeping the events.k8s.io
+            // `series` consistent, rather than leaving it stuck at count:1.
+            let now = chrono::Utc::now();
+            existing.count = existing.count.saturating_add(1);
+            existing.last_timestamp = Some(now);
+            existing.message = message.to_string();
+            existing.series = Some(rusternetes_common::resources::EventSeries {
+                count: existing.count,
+                last_observed_time: now,
+            });
+            if let Err(e) = self.storage.update(&key, &existing).await {
+                warn!(
+                    "Failed to bump recurring Warning event {}/{}: {}",
+                    namespace, reason, e
+                );
+            }
             return;
         }
         let event = Event::new(

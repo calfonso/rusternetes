@@ -8,6 +8,7 @@ pub mod deletion;
 pub mod dump;
 pub mod encryption;
 pub mod error;
+pub mod event_correlator;
 pub mod feature_gates;
 pub mod field_selector;
 pub mod label_selector;

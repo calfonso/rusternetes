@@ -1,6 +1,8 @@
 use chrono::Utc;
 use futures::StreamExt;
-use rusternetes_common::resources::{Event, EventSource, EventType, ObjectReference, Pod};
+use rusternetes_common::resources::{
+    Event, EventSeries, EventSource, EventType, ObjectReference, Pod,
+};
 use rusternetes_storage::{build_prefix, Storage, WorkQueue, RECONCILE_ALL_SENTINEL};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -12,6 +14,12 @@ pub struct EventsController<S: Storage> {
 }
 
 impl<S: Storage + 'static> EventsController<S> {
+    /// Minimum time that must elapse between two recorded occurrences of an
+    /// otherwise-identical event before the polling reconciler bumps its
+    /// `count`. Prevents per-resync inflation while still letting genuinely
+    /// recurring events accumulate.
+    const EVENT_DEDUP_MIN_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
+
     pub fn new(storage: Arc<S>, sync_interval_secs: u64) -> Self {
         Self {
             storage,
@@ -311,11 +319,49 @@ impl<S: Storage + 'static> EventsController<S> {
 
         // Check if event already exists
         let key = format!("/registry/events/{}/{}", namespace, event_name);
-        if let Ok(_existing_event) = self.storage.get::<Event>(&key).await {
-            // Event already exists — don't update on every reconcile loop.
-            // The event was already recorded; continuously incrementing the
-            // count and rewriting to etcd every second creates massive I/O
-            // pressure and log spam under load.
+        if let Ok(mut existing_event) = self.storage.get::<Event>(&key).await {
+            // Event already exists — this is a recurring occurrence of the
+            // same (object, reason) event. Mirror upstream's eventLogger
+            // de-duplication: bump `count`, advance `lastTimestamp`, and keep
+            // the events.k8s.io `series` in lock-step so the event no longer
+            // appears stuck at count:1.
+            //
+            // Guard against the polling nature of this reconciler: the loop
+            // re-evaluates unchanged pod state every resync (~30s). Without a
+            // throttle we would inflate the count on every pass even though
+            // nothing genuinely recurred, recreating the I/O / log-spam
+            // pressure the previous skip-only logic was protecting against.
+            // We therefore only bump when either:
+            //   - the message changed (genuinely new information), or
+            //   - at least `EVENT_DEDUP_MIN_INTERVAL` has elapsed since the
+            //     last recorded occurrence (a real, distinct recurrence).
+            let now = Utc::now();
+            let message_changed = existing_event.message != message;
+            let interval_elapsed = existing_event
+                .last_timestamp
+                .map(|t| now - t >= Self::EVENT_DEDUP_MIN_INTERVAL)
+                .unwrap_or(true);
+
+            if !message_changed && !interval_elapsed {
+                // Too soon and nothing changed — treat as the same observation.
+                return Ok(());
+            }
+
+            existing_event.count = existing_event.count.saturating_add(1);
+            existing_event.last_timestamp = Some(now);
+            existing_event.message = message.to_string();
+            // Keep the series shape (events.k8s.io/v1) consistent with count.
+            existing_event.series = Some(EventSeries {
+                count: existing_event.count,
+                last_observed_time: now,
+            });
+
+            if let Err(e) = self.storage.update(&key, &existing_event).await {
+                eprintln!(
+                    "Failed to bump count for recurring event {}/{}: {}",
+                    namespace, event_name, e
+                );
+            }
             return Ok(());
         }
 
@@ -502,6 +548,79 @@ mod tests {
         assert_eq!(event.reason, "Started");
         assert_eq!(event.message, "Pod started successfully");
         assert_eq!(event.count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_recurring_event_bumps_count_and_series() {
+        use rusternetes_storage::MemoryStorage;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = EventsController::new(storage.clone(), 5);
+
+        let obj_ref = ObjectReference {
+            kind: Some("Pod".to_string()),
+            namespace: Some("default".to_string()),
+            name: Some("recurring-pod".to_string()),
+            uid: Some("uid-recur-1".to_string()),
+            api_version: Some("v1".to_string()),
+            resource_version: None,
+            field_path: None,
+        };
+
+        // First emission creates the event at count 1.
+        controller
+            .create_event_if_new(
+                "default",
+                &obj_ref,
+                "BackOff",
+                "Back-off restarting failed container",
+                EventType::Warning,
+                Some("kubelet".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let event_name = Event::generate_name(&obj_ref, "BackOff");
+        let key = format!("/registry/events/default/{}", event_name);
+        let after_first: Event = storage.get(&key).await.unwrap();
+        assert_eq!(after_first.count, 1, "first emission should be count 1");
+        assert!(
+            after_first.series.is_none(),
+            "no series before a recurrence"
+        );
+
+        // Second emission with a changed message is a genuine recurrence and
+        // must bump the count (not stay stuck at 1) and populate the series.
+        controller
+            .create_event_if_new(
+                "default",
+                &obj_ref,
+                "BackOff",
+                "Back-off restarting failed container (attempt 2)",
+                EventType::Warning,
+                Some("kubelet".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let after_second: Event = storage.get(&key).await.unwrap();
+        assert!(
+            after_second.count >= 2,
+            "recurring event must reach count >= 2, got {}",
+            after_second.count
+        );
+        let series = after_second
+            .series
+            .as_ref()
+            .expect("series must be populated on a recurrence");
+        assert_eq!(
+            series.count, after_second.count,
+            "series.count must track the event count"
+        );
+        assert!(
+            after_second.last_timestamp.is_some(),
+            "lastTimestamp must be advanced on a recurrence"
+        );
     }
 
     #[tokio::test]
