@@ -373,7 +373,10 @@ ENTRYPOINT ["/app/controller-manager"]
 CMD ["--etcd-servers", "http://etcd:2379"]
 
 # ---------------------------------------------------------------------
-# Stage 7: kube-proxy runtime. Needs iptables for service routing.
+# Stage 7: kube-proxy runtime. Needs iptables for service routing, and kmod
+# (modprobe) to load br_netfilter on startup so bridge-nf-call-iptables can be
+# enabled — required for NodePort traffic to a node's bridge IP to hit the
+# host-netns DNAT rules. The host module tree is bind-mounted at /lib/modules.
 # ---------------------------------------------------------------------
 FROM debian:sid-slim AS kube-proxy
 
@@ -382,6 +385,7 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     iptables \
     iproute2 \
+    kmod \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
