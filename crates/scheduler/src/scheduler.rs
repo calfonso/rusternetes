@@ -1751,6 +1751,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scheduler_emits_scheduled_event_via_recorder() {
+        use rusternetes_common::resources::{Event, EventType, ObjectReference};
+
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+
+        let node1 = make_node("node-1");
+        storage
+            .create("/registry/nodes/node-1", &node1)
+            .await
+            .unwrap();
+
+        let mut pod = make_pending_pod("sched-pod", "default");
+        pod.metadata.uid = "sched-pod-uid-1234".to_string();
+        storage
+            .create("/registry/pods/default/sched-pod", &pod)
+            .await
+            .unwrap();
+
+        scheduler.schedule_pending_pods().await.unwrap();
+
+        // Pod must be bound.
+        let bound: Pod = storage
+            .get("/registry/pods/default/sched-pod")
+            .await
+            .unwrap();
+        assert_eq!(
+            bound.spec.as_ref().and_then(|s| s.node_name.as_deref()),
+            Some("node-1"),
+            "pod should be bound to node-1"
+        );
+
+        // The Scheduled event must be retrievable at the recorder's STABLE key
+        // (object.reason.uid) — proving it was routed through EventRecorder, not
+        // the old ad-hoc `{pod}.sched.{timestamp}` write that never deduplicates.
+        let involved = ObjectReference {
+            kind: Some("Pod".to_string()),
+            namespace: Some("default".to_string()),
+            name: Some("sched-pod".to_string()),
+            uid: Some("sched-pod-uid-1234".to_string()),
+            api_version: Some("v1".to_string()),
+            resource_version: None,
+            field_path: None,
+        };
+        let name = Event::generate_name(&involved, "Scheduled");
+        let key = format!("/registry/events/default/{}", name);
+        let ev: Event = storage
+            .get(&key)
+            .await
+            .expect("Scheduled event must be stored at the recorder's stable key");
+
+        assert_eq!(ev.reason, "Scheduled");
+        assert!(matches!(ev.event_type, EventType::Normal));
+        assert_eq!(ev.source.component, "default-scheduler");
+        assert_eq!(
+            ev.message,
+            "Successfully assigned default/sched-pod to node-1"
+        );
+    }
+
+    #[tokio::test]
     async fn test_scheduler_does_not_reschedule_already_scheduled_pod() {
         let storage = Arc::new(MemoryStorage::new());
         let scheduler =
