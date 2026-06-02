@@ -8,11 +8,14 @@ Rusternetes is a from-scratch Rust reimplementation of Kubernetes. This document
 
 **Every conformance figure in this repo is dated and tagged with the storage backend it was measured on.** etcd and the SQLite/rhino backend exercise different code paths and do not produce the same numbers — never treat an older etcd figure (e.g. the Round 160 / 94.1% below) as the current baseline.
 
-| Date | Backend | Image | Commit | Pass | Fail | Ran | Pass rate |
-|------|---------|-------|--------|------|------|-----|-----------|
-| 2026-05-31 | SQLite / rhino | `conformance:v1.35.0` | `e9c9f507` | 347 | 99 | 446 | 77.8% |
+| Date | OS | Backend | Image | Commit | Pass | Fail | Ran | Pass rate |
+|------|----|---------|-------|--------|------|------|-----|-----------|
+| 2026-06-02 | Zorin OS 18 | SQLite / rhino | `conformance:v1.35.0` | `e1758455` | 373 | 64 | 441 | 84.6% |
+| 2026-05-31 | — | SQLite / rhino | `conformance:v1.35.0` | `e9c9f507` | 347 | 99 | 446 | 77.8% |
 
-Hydrophone, full `[Conformance]` suite, multi-container SQLite stack (`compose.sqlite.yml` + `compose.dind.yml`), rhino submodule `7ec61cb`. Per-test PASS/FAIL for this run (one column per run, verbatim ginkgo keys): [`conformance/PER_TEST_RESULTS.md`](conformance/PER_TEST_RESULTS.md).
+Hydrophone, full `[Conformance]` suite (441), multi-container SQLite stack (`compose.sqlite.yml` + `compose.dind.yml`), rhino submodule. Per-test PASS/FAIL per run (verbatim ginkgo keys, now date/OS/commit-tagged): [`conformance/PER_TEST_RESULTS.md`](conformance/PER_TEST_RESULTS.md).
+
+**2026-06-02 (`e1758455`):** 373/441 (84.6%), up from 342 on 2026-05-31 — driven by PRs #886–#938 (RoleRef/CRD/decode Go-parity, CRD serving + OpenAPI publish, admission-webhook invocation, ReplicationController/GC lifecycle, RuntimeClass, InPlace resize, ServiceAccount token mount, kubectl client, Services endpoints). `known-green.txt` grew 323 → 385; this batch closes the backlog of conformance issues whose tests are now green. The remaining 64 failures are SchedulerPredicates/Preemption `[Serial]`, PreStop, InPlace-resize-via-replace, KubeletManagedEtcHosts, InitContainer, Aggregator sample API server, CSI PV/StorageClass/VolumeAttachment lifecycle, and Subpath — tracked in the live-cluster task set.
 
 This is the first full conformance run on the SQLite/rhino backend after migrating off etcd and landing a batch of breaking storage/watch changes. It is **not** comparable to the historical etcd peak below (Round 160, 94.1%): a different backend, and many fixes for SQLite-specific behaviour are still in flight. The 99 failures cluster tightly, and most are already being addressed:
 
