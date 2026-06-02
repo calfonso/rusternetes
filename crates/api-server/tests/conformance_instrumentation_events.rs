@@ -139,6 +139,7 @@ fn events_v1_event(ns: &str, name: &str) -> Value {
         },
         "note": "Conformance event note",
         "reportingController": "e2e-test-controller",
+        "reportingInstance": "e2e-test-controller-0",
         "type": "Normal"
     })
 }
