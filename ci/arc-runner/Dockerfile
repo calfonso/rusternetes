@@ -57,3 +57,18 @@ RUN mkdir -p /home/runner/.docker/cli-plugins \
       -o /home/runner/.docker/cli-plugins/docker-compose \
  && chmod +x /home/runner/.docker/cli-plugins/docker-compose \
  && /home/runner/.docker/cli-plugins/docker-compose version
+
+# sccache — shared rustc compilation cache. The CI jobs set
+# RUSTC_WRAPPER=sccache + SCCACHE_* (→ the in-cluster MinIO) via the ARC
+# runner pod env (indy/arc-runner/values-*.yaml), so the binary MUST exist on
+# PATH or every `cargo build`/`clippy`/`nextest` fails with "RUSTC_WRAPPER
+# not found". The musl build is statically linked and portable across the
+# runner base image. Pinned; bumps land here, not in workflow files.
+ENV SCCACHE_VERSION=v0.8.2
+RUN curl -fsSL \
+      "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar xz -C /tmp \
+ && mv "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /home/runner/.cargo/bin/sccache \
+ && chmod +x /home/runner/.cargo/bin/sccache \
+ && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl" \
+ && sccache --version
