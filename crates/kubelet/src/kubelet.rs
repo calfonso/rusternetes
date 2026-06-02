@@ -2158,7 +2158,11 @@ impl Kubelet {
                                 // Ensure image is available before starting
                                 if let Err(e) = self
                                     .runtime
-                                    .ensure_image(&ic.image, ic.image_pull_policy.as_deref())
+                                    .ensure_image(
+                                        &ic.image,
+                                        ic.image_pull_policy.as_deref(),
+                                        Some((pod, ic.name.as_str())),
+                                    )
                                     .await
                                 {
                                     warn!(
@@ -3399,6 +3403,27 @@ impl Kubelet {
                                     namespace, pod_name
                                 );
 
+                                // Upstream emits Unhealthy when a probe fails and
+                                // Killing as it tears the container down to restart.
+                                self.runtime
+                                    .emit_event(
+                                        pod,
+                                        None,
+                                        crate::events::CONTAINER_UNHEALTHY,
+                                        rusternetes_common::resources::EventType::Warning,
+                                        "Liveness probe failed, container will be restarted",
+                                    )
+                                    .await;
+                                self.runtime
+                                    .emit_event(
+                                        pod,
+                                        None,
+                                        crate::events::KILLING_CONTAINER,
+                                        rusternetes_common::resources::EventType::Normal,
+                                        "Stopping container after failed liveness probe",
+                                    )
+                                    .await;
+
                                 // Capture current restart counts before stopping
                                 let current_restart_counts: HashMap<String, u32> = pod
                                     .status
@@ -3421,6 +3446,17 @@ impl Kubelet {
                                 if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
                                     error!("Failed to stop pod for restart: {}", e);
                                 } else {
+                                    // Restart is in back-off — upstream emits BackOff
+                                    // before the container is recreated.
+                                    self.runtime
+                                        .emit_event(
+                                            pod,
+                                            None,
+                                            crate::events::BACK_OFF_START_CONTAINER,
+                                            rusternetes_common::resources::EventType::Warning,
+                                            "Back-off restarting failed container",
+                                        )
+                                        .await;
                                     // Build container statuses with incremented restart counts
                                     let restarting_statuses: Vec<ContainerStatus> = pod
                                         .spec

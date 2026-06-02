@@ -169,87 +169,18 @@ impl<S: Storage + 'static> EventsController<S> {
                     }
                 }
                 Some(Phase::Running) => {
-                    self.create_event_if_new(
-                        namespace,
-                        &pod_ref,
-                        "Started",
-                        &format!("Started pod {}", pod_name),
-                        EventType::Normal,
-                        Some("kubelet".to_string()),
-                    )
-                    .await?;
-
-                    // Create events for container statuses
-                    if let Some(container_statuses) = &status.container_statuses {
-                        for container_status in container_statuses {
-                            // Check for running containers
-                            if matches!(&container_status.state, Some(state) if matches!(state, rusternetes_common::resources::ContainerState::Running { .. }))
-                            {
-                                self.create_event_if_new(
-                                    namespace,
-                                    &pod_ref,
-                                    "Pulled",
-                                    &format!(
-                                        "Container image \\\"{}\\\" already present on machine",
-                                        container_status.image.as_deref().unwrap_or("unknown")
-                                    ),
-                                    EventType::Normal,
-                                    Some("kubelet".to_string()),
-                                )
-                                .await?;
-
-                                self.create_event_if_new(
-                                    namespace,
-                                    &pod_ref,
-                                    "Created",
-                                    &format!("Created container {}", container_status.name),
-                                    EventType::Normal,
-                                    Some("kubelet".to_string()),
-                                )
-                                .await?;
-
-                                self.create_event_if_new(
-                                    namespace,
-                                    &pod_ref,
-                                    "Started",
-                                    &format!("Started container {}", container_status.name),
-                                    EventType::Normal,
-                                    Some("kubelet".to_string()),
-                                )
-                                .await?;
-                            }
-
-                            // Check for restarts
-                            if container_status.restart_count > 0 {
-                                self.create_event_if_new(
-                                    namespace,
-                                    &pod_ref,
-                                    "BackOff",
-                                    &format!(
-                                        "Back-off restarting failed container {} in pod {}",
-                                        container_status.name, pod_name
-                                    ),
-                                    EventType::Warning,
-                                    Some("kubelet".to_string()),
-                                )
-                                .await?;
-                            }
-                        }
-                    }
+                    // Container-lifecycle events (Pulling/Pulled/Created/Started/
+                    // BackOff) are now emitted by the kubelet at the real
+                    // transition points via the unified EventRecorder — it is the
+                    // source of truth, mirroring upstream. This controller no
+                    // longer *infers* them from pod.status, which previously
+                    // double-sourced events and could only guess at messages.
+                    // See crates/kubelet/src/events.rs.
                 }
                 Some(Phase::Succeeded) => {
-                    // Pods that succeeded went through Running — emit Started
-                    // event if not already emitted. Tests that watch for "Started"
-                    // events may miss the Running phase if the pod completes quickly.
-                    self.create_event_if_new(
-                        namespace,
-                        &pod_ref,
-                        "Started",
-                        &format!("Started pod {}", pod_name),
-                        EventType::Normal,
-                        Some("kubelet".to_string()),
-                    )
-                    .await?;
+                    // Container Started events are kubelet-owned now; this
+                    // controller only summarises the pod-level outcome the
+                    // kubelet does not emit.
                     self.create_event_if_new(
                         namespace,
                         &pod_ref,
@@ -261,27 +192,8 @@ impl<S: Storage + 'static> EventsController<S> {
                     .await?;
                 }
                 Some(Phase::Failed) => {
-                    // Pods that failed may have started containers — emit Started
-                    if status.container_statuses.as_ref().is_some_and(|cs| {
-                        cs.iter().any(|c| {
-                            matches!(
-                                c.state,
-                                Some(
-                                    rusternetes_common::resources::ContainerState::Terminated { .. }
-                                )
-                            )
-                        })
-                    }) {
-                        self.create_event_if_new(
-                            namespace,
-                            &pod_ref,
-                            "Started",
-                            &format!("Started pod {}", pod_name),
-                            EventType::Normal,
-                            Some("kubelet".to_string()),
-                        )
-                        .await?;
-                    }
+                    // Container lifecycle events are kubelet-owned; keep only the
+                    // pod-level Failed summary the kubelet does not emit.
                     let reason = status.reason.as_deref().unwrap_or("Unknown");
                     let message = status.message.as_deref().unwrap_or("Pod failed");
                     self.create_event_if_new(
@@ -596,7 +508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_succeeded_pod_emits_started_event() {
+    async fn test_succeeded_pod_emits_completed_not_started() {
         use rusternetes_common::resources::ContainerState;
         use rusternetes_common::types::Phase;
         use rusternetes_storage::MemoryStorage;
@@ -651,16 +563,18 @@ mod tests {
         let has_started = events.iter().any(|e| e.reason == "Started");
         let has_completed = events.iter().any(|e| e.reason == "Completed");
 
+        // Container "Started" is now kubelet-owned — this controller must no
+        // longer synthesise it. It still summarises the pod-level Completed.
         assert!(
-            has_started,
-            "Succeeded pod should have Started event. Events: {:?}",
+            !has_started,
+            "controller must NOT infer Started (kubelet owns it). Events: {:?}",
             events.iter().map(|e| &e.reason).collect::<Vec<_>>()
         );
         assert!(has_completed, "Succeeded pod should have Completed event");
     }
 
     #[tokio::test]
-    async fn test_failed_pod_with_containers_emits_started_event() {
+    async fn test_failed_pod_emits_failed_not_started() {
         use rusternetes_common::resources::ContainerState;
         use rusternetes_common::types::Phase;
         use rusternetes_storage::MemoryStorage;
@@ -712,9 +626,11 @@ mod tests {
         let has_started = events.iter().any(|e| e.reason == "Started");
         let has_failed = events.iter().any(|e| e.reason == "Failed");
 
+        // Container lifecycle events are kubelet-owned; the controller keeps
+        // only the pod-level Failed summary.
         assert!(
-            has_started,
-            "Failed pod with terminated containers should have Started event. Events: {:?}",
+            !has_started,
+            "controller must NOT infer Started (kubelet owns it). Events: {:?}",
             events.iter().map(|e| &e.reason).collect::<Vec<_>>()
         );
         assert!(has_failed, "Failed pod should have Failed event");
