@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod cni;
 mod config;
+mod events;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;

@@ -8,11 +8,12 @@ use bollard::image::CreateImageOptions;
 use bollard::Docker;
 use chrono::Utc;
 use futures_util::StreamExt;
+use rusternetes_common::resources::EventType;
 use rusternetes_common::resources::{
     ConfigMap, Container, ContainerState, ContainerStatus, ExecAction, GRPCAction, HTTPGetAction,
     LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, Probe, Secret, TCPSocketAction,
 };
-use rusternetes_storage::{build_key, Storage};
+use rusternetes_storage::{build_key, EventRecorder, Storage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -127,6 +128,13 @@ pub enum PodNetworkMode {
 pub struct ContainerRuntime {
     docker: Docker,
     storage: Option<Arc<rusternetes_storage::StorageBackend>>,
+    /// Records kubelet lifecycle events (Pulling/Pulled/Failed/Created/Started/
+    /// Killing/BackOff/Unhealthy). Set alongside `storage` in
+    /// [`ContainerRuntime::with_storage`]; `None` for the bare runtime (no
+    /// storage handle → events would have nowhere to go). Shares one
+    /// `EventCorrelator` across the runtime's lifetime so the spam-filter and
+    /// aggregation windows persist between emissions.
+    event_recorder: Option<EventRecorder<rusternetes_storage::StorageBackend>>,
     volumes_base_path: String,
     cluster_dns: String,
     cluster_domain: String,
@@ -773,6 +781,7 @@ impl ContainerRuntime {
         Ok(Self {
             docker,
             storage: None,
+            event_recorder: None,
             volumes_base_path,
             cluster_dns,
             cluster_domain,
@@ -983,8 +992,43 @@ impl ContainerRuntime {
     }
 
     pub fn with_storage(mut self, storage: Arc<rusternetes_storage::StorageBackend>) -> Self {
+        self.event_recorder = Some(EventRecorder::new(Arc::clone(&storage)));
         self.storage = Some(storage);
         self
+    }
+
+    /// Emit a kubelet lifecycle event if a recorder is configured. A no-op when
+    /// the runtime has no storage handle (e.g. unit fixtures). Failures are
+    /// logged, never propagated — a dropped event must not fail a pod sync.
+    pub(crate) async fn emit_event(
+        &self,
+        pod: &Pod,
+        container_name: Option<&str>,
+        reason: &str,
+        event_type: EventType,
+        message: &str,
+    ) {
+        let Some(recorder) = &self.event_recorder else {
+            return;
+        };
+        if let Err(e) = crate::events::emit_lifecycle_event(
+            recorder,
+            pod,
+            container_name,
+            reason,
+            event_type,
+            message,
+        )
+        .await
+        {
+            warn!(
+                "Failed to record {} event for pod {}/{}: {}",
+                reason,
+                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                pod.metadata.name,
+                e
+            );
+        }
     }
 
     /// Setup CNI networking for a pod
@@ -1084,8 +1128,17 @@ impl ContainerRuntime {
         Ok(())
     }
 
-    /// Pull an image if necessary based on the pull policy
-    pub async fn ensure_image(&self, image: &str, pull_policy: Option<&str>) -> Result<()> {
+    /// Pull an image if necessary based on the pull policy.
+    ///
+    /// `event_ctx = Some((pod, container_name))` attributes the image
+    /// Pulling/Pulled/Failed events to a container; `None` suppresses them
+    /// (used for the pause/sandbox image, which upstream does not surface).
+    pub async fn ensure_image(
+        &self,
+        image: &str,
+        pull_policy: Option<&str>,
+        event_ctx: Option<(&Pod, &str)>,
+    ) -> Result<()> {
         let policy = pull_policy.unwrap_or("IfNotPresent");
 
         // Normalize image name to include registry if not specified
@@ -1128,6 +1181,16 @@ impl ContainerRuntime {
 
         if should_pull {
             info!("Pulling image: {}", normalized_image);
+            if let Some((pod, cname)) = event_ctx {
+                self.emit_event(
+                    pod,
+                    Some(cname),
+                    crate::events::PULLING_IMAGE,
+                    EventType::Normal,
+                    &format!("Pulling image \"{}\"", image),
+                )
+                .await;
+            }
 
             // Try to pull the image with proper registry handling
             if let Err(e) = self.pull_image_with_retry(&normalized_image).await {
@@ -1136,13 +1199,45 @@ impl ContainerRuntime {
                 // If normalized image failed and it's different from original, try original
                 if normalized_image != image {
                     warn!("Retrying with original image name: {}", image);
-                    self.pull_image_with_retry(image).await?;
+                    if let Err(e2) = self.pull_image_with_retry(image).await {
+                        if let Some((pod, cname)) = event_ctx {
+                            self.emit_event(
+                                pod,
+                                Some(cname),
+                                crate::events::FAILED_TO_PULL_IMAGE,
+                                EventType::Warning,
+                                &format!("Failed to pull image \"{}\": {}", image, e2),
+                            )
+                            .await;
+                        }
+                        return Err(e2);
+                    }
                 } else {
+                    if let Some((pod, cname)) = event_ctx {
+                        self.emit_event(
+                            pod,
+                            Some(cname),
+                            crate::events::FAILED_TO_PULL_IMAGE,
+                            EventType::Warning,
+                            &format!("Failed to pull image \"{}\": {}", image, e),
+                        )
+                        .await;
+                    }
                     return Err(e);
                 }
             }
 
             info!("Successfully pulled image: {}", image);
+            if let Some((pod, cname)) = event_ctx {
+                self.emit_event(
+                    pod,
+                    Some(cname),
+                    crate::events::PULLED_IMAGE,
+                    EventType::Normal,
+                    &format!("Successfully pulled image \"{}\"", image),
+                )
+                .await;
+            }
             // Cache the pulled image
             let mut cache = self.image_cache.lock().unwrap();
             cache.insert(image.to_string());
@@ -1482,20 +1577,27 @@ impl ContainerRuntime {
         // K8s EnsureImageExists is called per-container, but Docker handles
         // concurrent pulls safely and we benefit from parallelism.
         {
-            let mut all_images: Vec<(String, Option<String>)> = Vec::new();
+            // (image, policy, container_name) — the container name attributes
+            // the per-image Pulling/Pulled/Failed events; dedup keeps the first
+            // container referencing each image (what `kubectl describe` shows).
+            let mut all_images: Vec<(String, Option<String>, String)> = Vec::new();
             if let Some(init_containers) = &pod.spec.as_ref().unwrap().init_containers {
                 for ic in init_containers {
-                    all_images.push((ic.image.clone(), ic.image_pull_policy.clone()));
+                    all_images.push((
+                        ic.image.clone(),
+                        ic.image_pull_policy.clone(),
+                        ic.name.clone(),
+                    ));
                 }
             }
             for c in &pod.spec.as_ref().unwrap().containers {
-                all_images.push((c.image.clone(), c.image_pull_policy.clone()));
+                all_images.push((c.image.clone(), c.image_pull_policy.clone(), c.name.clone()));
             }
             // Deduplicate
             let mut seen = std::collections::HashSet::new();
-            let unique: Vec<(String, Option<String>)> = all_images
+            let unique: Vec<(String, Option<String>, String)> = all_images
                 .into_iter()
-                .filter(|(img, _)| seen.insert(img.clone()))
+                .filter(|(img, _, _)| seen.insert(img.clone()))
                 .collect();
             if !unique.is_empty() {
                 debug!(
@@ -1505,7 +1607,9 @@ impl ContainerRuntime {
                 );
                 let futs: Vec<_> = unique
                     .iter()
-                    .map(|(img, pol)| self.ensure_image(img, pol.as_deref()))
+                    .map(|(img, pol, cname)| {
+                        self.ensure_image(img, pol.as_deref(), Some((pod, cname.as_str())))
+                    })
                     .collect();
                 let results = futures_util::future::join_all(futs).await;
                 for (i, r) in results.into_iter().enumerate() {
@@ -2099,7 +2203,9 @@ impl ContainerRuntime {
 
         // Ensure busybox image is available (critical for podman which may not auto-pull)
         // Use IfNotPresent policy to avoid unnecessary pulls on every pod start
-        self.ensure_image("busybox:latest", Some("IfNotPresent"))
+        // Pause/sandbox image: no event_ctx — upstream does not surface
+        // Pulling/Pulled for the infra container.
+        self.ensure_image("busybox:latest", Some("IfNotPresent"), None)
             .await
             .context("Failed to ensure busybox image for pause container")?;
 
@@ -5645,9 +5751,31 @@ impl ContainerRuntime {
                     "Docker API error creating container {}: {}",
                     container_name, e
                 );
+                self.emit_event(
+                    pod,
+                    Some(&container.name),
+                    crate::events::FAILED_CONTAINER,
+                    EventType::Warning,
+                    &format!(
+                        "Error: failed to create container {}: {}",
+                        container.name, e
+                    ),
+                )
+                .await;
                 return Err(anyhow::anyhow!("Failed to create container: {}", e));
             }
         }
+
+        // The container now exists in Docker. Upstream emits CreatedContainer
+        // here (pkg/kubelet/kuberuntime/kuberuntime_container.go:startContainer).
+        self.emit_event(
+            pod,
+            Some(&container.name),
+            crate::events::CREATED_CONTAINER,
+            EventType::Normal,
+            &format!("Created container {}", container.name),
+        )
+        .await;
 
         // Start the container
         if let Err(e) = self
@@ -5656,6 +5784,14 @@ impl ContainerRuntime {
             .await
         {
             error!("Failed to start container {}: {}", container_name, e);
+            self.emit_event(
+                pod,
+                Some(&container.name),
+                crate::events::FAILED_CONTAINER,
+                EventType::Warning,
+                &format!("Error: failed to start container {}: {}", container.name, e),
+            )
+            .await;
             return Err(anyhow::anyhow!(
                 "Failed to start container {}: {}",
                 container_name,
@@ -5664,6 +5800,15 @@ impl ContainerRuntime {
         }
 
         info!("Container {} started successfully", container_name);
+        // Upstream emits StartedContainer immediately after a successful start.
+        self.emit_event(
+            pod,
+            Some(&container.name),
+            crate::events::STARTED_CONTAINER,
+            EventType::Normal,
+            &format!("Started container {}", container.name),
+        )
+        .await;
 
         // Write Kubernetes-managed /etc/hosts into the container after start.
         // Docker may override bind-mounted /etc/hosts during container creation,
