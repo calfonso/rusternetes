@@ -1,27 +1,33 @@
 use chrono::Utc;
 use futures::StreamExt;
-use rusternetes_common::resources::{
-    Event, EventSeries, EventSource, EventType, ObjectReference, Pod,
+use rusternetes_common::resources::{Event, EventSource, EventType, ObjectReference, Pod};
+use rusternetes_storage::{
+    build_prefix, EventRecorder, Storage, WorkQueue, RECONCILE_ALL_SENTINEL,
 };
-use rusternetes_storage::{build_prefix, Storage, WorkQueue, RECONCILE_ALL_SENTINEL};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 /// EventsController creates events for pod lifecycle changes
 pub struct EventsController<S: Storage> {
     storage: Arc<S>,
+    /// Unified recorder: every emission runs through the shared
+    /// [`EventCorrelator`](rusternetes_common::event_correlator::EventCorrelator)
+    /// (spam-filter + aggregation + count) before reaching storage, replacing
+    /// the hand-rolled create/bump this controller used to do inline.
+    recorder: EventRecorder<S>,
     sync_interval: Duration,
 }
 
 impl<S: Storage + 'static> EventsController<S> {
     /// Minimum time that must elapse between two recorded occurrences of an
-    /// otherwise-identical event before the polling reconciler bumps its
-    /// `count`. Prevents per-resync inflation while still letting genuinely
-    /// recurring events accumulate.
+    /// otherwise-identical event before the polling reconciler re-emits it.
+    /// Prevents per-resync inflation while still letting genuinely recurring
+    /// events accumulate.
     const EVENT_DEDUP_MIN_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
 
     pub fn new(storage: Arc<S>, sync_interval_secs: u64) -> Self {
         Self {
+            recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
             sync_interval: Duration::from_secs(sync_interval_secs),
         }
@@ -314,27 +320,15 @@ impl<S: Storage + 'static> EventsController<S> {
         event_type: EventType,
         component: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Generate event name based on involved object and reason
+        // Polling-reconciler guard: this loop re-derives pod-lifecycle state
+        // from `pod.status` on every resync (~30s). Without a throttle we would
+        // re-enter the recorder for an unchanged observation each pass, letting
+        // the spam-filter's burst window bleed count onto a genuinely-static
+        // event. Only proceed when the event is new, its message changed, or a
+        // real interval has elapsed since the last recorded occurrence.
         let event_name = Event::generate_name(involved_object, reason);
-
-        // Check if event already exists
         let key = format!("/registry/events/{}/{}", namespace, event_name);
-        if let Ok(mut existing_event) = self.storage.get::<Event>(&key).await {
-            // Event already exists — this is a recurring occurrence of the
-            // same (object, reason) event. Mirror upstream's eventLogger
-            // de-duplication: bump `count`, advance `lastTimestamp`, and keep
-            // the events.k8s.io `series` in lock-step so the event no longer
-            // appears stuck at count:1.
-            //
-            // Guard against the polling nature of this reconciler: the loop
-            // re-evaluates unchanged pod state every resync (~30s). Without a
-            // throttle we would inflate the count on every pass even though
-            // nothing genuinely recurred, recreating the I/O / log-spam
-            // pressure the previous skip-only logic was protecting against.
-            // We therefore only bump when either:
-            //   - the message changed (genuinely new information), or
-            //   - at least `EVENT_DEDUP_MIN_INTERVAL` has elapsed since the
-            //     last recorded occurrence (a real, distinct recurrence).
+        if let Ok(existing_event) = self.storage.get::<Event>(&key).await {
             let now = Utc::now();
             let message_changed = existing_event.message != message;
             let interval_elapsed = existing_event
@@ -346,47 +340,25 @@ impl<S: Storage + 'static> EventsController<S> {
                 // Too soon and nothing changed — treat as the same observation.
                 return Ok(());
             }
+        }
 
-            existing_event.count = existing_event.count.saturating_add(1);
-            existing_event.last_timestamp = Some(now);
-            existing_event.message = message.to_string();
-            // Keep the series shape (events.k8s.io/v1) consistent with count.
-            existing_event.series = Some(EventSeries {
-                count: existing_event.count,
-                last_observed_time: now,
-            });
-
-            if let Err(e) = self.storage.update(&key, &existing_event).await {
-                eprintln!(
-                    "Failed to bump count for recurring event {}/{}: {}",
+        // Delegate the actual create/bump to the unified recorder so the
+        // spam-filter + aggregation + count stages run. The recorder is the
+        // single authority on `count` and `series`.
+        let source = EventSource {
+            component: component.unwrap_or_else(|| "rusternetes".to_string()),
+            host: None,
+        };
+        self.recorder
+            .event(involved_object, &source, event_type, reason, message)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                format!(
+                    "event recorder failed for {}/{}: {}",
                     namespace, event_name, e
-                );
-            }
-            return Ok(());
-        }
-
-        // Create new event
-        let mut event = Event::new(
-            event_name.clone(),
-            namespace.to_string(),
-            involved_object.clone(),
-            reason.to_string(),
-            message.to_string(),
-            event_type,
-        );
-
-        // Set component if provided
-        if let Some(comp) = component {
-            event.source = EventSource {
-                component: comp,
-                host: None,
-            };
-        }
-
-        // Store event
-        self.storage.create(&key, &event).await?;
-
-        println!("Created event: {} - {} - {}", namespace, reason, message);
+                )
+                .into()
+            })?;
 
         Ok(())
     }

@@ -104,6 +104,20 @@ impl PassiveClock for FixedClock {
     }
 }
 
+/// The production clock: returns the real wall-clock time. Unlike the test
+/// clocks above (which use `Rc<Cell<..>>` and are therefore `!Send`), this is a
+/// zero-sized `Send + Sync + Clone` type, so an [`EventCorrelator<RealClock>`]
+/// can live inside an `Arc<Mutex<..>>` shared across async tasks — which is how
+/// the [`crate`-level] event recorder holds it.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct RealClock;
+
+impl PassiveClock for RealClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
 /// Event type discriminator. Mirrors `v1.EventTypeNormal` / `v1.EventTypeWarning`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CorrelatorEventType {
