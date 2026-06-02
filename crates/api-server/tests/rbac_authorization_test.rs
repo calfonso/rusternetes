@@ -264,6 +264,23 @@ async fn post_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16,
     (status, v)
 }
 
+async fn put_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
+    let router = build_router(state, None);
+    let req = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, v)
+}
+
 /// Build a `SubjectAccessReview` JSON body for the given principal + verb +
 /// `(group, resource, namespace)` triple. Used everywhere we want the api-server
 /// to compute "is `user` allowed to `verb` `resource` in `namespace`" via the
@@ -496,6 +513,243 @@ async fn rolebinding_create_blocked_when_caller_lacks_escalate() {
     assert_eq!(
         status, 403,
         "escalation MUST be blocked without the `escalate` verb, got {status}: {body}"
+    );
+}
+
+/// Upstream's `rolebinding/policybased` storage runs the same
+/// `ConfirmNoEscalation` check on UPDATE as on CREATE: the bound role's rules
+/// may be granted to (possibly new) subjects, so the updater must already hold
+/// those rules or the `escalate` verb. `roleRef` is immutable, so we seed an
+/// existing binding and PUT it back unchanged (only the subject list grows);
+/// without `escalate` the caller still lacks the bound `secret-master` rules,
+/// so the update must 403.
+#[tokio::test]
+async fn rolebinding_update_blocked_when_caller_lacks_escalate() {
+    let (state, mem, _backend) = spawn_state_rbac_admin_only().await;
+    let ns = "rbac-escalation-update";
+
+    // A powerful Role: full secret access in the namespace.
+    let role = Role {
+        type_meta: TypeMeta {
+            kind: "Role".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta {
+            name: "secret-master".into(),
+            namespace: Some(ns.into()),
+            ..Default::default()
+        },
+        rules: vec![PolicyRule {
+            verbs: vec!["get".into(), "list".into(), "create".into()],
+            api_groups: Some(vec!["".into()]),
+            resources: Some(vec!["secrets".into()]),
+            resource_names: None,
+            non_resource_urls: None,
+        }],
+    };
+    mem.create(&build_key("roles", Some(ns), "secret-master"), &role)
+        .await
+        .unwrap();
+
+    // Seed an existing RoleBinding directly, bypassing the create-time gate.
+    let existing = RoleBinding {
+        type_meta: TypeMeta {
+            kind: "RoleBinding".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta {
+            name: "mallory-secret-binding".into(),
+            namespace: Some(ns.into()),
+            ..Default::default()
+        },
+        subjects: vec![Subject {
+            kind: "User".into(),
+            name: "mallory".into(),
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            namespace: None,
+        }],
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".into(),
+            kind: "Role".into(),
+            name: "secret-master".into(),
+        },
+    };
+    mem.create(
+        &build_key("rolebindings", Some(ns), "mallory-secret-binding"),
+        &existing,
+    )
+    .await
+    .unwrap();
+
+    // PUT the binding back with an additional subject (roleRef unchanged, so the
+    // immutability check passes and the escalation gate is reached).
+    let rb_body = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {"name": "mallory-secret-binding", "namespace": ns},
+        "subjects": [
+            {"kind": "User", "name": "mallory", "apiGroup": "rbac.authorization.k8s.io"},
+            {"kind": "User", "name": "eve", "apiGroup": "rbac.authorization.k8s.io"}
+        ],
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": "secret-master"
+        }
+    });
+    let (status, body) = put_json(
+        state.clone(),
+        &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/mallory-secret-binding"),
+        &rb_body,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "RoleBinding update escalation MUST be blocked without `escalate`, got {status}: {body}"
+    );
+}
+
+/// `clusterrolebinding/policybased` runs `ConfirmNoEscalation` on CREATE at
+/// cluster scope (empty binding namespace). Binding a `ClusterRole` whose rules
+/// the caller lacks, without the `escalate` verb, must 403.
+#[tokio::test]
+async fn clusterrolebinding_create_blocked_when_caller_lacks_escalate() {
+    let (state, mem, _backend) = spawn_state_rbac_admin_only().await;
+
+    // A powerful ClusterRole: cluster-wide secret access.
+    let cr = ClusterRole {
+        type_meta: TypeMeta {
+            kind: "ClusterRole".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta {
+            name: "cluster-secret-master".into(),
+            ..Default::default()
+        },
+        rules: vec![PolicyRule {
+            verbs: vec!["get".into(), "list".into(), "create".into()],
+            api_groups: Some(vec!["".into()]),
+            resources: Some(vec!["secrets".into()]),
+            resource_names: None,
+            non_resource_urls: None,
+        }],
+        aggregation_rule: None,
+    };
+    mem.create(
+        &build_key("clusterroles", None, "cluster-secret-master"),
+        &cr,
+    )
+    .await
+    .unwrap();
+
+    let crb_body = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {"name": "mallory-cluster-secret-binding"},
+        "subjects": [
+            {"kind": "User", "name": "mallory", "apiGroup": "rbac.authorization.k8s.io"}
+        ],
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "cluster-secret-master"
+        }
+    });
+    let (status, body) = post_json(
+        state.clone(),
+        "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
+        &crb_body,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "ClusterRoleBinding create escalation MUST be blocked without `escalate`, got {status}: {body}"
+    );
+}
+
+/// `clusterrolebinding/policybased` runs the same escalation check on UPDATE.
+/// Seed an existing binding and PUT it back (roleRef immutable) with a new
+/// subject; without `escalate` and lacking the bound rules, the update 403s.
+#[tokio::test]
+async fn clusterrolebinding_update_blocked_when_caller_lacks_escalate() {
+    let (state, mem, _backend) = spawn_state_rbac_admin_only().await;
+
+    let cr = ClusterRole {
+        type_meta: TypeMeta {
+            kind: "ClusterRole".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta {
+            name: "cluster-secret-master".into(),
+            ..Default::default()
+        },
+        rules: vec![PolicyRule {
+            verbs: vec!["get".into(), "list".into(), "create".into()],
+            api_groups: Some(vec!["".into()]),
+            resources: Some(vec!["secrets".into()]),
+            resource_names: None,
+            non_resource_urls: None,
+        }],
+        aggregation_rule: None,
+    };
+    mem.create(
+        &build_key("clusterroles", None, "cluster-secret-master"),
+        &cr,
+    )
+    .await
+    .unwrap();
+
+    let existing = ClusterRoleBinding {
+        type_meta: TypeMeta {
+            kind: "ClusterRoleBinding".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+        },
+        metadata: ObjectMeta {
+            name: "mallory-cluster-secret-binding".into(),
+            ..Default::default()
+        },
+        subjects: vec![Subject {
+            kind: "User".into(),
+            name: "mallory".into(),
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            namespace: None,
+        }],
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".into(),
+            kind: "ClusterRole".into(),
+            name: "cluster-secret-master".into(),
+        },
+    };
+    mem.create(
+        &build_key("clusterrolebindings", None, "mallory-cluster-secret-binding"),
+        &existing,
+    )
+    .await
+    .unwrap();
+
+    let crb_body = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {"name": "mallory-cluster-secret-binding"},
+        "subjects": [
+            {"kind": "User", "name": "mallory", "apiGroup": "rbac.authorization.k8s.io"},
+            {"kind": "User", "name": "eve", "apiGroup": "rbac.authorization.k8s.io"}
+        ],
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "cluster-secret-master"
+        }
+    });
+    let (status, body) = put_json(
+        state.clone(),
+        "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/mallory-cluster-secret-binding",
+        &crb_body,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "ClusterRoleBinding update escalation MUST be blocked without `escalate`, got {status}: {body}"
     );
 }
 
