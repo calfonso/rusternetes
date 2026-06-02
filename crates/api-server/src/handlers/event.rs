@@ -219,6 +219,18 @@ pub async fn create(
     // Ensure creation timestamp is set
     event.metadata.ensure_creation_timestamp();
 
+    // Field validation (mirrors upstream ValidateEventCreate, core/v1 path —
+    // legacy-only rules so internally-generated events are not over-tightened).
+    {
+        let errs = rusternetes_common::validation::events::validate_event_create(
+            &event,
+            rusternetes_common::validation::events::RequestVersion::CoreV1,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let key = build_key("events", Some(&namespace), &event.metadata.name);
 
     // If dry-run, skip storage operation but return the validated resource
@@ -270,13 +282,26 @@ pub async fn update(
     // Preserve creation_timestamp from the existing resource — the client
     // may send a truncated version (Go's time.Time loses nanosecond precision
     // during JSON round-trip in some cases).
-    if let Ok(existing) = state.storage.get::<Event>(&key).await {
+    let existing_event = state.storage.get::<Event>(&key).await.ok();
+    if let Some(existing) = &existing_event {
         if existing.metadata.creation_timestamp.is_some() {
             event.metadata.creation_timestamp = existing.metadata.creation_timestamp;
         }
         // Also preserve UID — must not change on update
         if !existing.metadata.uid.is_empty() {
-            event.metadata.uid = existing.metadata.uid;
+            event.metadata.uid = existing.metadata.uid.clone();
+        }
+    }
+
+    // Field validation (mirrors upstream ValidateEventUpdate, core/v1 path).
+    if let Some(existing) = &existing_event {
+        let errs = rusternetes_common::validation::events::validate_event_update(
+            &event,
+            existing,
+            rusternetes_common::validation::events::RequestVersion::CoreV1,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
@@ -687,13 +712,12 @@ pub async fn create_events_v1(
     event.metadata.ensure_uid();
     event.api_version = "events.k8s.io/v1".to_string();
 
-    // Map events.k8s.io/v1 fields to core/v1 equivalents for field selector compatibility.
-    // reportingComponent → source.component, note → message, regarding → involvedObject
-    if event.source.component.is_empty() {
-        if let Some(ref rc) = event.reporting_component {
-            event.source.component = rc.clone();
-        }
-    }
+    // Map the events.k8s.io/v1 `regarding`/`note` aliases onto the core
+    // `involvedObject`/`message` fields BEFORE validation: the strict
+    // validator reads `involvedObject.namespace` and `message`/`note` length.
+    // Crucially we do NOT yet copy `reportingController` into `source` — strict
+    // validation requires `source` to be unset, and the client legitimately
+    // leaves it empty.
     if event.message.is_empty() {
         if let Some(ref note) = event.note {
             event.message = note.clone();
@@ -717,6 +741,28 @@ pub async fn create_events_v1(
     }
 
     event.metadata.ensure_creation_timestamp();
+
+    // Strict field validation (mirrors upstream ValidateEventCreate on the
+    // events.k8s.io/v1 path). Run before the source-component back-fill so a
+    // valid client event with an empty `source` still passes the
+    // "source needs to be unset" rule.
+    {
+        let errs = rusternetes_common::validation::events::validate_event_create(
+            &event,
+            rusternetes_common::validation::events::RequestVersion::EventsV1,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
+    // Back-fill source.component from reportingController for field-selector
+    // compatibility now that strict validation has passed.
+    if event.source.component.is_empty() {
+        if let Some(ref rc) = event.reporting_component {
+            event.source.component = rc.clone();
+        }
+    }
 
     let key = build_key("events", Some(&namespace), &event.metadata.name);
 
@@ -761,17 +807,21 @@ pub async fn update_events_v1(
     // Preserve creation_timestamp and UID from existing resource — the client
     // may send a truncated version (Go's time.Time loses nanosecond precision
     // during JSON round-trip in some cases).
-    if let Ok(existing) = state.storage.get::<Event>(&key).await {
+    let existing_event = state.storage.get::<Event>(&key).await.ok();
+    if let Some(existing) = &existing_event {
         if existing.metadata.creation_timestamp.is_some() {
             event.metadata.creation_timestamp = existing.metadata.creation_timestamp;
         }
         // Also preserve UID — must not change on update
         if !existing.metadata.uid.is_empty() {
-            event.metadata.uid = existing.metadata.uid;
+            event.metadata.uid = existing.metadata.uid.clone();
         }
     }
 
-    // Map events.k8s.io/v1 fields to core/v1 equivalents
+    // Map events.k8s.io/v1 fields to core/v1 equivalents. On the update path
+    // we back-fill `source.component` from `reportingController` to mirror how
+    // the stored event was normalised at create time, so the strict update
+    // immutability check on `source` compares like with like.
     if event.source.component.is_empty() {
         if let Some(ref rc) = event.reporting_component {
             event.source.component = rc.clone();
@@ -791,6 +841,20 @@ pub async fn update_events_v1(
     {
         if let Some(ref regarding) = event.regarding {
             event.involved_object = regarding.clone();
+        }
+    }
+
+    // Strict field validation (mirrors upstream ValidateEventUpdate on the
+    // events.k8s.io/v1 path: immutability of most fields + microsecond-precision
+    // eventTime tolerance).
+    if let Some(existing) = &existing_event {
+        let errs = rusternetes_common::validation::events::validate_event_update(
+            &event,
+            existing,
+            rusternetes_common::validation::events::RequestVersion::EventsV1,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
