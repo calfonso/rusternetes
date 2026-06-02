@@ -125,6 +125,22 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) {
     mem.create(&key, &pod).await.expect("seed pod");
 }
 
+/// Seed a ConfigMap — a resource with ObjectMeta but no custom Table printer.
+async fn seed_configmap(mem: &Arc<MemoryStorage>, name: &str) {
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": name,
+            "namespace": TEST_NS,
+            "creationTimestamp": "2026-06-02T00:00:00Z",
+        },
+        "data": {"k": "v"}
+    });
+    let key = build_key("configmaps", Some(TEST_NS), name);
+    mem.create(&key, &cm).await.expect("seed configmap");
+}
+
 /// Parse the body as JSON and assert it looks like the seeded Pod.
 fn assert_pod_body(name: &str, body: &[u8]) {
     let v: Value = serde_json::from_slice(body).unwrap_or_else(|e| {
@@ -441,14 +457,25 @@ async fn accept_as_table_pod_list_is_not_double_wrapped() {
     );
 }
 
-/// `Accept: application/json;as=Table` for a resource without a registered
-/// Table converter (ConfigMap) must return 406 Not Acceptable, matching the
-/// upstream contract in `test/e2e/apimachinery/table.go`.
+/// `Accept: application/json;as=Table` for a resource WITHOUT a custom printer
+/// (ConfigMap) must return a 200 default NAME/AGE Table, NOT 406.
+///
+/// Upstream contract verified against
+/// `test/e2e/apimachinery/table_conversion.go` (release-1.35): every resource
+/// carrying ObjectMeta gets a Table. Kinds with no custom printer fall back to
+/// the `defaultTableConvertor` (NAME from `metadata.name`, AGE from
+/// `metadata.creationTimestamp`) in
+/// `staging/src/k8s.io/apiserver/pkg/registry/rest/table.go`. 406 is reserved
+/// for metadata-less review backends (see the SelfSubjectAccessReview test in
+/// `conformance_apimachinery_vap_apf_server.rs`).
+///
+/// Regression guard for the #918 allowlist that wrongly 406'd ~12 common kinds.
 #[tokio::test]
-async fn accept_as_table_returns_406_for_resource_without_converter() {
-    let (_mem, router) = spawn_router();
+async fn accept_as_table_returns_default_table_for_resource_without_printer() {
+    let (mem, router) = spawn_router();
+    seed_configmap(&mem, "cm-table").await;
 
-    let (status, _ct, _body) = get_with_accept(
+    let (status, ct, body) = get_with_accept(
         router,
         "/api/v1/namespaces/default/configmaps",
         "application/json;as=Table;v=v1;g=meta.k8s.io",
@@ -457,9 +484,64 @@ async fn accept_as_table_returns_406_for_resource_without_converter() {
 
     assert_eq!(
         status,
-        StatusCode::NOT_ACCEPTABLE,
-        "configmaps have no Table converter; must return 406"
+        StatusCode::OK,
+        "configmaps must return a 200 default Table, not 406; ct={ct} body={:?}",
+        String::from_utf8_lossy(&body),
     );
+    let v: Value = serde_json::from_slice(&body).expect("Table body is JSON");
+    assert_eq!(v["kind"], "Table", "kind must be Table; got {}", v);
+    let cols = v["columnDefinitions"]
+        .as_array()
+        .expect("columnDefinitions must be array");
+    let col_names: Vec<&str> = cols.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(
+        col_names.iter().any(|n| n.eq_ignore_ascii_case("Name")),
+        "default Table must have a Name column; got {col_names:?}"
+    );
+    assert!(
+        col_names.iter().any(|n| n.eq_ignore_ascii_case("Age")),
+        "default Table must have an Age column; got {col_names:?}"
+    );
+    let rows = v["rows"].as_array().expect("rows must be array");
+    assert_eq!(rows.len(), 1, "one row per configmap; got {}", v);
+    assert_eq!(
+        rows[0]["object"]["metadata"]["name"], "cm-table",
+        "row.object must carry the source ConfigMap; got {}",
+        rows[0]
+    );
+}
+
+/// Same default-Table fallback must hold for `secrets` and `podtemplates` —
+/// neither has a custom printer in Rusternetes, both carry ObjectMeta, so both
+/// must convert to a 200 NAME/AGE Table rather than 406.
+#[tokio::test]
+async fn accept_as_table_default_table_for_secrets_and_podtemplates() {
+    for (resource, kind) in [("secrets", "Secret"), ("podtemplates", "PodTemplate")] {
+        let (_mem, router) = spawn_router();
+        let (status, ct, body) = get_with_accept(
+            router,
+            &format!("/api/v1/namespaces/default/{resource}"),
+            "application/json;as=Table;v=v1;g=meta.k8s.io",
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{kind} list must return a 200 default Table, not 406; ct={ct} body={:?}",
+            String::from_utf8_lossy(&body),
+        );
+        let v: Value = serde_json::from_slice(&body).expect("Table body is JSON");
+        assert_eq!(v["kind"], "Table", "{kind}: kind must be Table; got {}", v);
+        let cols = v["columnDefinitions"]
+            .as_array()
+            .expect("columnDefinitions must be array");
+        assert!(
+            !cols.is_empty(),
+            "{kind}: default Table must define columns; got {}",
+            v
+        );
+    }
 }
 
 /// `Accept: application/json;as=PartialObjectMetadata;v=v1;g=meta.k8s.io`.
