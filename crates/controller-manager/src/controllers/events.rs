@@ -149,24 +149,13 @@ impl<S: Storage + 'static> EventsController<S> {
 
             match &status.phase {
                 Some(Phase::Pending) => {
-                    // Check if pod is scheduled
-                    if let Some(spec) = &pod.spec {
-                        if spec.node_name.as_deref().is_some_and(|n| !n.is_empty()) {
-                            self.create_event_if_new(
-                                namespace,
-                                &pod_ref,
-                                "Scheduled",
-                                &format!(
-                                    "Successfully assigned {} to {}",
-                                    pod_name,
-                                    spec.node_name.as_deref().unwrap_or("node")
-                                ),
-                                EventType::Normal,
-                                Some("scheduler".to_string()),
-                            )
-                            .await?;
-                        }
-                    }
+                    // The `Scheduled` event is now emitted by the scheduler
+                    // itself via the unified EventRecorder at bind time (it is
+                    // the source of truth, mirroring upstream's
+                    // `recorder.Eventf` after bind). This controller no longer
+                    // SYNTHESISES it from `pod.status` — doing so double-sourced
+                    // the event and could only guess the message. See
+                    // crates/scheduler/src/scheduler.rs::bind_pod_to_node.
                 }
                 Some(Phase::Running) => {
                     // Container-lifecycle events (Pulling/Pulled/Created/Started/
