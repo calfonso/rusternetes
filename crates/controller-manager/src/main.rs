@@ -522,8 +522,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start CertificateSigningRequest controller
-    let csr_controller = Arc::new(CertificateSigningRequestController::new(storage.clone()));
+    // Start CertificateSigningRequest controller, enabling the in-process signer
+    // when a cluster CA is provided via env (RUSTERNETES_CA_CERT_FILE/KEY_FILE).
+    let csr_controller = {
+        let mut controller = CertificateSigningRequestController::new(storage.clone());
+        if let Some(ca) = controllers::cert_authority::load_cluster_ca_from_env() {
+            controller = controller.with_certificate_authority(ca);
+        }
+        Arc::new(controller)
+    };
     spawn_controller!("CertificateSigningRequest controller", leader_elector, {
         let controller = csr_controller.clone();
         async move {

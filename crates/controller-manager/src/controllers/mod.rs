@@ -1,5 +1,6 @@
 pub mod apiservice;
 pub mod cascade_tests;
+pub mod cert_authority;
 pub mod certificate_signing_request;
 pub mod crd;
 pub mod cronjob;
