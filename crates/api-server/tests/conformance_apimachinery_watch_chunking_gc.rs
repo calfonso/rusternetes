@@ -278,11 +278,15 @@ async fn watch_extract_resource_version_from_raw_json() {
 #[tokio::test]
 async fn watch_query_param_recognised_for_list_endpoints() {
     assert!(is_watch_request(&qp(&[("watch", "true")])));
-    // The implementation parses the value with `str::parse::<bool>`, which
-    // is strict: "1" / "0" / "yes" / etc. are NOT recognised — only the
-    // literal strings "true" and "false".
-    assert!(!is_watch_request(&qp(&[("watch", "1")])));
+    // Kubernetes parses query booleans with Go's `strconv.ParseBool`, so the
+    // value "1" (sent by Lens and other non-client-go informers) is ALSO a
+    // watch — see `parse_k8s_bool`. Treating it as a plain list made those
+    // clients relist-loop (poll) instead of watching.
+    assert!(is_watch_request(&qp(&[("watch", "1")])));
+    assert!(is_watch_request(&qp(&[("watch", "t")])));
     assert!(!is_watch_request(&qp(&[("watch", "false")])));
+    assert!(!is_watch_request(&qp(&[("watch", "0")])));
+    assert!(!is_watch_request(&qp(&[("watch", "yes")])));
     assert!(!is_watch_request(&qp(&[])));
 }
 
