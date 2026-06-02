@@ -81,18 +81,19 @@ async fn send(
     (status, v)
 }
 
-async fn send_with_accept(
+/// POST a JSON body with an explicit `Accept` header; return `(status, body)`.
+async fn send_post_with_accept(
     router: &axum::Router,
-    method: &str,
     uri: &str,
+    body: &Value,
     accept: &str,
 ) -> (u16, Value) {
     let req = Request::builder()
-        .method(method)
+        .method("POST")
         .uri(uri)
+        .header("content-type", "application/json")
         .header("accept", accept)
-        .header("content-length", "0")
-        .body(Body::empty())
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
@@ -859,32 +860,48 @@ async fn watchers_should_restart_from_last_resource_version_observed() {
 /// [sig-api-machinery] Servers with support for Table transformation should
 /// return a 406 for a backend which does not implement metadata [Conformance]
 ///
-/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/table.go:92
-/// Sonobuoy (2026-05-29): FAIL — included as GAP stub
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/table_conversion.go:154
 ///
-/// When a client sends `Accept: application/json;as=Table;v=v1beta1;g=meta.k8s.io`
-/// and the server does not support the `Table` transformer for the requested
-/// resource, it must respond 406 Not Acceptable.
+/// The 406 contract is NARROW: it applies only to a *metadata-less* virtual
+/// backend. Upstream posts a `SelfSubjectAccessReview` (a synthetic "review"
+/// object with no ObjectMeta) with the Table Accept header and asserts 406.
+/// Normal resources that carry ObjectMeta — including printer-less ones like
+/// configmaps/secrets/podtemplates — must instead return a 200 default
+/// NAME/AGE Table (covered in `decoder_accept_header_test.rs`).
 ///
-/// Rusternetes currently ignores the `as=Table` part of the Accept header
-/// and serves plain JSON, so this test is a GAP marker.
+/// Regression guard: PR #918 wrongly extended the 406 to ~12 common kinds via
+/// a converter allowlist. The correct rule is "406 iff no ObjectMeta", which
+/// only the review backends hit.
 #[tokio::test]
 async fn table_transformation_should_return_406_for_backend_without_metadata() {
     let (router, _mem) = spawn_router();
 
-    // Request Table format for /api/v1/namespaces/default/configmaps.
-    let (status, _body) = send_with_accept(
+    // POST a SelfSubjectAccessReview asking for the Table format. The review
+    // backend has no ObjectMeta, so its handler rejects the projection with
+    // 406 Not Acceptable.
+    let ssar = serde_json::json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SelfSubjectAccessReview",
+        "spec": {
+            "resourceAttributes": {
+                "namespace": "default",
+                "verb": "get",
+                "resource": "pods",
+            }
+        }
+    });
+    let (status, _body) = send_post_with_accept(
         &router,
-        "GET",
-        "/api/v1/namespaces/default/configmaps",
+        "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+        &ssar,
         "application/json;as=Table;v=v1beta1;g=meta.k8s.io",
     )
     .await;
 
-    // K8s contract: 406 Not Acceptable when the backend does not support Table.
+    // K8s contract: 406 Not Acceptable for a metadata-less review backend.
     assert_eq!(
         status, 406,
-        "Table request for unimplemented backend must return 406 Not Acceptable; got {status}"
+        "Table request for a metadata-less review backend must return 406; got {status}"
     );
 }
 

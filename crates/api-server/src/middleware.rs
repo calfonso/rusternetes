@@ -1054,27 +1054,24 @@ pub async fn normalize_content_type_middleware(
                             Ok(v) => {
                                 let body_kind =
                                     v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                                // Enforce the Table 406 contract: a resource
-                                // whose kind has no registered Table converter
-                                // must fail `as=Table` with 406 Not Acceptable,
-                                // not silently fall back to a generic table.
-                                // Upstream parity:
-                                // `staging/src/k8s.io/apiserver/pkg/endpoints/
-                                //  handlers/get.go` returns NotAcceptable when
-                                // the negotiated Table converter is missing
-                                // (see test/e2e/apimachinery/table.go).
-                                if neg.target == AsTarget::Table
-                                    && body_kind != "Table"
-                                    && !kind_has_table_converter(table_kind_hint(&v))
-                                {
-                                    return Ok(rusternetes_common::Error::NotAcceptable(
-                                        "the server could not find the requested resource \
-                                         in the Table format; the resource does not \
-                                         implement the Table converter"
-                                            .to_string(),
-                                    )
-                                    .into_response());
-                                }
+                                // Upstream contract (verified against
+                                // test/e2e/apimachinery/table_conversion.go,
+                                // release-1.35): EVERY resource carrying
+                                // ObjectMeta gets a Table. Kinds with a custom
+                                // printer use its columns; everything else
+                                // (configmaps, secrets, podtemplates, …) falls
+                                // back to the `defaultTableConvertor`'s NAME +
+                                // AGE table — see
+                                // `staging/src/k8s.io/apiserver/pkg/registry/
+                                //  rest/table.go`. 406 Not Acceptable is
+                                // reserved for metadata-less "review" backends
+                                // (SubjectAccessReview / SelfSubjectAccessReview
+                                // / TokenReview), which their handlers reject
+                                // *before* this middleware ever sees a 200 body
+                                // (see handlers/authorization.rs). A 200 JSON
+                                // body that reaches here therefore always
+                                // carries ObjectMeta and must convert, never
+                                // 406.
                                 let converted = match neg.target {
                                     // A handler that already produced a Table
                                     // (its list path branches on `wants_table`)
@@ -1219,45 +1216,6 @@ fn parse_accept_as_target(accept: &str) -> Option<AsNegotiation> {
         }
     }
     None
-}
-
-/// Extract the resource kind (singular, `List` suffix stripped) used to
-/// decide Table column sets and converter availability. Prefers the kind of
-/// the first list item, falling back to the top-level `kind`.
-fn table_kind_hint(value: &serde_json::Value) -> &str {
-    let kind = value
-        .get("items")
-        .and_then(|i| i.as_array())
-        .and_then(|items| items.first())
-        .and_then(|o| o.get("kind"))
-        .and_then(|k| k.as_str())
-        .or_else(|| value.get("kind").and_then(|k| k.as_str()))
-        .unwrap_or("");
-    kind.strip_suffix("List").unwrap_or(kind)
-}
-
-/// Whether a resource kind has a registered Table converter. Mirrors the
-/// upstream apiserver, which only serves `as=Table` for resources whose
-/// REST storage implements `rest.TableConvertor`; resources without one
-/// must return 406 Not Acceptable rather than a generic fallback table.
-///
-/// Rusternetes registers explicit Table printers for the workload and
-/// service kinds whose list handlers branch on `wants_table`
-/// (pod/deployment/replicaset/replicationcontroller/service). Everything
-/// else — ConfigMap, Secret, etc. — has no converter and is rejected, which
-/// matches the conformance contract exercised by
-/// `test/e2e/apimachinery/table.go`.
-fn kind_has_table_converter(kind: &str) -> bool {
-    matches!(
-        kind,
-        "Pod"
-            | "Deployment"
-            | "ReplicaSet"
-            | "ReplicationController"
-            | "Service"
-            | "Node"
-            | "Namespace"
-    )
 }
 
 /// Convert a single object or List into a `meta.k8s.io/v1.Table`.
