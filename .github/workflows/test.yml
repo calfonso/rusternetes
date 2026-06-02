@@ -76,6 +76,48 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
+  nextest-sqlite:
+    name: cargo nextest (sqlite feature)
+    # The rhino/SQLite-backed tests in rusternetes-api-server are gated behind
+    # `#[cfg(feature = "sqlite")]`, so the default `nextest` job above compiles
+    # them out and never runs them — e.g. watch_delivery_rhino_test.rs, which
+    # covers the rhino watch-delivery regression class PR #885 fixed. Without
+    # this job those tests pass CI silently. The submodule + system deps are
+    # already provided by the runner image; we just flip the feature on.
+    #
+    # Large tier: layering the sqlite driver + rhino on top of api-server peaks
+    # well above the light tier clippy uses.
+    runs-on: arc-runner-set
+    steps:
+      - name: Checkout repository
+        # rhino is an in-tree submodule (./rhino) resolving the storage crate's
+        # `../../rhino` path dep. submodules: recursive checks it out pinned.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Cache cargo registry + target
+        # Distinct shared-key: the sqlite feature produces different artifacts
+        # under target/ than the default-feature nextest job.
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          shared-key: "nextest-sqlite"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo clippy (sqlite feature, hard gate)
+        # Lint the sqlite-gated code too — the default clippy job below builds
+        # default features only, so `#[cfg(feature = "sqlite")]` paths are
+        # otherwise never linted.
+        run: cargo clippy -p rusternetes-api-server --all-targets --features sqlite --locked -- -D warnings
+
+      - name: cargo nextest run (sqlite feature)
+        run: cargo nextest run -p rusternetes-api-server --features sqlite --locked --no-fail-fast --status-level fail
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
   clippy:
     name: cargo clippy
     # Clippy peaks at ~250 MiB resident, so it runs on the light-tier
