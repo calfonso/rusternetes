@@ -74,6 +74,12 @@ pub struct Kubelet {
     /// ticked recently. Mirrors upstream `pkg/kubelet/kubelet.go`'s
     /// `syncLoopMonitor`. 0 = no successful sync yet.
     last_sync: AtomicU64,
+    /// Port the kubelet API server listens on (the `--metrics-port` flag).
+    /// Advertised in the node's `status.daemonEndpoints.kubeletEndpoint.Port`
+    /// so the api-server proxies log/exec/metrics requests to the right port.
+    /// A second node on the same host runs on a different port (e.g. 10251)
+    /// to avoid a clash, so this must NOT be hardcoded to 10250.
+    metrics_port: u16,
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -149,6 +155,7 @@ impl Kubelet {
             EvictionManager::new(),
             None,
             crate::runtime::PodNetworkMode::Cni,
+            10250,
         )
         .await
     }
@@ -170,6 +177,7 @@ impl Kubelet {
         eviction_manager: EvictionManager,
         netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
         pod_network_mode: crate::runtime::PodNetworkMode,
+        metrics_port: u16,
     ) -> Result<Self> {
         let mut runtime = ContainerRuntime::new(
             volume_dir,
@@ -202,6 +210,7 @@ impl Kubelet {
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
             last_sync: AtomicU64::new(0),
+            metrics_port,
         })
     }
 
@@ -671,11 +680,15 @@ impl Kubelet {
             images: None,
             volumes_in_use: None,
             volumes_attached: None,
-            // K8s sets kubelet endpoint port to 10250 (default kubelet API port)
+            // Advertise the port the kubelet API server actually listens on
+            // (the --metrics-port flag), so the api-server proxies log/exec/
+            // metrics to the right port. A second kubelet on the same host
+            // runs on e.g. 10251 to avoid a clash; hardcoding 10250 made every
+            // proxy request to that node hit a closed port and time out.
             // See: pkg/kubelet/kubelet.go:505 — DaemonEndpoints{KubeletEndpoint{Port: kubeCfg.Port}}
             daemon_endpoints: Some(rusternetes_common::resources::NodeDaemonEndpoints {
                 kubelet_endpoint: Some(rusternetes_common::resources::DaemonEndpoint {
-                    port: 10250,
+                    port: self.metrics_port as i32,
                 }),
             }),
             config: None,

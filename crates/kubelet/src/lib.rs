@@ -139,6 +139,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             eviction::EvictionManager::new(),
             config.netstack,
             config.pod_network_mode,
+            config.metrics_port,
         )
         .await?,
     );
