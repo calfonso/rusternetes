@@ -534,6 +534,12 @@ async fn events_v1_should_fetch_patch_delete_list() {
         .and_then(|m| m.as_object_mut())
     {
         meta.remove("managedFields");
+        // Strict events.k8s.io/v1 update validation (ValidateObjectMetaUpdate)
+        // rejects an update whose metadata.resourceVersion is empty. A real
+        // etcd backend stamps an RV that GET round-trips; the in-process
+        // MemoryStorage test backend does not synthesize one, so set it
+        // explicitly to mirror what a live backend returns.
+        meta.insert("resourceVersion".to_string(), json!("1"));
     }
     let (status, _updated) =
         put_json(&state, &format!("{ns_path}/{event_name}"), &update_event).await;
