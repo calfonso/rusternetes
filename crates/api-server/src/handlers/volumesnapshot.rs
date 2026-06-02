@@ -117,7 +117,9 @@ pub async fn list_volumesnapshots(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vss, &params)?;
 
-    let list = List::new("VolumeSnapshotList", "snapshot.storage.k8s.io/v1", vss);
+    let mut list = List::new("VolumeSnapshotList", "snapshot.storage.k8s.io/v1", vss);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 
@@ -155,7 +157,9 @@ pub async fn list_all_volumesnapshots(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vss, &params)?;
 
-    let list = List::new("VolumeSnapshotList", "snapshot.storage.k8s.io/v1", vss);
+    let mut list = List::new("VolumeSnapshotList", "snapshot.storage.k8s.io/v1", vss);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 

@@ -265,7 +265,9 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut cronjobs, &params)?;
 
-    let list = List::new("CronJobList", "batch/v1", cronjobs);
+    let mut list = List::new("CronJobList", "batch/v1", cronjobs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -326,7 +328,9 @@ pub async fn list_all_cronjobs(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut cronjobs, &params)?;
 
-    let list = List::new("CronJobList", "batch/v1", cronjobs);
+    let mut list = List::new("CronJobList", "batch/v1", cronjobs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

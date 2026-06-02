@@ -138,7 +138,9 @@ pub async fn list_endpoints(
     }
     crate::handlers::filtering::apply_selectors(&mut endpoints, &params_map)?;
 
-    let list = List::new("EndpointsList", "v1", endpoints);
+    let mut list = List::new("EndpointsList", "v1", endpoints);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -185,7 +187,9 @@ pub async fn list_all_endpoints(
     }
     crate::handlers::filtering::apply_selectors(&mut endpoints, &params_map)?;
 
-    let list = List::new("EndpointsList", "v1", endpoints);
+    let mut list = List::new("EndpointsList", "v1", endpoints);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

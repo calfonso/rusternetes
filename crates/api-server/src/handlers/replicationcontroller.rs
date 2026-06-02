@@ -350,7 +350,9 @@ pub async fn list_replicationcontrollers(
         return Ok(axum::Json(table).into_response());
     }
 
-    let list = List::new("ReplicationControllerList", "v1", rcs);
+    let mut list = List::new("ReplicationControllerList", "v1", rcs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -408,7 +410,9 @@ pub async fn list_all_replicationcontrollers(
         return Ok(axum::Json(table).into_response());
     }
 
-    let list = List::new("ReplicationControllerList", "v1", rcs);
+    let mut list = List::new("ReplicationControllerList", "v1", rcs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

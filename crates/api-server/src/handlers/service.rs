@@ -766,7 +766,9 @@ pub async fn list(
     }
 
     // Wrap in proper List object
-    let list = List::new("ServiceList", "v1", services);
+    let mut list = List::new("ServiceList", "v1", services);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -830,7 +832,9 @@ pub async fn list_all_services(
         return Ok(Json(table).into_response());
     }
 
-    let list = List::new("ServiceList", "v1", services);
+    let mut list = List::new("ServiceList", "v1", services);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

@@ -362,7 +362,9 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut statefulsets, &params)?;
 
-    let list = List::new("StatefulSetList", "apps/v1", statefulsets);
+    let mut list = List::new("StatefulSetList", "apps/v1", statefulsets);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -424,7 +426,9 @@ pub async fn list_all_statefulsets(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut statefulsets, &params)?;
 
-    let list = List::new("StatefulSetList", "apps/v1", statefulsets);
+    let mut list = List::new("StatefulSetList", "apps/v1", statefulsets);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

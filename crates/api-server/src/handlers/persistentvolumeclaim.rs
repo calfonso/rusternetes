@@ -162,7 +162,9 @@ pub async fn list_pvcs(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut pvcs, &params)?;
 
-    let list = List::new("PersistentVolumeClaimList", "v1", pvcs);
+    let mut list = List::new("PersistentVolumeClaimList", "v1", pvcs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -224,7 +226,9 @@ pub async fn list_all_pvcs(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut pvcs, &params)?;
 
-    let list = List::new("PersistentVolumeClaimList", "v1", pvcs);
+    let mut list = List::new("PersistentVolumeClaimList", "v1", pvcs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

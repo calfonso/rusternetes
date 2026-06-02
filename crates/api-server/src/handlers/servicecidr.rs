@@ -212,7 +212,9 @@ pub async fn list_servicecidrs(
     let prefix = build_prefix("servicecidrs", None);
     let servicecidrs = state.storage.list::<ServiceCIDR>(&prefix).await?;
 
-    let list = List::new("ServiceCIDRList", "networking.k8s.io/v1", servicecidrs);
+    let mut list = List::new("ServiceCIDRList", "networking.k8s.io/v1", servicecidrs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

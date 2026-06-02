@@ -452,7 +452,9 @@ pub async fn list(
         return Ok(axum::Json(table).into_response());
     }
 
-    let list = List::new("DeploymentList", "apps/v1", deployments);
+    let mut list = List::new("DeploymentList", "apps/v1", deployments);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -530,7 +532,9 @@ pub async fn list_all_deployments(
         return Ok(axum::Json(table).into_response());
     }
 
-    let list = List::new("DeploymentList", "apps/v1", deployments);
+    let mut list = List::new("DeploymentList", "apps/v1", deployments);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

@@ -143,7 +143,9 @@ pub async fn list_csistoragecapacities(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut cscs, &params)?;
 
-    let list = List::new("CSIStorageCapacityList", "storage.k8s.io/v1", cscs);
+    let mut list = List::new("CSIStorageCapacityList", "storage.k8s.io/v1", cscs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -205,7 +207,9 @@ pub async fn list_all_csistoragecapacities(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut cscs, &params)?;
 
-    let list = List::new("CSIStorageCapacityList", "storage.k8s.io/v1", cscs);
+    let mut list = List::new("CSIStorageCapacityList", "storage.k8s.io/v1", cscs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

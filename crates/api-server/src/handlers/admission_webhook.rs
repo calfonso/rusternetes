@@ -310,11 +310,13 @@ pub async fn list_validating_webhooks(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut configs, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "ValidatingWebhookConfigurationList",
         "admissionregistration.k8s.io/v1",
         configs,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -603,11 +605,13 @@ pub async fn list_mutating_webhooks(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut configs, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "MutatingWebhookConfigurationList",
         "admissionregistration.k8s.io/v1",
         configs,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

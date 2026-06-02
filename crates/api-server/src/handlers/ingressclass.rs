@@ -203,7 +203,9 @@ pub async fn list_ingressclasses(
     let mut ingress_classes: Vec<IngressClass> = state.storage.list(&prefix).await?;
     crate::handlers::filtering::apply_selectors(&mut ingress_classes, &params)?;
 
-    let list = List::new("IngressClassList", "networking.k8s.io/v1", ingress_classes);
+    let mut list = List::new("IngressClassList", "networking.k8s.io/v1", ingress_classes);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
