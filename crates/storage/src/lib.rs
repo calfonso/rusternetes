@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 pub mod concurrency;
 pub mod etcd;
+pub mod event_recorder;
 pub mod memory;
 pub mod metadata;
 #[cfg(any(feature = "sqlite", feature = "redis"))]
@@ -14,6 +15,9 @@ pub mod workqueue;
 
 // Re-export MemoryStorage for convenient testing
 pub use memory::MemoryStorage;
+
+// Re-export the unified event recorder
+pub use event_recorder::EventRecorder;
 
 // Re-export work queue types
 pub use workqueue::{extract_key, WorkQueue, WorkQueueConfig, RECONCILE_ALL_SENTINEL};
