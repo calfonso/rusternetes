@@ -185,8 +185,14 @@ impl AdmissionWebhookClient {
             // (test/e2e/apimachinery/webhook.go:358 — "Webhook fail open" should
             // observe an HTTP/dial timeout error). The Go context-deadline phrase
             // is retained for backwards compatibility with existing assertions.
+            // Include the webhook URL with its `?timeout={n}s` query: the
+            // conformance "should honor timeout" test asserts the error names
+            // the queried endpoint (e.g. `/always-allow-delay-5s?timeout=1s`),
+            // not just that a timeout occurred.
+            // K8s ref: test/e2e/apimachinery/webhook.go (testSlowWebhookTimeoutFailEarly)
             Err(_elapsed) => Err(rusternetes_common::Error::Internal(format!(
-                "failed to call webhook: HTTP/dial timeout: context deadline exceeded ({}s)",
+                "failed to call webhook: HTTP/dial timeout: context deadline exceeded querying {}?timeout={}s",
+                url,
                 timeout.as_secs()
             ))),
         }
@@ -274,17 +280,23 @@ impl AdmissionWebhookClient {
             } else {
                 ""
             };
+            // `url` here is url_with_timeout (carries `?timeout={n}s`). Naming it
+            // in the error lets the conformance timeout test match the queried
+            // endpoint (e.g. `/always-allow-delay-5s?timeout=1s`).
             let full_error = if causes.is_empty() && !e.is_timeout() {
-                format!("failed to call webhook: {}{}", timeout_phrase, e)
+                format!(
+                    "failed to call webhook: {}{} querying {}",
+                    timeout_phrase, e, url
+                )
             } else if causes.is_empty() {
                 format!(
-                    "failed to call webhook: {}{}: context deadline exceeded",
-                    timeout_phrase, e
+                    "failed to call webhook: {}{}: context deadline exceeded querying {}",
+                    timeout_phrase, e, url
                 )
             } else {
                 format!(
-                    "failed to call webhook: {}{} ({})",
-                    timeout_phrase, e, normalized_causes
+                    "failed to call webhook: {}{} ({}) querying {}",
+                    timeout_phrase, e, normalized_causes, url
                 )
             };
             rusternetes_common::Error::Internal(full_error)
