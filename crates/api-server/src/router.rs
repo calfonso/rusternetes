@@ -323,7 +323,7 @@ async fn custom_resource_fallback(
                 .unwrap_or_default();
             let is_watch = query_params
                 .get("watch")
-                .and_then(|v| v.parse::<bool>().ok())
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
                 .unwrap_or(false);
 
             if is_watch {
