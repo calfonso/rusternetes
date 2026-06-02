@@ -59,7 +59,9 @@ prost-types = "0.13"
 jsonwebtoken = "9.3" # JWT token generation and validation
 rustls = { version = "0.23", features = ["aws-lc-rs"] } # TLS support with aws-lc-rs crypto provider
 tokio-rustls = "0.26" # Tokio integration for rustls
-rcgen = "0.13" # Certificate generation
+rcgen = { version = "0.13", features = [
+    "x509-parser",
+] } # Certificate generation + CSR/CA PEM parsing (x509-parser feature gates from_ca_cert_pem / CertificateSigningRequestParams)
 prometheus = "0.14" # Prometheus metrics
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false } # HTTP client
 cel = "0.13" # Common Expression Language (CEL) interpreter

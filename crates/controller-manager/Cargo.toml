@@ -38,6 +38,7 @@ base64.workspace = true
 
 [dev-dependencies]
 async-trait = { workspace = true }
+x509-parser = { workspace = true }
 
 [features]
 default = []
