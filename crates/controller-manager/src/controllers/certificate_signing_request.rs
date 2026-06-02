@@ -8,6 +8,8 @@ use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use super::cert_authority::CertificateAuthority;
+
 /// CertificateSigningRequestController manages certificate signing requests.
 ///
 /// This controller:
@@ -22,6 +24,11 @@ use tracing::{debug, error, info, warn};
 pub struct CertificateSigningRequestController<S: Storage> {
     storage: Arc<S>,
     auto_approve_kubelet_certs: bool,
+    /// Cluster signer. When present, the controller issues a certificate into
+    /// `status.certificate` for approved CSRs (mirroring the upstream
+    /// kube-controller-manager signer). When `None`, issuance is left to an
+    /// external signer — the controller only validates + auto-approves.
+    ca: Option<Arc<CertificateAuthority>>,
 }
 
 impl<S: Storage + 'static> CertificateSigningRequestController<S> {
@@ -29,7 +36,15 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
         Self {
             storage,
             auto_approve_kubelet_certs: true,
+            ca: None,
         }
+    }
+
+    /// Attach a cluster certificate authority so approved CSRs are signed
+    /// in-process. Without it the controller behaves as before (approve only).
+    pub fn with_certificate_authority(mut self, ca: Arc<CertificateAuthority>) -> Self {
+        self.ca = Some(ca);
+        self
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -175,15 +190,13 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
                 .await;
         }
 
-        // Check if CSR is already approved/denied
+        // Inspect existing conditions + whether a certificate was already issued.
+        let mut approved = false;
         if let Some(status) = &csr.status {
             if let Some(conditions) = &status.conditions {
                 for condition in conditions {
                     match condition.type_.as_str() {
-                        "Approved" => {
-                            debug!("CSR {} is already approved", csr_name);
-                            return Ok(());
-                        }
+                        "Approved" => approved = true,
                         "Denied" => {
                             debug!("CSR {} is already denied", csr_name);
                             return Ok(());
@@ -197,11 +210,41 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
                 }
             }
         }
+        let already_issued = csr
+            .status
+            .as_ref()
+            .and_then(|s| s.certificate.as_ref())
+            .is_some_and(|c| !c.is_empty());
 
-        // Auto-approve if policy allows
+        if approved {
+            if already_issued {
+                debug!("CSR {} already has an issued certificate", csr_name);
+                return Ok(());
+            }
+            // Sign it ourselves if a cluster CA is configured; otherwise leave
+            // issuance to an external signer (unchanged behaviour).
+            if self.ca.is_some() {
+                return self.issue_certificate(csr).await;
+            }
+            debug!("CSR {} approved, awaiting external signer", csr_name);
+            return Ok(());
+        }
+
+        // Auto-approve if policy allows, then issue immediately when we are the
+        // signer so a freshly auto-approved kubelet CSR gets its cert in one pass.
         if self.should_auto_approve(csr)? {
             info!("Auto-approving CSR {}", csr_name);
-            return self.approve_csr(csr).await;
+            self.approve_csr(csr).await?;
+            if self.ca.is_some() {
+                let key =
+                    format!("/registry/certificatesigningrequests/{}", csr.metadata.name);
+                if let Ok(approved_csr) =
+                    self.storage.get::<CertificateSigningRequest>(&key).await
+                {
+                    return self.issue_certificate(&approved_csr).await;
+                }
+            }
+            return Ok(());
         }
 
         debug!(
@@ -283,6 +326,84 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
             "Approved CSR {} - awaiting external signer",
             csr.metadata.name
         );
+        Ok(())
+    }
+
+    /// Sign an approved CSR with the configured cluster CA and write the issued
+    /// certificate into `status.certificate`. On a signing/parse error the CSR
+    /// is marked `Failed` (terminal) rather than retried forever.
+    async fn issue_certificate(&self, csr: &CertificateSigningRequest) -> Result<()> {
+        let Some(ca) = &self.ca else {
+            return Ok(());
+        };
+
+        let request_pem = match decode_request_pem(&csr.spec.request) {
+            Ok(pem) => pem,
+            Err(e) => return self.fail_csr(csr, &format!("invalid request: {e}")).await,
+        };
+
+        let cert_pem = match ca.sign(&request_pem, &csr.spec.usages, csr.spec.expiration_seconds) {
+            Ok(pem) => pem,
+            Err(e) => {
+                warn!("Failed to sign CSR {}: {}", csr.metadata.name, e);
+                return self.fail_csr(csr, &format!("signing failed: {e}")).await;
+            }
+        };
+
+        let mut updated = csr.clone();
+        let status = updated
+            .status
+            .get_or_insert_with(|| CertificateSigningRequestStatus {
+                conditions: None,
+                certificate: None,
+            });
+        status.certificate = Some(cert_pem);
+
+        self.storage
+            .update(
+                &format!("/registry/certificatesigningrequests/{}", csr.metadata.name),
+                &updated,
+            )
+            .await
+            .context("Failed to persist issued certificate")?;
+
+        info!("Issued certificate for CSR {}", csr.metadata.name);
+        Ok(())
+    }
+
+    /// Mark a CSR `Failed` (terminal) — used when signing cannot proceed.
+    async fn fail_csr(&self, csr: &CertificateSigningRequest, reason: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let condition = CertificateSigningRequestCondition {
+            type_: "Failed".to_string(),
+            status: "True".to_string(),
+            reason: Some("SignerFailure".to_string()),
+            message: Some(reason.to_string()),
+            last_update_time: Some(now.clone()),
+            last_transition_time: Some(now),
+        };
+
+        let mut conditions = csr
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.clone())
+            .unwrap_or_default();
+        conditions.push(condition);
+        let certificate = csr.status.as_ref().and_then(|s| s.certificate.clone());
+
+        let mut updated = csr.clone();
+        updated.status = Some(CertificateSigningRequestStatus {
+            conditions: Some(conditions),
+            certificate,
+        });
+        self.storage
+            .update(
+                &format!("/registry/certificatesigningrequests/{}", csr.metadata.name),
+                &updated,
+            )
+            .await
+            .context("Failed to persist CSR failure")?;
+        warn!("CSR {} failed: {}", csr.metadata.name, reason);
         Ok(())
     }
 
@@ -408,6 +529,17 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
     }
 }
 
+/// Decode `spec.request` into PEM text. The field is `[]byte` on the wire
+/// (base64-encoded PEM); fall back to treating it as raw PEM, matching
+/// `validate_pem_format`.
+fn decode_request_pem(request: &str) -> Result<String> {
+    use base64::{engine::general_purpose, Engine as _};
+    let bytes = general_purpose::STANDARD
+        .decode(request.trim())
+        .unwrap_or_else(|_| request.as_bytes().to_vec());
+    String::from_utf8(bytes).context("CSR request is not valid UTF-8 PEM")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +577,108 @@ mod tests {
         };
 
         assert!(controller.validate_csr_spec(&spec).is_ok());
+    }
+
+    /// Build a self-signed CA and return `(CertificateAuthority, base64-PEM CSR
+    /// for `cn`)` ready to drop into a CSR `spec.request`.
+    fn ca_and_request(cn: &str) -> (Arc<crate::controllers::cert_authority::CertificateAuthority>, String) {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "rusternetes-ca");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca = Arc::new(
+            crate::controllers::cert_authority::CertificateAuthority::from_pem(
+                &ca_cert.pem(),
+                &ca_key.serialize_pem(),
+            )
+            .unwrap(),
+        );
+
+        let leaf_params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let req = leaf_params.serialize_request(&leaf_key).unwrap();
+        let req_pem = pem::encode(&pem::Pem::new("CERTIFICATE REQUEST", req.der().to_vec()));
+        let request_b64 = general_purpose::STANDARD.encode(req_pem);
+        (ca, request_b64)
+    }
+
+    fn approved_csr(name: &str, request_b64: String) -> CertificateSigningRequest {
+        CertificateSigningRequest {
+            api_version: "certificates.k8s.io/v1".to_string(),
+            kind: "CertificateSigningRequest".to_string(),
+            metadata: ObjectMeta::new(name),
+            spec: CertificateSigningRequestSpec {
+                request: request_b64,
+                signer_name: "kubernetes.io/kube-apiserver-client".to_string(),
+                usages: vec![KeyUsage::DigitalSignature, KeyUsage::ClientAuth],
+                expiration_seconds: Some(86400),
+                uid: None,
+                groups: None,
+                username: None,
+                extra: None,
+            },
+            status: Some(CertificateSigningRequestStatus {
+                conditions: Some(vec![CertificateSigningRequestCondition {
+                    type_: "Approved".to_string(),
+                    status: "True".to_string(),
+                    reason: None,
+                    message: None,
+                    last_update_time: None,
+                    last_transition_time: None,
+                }]),
+                certificate: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_issues_certificate_for_approved_csr_when_ca_present() {
+        let (ca, request_b64) = ca_and_request("system:node:n1");
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = CertificateSigningRequestController::new(storage.clone())
+            .with_certificate_authority(ca);
+
+        let csr = approved_csr("issue-me", request_b64);
+        let key = "/registry/certificatesigningrequests/issue-me";
+        storage.create(key, &csr).await.unwrap();
+
+        controller.reconcile_csr(&csr).await.unwrap();
+
+        let updated: CertificateSigningRequest = storage.get(key).await.unwrap();
+        let cert = updated
+            .status
+            .and_then(|s| s.certificate)
+            .expect("status.certificate must be populated by the signer");
+        assert!(
+            cert.contains("BEGIN CERTIFICATE"),
+            "issued certificate must be PEM; got {cert}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_certificate_empty_when_no_ca_configured() {
+        // Without a configured signer the controller must not invent a cert —
+        // it leaves issuance to an external signer (pre-existing behaviour).
+        let (_ca, request_b64) = ca_and_request("system:node:n2");
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = CertificateSigningRequestController::new(storage.clone());
+
+        let csr = approved_csr("no-signer", request_b64);
+        let key = "/registry/certificatesigningrequests/no-signer";
+        storage.create(key, &csr).await.unwrap();
+
+        controller.reconcile_csr(&csr).await.unwrap();
+
+        let updated: CertificateSigningRequest = storage.get(key).await.unwrap();
+        assert!(
+            updated.status.and_then(|s| s.certificate).is_none(),
+            "no CA configured → status.certificate must stay empty"
+        );
     }
 
     #[tokio::test]
