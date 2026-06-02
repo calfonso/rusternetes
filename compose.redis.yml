@@ -206,6 +206,15 @@ services:
       - NET_ADMIN
       - NET_RAW
       - SYS_ADMIN
+    volumes:
+      # Mount the host kernel module tree so kube-proxy can `modprobe
+      # br_netfilter` at startup (the container is privileged). Without
+      # br_netfilter the bridge-nf-call-iptables sysctl cannot be enabled, so
+      # L2-bridged traffic to a node IP:nodePort bypasses the host-netns
+      # NodePort DNAT rules and NodePort Services are unreachable from pods
+      # (ClusterIP still works — it is L3-routed through the host).
+      # See crates/kube-proxy/src/iptables.rs (modprobe + sysctl on startup).
+      - /lib/modules:/lib/modules:ro
     environment:
       - RUST_LOG=info
     # Host network: rhino is accessible via the mapped port on localhost
