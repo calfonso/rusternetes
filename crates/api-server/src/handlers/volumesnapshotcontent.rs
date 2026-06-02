@@ -108,11 +108,13 @@ pub async fn list_volumesnapshotcontents(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vscs, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "VolumeSnapshotContentList",
         "snapshot.storage.k8s.io/v1",
         vscs,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 

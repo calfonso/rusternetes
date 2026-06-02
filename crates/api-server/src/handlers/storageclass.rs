@@ -109,7 +109,9 @@ pub async fn list_storageclasses(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut scs, &params)?;
 
-    let list = List::new("StorageClassList", "storage.k8s.io/v1", scs);
+    let mut list = List::new("StorageClassList", "storage.k8s.io/v1", scs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

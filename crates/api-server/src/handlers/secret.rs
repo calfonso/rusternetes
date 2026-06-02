@@ -414,7 +414,9 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut secrets, &params)?;
 
-    let list = List::new("SecretList", "v1", secrets);
+    let mut list = List::new("SecretList", "v1", secrets);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -475,7 +477,9 @@ pub async fn list_all_secrets(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut secrets, &params)?;
 
-    let list = List::new("SecretList", "v1", secrets);
+    let mut list = List::new("SecretList", "v1", secrets);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

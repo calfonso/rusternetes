@@ -334,9 +334,9 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut replicasets, &params)?;
 
-    // Get a resource version for consistency
-    let rv = state.storage.current_revision().await.unwrap_or(0);
-    let resource_version = rv.to_string();
+    // Get the store revision for the list; never "0"/"" so informers can watch.
+    let resource_version =
+        crate::handlers::list_collection_resource_version(&state.storage, &replicasets).await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -412,9 +412,9 @@ pub async fn list_all_replicasets(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut replicasets, &params)?;
 
-    // Get a resource version for consistency
-    let rv = state.storage.current_revision().await.unwrap_or(0);
-    let resource_version = rv.to_string();
+    // Get the store revision for the list; never "0"/"" so informers can watch.
+    let resource_version =
+        crate::handlers::list_collection_resource_version(&state.storage, &replicasets).await;
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());

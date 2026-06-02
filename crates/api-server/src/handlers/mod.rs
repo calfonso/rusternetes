@@ -107,3 +107,29 @@ pub fn list_resource_version<T: serde::Serialize>(items: &[T]) -> String {
         "1".to_string()
     }
 }
+
+/// Resolve the `metadata.resourceVersion` to stamp on a LIST collection
+/// response.
+///
+/// Upstream Kubernetes semantics: a LIST's `metadata.resourceVersion` is the
+/// store revision at which the list was taken (etcd's header revision).
+/// client-go's `Reflector.ListAndWatch` (every informer, e.g. Lens) does
+/// LIST -> read `list.metadata.resourceVersion` -> WATCH from it. An empty or
+/// "0" value makes the reflector unable to start a watch and it falls into a
+/// constant relist loop, so live updates never arrive.
+///
+/// This queries `storage.current_revision()` and renders it as a decimal
+/// string. If that call fails (or returns a non-positive revision) it falls
+/// back to the maximum item resourceVersion via [`list_resource_version`],
+/// which itself never returns `""` (it falls back to `"1"`). The result is
+/// therefore guaranteed to be a non-empty `^[0-9]+$` string.
+pub async fn list_collection_resource_version<T: serde::Serialize>(
+    storage: &rusternetes_storage::StorageBackend,
+    items: &[T],
+) -> String {
+    use rusternetes_storage::Storage;
+    match storage.current_revision().await {
+        Ok(rev) if rev > 0 => rev.to_string(),
+        _ => list_resource_version(items),
+    }
+}

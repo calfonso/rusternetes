@@ -339,7 +339,9 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut service_accounts, &params)?;
 
-    let list = List::new("ServiceAccountList", "v1", service_accounts);
+    let mut list = List::new("ServiceAccountList", "v1", service_accounts);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -400,7 +402,9 @@ pub async fn list_all_serviceaccounts(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut service_accounts, &params)?;
 
-    let list = List::new("ServiceAccountList", "v1", service_accounts);
+    let mut list = List::new("ServiceAccountList", "v1", service_accounts);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

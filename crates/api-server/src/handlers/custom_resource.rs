@@ -418,7 +418,9 @@ pub async fn list_custom_resources(
     // sees the requested-version field layout.
     crate::handlers::filtering::apply_selectors(&mut crs, &params)?;
 
-    let list = List::new("List", "v1", crs);
+    let mut list = List::new("List", "v1", crs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list))
 }
 

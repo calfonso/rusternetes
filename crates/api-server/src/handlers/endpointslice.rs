@@ -142,7 +142,9 @@ pub async fn list_endpointslices(
     }
     crate::handlers::filtering::apply_selectors(&mut endpointslices, &params_map)?;
 
-    let list = List::new("EndpointSliceList", "discovery.k8s.io/v1", endpointslices);
+    let mut list = List::new("EndpointSliceList", "discovery.k8s.io/v1", endpointslices);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -190,7 +192,9 @@ pub async fn list_all_endpointslices(
     }
     crate::handlers::filtering::apply_selectors(&mut endpointslices, &params_map)?;
 
-    let list = List::new("EndpointSliceList", "discovery.k8s.io/v1", endpointslices);
+    let mut list = List::new("EndpointSliceList", "discovery.k8s.io/v1", endpointslices);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

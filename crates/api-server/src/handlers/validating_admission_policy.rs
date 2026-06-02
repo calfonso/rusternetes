@@ -211,11 +211,13 @@ pub async fn list_validating_admission_policies(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut policies, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "ValidatingAdmissionPolicyList",
         "admissionregistration.k8s.io/v1",
         policies,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -429,11 +431,13 @@ pub async fn list_validating_admission_policy_bindings(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut bindings, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "ValidatingAdmissionPolicyBindingList",
         "admissionregistration.k8s.io/v1",
         bindings,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

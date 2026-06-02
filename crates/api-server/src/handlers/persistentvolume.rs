@@ -151,7 +151,9 @@ pub async fn list_pvs(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut pvs, &params)?;
 
-    let list = List::new("PersistentVolumeList", "v1", pvs);
+    let mut list = List::new("PersistentVolumeList", "v1", pvs);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

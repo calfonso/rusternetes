@@ -168,7 +168,9 @@ pub async fn list_resourceclaimtemplates(
 
     crate::handlers::filtering::apply_selectors(&mut templates, &params)?;
 
-    let list = List::new("ResourceClaimTemplateList", "resource.k8s.io/v1", templates);
+    let mut list = List::new("ResourceClaimTemplateList", "resource.k8s.io/v1", templates);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -227,7 +229,9 @@ pub async fn list_all_resourceclaimtemplates(
 
     crate::handlers::filtering::apply_selectors(&mut templates, &params)?;
 
-    let list = List::new("ResourceClaimTemplateList", "resource.k8s.io/v1", templates);
+    let mut list = List::new("ResourceClaimTemplateList", "resource.k8s.io/v1", templates);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

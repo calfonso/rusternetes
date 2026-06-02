@@ -262,7 +262,9 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut ingresses, &params)?;
 
-    let list = List::new("IngressList", "networking.k8s.io/v1", ingresses);
+    let mut list = List::new("IngressList", "networking.k8s.io/v1", ingresses);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -324,7 +326,9 @@ pub async fn list_all_ingresses(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut ingresses, &params)?;
 
-    let list = List::new("IngressList", "networking.k8s.io/v1", ingresses);
+    let mut list = List::new("IngressList", "networking.k8s.io/v1", ingresses);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

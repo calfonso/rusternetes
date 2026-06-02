@@ -400,11 +400,13 @@ pub async fn list_crds(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut crds, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "CustomResourceDefinitionList",
         "apiextensions.k8s.io/v1",
         crds,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

@@ -212,11 +212,13 @@ pub async fn list_priority_level_configurations(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "PriorityLevelConfigurationList",
         "flowcontrol.apiserver.k8s.io/v1",
         items,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -400,7 +402,9 @@ pub async fn list_flow_schemas(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut items, &params)?;
 
-    let list = List::new("FlowSchemaList", "flowcontrol.apiserver.k8s.io/v1", items);
+    let mut list = List::new("FlowSchemaList", "flowcontrol.apiserver.k8s.io/v1", items);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

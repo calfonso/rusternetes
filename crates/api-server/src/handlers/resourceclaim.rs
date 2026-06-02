@@ -170,7 +170,9 @@ pub async fn list_resourceclaims(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut claims, &params)?;
 
-    let list = List::new("ResourceClaimList", "resource.k8s.io/v1", claims);
+    let mut list = List::new("ResourceClaimList", "resource.k8s.io/v1", claims);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::Json(list).into_response())
 }
 
@@ -231,7 +233,9 @@ pub async fn list_all_resourceclaims(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut claims, &params)?;
 
-    let list = List::new("ResourceClaimList", "resource.k8s.io/v1", claims);
+    let mut list = List::new("ResourceClaimList", "resource.k8s.io/v1", claims);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::Json(list).into_response())
 }
 

@@ -231,11 +231,13 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut priority_classes, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "PriorityClassList",
         "scheduling.k8s.io/v1",
         priority_classes,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

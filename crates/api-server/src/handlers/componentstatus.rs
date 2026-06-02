@@ -67,6 +67,8 @@ pub async fn list(
         ComponentStatus::healthy("etcd-0"),
     ];
 
-    let list = List::new("ComponentStatusList", "v1", components);
+    let mut list = List::new("ComponentStatusList", "v1", components);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&_state.storage, &list.items).await);
     Ok(Json(list))
 }

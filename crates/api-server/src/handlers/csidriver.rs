@@ -108,7 +108,9 @@ pub async fn list_csidrivers(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut drivers, &params)?;
 
-    let list = List::new("CSIDriverList", "storage.k8s.io/v1", drivers);
+    let mut list = List::new("CSIDriverList", "storage.k8s.io/v1", drivers);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::response::IntoResponse::into_response(Json(list)))
 }
 

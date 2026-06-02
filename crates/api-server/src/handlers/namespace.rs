@@ -598,7 +598,9 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut namespaces, &params)?;
 
-    let list = List::new("NamespaceList", "v1", namespaces);
+    let mut list = List::new("NamespaceList", "v1", namespaces);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

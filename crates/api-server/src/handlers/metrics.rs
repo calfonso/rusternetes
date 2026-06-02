@@ -113,11 +113,16 @@ pub async fn list_node_metrics(
                 usage,
             });
         }
-        let list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
+        let mut list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
+        list.metadata.resource_version = Some(
+            crate::handlers::list_collection_resource_version(&state.storage, &list.items).await,
+        );
         return Ok(Json(list));
     }
 
-    let list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics);
+    let mut list = List::new("NodeMetricsList", "metrics.k8s.io/v1beta1", metrics);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list))
 }
 
@@ -285,7 +290,9 @@ pub async fn list_pod_metrics(
         metrics_list.push(metrics);
     }
 
-    let list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
+    let mut list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list))
 }
 
@@ -376,7 +383,9 @@ pub async fn list_all_pod_metrics(
         }
     }
 
-    let list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
+    let mut list = List::new("PodMetricsList", "metrics.k8s.io/v1beta1", metrics_list);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list))
 }
 

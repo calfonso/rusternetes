@@ -159,7 +159,9 @@ pub async fn list_resourceslices(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut slices, &params)?;
 
-    let list = List::new("ResourceSliceList", "resource.k8s.io/v1", slices);
+    let mut list = List::new("ResourceSliceList", "resource.k8s.io/v1", slices);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

@@ -244,7 +244,9 @@ pub async fn list_runtimeclasses(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut runtime_classes, &params)?;
 
-    let list = List::new("RuntimeClassList", "node.k8s.io/v1", runtime_classes);
+    let mut list = List::new("RuntimeClassList", "node.k8s.io/v1", runtime_classes);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(axum::Json(list).into_response())
 }
 

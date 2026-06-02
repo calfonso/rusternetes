@@ -220,7 +220,9 @@ pub async fn list_ipaddresses(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut ipaddresses, &params)?;
 
-    let list = List::new("IPAddressList", "networking.k8s.io/v1", ipaddresses);
+    let mut list = List::new("IPAddressList", "networking.k8s.io/v1", ipaddresses);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 

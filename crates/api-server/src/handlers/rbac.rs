@@ -540,7 +540,9 @@ pub async fn list_roles(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut roles, &params)?;
 
-    let list = List::new("RoleList", "rbac.authorization.k8s.io/v1", roles);
+    let mut list = List::new("RoleList", "rbac.authorization.k8s.io/v1", roles);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -581,7 +583,9 @@ pub async fn list_all_roles(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut roles, &params)?;
 
-    let list = List::new("RoleList", "rbac.authorization.k8s.io/v1", roles);
+    let mut list = List::new("RoleList", "rbac.authorization.k8s.io/v1", roles);
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -830,11 +834,13 @@ pub async fn list_rolebindings(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rolebindings, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "RoleBindingList",
         "rbac.authorization.k8s.io/v1",
         rolebindings,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -877,11 +883,13 @@ pub async fn list_all_rolebindings(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rolebindings, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "RoleBindingList",
         "rbac.authorization.k8s.io/v1",
         rolebindings,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -1110,11 +1118,13 @@ pub async fn list_clusterroles(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut clusterroles, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "ClusterRoleList",
         "rbac.authorization.k8s.io/v1",
         clusterroles,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
@@ -1351,11 +1361,13 @@ pub async fn list_clusterrolebindings(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut clusterrolebindings, &params)?;
 
-    let list = List::new(
+    let mut list = List::new(
         "ClusterRoleBindingList",
         "rbac.authorization.k8s.io/v1",
         clusterrolebindings,
     );
+    list.metadata.resource_version =
+        Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list).into_response())
 }
 
