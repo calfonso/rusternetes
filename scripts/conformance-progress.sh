@@ -35,19 +35,50 @@ else
     fi
 fi
 
-# Find the e2e pod name
-find_e2e_pod() {
-    curl -sk https://localhost:6443/api/v1/namespaces/sonobuoy/pods 2>/dev/null | \
-        python3 -c "
+API="https://localhost:6443"
+
+# Detect which conformance harness is running and where its ginkgo log lives.
+# Prints "harness namespace pod container" or nothing if no run is found.
+#   * Hydrophone (cluster-up.sh --conformance hydrophone): namespace
+#     `conformance`, pod `e2e-conformance-test`, ginkgo streams to the
+#     `conformance-container` stdout.
+#   * Sonobuoy (run-conformance.sh): namespace `sonobuoy`, pod `e2e-job-*`,
+#     ginkgo writes to a FILE inside the `e2e` container.
+detect_harness() {
+    # Hydrophone first — it's the default for local/e2e runs.
+    if curl -sk "$API/api/v1/namespaces/conformance/pods/e2e-conformance-test" 2>/dev/null \
+            | grep -q '"phase"'; then
+        echo "hydrophone conformance e2e-conformance-test conformance-container"
+        return
+    fi
+    # Sonobuoy fallback.
+    local pod
+    pod=$(curl -sk "$API/api/v1/namespaces/sonobuoy/pods" 2>/dev/null | python3 -c "
 import sys,json
 try:
-    data=json.load(sys.stdin)
-    for p in data.get('items',[]):
+    for p in json.load(sys.stdin).get('items',[]):
         if 'e2e-job' in p['metadata']['name']:
-            print(p['metadata']['name'])
-            break
+            print(p['metadata']['name']); break
 except: pass
-" 2>/dev/null
+" 2>/dev/null)
+    [ -n "$pod" ] && echo "sonobuoy sonobuoy $pod e2e"
+}
+
+# Return the raw ginkgo progress text for the detected harness.
+get_progress_text() {
+    local harness=$1 ns=$2 pod=$3 container=$4
+    if [ "$harness" = "sonobuoy" ]; then
+        # Sonobuoy's ginkgo writes to a file, not stdout — read it from the
+        # container directly, falling back to the API log endpoint.
+        local c
+        c=$($CRT ps --format "{{.Names}}" | grep "e2e-job.*_e2e$" | head -1)
+        if [ -n "$c" ]; then
+            $CRT exec "$c" cat /tmp/sonobuoy/results/e2e.log 2>/dev/null
+            return
+        fi
+    fi
+    # Hydrophone (and the sonobuoy API fallback) stream ginkgo to stdout.
+    curl -sk "$API/api/v1/namespaces/$ns/pods/$pod/log?container=$container" 2>/dev/null
 }
 
 parse_progress() {
@@ -85,22 +116,14 @@ echo "Polling every ${INTERVAL}s (pass interval as arg to change)"
 echo ""
 
 while true; do
-    E2E_POD=$(find_e2e_pod)
+    read -r HARNESS NS E2E_POD CONTAINER <<< "$(detect_harness)"
     if [ -z "$E2E_POD" ]; then
-        echo "$(date +%H:%M:%S) | No e2e pod found. Waiting..."
+        echo "$(date +%H:%M:%S) | No e2e pod found (sonobuoy or hydrophone). Waiting..."
         sleep "$INTERVAL"
         continue
     fi
 
-    # Get test output from the e2e.log file inside the container
-    # (ginkgo writes to this file, not stdout, so Docker logs won't have progress)
-    E2E_CONTAINER=$($CRT ps --format "{{.Names}}" | grep "e2e-job.*_e2e$" | head -1)
-    if [ -n "$E2E_CONTAINER" ]; then
-        RESULT=$($CRT exec "$E2E_CONTAINER" cat /tmp/sonobuoy/results/e2e.log 2>/dev/null | parse_progress)
-    else
-        # Fallback to API logs if container not accessible directly
-        RESULT=$(curl -sk "https://localhost:6443/api/v1/namespaces/sonobuoy/pods/${E2E_POD}/log?container=e2e" 2>/dev/null | parse_progress)
-    fi
+    RESULT=$(get_progress_text "$HARNESS" "$NS" "$E2E_POD" "$CONTAINER" | parse_progress)
 
     if [ -z "$RESULT" ]; then
         echo "$(date +%H:%M:%S) | No logs yet. Waiting..."
