@@ -1574,6 +1574,39 @@ mod tests {
         }
     }
 
+    /// Drive reconcile cycles (readying pods + simulating kubelet cleanup) until
+    /// the rollout converges (currentRevision == updateRevision and all replicas
+    /// updated), or panic after a generous bound.
+    async fn roll_to_completion(
+        controller: &StatefulSetController<MemoryStorage>,
+        storage: &Arc<MemoryStorage>,
+        ns: &str,
+        key: &str,
+        name: &str,
+        replicas: i32,
+    ) {
+        for cycle in 0..40 {
+            simulate_kubelet_cleanup(storage, ns).await;
+            for i in 0..replicas {
+                let pod_name = format!("{}-{}", name, i);
+                let pod_key = format!("/registry/pods/{}/{}", ns, pod_name);
+                if storage.get::<Pod>(&pod_key).await.is_ok() {
+                    make_pod_ready(storage, ns, &pod_name).await;
+                }
+            }
+            let mut ss: StatefulSet = storage.get(key).await.unwrap();
+            controller.reconcile(&mut ss).await.unwrap();
+            let ss: StatefulSet = storage.get(key).await.unwrap();
+            let status = ss.status.as_ref().unwrap();
+            if status.current_revision == status.update_revision
+                && status.updated_replicas == Some(replicas)
+            {
+                return;
+            }
+            assert!(cycle < 39, "rollout did not converge");
+        }
+    }
+
     /// During a rolling update, currentRevision != updateRevision.
     /// After all pods are updated, currentRevision == updateRevision.
     #[tokio::test]
@@ -1676,6 +1709,160 @@ mod tests {
             status.updated_replicas,
             Some(3),
             "All replicas should be updated"
+        );
+    }
+
+    /// Reverting the template to a previous revision must roll pods back to that
+    /// revision. Because the revision is a deterministic hash of the template,
+    /// an identical template reproduces the original revision hash — upstream
+    /// reuses the existing ControllerRevision rather than minting a new one.
+    #[tokio::test]
+    async fn test_rolling_update_rollback_to_prior_revision() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+        let ns = "default";
+        let key = format!("/registry/statefulsets/{}/web-rb", ns);
+        storage
+            .create(&key, &make_statefulset("web-rb", ns, 3, "nginx:1.19"))
+            .await
+            .unwrap();
+
+        // Initial rollout at revA (nginx:1.19).
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+        roll_to_completion(&controller, &storage, ns, &key, "web-rb", 3).await;
+        let rev_a = storage
+            .get::<StatefulSet>(&key)
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .current_revision
+            .unwrap();
+
+        // Update to revB (nginx:1.20) and roll out fully.
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        ss.spec.template.spec.containers[0].image = "nginx:1.20".to_string();
+        storage.update(&key, &ss).await.unwrap();
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+        roll_to_completion(&controller, &storage, ns, &key, "web-rb", 3).await;
+        let rev_b = storage
+            .get::<StatefulSet>(&key)
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .current_revision
+            .unwrap();
+        assert_ne!(rev_a, rev_b, "the update must produce a distinct revision");
+
+        // Roll BACK to nginx:1.19. The update revision must equal revA again
+        // (reuse the prior revision hash), not a fresh third revision.
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        ss.spec.template.spec.containers[0].image = "nginx:1.19".to_string();
+        storage.update(&key, &ss).await.unwrap();
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+        let rev_during_rollback = storage
+            .get::<StatefulSet>(&key)
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .update_revision
+            .unwrap();
+        assert_eq!(
+            rev_during_rollback, rev_a,
+            "rollback must reuse the prior revision hash, not mint a new one"
+        );
+
+        // Complete the rollback: every pod is back on revA + nginx:1.19.
+        roll_to_completion(&controller, &storage, ns, &key, "web-rb", 3).await;
+        for i in 0..3 {
+            let pod: Pod = storage
+                .get(&format!("/registry/pods/{}/web-rb-{}", ns, i))
+                .await
+                .unwrap();
+            assert_eq!(
+                pod.spec.as_ref().unwrap().containers[0].image,
+                "nginx:1.19",
+                "pod web-rb-{i} must be rolled back to the original image"
+            );
+            let rev = pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("controller-revision-hash"))
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                rev, rev_a,
+                "pod web-rb-{i} must carry the rolled-back revision"
+            );
+        }
+        let status = storage
+            .get::<StatefulSet>(&key)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(status.current_revision.as_deref(), Some(rev_a.as_str()));
+        assert_eq!(status.update_revision.as_deref(), Some(rev_a.as_str()));
+    }
+
+    /// Rolling updates replace pods from the highest ordinal down (OrderedReady):
+    /// the first pod the controller marks for replacement is the highest-ordinal
+    /// stale one, and lower ordinals wait their turn.
+    #[tokio::test]
+    async fn test_rolling_update_replaces_highest_ordinal_first() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+        let ns = "default";
+        let key = format!("/registry/statefulsets/{}/web-ord", ns);
+        storage
+            .create(&key, &make_statefulset("web-ord", ns, 3, "nginx:1.19"))
+            .await
+            .unwrap();
+
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+        for i in 0..3 {
+            make_pod_ready(&storage, ns, &format!("web-ord-{}", i)).await;
+        }
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+
+        // Trigger an update; keep all pods Ready and reconcile exactly once.
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        ss.spec.template.spec.containers[0].image = "nginx:1.20".to_string();
+        storage.update(&key, &ss).await.unwrap();
+        for i in 0..3 {
+            make_pod_ready(&storage, ns, &format!("web-ord-{}", i)).await;
+        }
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+
+        let terminating = |pod: &Pod| pod.metadata.deletion_timestamp.is_some();
+        let p0: Pod = storage
+            .get(&format!("/registry/pods/{}/web-ord-0", ns))
+            .await
+            .unwrap();
+        let p1: Pod = storage
+            .get(&format!("/registry/pods/{}/web-ord-1", ns))
+            .await
+            .unwrap();
+        let p2: Pod = storage
+            .get(&format!("/registry/pods/{}/web-ord-2", ns))
+            .await
+            .unwrap();
+        assert!(
+            terminating(&p2),
+            "highest-ordinal pod web-ord-2 must be replaced first"
+        );
+        assert!(
+            !terminating(&p0) && !terminating(&p1),
+            "lower-ordinal pods must not be replaced before web-ord-2"
         );
     }
 
