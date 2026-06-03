@@ -1432,7 +1432,24 @@ impl ProtoRegistry {
         schemas.insert(
             "NamespaceCondition".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                // Field tags mirror upstream k8s.io/api/core/v1 NamespaceCondition.
+                // Tag 3 is unused for namespaces (no lastProbeTime); the typed Go
+                // client decodes these back into v1.NamespaceCondition, so an empty
+                // schema would drop type/status/reason/message and break the
+                // `should apply changes to a namespace status` conformance test.
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                ]),
             },
         );
 
@@ -13273,6 +13290,52 @@ mod tests {
         assert_eq!(
             first.get("field"),
             Some(&Value::String("spec.replicas".into())),
+        );
+    }
+
+    /// Regression for `[sig-api-machinery] Namespaces should apply changes to a
+    /// namespace status [Conformance]`. The typed Go client negotiates
+    /// `application/vnd.kubernetes.protobuf` for core/v1, so a Namespace /status
+    /// response is encoded to protobuf and decoded back into a typed
+    /// `v1.NamespaceCondition`. With an empty `NamespaceCondition` schema every
+    /// condition field was silently dropped. Encode a Namespace with conditions
+    /// and confirm type/status/reason/message survive a proto round-trip.
+    #[test]
+    fn test_namespace_condition_protobuf_roundtrip() {
+        let registry = ProtoRegistry::new();
+        let ns = json!({
+            "metadata": { "name": "nstest" },
+            "status": {
+                "phase": "Active",
+                "conditions": [{
+                    "type": "StatusUpdate",
+                    "status": "True",
+                    "reason": "E2E",
+                    "message": "Updated by an e2e test"
+                }]
+            }
+        });
+
+        let bytes = registry
+            .encode_message("Namespace", &ns)
+            .expect("Namespace must encode to protobuf");
+        let decoded = registry
+            .decode_message("Namespace", &bytes)
+            .expect("Namespace must decode from protobuf");
+
+        let cond = decoded
+            .pointer("/status/conditions/0")
+            .expect("condition must round-trip");
+        assert_eq!(
+            cond.get("type"),
+            Some(&Value::String("StatusUpdate".into()))
+        );
+        assert_eq!(cond.get("status"), Some(&Value::String("True".into())));
+        assert_eq!(cond.get("reason"), Some(&Value::String("E2E".into())));
+        assert_eq!(
+            cond.get("message"),
+            Some(&Value::String("Updated by an e2e test".into())),
+            "NamespaceCondition.message must survive protobuf encode/decode"
         );
     }
 }
