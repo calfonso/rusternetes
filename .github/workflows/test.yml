@@ -17,6 +17,18 @@ env:
 # toolchain (clippy + rustfmt), cargo-nextest, and the system build
 # deps (protoc + libprotobuf-dev, mold + clang, pkg-config + libssl-dev).
 #
+# Two jobs, two feature configs, each compiled exactly once:
+#   - `nextest` builds + tests the whole workspace WITH the `sqlite` feature.
+#     Features are additive and there are no `cfg(not(feature="sqlite"))`
+#     tests, so this is a superset of the default run — it covers the regular
+#     tests AND the rhino/SQLite-gated ones. (Previously a separate
+#     `nextest-sqlite` job recompiled + retested api-server a second time;
+#     that redundant load is gone.)
+#   - `clippy` builds + lints the workspace with DEFAULT features, which is
+#     what guards the no-sqlite build from breaking.
+# Between them both feature configs are compiled, but neither crate is built
+# twice in the same config.
+#
 # `cargo nextest` and `cargo clippy` are REQUIRED status checks. To keep
 # them mergeable without burning a full compile on PRs that touch no Rust
 # (docs / scripts / compose / known-green.txt only), each job stays
@@ -78,14 +90,23 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo nextest run
-        # `--status-level fail` suppresses per-test PASS lines; the
-        # final summary still reports totals. `--no-fail-fast` surfaces
-        # every failure in one run instead of stopping at the first.
-        # Doctests are not run (nextest limitation) — none of the
-        # workspace currently depends on doctest coverage; add a
-        # separate `cargo test --doc` step if that changes.
+        # Run the whole workspace with the `sqlite` feature ON. Features are
+        # additive and there are no `cfg(not(feature = "sqlite"))` tests, so a
+        # single sqlite-enabled run is a SUPERSET of the default run: it
+        # executes every default test PLUS the rhino/SQLite-gated ones (e.g.
+        # watch_delivery_rhino_test.rs). This replaces the old separate
+        # `nextest` + `nextest-sqlite` jobs, which compiled and tested
+        # api-server twice. The default (no-sqlite) build stays guarded by the
+        # `clippy` job below, which compiles the workspace with default
+        # features.
+        #
+        # `--status-level fail` suppresses per-test PASS lines; the final
+        # summary still reports totals. `--no-fail-fast` surfaces every failure
+        # in one run instead of stopping at the first. Doctests are not run
+        # (nextest limitation) — none of the workspace depends on doctest
+        # coverage; add a separate `cargo test --doc` step if that changes.
         if: steps.rust.outputs.changed == 'true'
-        run: cargo nextest run --workspace --locked --no-fail-fast --status-level fail
+        run: cargo nextest run --workspace --features rusternetes-api-server/sqlite --locked --no-fail-fast --status-level fail
 
       - name: sccache stats
         # Compilation cache hit-rate, for visibility. sccache itself is
@@ -94,66 +115,6 @@ jobs:
         # + values-*.yaml). It shares rustc artifacts between this job and the
         # clippy job and across successive pushes to a PR. `|| true` keeps a
         # missing/unconfigured sccache from failing the job.
-        if: always() && steps.rust.outputs.changed == 'true'
-        run: sccache --show-stats || true
-
-  nextest-sqlite:
-    name: cargo nextest (sqlite feature)
-    # The rhino/SQLite-backed tests in rusternetes-api-server are gated behind
-    # `#[cfg(feature = "sqlite")]`, so the default `nextest` job above compiles
-    # them out and never runs them — e.g. watch_delivery_rhino_test.rs, which
-    # covers the rhino watch-delivery regression class PR #885 fixed. Without
-    # this job those tests pass CI silently. The submodule + system deps are
-    # already provided by the runner image; we just flip the feature on.
-    #
-    # Large tier: layering the sqlite driver + rhino on top of api-server peaks
-    # well above the light tier clippy uses.
-    runs-on: arc-runner-set
-    steps:
-      - name: Checkout repository
-        # rhino is an in-tree submodule (./rhino) resolving the storage crate's
-        # `../../rhino` path dep. submodules: recursive checks it out pinned.
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Detect Rust-relevant changes
-        id: rust
-        run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" \
-              | grep -qE '(\.rs|\.proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)build\.rs$|^rhino($|/)|(^|/)rust-toolchain|^\.github/workflows/(test|fmt)\.yml$'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No Rust-relevant changes — skipping the sqlite nextest job."
-          fi
-
-      - name: Cache cargo registry + target
-        # Distinct shared-key: the sqlite feature produces different artifacts
-        # under target/ than the default-feature nextest job.
-        if: steps.rust.outputs.changed == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          shared-key: "nextest-sqlite"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: cargo clippy (sqlite feature, hard gate)
-        # Lint the sqlite-gated code too — the default clippy job below builds
-        # default features only, so `#[cfg(feature = "sqlite")]` paths are
-        # otherwise never linted.
-        if: steps.rust.outputs.changed == 'true'
-        run: cargo clippy -p rusternetes-api-server --all-targets --features sqlite --locked -- -D warnings
-
-      - name: cargo nextest run (sqlite feature)
-        if: steps.rust.outputs.changed == 'true'
-        run: cargo nextest run -p rusternetes-api-server --features sqlite --locked --no-fail-fast --status-level fail
-
-      - name: sccache stats
         if: always() && steps.rust.outputs.changed == 'true'
         run: sccache --show-stats || true
 
@@ -202,8 +163,12 @@ jobs:
         # ratchet test.yml to -D warnings`; future PRs must keep clippy
         # green or `#[allow(<lint>)]` the specific case with a comment.
         #
-        # Default features only: the optional `jaeger` feature pulls in
-        # opentelemetry-jaeger which is itself deprecated upstream.
+        # Default features only: this is the no-sqlite build guard (the
+        # `nextest` job compiles the sqlite config), and the optional `jaeger`
+        # feature pulls in opentelemetry-jaeger which is itself deprecated
+        # upstream. Note: clippy lints are therefore not run on the
+        # `cfg(feature = "sqlite")` code paths — those are still compiled (and
+        # type-checked) by the sqlite-enabled `nextest` job, just not linted.
         #
         # `--all-targets` also acts as the bin-target build check the
         # old explicit `cargo build` step provided — clippy compiles
