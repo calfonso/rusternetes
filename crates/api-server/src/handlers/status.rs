@@ -1264,4 +1264,117 @@ mod tests {
         // Phase preserved.
         assert_eq!(updated_resource["status"]["phase"], "Active");
     }
+
+    async fn create_status_test_state() -> Arc<ApiServerState> {
+        use rusternetes_common::auth::TokenManager;
+        use rusternetes_common::authz::AlwaysAllowAuthorizer;
+        use rusternetes_common::observability::MetricsRegistry;
+        use rusternetes_storage::StorageBackend;
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let token_manager = Arc::new(TokenManager::new(b"test-secret"));
+        let authorizer =
+            Arc::new(AlwaysAllowAuthorizer) as Arc<dyn rusternetes_common::authz::Authorizer>;
+        let metrics = Arc::new(MetricsRegistry::new());
+
+        Arc::new(ApiServerState::new(
+            storage,
+            token_manager,
+            authorizer,
+            metrics,
+            true,
+        ))
+    }
+
+    fn admin_auth_ctx() -> AuthContext {
+        AuthContext {
+            user: rusternetes_common::auth::UserInfo::anonymous(),
+        }
+    }
+
+    /// End-to-end exercise of the cluster-scoped PUT /status handler used by the
+    /// upstream `[sig-api-machinery] Namespaces [Serial] should apply changes to
+    /// a namespace status [Conformance]` test. The typed Go client calls
+    /// `UpdateStatus` with the full Namespace (spec included), and then strictly
+    /// decodes the response into a `*v1.Namespace`. This drives the real handler
+    /// over MemoryStorage to confirm the appended condition round-trips.
+    #[tokio::test]
+    async fn test_namespace_status_put_handler_roundtrip() {
+        let state = create_status_test_state().await;
+
+        // Seed an Active namespace with a previously-patched condition.
+        let key = build_key("namespaces", None, "nstest");
+        let seeded = json!({
+            "kind": "Namespace",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "nstest",
+                "annotations": { "e2e-patched-ns-status": "nstest" }
+            },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": {
+                "phase": "Active",
+                "conditions": [{
+                    "type": "StatusPatch", "status": "True",
+                    "reason": "E2E", "message": "Patched by an e2e test"
+                }]
+            }
+        });
+        let _: Value = state.storage.create(&key, &seeded).await.unwrap();
+
+        // The typed client PUTs the full Namespace with one extra condition.
+        let body = json!({
+            "kind": "Namespace",
+            "apiVersion": "v1",
+            "metadata": { "name": "nstest" },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": {
+                "phase": "Active",
+                "conditions": [
+                    {"type": "StatusPatch", "status": "True", "reason": "E2E",
+                     "message": "Patched by an e2e test"},
+                    {"type": "StatusUpdate", "status": "True", "reason": "E2E",
+                     "message": "Updated by an e2e test"}
+                ]
+            }
+        });
+
+        let uri: Uri = "/api/v1/namespaces/nstest/status".parse().unwrap();
+        let resp = update_cluster_status(
+            State(state.clone()),
+            Extension(admin_auth_ctx()),
+            uri,
+            axum::http::HeaderMap::new(),
+            Path("nstest".to_string()),
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect("PUT /status must succeed");
+
+        let saved = resp.0;
+        assert_eq!(saved["kind"], "Namespace");
+        assert_eq!(saved["apiVersion"], "v1");
+        assert_eq!(saved["status"]["phase"], "Active");
+        let conds = saved["status"]["conditions"]
+            .as_array()
+            .expect("conditions array");
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[1]["type"], "StatusUpdate");
+        assert_eq!(conds[1]["message"], "Updated by an e2e test");
+
+        // GET /status must reflect the update for the next read.
+        let get_uri: Uri = "/api/v1/namespaces/nstest/status".parse().unwrap();
+        let got = get_cluster_status(
+            State(state.clone()),
+            Extension(admin_auth_ctx()),
+            get_uri,
+            Path("nstest".to_string()),
+        )
+        .await
+        .expect("GET /status must succeed");
+        let got = got.0;
+        let conds = got["status"]["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[1]["type"], "StatusUpdate");
+    }
 }
