@@ -1671,16 +1671,26 @@ fn validate_custom_resource_schema(
             // K8s validates the entire CR object. Some CRDs define enum fields
             // at the top level (e.g., cronies), not under spec.
             if let Some(ref properties) = validation.open_apiv3_schema.properties {
-                // Validate spec if present
+                // Validate spec if present. Root the error path at "spec" so a
+                // missing nested required field reports the upstream-format path
+                // (e.g. `spec.bars[0].name: Required value`).
                 if let Some(ref spec) = cr.spec {
                     if let Some(spec_schema) = properties.get("spec") {
-                        SchemaValidator::validate_no_unknown_check(spec_schema, spec)?;
+                        SchemaValidator::validate_no_unknown_check_with_root(
+                            spec_schema,
+                            spec,
+                            "spec",
+                        )?;
                     }
                 }
                 // Validate status if present
                 if let Some(ref status) = cr.status {
                     if let Some(status_schema) = properties.get("status") {
-                        SchemaValidator::validate_no_unknown_check(status_schema, status)?;
+                        SchemaValidator::validate_no_unknown_check_with_root(
+                            status_schema,
+                            status,
+                            "status",
+                        )?;
                     }
                 }
                 // Validate extra top-level fields (e.g., cronies, hostPort)
@@ -1689,7 +1699,11 @@ fn validate_custom_resource_schema(
                         continue;
                     }
                     if let Some(field_schema) = properties.get(key) {
-                        SchemaValidator::validate_no_unknown_check(field_schema, value)?;
+                        SchemaValidator::validate_no_unknown_check_with_root(
+                            field_schema,
+                            value,
+                            key,
+                        )?;
                     }
                 }
             }
