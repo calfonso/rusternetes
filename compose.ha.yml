@@ -343,6 +343,13 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    volumes:
+      # Host kernel module tree so kube-proxy can `modprobe br_netfilter` at
+      # startup (privileged container). Required for NodePort: without it the
+      # bridge-nf-call-iptables sysctl can't be set, so bridged traffic to a
+      # node IP:nodePort bypasses the NodePort DNAT rules (ClusterIP still
+      # works). See crates/kube-proxy/src/iptables.rs.
+      - /lib/modules:/lib/modules:ro
     environment:
       - RUST_LOG=info
     command:

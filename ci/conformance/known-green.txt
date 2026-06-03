@@ -468,3 +468,9 @@
 [sig-scheduling] SchedulerPredicates [Serial] validates that there exists conflict between pods with same hostPort and protocol but one using 0.0.0.0 hostIP [Conformance]
 [sig-scheduling] SchedulerPreemption [Serial] PriorityClass endpoints verify PriorityClass endpoints can be operated with different HTTP methods [Conformance]
 [sig-storage] EmptyDir wrapper volumes should not cause race condition when used for configmaps [Serial] [Conformance]
+
+# --- Added 2026-06-03 (NodePort fix: kube-proxy /lib/modules + kmod -> br_netfilter) ---
+[sig-network] Services should be able to change the type from ExternalName to NodePort [Conformance]
+[sig-network] Services should be able to create a functioning NodePort service [Conformance]
+[sig-network] Services should be able to switch session affinity for NodePort service [LinuxOnly] [Conformance]
+[sig-network] Services should have session affinity work for NodePort service [LinuxOnly] [Conformance]
