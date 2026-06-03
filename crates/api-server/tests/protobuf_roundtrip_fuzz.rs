@@ -122,6 +122,74 @@ fn all_schemas(reg: &ProtoRegistry) -> HashMap<String, MessageSchema> {
         .collect()
 }
 
+/// Assert `expected` is a deep subset of `actual`: every key/element present in
+/// `expected` must appear identically in `actual`. Extra keys in `actual` are
+/// tolerated (the envelope decoder injects `apiVersion`/`kind` from TypeMeta,
+/// and the codec may default-fill fields). This catches the two failure modes
+/// that matter for request decoding — a field being *corrupted* (issue #495,
+/// where an embedded-JSON string was replaced) or *lost* (the map<string,Time>
+/// bug) — without flagging benign additions.
+fn json_contains(expected: &Value, actual: &Value) -> Result<(), String> {
+    match (expected, actual) {
+        (Value::Object(e), Value::Object(a)) => {
+            for (k, ev) in e {
+                match a.get(k) {
+                    Some(av) => json_contains(ev, av).map_err(|m| format!("/{k}{m}"))?,
+                    None => return Err(format!("/{k} MISSING (expected {ev})")),
+                }
+            }
+            Ok(())
+        }
+        (Value::Array(e), Value::Array(a)) => {
+            if e.len() != a.len() {
+                return Err(format!(" array len {} != {}", e.len(), a.len()));
+            }
+            for (i, (ev, av)) in e.iter().zip(a).enumerate() {
+                json_contains(ev, av).map_err(|m| format!("/[{i}]{m}"))?;
+            }
+            Ok(())
+        }
+        _ => {
+            if expected == actual {
+                Ok(())
+            } else {
+                Err(format!(" CHANGED: {expected} -> {actual}"))
+            }
+        }
+    }
+}
+
+/// Append a protobuf length-delimited field (`wire type 2`) to `buf`.
+fn push_len_delim(buf: &mut Vec<u8>, field: u8, data: &[u8]) {
+    buf.push((field << 3) | 2);
+    let mut len = data.len();
+    loop {
+        let mut b = (len & 0x7f) as u8;
+        len >>= 7;
+        if len != 0 {
+            b |= 0x80;
+        }
+        buf.push(b);
+        if len == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(data);
+}
+
+/// Build the `k8s\0` protobuf envelope a typed client sends: an `Unknown`
+/// message with `typeMeta` (field 1, carrying apiVersion+kind) and `raw`
+/// (field 2, the native-protobuf-encoded resource).
+fn k8s_envelope(api_version: &str, kind: &str, raw: &[u8]) -> Vec<u8> {
+    let mut type_meta = Vec::new();
+    push_len_delim(&mut type_meta, 1, api_version.as_bytes()); // apiVersion
+    push_len_delim(&mut type_meta, 2, kind.as_bytes()); // kind
+    let mut env = b"k8s\0".to_vec();
+    push_len_delim(&mut env, 1, &type_meta); // Unknown.typeMeta
+    push_len_delim(&mut env, 2, raw); // Unknown.raw
+    env
+}
+
 #[test]
 fn registry_encode_decode_is_symmetric_for_every_kind() {
     let reg = ProtoRegistry::new();
@@ -189,6 +257,145 @@ fn registry_encode_decode_is_symmetric_for_every_kind() {
     assert!(
         failures.is_empty(),
         "{} roundtrip failures:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn json_value_survives_cbor_roundtrip() {
+    // CBOR is the 1.35 default wire format for several clients (KEP-4222). The
+    // request middleware decodes it via `decode_cbor_to_json`. A value encoded
+    // to CBOR and back must be byte-for-byte identical — number widening, string
+    // mangling, or map reordering here would silently corrupt every CBOR
+    // request. (The #954 CRD struct-form bug was this class, one layer up.)
+    use rusternetes_api_server::cbor::{decode_cbor_to_json, encode_json_to_cbor};
+
+    let reg = ProtoRegistry::new();
+    let schemas = all_schemas(&reg);
+    let mut failures: Vec<String> = Vec::new();
+    let mut tested = 0usize;
+
+    let mut names: Vec<&String> = schemas.keys().collect();
+    names.sort();
+
+    for name in names {
+        let value = match synth_message(name, &schemas, 4) {
+            Some(v) => v,
+            None => continue,
+        };
+        let cbor = match encode_json_to_cbor(&value) {
+            Ok(b) => b,
+            Err(e) => {
+                failures.push(format!("{name}: encode_json_to_cbor error: {e}"));
+                continue;
+            }
+        };
+        let back = match decode_cbor_to_json(&cbor) {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push(format!("{name}: decode_cbor_to_json error: {e}"));
+                continue;
+            }
+        };
+        tested += 1;
+        if back != value {
+            failures.push(format!(
+                "{name}: CBOR roundtrip mismatch\n  in : {}\n  out: {}",
+                serde_json::to_string(&value).unwrap(),
+                serde_json::to_string(&back).unwrap(),
+            ));
+        }
+    }
+
+    eprintln!(
+        "cbor roundtrip: {tested} kinds tested, {} failures",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} CBOR roundtrip failures:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn resource_survives_protobuf_envelope_request_path() {
+    // The real request decode path: a typed client encodes a resource to native
+    // protobuf, wraps it in the `k8s\0` Unknown envelope, and POSTs it. The
+    // middleware runs `decode_k8s_protobuf_request_body` (extract → schema
+    // registry → CRD decoder → brace-scan). This is exactly where issue #495
+    // lived: an adversarial string in a command field was mistaken for the body.
+    //
+    // We seed every metadata-bearing (i.e. top-level) resource with the
+    // adversarial corpus, push it through the genuine middleware function, and
+    // assert no synthesized field was corrupted or lost.
+    use rusternetes_api_server::middleware::decode_k8s_protobuf_request_body;
+
+    let reg = ProtoRegistry::new();
+    let schemas = all_schemas(&reg);
+    let mut failures: Vec<String> = Vec::new();
+    let mut tested = 0usize;
+
+    let mut names: Vec<&String> = schemas.keys().collect();
+    names.sort();
+
+    for name in names {
+        if name == "Time" || name == "MicroTime" {
+            continue;
+        }
+        let value = match synth_message(name, &schemas, 4) {
+            Some(v) => v,
+            None => continue,
+        };
+        // Only exercise real top-level resources (those carrying ObjectMeta) —
+        // sub-messages are never sent as a standalone request body.
+        if !value.get("metadata").is_some_and(|m| m.is_object()) {
+            continue;
+        }
+
+        let raw = match reg.encode_message(name, &value) {
+            Some(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        // raw must be native protobuf (not literal JSON) so we hit the decode
+        // cascade the bug lived in, not the raw-is-already-JSON shortcut.
+        assert_ne!(
+            raw.first(),
+            Some(&b'{'),
+            "{name}: encoded protobuf unexpectedly starts with '{{'"
+        );
+
+        let envelope = k8s_envelope("v1", name, &raw);
+        let json_bytes = decode_k8s_protobuf_request_body(&envelope);
+        let decoded: Value = match serde_json::from_slice(&json_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push(format!(
+                    "{name}: middleware output is not valid JSON: {e}\n  body: {}",
+                    String::from_utf8_lossy(&json_bytes)
+                ));
+                continue;
+            }
+        };
+        tested += 1;
+        if let Err(path) = json_contains(&value, &decoded) {
+            failures.push(format!(
+                "{name}: field {path}\n  sent   : {}\n  decoded: {}",
+                serde_json::to_string(&value).unwrap(),
+                serde_json::to_string(&decoded).unwrap(),
+            ));
+        }
+    }
+
+    eprintln!(
+        "envelope request-path: {tested} resources tested, {} failures",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} envelope request-path failures:\n\n{}",
         failures.len(),
         failures.join("\n\n")
     );

@@ -612,97 +612,7 @@ pub async fn normalize_content_type_middleware(
                 }
             };
 
-            let json_body = if body_bytes.starts_with(b"k8s\0") {
-                // K8s protobuf envelope — extract the JSON from the `raw` field.
-                let extracted = extract_json_from_k8s_protobuf(&body_bytes);
-                if let Some(json) = extracted {
-                    json
-                } else {
-                    // Extraction failed — the `raw` field contains native protobuf, not JSON.
-                    // First try the structured protobuf-to-JSON decoder.
-                    // Then fall back to brace-scanning, but always validate the result.
-                    use std::fmt::Write as _;
-                    let mut hex_preview = String::with_capacity(80 * 3);
-                    for b in body_bytes.iter().skip(4).take(80) {
-                        let _ = write!(hex_preview, "{:02x} ", b);
-                    }
-                    if hex_preview.ends_with(' ') {
-                        hex_preview.pop();
-                    }
-                    debug!(
-                        "Protobuf body has no JSON in raw field ({} bytes). Hex after k8s\\0: {}",
-                        body_bytes.len(),
-                        hex_preview
-                    );
-
-                    // Try the generic proto schema-based decoder first.
-                    // This handles ALL standard K8s types (Deployment, Pod, Service, etc.)
-                    // by using field number → name mappings from the K8s .proto definitions.
-                    if let Some(json_bytes) = PROTO_REGISTRY.decode_k8s_resource(&body_bytes) {
-                        if serde_json::from_slice::<serde_json::Value>(&json_bytes).is_ok() {
-                            info!(
-                                "Decoded K8s protobuf via schema registry ({} bytes)",
-                                json_bytes.len()
-                            );
-                            json_bytes
-                        } else {
-                            warn!(
-                                "Schema-decoded protobuf produced invalid JSON, trying CRD decoder"
-                            );
-                            // Fall through to CRD-specific decoder
-                            if let Some(json_bytes) = decode_k8s_protobuf_to_json(&body_bytes) {
-                                if serde_json::from_slice::<serde_json::Value>(&json_bytes).is_ok()
-                                {
-                                    info!(
-                                        "Decoded K8s protobuf to JSON ({} bytes)",
-                                        json_bytes.len()
-                                    );
-                                    json_bytes
-                                } else {
-                                    try_brace_scan_or_type_meta(&body_bytes)
-                                }
-                            } else {
-                                try_brace_scan_or_type_meta(&body_bytes)
-                            }
-                        }
-                    }
-                    // Schema-based decode returned None (unknown kind) — try CRD decoder
-                    else if let Some(json_bytes) = decode_k8s_protobuf_to_json(&body_bytes) {
-                        if serde_json::from_slice::<serde_json::Value>(&json_bytes).is_ok() {
-                            info!("Decoded K8s protobuf to JSON ({} bytes)", json_bytes.len());
-                            json_bytes
-                        } else {
-                            warn!("Decoded protobuf produced invalid JSON, trying brace scan");
-                            try_brace_scan_or_type_meta(&body_bytes)
-                        }
-                    } else {
-                        // Both decoders failed — try brace scan, then TypeMeta
-                        try_brace_scan_or_type_meta(&body_bytes)
-                    }
-                }
-            } else if body_bytes.starts_with(b"{") || body_bytes.starts_with(b"[") {
-                // Already JSON despite protobuf Content-Type
-                body_bytes.to_vec()
-            } else {
-                // Unknown binary format — might be K8s protobuf without k8s\0 magic,
-                // or CBOR, or another encoding.
-                // Try brace scan but validate the result is actual JSON.
-                let mut found_valid = None;
-                for i in 0..body_bytes.len() {
-                    if body_bytes[i] == b'{' {
-                        // Try to extract a balanced JSON object
-                        let candidate = scan_balanced_braces(&body_bytes[i..]);
-                        if let Some(ref c) = candidate {
-                            if serde_json::from_slice::<serde_json::Value>(c).is_ok() {
-                                found_valid = Some(c.clone());
-                                break;
-                            }
-                        }
-                        // This `{` wasn't valid JSON start, try next one
-                    }
-                }
-                found_valid.unwrap_or_else(|| b"{}".to_vec())
-            };
+            let json_body = decode_k8s_protobuf_request_body(&body_bytes);
 
             let mut new_request = Request::from_parts(parts, axum::body::Body::from(json_body));
             new_request.headers_mut().insert(
@@ -1587,6 +1497,95 @@ fn looks_like_k8s_resource_json(val: &serde_json::Value) -> bool {
     let has_metadata_name = val.get("metadata").and_then(|m| m.get("name")).is_some();
     let has_spec = val.get("spec").is_some();
     (has_api_version && has_kind) || (has_metadata_name && has_spec)
+}
+
+/// Decode a `Content-Type: application/vnd.kubernetes.protobuf` request body to
+/// JSON bytes. This is the exact cascade the request middleware runs, factored
+/// out as a pure function so it can be exercised directly (see the roundtrip
+/// fuzz harness in `tests/protobuf_roundtrip_fuzz.rs`):
+///
+/// 1. `k8s\0` envelope → try to extract literal JSON from the `raw` field, else
+/// 2. the schema-registry protobuf decoder (handles every registered kind), else
+/// 3. the CRD-specific protobuf decoder, else
+/// 4. brace-scan / TypeMeta reconstruction as a last resort.
+///
+/// A non-enveloped body that is already JSON is passed through; anything else
+/// falls back to a brace scan. Issue #495 lived in step 1's fallback, which is
+/// why having this path under test matters.
+pub fn decode_k8s_protobuf_request_body(body_bytes: &[u8]) -> Vec<u8> {
+    if body_bytes.starts_with(b"k8s\0") {
+        // K8s protobuf envelope — extract the JSON from the `raw` field.
+        if let Some(json) = extract_json_from_k8s_protobuf(body_bytes) {
+            return json;
+        }
+        // Extraction failed — the `raw` field contains native protobuf, not JSON.
+        // First try the structured protobuf-to-JSON decoder.
+        // Then fall back to brace-scanning, but always validate the result.
+        use std::fmt::Write as _;
+        let mut hex_preview = String::with_capacity(80 * 3);
+        for b in body_bytes.iter().skip(4).take(80) {
+            let _ = write!(hex_preview, "{:02x} ", b);
+        }
+        if hex_preview.ends_with(' ') {
+            hex_preview.pop();
+        }
+        debug!(
+            "Protobuf body has no JSON in raw field ({} bytes). Hex after k8s\\0: {}",
+            body_bytes.len(),
+            hex_preview
+        );
+
+        // Try the generic proto schema-based decoder first.
+        // This handles ALL standard K8s types (Deployment, Pod, Service, etc.)
+        // by using field number → name mappings from the K8s .proto definitions.
+        if let Some(json_bytes) = PROTO_REGISTRY.decode_k8s_resource(body_bytes) {
+            if serde_json::from_slice::<serde_json::Value>(&json_bytes).is_ok() {
+                info!(
+                    "Decoded K8s protobuf via schema registry ({} bytes)",
+                    json_bytes.len()
+                );
+                return json_bytes;
+            }
+            warn!("Schema-decoded protobuf produced invalid JSON, trying CRD decoder");
+            // Fall through to CRD-specific decoder
+            if let Some(json_bytes) = decode_k8s_protobuf_to_json(body_bytes) {
+                if serde_json::from_slice::<serde_json::Value>(&json_bytes).is_ok() {
+                    info!("Decoded K8s protobuf to JSON ({} bytes)", json_bytes.len());
+                    return json_bytes;
+                }
+            }
+            return try_brace_scan_or_type_meta(body_bytes);
+        }
+        // Schema-based decode returned None (unknown kind) — try CRD decoder
+        if let Some(json_bytes) = decode_k8s_protobuf_to_json(body_bytes) {
+            if serde_json::from_slice::<serde_json::Value>(&json_bytes).is_ok() {
+                info!("Decoded K8s protobuf to JSON ({} bytes)", json_bytes.len());
+                return json_bytes;
+            }
+            warn!("Decoded protobuf produced invalid JSON, trying brace scan");
+        }
+        // Both decoders failed — try brace scan, then TypeMeta
+        try_brace_scan_or_type_meta(body_bytes)
+    } else if body_bytes.starts_with(b"{") || body_bytes.starts_with(b"[") {
+        // Already JSON despite protobuf Content-Type
+        body_bytes.to_vec()
+    } else {
+        // Unknown binary format — might be K8s protobuf without k8s\0 magic,
+        // or CBOR, or another encoding.
+        // Try brace scan but validate the result is actual JSON.
+        for i in 0..body_bytes.len() {
+            if body_bytes[i] == b'{' {
+                // Try to extract a balanced JSON object
+                if let Some(c) = scan_balanced_braces(&body_bytes[i..]) {
+                    if serde_json::from_slice::<serde_json::Value>(&c).is_ok() {
+                        return c;
+                    }
+                }
+                // This `{` wasn't valid JSON start, try next one
+            }
+        }
+        b"{}".to_vec()
+    }
 }
 
 /// Extract TypeMeta (apiVersion, kind) from a K8s protobuf envelope.
