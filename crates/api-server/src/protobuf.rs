@@ -1432,7 +1432,24 @@ impl ProtoRegistry {
         schemas.insert(
             "NamespaceCondition".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                // Field tags mirror upstream k8s.io/api/core/v1 NamespaceCondition.
+                // Tag 3 is unused for namespaces (no lastProbeTime); the typed Go
+                // client decodes these back into v1.NamespaceCondition, so an empty
+                // schema would drop type/status/reason/message and break the
+                // `should apply changes to a namespace status` conformance test.
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                ]),
             },
         );
 
