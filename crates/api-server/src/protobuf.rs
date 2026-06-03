@@ -1129,13 +1129,34 @@ impl ProtoRegistry {
         schemas.insert(
             "ServiceStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "loadBalancer".into(),
+                            FieldType::Message("LoadBalancerStatus".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
             "SessionAffinityConfig".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "clientIP".into(),
+                        FieldType::Message("ClientIPConfig".into()),
+                    ),
+                )]),
             },
         );
 
@@ -1203,7 +1224,36 @@ impl ProtoRegistry {
         schemas.insert(
             "JobStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "JobCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("startTime".into(), FieldType::Message("Time".into()))),
+                    (
+                        3,
+                        ("completionTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (4, ("active".into(), FieldType::Int)),
+                    (5, ("succeeded".into(), FieldType::Int)),
+                    (6, ("failed".into(), FieldType::Int)),
+                    (7, ("completedIndexes".into(), FieldType::String)),
+                    (
+                        8,
+                        (
+                            "uncountedTerminatedPods".into(),
+                            FieldType::Message("UncountedTerminatedPods".into()),
+                        ),
+                    ),
+                    (9, ("ready".into(), FieldType::Int)),
+                    (10, ("terminating".into(), FieldType::Int)),
+                    (11, ("failedIndexes".into(), FieldType::String)),
+                ]),
             },
         );
         schemas.insert(
@@ -1574,7 +1624,35 @@ impl ProtoRegistry {
         schemas.insert(
             "PersistentVolumeClaimStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("phase".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "accessModes".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (3, ("capacity".into(), FieldType::QuantityMap)),
+                    (
+                        4,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PersistentVolumeClaimCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (5, ("allocatedResources".into(), FieldType::QuantityMap)),
+                    (
+                        7,
+                        ("allocatedResourceStatuses".into(), FieldType::StringMap),
+                    ),
+                    (
+                        8,
+                        ("currentVolumeAttributesClassName".into(), FieldType::String),
+                    ),
+                ]),
             },
         );
         schemas.insert(
@@ -1655,7 +1733,22 @@ impl ProtoRegistry {
         schemas.insert(
             "ReplicationControllerStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("replicas".into(), FieldType::Int)),
+                    (2, ("fullyLabeledReplicas".into(), FieldType::Int)),
+                    (3, ("observedGeneration".into(), FieldType::Int)),
+                    (4, ("readyReplicas".into(), FieldType::Int)),
+                    (5, ("availableReplicas".into(), FieldType::Int)),
+                    (
+                        6,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ReplicationControllerCondition".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
             },
         );
 
@@ -1740,26 +1833,119 @@ impl ProtoRegistry {
         schemas.insert(
             "NodeSpec".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("podCIDR".into(), FieldType::String)),
+                    (2, ("doNotUseExternalID".into(), FieldType::String)),
+                    (3, ("providerID".into(), FieldType::String)),
+                    (4, ("unschedulable".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "taints".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Taint".into()))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "configSource".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "podCIDRs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
             "NodeStatus".into(),
             MessageSchema {
-                // NOTE: this schema is otherwise empty — the full NodeStatus
-                // field set (capacity/allocatable maps, conditions, addresses,
-                // nodeInfo, images, ...) is still unmapped, so those are dropped
-                // for protobuf clients (tracked separately). daemonEndpoints
-                // (field 6, matching upstream core/v1 NodeStatus) is mapped here
-                // because the e2e metrics grabber reads
-                // kubeletEndpoint.Port over protobuf and otherwise sees 0.
-                fields: HashMap::from([(
-                    6,
+                // Full core/v1 NodeStatus field set (generated.proto).
+                fields: HashMap::from([
+                    (1, ("capacity".into(), FieldType::QuantityMap)),
+                    (2, ("allocatable".into(), FieldType::QuantityMap)),
+                    (3, ("phase".into(), FieldType::String)),
                     (
-                        "daemonEndpoints".into(),
-                        FieldType::Message("NodeDaemonEndpoints".into()),
+                        4,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeCondition".into(),
+                            ))),
+                        ),
                     ),
-                )]),
+                    (
+                        5,
+                        (
+                            "addresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("NodeAddress".into()))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "daemonEndpoints".into(),
+                            FieldType::Message("NodeDaemonEndpoints".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "nodeInfo".into(),
+                            FieldType::Message("NodeSystemInfo".into()),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "images".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerImage".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "volumesInUse".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        10,
+                        (
+                            "volumesAttached".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "AttachedVolume".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        11,
+                        (
+                            "config".into(),
+                            FieldType::Message("NodeConfigStatus".into()),
+                        ),
+                    ),
+                    (
+                        12,
+                        (
+                            "runtimeHandlers".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeRuntimeHandler".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        13,
+                        ("features".into(), FieldType::Message("NodeFeatures".into())),
+                    ),
+                ]),
             },
         );
 
@@ -2127,7 +2313,22 @@ impl ProtoRegistry {
         schemas.insert(
             "WebhookConversion".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        2,
+                        (
+                            "clientConfig".into(),
+                            FieldType::Message("WebhookClientConfig".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "conversionReviewVersions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
@@ -13238,23 +13439,15 @@ mod tests {
         );
     }
 
-    /// Schemas registered with no fields. `Patch` is opaque and
-    /// `CustomResourceSubresourceStatus` is an empty message upstream — those
-    /// two are legitimately empty. The rest are KNOWN-INCOMPLETE debt: their
-    /// fields silently drop over vnd.kubernetes.protobuf until populated
-    /// (EndpointSubset was one such bug — the EndpointSliceMirroring test).
-    /// Remove an entry when you give that schema fields. NEVER add a new entry
-    /// to silence the guard below — populate the schema instead.
+    /// Schemas registered with no fields. Only two messages are legitimately
+    /// empty in the upstream proto: `Patch` is an opaque body and
+    /// `CustomResourceSubresourceStatus` is an empty message. Every other type
+    /// MUST carry its fields, or they silently drop over vnd.kubernetes.protobuf
+    /// (the EndpointSubset / NodeStatus bug class). NEVER add a new entry here to
+    /// silence the guard below — populate the schema instead.
     const ALLOWED_EMPTY_SCHEMAS: &[&str] = &[
         "Patch",                           // opaque patch body
         "CustomResourceSubresourceStatus", // empty message in the proto
-        "JobStatus",                       // TODO(#321): Job status subresource
-        "ServiceStatus",                   // TODO(#423): Service status lifecycle
-        "NodeSpec",                        // TODO: populate node spec fields
-        "PersistentVolumeClaimStatus",     // TODO: populate PVC status fields
-        "ReplicationControllerStatus",     // TODO: populate RC status fields
-        "SessionAffinityConfig",           // TODO: clientIP.timeoutSeconds
-        "WebhookConversion",               // TODO: strategy + clientConfig
     ];
 
     #[test]
@@ -13276,6 +13469,82 @@ mod tests {
             unexpected.len(),
             unexpected.join("\n")
         );
+    }
+
+    #[test]
+    fn test_newly_populated_status_schemas_roundtrip() {
+        // Previously-empty schemas, now populated. Each must carry its fields
+        // through a protobuf round-trip (was: silently dropped).
+        let reg = ProtoRegistry::new();
+        let cases: &[(&str, Value, &str, Value)] = &[
+            (
+                "JobStatus",
+                json!({"active":2,"succeeded":3,"failed":1,"ready":1}),
+                "/succeeded",
+                json!(3),
+            ),
+            (
+                "ServiceStatus",
+                json!({"loadBalancer":{"ingress":[{"ip":"1.2.3.4"}]}}),
+                "/loadBalancer/ingress/0/ip",
+                json!("1.2.3.4"),
+            ),
+            (
+                "NodeSpec",
+                json!({"podCIDR":"10.0.0.0/24","unschedulable":true,"podCIDRs":["10.0.0.0/24"]}),
+                "/podCIDR",
+                json!("10.0.0.0/24"),
+            ),
+            (
+                "PersistentVolumeClaimStatus",
+                json!({"phase":"Bound","accessModes":["ReadWriteOnce"],"capacity":{"storage":"1Gi"}}),
+                "/capacity/storage",
+                json!("1Gi"),
+            ),
+            (
+                "ReplicationControllerStatus",
+                json!({"replicas":3,"readyReplicas":2,"availableReplicas":2}),
+                "/replicas",
+                json!(3),
+            ),
+            (
+                "SessionAffinityConfig",
+                json!({"clientIP":{"timeoutSeconds":30}}),
+                "/clientIP/timeoutSeconds",
+                json!(30),
+            ),
+            (
+                "WebhookConversion",
+                json!({"conversionReviewVersions":["v1"]}),
+                "/conversionReviewVersions/0",
+                json!("v1"),
+            ),
+            (
+                "NodeStatus",
+                json!({"capacity":{"cpu":"4"},"conditions":[{"type":"Ready","status":"True"}]}),
+                "/capacity/cpu",
+                json!("4"),
+            ),
+            (
+                "NodeStatus",
+                json!({"addresses":[{"type":"InternalIP","address":"1.2.3.4"}],"nodeInfo":{"machineID":"m1"}}),
+                "/addresses/0/address",
+                json!("1.2.3.4"),
+            ),
+        ];
+        for (ty, input, ptr, expected) in cases {
+            let bytes = reg
+                .encode_message(ty, input)
+                .unwrap_or_else(|| panic!("{ty} must encode to protobuf"));
+            let decoded = reg
+                .decode_message(ty, &bytes)
+                .unwrap_or_else(|| panic!("{ty} must decode from protobuf"));
+            assert_eq!(
+                decoded.pointer(ptr),
+                Some(expected),
+                "{ty}{ptr} must survive the protobuf round-trip"
+            );
+        }
     }
 
     #[test]
