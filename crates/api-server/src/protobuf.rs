@@ -13472,6 +13472,41 @@ mod tests {
     }
 
     #[test]
+    fn test_job_status_conditions_survive_protobuf_decode() {
+        // [sig-apps] "Job should apply changes to a job status" does
+        // UpdateStatus (a PUT of the full Job over vnd.kubernetes.protobuf).
+        // With an empty JobStatus schema the request decode dropped
+        // status.conditions, so the PUT persisted an empty status and the
+        // CustomConditionType vanished. The Job -> JobStatus -> JobCondition
+        // chain must now carry conditions through a protobuf decode.
+        let registry = ProtoRegistry::new();
+        let job = json!({
+            "metadata": { "name": "job-status-test" },
+            "status": {
+                "active": 1,
+                "conditions": [{
+                    "type": "CustomConditionType",
+                    "status": "True",
+                    "reason": "E2E",
+                    "message": "Set from e2e test"
+                }]
+            }
+        });
+        let bytes = registry
+            .encode_message("Job", &job)
+            .expect("Job must encode to protobuf");
+        let decoded = registry
+            .decode_message("Job", &bytes)
+            .expect("Job must decode from protobuf");
+        assert_eq!(
+            decoded.pointer("/status/conditions/0/type"),
+            Some(&json!("CustomConditionType")),
+            "Job.status.conditions must survive protobuf decode (UpdateStatus PUT)"
+        );
+        assert_eq!(decoded.pointer("/status/active"), Some(&json!(1)));
+    }
+
+    #[test]
     fn test_newly_populated_status_schemas_roundtrip() {
         // Previously-empty schemas, now populated. Each must carry its fields
         // through a protobuf round-trip (was: silently dropped).
