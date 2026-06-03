@@ -359,8 +359,16 @@ pub struct JSONSchemaProps {
     pub x_kubernetes_validations: Option<Vec<serde_json::Value>>,
 }
 
-/// JSONSchemaPropsOrArray represents a value that can be either a JSONSchemaProps or an array of them
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// JSONSchemaPropsOrArray represents a value that can be either a JSONSchemaProps or an array of them.
+///
+/// Serializes inline (matching upstream's JSON `MarshalJSON`). Deserialization
+/// accepts BOTH the inline JSON form (`{type: object, ...}` / `[ ... ]`) AND
+/// the struct form (`{schema: {...}}` / `{jSONSchemas: [...]}`) that
+/// vnd.kubernetes CBOR clients emit — k8s CBOR-encodes this type as its Go
+/// struct (protobuf field names `schema` / `jSONSchemas`) rather than inlining
+/// it, and rusternetes transcodes that CBOR to JSON before typed decode. See
+/// [`deserialize_schema_or_array`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum JSONSchemaPropsOrArray {
@@ -368,8 +376,11 @@ pub enum JSONSchemaPropsOrArray {
     Schemas(Vec<JSONSchemaProps>),
 }
 
-/// JSONSchemaPropsOrBool represents a value that can be either a JSONSchemaProps or a boolean
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// JSONSchemaPropsOrBool represents a value that can be either a JSONSchemaProps or a boolean.
+///
+/// Like [`JSONSchemaPropsOrArray`], deserialization also accepts the CBOR
+/// struct form `{allows: <bool>, schema: {...}}`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum JSONSchemaPropsOrBool {
@@ -377,13 +388,120 @@ pub enum JSONSchemaPropsOrBool {
     Bool(bool),
 }
 
-/// JSONSchemaPropsOrStringArray represents a value that can be either a JSONSchemaProps or a string array
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// JSONSchemaPropsOrStringArray represents a value that can be either a JSONSchemaProps or a string array.
+///
+/// Like [`JSONSchemaPropsOrArray`], deserialization also accepts the CBOR
+/// struct form `{schema: {...}}` / `{property: [...]}`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum JSONSchemaPropsOrStringArray {
     Schema(JSONSchemaProps),
     Strings(Vec<String>),
+}
+
+// ---------------------------------------------------------------------------
+// Custom Deserialize for the JSONSchemaProps "or X" union types.
+//
+// Upstream defines custom JSON marshalers that *inline* the value, but its CBOR
+// marshalers (pre-1.36) fall back to the Go struct shape, so a CBOR request
+// body carries e.g. `items: {schema: {...}}` instead of `items: {type: ...}`.
+// rusternetes transcodes incoming CBOR to JSON, so by the time we decode we may
+// see either shape. A plain `#[serde(untagged)]` derive only understood the
+// inline shape and silently parsed the struct shape as an (empty) inline
+// schema, which then tripped strict field validation with a spurious
+// `unknown field "...items.schema"` and broke CRD creation over CBOR
+// (CustomResourcePublishOpenAPI conformance specs).
+//
+// The struct shape is unambiguous: an inline JSONSchemaProps never has a
+// top-level `schema` / `jSONSchemas` / `allows` / `property` key (those are not
+// JSONSchemaProps fields), so their presence selects the struct form.
+// ---------------------------------------------------------------------------
+
+fn json_props_from_value<E: serde::de::Error>(v: serde_json::Value) -> Result<JSONSchemaProps, E> {
+    serde_json::from_value(v).map_err(E::custom)
+}
+
+impl<'de> Deserialize<'de> for JSONSchemaPropsOrArray {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::Array(_) => Ok(Self::Schemas(
+                serde_json::from_value(v).map_err(D::Error::custom)?,
+            )),
+            serde_json::Value::Object(ref m)
+                if m.contains_key("schema") || m.contains_key("jSONSchemas") =>
+            {
+                if let Some(s) = m.get("schema").filter(|s| !s.is_null()) {
+                    Ok(Self::Schema(json_props_from_value(s.clone())?))
+                } else if let Some(a) = m.get("jSONSchemas").filter(|a| !a.is_null()) {
+                    Ok(Self::Schemas(
+                        serde_json::from_value(a.clone()).map_err(D::Error::custom)?,
+                    ))
+                } else {
+                    Ok(Self::Schema(JSONSchemaProps::default()))
+                }
+            }
+            other => Ok(Self::Schema(json_props_from_value(other)?)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JSONSchemaPropsOrBool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::Bool(b) => Ok(Self::Bool(b)),
+            serde_json::Value::Object(ref m)
+                if m.contains_key("schema") || m.contains_key("allows") =>
+            {
+                if let Some(s) = m.get("schema").filter(|s| !s.is_null()) {
+                    Ok(Self::Schema(json_props_from_value(s.clone())?))
+                } else {
+                    Ok(Self::Bool(
+                        m.get("allows").and_then(|a| a.as_bool()).unwrap_or(false),
+                    ))
+                }
+            }
+            other => Ok(Self::Schema(json_props_from_value(other)?)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JSONSchemaPropsOrStringArray {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::Array(_) => Ok(Self::Strings(
+                serde_json::from_value(v).map_err(D::Error::custom)?,
+            )),
+            serde_json::Value::Object(ref m)
+                if m.contains_key("schema") || m.contains_key("property") =>
+            {
+                if let Some(s) = m.get("schema").filter(|s| !s.is_null()) {
+                    Ok(Self::Schema(json_props_from_value(s.clone())?))
+                } else if let Some(p) = m.get("property").filter(|p| !p.is_null()) {
+                    Ok(Self::Strings(
+                        serde_json::from_value(p.clone()).map_err(D::Error::custom)?,
+                    ))
+                } else {
+                    Ok(Self::Schema(JSONSchemaProps::default()))
+                }
+            }
+            other => Ok(Self::Schema(json_props_from_value(other)?)),
+        }
+    }
 }
 
 /// CustomResourceSubresources defines the status and scale subresources
@@ -577,6 +695,81 @@ pub struct CustomResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_jsonschema_items_accepts_cbor_struct_form() {
+        // A vnd.kubernetes CBOR client (1.35) sends `items` in the Go struct
+        // form `{"schema": {...}}` (transcoded to JSON by rusternetes), not the
+        // JSON-inlined form. Both must decode to the same Schema, and the inner
+        // schema's fields must be preserved (regression: the old untagged derive
+        // parsed it as an empty schema and strict validation rejected
+        // `items.schema`).
+        let inline: JSONSchemaProps = serde_json::from_value(serde_json::json!({
+            "type": "array",
+            "items": { "type": "object", "properties": { "name": { "type": "string" } } }
+        }))
+        .unwrap();
+        let struct_form: JSONSchemaProps = serde_json::from_value(serde_json::json!({
+            "type": "array",
+            "items": { "schema": { "type": "object", "properties": { "name": { "type": "string" } } } }
+        }))
+        .unwrap();
+
+        for (label, props) in [("inline", &inline), ("struct", &struct_form)] {
+            match props.items.as_deref() {
+                Some(JSONSchemaPropsOrArray::Schema(s)) => {
+                    assert_eq!(
+                        s.type_.as_deref(),
+                        Some("object"),
+                        "{label}: items elem type"
+                    );
+                    assert!(
+                        s.properties
+                            .as_ref()
+                            .is_some_and(|p| p.contains_key("name")),
+                        "{label}: items elem must keep its properties"
+                    );
+                }
+                other => panic!("{label}: expected Schema variant, got {other:?}"),
+            }
+        }
+        // Inline and struct forms must be equivalent after decode.
+        assert_eq!(inline.items, struct_form.items);
+    }
+
+    #[test]
+    fn test_jsonschema_or_bool_and_stringarray_cbor_struct_form() {
+        // additionalProperties: CBOR struct form {allows, schema} and {schema}.
+        let ap_bool: JSONSchemaProps = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "additionalProperties": { "allows": false }
+        }))
+        .unwrap();
+        assert_eq!(
+            ap_bool.additional_properties.as_deref(),
+            Some(&JSONSchemaPropsOrBool::Bool(false))
+        );
+        let ap_schema: JSONSchemaProps = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "additionalProperties": { "schema": { "type": "string" } }
+        }))
+        .unwrap();
+        match ap_schema.additional_properties.as_deref() {
+            Some(JSONSchemaPropsOrBool::Schema(s)) => {
+                assert_eq!(s.type_.as_deref(), Some("string"))
+            }
+            other => panic!("expected Schema, got {other:?}"),
+        }
+        // inline bool still works
+        let ap_inline: JSONSchemaProps = serde_json::from_value(serde_json::json!({
+            "type": "object", "additionalProperties": true
+        }))
+        .unwrap();
+        assert_eq!(
+            ap_inline.additional_properties.as_deref(),
+            Some(&JSONSchemaPropsOrBool::Bool(true))
+        );
+    }
 
     #[test]
     fn test_crd_creation() {

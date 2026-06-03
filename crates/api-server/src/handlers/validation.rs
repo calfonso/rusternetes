@@ -450,6 +450,29 @@ fn find_unknown_fields_via_diff(
     match (original, canonical) {
         (serde_json::Value::Object(orig_map), serde_json::Value::Object(canon_map)) => {
             for (key, orig_val) in orig_map {
+                // Representation-transform keys: the JSONSchemaProps union types
+                // (JSONSchemaPropsOrArray/OrBool/OrStringArray) are CBOR-encoded
+                // by k8s in their Go struct form — `{schema: {...}}`,
+                // `{allows, schema}`, `{jSONSchemas: [...]}`, `{property: [...]}`.
+                // The custom Deserialize accepts those, but they re-serialize
+                // inline, so the diff sees the wrapper key as "missing from
+                // canonical". It is not unknown — just an alternate encoding the
+                // type consumed (serde_ignored, authoritative for real unknowns,
+                // does not flag it). These names are never genuine JSONSchemaProps
+                // fields, so skipping them when absent from canonical is safe and
+                // narrow (does NOT skip whole nodes — a wrong-case sibling like
+                // `APIVersion` is still reported).
+                const UNION_WRAPPER_KEYS: &[&str] =
+                    &["schema", "jSONSchemas", "allows", "property"];
+                if UNION_WRAPPER_KEYS.contains(&key.as_str())
+                    && !canon_map.contains_key(key)
+                    && matches!(
+                        orig_val,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    )
+                {
+                    continue;
+                }
                 let field_path = if prefix.is_empty() {
                     key.clone()
                 } else {
