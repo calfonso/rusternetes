@@ -1835,7 +1835,7 @@ impl ProtoRegistry {
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("podCIDR".into(), FieldType::String)),
-                    (2, ("doNotUseExternalID".into(), FieldType::String)),
+                    (2, ("externalID".into(), FieldType::String)),
                     (3, ("providerID".into(), FieldType::String)),
                     (4, ("unschedulable".into(), FieldType::Bool)),
                     (
