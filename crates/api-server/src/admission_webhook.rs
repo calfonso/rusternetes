@@ -4025,14 +4025,15 @@ mod tests {
 
         // Webhook for configmaps, scoped to namespaces labeled webhook-e2e=true.
         let mut config = make_validating_config("deny-marker-cms", &url, configmaps_rule());
-        config.webhooks.as_mut().unwrap()[0].namespace_selector =
-            Some(rusternetes_common::resources::admission_webhook::LabelSelector {
+        config.webhooks.as_mut().unwrap()[0].namespace_selector = Some(
+            rusternetes_common::resources::admission_webhook::LabelSelector {
                 match_labels: Some(std::collections::HashMap::from([(
                     "webhook-e2e".to_string(),
                     "true".to_string(),
                 )])),
                 match_expressions: None,
-            });
+            },
+        );
         storage
             .create(
                 "/registry/validatingwebhookconfigurations/deny-marker-cms",
