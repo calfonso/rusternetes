@@ -16,15 +16,18 @@ env:
 # Both jobs run on self-hosted ARC scale sets that ship the Rust
 # toolchain (clippy + rustfmt), cargo-nextest, and the system build
 # deps (protoc + libprotobuf-dev, mold + clang, pkg-config + libssl-dev).
-# They share an anchor block so the repeated setup (checkout, rhino
-# clone, mold enable, rust-cache) stays in lock-step.
+#
+# `cargo nextest` and `cargo clippy` are REQUIRED status checks. To keep
+# them mergeable without burning a full compile on PRs that touch no Rust
+# (docs / scripts / compose / known-green.txt only), each job stays
+# always-triggered but gates its cache+build steps on a change-detection
+# step — so the required check still reports green in seconds when there's
+# no Rust to build. Pushes to main always run the full job.
 #
 # Memory budget differs per job, so each picks a differently-sized ARC
 # scale set:
 #   - `arc-runner-set`       — large tier, for nextest (peaks near 8 GiB)
 #   - `arc-runner-set-small` — light tier, for clippy (~250 MiB peak)
-# Both scale sets share one runner image; only the pod resource
-# requests differ. The cluster + helm values are maintained out-of-tree.
 jobs:
   nextest:
     name: cargo nextest
@@ -33,9 +36,25 @@ jobs:
       - name: Checkout repository
         # rhino is an in-tree submodule (./rhino) resolving the storage crate's
         # `../../rhino` path dep. submodules: recursive checks it out pinned.
+        # fetch-depth: 0 gives the change-detection diff the PR base commit.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Detect Rust-relevant changes
+        id: rust
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" \
+              | grep -qE '(\.rs|\.proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)build\.rs$|^rhino($|/)|(^|/)rust-toolchain|^\.github/workflows/(test|fmt)\.yml$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Rust-relevant changes — skipping cargo nextest (required check reports green)."
+          fi
 
       - name: Cache cargo registry + target
         # ARC runner pods are ephemeral; rust-cache restores ~/.cargo
@@ -49,6 +68,7 @@ jobs:
         # 1-3 min per PR job; main pays that cost once per Cargo.lock
         # change. PRs that touch Cargo.lock will recompile new deps
         # but still benefit from the warm cache for everything else.
+        if: steps.rust.outputs.changed == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           # Distinct cache namespace from clippy: the test profile and
@@ -64,6 +84,7 @@ jobs:
         # Doctests are not run (nextest limitation) — none of the
         # workspace currently depends on doctest coverage; add a
         # separate `cargo test --doc` step if that changes.
+        if: steps.rust.outputs.changed == 'true'
         run: cargo nextest run --workspace --locked --no-fail-fast --status-level fail
 
       - name: sccache stats
@@ -73,7 +94,7 @@ jobs:
         # + values-*.yaml). It shares rustc artifacts between this job and the
         # clippy job and across successive pushes to a PR. `|| true` keeps a
         # missing/unconfigured sccache from failing the job.
-        if: always()
+        if: always() && steps.rust.outputs.changed == 'true'
         run: sccache --show-stats || true
 
   nextest-sqlite:
@@ -95,10 +116,26 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Detect Rust-relevant changes
+        id: rust
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" \
+              | grep -qE '(\.rs|\.proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)build\.rs$|^rhino($|/)|(^|/)rust-toolchain|^\.github/workflows/(test|fmt)\.yml$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Rust-relevant changes — skipping the sqlite nextest job."
+          fi
 
       - name: Cache cargo registry + target
         # Distinct shared-key: the sqlite feature produces different artifacts
         # under target/ than the default-feature nextest job.
+        if: steps.rust.outputs.changed == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -109,13 +146,15 @@ jobs:
         # Lint the sqlite-gated code too — the default clippy job below builds
         # default features only, so `#[cfg(feature = "sqlite")]` paths are
         # otherwise never linted.
+        if: steps.rust.outputs.changed == 'true'
         run: cargo clippy -p rusternetes-api-server --all-targets --features sqlite --locked -- -D warnings
 
       - name: cargo nextest run (sqlite feature)
+        if: steps.rust.outputs.changed == 'true'
         run: cargo nextest run -p rusternetes-api-server --features sqlite --locked --no-fail-fast --status-level fail
 
       - name: sccache stats
-        if: always()
+        if: always() && steps.rust.outputs.changed == 'true'
         run: sccache --show-stats || true
 
   clippy:
@@ -131,9 +170,25 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Detect Rust-relevant changes
+        id: rust
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" \
+              | grep -qE '(\.rs|\.proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)build\.rs$|^rhino($|/)|(^|/)rust-toolchain|^\.github/workflows/(test|fmt)\.yml$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Rust-relevant changes — skipping cargo clippy (required check reports green)."
+          fi
 
       - name: Cache cargo registry + target
         # See save-if rationale in the nextest job's cache step.
+        if: steps.rust.outputs.changed == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -154,10 +209,11 @@ jobs:
         # old explicit `cargo build` step provided — clippy compiles
         # every target before lint, so any compile error in a bin fails
         # this step.
+        if: steps.rust.outputs.changed == 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: sccache stats
         # See the nextest job's sccache-stats step. This job populates the
         # shared cache that nextest then reads (and vice-versa).
-        if: always()
+        if: always() && steps.rust.outputs.changed == 'true'
         run: sccache --show-stats || true
