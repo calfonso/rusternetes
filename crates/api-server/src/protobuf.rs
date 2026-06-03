@@ -2642,6 +2642,8 @@ impl ProtoRegistry {
         Self::register_flowcontrol_v1(&mut schemas);
         Self::register_node_v1(&mut schemas);
         Self::register_authentication_v1(&mut schemas);
+        Self::register_authorization_v1(&mut schemas);
+        Self::register_certificates_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -7205,7 +7207,17 @@ impl ProtoRegistry {
                     pos = new_pos;
 
                     if let Some((name, field_type)) = schema.fields.get(&field_num) {
-                        let json_val = match field_type {
+                        // For a repeated scalar the element type — not the
+                        // `Repeated` wrapper — decides the JSON form. Decoding a
+                        // repeated bool through the wildcard arm yielded integer
+                        // `1`, which then failed to re-encode (`1.as_bool()` is
+                        // None) and silently dropped the element (e.g.
+                        // DeviceAttribute.bools).
+                        let scalar_type = match field_type {
+                            FieldType::Repeated(inner) => inner.as_ref(),
+                            other => other,
+                        };
+                        let json_val = match scalar_type {
                             FieldType::Bool => Value::Bool(value != 0),
                             FieldType::Int => json!(value as i64),
                             _ => json!(value as i64),
@@ -12328,6 +12340,346 @@ impl ProtoRegistry {
     /// UserInfo. Field numbers from `k8s.io/api/authentication/v1/generated.proto`.
     /// TokenRequest is namespaced under the ServiceAccount `token` subresource;
     /// its request body is decoded the same way so it is registered here too.
+    /// authorization.k8s.io/v1 review kinds. Field numbers from
+    /// staging/src/k8s.io/api/authorization/v1/generated.proto.
+    ///
+    /// The typed Go client POSTs these over vnd.kubernetes.protobuf; without a
+    /// schema the nested `resourceAttributes` message was dropped on decode and
+    /// the handler returned 500 "Either resourceAttributes or
+    /// nonResourceAttributes must be specified" (the [sig-auth] SubjectReview
+    /// conformance test). `spec.extra` (map<string, ExtraValue=repeated string>)
+    /// has no matching FieldType variant and is rarely set, so it is omitted —
+    /// the decoder simply skips field 5.
+    fn register_authorization_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        let review_kind = |spec_type: &str| MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
+                    ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                ),
+                (2, ("spec".into(), FieldType::Message(spec_type.into()))),
+                (
+                    3,
+                    (
+                        "status".into(),
+                        FieldType::Message("SubjectAccessReviewStatus".into()),
+                    ),
+                ),
+            ]),
+        };
+        schemas.insert(
+            "SubjectAccessReview".into(),
+            review_kind("SubjectAccessReviewSpec"),
+        );
+        schemas.insert(
+            "LocalSubjectAccessReview".into(),
+            review_kind("SubjectAccessReviewSpec"),
+        );
+        schemas.insert(
+            "SelfSubjectAccessReview".into(),
+            review_kind("SelfSubjectAccessReviewSpec"),
+        );
+
+        schemas.insert(
+            "SubjectAccessReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "resourceAttributes".into(),
+                            FieldType::Message("ResourceAttributes".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceAttributes".into(),
+                            FieldType::Message("NonResourceAttributes".into()),
+                        ),
+                    ),
+                    (3, ("user".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "groups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (6, ("uid".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectAccessReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "resourceAttributes".into(),
+                            FieldType::Message("ResourceAttributes".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceAttributes".into(),
+                            FieldType::Message("NonResourceAttributes".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ResourceAttributes".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("verb".into(), FieldType::String)),
+                    (3, ("group".into(), FieldType::String)),
+                    (4, ("version".into(), FieldType::String)),
+                    (5, ("resource".into(), FieldType::String)),
+                    (6, ("subresource".into(), FieldType::String)),
+                    (7, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NonResourceAttributes".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (2, ("verb".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SubjectAccessReviewStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("allowed".into(), FieldType::Bool)),
+                    (2, ("reason".into(), FieldType::String)),
+                    (3, ("evaluationError".into(), FieldType::String)),
+                    (4, ("denied".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+
+        // SelfSubjectRulesReview (kubectl auth can-i --list).
+        schemas.insert(
+            "SelfSubjectRulesReview".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("SelfSubjectRulesReviewSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("SubjectRulesReviewStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectRulesReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("namespace".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "SubjectRulesReviewStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "resourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ResourceRule".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NonResourceRule".into(),
+                            ))),
+                        ),
+                    ),
+                    (3, ("incomplete".into(), FieldType::Bool)),
+                    (4, ("evaluationError".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ResourceRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "resourceNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NonResourceRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceURLs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+    }
+
+    /// certificates.k8s.io/v1. Field numbers from
+    /// staging/src/k8s.io/api/certificates/v1/generated.proto. `spec.extra`
+    /// (map<string, ExtraValue=repeated string>) has no matching FieldType and
+    /// is omitted — the decoder skips field 6.
+    fn register_certificates_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "CertificateSigningRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("CertificateSigningRequestSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("CertificateSigningRequestStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CertificateSigningRequestSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("request".into(), FieldType::Bytes)),
+                    (2, ("username".into(), FieldType::String)),
+                    (3, ("uid".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "groups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "usages".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (7, ("signerName".into(), FieldType::String)),
+                    (8, ("expirationSeconds".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CertificateSigningRequestStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "CertificateSigningRequestCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("certificate".into(), FieldType::Bytes)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CertificateSigningRequestCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("reason".into(), FieldType::String)),
+                    (3, ("message".into(), FieldType::String)),
+                    (
+                        4,
+                        ("lastUpdateTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        5,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (6, ("status".into(), FieldType::String)),
+                ]),
+            },
+        );
+    }
+
     fn register_authentication_v1(schemas: &mut HashMap<String, MessageSchema>) {
         schemas.insert(
             "TokenReview".into(),
@@ -13349,6 +13701,359 @@ mod tests {
             cond.get("message"),
             Some(&Value::String("Updated by an e2e test".into())),
             "NamespaceCondition.message must survive protobuf encode/decode"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wide protobuf coverage: exercise EVERY registered message schema.
+    //
+    // We keep hitting per-type protobuf regressions where a schema is empty,
+    // missing, or references a sub-message that was never registered (e.g.
+    // NodeStatus shipped empty -> daemonEndpoints dropped; SubjectAccessReview
+    // had no schema -> resourceAttributes dropped -> 500). These two tests
+    // guard the whole registry at once instead of one ad-hoc test per type.
+    // ------------------------------------------------------------------
+
+    /// Collect every message-type name a FieldType references (recursing
+    /// through Repeated wrappers).
+    fn proto_referenced_types(ft: &FieldType, out: &mut Vec<String>) {
+        match ft {
+            FieldType::Message(t) | FieldType::InlineMessage(t) | FieldType::MessageMap(t) => {
+                out.push(t.clone())
+            }
+            FieldType::Repeated(inner) => proto_referenced_types(inner, out),
+            _ => {}
+        }
+    }
+
+    /// Message types resolved by bespoke decode/encode paths rather than a
+    /// registered MessageSchema — referencing them without a schema entry is
+    /// legitimate.
+    const PROTO_SPECIAL_LEAF_TYPES: &[&str] = &["Time", "MicroTime"];
+
+    #[test]
+    fn test_all_protobuf_schemas_reference_registered_types() {
+        let registry = ProtoRegistry::new();
+        let mut missing: Vec<String> = Vec::new();
+        for (owner, schema) in &registry.schemas {
+            for (name, ft) in schema.fields.values() {
+                let mut refs = Vec::new();
+                proto_referenced_types(ft, &mut refs);
+                for r in refs {
+                    if PROTO_SPECIAL_LEAF_TYPES.contains(&r.as_str()) {
+                        continue;
+                    }
+                    if !registry.schemas.contains_key(&r) {
+                        missing.push(format!("{owner}.{name} -> unregistered message type `{r}`"));
+                    }
+                }
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "protobuf schemas reference {} unregistered message type(s) — \
+             nested fields of these will silently drop on the wire:\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+    }
+
+    /// Build a sample JSON value for a FieldType whose every leaf survives the
+    /// encode/decode round-trip. `path` carries the chain of message types
+    /// currently being expanded for cycle + depth guarding.
+    fn proto_synth_value(
+        reg: &ProtoRegistry,
+        ft: &FieldType,
+        path: &mut Vec<String>,
+    ) -> serde_json::Value {
+        use serde_json::json;
+        match ft {
+            FieldType::String => json!("x"),
+            FieldType::Int => json!(7),
+            FieldType::Double => json!(1.5),
+            FieldType::Bool => json!(true),
+            FieldType::Bytes => json!("YWJj"), // base64("abc")
+            FieldType::IntOrString => json!("x"),
+            FieldType::Quantity => json!("1"),
+            FieldType::JsonRaw => json!({ "x": 1 }),
+            FieldType::StringMap => json!({ "k": "v" }),
+            FieldType::BytesMap => json!({ "k": "YWJj" }),
+            FieldType::QuantityMap => json!({ "k": "1" }),
+            FieldType::Repeated(inner) => {
+                let v = proto_synth_value(reg, inner, path);
+                if v.is_null() {
+                    json!([])
+                } else {
+                    json!([v])
+                }
+            }
+            FieldType::Message(t) | FieldType::InlineMessage(t) => {
+                proto_synth_message(reg, t, path)
+            }
+            FieldType::MessageMap(t) => {
+                let v = proto_synth_message(reg, t, path);
+                if v.is_null() {
+                    json!({})
+                } else {
+                    json!({ "k": v })
+                }
+            }
+        }
+    }
+
+    /// Build a sample object for a message type. Returns Null when the type is
+    /// a fragile timestamp leaf, unregistered, or already on the expansion
+    /// path (cycle) / past the depth cap — the caller then omits the field.
+    fn proto_synth_message(
+        reg: &ProtoRegistry,
+        t: &str,
+        path: &mut Vec<String>,
+    ) -> serde_json::Value {
+        use serde_json::{Map, Value};
+        // Time/MicroTime JSON forms are RFC3339 strings whose re-encode is not
+        // byte-identical to an arbitrary synthesized instant; skip them.
+        if PROTO_SPECIAL_LEAF_TYPES.contains(&t) {
+            return Value::Null;
+        }
+        if path.iter().any(|p| p == t) || path.len() > 5 {
+            return Value::Null;
+        }
+        let Some(schema) = reg.schemas.get(t) else {
+            return Value::Null;
+        };
+        path.push(t.to_string());
+        let mut obj = Map::new();
+        for (name, ft) in schema.fields.values() {
+            match ft {
+                // Inline messages live flattened in the parent object.
+                FieldType::InlineMessage(inner) => {
+                    if let Value::Object(m) = proto_synth_message(reg, inner, path) {
+                        for (k, v) in m {
+                            obj.insert(k, v);
+                        }
+                    }
+                }
+                _ => {
+                    let v = proto_synth_value(reg, ft, path);
+                    if !v.is_null() {
+                        obj.insert(name.clone(), v);
+                    }
+                }
+            }
+        }
+        path.pop();
+        Value::Object(obj)
+    }
+
+    #[test]
+    fn test_all_protobuf_schemas_roundtrip_consistently() {
+        let reg = ProtoRegistry::new();
+        let mut names: Vec<String> = reg.schemas.keys().cloned().collect();
+        names.sort();
+        let mut failures: Vec<String> = Vec::new();
+        for name in &names {
+            let mut path = Vec::new();
+            let synth = proto_synth_message(&reg, name, &mut path);
+            let Some(bytes1) = reg.encode_message(name, &synth) else {
+                continue;
+            };
+            let Some(decoded) = reg.decode_message(name, &bytes1) else {
+                failures.push(format!("{name}: encodes but fails to decode"));
+                continue;
+            };
+            let Some(bytes2) = reg.encode_message(name, &decoded) else {
+                failures.push(format!("{name}: decoded value fails to re-encode"));
+                continue;
+            };
+            if bytes1 != bytes2 {
+                failures.push(format!(
+                    "{name}: wire bytes differ after decode->re-encode ({} -> {} bytes) — \
+                     a field is dropped or mis-typed in the schema",
+                    bytes1.len(),
+                    bytes2.len()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} protobuf schema(s) do not round-trip consistently:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Every API Kind the server advertises in discovery. Typed Go clients
+    /// negotiate `vnd.kubernetes.protobuf` for built-in groups, so each such
+    /// Kind MUST have a protobuf schema (bare or group-qualified) or its
+    /// request/response bodies silently drop fields — the SubjectAccessReview
+    /// bug class. Keep in sync with `handlers/discovery.rs`.
+    const SERVED_BUILTIN_KINDS: &[&str] = &[
+        "APIGroupList",
+        "APIResourceList",
+        "APIService",
+        "APIVersions",
+        "Binding",
+        "CertificateSigningRequest",
+        "ClusterRole",
+        "ClusterRoleBinding",
+        "ComponentStatus",
+        "ConfigMap",
+        "ControllerRevision",
+        "CronJob",
+        "CSIDriver",
+        "CSINode",
+        "CSIStorageCapacity",
+        "CustomResourceDefinition",
+        "DaemonSet",
+        "Deployment",
+        "DeviceClass",
+        "Endpoints",
+        "EndpointSlice",
+        "Event",
+        "Eviction",
+        "FlowSchema",
+        "HorizontalPodAutoscaler",
+        "Ingress",
+        "IngressClass",
+        "IPAddress",
+        "Job",
+        "Lease",
+        "LimitRange",
+        "LocalSubjectAccessReview",
+        "MetricValueList",
+        "MutatingWebhookConfiguration",
+        "Namespace",
+        "NetworkPolicy",
+        "Node",
+        "NodeMetrics",
+        "PersistentVolume",
+        "PersistentVolumeClaim",
+        "Pod",
+        "PodAttachOptions",
+        "PodDisruptionBudget",
+        "PodExecOptions",
+        "PodMetrics",
+        "PodPortForwardOptions",
+        "PodTemplate",
+        "PriorityClass",
+        "PriorityLevelConfiguration",
+        "ReplicaSet",
+        "ReplicationController",
+        "ResourceClaim",
+        "ResourceClaimTemplate",
+        "ResourceQuota",
+        "ResourceSlice",
+        "Role",
+        "RoleBinding",
+        "RuntimeClass",
+        "Scale",
+        "Secret",
+        "SelfSubjectAccessReview",
+        "SelfSubjectReview",
+        "SelfSubjectRulesReview",
+        "Service",
+        "ServiceAccount",
+        "ServiceCIDR",
+        "StatefulSet",
+        "StorageClass",
+        "SubjectAccessReview",
+        "TokenReview",
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding",
+        "ValidatingWebhookConfiguration",
+        "VolumeAttachment",
+        "VolumeAttributesClass",
+        "VolumeSnapshot",
+        "VolumeSnapshotClass",
+        "VolumeSnapshotContent",
+    ];
+
+    /// Discovery-advertised Kinds that are NOT served over protobuf and so need
+    /// no schema: metrics.k8s.io is an aggregated API and the snapshot +
+    /// apiextensions groups are CRD-backed — all speak JSON only.
+    const PROTO_EXEMPT_KINDS: &[&str] = &[
+        "NodeMetrics",
+        "PodMetrics",
+        "MetricValueList",
+        "VolumeSnapshot",
+        "VolumeSnapshotClass",
+        "VolumeSnapshotContent",
+        "CustomResourceDefinition",
+    ];
+
+    #[test]
+    fn test_every_served_builtin_kind_has_protobuf_schema() {
+        let reg = ProtoRegistry::new();
+        let mut missing: Vec<&str> = Vec::new();
+        for k in SERVED_BUILTIN_KINDS {
+            if PROTO_EXEMPT_KINDS.contains(k) {
+                continue;
+            }
+            // Accept a bare key (`Pod`) or a group-qualified one
+            // (`resource.k8s.io/v1.ResourceSlice`).
+            let registered = reg.schemas.contains_key(*k)
+                || reg
+                    .schemas
+                    .keys()
+                    .any(|key| key.rsplit('.').next() == Some(*k));
+            if !registered {
+                missing.push(k);
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "{} served built-in Kind(s) have no protobuf schema — their bodies will \
+             drop fields over vnd.kubernetes.protobuf:\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_subject_access_review_protobuf_roundtrip() {
+        // The [sig-auth] SubjectReview conformance test POSTs a SubjectAccessReview
+        // over vnd.kubernetes.protobuf with spec.resourceAttributes set. An absent
+        // schema dropped resourceAttributes -> the handler saw None and returned
+        // 500 "Either resourceAttributes or nonResourceAttributes must be specified".
+        let registry = ProtoRegistry::new();
+        let sar = json!({
+            "metadata": {},
+            "spec": {
+                "user": "system:serviceaccount:subjectreview-1416:e2e",
+                "groups": ["system:authenticated", "system:serviceaccounts"],
+                "resourceAttributes": {
+                    "namespace": "subjectreview-1416",
+                    "verb": "create",
+                    "group": "",
+                    "resource": "pods"
+                }
+            }
+        });
+        let bytes = registry
+            .encode_message("SubjectAccessReview", &sar)
+            .expect("SubjectAccessReview must encode to protobuf");
+        let decoded = registry
+            .decode_message("SubjectAccessReview", &bytes)
+            .expect("SubjectAccessReview must decode from protobuf");
+
+        assert_eq!(
+            decoded.pointer("/spec/resourceAttributes/resource"),
+            Some(&json!("pods")),
+            "resourceAttributes.resource must survive protobuf encode/decode"
+        );
+        assert_eq!(
+            decoded.pointer("/spec/resourceAttributes/verb"),
+            Some(&json!("create"))
+        );
+        assert_eq!(
+            decoded.pointer("/spec/resourceAttributes/namespace"),
+            Some(&json!("subjectreview-1416"))
+        );
+        assert_eq!(
+            decoded.pointer("/spec/user"),
+            Some(&json!("system:serviceaccount:subjectreview-1416:e2e"))
         );
     }
 
