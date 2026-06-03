@@ -177,6 +177,19 @@ while [ $i -lt ${#lines[@]} ]; do
         continue
     fi
 
+    # Skip LIVE subagent worktrees (the Agent tool's `isolation: worktree`).
+    # These are named `worktree-agent-<id>` on a `.../agent-<id>` path, and an
+    # agent does `git reset --hard <remote>/main` at startup — so before it
+    # commits, its branch tip *is* main, which `is_merged` (merge-base
+    # --is-ancestor) would read as "merged" and delete out from under the
+    # running agent. They are managed/cleaned by the agent harness, never by
+    # this merged-PR prune sweep.
+    if [[ "$wt_branch" == worktree-agent-* ]] || [[ "$wt_path" == *"/.claude/worktrees/agent-"* ]]; then
+        printf 'SKIP    %s  (live subagent worktree — not a PR-prune target)\n' "$wt_path"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
     # Skip worktrees outside .claude/worktrees/ unless --all-paths.
     if ! $ALL_PATHS && [[ "$wt_path" != *"/.claude/worktrees/"* ]]; then
         printf 'SKIP    %s  (outside .claude/worktrees/ — pass --all-paths to include)\n' "$wt_path"
