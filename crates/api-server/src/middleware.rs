@@ -1554,18 +1554,39 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // Fallback: scan for the first valid JSON object in the data
+    // Fallback: scan for the first valid JSON object in the data.
+    // Guard with `looks_like_k8s_resource_json` so we don't mistake an
+    // embedded JSON fragment from a string field value (e.g. a container
+    // command arg like `--post-data={"Source": "prestop"}`, issue #495) for
+    // the resource body — that fragment parses as valid JSON but isn't a
+    // resource and would fail strict validation with a bogus "unknown field".
     for i in 0..data.len() {
         if data[i] == b'{' {
             if let Some(candidate) = scan_balanced_braces(&data[i..]) {
-                // Only return if this is actually valid JSON, not binary garbage
-                if serde_json::from_slice::<serde_json::Value>(&candidate).is_ok() {
-                    return Some(candidate);
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&candidate) {
+                    if looks_like_k8s_resource_json(&val) {
+                        return Some(candidate);
+                    }
                 }
             }
         }
     }
     None
+}
+
+/// Heuristic: does this parsed JSON value look like a top-level Kubernetes
+/// resource (as opposed to an arbitrary JSON fragment that happened to be
+/// embedded in a protobuf string field)?
+///
+/// A real resource body carries either TypeMeta (`apiVersion` + `kind`) or a
+/// `metadata` object with a `name` alongside a `spec`. An embedded fragment
+/// like `{"Source": "prestop"}` from a command-line arg has neither.
+fn looks_like_k8s_resource_json(val: &serde_json::Value) -> bool {
+    let has_api_version = val.get("apiVersion").is_some();
+    let has_kind = val.get("kind").is_some();
+    let has_metadata_name = val.get("metadata").and_then(|m| m.get("name")).is_some();
+    let has_spec = val.get("spec").is_some();
+    (has_api_version && has_kind) || (has_metadata_name && has_spec)
 }
 
 /// Extract TypeMeta (apiVersion, kind) from a K8s protobuf envelope.
@@ -2197,17 +2218,11 @@ fn try_brace_scan_or_type_meta(body_bytes: &[u8]) -> Vec<u8> {
         if body_bytes[i] == b'{' {
             if let Some(candidate) = scan_balanced_braces(&body_bytes[i..]) {
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&candidate) {
-                    // Validate this looks like a K8s resource object, not a random fragment.
-                    // A valid resource must have either:
-                    // - "apiVersion" and "kind" fields, OR
-                    // - a "metadata" field with "name"
-                    let has_api_version = val.get("apiVersion").is_some();
-                    let has_kind = val.get("kind").is_some();
-                    let has_metadata_name =
-                        val.get("metadata").and_then(|m| m.get("name")).is_some();
-                    let has_spec = val.get("spec").is_some();
-
-                    if (has_api_version && has_kind) || (has_metadata_name && has_spec) {
+                    // Validate this looks like a K8s resource object, not a
+                    // random fragment — protobuf string field values can contain
+                    // accidental JSON (e.g. a command arg) that parses but isn't
+                    // the resource (issue #495).
+                    if looks_like_k8s_resource_json(&val) {
                         info!(
                             "Found valid K8s JSON via brace scan at offset {} ({} bytes)",
                             i,
@@ -2216,8 +2231,9 @@ fn try_brace_scan_or_type_meta(body_bytes: &[u8]) -> Vec<u8> {
                         return candidate;
                     }
                     debug!(
-                        "Skipping non-resource JSON at offset {} ({} bytes, has_api={}, has_kind={}, has_meta_name={}, has_spec={})",
-                        i, candidate.len(), has_api_version, has_kind, has_metadata_name, has_spec
+                        "Skipping non-resource JSON at offset {} ({} bytes)",
+                        i,
+                        candidate.len()
                     );
                 }
             }
@@ -2308,6 +2324,43 @@ pub async fn capture_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_json_skips_embedded_non_resource_json() {
+        // Regression for issue #495: a Pod's container command can contain a
+        // string arg with embedded JSON, e.g.
+        //   "wget --post-data={\"Source\": \"prestop\"}"
+        // The k8s-protobuf raw field is native protobuf (not JSON), so the
+        // brace-scan fallback used to rip the embedded {"Source": "prestop"}
+        // out of the command string and hand it back as the resource body,
+        // which then failed strict validation with `unknown field "Source"`.
+        // The fallback must reject JSON that isn't shaped like a K8s resource.
+        let mut env = Vec::new();
+        env.extend_from_slice(b"k8s\0");
+        // field 1 (TypeMeta): empty submessage (tag 0x0a, len 0)
+        env.push(0x0a);
+        env.push(0x00);
+        // field 2 (raw): native protobuf carrying a string field whose value
+        // contains the embedded JSON fragment.
+        let raw = {
+            let mut r = Vec::new();
+            let s = b"--post-data={\"Source\": \"prestop\"}";
+            r.push(0x0a); // string field, tag 0x0a
+            r.push(s.len() as u8);
+            r.extend_from_slice(s);
+            r
+        };
+        env.push(0x12); // field 2, wire type 2
+        env.push(raw.len() as u8);
+        env.extend_from_slice(&raw);
+
+        let out = extract_json_from_k8s_protobuf(&env);
+        assert!(
+            out.is_none(),
+            "embedded non-resource JSON must not be extracted as the body, got: {:?}",
+            out.map(|b| String::from_utf8_lossy(&b).into_owned())
+        );
+    }
 
     #[test]
     fn test_scan_balanced_braces_valid_json() {
