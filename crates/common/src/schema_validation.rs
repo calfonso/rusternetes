@@ -120,8 +120,21 @@ impl SchemaValidator {
     /// Used for normal (non-strict) validation where unknown fields are pruned
     /// rather than rejected. Still validates types, required fields, enums, etc.
     pub fn validate_no_unknown_check(schema: &JSONSchemaProps, value: &Value) -> Result<(), Error> {
+        Self::validate_no_unknown_check_with_root(schema, value, "")
+    }
+
+    /// Like [`Self::validate_no_unknown_check`] but starts error paths at
+    /// `root` (e.g. `"spec"`), so a missing nested required field reports the
+    /// upstream-format path `spec.bars[0].name: Required value` rather than
+    /// `bars[0].name: ...`. Callers validating a sub-document (spec/status/etc.)
+    /// must pass the field's name so the path is rooted at the whole CR.
+    pub fn validate_no_unknown_check_with_root(
+        schema: &JSONSchemaProps,
+        value: &Value,
+        root: &str,
+    ) -> Result<(), Error> {
         let mut dummy = Vec::new();
-        Self::validate_with_path_skip_unknown(schema, value, "", &mut dummy)
+        Self::validate_with_path_skip_unknown(schema, value, root, &mut dummy)
     }
 
     /// Walk a JSON value against a schema and collect every validation issue
@@ -360,20 +373,19 @@ impl SchemaValidator {
         base_path: &str,
     ) -> Result<(), Error> {
         let mut unknown_fields = Vec::new();
-        Self::validate_with_path(schema, value, "", &mut unknown_fields)?;
+        // Root all paths at `base_path` (e.g. "spec") so non-unknown errors —
+        // required, type, enum — that `validate_with_path` returns via `?` carry
+        // the upstream-format path (`spec.bars[0].name: Required value`), not a
+        // spec-relative one. Unknown-field paths are already rooted here too, so
+        // they no longer need the base_path re-prepended below.
+        Self::validate_with_path(schema, value, base_path, &mut unknown_fields)?;
         if !unknown_fields.is_empty() {
             unknown_fields.sort();
             let msg = unknown_fields
                 .iter()
                 .map(|p| {
-                    // Convert ".foo" to "spec.foo" by prepending base_path
                     let field = p.trim_start_matches('.');
-                    let full_path = if base_path.is_empty() {
-                        field.to_string()
-                    } else {
-                        format!("{}.{}", base_path, field)
-                    };
-                    format!("strict decoding error: unknown field \"{}\"", full_path)
+                    format!("strict decoding error: unknown field \"{}\"", field)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -977,6 +989,55 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_nested_required_in_array_items_reports_rooted_path() {
+        // CustomResourcePublishOpenAPI #239: a CR with spec.bars[0] missing the
+        // required `name` must be rejected with the upstream-format path
+        // `spec.bars[0].name: Required value` (the conformance test matches that
+        // exact substring). Previously the path was rooted at the spec subtree
+        // (`bars[0].name`), so the test saw an error but not the expected one.
+        let item_schema: JSONSchemaProps = serde_json::from_value(json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": {"type": "string"}, "age": {"type": "string"} }
+        }))
+        .unwrap();
+        let spec_schema: JSONSchemaProps = serde_json::from_value(json!({
+            "type": "object",
+            "properties": { "bars": { "type": "array", "items": item_schema } }
+        }))
+        .unwrap();
+
+        let spec = json!({ "bars": [ { "age": "10" } ] });
+        let err = SchemaValidator::validate_no_unknown_check_with_root(&spec_schema, &spec, "spec")
+            .expect_err("missing required name must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("spec.bars[0].name: Required value"),
+            "error must carry the rooted path, got: {msg}"
+        );
+
+        // Sanity: a valid CR passes.
+        let ok = json!({ "bars": [ { "name": "bar0", "age": "10" } ] });
+        assert!(
+            SchemaValidator::validate_no_unknown_check_with_root(&spec_schema, &ok, "spec").is_ok()
+        );
+
+        // The kubectl-create path goes through validate_strict (fieldValidation
+        // =Strict). It must produce the same rooted path.
+        let strict_err = SchemaValidator::validate_strict(&spec_schema, &spec, "spec")
+            .expect_err("validate_strict must reject missing required name");
+        let smsg = strict_err.to_string();
+        assert!(
+            smsg.contains("spec.bars[0].name: Required value"),
+            "validate_strict must root the path at spec, got: {smsg}"
+        );
+        assert!(
+            SchemaValidator::validate_strict(&spec_schema, &ok, "spec").is_ok(),
+            "valid CR must pass validate_strict"
+        );
+    }
 
     #[test]
     fn test_validate_type_object() {
