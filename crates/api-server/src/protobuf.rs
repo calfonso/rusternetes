@@ -1129,13 +1129,34 @@ impl ProtoRegistry {
         schemas.insert(
             "ServiceStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "loadBalancer".into(),
+                            FieldType::Message("LoadBalancerStatus".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
             "SessionAffinityConfig".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "clientIP".into(),
+                        FieldType::Message("ClientIPConfig".into()),
+                    ),
+                )]),
             },
         );
 
@@ -1203,7 +1224,36 @@ impl ProtoRegistry {
         schemas.insert(
             "JobStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "JobCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("startTime".into(), FieldType::Message("Time".into()))),
+                    (
+                        3,
+                        ("completionTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (4, ("active".into(), FieldType::Int)),
+                    (5, ("succeeded".into(), FieldType::Int)),
+                    (6, ("failed".into(), FieldType::Int)),
+                    (7, ("completedIndexes".into(), FieldType::String)),
+                    (
+                        8,
+                        (
+                            "uncountedTerminatedPods".into(),
+                            FieldType::Message("UncountedTerminatedPods".into()),
+                        ),
+                    ),
+                    (9, ("ready".into(), FieldType::Int)),
+                    (10, ("terminating".into(), FieldType::Int)),
+                    (11, ("failedIndexes".into(), FieldType::String)),
+                ]),
             },
         );
         schemas.insert(
@@ -1574,7 +1624,35 @@ impl ProtoRegistry {
         schemas.insert(
             "PersistentVolumeClaimStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("phase".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "accessModes".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (3, ("capacity".into(), FieldType::QuantityMap)),
+                    (
+                        4,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "PersistentVolumeClaimCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (5, ("allocatedResources".into(), FieldType::QuantityMap)),
+                    (
+                        7,
+                        ("allocatedResourceStatuses".into(), FieldType::StringMap),
+                    ),
+                    (
+                        8,
+                        ("currentVolumeAttributesClassName".into(), FieldType::String),
+                    ),
+                ]),
             },
         );
         schemas.insert(
@@ -1655,7 +1733,22 @@ impl ProtoRegistry {
         schemas.insert(
             "ReplicationControllerStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("replicas".into(), FieldType::Int)),
+                    (2, ("fullyLabeledReplicas".into(), FieldType::Int)),
+                    (3, ("observedGeneration".into(), FieldType::Int)),
+                    (4, ("readyReplicas".into(), FieldType::Int)),
+                    (5, ("availableReplicas".into(), FieldType::Int)),
+                    (
+                        6,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ReplicationControllerCondition".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
             },
         );
 
@@ -1680,10 +1773,43 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // EndpointSubset { addresses=1, notReadyAddresses=2, ports=3 } —
+        // core/v1/generated.proto. Was empty, so over vnd.kubernetes.protobuf
+        // every Endpoints.subsets[] decoded to {} and addresses + ports were
+        // dropped — the EndpointSliceMirroring conformance test then saw a
+        // mirrored slice with 0 ports.
         schemas.insert(
             "EndpointSubset".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "addresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EndpointAddress".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "notReadyAddresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EndpointAddress".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EndpointPort".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
             },
         );
 
@@ -1707,26 +1833,119 @@ impl ProtoRegistry {
         schemas.insert(
             "NodeSpec".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("podCIDR".into(), FieldType::String)),
+                    (2, ("externalID".into(), FieldType::String)),
+                    (3, ("providerID".into(), FieldType::String)),
+                    (4, ("unschedulable".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "taints".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Taint".into()))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "configSource".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "podCIDRs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
             "NodeStatus".into(),
             MessageSchema {
-                // NOTE: this schema is otherwise empty — the full NodeStatus
-                // field set (capacity/allocatable maps, conditions, addresses,
-                // nodeInfo, images, ...) is still unmapped, so those are dropped
-                // for protobuf clients (tracked separately). daemonEndpoints
-                // (field 6, matching upstream core/v1 NodeStatus) is mapped here
-                // because the e2e metrics grabber reads
-                // kubeletEndpoint.Port over protobuf and otherwise sees 0.
-                fields: HashMap::from([(
-                    6,
+                // Full core/v1 NodeStatus field set (generated.proto).
+                fields: HashMap::from([
+                    (1, ("capacity".into(), FieldType::QuantityMap)),
+                    (2, ("allocatable".into(), FieldType::QuantityMap)),
+                    (3, ("phase".into(), FieldType::String)),
                     (
-                        "daemonEndpoints".into(),
-                        FieldType::Message("NodeDaemonEndpoints".into()),
+                        4,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeCondition".into(),
+                            ))),
+                        ),
                     ),
-                )]),
+                    (
+                        5,
+                        (
+                            "addresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("NodeAddress".into()))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "daemonEndpoints".into(),
+                            FieldType::Message("NodeDaemonEndpoints".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "nodeInfo".into(),
+                            FieldType::Message("NodeSystemInfo".into()),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "images".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerImage".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "volumesInUse".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        10,
+                        (
+                            "volumesAttached".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "AttachedVolume".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        11,
+                        (
+                            "config".into(),
+                            FieldType::Message("NodeConfigStatus".into()),
+                        ),
+                    ),
+                    (
+                        12,
+                        (
+                            "runtimeHandlers".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeRuntimeHandler".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        13,
+                        ("features".into(), FieldType::Message("NodeFeatures".into())),
+                    ),
+                ]),
             },
         );
 
@@ -2094,7 +2313,22 @@ impl ProtoRegistry {
         schemas.insert(
             "WebhookConversion".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        2,
+                        (
+                            "clientConfig".into(),
+                            FieldType::Message("WebhookClientConfig".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "conversionReviewVersions".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
             },
         );
         schemas.insert(
@@ -13167,6 +13401,223 @@ mod tests {
             val.pointer("/rule").is_none(),
             "rule must be inlined, not nested: {val}"
         );
+    }
+
+    #[test]
+    fn test_endpoints_subset_ports_protobuf_roundtrip() {
+        // EndpointSubset had an empty schema, so a custom Endpoints POSTed over
+        // vnd.kubernetes.protobuf decoded with empty subsets -> the
+        // EndpointSliceMirroring controller mirrored a slice with 0 ports.
+        let registry = ProtoRegistry::new();
+        let endpoints = json!({
+            "metadata": { "name": "example-custom-endpoints" },
+            "subsets": [{
+                "addresses": [{ "ip": "10.0.0.1" }],
+                "ports": [{ "name": "example", "port": 80, "protocol": "TCP" }]
+            }]
+        });
+        let bytes = registry
+            .encode_message("Endpoints", &endpoints)
+            .expect("Endpoints must encode to protobuf");
+        let decoded = registry
+            .decode_message("Endpoints", &bytes)
+            .expect("Endpoints must decode from protobuf");
+
+        assert_eq!(
+            decoded.pointer("/subsets/0/ports/0/port"),
+            Some(&json!(80)),
+            "EndpointSubset.ports[].port must survive protobuf encode/decode"
+        );
+        assert_eq!(
+            decoded.pointer("/subsets/0/ports/0/name"),
+            Some(&json!("example"))
+        );
+        assert_eq!(
+            decoded.pointer("/subsets/0/addresses/0/ip"),
+            Some(&json!("10.0.0.1")),
+            "EndpointSubset.addresses[].ip must survive protobuf encode/decode"
+        );
+    }
+
+    /// Schemas registered with no fields. Only two messages are legitimately
+    /// empty in the upstream proto: `Patch` is an opaque body and
+    /// `CustomResourceSubresourceStatus` is an empty message. Every other type
+    /// MUST carry its fields, or they silently drop over vnd.kubernetes.protobuf
+    /// (the EndpointSubset / NodeStatus bug class). NEVER add a new entry here to
+    /// silence the guard below — populate the schema instead.
+    const ALLOWED_EMPTY_SCHEMAS: &[&str] = &[
+        "Patch",                           // opaque patch body
+        "CustomResourceSubresourceStatus", // empty message in the proto
+    ];
+
+    #[test]
+    fn test_no_unexpected_empty_protobuf_schemas() {
+        let reg = ProtoRegistry::new();
+        let mut unexpected: Vec<&str> = reg
+            .schemas
+            .iter()
+            .filter(|(_, s)| s.fields.is_empty())
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !ALLOWED_EMPTY_SCHEMAS.contains(k))
+            .collect();
+        unexpected.sort();
+        assert!(
+            unexpected.is_empty(),
+            "{} unexpected empty protobuf schema(s) — their fields will silently \
+             drop over vnd.kubernetes.protobuf. Populate the schema; do NOT add it \
+             to ALLOWED_EMPTY_SCHEMAS:\n{}",
+            unexpected.len(),
+            unexpected.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_service_status_survives_protobuf_decode() {
+        // [sig-network] "Services should complete a service status lifecycle"
+        // does UpdateStatus (a PUT of the full Service over protobuf) adding a
+        // status condition, then watches for the Service to carry it. With an
+        // empty ServiceStatus schema the PUT decode dropped status, so the
+        // watched object never matched and the test timed out locating it.
+        let registry = ProtoRegistry::new();
+        let svc = json!({
+            "metadata": { "name": "test-service" },
+            "spec": { "type": "ClusterIP" },
+            "status": {
+                "loadBalancer": { "ingress": [{ "ip": "1.2.3.4" }] },
+                "conditions": [{
+                    "type": "StatusUpdate",
+                    "status": "True",
+                    "reason": "E2E",
+                    "message": "Set from e2e test"
+                }]
+            }
+        });
+        let bytes = registry
+            .encode_message("Service", &svc)
+            .expect("Service must encode to protobuf");
+        let decoded = registry
+            .decode_message("Service", &bytes)
+            .expect("Service must decode from protobuf");
+        assert_eq!(
+            decoded.pointer("/status/conditions/0/type"),
+            Some(&json!("StatusUpdate")),
+            "Service.status.conditions must survive protobuf decode (UpdateStatus PUT)"
+        );
+        assert_eq!(
+            decoded.pointer("/status/loadBalancer/ingress/0/ip"),
+            Some(&json!("1.2.3.4"))
+        );
+    }
+
+    #[test]
+    fn test_job_status_conditions_survive_protobuf_decode() {
+        // [sig-apps] "Job should apply changes to a job status" does
+        // UpdateStatus (a PUT of the full Job over vnd.kubernetes.protobuf).
+        // With an empty JobStatus schema the request decode dropped
+        // status.conditions, so the PUT persisted an empty status and the
+        // CustomConditionType vanished. The Job -> JobStatus -> JobCondition
+        // chain must now carry conditions through a protobuf decode.
+        let registry = ProtoRegistry::new();
+        let job = json!({
+            "metadata": { "name": "job-status-test" },
+            "status": {
+                "active": 1,
+                "conditions": [{
+                    "type": "CustomConditionType",
+                    "status": "True",
+                    "reason": "E2E",
+                    "message": "Set from e2e test"
+                }]
+            }
+        });
+        let bytes = registry
+            .encode_message("Job", &job)
+            .expect("Job must encode to protobuf");
+        let decoded = registry
+            .decode_message("Job", &bytes)
+            .expect("Job must decode from protobuf");
+        assert_eq!(
+            decoded.pointer("/status/conditions/0/type"),
+            Some(&json!("CustomConditionType")),
+            "Job.status.conditions must survive protobuf decode (UpdateStatus PUT)"
+        );
+        assert_eq!(decoded.pointer("/status/active"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn test_newly_populated_status_schemas_roundtrip() {
+        // Previously-empty schemas, now populated. Each must carry its fields
+        // through a protobuf round-trip (was: silently dropped).
+        let reg = ProtoRegistry::new();
+        let cases: &[(&str, Value, &str, Value)] = &[
+            (
+                "JobStatus",
+                json!({"active":2,"succeeded":3,"failed":1,"ready":1}),
+                "/succeeded",
+                json!(3),
+            ),
+            (
+                "ServiceStatus",
+                json!({"loadBalancer":{"ingress":[{"ip":"1.2.3.4"}]}}),
+                "/loadBalancer/ingress/0/ip",
+                json!("1.2.3.4"),
+            ),
+            (
+                "NodeSpec",
+                json!({"podCIDR":"10.0.0.0/24","unschedulable":true,"podCIDRs":["10.0.0.0/24"]}),
+                "/podCIDR",
+                json!("10.0.0.0/24"),
+            ),
+            (
+                "PersistentVolumeClaimStatus",
+                json!({"phase":"Bound","accessModes":["ReadWriteOnce"],"capacity":{"storage":"1Gi"}}),
+                "/capacity/storage",
+                json!("1Gi"),
+            ),
+            (
+                "ReplicationControllerStatus",
+                json!({"replicas":3,"readyReplicas":2,"availableReplicas":2}),
+                "/replicas",
+                json!(3),
+            ),
+            (
+                "SessionAffinityConfig",
+                json!({"clientIP":{"timeoutSeconds":30}}),
+                "/clientIP/timeoutSeconds",
+                json!(30),
+            ),
+            (
+                "WebhookConversion",
+                json!({"conversionReviewVersions":["v1"]}),
+                "/conversionReviewVersions/0",
+                json!("v1"),
+            ),
+            (
+                "NodeStatus",
+                json!({"capacity":{"cpu":"4"},"conditions":[{"type":"Ready","status":"True"}]}),
+                "/capacity/cpu",
+                json!("4"),
+            ),
+            (
+                "NodeStatus",
+                json!({"addresses":[{"type":"InternalIP","address":"1.2.3.4"}],"nodeInfo":{"machineID":"m1"}}),
+                "/addresses/0/address",
+                json!("1.2.3.4"),
+            ),
+        ];
+        for (ty, input, ptr, expected) in cases {
+            let bytes = reg
+                .encode_message(ty, input)
+                .unwrap_or_else(|| panic!("{ty} must encode to protobuf"));
+            let decoded = reg
+                .decode_message(ty, &bytes)
+                .unwrap_or_else(|| panic!("{ty} must decode from protobuf"));
+            assert_eq!(
+                decoded.pointer(ptr),
+                Some(expected),
+                "{ty}{ptr} must survive the protobuf round-trip"
+            );
+        }
     }
 
     #[test]
