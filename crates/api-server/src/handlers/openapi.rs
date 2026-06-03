@@ -296,6 +296,26 @@ pub async fn get_openapi_spec_path(
                 }
             }
         }
+
+        // The injected CRD schemas reference ObjectMeta via the v2-style
+        // `#/definitions/...` ref (build_crd_schema_definition is shared with the
+        // v2 endpoint). In the v3 document refs must resolve under
+        // `#/components/schemas/...`, and the referenced meta types must exist
+        // there — otherwise `kubectl explain <crd>.metadata` shows the field as
+        // <ObjectMeta> with no FIELDS (the ref dangles). Add the meta v1 schemas
+        // (with their full property set) and rewrite the injected refs.
+        if let Some(schemas) = spec_json
+            .pointer_mut("/components/schemas")
+            .and_then(|v| v.as_object_mut())
+        {
+            schemas
+                .entry("io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta".to_string())
+                .or_insert_with(meta_v1_object_meta_schema);
+            schemas
+                .entry("io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference".to_string())
+                .or_insert_with(meta_v1_owner_reference_schema);
+        }
+        rewrite_definition_refs_to_components(&mut spec_json);
     }
 
     let json_bytes = serde_json::to_vec(&spec_json).unwrap_or_default();
@@ -776,6 +796,96 @@ fn core_v1_builtin_definitions() -> Vec<(String, serde_json::Value)> {
             (key, def)
         })
         .collect()
+}
+
+/// The meta/v1 ObjectMeta schema, with its full property set, for the
+/// OpenAPI v3 `components/schemas` map. `kubectl explain <crd>.metadata`
+/// resolves the CRD's `metadata` `$ref` to this and lists its FIELDS
+/// (creationTimestamp, name, labels, …). Mirrors the v2 definition emitted by
+/// `build_swagger_spec_for_crds`, but ref'd under `#/components/schemas/`.
+fn meta_v1_object_meta_schema() -> serde_json::Value {
+    serde_json::json!({
+        "description": "ObjectMeta is metadata that all persisted resources must have, which includes all objects users must create.",
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Name must be unique within a namespace." },
+            "generateName": { "type": "string", "description": "GenerateName is an optional prefix used by the server to generate a unique name." },
+            "namespace": { "type": "string", "description": "Namespace defines the space within which each name must be unique." },
+            "selfLink": { "type": "string", "description": "Deprecated: selfLink is a legacy read-only field that is no longer populated by the system." },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Map of string keys and values that can be used to organize and categorize objects." },
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Annotations is an unstructured key value map stored with a resource." },
+            "uid": { "type": "string", "description": "UID is the unique in time and space value for this object." },
+            "resourceVersion": { "type": "string", "description": "An opaque value that represents the internal version of this object." },
+            "generation": { "type": "integer", "format": "int64", "description": "A sequence number representing a specific generation of the desired state." },
+            "creationTimestamp": { "type": "string", "format": "date-time", "description": "CreationTimestamp is a timestamp representing the server time when this object was created." },
+            "deletionTimestamp": { "type": "string", "format": "date-time", "description": "DeletionTimestamp is RFC 3339 date and time at which this resource will be deleted." },
+            "deletionGracePeriodSeconds": { "type": "integer", "format": "int64", "description": "Number of seconds allowed for this object to gracefully terminate." },
+            "ownerReferences": { "type": "array", "items": { "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference" }, "description": "List of objects depended by this object." },
+            "finalizers": { "type": "array", "items": { "type": "string" }, "description": "Must be empty before the object is deleted from the registry." }
+        }
+    })
+}
+
+/// The meta/v1 OwnerReference schema for `components/schemas` (referenced by
+/// [`meta_v1_object_meta_schema`]).
+fn meta_v1_owner_reference_schema() -> serde_json::Value {
+    serde_json::json!({
+        "description": "OwnerReference contains enough information to let you identify an owning object.",
+        "type": "object",
+        "required": ["apiVersion", "kind", "name", "uid"],
+        "properties": {
+            "apiVersion": { "type": "string", "description": "API version of the referent." },
+            "kind": { "type": "string", "description": "Kind of the referent." },
+            "name": { "type": "string", "description": "Name of the referent." },
+            "uid": { "type": "string", "description": "UID of the referent." },
+            "controller": { "type": "boolean", "description": "If true, this reference points to the managing controller." },
+            "blockOwnerDeletion": { "type": "boolean", "description": "If true, AND if the owner has the \"foregroundDeletion\" finalizer, then the owner cannot be deleted from the key-value store until this reference is removed." }
+        }
+    })
+}
+
+/// Rewrite every `$ref` of the form `#/definitions/<X>` to
+/// `#/components/schemas/<X>` in-place. The CRD schema builder is shared with
+/// the v2 (swagger) endpoint and emits v2-style `#/definitions/` refs; the v3
+/// document resolves refs under `#/components/schemas/`. The base v3 spec never
+/// uses `#/definitions/`, so this only touches the injected CRD schemas.
+fn rewrite_definition_refs_to_components(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Recurse into children first (skip the `$ref` string itself).
+            for (k, v) in map.iter_mut() {
+                if k != "$ref" {
+                    rewrite_definition_refs_to_components(v);
+                }
+            }
+            // Rewrite the v2 `#/definitions/` prefix to v3 `#/components/schemas/`.
+            if let Some(serde_json::Value::String(s)) = map.get_mut("$ref") {
+                if let Some(rest) = s.strip_prefix("#/definitions/") {
+                    *s = format!("#/components/schemas/{}", rest);
+                }
+            }
+            // OpenAPI v3: a Schema Object with `$ref` set ignores all sibling
+            // keywords (description, etc.) — unlike v2. CRD properties like
+            // `metadata` carry both a `$ref` and a `description` ("Standard
+            // object's metadata. ..."); without this, `kubectl explain
+            // <crd>.metadata` resolves the ref and prints the ObjectMeta TYPE
+            // description instead of the field one (conformance:
+            // CustomResourcePublishOpenAPI "with validation schema"). Move the
+            // `$ref` under `allOf` so the siblings are honored while the ref
+            // still expands the fields.
+            if map.contains_key("$ref") && map.len() > 1 {
+                if let Some(r) = map.remove("$ref") {
+                    map.insert("allOf".to_string(), serde_json::json!([{ "$ref": r }]));
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                rewrite_definition_refs_to_components(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build the per-version CRD schema definition that's inserted into the spec's
