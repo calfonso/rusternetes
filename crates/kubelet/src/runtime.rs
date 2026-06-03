@@ -5813,7 +5813,15 @@ impl ContainerRuntime {
         // Write Kubernetes-managed /etc/hosts into the container after start.
         // Docker may override bind-mounted /etc/hosts during container creation,
         // so we write it via `docker exec` after start to guarantee our content.
-        if let Some(hosts_path) = hosts_file_path {
+        //
+        // Skip entirely when the container mounts its own /etc/hosts (same guard
+        // as the bind-mount path above). If we exec'd `cat > /etc/hosts` into a
+        // container whose /etc/hosts is a hostPath mount of the node's real
+        // /etc/hosts (conformance KubeletManagedEtcHosts busybox-3 uses exactly
+        // this), the write would go *through* the bind mount and corrupt the
+        // node's /etc/hosts — making the file look kubelet-managed to every
+        // subsequent pod and failing the "should be kubelet managed" check.
+        if let Some(hosts_path) = hosts_file_path.filter(|_| !has_hosts_mount) {
             if let Ok(hosts_content) = std::fs::read_to_string(hosts_path) {
                 // Use printf to write the exact content (handles newlines correctly)
                 let exec_config = CreateExecOptions {
