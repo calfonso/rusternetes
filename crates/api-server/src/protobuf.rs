@@ -1680,10 +1680,43 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // EndpointSubset { addresses=1, notReadyAddresses=2, ports=3 } —
+        // core/v1/generated.proto. Was empty, so over vnd.kubernetes.protobuf
+        // every Endpoints.subsets[] decoded to {} and addresses + ports were
+        // dropped — the EndpointSliceMirroring conformance test then saw a
+        // mirrored slice with 0 ports.
         schemas.insert(
             "EndpointSubset".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "addresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EndpointAddress".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "notReadyAddresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EndpointAddress".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "ports".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "EndpointPort".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
             },
         );
 
@@ -13166,6 +13199,82 @@ mod tests {
         assert!(
             val.pointer("/rule").is_none(),
             "rule must be inlined, not nested: {val}"
+        );
+    }
+
+    #[test]
+    fn test_endpoints_subset_ports_protobuf_roundtrip() {
+        // EndpointSubset had an empty schema, so a custom Endpoints POSTed over
+        // vnd.kubernetes.protobuf decoded with empty subsets -> the
+        // EndpointSliceMirroring controller mirrored a slice with 0 ports.
+        let registry = ProtoRegistry::new();
+        let endpoints = json!({
+            "metadata": { "name": "example-custom-endpoints" },
+            "subsets": [{
+                "addresses": [{ "ip": "10.0.0.1" }],
+                "ports": [{ "name": "example", "port": 80, "protocol": "TCP" }]
+            }]
+        });
+        let bytes = registry
+            .encode_message("Endpoints", &endpoints)
+            .expect("Endpoints must encode to protobuf");
+        let decoded = registry
+            .decode_message("Endpoints", &bytes)
+            .expect("Endpoints must decode from protobuf");
+
+        assert_eq!(
+            decoded.pointer("/subsets/0/ports/0/port"),
+            Some(&json!(80)),
+            "EndpointSubset.ports[].port must survive protobuf encode/decode"
+        );
+        assert_eq!(
+            decoded.pointer("/subsets/0/ports/0/name"),
+            Some(&json!("example"))
+        );
+        assert_eq!(
+            decoded.pointer("/subsets/0/addresses/0/ip"),
+            Some(&json!("10.0.0.1")),
+            "EndpointSubset.addresses[].ip must survive protobuf encode/decode"
+        );
+    }
+
+    /// Schemas registered with no fields. `Patch` is opaque and
+    /// `CustomResourceSubresourceStatus` is an empty message upstream — those
+    /// two are legitimately empty. The rest are KNOWN-INCOMPLETE debt: their
+    /// fields silently drop over vnd.kubernetes.protobuf until populated
+    /// (EndpointSubset was one such bug — the EndpointSliceMirroring test).
+    /// Remove an entry when you give that schema fields. NEVER add a new entry
+    /// to silence the guard below — populate the schema instead.
+    const ALLOWED_EMPTY_SCHEMAS: &[&str] = &[
+        "Patch",                           // opaque patch body
+        "CustomResourceSubresourceStatus", // empty message in the proto
+        "JobStatus",                       // TODO(#321): Job status subresource
+        "ServiceStatus",                   // TODO(#423): Service status lifecycle
+        "NodeSpec",                        // TODO: populate node spec fields
+        "PersistentVolumeClaimStatus",     // TODO: populate PVC status fields
+        "ReplicationControllerStatus",     // TODO: populate RC status fields
+        "SessionAffinityConfig",           // TODO: clientIP.timeoutSeconds
+        "WebhookConversion",               // TODO: strategy + clientConfig
+    ];
+
+    #[test]
+    fn test_no_unexpected_empty_protobuf_schemas() {
+        let reg = ProtoRegistry::new();
+        let mut unexpected: Vec<&str> = reg
+            .schemas
+            .iter()
+            .filter(|(_, s)| s.fields.is_empty())
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !ALLOWED_EMPTY_SCHEMAS.contains(k))
+            .collect();
+        unexpected.sort();
+        assert!(
+            unexpected.is_empty(),
+            "{} unexpected empty protobuf schema(s) — their fields will silently \
+             drop over vnd.kubernetes.protobuf. Populate the schema; do NOT add it \
+             to ALLOWED_EMPTY_SCHEMAS:\n{}",
+            unexpected.len(),
+            unexpected.join("\n")
         );
     }
 
