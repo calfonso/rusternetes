@@ -1713,7 +1713,20 @@ impl ProtoRegistry {
         schemas.insert(
             "NodeStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                // NOTE: this schema is otherwise empty — the full NodeStatus
+                // field set (capacity/allocatable maps, conditions, addresses,
+                // nodeInfo, images, ...) is still unmapped, so those are dropped
+                // for protobuf clients (tracked separately). daemonEndpoints
+                // (field 6, matching upstream core/v1 NodeStatus) is mapped here
+                // because the e2e metrics grabber reads
+                // kubeletEndpoint.Port over protobuf and otherwise sees 0.
+                fields: HashMap::from([(
+                    6,
+                    (
+                        "daemonEndpoints".into(),
+                        FieldType::Message("NodeDaemonEndpoints".into()),
+                    ),
+                )]),
             },
         );
 
@@ -13336,6 +13349,31 @@ mod tests {
             cond.get("message"),
             Some(&Value::String("Updated by an e2e test".into())),
             "NamespaceCondition.message must survive protobuf encode/decode"
+        );
+    }
+
+    #[test]
+    fn test_node_daemon_endpoints_protobuf_roundtrip() {
+        // The e2e metrics grabber reads status.daemonEndpoints.kubeletEndpoint.Port
+        // over protobuf; an empty NodeStatus schema dropped it -> "Invalid Kubelet
+        // port 0". Field 6 (daemonEndpoints) must now survive the round-trip.
+        let registry = ProtoRegistry::new();
+        let node = json!({
+            "metadata": { "name": "node-test" },
+            "status": {
+                "daemonEndpoints": { "kubeletEndpoint": { "Port": 10250 } }
+            }
+        });
+        let bytes = registry
+            .encode_message("Node", &node)
+            .expect("Node must encode to protobuf");
+        let decoded = registry
+            .decode_message("Node", &bytes)
+            .expect("Node must decode from protobuf");
+        assert_eq!(
+            decoded.pointer("/status/daemonEndpoints/kubeletEndpoint/Port"),
+            Some(&json!(10250)),
+            "kubeletEndpoint.Port must survive protobuf encode/decode"
         );
     }
 }
