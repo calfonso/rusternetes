@@ -68,6 +68,8 @@
 # closes #440
 [sig-node] Container Lifecycle Hook when create a pod with lifecycle hook should execute prestop http hook properly [NodeConformance] [Conformance]
 # closes #551
+[sig-node] PreStop should call prestop when killing a pod [Conformance]
+# closes #495
 [sig-storage] ConfigMap binary data should be reflected in volume [NodeConformance] [Conformance]
 # closes #552
 [sig-storage] ConfigMap optional updates should be reflected in volume [NodeConformance] [Conformance]
