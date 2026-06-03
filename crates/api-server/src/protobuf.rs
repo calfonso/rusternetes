@@ -7932,7 +7932,19 @@ impl ProtoRegistry {
                     for (k, v) in map {
                         let mut entry = Vec::new();
                         push_string_field(&mut entry, 1, k.as_bytes());
-                        if let Some(inner) = self.encode_message(inner_type, v) {
+                        // Time/MicroTime map values arrive as RFC3339 strings,
+                        // exactly like scalar Time fields (e.g.
+                        // PodDisruptionBudgetStatus.disruptedPods). Encode them
+                        // via encode_timestamp; the generic encode_message would
+                        // see a non-Object value and emit an empty submessage.
+                        let inner = if (inner_type == "Time" || inner_type == "MicroTime")
+                            && v.is_string()
+                        {
+                            Some(encode_timestamp(v))
+                        } else {
+                            self.encode_message(inner_type, v)
+                        };
+                        if let Some(inner) = inner {
                             push_length_delimited_field(&mut entry, 2, &inner);
                         }
                         push_length_delimited_field(buf, tag, &entry);
@@ -8038,9 +8050,18 @@ impl ProtoRegistry {
                         key = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
                     }
                     2 => {
-                        val = self
-                            .decode_message(msg_type, &data[pos..pos + len])
-                            .unwrap_or(Value::Null);
+                        let slice = &data[pos..pos + len];
+                        // Time/MicroTime map values decode to RFC3339 strings,
+                        // mirroring decode_field_value's scalar handling. The
+                        // generic decode_message would emit `{seconds, nanos}`
+                        // (or `{}` for an empty submessage) instead.
+                        val = if msg_type == "Time" {
+                            decode_timestamp(slice)
+                        } else if msg_type == "MicroTime" {
+                            decode_micro_timestamp(slice)
+                        } else {
+                            self.decode_message(msg_type, slice).unwrap_or(Value::Null)
+                        };
                     }
                     _ => {}
                 }
@@ -13351,6 +13372,30 @@ mod tests {
         assert_eq!(read_varint(&[0x08], 0), Some((8, 1)));
         assert_eq!(read_varint(&[0x96, 0x01], 0), Some((150, 2)));
         assert_eq!(read_varint(&[0xac, 0x02], 0), Some((300, 2)));
+    }
+
+    #[test]
+    fn message_map_of_time_roundtrips_as_rfc3339_string() {
+        // `PodDisruptionBudgetStatus.disruptedPods` is map<string, Time>. The
+        // Time value serialises to an RFC3339 string in JSON, exactly like a
+        // scalar Time field. The MessageMap encode/decode paths used to bypass
+        // the Time special-case (encode_message/decode_message on the bare
+        // value), dropping the timestamp to `{}`. Found by the roundtrip fuzz
+        // harness (tests/protobuf_roundtrip_fuzz.rs).
+        let reg = ProtoRegistry::new();
+        let value = json!({
+            "disruptedPods": { "pod-a": "2020-01-02T03:04:05Z" }
+        });
+        let bytes = reg
+            .encode_message("PodDisruptionBudgetStatus", &value)
+            .expect("encode");
+        let decoded = reg
+            .decode_message("PodDisruptionBudgetStatus", &bytes)
+            .expect("decode");
+        assert_eq!(
+            decoded, value,
+            "map<string, Time> value must survive as an RFC3339 string"
+        );
     }
 
     #[test]
