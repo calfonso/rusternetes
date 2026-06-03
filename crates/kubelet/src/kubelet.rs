@@ -853,6 +853,33 @@ impl Kubelet {
         // Only write to storage if the heartbeat is stale (>10s old) or status changed.
         // This prevents rv churn that causes PATCH conflicts for external node updates.
         let mut needs_write = false;
+
+        // Re-ensure the kubelet endpoint port on EVERY heartbeat, not only at
+        // registration. `status.daemonEndpoints.kubeletEndpoint.Port` is read by
+        // the e2e metrics grabber and the api-server log/exec/metrics proxy; it
+        // was previously set only in register_node, so once a status
+        // round-trip dropped it nothing re-added it (unlike capacity /
+        // conditions / addresses, which are re-ensured above) — leaving it
+        // null and producing "Invalid Kubelet port 0". Upstream's setNodeStatus
+        // sets DaemonEndpoints on every sync; mirror that.
+        if let Some(ref mut status) = node.status {
+            let current_port = status
+                .daemon_endpoints
+                .as_ref()
+                .and_then(|d| d.kubelet_endpoint.as_ref())
+                .map(|e| e.port)
+                .unwrap_or(0);
+            if current_port != self.metrics_port as i32 {
+                status.daemon_endpoints =
+                    Some(rusternetes_common::resources::NodeDaemonEndpoints {
+                        kubelet_endpoint: Some(rusternetes_common::resources::DaemonEndpoint {
+                            port: self.metrics_port as i32,
+                        }),
+                    });
+                needs_write = true;
+            }
+        }
+
         if let Some(ref mut status) = node.status {
             if let Some(ref mut conditions) = status.conditions {
                 for condition in conditions.iter_mut() {
