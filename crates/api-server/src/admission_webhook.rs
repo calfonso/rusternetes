@@ -4004,6 +4004,109 @@ mod tests {
         assert!(matches!(resp, AdmissionResponse::Deny(ref r) if r == "no configmaps for you"));
     }
 
+    /// Reproduces the conformance "waiting for webhook configuration to be
+    /// ready" hang (the dominant time-sink in a macOS Hydrophone run).
+    ///
+    /// The e2e framework's `waitWebhookConfigurationReady` registers a webhook
+    /// scoped by `namespaceSelector`, then repeatedly creates a marker
+    /// ConfigMap in a namespace carrying the matching label until the webhook
+    /// denies it. The webhook must therefore fire for a marker object whose
+    /// namespace matches the selector — the manager has to read that
+    /// namespace's labels from storage to evaluate it. If it doesn't, the
+    /// marker is never denied and the readiness poll burns its full timeout.
+    #[tokio::test]
+    async fn test_validating_webhook_namespace_selector_fires_for_labeled_ns() {
+        let deny_resp = AdmissionReviewResponse {
+            uid: String::new(),
+            allowed: false,
+            status: Some(AdmissionStatus {
+                status: "Failure".into(),
+                message: Some("marker denied".into()),
+                reason: None,
+                code: Some(403),
+                metadata: None,
+            }),
+            patch: None,
+            patch_type: None,
+            audit_annotations: None,
+            warnings: None,
+        };
+        let (url, handle) = spawn_webhook_server(deny_resp).await;
+
+        let storage = Arc::new(MemoryStorage::new());
+
+        // Webhook for configmaps, scoped to namespaces labeled webhook-e2e=true.
+        let mut config = make_validating_config("deny-marker-cms", &url, configmaps_rule());
+        config.webhooks.as_mut().unwrap()[0].namespace_selector = Some(
+            rusternetes_common::resources::admission_webhook::LabelSelector {
+                match_labels: Some(std::collections::HashMap::from([(
+                    "webhook-e2e".to_string(),
+                    "true".to_string(),
+                )])),
+                match_expressions: None,
+            },
+        );
+        storage
+            .create(
+                "/registry/validatingwebhookconfigurations/deny-marker-cms",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        // The marker namespace must exist in storage with the matching label so
+        // the manager can evaluate the namespaceSelector against it.
+        let ns_key = rusternetes_storage::build_key("namespaces", None, "webhook-markers");
+        storage
+            .create(
+                &ns_key,
+                &json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": "webhook-markers", "labels": {"webhook-e2e": "true"}}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let manager = AdmissionWebhookManager::new(storage);
+        let gvk = GroupVersionKind {
+            group: "".into(),
+            version: "v1".into(),
+            kind: "ConfigMap".into(),
+        };
+        let gvr = GroupVersionResource {
+            group: "".into(),
+            version: "v1".into(),
+            resource: "configmaps".into(),
+        };
+        let user = UserInfo {
+            username: "alice".into(),
+            uid: "1".into(),
+            groups: vec![],
+        };
+        let resp = manager
+            .run_validating_webhooks(
+                &Operation::Create,
+                &gvk,
+                &gvr,
+                Some("webhook-markers"),
+                "marker",
+                Some(json!({"metadata": {"name": "marker", "namespace": "webhook-markers"}})),
+                None,
+                &user,
+            )
+            .await
+            .unwrap();
+        handle.abort();
+
+        assert!(
+            matches!(resp, AdmissionResponse::Deny(ref r) if r == "marker denied"),
+            "webhook with namespaceSelector should fire for a marker in a label-matching namespace, got {:?}",
+            resp
+        );
+    }
+
     #[tokio::test]
     async fn test_validating_webhook_denies_pod_attach_subresource() {
         let deny_resp = AdmissionReviewResponse {
