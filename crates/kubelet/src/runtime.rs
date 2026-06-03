@@ -11,7 +11,8 @@ use futures_util::StreamExt;
 use rusternetes_common::resources::EventType;
 use rusternetes_common::resources::{
     ConfigMap, Container, ContainerState, ContainerStatus, ExecAction, GRPCAction, HTTPGetAction,
-    LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, Probe, Secret, TCPSocketAction,
+    LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, PodCondition, Probe, Secret,
+    TCPSocketAction,
 };
 use rusternetes_storage::{build_key, EventRecorder, Storage};
 use std::collections::HashMap;
@@ -2440,6 +2441,33 @@ impl ContainerRuntime {
             return;
         };
         let init_statuses = self.get_init_container_statuses(&status_pod).await;
+
+        // Names of init containers that have NOT yet terminated with exit 0.
+        // While any remain incomplete the pod is, by definition, not Initialized.
+        let incomplete_inits: Vec<String> = status_pod
+            .spec
+            .as_ref()
+            .and_then(|sp| sp.init_containers.as_ref())
+            .map(|ics| {
+                ics.iter()
+                    .filter(|c| {
+                        let completed = init_statuses
+                            .as_ref()
+                            .and_then(|st| st.iter().find(|s| s.name == c.name))
+                            .map(|s| {
+                                matches!(
+                                    &s.state,
+                                    Some(ContainerState::Terminated { exit_code: 0, .. })
+                                )
+                            })
+                            .unwrap_or(false);
+                        !completed
+                    })
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if let Some(ref mut s) = status_pod.status {
             s.init_container_statuses = init_statuses;
             if let Some(r) = reason {
@@ -2448,8 +2476,72 @@ impl ContainerRuntime {
             if let Some(m) = message {
                 s.message = Some(m);
             }
+            // While any init container is still incomplete, keep the
+            // Initialized=False condition family on EVERY status write from this
+            // path. Watches sample these intermediate events — the conformance
+            // test "should not start app containers if init containers fail on a
+            // RestartAlways pod" reads pod.conditions[Initialized] at the moment
+            // an init container has failed twice. Previously this writer only
+            // touched init_container_statuses/reason/message, leaving a window
+            // where conditions held just PodScheduled, so
+            // GetPodCondition(Initialized) returned nil and the test failed.
+            // K8s ref: pkg/kubelet/status/generate.go GeneratePodInitializedCondition.
+            if !incomplete_inits.is_empty() {
+                s.conditions = Some(Self::init_progress_conditions(&incomplete_inits));
+            }
         }
         let _ = storage.update(&pod_key, &status_pod).await;
+    }
+
+    /// Pod conditions for a pod whose init containers are still incomplete:
+    /// `Initialized=False` (ContainersNotInitialized) plus the dependent
+    /// `ContainersReady=False` / `Ready=False`, alongside the already-true
+    /// `PodScheduled`. Mirrors the kubelet status generator so every init-phase
+    /// status write presents a consistent set of conditions.
+    fn init_progress_conditions(incomplete_init_names: &[String]) -> Vec<PodCondition> {
+        let now = Some(chrono::Utc::now());
+        let msg = format!(
+            "containers with incomplete status: [{}]",
+            incomplete_init_names.join(" ")
+        );
+        vec![
+            PodCondition {
+                condition_type: "Initialized".to_string(),
+                status: "False".to_string(),
+                reason: Some("ContainersNotInitialized".to_string()),
+                message: Some(msg.clone()),
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+            PodCondition {
+                condition_type: "PodScheduled".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+            PodCondition {
+                condition_type: "ContainersReady".to_string(),
+                status: "False".to_string(),
+                reason: Some("ContainersNotReady".to_string()),
+                message: Some(msg.clone()),
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+            PodCondition {
+                condition_type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: Some("ContainersNotReady".to_string()),
+                message: Some(msg),
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+        ]
     }
 
     /// Wait for a container to complete (used for init containers)
