@@ -840,16 +840,17 @@ impl<S: Storage + 'static> JobController<S> {
         if success_policy_met {
             info!("Job {}/{} met success policy criteria", namespace, name);
 
-            // Terminate remaining active pods and count how many we're terminating
-            let mut _terminating_count = 0i32;
+            // Delete remaining active pods. K8s's job controller issues a real
+            // pod delete on completion (DeletePod + finalizer removal), so the
+            // pods are gone — not left lingering with a deletionTimestamp. We
+            // delete them outright so status.terminating settles at 0 on the
+            // next sync (the conformance test asserts Terminating == 0); the
+            // kubelet GCs the container once the pod disappears from the API.
             for pod in job_pods.iter() {
                 let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
                 if matches!(phase, Some(Phase::Running) | Some(Phase::Pending)) {
                     let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                    let mut term_pod = pod.clone();
-                    term_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                    let _ = self.storage.update(&pod_key, &term_pod).await;
-                    _terminating_count += 1;
+                    let _ = self.storage.delete(&pod_key).await;
                 }
             }
 
@@ -2264,6 +2265,96 @@ mod tests {
             "SuccessCriteriaMet condition should be set"
         );
         assert!(status.completion_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_success_policy_succeeded_indexes_terminates_running_ready_pod() {
+        // Mirrors [sig-apps] "with successPolicy succeededIndexes rule": an
+        // indexed job (completions=5, parallelism=2) whose required index 0
+        // succeeds while another index is still Running and Ready. Once the
+        // success policy is met the job must complete with active/ready/
+        // terminating all 0 and completedIndexes "0" — the conformance test
+        // asserts job.Status.Ready == 0.
+        let storage = Arc::new(MemoryStorage::new());
+
+        let mut job = make_job("sp-idx-job", "default", 5, 2);
+        job.spec.completion_mode = Some("Indexed".to_string());
+        job.spec.success_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "rules": [{ "succeededIndexes": "0" }]
+            }))
+            .unwrap(),
+        );
+        let job_key = "/registry/jobs/default/sp-idx-job";
+        storage.create(job_key, &job).await.unwrap();
+
+        // Index 0 succeeded (the required index).
+        let pod0 = make_indexed_pod(
+            "pod-0",
+            "default",
+            Phase::Succeeded,
+            "sp-idx-job",
+            "job-uid-1",
+            0,
+        );
+        storage
+            .create("/registry/pods/default/pod-0", &pod0)
+            .await
+            .unwrap();
+
+        // Index 2 is still Running AND Ready — must not be counted once the
+        // success policy completes the job.
+        let mut pod2 = make_indexed_pod(
+            "pod-2",
+            "default",
+            Phase::Running,
+            "sp-idx-job",
+            "job-uid-1",
+            2,
+        );
+        if let Some(ref mut st) = pod2.status {
+            st.conditions = Some(vec![rusternetes_common::resources::PodCondition {
+                condition_type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_probe_time: None,
+                last_transition_time: None,
+                observed_generation: None,
+            }]);
+        }
+        storage
+            .create("/registry/pods/default/pod-2", &pod2)
+            .await
+            .unwrap();
+
+        let controller = JobController::new(storage.clone());
+
+        // Two reconciles: the second simulates a follow-up loop where the
+        // terminating pod is still present in storage (kubelet hasn't removed
+        // it yet) — status must stay settled at 0s.
+        for _ in 0..2 {
+            let mut job: Job = storage.get(job_key).await.unwrap();
+            controller.reconcile(&mut job).await.unwrap();
+        }
+
+        let status: JobStatus = storage.get::<Job>(job_key).await.unwrap().status.unwrap();
+        assert_eq!(
+            status.completed_indexes.as_deref(),
+            Some("0"),
+            "completedIndexes must be exactly the succeeded index"
+        );
+        assert_eq!(
+            status.active,
+            Some(0),
+            "active must be 0 after successPolicy"
+        );
+        assert_eq!(
+            status.ready,
+            Some(0),
+            "ready must be 0 after successPolicy — the still-Running pod is terminating"
+        );
+        assert_eq!(status.terminating, Some(0), "terminating must be 0");
     }
 
     #[tokio::test]

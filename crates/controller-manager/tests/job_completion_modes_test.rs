@@ -359,15 +359,24 @@ async fn test_indexed_job_success_policy_caps_status_succeeded_at_policy_match()
         "active must be 0 — other pod is being terminated"
     );
 
-    // Simulate what the live e2e observed: the other pod, which had not yet
-    // been terminated by kubelet, still racing to Succeeded. The Job is already
-    // Complete via the policy; succeeded MUST NOT increase past 1.
-    let pod1 = pods
+    // On policy match the controller deletes the still-active index-1 pod
+    // (matching upstream, which deletes active pods on completion so
+    // status.terminating settles at 0). Confirm it is gone, then simulate the
+    // live race where that pod had ALREADY reached Succeeded around deletion
+    // time: a late Succeeded pod for index 1 reappears. The Job is already
+    // Complete via the policy, so succeeded MUST NOT increase past 1 and index
+    // 1 (not in succeededIndexes) must not join completedIndexes.
+    let index1_present = storage
+        .list::<Pod>("/registry/pods/default/")
+        .await
+        .unwrap()
         .iter()
-        .find(|p| pod_index(p) == Some(1))
-        .cloned()
-        .expect("pod for index 1");
-    set_pod_status(&storage, "default", &pod1, succeeded_status()).await;
+        .any(|p| pod_index(p) == Some(1));
+    assert!(
+        !index1_present,
+        "active index-1 pod must be deleted once the success policy completes the job"
+    );
+    create_duplicate_indexed_pod(&storage, &after_policy, "default", 1, Phase::Succeeded).await;
 
     controller.reconcile_all().await.unwrap();
     let final_job: Job = storage.get(&key).await.unwrap();
