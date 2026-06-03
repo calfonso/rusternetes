@@ -13472,6 +13472,44 @@ mod tests {
     }
 
     #[test]
+    fn test_service_status_survives_protobuf_decode() {
+        // [sig-network] "Services should complete a service status lifecycle"
+        // does UpdateStatus (a PUT of the full Service over protobuf) adding a
+        // status condition, then watches for the Service to carry it. With an
+        // empty ServiceStatus schema the PUT decode dropped status, so the
+        // watched object never matched and the test timed out locating it.
+        let registry = ProtoRegistry::new();
+        let svc = json!({
+            "metadata": { "name": "test-service" },
+            "spec": { "type": "ClusterIP" },
+            "status": {
+                "loadBalancer": { "ingress": [{ "ip": "1.2.3.4" }] },
+                "conditions": [{
+                    "type": "StatusUpdate",
+                    "status": "True",
+                    "reason": "E2E",
+                    "message": "Set from e2e test"
+                }]
+            }
+        });
+        let bytes = registry
+            .encode_message("Service", &svc)
+            .expect("Service must encode to protobuf");
+        let decoded = registry
+            .decode_message("Service", &bytes)
+            .expect("Service must decode from protobuf");
+        assert_eq!(
+            decoded.pointer("/status/conditions/0/type"),
+            Some(&json!("StatusUpdate")),
+            "Service.status.conditions must survive protobuf decode (UpdateStatus PUT)"
+        );
+        assert_eq!(
+            decoded.pointer("/status/loadBalancer/ingress/0/ip"),
+            Some(&json!("1.2.3.4"))
+        );
+    }
+
+    #[test]
     fn test_job_status_conditions_survive_protobuf_decode() {
         // [sig-apps] "Job should apply changes to a job status" does
         // UpdateStatus (a PUT of the full Job over vnd.kubernetes.protobuf).
