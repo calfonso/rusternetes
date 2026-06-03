@@ -3005,7 +3005,13 @@ impl ProtoRegistry {
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
-                    (2, ("rule".into(), FieldType::Message("Rule".into()))),
+                    // Go embeds `Rule` as `json:",inline"`, so the decoded JSON
+                    // must merge apiGroups/apiVersions/resources/scope up into
+                    // RuleWithOperations — not nest them under "rule". The Rust
+                    // type uses `#[serde(flatten)]`, so a nested "rule" object is
+                    // silently dropped, leaving every webhook rule empty (matching
+                    // nothing → the webhook is never invoked). Use InlineMessage.
+                    (2, ("rule".into(), FieldType::InlineMessage("Rule".into()))),
                 ]),
             },
         );
@@ -3023,8 +3029,11 @@ impl ProtoRegistry {
                     (
                         2,
                         (
+                            // Go embeds RuleWithOperations as `json:",inline"`; the
+                            // Rust type flattens it too, so merge its fields up
+                            // rather than nesting under "ruleWithOperations".
                             "ruleWithOperations".into(),
-                            FieldType::Message("RuleWithOperations".into()),
+                            FieldType::InlineMessage("RuleWithOperations".into()),
                         ),
                     ),
                 ]),
@@ -9421,8 +9430,12 @@ impl ProtoRegistry {
                     (
                         1,
                         (
+                            // apiregistration's ServiceReference has a different
+                            // proto layout (port at field 3, no path) than the
+                            // admissionregistration/CRD one — use a distinct schema
+                            // key so they don't clobber each other in the registry.
                             "service".into(),
-                            FieldType::Message("ServiceReference".into()),
+                            FieldType::Message("APIServiceReference".into()),
                         ),
                     ),
                     (2, ("group".into(), FieldType::String)),
@@ -9466,12 +9479,16 @@ impl ProtoRegistry {
                 ]),
             },
         );
-        // ServiceReference (apiregistration/v1) — separate proto from
-        // admissionregistration/v1.ServiceReference (which has `path` at
-        // field 3 instead of `port`). No conflict today; if admissionregistration
-        // registers its own ServiceReference, prefix one with the group.
+        // ServiceReference (apiregistration/v1) — DISTINCT proto from
+        // admissionregistration/v1 + apiextensions/v1 `ServiceReference`, which
+        // have `path` at field 3 and `port` at field 4. apiregistration's has
+        // `port` at field 3 and no `path`. These previously shared the
+        // "ServiceReference" registry key, so this one clobbered the webhook/CRD
+        // schema — breaking webhook clientConfig.service decode (path dropped,
+        // port read from the path's first byte). Keyed separately as
+        // "APIServiceReference" and referenced only by APIServiceSpec.service.
         schemas.insert(
-            "ServiceReference".into(),
+            "APIServiceReference".into(),
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("namespace".into(), FieldType::String)),
@@ -12718,6 +12735,90 @@ mod tests {
         assert_eq!(read_varint(&[0x08], 0), Some((8, 1)));
         assert_eq!(read_varint(&[0x96, 0x01], 0), Some((150, 2)));
         assert_eq!(read_varint(&[0xac, 0x02], 0), Some((300, 2)));
+    }
+
+    #[test]
+    fn test_decode_rule_with_operations_inlines_rule() {
+        // Reproduces the conformance AdmissionWebhook failure: client-go creates
+        // ValidatingWebhookConfiguration via protobuf. RuleWithOperations embeds
+        // `Rule` as Go `json:",inline"` (proto field 2). The decoded JSON must
+        // MERGE apiGroups/apiVersions/resources up into RuleWithOperations, because
+        // the Rust type uses #[serde(flatten)]. A nested "rule" object is dropped,
+        // leaving every webhook rule empty → the webhook never matches/fires.
+        let registry = ProtoRegistry::new();
+
+        // Inner Rule: apiVersions=["v1"], resources=["configmaps"]
+        let rule = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x12, 0x02]); // field 2 (apiVersions), len 2
+            b.extend_from_slice(b"v1");
+            b.extend_from_slice(&[0x1A, 0x0A]); // field 3 (resources), len 10
+            b.extend_from_slice(b"configmaps");
+            b
+        };
+        let mut rwo = Vec::new();
+        rwo.extend_from_slice(&[0x0A, 0x06]); // field 1 (operations), len 6
+        rwo.extend_from_slice(b"CREATE");
+        rwo.push(0x12); // field 2 (rule), wire type 2
+        rwo.push(rule.len() as u8);
+        rwo.extend_from_slice(&rule);
+
+        let val = registry
+            .decode_message("RuleWithOperations", &rwo)
+            .expect("RuleWithOperations decodes");
+
+        assert_eq!(
+            val.pointer("/operations/0"),
+            Some(&Value::String("CREATE".into()))
+        );
+        // The whole point: rule fields are flattened, NOT nested under "rule".
+        assert_eq!(
+            val.pointer("/resources/0"),
+            Some(&Value::String("configmaps".into())),
+            "rule.resources must be inlined to top level; got: {val}"
+        );
+        assert_eq!(
+            val.pointer("/apiVersions/0"),
+            Some(&Value::String("v1".into()))
+        );
+        assert!(
+            val.pointer("/rule").is_none(),
+            "rule must be inlined, not nested: {val}"
+        );
+    }
+
+    #[test]
+    fn test_decode_service_reference_path_and_port() {
+        // Webhook clientConfig.service must keep its path and port: dropping the
+        // path makes the api-server POST to "/" (404 from the webhook server);
+        // the e2e readiness marker then never gets denied.
+        let registry = ProtoRegistry::new();
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0x0A, 0x0C]); // f1 namespace, len 12
+        b.extend_from_slice(b"webhook-2926");
+        b.extend_from_slice(&[0x12, 0x10]); // f2 name, len 16
+        b.extend_from_slice(b"e2e-test-webhook");
+        b.extend_from_slice(&[0x1A, 0x0B]); // f3 path, len 11
+        b.extend_from_slice(b"/configmaps");
+        b.extend_from_slice(&[0x20, 0xFB, 0x41]); // f4 port varint = 8443
+
+        let val = registry
+            .decode_message("ServiceReference", &b)
+            .expect("ServiceReference decodes");
+        assert_eq!(
+            val.pointer("/namespace"),
+            Some(&Value::String("webhook-2926".into()))
+        );
+        assert_eq!(
+            val.pointer("/path"),
+            Some(&Value::String("/configmaps".into())),
+            "service.path dropped; got: {val}"
+        );
+        assert_eq!(
+            val.pointer("/port").and_then(|v| v.as_i64()),
+            Some(8443),
+            "service.port garbled; got: {val}"
+        );
     }
 
     #[test]
