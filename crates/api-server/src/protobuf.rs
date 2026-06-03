@@ -2643,6 +2643,7 @@ impl ProtoRegistry {
         Self::register_node_v1(&mut schemas);
         Self::register_authentication_v1(&mut schemas);
         Self::register_authorization_v1(&mut schemas);
+        Self::register_certificates_v1(&mut schemas);
 
         ProtoRegistry { schemas }
     }
@@ -12464,6 +12465,219 @@ impl ProtoRegistry {
                 ]),
             },
         );
+
+        // SelfSubjectRulesReview (kubectl auth can-i --list).
+        schemas.insert(
+            "SelfSubjectRulesReview".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("SelfSubjectRulesReviewSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("SubjectRulesReviewStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectRulesReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("namespace".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "SubjectRulesReviewStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "resourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ResourceRule".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceRules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NonResourceRule".into(),
+                            ))),
+                        ),
+                    ),
+                    (3, ("incomplete".into(), FieldType::Bool)),
+                    (4, ("evaluationError".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ResourceRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "resourceNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NonResourceRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceURLs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+    }
+
+    /// certificates.k8s.io/v1. Field numbers from
+    /// staging/src/k8s.io/api/certificates/v1/generated.proto. `spec.extra`
+    /// (map<string, ExtraValue=repeated string>) has no matching FieldType and
+    /// is omitted — the decoder skips field 6.
+    fn register_certificates_v1(schemas: &mut HashMap<String, MessageSchema>) {
+        schemas.insert(
+            "CertificateSigningRequest".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("CertificateSigningRequestSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("CertificateSigningRequestStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CertificateSigningRequestSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("request".into(), FieldType::Bytes)),
+                    (2, ("username".into(), FieldType::String)),
+                    (3, ("uid".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "groups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "usages".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (7, ("signerName".into(), FieldType::String)),
+                    (8, ("expirationSeconds".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CertificateSigningRequestStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "CertificateSigningRequestCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("certificate".into(), FieldType::Bytes)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CertificateSigningRequestCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("reason".into(), FieldType::String)),
+                    (3, ("message".into(), FieldType::String)),
+                    (
+                        4,
+                        ("lastUpdateTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        5,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (6, ("status".into(), FieldType::String)),
+                ]),
+            },
+        );
     }
 
     fn register_authentication_v1(schemas: &mut HashMap<String, MessageSchema>) {
@@ -13666,6 +13880,134 @@ mod tests {
             "{} protobuf schema(s) do not round-trip consistently:\n{}",
             failures.len(),
             failures.join("\n")
+        );
+    }
+
+    /// Every API Kind the server advertises in discovery. Typed Go clients
+    /// negotiate `vnd.kubernetes.protobuf` for built-in groups, so each such
+    /// Kind MUST have a protobuf schema (bare or group-qualified) or its
+    /// request/response bodies silently drop fields — the SubjectAccessReview
+    /// bug class. Keep in sync with `handlers/discovery.rs`.
+    const SERVED_BUILTIN_KINDS: &[&str] = &[
+        "APIGroupList",
+        "APIResourceList",
+        "APIService",
+        "APIVersions",
+        "Binding",
+        "CertificateSigningRequest",
+        "ClusterRole",
+        "ClusterRoleBinding",
+        "ComponentStatus",
+        "ConfigMap",
+        "ControllerRevision",
+        "CronJob",
+        "CSIDriver",
+        "CSINode",
+        "CSIStorageCapacity",
+        "CustomResourceDefinition",
+        "DaemonSet",
+        "Deployment",
+        "DeviceClass",
+        "Endpoints",
+        "EndpointSlice",
+        "Event",
+        "Eviction",
+        "FlowSchema",
+        "HorizontalPodAutoscaler",
+        "Ingress",
+        "IngressClass",
+        "IPAddress",
+        "Job",
+        "Lease",
+        "LimitRange",
+        "LocalSubjectAccessReview",
+        "MetricValueList",
+        "MutatingWebhookConfiguration",
+        "Namespace",
+        "NetworkPolicy",
+        "Node",
+        "NodeMetrics",
+        "PersistentVolume",
+        "PersistentVolumeClaim",
+        "Pod",
+        "PodAttachOptions",
+        "PodDisruptionBudget",
+        "PodExecOptions",
+        "PodMetrics",
+        "PodPortForwardOptions",
+        "PodTemplate",
+        "PriorityClass",
+        "PriorityLevelConfiguration",
+        "ReplicaSet",
+        "ReplicationController",
+        "ResourceClaim",
+        "ResourceClaimTemplate",
+        "ResourceQuota",
+        "ResourceSlice",
+        "Role",
+        "RoleBinding",
+        "RuntimeClass",
+        "Scale",
+        "Secret",
+        "SelfSubjectAccessReview",
+        "SelfSubjectReview",
+        "SelfSubjectRulesReview",
+        "Service",
+        "ServiceAccount",
+        "ServiceCIDR",
+        "StatefulSet",
+        "StorageClass",
+        "SubjectAccessReview",
+        "TokenReview",
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding",
+        "ValidatingWebhookConfiguration",
+        "VolumeAttachment",
+        "VolumeAttributesClass",
+        "VolumeSnapshot",
+        "VolumeSnapshotClass",
+        "VolumeSnapshotContent",
+    ];
+
+    /// Discovery-advertised Kinds that are NOT served over protobuf and so need
+    /// no schema: metrics.k8s.io is an aggregated API and the snapshot +
+    /// apiextensions groups are CRD-backed — all speak JSON only.
+    const PROTO_EXEMPT_KINDS: &[&str] = &[
+        "NodeMetrics",
+        "PodMetrics",
+        "MetricValueList",
+        "VolumeSnapshot",
+        "VolumeSnapshotClass",
+        "VolumeSnapshotContent",
+        "CustomResourceDefinition",
+    ];
+
+    #[test]
+    fn test_every_served_builtin_kind_has_protobuf_schema() {
+        let reg = ProtoRegistry::new();
+        let mut missing: Vec<&str> = Vec::new();
+        for k in SERVED_BUILTIN_KINDS {
+            if PROTO_EXEMPT_KINDS.contains(k) {
+                continue;
+            }
+            // Accept a bare key (`Pod`) or a group-qualified one
+            // (`resource.k8s.io/v1.ResourceSlice`).
+            let registered = reg.schemas.contains_key(*k)
+                || reg
+                    .schemas
+                    .keys()
+                    .any(|key| key.rsplit('.').next() == Some(*k));
+            if !registered {
+                missing.push(k);
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "{} served built-in Kind(s) have no protobuf schema — their bodies will \
+             drop fields over vnd.kubernetes.protobuf:\n{}",
+            missing.len(),
+            missing.join("\n")
         );
     }
 
