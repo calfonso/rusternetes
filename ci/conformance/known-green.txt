@@ -205,6 +205,7 @@
 [sig-storage] HostPath should give a volume the correct mode [LinuxOnly] [NodeConformance]
 [sig-storage] HostPath should support r/w [NodeConformance]
 [sig-storage] HostPath should support subPath [NodeConformance]
+[sig-network] EndpointSliceMirroring should mirror a custom Endpoints resource through create update and delete [Conformance]
 [sig-network] Services should be able to up and down services
 [sig-network] Services should serve multiport endpoints from pods [Conformance]
 [sig-network] DNS should provide DNS for services [Conformance]
@@ -279,6 +280,7 @@
 [sig-apps] StatefulSet Basic StatefulSet functionality [StatefulSetBasic] Should recreate evicted statefulset [Conformance]
 [sig-apps] StatefulSet Basic StatefulSet functionality [StatefulSetBasic] should validate Statefulset Status endpoints [Conformance]
 [sig-architecture] Conformance Tests should have at least two untainted nodes [Conformance]
+[sig-auth] Certificates API [Privileged:ClusterAdmin] should support CSR API operations [Conformance]
 [sig-auth] ServiceAccounts ServiceAccountIssuerDiscovery should support OIDC discovery of service account issuer [Conformance]
 [sig-auth] ServiceAccounts should allow opting out of API token automount [Conformance]
 [sig-auth] ServiceAccounts should guarantee kube-root-ca.crt exist in any namespace [Conformance]
@@ -477,3 +479,4 @@
 [sig-network] Services should be able to create a functioning NodePort service [Conformance]
 [sig-network] Services should be able to switch session affinity for NodePort service [LinuxOnly] [Conformance]
 [sig-network] Services should have session affinity work for NodePort service [LinuxOnly] [Conformance]
+[sig-auth] SubjectReview should support SubjectReview API operations [Conformance]
