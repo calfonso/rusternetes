@@ -286,6 +286,45 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             if let Err(e) = self.bind_pod_to_node(pod, &node.metadata.name).await {
                 error!("Failed to bind pod {}/{} to node: {}", ns, name, e);
             }
+        } else if let Some((node_name, victims)) = self.try_preempt(&pod, &nodes, &all_pods).await {
+            // No node fits — preempt lower-priority pods. The production
+            // watch/work-queue path (this method) previously never attempted
+            // preemption; it only existed in the test-only schedule_pending_pods,
+            // so [sig-scheduling] SchedulerPreemption never worked. Evict the
+            // victims and set nominatedNodeName; once the victims terminate, the
+            // resync re-enqueues this pod and select_node binds it to the node.
+            info!(
+                "Preempting {} pod(s) on node {} for higher-priority pod {}/{}",
+                victims.len(),
+                node_name,
+                ns,
+                name
+            );
+            for victim in &victims {
+                if let Err(e) = self.evict_pod(victim).await {
+                    error!("Failed to evict victim pod {}: {}", victim, e);
+                }
+            }
+            self.update_pod_with_retry(&pod_key, |p| {
+                if let Some(ref mut status) = p.status {
+                    status.nominated_node_name = Some(node_name.clone());
+                }
+            })
+            .await;
+        } else {
+            // No node fits and preemption can't help — surface FailedScheduling.
+            // The production path previously stayed silent here; the
+            // [sig-scheduling] SchedulerPredicates specs perform an action and
+            // wait (via WaitForSchedulerAfterAction) for a Warning/
+            // FailedScheduling event for the pod, so without it they time out.
+            // The recorder's correlator dedups across cycles, matching upstream
+            // recorder.Eventf(pod, Warning, "FailedScheduling", …).
+            let msg = format!(
+                "0/{} nodes are available: no nodes match the pod's scheduling requirements.",
+                nodes.len()
+            );
+            self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
+                .await;
         }
 
         Ok(())
