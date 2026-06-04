@@ -135,8 +135,10 @@ services:
     volumes:
       # Podman socket
       - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      # Share volume directory so ConfigMap/Secret volumes can be mounted into pods
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      # Share volume directory so ConfigMap/Secret volumes can be mounted into pods.
+      # rshared so kubelet tmpfs mounts (Memory-medium emptyDir) propagate to the
+      # host daemon and persist across container restarts (#445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       # Mount TLS certificates so kubelet can inject CA cert into service account volumes
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
     environment:
