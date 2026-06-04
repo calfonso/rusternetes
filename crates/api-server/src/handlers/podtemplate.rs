@@ -243,6 +243,16 @@ pub async fn list_podtemplates(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut podtemplates, &params)?;
 
+    // Deterministic sort by (namespace, name) so `?continue` chains are
+    // stable regardless of underlying storage iteration order. The offset
+    // helper below relies on a total, repeatable order across pages.
+    podtemplates.sort_by(|a, b| {
+        a.metadata
+            .namespace
+            .cmp(&b.metadata.namespace)
+            .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+    });
+
     // Apply pagination
     let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok());
     let continue_token = params.get("continue").cloned();
@@ -340,6 +350,16 @@ pub async fn list_all_podtemplates(
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut podtemplates, &params)?;
+
+    // Deterministic sort by (namespace, name) so `?continue` chains are
+    // stable regardless of underlying storage iteration order. The offset
+    // helper below relies on a total, repeatable order across pages.
+    podtemplates.sort_by(|a, b| {
+        a.metadata
+            .namespace
+            .cmp(&b.metadata.namespace)
+            .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+    });
 
     // Apply pagination
     let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok());
