@@ -2,7 +2,7 @@
 
 **A ground-up reimplementation of Kubernetes in Rust.** [Documentation Site](https://calfonso.github.io/rusternetes/)
 
-Current state of indyjonesnl/rusternetes development: 45/441 conformance tests 'FAIL'; 432/441 conformance tests 'PASSED' ![](https://geps.dev/progress/98)
+Current state of indyjonesnl/rusternetes development: **5/441** conformance tests 'FAIL'; **436/441** conformance tests 'PASSED' ![](https://geps.dev/progress/98.8)
 
 ---
 
