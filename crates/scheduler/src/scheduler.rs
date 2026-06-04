@@ -311,6 +311,20 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
             })
             .await;
+        } else {
+            // No node fits and preemption can't help — surface FailedScheduling.
+            // The production path previously stayed silent here; the
+            // [sig-scheduling] SchedulerPredicates specs perform an action and
+            // wait (via WaitForSchedulerAfterAction) for a Warning/
+            // FailedScheduling event for the pod, so without it they time out.
+            // The recorder's correlator dedups across cycles, matching upstream
+            // recorder.Eventf(pod, Warning, "FailedScheduling", …).
+            let msg = format!(
+                "0/{} nodes are available: no nodes match the pod's scheduling requirements.",
+                nodes.len()
+            );
+            self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
+                .await;
         }
 
         Ok(())
