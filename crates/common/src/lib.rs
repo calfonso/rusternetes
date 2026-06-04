@@ -20,6 +20,7 @@ pub mod quantity;
 pub mod resources;
 pub mod schema_validation;
 pub mod server_side_apply;
+pub mod serviceaccount;
 pub mod tls;
 pub mod tracing;
 pub mod types;

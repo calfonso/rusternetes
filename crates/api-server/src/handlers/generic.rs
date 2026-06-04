@@ -161,6 +161,45 @@ pub async fn update_apiservice_status(
     Ok(Json(result))
 }
 
+pub async fn patch_apiservice(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> rusternetes_common::Result<Json<Value>> {
+    let attrs = RequestAttributes::new(auth_ctx.user, "patch", "apiservices")
+        .with_api_group("apiregistration.k8s.io")
+        .with_name(&name);
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
+    }
+
+    // `normalize_content_type_middleware` rewrites the request Content-Type to
+    // application/json (so Axum's JSON extractor accepts the body) and stashes
+    // the real patch MIME in `x-original-content-type`. Prefer that.
+    let content_type = headers
+        .get("x-original-content-type")
+        .or_else(|| headers.get("content-type"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/merge-patch+json");
+    let patch_type = crate::patch::PatchType::from_content_type(content_type)
+        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+    let patch: Value = serde_json::from_slice(&body)
+        .map_err(|e| rusternetes_common::Error::BadRequest(format!("invalid patch body: {}", e)))?;
+
+    let key = build_key("apiservices", None, &name);
+    let original: Value = state.storage.get(&key).await?;
+    let mut patched = crate::patch::apply_patch(&original, &patch, patch_type)
+        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+    patched["kind"] = Value::String("APIService".to_string());
+    patched["apiVersion"] = Value::String("apiregistration.k8s.io/v1".to_string());
+
+    let result: Value = state.storage.update(&key, &patched).await?;
+    Ok(Json(result))
+}
+
 pub async fn delete_apiservice(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -178,6 +217,49 @@ pub async fn delete_apiservice(
     let deleted: Value = state.storage.get(&key).await?;
     state.storage.delete(&key).await?;
     Ok(Json(deleted))
+}
+
+/// DELETE on the APIService collection (`deletecollection`), honouring an
+/// optional `labelSelector`. Used by clients that clean up APIServices by label
+/// (e.g. the aggregator conformance test). Returns a success `Status`.
+pub async fn deletecollection_apiservices(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<HashMap<String, String>>,
+) -> rusternetes_common::Result<Json<Value>> {
+    let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "apiservices")
+        .with_api_group("apiregistration.k8s.io");
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
+    }
+
+    let selector = params
+        .get("labelSelector")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let parsed = rusternetes_common::label_selector::LabelSelector::parse(selector)
+        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+
+    let prefix = build_prefix("apiservices", None);
+    let items: Vec<Value> = state.storage.list(&prefix).await.unwrap_or_default();
+    for item in &items {
+        if !parsed.matches_resource(item) {
+            continue;
+        }
+        if let Some(name) = item.pointer("/metadata/name").and_then(|v| v.as_str()) {
+            let key = build_key("apiservices", None, name);
+            let _ = state.storage.delete(&key).await;
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "metadata": {},
+        "status": "Success",
+        "details": { "group": "apiregistration.k8s.io", "kind": "apiservices" },
+    })))
 }
 
 pub async fn list_apiservices(
@@ -242,6 +324,8 @@ pub async fn list_apiservices(
 /// Resolved network target for an aggregated APIService.
 #[derive(Debug, Clone)]
 pub struct AggregatorTarget {
+    /// The address we actually open the TCP connection to — a backend pod IP
+    /// (the api-server cannot reach ClusterIPs).
     pub host: String,
     pub port: u16,
     pub insecure_skip_tls_verify: bool,
@@ -249,6 +333,12 @@ pub struct AggregatorTarget {
     /// URL scheme used when forwarding. Always `"https"` in production; tests
     /// may override to `"http"` to drive a plain warp mock backend.
     pub scheme: &'static str,
+    /// TLS server name (and request `Host`) to present, e.g.
+    /// `<service>.<namespace>.svc`. The aggregated apiserver's serving cert is
+    /// issued for this DNS name, not the pod IP, so we verify the cert against
+    /// it while connecting to `host` via reqwest's `resolve()`. `None` ⇒ use
+    /// `host` directly (e.g. the http test backend).
+    pub server_name: Option<String>,
 }
 
 /// Look up the APIService registered for `{group}/{version}` and resolve a
@@ -256,6 +346,88 @@ pub struct AggregatorTarget {
 ///
 /// Returns `Ok(None)` when no APIService is registered, `Err(503)` when the
 /// APIService exists but the backing service is unreachable.
+/// Resolve a reachable `(ip, port)` for an aggregated APIService backend
+/// service. Prefers a ready pod IP (EndpointSlices → Endpoints) because the
+/// api-server cannot reach ClusterIPs; falls back to the ClusterIP only if no
+/// endpoints exist. `svc_port` is the APIService's `spec.service.port`.
+async fn resolve_aggregator_backend_address<S: Storage + Send + Sync>(
+    storage: &S,
+    svc_ns: &str,
+    svc_name: &str,
+    svc_port: Option<u16>,
+) -> Option<(String, u16)> {
+    // Strategy 1: EndpointSlices (preferred — gives a ready pod IP + targetPort).
+    let es_prefix = rusternetes_storage::build_prefix("endpointslices", Some(svc_ns));
+    let slices: Vec<rusternetes_common::resources::EndpointSlice> =
+        storage.list(&es_prefix).await.unwrap_or_default();
+    for es in &slices {
+        let owns = es
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kubernetes.io/service-name"))
+            .map(|s| s == svc_name)
+            .unwrap_or(false);
+        if !owns {
+            continue;
+        }
+        // Proxying straight to a pod IP, so the endpoint targetPort wins over
+        // the Service port (which only applies to ClusterIP access).
+        let ep_port = es.ports.first().and_then(|p| p.port).map(|p| p as u16);
+        for ep in &es.endpoints {
+            if ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
+                if let Some(addr) = ep.addresses.first() {
+                    return Some((addr.clone(), ep_port.or(svc_port).unwrap_or(443)));
+                }
+            }
+        }
+    }
+
+    // Strategy 2: legacy Endpoints object.
+    let ep_key = rusternetes_storage::build_key("endpoints", Some(svc_ns), svc_name);
+    if let Ok(ep) = storage
+        .get::<rusternetes_common::resources::Endpoints>(&ep_key)
+        .await
+    {
+        if let Some(addr) = ep
+            .subsets
+            .iter()
+            .flat_map(|s| s.addresses.iter().flatten())
+            .next()
+        {
+            let ep_port = ep
+                .subsets
+                .iter()
+                .flat_map(|s| s.ports.iter().flatten())
+                .next()
+                .map(|p| p.port);
+            return Some((addr.ip.clone(), ep_port.or(svc_port).unwrap_or(443)));
+        }
+    }
+
+    // Strategy 3: last resort — ClusterIP (only works if the api-server's netns
+    // happens to have kube-proxy rules, which it usually does not).
+    let svc_key = rusternetes_storage::build_key("services", Some(svc_ns), svc_name);
+    if let Ok(svc) = storage
+        .get::<rusternetes_common::resources::Service>(&svc_key)
+        .await
+    {
+        if let Some(ip) = svc
+            .spec
+            .cluster_ip
+            .clone()
+            .filter(|ip| !ip.is_empty() && ip != "None")
+        {
+            let port = svc_port
+                .or_else(|| svc.spec.ports.first().map(|p| p.port))
+                .unwrap_or(443);
+            return Some((ip, port));
+        }
+    }
+
+    None
+}
+
 pub async fn resolve_aggregator_target(
     state: &Arc<ApiServerState>,
     group: &str,
@@ -303,46 +475,12 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
         .and_then(|v| v.as_i64())
         .map(|p| p as u16);
 
-    let svc_key = rusternetes_storage::build_key("services", Some(svc_ns), svc_name);
-    let resolved = if let Ok(svc) = storage
-        .get::<rusternetes_common::resources::Service>(&svc_key)
-        .await
-    {
-        let cluster_ip = svc
-            .spec
-            .cluster_ip
-            .clone()
-            .filter(|ip| !ip.is_empty() && ip != "None");
-        let port = svc_port
-            .or_else(|| svc.spec.ports.first().map(|p| p.port))
-            .unwrap_or(443u16);
-        cluster_ip.map(|ip| (ip, port))
-    } else {
-        let ep_key = rusternetes_storage::build_key("endpoints", Some(svc_ns), svc_name);
-        if let Ok(ep) = storage
-            .get::<rusternetes_common::resources::Endpoints>(&ep_key)
-            .await
-        {
-            ep.subsets
-                .iter()
-                .flat_map(|s| s.addresses.iter().flatten())
-                .next()
-                .map(|addr| {
-                    let port = svc_port
-                        .or_else(|| {
-                            ep.subsets
-                                .iter()
-                                .flat_map(|s| s.ports.iter().flatten())
-                                .next()
-                                .map(|p| p.port)
-                        })
-                        .unwrap_or(443u16);
-                    (addr.ip.clone(), port)
-                })
-        } else {
-            None
-        }
-    };
+    // Resolve a reachable backend address. The api-server runs in its own
+    // network namespace WITHOUT kube-proxy iptables, so it cannot reach the
+    // backend's ClusterIP — it must talk to a backing pod IP directly (same as
+    // the node/service proxy handlers). Prefer EndpointSlices, then the legacy
+    // Endpoints object, and only fall back to ClusterIP as a last resort.
+    let resolved = resolve_aggregator_backend_address(storage, svc_ns, svc_name, svc_port).await;
 
     match resolved {
         Some((host, port)) => Ok(Some(AggregatorTarget {
@@ -351,6 +489,9 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
             insecure_skip_tls_verify,
             ca_bundle,
             scheme: "https",
+            // The serving cert is issued for the service DNS name; verify TLS
+            // against it while connecting to the resolved pod IP.
+            server_name: Some(format!("{}.{}.svc", svc_name, svc_ns)),
         })),
         None => {
             warn!(
@@ -428,18 +569,29 @@ pub async fn forward_to_aggregator(
     request_headers: &HeaderMap,
     body_bytes: Vec<u8>,
 ) -> Response {
+    // The URL host (and thus TLS SNI + cert verification name) is the service
+    // DNS name when set; we then pin DNS resolution of that name to the backend
+    // pod IP via `resolve()`. This lets us connect to a reachable pod IP while
+    // still verifying the cert that was issued for `<service>.<ns>.svc`.
+    let url_host = target.server_name.as_deref().unwrap_or(&target.host);
     let target_url = format!(
         "{}://{}:{}{}",
-        target.scheme, target.host, target.port, path_and_query
+        target.scheme, url_host, target.port, path_and_query
     );
     debug!(
-        "API aggregation proxy: {} {} -> {}",
-        method, path_and_query, target_url
+        "API aggregation proxy: {} {} -> {} (connect {}:{})",
+        method, path_and_query, target_url, target.host, target.port
     );
 
     let mut client_builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none());
+    if target.server_name.is_some() {
+        if let Ok(ip) = target.host.parse::<std::net::IpAddr>() {
+            client_builder =
+                client_builder.resolve(url_host, std::net::SocketAddr::new(ip, target.port));
+        }
+    }
     if target.insecure_skip_tls_verify {
         client_builder = client_builder.danger_accept_invalid_certs(true);
     } else if let Some(ref pem) = target.ca_bundle {
@@ -525,6 +677,101 @@ pub async fn forward_to_aggregator(
             warn!("API aggregation proxy error: {}", e);
             service_unavailable_response(&format!("aggregated API server unavailable: {}", e))
         }
+    }
+}
+
+/// Build a reqwest client configured to reach an aggregated backend: TLS trust
+/// per the APIService (caBundle / insecure), and DNS of the service name pinned
+/// to the resolved pod IP (so the cert — issued for the service DNS name — still
+/// verifies while we connect to a reachable address).
+fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(name) = target.server_name.as_deref() {
+        if let Ok(ip) = target.host.parse::<std::net::IpAddr>() {
+            b = b.resolve(name, std::net::SocketAddr::new(ip, target.port));
+        }
+    }
+    if target.insecure_skip_tls_verify {
+        b = b.danger_accept_invalid_certs(true);
+    } else if let Some(pem) = target.ca_bundle.as_ref() {
+        match reqwest::tls::Certificate::from_pem(pem) {
+            Ok(cert) => b = b.add_root_certificate(cert),
+            Err(_) => b = b.danger_accept_invalid_certs(true),
+        }
+    } else {
+        b = b.danger_accept_invalid_certs(true);
+    }
+    b.build().ok()
+}
+
+/// Fetch the legacy discovery (`APIResourceList`) for `group/version` from an
+/// aggregated backend and convert it to the aggregated-discovery resource
+/// entries (`apidiscovery.k8s.io` shape). Used to inline an aggregated group's
+/// resources into the `/apis` aggregated-discovery document. Returns `None`
+/// when there is no backend, it is unreachable, or it serves nothing.
+pub async fn aggregated_discovery_resources(
+    state: &Arc<ApiServerState>,
+    group: &str,
+    version: &str,
+) -> Option<Vec<Value>> {
+    let target = resolve_aggregator_target(state, group, version)
+        .await
+        .ok()
+        .flatten()?;
+    let client = build_aggregator_client(&target)?;
+    let url_host = target.server_name.as_deref().unwrap_or(&target.host);
+    let url = format!(
+        "{}://{}:{}/apis/{}/{}",
+        target.scheme, url_host, target.port, group, version
+    );
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json")
+        // Identify as the aggregator so the backend authorises discovery.
+        .header("X-Remote-User", "system:kube-aggregator")
+        .header("X-Remote-Group", "system:masters")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.ok()?;
+    let resources = body.get("resources").and_then(|v| v.as_array())?;
+    let mut out = Vec::new();
+    for r in resources {
+        let Some(name) = r.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Subresources (e.g. "flunders/status") are nested under their parent in
+        // aggregated discovery; skip them as standalone entries.
+        if name.contains('/') {
+            continue;
+        }
+        let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let namespaced = r
+            .get("namespaced")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let singular = r.get("singularName").and_then(|v| v.as_str()).unwrap_or("");
+        let verbs = r
+            .get("verbs")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        out.push(serde_json::json!({
+            "resource": name,
+            "responseKind": { "group": group, "version": version, "kind": kind },
+            "scope": if namespaced { "Namespaced" } else { "Cluster" },
+            "singularResource": singular,
+            "verbs": verbs,
+        }));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 

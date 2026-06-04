@@ -1,6 +1,6 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use rusternetes_common::{
-    resources::{LimitRange, Pod, ResourceQuota, ServiceAccount, Volume, VolumeMount},
+    resources::{LimitRange, Pod, ResourceQuota, ServiceAccount},
     types::ResourceRequirements,
 };
 use rusternetes_storage::Storage;
@@ -1057,144 +1057,11 @@ pub async fn inject_service_account_token<S: Storage>(
         return Ok(());
     }
 
-    // The service account token secret name follows the pattern: {sa-name}-token
-    let _token_secret_name = format!("{}-token", sa_name);
-
-    // Define the service account token volume as a Projected volume
-    // with three sources, matching K8s TokenVolumeSource() exactly:
-    //   1. ServiceAccountToken — kubelet generates bound JWT with pod claims
-    //   2. ConfigMap (kube-root-ca.crt) — provides ca.crt for API server TLS
-    //   3. DownwardAPI — provides namespace from pod metadata
-    //
-    // See K8s source: plugin/pkg/admission/serviceaccount/admission.go
-    let sa_token_volume = Volume {
-        name: "kube-api-access".to_string(),
-        empty_dir: None,
-        host_path: None,
-        config_map: None,
-        secret: None,
-        persistent_volume_claim: None,
-        downward_api: None,
-        csi: None,
-        ephemeral: None,
-        nfs: None,
-        iscsi: None,
-        projected: Some(rusternetes_common::resources::ProjectedVolumeSource {
-            sources: Some(vec![
-                // Source 1: ServiceAccountToken — kubelet generates bound JWT
-                rusternetes_common::resources::VolumeProjection {
-                    service_account_token: Some(
-                        rusternetes_common::resources::ServiceAccountTokenProjection {
-                            path: "token".to_string(),
-                            expiration_seconds: Some(3607),
-                            audience: None,
-                        },
-                    ),
-                    config_map: None,
-                    secret: None,
-                    downward_api: None,
-                    cluster_trust_bundle: None,
-                },
-                // Source 2: ConfigMap kube-root-ca.crt — provides ca.crt
-                rusternetes_common::resources::VolumeProjection {
-                    service_account_token: None,
-                    config_map: Some(rusternetes_common::resources::ConfigMapProjection {
-                        name: Some("kube-root-ca.crt".to_string()),
-                        items: Some(vec![rusternetes_common::resources::KeyToPath {
-                            key: "ca.crt".to_string(),
-                            path: "ca.crt".to_string(),
-                            mode: None,
-                        }]),
-                        optional: None,
-                    }),
-                    secret: None,
-                    downward_api: None,
-                    cluster_trust_bundle: None,
-                },
-                // Source 3: DownwardAPI — provides namespace
-                rusternetes_common::resources::VolumeProjection {
-                    service_account_token: None,
-                    config_map: None,
-                    secret: None,
-                    downward_api: Some(rusternetes_common::resources::DownwardAPIProjection {
-                        items: Some(vec![rusternetes_common::resources::DownwardAPIVolumeFile {
-                            path: "namespace".to_string(),
-                            field_ref: Some(rusternetes_common::resources::ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "metadata.namespace".to_string(),
-                            }),
-                            resource_field_ref: None,
-                            mode: None,
-                        }]),
-                    }),
-                    cluster_trust_bundle: None,
-                },
-            ]),
-            default_mode: Some(0o644),
-        }),
-        image: None,
-    };
-
-    // Add volume to pod spec
-    if let Some(volumes) = &mut spec.volumes {
-        // Check if volume already exists
-        if !volumes.iter().any(|v| v.name == "kube-api-access") {
-            volumes.push(sa_token_volume);
-            info!(
-                "Injected service account token volume for pod {}/{}",
-                namespace, pod.metadata.name
-            );
-        }
-    } else {
-        spec.volumes = Some(vec![sa_token_volume]);
-        info!(
-            "Injected service account token volume for pod {}/{}",
-            namespace, pod.metadata.name
-        );
-    }
-
-    // Define the volume mount for the token
-    let sa_token_mount = VolumeMount {
-        name: "kube-api-access".to_string(),
-        mount_path: "/var/run/secrets/kubernetes.io/serviceaccount".to_string(),
-        read_only: Some(true),
-        sub_path: None,
-        sub_path_expr: None,
-        mount_propagation: None,
-        recursive_read_only: None,
-    };
-
-    // Add volume mount to all containers
-    for container in &mut spec.containers {
-        if let Some(mounts) = &mut container.volume_mounts {
-            // Check if mount already exists
-            if !mounts
-                .iter()
-                .any(|m| m.mount_path == "/var/run/secrets/kubernetes.io/serviceaccount")
-            {
-                mounts.push(sa_token_mount.clone());
-            }
-        } else {
-            container.volume_mounts = Some(vec![sa_token_mount.clone()]);
-        }
-    }
-
-    // Also add to init containers if present
-    if let Some(init_containers) = &mut spec.init_containers {
-        for container in init_containers {
-            if let Some(mounts) = &mut container.volume_mounts {
-                // Check if mount already exists
-                if !mounts
-                    .iter()
-                    .any(|m| m.mount_path == "/var/run/secrets/kubernetes.io/serviceaccount")
-                {
-                    mounts.push(sa_token_mount.clone());
-                }
-            } else {
-                container.volume_mounts = Some(vec![sa_token_mount.clone()]);
-            }
-        }
-    }
+    // Inject the projected kube-api-access volume (token + ca.crt + namespace)
+    // and mount it into every container. Shared with the controller-manager so
+    // controller-created pods (ReplicaSet/StatefulSet/etc.) get the same volume
+    // — they write pods straight to storage and bypass this HTTP admission path.
+    rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
 
     info!(
         "Service account token injection complete for pod {}/{} using SA {}",

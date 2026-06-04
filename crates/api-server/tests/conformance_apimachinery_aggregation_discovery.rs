@@ -716,6 +716,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
         insecure_skip_tls_verify: true,
         ca_bundle: None,
         scheme: "http",
+        server_name: None,
     };
     let auth = rusternetes_api_server::middleware::AuthContext {
         user: rusternetes_common::auth::UserInfo {
