@@ -59,23 +59,33 @@ async fn status_for(method: Method) -> StatusCode {
 
 #[tokio::test]
 async fn proxy_routes_all_methods_not_405() {
-    let get = status_for(Method::GET).await;
-    assert_ne!(
-        get,
-        StatusCode::METHOD_NOT_ALLOWED,
-        "GET on pod proxy must be routed"
-    );
-    // The methods the e2e exercises that previously weren't registered.
-    for m in [Method::OPTIONS, Method::HEAD] {
+    // GET/HEAD on a bare `.../proxy` (no trailing slash) 301-redirect to
+    // `.../proxy/`, matching the upstream apiserver (#410). Both are still
+    // "routed" — the property this test guards is that no method hits a
+    // 405 Method Not Allowed.
+    for m in [Method::GET, Method::HEAD] {
+        let s = status_for(m.clone()).await;
+        assert_eq!(
+            s,
+            StatusCode::MOVED_PERMANENTLY,
+            "{m} on a bare proxy path must 301-redirect to the trailing-slash form"
+        );
+    }
+    // The verb-test methods (the e2e sends OPTIONS, which previously wasn't a
+    // registered route → 405) are proxied THROUGH to the handler, not
+    // redirected. With no backend reachable the handler returns a
+    // deterministic non-405 status (and crucially not the GET/HEAD 301).
+    for m in [Method::OPTIONS] {
         let s = status_for(m.clone()).await;
         assert_ne!(
             s,
             StatusCode::METHOD_NOT_ALLOWED,
             "{m} on the proxy subresource must be routed to the handler, not 405"
         );
-        assert_eq!(
-            s, get,
-            "{m} should reach the same proxy handler outcome as GET (got {s} vs {get})"
+        assert_ne!(
+            s,
+            StatusCode::MOVED_PERMANENTLY,
+            "{m} must be proxied through, not redirected"
         );
     }
 }
