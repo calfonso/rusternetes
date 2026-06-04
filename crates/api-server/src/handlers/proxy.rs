@@ -231,6 +231,9 @@ pub async fn proxy_service_root(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response> {
+    if let Some(redirect) = proxy_trailing_slash_redirect(&method, &original_uri) {
+        return Ok(redirect);
+    }
     proxy_service(
         State(state),
         Extension(auth_ctx),
@@ -459,6 +462,39 @@ pub async fn proxy_service(
 }
 
 /// Proxy HTTP requests to a pod (root path, no trailing path component)
+/// The pod/service proxy subresource redirects a bare `.../proxy` (no trailing
+/// slash) to `.../proxy/` with HTTP 301, preserving the query string — matching
+/// the upstream apiserver.
+///
+/// Only GET and HEAD are redirected. The e2e "Proxy ... valid responses" test
+/// asserts GET/HEAD on a bare `.../proxy` return 301, but its verb sub-test
+/// (DELETE/OPTIONS/PATCH/POST/PUT) uses a NON-redirect-following client
+/// (`CheckRedirect: ErrUseLastResponse`) and asserts those return 200 directly.
+/// So mutating methods must be proxied through, not redirected.
+fn proxy_trailing_slash_redirect(method: &Method, uri: &Uri) -> Option<Response> {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return None;
+    }
+    let path = uri.path();
+    if !path.ends_with("/proxy") {
+        return None;
+    }
+    let mut location = String::with_capacity(path.len() + 2);
+    location.push_str(path);
+    location.push('/');
+    if let Some(q) = uri.query() {
+        location.push('?');
+        location.push_str(q);
+    }
+    Some(
+        Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header(axum::http::header::LOCATION, location)
+            .body(Body::empty())
+            .unwrap(),
+    )
+}
+
 pub async fn proxy_pod_root(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -468,6 +504,9 @@ pub async fn proxy_pod_root(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response> {
+    if let Some(redirect) = proxy_trailing_slash_redirect(&method, &original_uri) {
+        return Ok(redirect);
+    }
     proxy_pod(
         State(state),
         Extension(auth_ctx),
