@@ -1,5 +1,8 @@
 # Rust
 target/
+# Also ignore a root `target` symlink (shared CARGO_TARGET_DIR across worktrees);
+# the `target/` rule above matches directories only, not the symlink.
+/target
 # Keep Cargo.lock for binary/workspace projects (needed for reproducible builds)
 # Cargo.lock
 **/*.rs.bk
