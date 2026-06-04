@@ -250,6 +250,106 @@ pub fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Return true if `path` is already a mount point (its device differs from its
+/// parent's). Used to make tmpfs setup/teardown idempotent.
+fn is_mount_point(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let p = std::path::Path::new(path);
+    match (p.metadata(), p.parent().map(|pp| pp.metadata())) {
+        (Ok(m), Some(Ok(pm))) => m.dev() != pm.dev(),
+        _ => false,
+    }
+}
+
+/// Mount a tmpfs at `dir` for a `medium: Memory` emptyDir volume.
+///
+/// K8s ref: `pkg/volume/emptydir/empty_dir.go` — Memory-medium emptyDir is a
+/// tmpfs mount. Mounting it on the host volume dir (rather than as a
+/// per-container Docker `--tmpfs`) makes the data persist across container
+/// restarts for the pod lifetime, and reports `fs_type=tmpfs` to the
+/// conformance emptyDir-tmpfs tests. Relies on the kubelet's volume bind being
+/// `rshared` so the mount propagates to the host daemon's namespace. Idempotent
+/// (no-op if already mounted). Best-effort: logs and continues on failure so a
+/// kernel without tmpfs propagation degrades to a plain (persistent) bind dir.
+fn mount_tmpfs_for_emptydir(dir: &str, size_bytes: Option<u64>) {
+    if is_mount_point(dir) {
+        return; // already mounted (pod re-sync) — keep the existing tmpfs + data
+    }
+    let mut opts = String::from("mode=0777");
+    if let Some(bytes) = size_bytes {
+        opts.push_str(&format!(",size={}", bytes));
+    }
+    match std::process::Command::new("mount")
+        .args(["-t", "tmpfs", "-o", &opts, "tmpfs", dir])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            info!("Mounted tmpfs for Memory emptyDir at {}", dir);
+        }
+        Ok(out) => {
+            warn!(
+                "Failed to mount tmpfs at {} ({}): falling back to persistent dir",
+                dir,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => {
+            warn!("Could not exec mount for tmpfs at {}: {}", dir, e);
+        }
+    }
+}
+
+/// Unmount a tmpfs previously mounted by [`mount_tmpfs_for_emptydir`]. Safe to
+/// call on a non-mount path (no-op). Best-effort.
+fn unmount_tmpfs(dir: &str) {
+    if !is_mount_point(dir) {
+        return;
+    }
+    match std::process::Command::new("umount").arg(dir).output() {
+        Ok(out) if out.status.success() => {
+            info!("Unmounted tmpfs at {}", dir);
+        }
+        Ok(out) => {
+            warn!(
+                "Failed to umount tmpfs at {}: {}",
+                dir,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => warn!("Could not exec umount at {}: {}", dir, e),
+    }
+}
+
+/// Parse a Kubernetes resource.Quantity (e.g. `1Gi`, `512Mi`, `100M`) into a
+/// byte count. Returns None on unrecognised input. Supports the binary (Ki, Mi,
+/// Gi, Ti) and decimal (k/K, M, G, T) suffixes used for memory quantities.
+fn parse_quantity_bytes(q: &str) -> Option<u64> {
+    let q = q.trim();
+    let (num, mult): (&str, u64) = if let Some(n) = q.strip_suffix("Ki") {
+        (n, 1024)
+    } else if let Some(n) = q.strip_suffix("Mi") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = q.strip_suffix("Gi") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = q.strip_suffix("Ti") {
+        (n, 1024u64.pow(4))
+    } else if let Some(n) = q.strip_suffix('k').or_else(|| q.strip_suffix('K')) {
+        (n, 1000)
+    } else if let Some(n) = q.strip_suffix('M') {
+        (n, 1_000_000)
+    } else if let Some(n) = q.strip_suffix('G') {
+        (n, 1_000_000_000)
+    } else if let Some(n) = q.strip_suffix('T') {
+        (n, 1_000_000_000_000)
+    } else {
+        (q, 1)
+    };
+    num.trim()
+        .parse::<f64>()
+        .ok()
+        .map(|v| (v * mult as f64) as u64)
+}
+
 /// Create the host-side termination-log file with world-writable permissions so
 /// a container running as a non-root UID can write its termination message
 /// through the bind mount.
@@ -3368,6 +3468,21 @@ impl ContainerRuntime {
             let pod_key = pod_dir_key(pod);
             let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_key, volume.name);
             setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
+
+            // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
+            // (propagated to the host daemon via the kubelet's rshared bind) so
+            // it persists across container restarts AND reports fs_type=tmpfs.
+            // K8s ref: pkg/volume/emptydir/empty_dir.go.
+            let is_memory =
+                volume.empty_dir.as_ref().and_then(|e| e.medium.as_deref()) == Some("Memory");
+            if is_memory {
+                let size_bytes = volume
+                    .empty_dir
+                    .as_ref()
+                    .and_then(|e| e.size_limit.as_deref())
+                    .and_then(parse_quantity_bytes);
+                mount_tmpfs_for_emptydir(&volume_dir, size_bytes);
+            }
             info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
             return Ok(volume_dir);
         }
@@ -5031,7 +5146,8 @@ impl ContainerRuntime {
 
         // Build volume bindings
         let mut binds = Vec::new();
-        let mut tmpfs_mounts: HashMap<String, String> = HashMap::new();
+        // Memory-medium emptyDir no longer uses a per-container Docker tmpfs
+        // (it is a host tmpfs bind now — see create_volume); no `tmpfs` mounts.
         let docker_vol_mounts: Vec<bollard::models::Mount> = Vec::new();
 
         // Identify which volumes are emptyDir (should use tmpfs)
@@ -5141,40 +5257,20 @@ impl ContainerRuntime {
                         // for the host-side volume directory (for ConfigMap/Secret data
                         // already written there). But the tmpfs takes precedence at
                         // the mount point for files the container creates.
-                        let is_emptydir = empty_dir_volumes.contains(&mount.name);
-                        let is_memory_medium = pod
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.volumes.as_ref())
-                            .and_then(|vols| vols.iter().find(|v| v.name == mount.name))
-                            .and_then(|v| v.empty_dir.as_ref())
-                            .and_then(|ed| ed.medium.as_deref())
-                            == Some("Memory");
+                        let _is_emptydir = empty_dir_volumes.contains(&mount.name);
 
-                        // Use tmpfs for Memory medium emptyDir (matches K8s behavior
-                        // and conformance test expectations for mount type).
-                        // Note: per-container tmpfs is destroyed on container restart,
-                        // which breaks data persistence. K8s keeps tmpfs alive via
-                        // the pod sandbox mount namespace. We don't share mounts yet.
-                        // Default medium uses bind mounts which persist across restarts.
-                        let use_tmpfs =
-                            is_emptydir && is_memory_medium && expanded_sub_path.is_none();
-
-                        if use_tmpfs {
-                            let opts = if read_only {
-                                "ro,mode=0777".to_string()
-                            } else {
-                                "mode=0777".to_string()
-                            };
-                            tmpfs_mounts.insert(mount.mount_path.clone(), opts);
-                        } else {
-                            let ro_suffix = if read_only { ":ro" } else { "" };
-                            let bind = format!(
-                                "{}:{}{}",
-                                effective_host_path, mount.mount_path, ro_suffix
-                            );
-                            binds.push(bind);
-                        }
+                        // Memory-medium emptyDir is backed by a tmpfs that the
+                        // kubelet mounts on the host volume dir in create_volume
+                        // (see mount_tmpfs_for_emptydir). We therefore bind that
+                        // host path into the container — the bind is tmpfs-backed
+                        // (reports fs_type=tmpfs) and, unlike a per-container
+                        // Docker `--tmpfs`, PERSISTS across container restarts
+                        // (#445). Default-medium emptyDir also binds the host dir.
+                        // Either way we never use a per-container Docker tmpfs.
+                        let ro_suffix = if read_only { ":ro" } else { "" };
+                        let bind =
+                            format!("{}:{}{}", effective_host_path, mount.mount_path, ro_suffix);
+                        binds.push(bind);
                         info!(
                             "Mounting volume {} at {} in container {}",
                             mount.name, mount.mount_path, container.name
@@ -5580,11 +5676,7 @@ impl ContainerRuntime {
                     Some(port_bindings)
                 },
                 binds: if binds.is_empty() { None } else { Some(binds) },
-                tmpfs: if tmpfs_mounts.is_empty() {
-                    None
-                } else {
-                    Some(tmpfs_mounts)
-                },
+                tmpfs: None,
                 mounts: if docker_vol_mounts.is_empty() {
                     None
                 } else {
@@ -8453,6 +8545,13 @@ impl ContainerRuntime {
 
         self.netstack_release_pod(pod_name).await;
 
+        // Unmount any Memory-medium emptyDir tmpfs mounts for this pod before
+        // removing the on-disk volume dirs. The dirs are UID-keyed, so this
+        // needs the Pod object (cleanup_pod_volumes only has the name). Without
+        // the umount, remove_dir_all would hit EBUSY on the tmpfs mountpoint and
+        // leak the mount. K8s ref: pkg/volume/emptydir/empty_dir.go TearDown.
+        self.unmount_pod_emptydir_tmpfs(pod);
+
         // Clean up volumes after all containers are stopped.
         // K8s does this in SyncTerminatedPod, but our sync loop only iterates
         // pods that exist in etcd. If a pod is deleted from etcd before
@@ -8461,6 +8560,28 @@ impl ContainerRuntime {
         self.cleanup_pod_volumes(pod_name).await?;
 
         Ok(())
+    }
+
+    /// Unmount the tmpfs backing each `medium: Memory` emptyDir volume of `pod`
+    /// and remove its (now-empty) UID-keyed volume dir. Best-effort + idempotent.
+    fn unmount_pod_emptydir_tmpfs(&self, pod: &Pod) {
+        let Some(spec) = pod.spec.as_ref() else {
+            return;
+        };
+        let Some(volumes) = spec.volumes.as_ref() else {
+            return;
+        };
+        let pod_key = pod_dir_key(pod);
+        for volume in volumes {
+            let is_memory =
+                volume.empty_dir.as_ref().and_then(|e| e.medium.as_deref()) == Some("Memory");
+            if !is_memory {
+                continue;
+            }
+            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_key, volume.name);
+            unmount_tmpfs(&volume_dir);
+            let _ = std::fs::remove_dir_all(&volume_dir);
+        }
     }
 
     /// Get the exit code of a terminated container.
@@ -9456,7 +9577,17 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{pod_dir_key, split_image_reference, write_file_atomic};
+    use super::{parse_quantity_bytes, pod_dir_key, split_image_reference, write_file_atomic};
+
+    #[test]
+    fn parse_quantity_bytes_handles_binary_and_decimal_suffixes() {
+        assert_eq!(parse_quantity_bytes("1Gi"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_quantity_bytes("512Mi"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_quantity_bytes("100M"), Some(100_000_000));
+        assert_eq!(parse_quantity_bytes("64Ki"), Some(64 * 1024));
+        assert_eq!(parse_quantity_bytes("2048"), Some(2048));
+        assert_eq!(parse_quantity_bytes("bogus"), None);
+    }
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
 

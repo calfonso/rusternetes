@@ -135,7 +135,12 @@ services:
       - rusternetes-net
     volumes:
       - /run/podman/podman.sock:/run/podman/podman.sock:rw
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
+      # volumes propagate back to the host mount namespace, where the Docker
+      # daemon resolves the app-container bind mounts. Without shared
+      # propagation the tmpfs is invisible to app containers and is destroyed
+      # on container restart (breaks emptyDir data persistence — #445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
     environment:
       - RUST_LOG=info
@@ -161,7 +166,12 @@ services:
       - rusternetes-net
     volumes:
       - /run/podman/podman.sock:/run/podman/podman.sock:rw
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
+      # volumes propagate back to the host mount namespace, where the Docker
+      # daemon resolves the app-container bind mounts. Without shared
+      # propagation the tmpfs is invisible to app containers and is destroyed
+      # on container restart (breaks emptyDir data persistence — #445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
     environment:
       - RUST_LOG=info
