@@ -44,6 +44,43 @@ bash scripts/conformance-progress.sh  # Monitor pass/fail progress
 
 KUBECONFIG: `~/.kube/rusternetes-config`
 
+### Local build performance
+
+The slow part of local iteration is **codegen on every edit**, not linking.
+Two settings dominate; both are machine-local (shell + `~/.cargo/config.toml`),
+not checked in:
+
+- **Incremental compilation, no local sccache.** Local sccache forces
+  `CARGO_INCREMENTAL=0`, and on a single-developer machine cargo's own
+  fingerprinting already skips unchanged crates, so local sccache hit-rate is
+  ~0% — you pay the no-incremental cost for no cache benefit. Locally, **unset
+  `RUSTC_WRAPPER` and set `CARGO_INCREMENTAL=1`**. Measured: a trivial edit →
+  rebuild of one crate drops from ~35s to ~5s. CI runs its own cluster-side
+  sccache→MinIO (see `indy/arc-runner/sccache-minio`), independent of local —
+  leave that alone.
+- **mold linker.** Uncomment the `[target.x86_64-unknown-linux-gnu]` block in
+  `~/.cargo/config.toml` (`linker = "clang"`, `-fuse-ld=mold`; needs
+  `apt-get install mold clang`). 3–5× faster links. The checked-in
+  `.cargo/config.toml` keeps this commented so CI links with system `ld` and
+  doesn't paper over mold-specific release issues. **Do not** add a
+  `[build] rustflags = ["-Z", "threads=24"]` line: `-Z` is nightly-only (the
+  pinned toolchain is stable) and cargo silently drops `[build].rustflags`
+  whenever a `[target.*].rustflags` exists — it's dead config that breaks
+  stable builds the moment the mold block is removed.
+
+**Shared target dir across worktrees.** Set
+`CARGO_TARGET_DIR=$HOME/.cache/rusternetes-target` and symlink each checkout's
+`./target` to it (`ln -s "$CARGO_TARGET_DIR" target`). All worktrees then share
+one compiled-dependency cache (~40–120G once, not per-worktree) and reuse each
+other's artifacts. Trade-off: cargo's target-lock serializes concurrent builds
+across worktrees (one `cargo build` at a time), which also keeps the disk from
+filling. Scripts that reference `target/debug/<bin>` keep working through the
+symlink.
+
+> Shell env vars set in `~/.bashrc` only reach **new interactive** shells
+> (`~/.bashrc` returns early for non-interactive shells). After editing them,
+> open a fresh terminal — already-running processes keep the old environment.
+
 ## Architecture
 
 Rust reimplementation of Kubernetes. Workspace with 10 crates:
