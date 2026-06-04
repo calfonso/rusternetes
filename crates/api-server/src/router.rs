@@ -1615,17 +1615,22 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // /apis/apiregistration.k8s.io/v1 stays public (no AuthContext).
         .route(
             "/apis/apiregistration.k8s.io/v1/apiservices",
-            get(handlers::generic::list_apiservices).post(handlers::generic::create_apiservice),
+            get(handlers::generic::list_apiservices)
+                .post(handlers::generic::create_apiservice)
+                .delete(handlers::generic::deletecollection_apiservices),
         )
         .route(
             "/apis/apiregistration.k8s.io/v1/apiservices/:name",
             get(handlers::generic::get_apiservice)
                 .put(handlers::generic::update_apiservice)
+                .patch(handlers::generic::patch_apiservice)
                 .delete(handlers::generic::delete_apiservice),
         )
         .route(
             "/apis/apiregistration.k8s.io/v1/apiservices/:name/status",
-            get(handlers::generic::get_apiservice).put(handlers::generic::update_apiservice_status),
+            get(handlers::generic::get_apiservice)
+                .put(handlers::generic::update_apiservice_status)
+                .patch(handlers::generic::patch_apiservice),
         )
         // ValidatingWebhookConfiguration (cluster-scoped)
         .route(

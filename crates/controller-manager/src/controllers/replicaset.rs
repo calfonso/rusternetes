@@ -679,7 +679,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             block_owner_deletion: Some(true),
         }]);
 
-        let pod = Pod {
+        let mut pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
@@ -706,6 +706,33 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 start_time: None,
             }),
         };
+
+        // Inject the ServiceAccount token volume exactly as the api-server's
+        // admission does for HTTP pod creates. Controllers write pods straight
+        // to storage and bypass that admission path, so without this a
+        // controller-created pod (and anything running in it, e.g. an
+        // aggregated apiserver — #225) has no
+        // /var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}.
+        if let Some(spec) = pod.spec.as_mut() {
+            let sa_name = rusternetes_common::serviceaccount::ensure_service_account_name(spec);
+            let sa_automount = self
+                .storage
+                .get::<rusternetes_common::resources::ServiceAccount>(&build_key(
+                    "serviceaccounts",
+                    Some(namespace),
+                    &sa_name,
+                ))
+                .await
+                .ok()
+                .and_then(|sa| sa.automount_service_account_token);
+            let should_mount = match spec.automount_service_account_token {
+                Some(v) => v,
+                None => sa_automount.unwrap_or(true),
+            };
+            if should_mount {
+                rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
+            }
+        }
 
         // Check ResourceQuota before creating pod
         super::check_resource_quota(&*self.storage, namespace)

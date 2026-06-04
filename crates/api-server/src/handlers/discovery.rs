@@ -329,6 +329,44 @@ pub async fn get_api_groups(
                     }
                 }
             }
+
+            // Merge aggregated (APIService-backed) groups. The kube-aggregator
+            // inlines each backend's resources into the aggregated-discovery
+            // document, so we fetch the backend's APIResourceList and convert it.
+            // Without this an aggregated group (e.g. wardle.example.com) is
+            // invisible to discovery clients even though the proxy works (#225).
+            for entry in crate::handlers::generic::list_registered_apiservice_groups(st).await {
+                let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if name.is_empty() || seen_groups.contains(name) {
+                    continue;
+                }
+                let mut versions_out: Vec<serde_json::Value> = Vec::new();
+                if let Some(vers) = entry.get("versions").and_then(|v| v.as_array()) {
+                    for v in vers {
+                        let Some(ver) = v.get("version").and_then(|x| x.as_str()) else {
+                            continue;
+                        };
+                        let resources =
+                            crate::handlers::generic::aggregated_discovery_resources(st, name, ver)
+                                .await
+                                .unwrap_or_default();
+                        versions_out.push(serde_json::json!({
+                            "version": ver,
+                            "resources": resources,
+                            "freshness": "Current",
+                        }));
+                    }
+                }
+                if !versions_out.is_empty() {
+                    seen_groups.insert(name.to_string());
+                    groups.push(serde_json::json!({
+                        "metadata": { "name": name },
+                        "versions": versions_out,
+                    }));
+                }
+            }
         }
 
         let discovery = serde_json::json!({

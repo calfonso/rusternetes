@@ -372,6 +372,7 @@ async fn forward_to_aggregator_forwards_body_and_impersonation() {
         insecure_skip_tls_verify: true,
         ca_bundle: None,
         scheme: "http",
+        server_name: None,
     };
 
     let auth = test_user("alice", &["dev"], &[("scopes", &["read"])]);
@@ -449,6 +450,7 @@ async fn forward_to_aggregator_includes_query_string() {
         insecure_skip_tls_verify: true,
         ca_bundle: None,
         scheme: "http",
+        server_name: None,
     };
     let auth = test_user("system:anonymous", &[], &[]);
     let resp = forward_to_aggregator(
@@ -488,6 +490,7 @@ async fn forward_to_aggregator_returns_503_when_backend_down() {
         insecure_skip_tls_verify: true,
         ca_bundle: None,
         scheme: "http",
+        server_name: None,
     };
     let auth = test_user("system:anonymous", &[], &[]);
     let resp = forward_to_aggregator(
