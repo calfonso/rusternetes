@@ -1877,6 +1877,12 @@ impl ContainerRuntime {
             }
         }
 
+        // Program hostPort routing (iptables DNAT) now that the pod IP is known.
+        // Idempotent — safe to re-run on every sync. See setup_hostport_rules (#403).
+        if let Some(ip) = pod_ip.as_deref() {
+            self.setup_hostport_rules(pod, ip);
+        }
+
         // For restartPolicy=Never pods, containers may exit immediately.
         // K8s SyncPod detects this within the same call and updates status.
         // Without this, the kubelet sync loop (3s interval) misses fast-exiting
@@ -2034,6 +2040,167 @@ impl ContainerRuntime {
         Ok(Some(hosts_path))
     }
 
+    /// Stable short hash of a pod name for deriving iptables chain names.
+    /// iptables chain names are limited to ~28 chars but pod names can be far
+    /// longer, so we hash. FNV-1a is deterministic across process restarts
+    /// (unlike `DefaultHasher`) so teardown after a kubelet restart still
+    /// derives the same chain names.
+    fn hostport_chain_hash(pod_name: &str) -> String {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in pod_name.bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        format!("{:08x}", h)
+    }
+
+    /// Run `iptables <args>` in the kubelet's network namespace; true on exit 0.
+    fn run_iptables(args: &[&str]) -> bool {
+        Command::new("iptables")
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Program a pod's hostPort routing as iptables DNAT — a minimal in-kubelet
+    /// CNI `portmap` — instead of Docker `-p` publishing.
+    ///
+    /// Docker `-p hostIP:hostPort:ctrPort` binds a socket on the host daemon,
+    /// which cannot bind a node InternalIP that is really the kubelet
+    /// container's bridge IP (conformance "[sig-network] HostPort", #403). DNAT
+    /// only matches+rewrites packets, so it works for the node IP. Per-pod
+    /// chains (`RK-HP-<hash>` for DNAT, `RK-MQ-<hash>` for MASQUERADE) make
+    /// teardown IP-independent. The MASQUERADE is required because, on the flat
+    /// shared bridge, the pod would otherwise reply directly to the client and
+    /// bypass conntrack — masquerading to the kubelet forces a symmetric path.
+    fn setup_hostport_rules(&self, pod: &Pod, pod_ip: &str) {
+        let Some(spec) = &pod.spec else {
+            return;
+        };
+        // hostNetwork pods bind the node IP directly — the container already
+        // listens on hostPort in the node netns, so no DNAT is needed (and a
+        // rule with podIP == nodeIP would self-loop). Upstream's portmap CNI
+        // plugin is likewise skipped for hostNetwork pods.
+        if spec.host_network.unwrap_or(false) {
+            return;
+        }
+        // (hostPort, proto-lowercase, containerPort, optional specific hostIP)
+        let mut rules: Vec<(u16, String, u16, Option<String>)> = Vec::new();
+        for c in &spec.containers {
+            if let Some(ports) = &c.ports {
+                for p in ports {
+                    if let Some(hp) = p.host_port.filter(|&x| x != 0) {
+                        let proto = p.protocol.as_deref().unwrap_or("TCP").to_lowercase();
+                        let hip = p
+                            .host_ip
+                            .clone()
+                            .filter(|s| !s.is_empty() && s != "0.0.0.0" && s != "::");
+                        rules.push((hp, proto, p.container_port, hip));
+                    }
+                }
+            }
+        }
+        if rules.is_empty() {
+            return;
+        }
+        let hash = Self::hostport_chain_hash(&pod.metadata.name);
+        let dnat = format!("RK-HP-{}", hash);
+        let masq = format!("RK-MQ-{}", hash);
+        // (Re)create + flush the per-pod chains so re-sync is idempotent.
+        let _ = Self::run_iptables(&["-t", "nat", "-N", &dnat]);
+        let _ = Self::run_iptables(&["-t", "nat", "-F", &dnat]);
+        let _ = Self::run_iptables(&["-t", "nat", "-N", &masq]);
+        let _ = Self::run_iptables(&["-t", "nat", "-F", &masq]);
+        for (hp, proto, ctr, hip) in &rules {
+            let dport = hp.to_string();
+            let cport = ctr.to_string();
+            let dest = format!("{}:{}", pod_ip, ctr);
+            let mut a: Vec<&str> = vec!["-t", "nat", "-A", &dnat, "-p", proto];
+            if let Some(h) = hip {
+                a.push("-d");
+                a.push(h.as_str());
+            }
+            a.extend_from_slice(&["--dport", &dport, "-j", "DNAT", "--to-destination", &dest]);
+            Self::run_iptables(&a);
+            Self::run_iptables(&[
+                "-t",
+                "nat",
+                "-A",
+                &masq,
+                "-p",
+                proto,
+                "-d",
+                pod_ip,
+                "--dport",
+                &cport,
+                "-j",
+                "MASQUERADE",
+            ]);
+        }
+        // Hook the per-pod chains into the nat hooks once (idempotent via -C).
+        for parent in ["PREROUTING", "OUTPUT"] {
+            if !Self::run_iptables(&["-t", "nat", "-C", parent, "-j", &dnat]) {
+                Self::run_iptables(&["-t", "nat", "-A", parent, "-j", &dnat]);
+            }
+        }
+        if !Self::run_iptables(&["-t", "nat", "-C", "POSTROUTING", "-j", &masq]) {
+            Self::run_iptables(&["-t", "nat", "-A", "POSTROUTING", "-j", &masq]);
+        }
+        info!(
+            "Programmed hostPort DNAT rules for pod {} ({} rule(s) -> {})",
+            pod.metadata.name,
+            rules.len(),
+            pod_ip
+        );
+    }
+
+    /// Remove the hostPort DNAT/MASQUERADE chains for a pod (jumps are deleted
+    /// by their IP-independent `-j <chain>` spec, then the chains flushed+removed).
+    fn teardown_hostport_rules(pod_name: &str) {
+        let hash = Self::hostport_chain_hash(pod_name);
+        let dnat = format!("RK-HP-{}", hash);
+        let masq = format!("RK-MQ-{}", hash);
+        for parent in ["PREROUTING", "OUTPUT"] {
+            let _ = Self::run_iptables(&["-t", "nat", "-D", parent, "-j", &dnat]);
+        }
+        let _ = Self::run_iptables(&["-t", "nat", "-D", "POSTROUTING", "-j", &masq]);
+        let _ = Self::run_iptables(&["-t", "nat", "-F", &dnat]);
+        let _ = Self::run_iptables(&["-t", "nat", "-X", &dnat]);
+        let _ = Self::run_iptables(&["-t", "nat", "-F", &masq]);
+        let _ = Self::run_iptables(&["-t", "nat", "-X", &masq]);
+    }
+
+    /// The kubelet's own container ID, used as the network-namespace donor
+    /// for hostNetwork pods. In the DinD/compose topology the "node" is the
+    /// kubelet container itself, so a hostNetwork pod must join *this*
+    /// container's netns (`network_mode: container:<id>`). Docker sets
+    /// `$HOSTNAME` to the short container ID by default, which Docker accepts
+    /// as a container reference.
+    fn own_container_id(&self) -> Option<String> {
+        std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty())
+    }
+
+    /// The node's InternalIP — the kubelet container's own bridge IP. Used as
+    /// `status.podIP` for hostNetwork pods, which share the node netns and
+    /// therefore carry the node's IP (matching upstream). Resolved the same
+    /// way the kubelet computes its node InternalIP (`detect_internal_ip`).
+    fn node_internal_ip(&self) -> String {
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 0u16))
+            {
+                for addr in addrs {
+                    if let std::net::IpAddr::V4(ip) = addr.ip() {
+                        if !ip.is_loopback() {
+                            return ip.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        "127.0.0.1".to_string()
+    }
+
     /// Start a pause (infra) container for a pod in non-CNI mode.
     ///
     /// The pause container holds the pod's network namespace. All real containers
@@ -2045,6 +2212,25 @@ impl ContainerRuntime {
     async fn start_pause_container(&self, pod_name: &str, pod: &Pod) -> Result<String> {
         let pause_name = format!("{}_pause", pod_name);
 
+        // hostNetwork pods share the node's network namespace. In the
+        // DinD/compose topology the "node" is the kubelet container itself,
+        // so the sandbox must join *this* container's netns rather than the
+        // pod bridge. That makes node-local addresses (127.0.0.1, the node
+        // InternalIP) and the hostPort DNAT rules installed in the node netns
+        // reachable from the pod — matching upstream, where hostNetwork pods
+        // run in the node root netns (sandbox network NamespaceMode_NODE).
+        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_sandbox.go.
+        let is_host_network = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.host_network)
+            .unwrap_or(false);
+        let host_netns_ref = if is_host_network {
+            self.own_container_id()
+        } else {
+            None
+        };
+
         // Check if pause container already exists and is running — if so, just return its IP.
         // Recreating the pause container would destroy all containers sharing its network namespace.
         if let Ok(inspect) = self
@@ -2055,7 +2241,32 @@ impl ContainerRuntime {
             let state = inspect.state.as_ref();
             let is_running = state.and_then(|s| s.running).unwrap_or(false);
 
-            if is_running {
+            // A sandbox's network namespace is fixed at creation. A running
+            // pause left over in the *wrong* mode — e.g. a prior bridge-mode
+            // pause for a pod that is now hostNetwork, or vice versa — must be
+            // recreated, not reused, or the pod silently lands in the wrong
+            // netns. (The host docker daemon is shared across kubelet
+            // containers, so a same-named pause can survive across runs.)
+            // Docker expands `container:<short>` to the full id, so match host
+            // mode by the `container:` prefix rather than an exact id.
+            let current_mode = inspect
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.network_mode.as_deref());
+            let netns_matches = if host_netns_ref.is_some() {
+                current_mode
+                    .map(|m| m.starts_with("container:"))
+                    .unwrap_or(false)
+            } else {
+                current_mode == Some(self.network.as_str())
+            };
+
+            if is_running && netns_matches {
+                // hostNetwork sandbox shares the node netns — it has no bridge
+                // attachment, so its pod IP is the node InternalIP.
+                if is_host_network {
+                    return Ok(self.node_internal_ip());
+                }
                 // Pause container is already running — return its IP
                 if let Some(network_settings) = inspect.network_settings {
                     if let Some(networks) = network_settings.networks {
@@ -2130,7 +2341,7 @@ impl ContainerRuntime {
         // The pause container owns the network namespace and must declare all ports;
         // child containers that join via --network container:<pause> cannot re-declare them.
         let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
-        let mut port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
+        let port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
             HashMap::new();
         if let Some(spec) = &pod.spec {
             for c in &spec.containers {
@@ -2139,31 +2350,12 @@ impl ContainerRuntime {
                         let proto = port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
                         let port_key = format!("{}/{}", port.container_port, proto);
                         exposed_ports.insert(port_key.clone(), HashMap::new());
-                        if let Some(host_port) = port.host_port {
-                            // Use the pod spec's hostIP if specified, otherwise 0.0.0.0.
-                            // Different pods can bind the same port on different hostIPs.
-                            // K8s ref: pkg/kubelet/cm/container_manager_linux.go
-                            //
-                            // We pass the hostIP directly to Docker. In our architecture
-                            // the kubelet uses the host Docker daemon (via docker.sock),
-                            // so the node's InternalIP (Docker bridge IP) is available
-                            // for binding. This allows two pods with the same hostPort
-                            // but different hostIPs (e.g., 127.0.0.1 vs 172.18.0.6) to
-                            // coexist without conflict.
-                            let bind_ip = port.host_ip.as_deref().unwrap_or("0.0.0.0");
-                            let bind_ip = if bind_ip.is_empty() || bind_ip == "::" {
-                                "0.0.0.0"
-                            } else {
-                                bind_ip
-                            };
-                            port_bindings.insert(
-                                port_key,
-                                Some(vec![bollard::models::PortBinding {
-                                    host_ip: Some(bind_ip.to_string()),
-                                    host_port: Some(host_port.to_string()),
-                                }]),
-                            );
-                        }
+                        // hostPort is NOT published via Docker `-p`. Docker `-p`
+                        // binds a socket on the host daemon, which cannot bind a
+                        // node InternalIP that is really the kubelet container's
+                        // bridge IP. hostPort is instead routed with iptables
+                        // DNAT once the pod IP is known (see setup_hostport_rules,
+                        // conformance "[sig-network] HostPort", #403).
                     }
                 }
             }
@@ -2213,22 +2405,32 @@ impl ContainerRuntime {
         let config = Config {
             image: Some("busybox:latest".to_string()),
             cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
-            hostname: Some(pause_hostname),
-            exposed_ports: if exposed_ports.is_empty() {
+            // Docker rejects hostname / exposed-ports / dns when the sandbox
+            // joins another container's netns (host_netns_ref) — those come
+            // from the donor netns. Only set them in the normal bridge case.
+            hostname: if host_netns_ref.is_some() {
+                None
+            } else {
+                Some(pause_hostname)
+            },
+            exposed_ports: if host_netns_ref.is_some() || exposed_ports.is_empty() {
                 None
             } else {
                 Some(exposed_ports)
             },
             host_config: Some(bollard::models::HostConfig {
-                network_mode: Some(self.network.clone()),
+                network_mode: Some(match &host_netns_ref {
+                    Some(id) => format!("container:{}", id),
+                    None => self.network.clone(),
+                }),
                 // Shareable IPC so app containers can join via ipc_mode=container:pause
                 ipc_mode: Some("shareable".to_string()),
-                dns: if is_coredns {
+                dns: if is_coredns || host_netns_ref.is_some() {
                     None
                 } else {
                     Some(vec![self.cluster_dns.clone()])
                 },
-                dns_options: if is_coredns {
+                dns_options: if is_coredns || host_netns_ref.is_some() {
                     None
                 } else {
                     Some(vec!["ndots:5".to_string()])
@@ -2391,6 +2593,12 @@ impl ContainerRuntime {
         }
 
         info!("Pause container {} running", pause_name);
+
+        // hostNetwork sandbox shares the node netns — no bridge IP to inspect;
+        // its pod IP is the node InternalIP.
+        if is_host_network {
+            return Ok(self.node_internal_ip());
+        }
 
         // Inspect to get the assigned IP
         let inspect = self
@@ -4769,7 +4977,7 @@ impl ContainerRuntime {
         let using_pause_network = !self.use_cni && netns_path.is_none();
 
         let mut exposed_ports = HashMap::new();
-        let mut port_bindings = HashMap::new();
+        let port_bindings = HashMap::new();
 
         if !using_pause_network {
             if let Some(ports) = &container.ports {
@@ -4777,20 +4985,8 @@ impl ContainerRuntime {
                     let proto = port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
                     let port_key = format!("{}/{}", port.container_port, proto);
                     exposed_ports.insert(port_key.clone(), HashMap::new());
-
-                    if let Some(host_port) = port.host_port {
-                        // Use the pod spec's hostIP if specified, otherwise 0.0.0.0.
-                        // K8s allows different pods to bind the same hostPort on
-                        // different hostIPs (e.g., 127.0.0.1 vs 172.18.0.6).
-                        let bind_ip = port.host_ip.as_deref().unwrap_or("0.0.0.0").to_string();
-                        port_bindings.insert(
-                            port_key,
-                            Some(vec![bollard::models::PortBinding {
-                                host_ip: Some(bind_ip),
-                                host_port: Some(host_port.to_string()),
-                            }]),
-                        );
-                    }
+                    // hostPort is routed via iptables DNAT (setup_hostport_rules),
+                    // not Docker `-p` — see the pause-container path and #403.
                 }
             }
         }
@@ -6119,6 +6315,9 @@ impl ContainerRuntime {
     /// after all containers are stopped, and by the container GC for
     /// orphaned pods. K8s ref: pkg/kubelet/kubelet.go:2484
     pub async fn cleanup_pod_volumes(&self, pod_name: &str) -> Result<()> {
+        // Remove any hostPort DNAT/MASQUERADE chains for this pod (#403).
+        Self::teardown_hostport_rules(pod_name);
+
         let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
 
         if std::path::Path::new(&volume_dir).exists() {
@@ -8444,6 +8643,22 @@ impl ContainerRuntime {
                     .docker
                     .inspect_container(id, None::<InspectContainerOptions>)
                     .await?;
+
+                // hostNetwork sandbox: the pause container joins the node
+                // (kubelet) netns via `network_mode: container:<id>`, so it has
+                // no bridge attachment to inspect. Its pod IP is the node
+                // InternalIP. Detect this by the pause's NetworkMode.
+                let joins_container_netns = inspect
+                    .host_config
+                    .as_ref()
+                    .and_then(|hc| hc.network_mode.as_deref())
+                    .map(|nm| nm.starts_with("container:"))
+                    .unwrap_or(false);
+                if joins_container_netns {
+                    let ip = self.node_internal_ip();
+                    debug!("Pod {} is hostNetwork — using node IP {}", pod_name, ip);
+                    return Ok(Some(ip));
+                }
 
                 if let Some(network_settings) = inspect.network_settings {
                     // First try to get IP from the specific network we're using
