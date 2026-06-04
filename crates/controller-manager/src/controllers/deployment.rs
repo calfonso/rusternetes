@@ -696,9 +696,27 @@ impl<S: Storage + 'static> DeploymentController<S> {
             // Also handle the case where the new RS has the right count but old
             // RSes still have pods — need to scale them down even without a
             // rolling update in progress.
-            // K8s ref: sync.go:320-327 — IsSaturated check
-            if active_replicas >= desired_replicas && old_rs_total > 0 && !is_scaling_event {
-                // New RS is saturated — scale all old RSes to 0
+            // K8s ref: sync.go:320-327 — IsSaturated check.
+            //
+            // IsSaturated requires the new RS to be fully scaled up AND every
+            // replica available, not merely spec.replicas == desired:
+            //   Spec.Replicas == Status.Replicas == Status.AvailableReplicas == desired
+            // (deployment_util.go::IsSaturated). Scaling old RSes to 0 on the
+            // spec count alone tears down the running old pods while the new
+            // ones are still unavailable — violating maxUnavailable. The
+            // conformance "deployment should support rollover" creates a new RS
+            // on a nonexistent image (never available) and asserts the old RS
+            // stays at 1; the spec-only check wrongly scaled it to 0.
+            let active_available = if let Some(status) = &active.status {
+                status.available_replicas
+            } else {
+                self.count_available_pods_for_rs(&active_name, namespace)
+                    .await
+            };
+            let new_rs_saturated =
+                active_replicas == desired_replicas && active_available == desired_replicas;
+            if new_rs_saturated && old_rs_total > 0 && !is_scaling_event {
+                // New RS is saturated (fully available) — scale all old RSes to 0.
                 for rs in owned_replicasets.iter() {
                     if rs.metadata.name != active_name && rs.spec.replicas > 0 {
                         info!(
@@ -717,7 +735,6 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 // reconcileNewReplicaSet: scale up based on maxTotalPods - currentPodCount
                 // reconcileOldReplicaSets: scale down based on allPodsCount - minAvailable - newRSUnavailable
                 let max_total = desired_replicas + max_surge;
-                let min_available = (desired_replicas - max_unavailable).max(0);
 
                 // K8s NewRSNewReplicas (deployment_util.go:820):
                 // currentPodCount = sum of all RS replicas (spec, not status)
@@ -745,78 +762,19 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     .await?;
                 }
 
-                // K8s reconcileOldReplicaSets (rolling.go:86-132):
-                // maxScaledDown = allPodsCount - minAvailable - newRSUnavailablePodCount
-                // Uses RS status.AvailableReplicas for availability counts.
-                // This prevents over-aggressive scale-down when new pods aren't ready.
-                //
-                // Count available replicas from all RSes (status-based, matching K8s).
-                // Fall back to counting pods directly if RS status is not yet populated.
-                let _all_available: i32 = owned_replicasets
-                    .iter()
-                    .map(|rs| {
-                        if let Some(status) = &rs.status {
-                            status.available_replicas
-                        } else {
-                            // Fall back to pod count
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(
-                                    self.count_available_pods_for_rs(&rs.metadata.name, namespace),
-                                )
-                            })
-                        }
-                    })
-                    .sum();
-
-                // New RS unavailable count = newRS.Spec.Replicas - newRS.Status.AvailableReplicas
-                let new_rs_available = if let Some(new_rs) = owned_replicasets
-                    .iter()
-                    .find(|rs| rs.metadata.name == active_name)
-                {
-                    if let Some(status) = &new_rs.status {
-                        status.available_replicas
-                    } else {
-                        self.count_available_pods_for_rs(&active_name, namespace)
-                            .await
-                    }
-                } else {
-                    0
-                };
-                let new_rs_unavailable = (new_active_replicas - new_rs_available).max(0);
-
-                // allPodsCount uses the updated count after scaling up
-                let all_pods_count: i32 = owned_replicasets
-                    .iter()
-                    .map(|rs| {
-                        if rs.metadata.name == active_name {
-                            new_active_replicas // Use the just-scaled-up count
-                        } else {
-                            rs.spec.replicas
-                        }
-                    })
-                    .sum();
-
-                let max_scaled_down = (all_pods_count - min_available - new_rs_unavailable).max(0);
-                let scale_down_by = max_scaled_down.min(old_rs_total);
-
-                if scale_down_by > 0 {
-                    let mut remaining_to_remove = scale_down_by;
-                    for rs in owned_replicasets.iter() {
-                        if rs.metadata.name != active_name
-                            && rs.spec.replicas > 0
-                            && remaining_to_remove > 0
-                        {
-                            let remove_from_this = rs.spec.replicas.min(remaining_to_remove);
-                            let new_replicas = rs.spec.replicas - remove_from_this;
-                            info!(
-                                "Rolling update: scaling down old ReplicaSet {}/{} from {} to {}",
-                                namespace, rs.metadata.name, rs.spec.replicas, new_replicas
-                            );
-                            self.update_replicaset_replicas(rs, new_replicas).await?;
-                            remaining_to_remove -= remove_from_this;
-                        }
-                    }
-                }
+                // reconcileOldReplicaSets — two-phase scale-down (cleanup
+                // unhealthy, then scale down healthy to minAvailable). Shared
+                // with the active>=desired path so both use lag-free,
+                // minReadySeconds-aware availability.
+                self.reconcile_old_replicasets(
+                    &owned_replicasets,
+                    &active_name,
+                    new_active_replicas,
+                    desired_replicas,
+                    max_unavailable,
+                    namespace,
+                )
+                .await?;
             } else {
                 // No rolling update needed (or already at desired), just ensure correct count
                 if active_replicas != desired_replicas {
@@ -835,38 +793,38 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     .await?;
                 }
 
-                // Scale down old ReplicaSets gradually — only remove old pods
-                // when the new RS has enough available replicas to maintain
-                // the minimum availability guarantee.
-                // K8s ref: pkg/controller/deployment/rolling.go — reconcileOldReplicaSets
-                let new_rs_available = self
-                    .count_available_pods_for_rs(&active_name, namespace)
-                    .await;
-                let min_available = (desired_replicas - max_unavailable).max(0);
-                let mut can_scale_down = (new_rs_available - min_available).max(0);
-                // When new RS is fully available, ensure old RSes are scaled to 0
-                // even if maxUnavailable rounds to 0 (e.g., 25% of 1 = 0)
-                if new_rs_available >= desired_replicas && old_rs_total > 0 && can_scale_down == 0 {
-                    can_scale_down = old_rs_total; // Force scale down all old RSes
-                }
-
-                if can_scale_down > 0 {
-                    let mut remaining = can_scale_down;
-                    for rs in owned_replicasets.iter() {
-                        if rs.metadata.name != active_name && rs.spec.replicas > 0 && remaining > 0
-                        {
-                            let remove = rs.spec.replicas.min(remaining);
-                            let new_replicas = rs.spec.replicas - remove;
-                            info!(
-                                "Scaling down old ReplicaSet {}/{} from {} to {} (available={})",
-                                namespace,
-                                rs.metadata.name,
-                                rs.spec.replicas,
-                                new_replicas,
-                                new_rs_available
-                            );
-                            self.update_replicaset_replicas(rs, new_replicas).await?;
-                            remaining -= remove;
+                // Scale down old ReplicaSets.
+                if is_rolling_update {
+                    // active >= desired: the new RS is at full count. Use the
+                    // same availability-gated two-phase reconcileOldReplicaSets
+                    // as the active<desired path, so old pods are never drained
+                    // below minAvailable while the new RS is still inside its
+                    // minReadySeconds window (conformance "deployment should
+                    // support rollover").
+                    self.reconcile_old_replicasets(
+                        &owned_replicasets,
+                        &active_name,
+                        desired_replicas,
+                        desired_replicas,
+                        max_unavailable,
+                        namespace,
+                    )
+                    .await?;
+                } else {
+                    // Recreate / non-rolling: once the new RS is fully available,
+                    // scale every old ReplicaSet to 0.
+                    let new_rs_available = self
+                        .count_available_pods_for_rs(&active_name, namespace)
+                        .await;
+                    if new_rs_available >= desired_replicas && old_rs_total > 0 {
+                        for rs in owned_replicasets.iter() {
+                            if rs.metadata.name != active_name && rs.spec.replicas > 0 {
+                                info!(
+                                    "Scaling down old ReplicaSet {}/{} to 0 (new RS available={})",
+                                    namespace, rs.metadata.name, new_rs_available
+                                );
+                                self.update_replicaset_replicas(rs, 0).await?;
+                            }
                         }
                     }
                 }
@@ -939,29 +897,17 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 self.create_replicaset_with_replicas(deployment, initial_replicas)
                     .await?;
 
-                // K8s reconcileOldReplicaSets (rolling.go:86-132):
-                // maxScaledDown = allPodsCount - minAvailable - newRSUnavailablePodCount
-                // Since new RS was just created, all its pods are unavailable.
-                // newRSUnavailablePodCount = initial_replicas (none are available yet)
-                let min_available = (desired_replicas - max_unavailable).max(0);
-                let all_pods_count = old_rs_total + initial_replicas;
-                let new_rs_unavailable = initial_replicas; // Just created, none available yet
-                let max_scaled_down = (all_pods_count - min_available - new_rs_unavailable).max(0);
-                let scale_down_by = max_scaled_down.min(old_rs_total);
-
-                let mut remaining_to_remove = scale_down_by;
-                for rs in owned_replicasets.iter() {
-                    if rs.spec.replicas > 0 && remaining_to_remove > 0 {
-                        let remove_from_this = rs.spec.replicas.min(remaining_to_remove);
-                        let new_replicas = rs.spec.replicas - remove_from_this;
-                        info!(
-                            "Rolling update: scaling down old ReplicaSet {}/{} from {} to {}",
-                            namespace, rs.metadata.name, rs.spec.replicas, new_replicas
-                        );
-                        self.update_replicaset_replicas(rs, new_replicas).await?;
-                        remaining_to_remove -= remove_from_this;
-                    }
-                }
+                // Do NOT scale old ReplicaSets down in this same pass. Old-RS
+                // scale-down is handled by the rolling-update branch above
+                // (reconcileOldReplicaSets), which uses lag-free, minReadySeconds-
+                // aware availability and a faithful two-phase (cleanup-unhealthy
+                // then scale-down-healthy) algorithm. The previous inline loop
+                // here scaled down old RSes in arbitrary order with no
+                // availability check, draining a still-available old RS the
+                // instant the new RS was created — dropping total availability
+                // below minAvailable and failing the "deployment should support
+                // rollover" rolling-update invariant. The next reconcile (with
+                // the new RS now the active RS) performs the correct scale-down.
             } else {
                 // No old RSs: create at full desired count
                 self.create_replicaset(deployment).await?;
@@ -1432,6 +1378,183 @@ impl<S: Storage + 'static> DeploymentController<S> {
     }
 
     /// Count pods that are Ready for a given ReplicaSet
+    /// reconcileOldReplicaSets (pkg/controller/deployment/rolling.go) — the
+    /// single, correct old-ReplicaSet scale-down used by every rolling-update
+    /// path. Two phases:
+    ///
+    /// 1. cleanupUnhealthyReplicas — remove only UNAVAILABLE replicas
+    ///    (spec - available) from each old RS, bounded by maxScaledDown.
+    /// 2. scaleDownOldReplicaSetsForRollingUpdate — remove HEALTHY old pods,
+    ///    but only down to minAvailable AVAILABLE pods across the deployment.
+    ///
+    /// Availability is computed from pods (lag-free, minReadySeconds-aware) so a
+    /// still-available old RS is never drained while the new RS is inside its
+    /// minReadySeconds window. `new_active_replicas` is the new RS's spec count
+    /// after this round's scale-up.
+    async fn reconcile_old_replicasets(
+        &self,
+        owned_replicasets: &[ReplicaSet],
+        active_name: &str,
+        new_active_replicas: i32,
+        desired_replicas: i32,
+        max_unavailable: i32,
+        namespace: &str,
+    ) -> rusternetes_common::Result<()> {
+        let min_available = (desired_replicas - max_unavailable).max(0);
+        let old_rs_list: Vec<ReplicaSet> = owned_replicasets
+            .iter()
+            .filter(|rs| rs.metadata.name != active_name)
+            .cloned()
+            .collect();
+        if old_rs_list.iter().all(|rs| rs.spec.replicas == 0) {
+            return Ok(());
+        }
+
+        let new_rs_available = if let Some(new_rs) = owned_replicasets
+            .iter()
+            .find(|rs| rs.metadata.name == active_name)
+        {
+            self.count_available_pods_min_ready(new_rs, namespace).await
+        } else {
+            0
+        };
+        let new_rs_unavailable = (new_active_replicas - new_rs_available).max(0);
+        let all_pods_count =
+            new_active_replicas + old_rs_list.iter().map(|rs| rs.spec.replicas).sum::<i32>();
+        let max_scaled_down = (all_pods_count - min_available - new_rs_unavailable).max(0);
+        if max_scaled_down <= 0 {
+            return Ok(());
+        }
+
+        let mut cur_replicas: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+        let mut old_available: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+        for rs in &old_rs_list {
+            cur_replicas.insert(rs.metadata.name.clone(), rs.spec.replicas);
+            let avail = self.count_available_pods_min_ready(rs, namespace).await;
+            old_available.insert(rs.metadata.name.clone(), avail);
+        }
+        let mut ordered: Vec<&ReplicaSet> = old_rs_list.iter().collect();
+        ordered.sort_by(|a, b| {
+            a.metadata
+                .creation_timestamp
+                .cmp(&b.metadata.creation_timestamp)
+        });
+
+        // Phase 1 — cleanup unhealthy (unavailable) replicas only.
+        let mut cleanup_done = 0;
+        for rs in &ordered {
+            if cleanup_done >= max_scaled_down {
+                break;
+            }
+            let name = &rs.metadata.name;
+            let cur = cur_replicas[name];
+            if cur == 0 {
+                continue;
+            }
+            let unhealthy = (cur - old_available[name]).max(0);
+            let scale = unhealthy.min(max_scaled_down - cleanup_done);
+            if scale <= 0 {
+                continue;
+            }
+            cur_replicas.insert(name.clone(), cur - scale);
+            cleanup_done += scale;
+        }
+
+        // Phase 2 — scale down healthy old pods, never below minAvailable
+        // AVAILABLE pods. When the new RS is not yet available this budget is 0.
+        let total_available = new_rs_available + old_available.values().sum::<i32>();
+        let healthy_budget = (total_available - min_available).max(0);
+        let mut healthy_done = 0;
+        for rs in &ordered {
+            if healthy_done >= healthy_budget {
+                break;
+            }
+            let name = &rs.metadata.name;
+            let cur = cur_replicas[name];
+            if cur == 0 {
+                continue;
+            }
+            let scale = cur.min(healthy_budget - healthy_done);
+            if scale <= 0 {
+                continue;
+            }
+            cur_replicas.insert(name.clone(), cur - scale);
+            healthy_done += scale;
+        }
+
+        for rs in &old_rs_list {
+            let target = cur_replicas[&rs.metadata.name];
+            if target != rs.spec.replicas {
+                info!(
+                    "Rolling update: scaling down old ReplicaSet {}/{} from {} to {} (available={})",
+                    namespace, rs.metadata.name, rs.spec.replicas, target,
+                    old_available.get(&rs.metadata.name).copied().unwrap_or(0)
+                );
+                self.update_replicaset_replicas(rs, target).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Count pods owned by `rs` that are *available*: Ready=True for at least
+    /// the RS's own `minReadySeconds`. Computed directly from pods (not from
+    /// `rs.status.availableReplicas`) so it never lags behind the ReplicaSet
+    /// controller's status writes — a lag that previously caused the deployment
+    /// controller to drain a still-available old ReplicaSet during a rollover.
+    async fn count_available_pods_min_ready(&self, rs: &ReplicaSet, namespace: &str) -> i32 {
+        let min_ready = rs.spec.min_ready_seconds.unwrap_or(0).max(0) as i64;
+        let now = chrono::Utc::now();
+        let pod_prefix = build_prefix("pods", Some(namespace));
+        let pods: Vec<Pod> = self.storage.list(&pod_prefix).await.unwrap_or_default();
+        let owned: Vec<&Pod> = pods
+            .iter()
+            .filter(|pod| {
+                pod.metadata
+                    .owner_references
+                    .as_ref()
+                    .map(|refs| refs.iter().any(|r| r.name == rs.metadata.name))
+                    .unwrap_or(false)
+            })
+            .collect();
+        // No Pod objects exist for this RS (the RS controller hasn't created
+        // them yet, or — in unit/integration tests — only RS status is
+        // maintained). Fall back to the RS's reported availableReplicas so
+        // availability isn't under-counted to 0, which would stall the rolling
+        // update. When pods DO exist we count them directly (lag-free,
+        // minReadySeconds-aware) — that is what fixes the rollover scale-down
+        // (#310) where rs.status lagged behind reality.
+        if owned.is_empty() {
+            return rs
+                .status
+                .as_ref()
+                .map(|s| s.available_replicas)
+                .unwrap_or(0);
+        }
+        owned
+            .iter()
+            .filter(|pod| {
+                let ready_cond = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .and_then(|c| {
+                        c.iter()
+                            .find(|cond| cond.condition_type == "Ready" && cond.status == "True")
+                    });
+                match ready_cond {
+                    Some(_) if min_ready == 0 => true,
+                    Some(cond) => match cond.last_transition_time {
+                        Some(t) => (now - t).num_seconds() >= min_ready,
+                        None => true,
+                    },
+                    None => false,
+                }
+            })
+            .count() as i32
+    }
+
     async fn count_available_pods_for_rs(&self, rs_name: &str, namespace: &str) -> i32 {
         let pod_prefix = build_prefix("pods", Some(namespace));
         let pods: Vec<Pod> = self.storage.list(&pod_prefix).await.unwrap_or_default();
