@@ -168,7 +168,6 @@ async fn store_pvc(storage: &MemoryStorage, pvc: &PersistentVolumeClaim) {
 ///   6. Delete PVC (simulate: remove from storage)
 ///   7. Verify PV reverts to Released / stays in storage for reclaim policy
 #[tokio::test]
-#[ignore = "GAP: PV Released/Reclaim phase transitions not yet implemented; upstream persistent_volumes.go lifecycle steps 6-7"]
 async fn pv_pvc_csi_conformance_full_lifecycle() {
     let storage = setup();
 
