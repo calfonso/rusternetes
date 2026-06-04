@@ -717,6 +717,34 @@ fn write_file_atomic(dest: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Split a Docker image reference into `(from_image, tag_or_digest)` for the
+/// Engine `/images/create` API.
+///
+/// The Engine pulls *all* tags when `tag` is empty, so a tagless reference
+/// like `busybox` or `docker.io/library/nginx` must default to `latest`.
+/// Parsing rules (matching the reference grammar used by the Docker CLI):
+///   - A `@` introduces a digest (`name@sha256:…`); the digest becomes the
+///     `tag` argument (the Engine accepts a digest in the `tag` field).
+///   - Otherwise a tag is the substring after the last `:`, but only when
+///     that `:` falls after the last `/` — so a registry host-port such as
+///     `localhost:5000/img` is not mistaken for a tag.
+///   - With neither, the tag defaults to `latest`.
+fn split_image_reference(image: &str) -> (String, String) {
+    if let Some(at) = image.find('@') {
+        let (name, digest) = image.split_at(at);
+        // digest still has the leading '@'
+        return (name.to_string(), digest[1..].to_string());
+    }
+    let last_slash = image.rfind('/');
+    if let Some(colon) = image.rfind(':') {
+        if last_slash.is_none_or(|slash| colon > slash) {
+            let (name, tag) = image.split_at(colon);
+            return (name.to_string(), tag[1..].to_string());
+        }
+    }
+    (image.to_string(), "latest".to_string())
+}
+
 impl ContainerRuntime {
     pub async fn new(
         volumes_base_path: String,
@@ -1286,8 +1314,18 @@ impl ContainerRuntime {
 
     /// Pull image with retry logic
     async fn pull_image_with_retry(&self, image: &str) -> Result<()> {
+        // Split the reference into (name, tag-or-digest). The Docker Engine
+        // `/images/create` endpoint pulls *every* tag of `fromImage` when no
+        // tag is supplied — for an image like `busybox` that is dozens of
+        // manifests, which both wastes work and trips the Docker Hub
+        // unauthenticated pull-rate limit (`toomanyrequests`), surfacing here
+        // as an opaque stream error. Default the tag to `latest` when absent,
+        // matching the Docker CLI and upstream kubelet
+        // (`pkg/kubelet/kuberuntime` → `parsers.ParseImageName`).
+        let (from_image, tag) = split_image_reference(image);
         let options = CreateImageOptions {
-            from_image: image,
+            from_image: from_image.as_str(),
+            tag: tag.as_str(),
             ..Default::default()
         };
 
@@ -9418,9 +9456,68 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{pod_dir_key, write_file_atomic};
+    use super::{pod_dir_key, split_image_reference, write_file_atomic};
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    // --- split_image_reference tests (regression for #445) ---
+
+    #[test]
+    fn split_image_reference_defaults_tag_to_latest() {
+        // A tagless reference MUST default to `latest`. Passing an empty tag
+        // to the Engine pulls every tag of the repo, which trips the Docker
+        // Hub pull-rate limit and surfaces as an opaque stream error.
+        assert_eq!(
+            split_image_reference("busybox"),
+            ("busybox".to_string(), "latest".to_string())
+        );
+        assert_eq!(
+            split_image_reference("docker.io/library/busybox"),
+            (
+                "docker.io/library/busybox".to_string(),
+                "latest".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn split_image_reference_preserves_explicit_tag() {
+        assert_eq!(
+            split_image_reference("nginx:stable-alpine"),
+            ("nginx".to_string(), "stable-alpine".to_string())
+        );
+        assert_eq!(
+            split_image_reference("registry.k8s.io/pause:3.10"),
+            ("registry.k8s.io/pause".to_string(), "3.10".to_string())
+        );
+    }
+
+    #[test]
+    fn split_image_reference_handles_registry_port() {
+        // The `:5000` is a host port, NOT a tag — it appears before the last
+        // `/`, so the reference is still tagless and defaults to `latest`.
+        assert_eq!(
+            split_image_reference("localhost:5000/myimage"),
+            ("localhost:5000/myimage".to_string(), "latest".to_string())
+        );
+        // Host-port AND explicit tag.
+        assert_eq!(
+            split_image_reference("localhost:5000/myimage:v2"),
+            ("localhost:5000/myimage".to_string(), "v2".to_string())
+        );
+    }
+
+    #[test]
+    fn split_image_reference_handles_digest() {
+        let (name, tag) = split_image_reference(
+            "busybox@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d",
+        );
+        assert_eq!(name, "busybox");
+        assert_eq!(
+            tag,
+            "sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d"
+        );
+    }
 
     // --- write_file_atomic tests ---
 
