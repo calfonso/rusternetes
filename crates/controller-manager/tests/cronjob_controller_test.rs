@@ -397,12 +397,12 @@ async fn test_cronjob_timezone_field_persisted_across_reconcile() {
 /// Sonobuoy: currently NOT covered — our `should_run_now` ignores `time_zone`
 /// and always interprets the schedule in UTC.
 ///
-/// RED-state: when a tz-aware CronJob's UTC interpretation of the schedule has
-/// not yet arrived but the tz-local interpretation has, the controller should
-/// still fire. We ignore this until the controller actually parses
-/// `spec.timeZone`.
+/// A tz-tagged CronJob fires its catch-up Job through the controller. The
+/// controller now parses `spec.timeZone` (see `should_run_now`); the
+/// deterministic UTC-vs-zone discrimination is unit-tested in
+/// `cronjob::tests::should_run_now_honours_time_zone` (this integration test
+/// can't pin wall-clock `now`, so it asserts the end-to-end firing path).
 #[tokio::test]
-#[ignore = "RED-state: controller does not yet honour spec.timeZone (uses UTC)"]
 async fn test_cronjob_timezone_aware_schedule_fires() {
     let storage = setup_test().await;
     // 23:30 UTC + America/New_York (UTC-5/-4) shifts the next "0 0 * * *"
@@ -681,11 +681,10 @@ async fn test_cronjob_concurrency_policy_allow_enforcement() {
 /// Upstream: k8s.io/kubernetes/pkg/controller/cronjob/utils.go honours DST via
 /// the Go time package when `spec.timeZone` is set.
 ///
-/// RED-state: the rusternetes controller currently parses schedules in UTC,
-/// which makes DST handling implicit (no transition exists in UTC). This test
-/// is ignored until `spec.timeZone` is plumbed through `should_run_now`.
+/// `spec.timeZone` is now honoured (`should_run_now` evaluates the schedule in
+/// the named zone via chrono-tz, which carries DST). This asserts the catch-up
+/// path produces exactly one Job for a DST-crossing daily schedule.
 #[tokio::test]
-#[ignore = "RED-state: controller treats schedule as UTC, no DST handling yet"]
 async fn test_cronjob_dst_transition_handling() {
     let storage = setup_test().await;
     // Daily-at-02:30 schedule in a tz that crosses DST. On the "spring

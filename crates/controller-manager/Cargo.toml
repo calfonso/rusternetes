@@ -28,6 +28,7 @@ clap.workspace = true
 futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 cron = "0.12"
 sha2 = "0.10"
 rand = "0.9"
