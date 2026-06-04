@@ -1909,7 +1909,13 @@ impl Kubelet {
                     .iter()
                     .flat_map(|c| c.ports.iter().flatten())
                     .filter_map(|p| {
-                        p.host_port.map(|hp| {
+                        // hostPort == 0 means "no host port" — it must not be
+                        // treated as an allocated port, or two pods that both
+                        // leave hostPort unset (0) falsely conflict and the
+                        // kubelet rejects the pod with HostPortConflict. The
+                        // conformance netexec pods declare containerPort with
+                        // hostPort: 0.
+                        p.host_port.filter(|&hp| hp != 0).map(|hp| {
                             let proto = p.protocol.clone().unwrap_or_else(|| "TCP".to_string());
                             let ip = p.host_ip.clone().unwrap_or_default();
                             (hp, proto, ip)
