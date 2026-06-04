@@ -290,7 +290,6 @@ async fn mark_all_pods_ready(storage: &Arc<MemoryStorage>, namespace: &str) {
 /// endpoints directly (GET/LIST/PATCH/DELETE on controllerrevisions). The
 /// storage-level contract (create / round-trip / delete) is green today.
 #[tokio::test]
-#[ignore = "GAP: ControllerRevision REST lifecycle not yet wired through api-server PATCH endpoint; upstream controller_revision.go:45"]
 async fn controller_revision_lifecycle_create_patch_delete() {
     let storage = new_storage();
     let ns = "default";
@@ -355,7 +354,6 @@ async fn controller_revision_lifecycle_create_patch_delete() {
 /// Sonobuoy: FAIL (failing.txt) — e2e verifies pod running status on each
 /// node via kubelet; the controller contract (one pod per node) is green.
 #[tokio::test]
-#[ignore = "GAP: DaemonSet e2e requires kubelet + node-readiness signal; controller contract already covered by daemonset_controller_test.rs; upstream daemon_set.go:109"]
 async fn daemonset_should_run_and_stop_simple_daemon() {
     let storage = new_storage();
     let ns = "default";
@@ -405,7 +403,6 @@ async fn daemonset_should_run_and_stop_simple_daemon() {
 /// Sonobuoy: FAIL (failing.txt) — "complex" means a node-selector-constrained
 /// DaemonSet; the controller only schedules to matching nodes.
 #[tokio::test]
-#[ignore = "GAP: DaemonSet e2e requires kubelet image-pull verification; controller nodeSelector scheduling covered by daemonset_controller_test.rs; upstream daemon_set.go:140"]
 async fn daemonset_should_run_and_stop_complex_daemon() {
     let storage = new_storage();
     let ns = "default";
@@ -528,7 +525,6 @@ async fn daemonset_rolling_update_replaces_pods_on_template_change() {
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/daemon_set.go:250
 /// Sonobuoy: FAIL (failing.txt)
 #[tokio::test]
-#[ignore = "GAP: rollback-without-unnecessary-restarts requires ControllerRevision-based rollback path not yet fully wired; upstream daemon_set.go:250"]
 async fn daemonset_should_rollback_without_unnecessary_restarts() {
     let storage = new_storage();
     let ns = "default";
@@ -589,7 +585,6 @@ async fn daemonset_should_rollback_without_unnecessary_restarts() {
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/daemon_set.go:290
 /// Sonobuoy: FAIL (failing.txt)
 #[tokio::test]
-#[ignore = "GAP: DaemonSet status.numberAvailable not yet incremented by controller; upstream daemon_set.go:290"]
 async fn daemonset_should_verify_changes_to_status() {
     let storage = new_storage();
     let ns = "default";
@@ -691,7 +686,6 @@ async fn daemonset_should_retry_creating_failed_daemon_pods() {
 /// already covered by the existing Job conformance file. This stub pins the
 /// gap so it is discoverable.
 #[tokio::test]
-#[ignore = "GAP: Job /status PATCH (server-side apply) endpoint not yet returning 200; upstream job.go:894"]
 async fn job_should_apply_changes_to_status() {
     let storage = new_storage();
     let ns = "default";
@@ -899,7 +893,6 @@ async fn disruption_controller_list_and_delete_pdb_collection() {
 /// status computation is green; the gap is the api-server PATCH routing for
 /// the PDB status subresource.
 #[tokio::test]
-#[ignore = "GAP: PDB /status PATCH endpoint returns 404/405; api-server routing for poddisruptionbudgets status subresource incomplete; upstream disruption.go:196"]
 async fn disruption_controller_should_update_patch_pdb_status() {
     let storage = new_storage();
     let ns = "default";
