@@ -382,13 +382,36 @@ impl<S: Storage + 'static> CronJobController<S> {
             }
         };
 
+        // Resolve spec.timeZone. The `cron` crate interprets a schedule in the
+        // timezone of the DateTime passed to `after()`, so we localise the
+        // reference times below to this zone — equivalent to upstream prefixing
+        // the schedule with `TZ=<zone>` (formatSchedule in
+        // pkg/controller/cronjob/cronjob_controllerv2.go). An unset/empty zone
+        // means UTC; an INVALID zone means "do not schedule" — matching
+        // upstream, which records an UnknownTimeZone event and returns without
+        // starting a job.
+        let tz: chrono_tz::Tz = match cronjob.spec.time_zone.as_deref() {
+            None | Some("") => chrono_tz::UTC,
+            Some(name) => match name.parse::<chrono_tz::Tz>() {
+                Ok(t) => t,
+                Err(_) => {
+                    warn!(
+                        "CronJob {}: invalid timeZone {:?}; not scheduling",
+                        cronjob.metadata.name, name
+                    );
+                    return Ok(false);
+                }
+            },
+        };
+        let now_tz = now.with_timezone(&tz);
+
         // Determine if job should run now
         // Check if we're within the schedule window since last run
         if let Some(last) = last_schedule {
-            // Find next scheduled time after last run
-            if let Some(next_run) = schedule_parsed.after(&last).next() {
+            // Find next scheduled time after last run, evaluated in `tz`.
+            if let Some(next_run) = schedule_parsed.after(&last.with_timezone(&tz)).next() {
                 // Should run if current time >= next scheduled time
-                let should_run = now >= next_run;
+                let should_run = now_tz >= next_run;
                 if should_run {
                     info!("CronJob should run: next_run={}, current={}", next_run, now);
                 }
@@ -400,9 +423,9 @@ impl<S: Storage + 'static> CronJobController<S> {
         } else {
             // Never run before - check if there's a scheduled time in the past minute
             // This prevents all cronjobs from running immediately on startup
-            let one_minute_ago = now - chrono::Duration::minutes(1);
+            let one_minute_ago = (now - chrono::Duration::minutes(1)).with_timezone(&tz);
             if let Some(next_run) = schedule_parsed.after(&one_minute_ago).next() {
-                let should_run = now >= next_run;
+                let should_run = now_tz >= next_run;
                 if should_run {
                     info!("CronJob first run: next_run={}, current={}", next_run, now);
                 }
@@ -583,5 +606,57 @@ mod tests {
         let timestamp = 1234567890;
         let job_name = format!("{}-{}", cronjob_name, timestamp);
         assert_eq!(job_name, "backup-1234567890");
+    }
+
+    /// `spec.timeZone` must change the firing decision. Discriminating case:
+    /// a daily-midnight schedule, last run at 02:00Z, evaluated at 06:00Z.
+    ///   * UTC  → next midnight after 02:00Z is tomorrow 00:00Z → NOT due.
+    ///   * America/New_York (EST, UTC-5) → last is 21:00 (prev day) local, next
+    ///     local midnight is 00:00 EST = 05:00Z, which 06:00Z has passed → DUE.
+    /// So the SAME inputs must fire under New York but not under UTC; an invalid
+    /// zone must never fire (upstream UnknownTimeZone behaviour). This fails if
+    /// the controller ignores `spec.timeZone` (evaluates everything as UTC).
+    #[tokio::test]
+    async fn should_run_now_honours_time_zone() {
+        use std::sync::Arc;
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let ctrl = super::CronJobController::new(storage);
+
+        let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mk = |tz: serde_json::Value| -> rusternetes_common::resources::CronJob {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "CronJob",
+                "metadata": {"name": "tz", "namespace": "default"},
+                "spec": {
+                    "schedule": "0 0 * * *",
+                    "timeZone": tz,
+                    "jobTemplate": {"spec": {"template": {"spec": {
+                        "containers": [{"name": "c", "image": "busybox"}]
+                    }}}},
+                },
+                "status": {"lastScheduleTime": "2025-01-15T02:00:00Z"},
+            }))
+            .unwrap()
+        };
+
+        let ny = mk(serde_json::json!("America/New_York"));
+        assert!(
+            ctrl.should_run_now("0 0 * * *", now, &ny).unwrap(),
+            "New York local midnight has passed → must fire"
+        );
+
+        let utc = mk(serde_json::Value::Null);
+        assert!(
+            !ctrl.should_run_now("0 0 * * *", now, &utc).unwrap(),
+            "UTC next midnight is tomorrow → must NOT fire"
+        );
+
+        let invalid = mk(serde_json::json!("Mars/Phobos"));
+        assert!(
+            !ctrl.should_run_now("0 0 * * *", now, &invalid).unwrap(),
+            "invalid timeZone → must not schedule"
+        );
     }
 }
