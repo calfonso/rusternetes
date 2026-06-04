@@ -1508,17 +1508,33 @@ impl<S: Storage + 'static> DeploymentController<S> {
         let now = chrono::Utc::now();
         let pod_prefix = build_prefix("pods", Some(namespace));
         let pods: Vec<Pod> = self.storage.list(&pod_prefix).await.unwrap_or_default();
-        pods.iter()
+        let owned: Vec<&Pod> = pods
+            .iter()
             .filter(|pod| {
-                let owned = pod
-                    .metadata
+                pod.metadata
                     .owner_references
                     .as_ref()
                     .map(|refs| refs.iter().any(|r| r.name == rs.metadata.name))
-                    .unwrap_or(false);
-                if !owned {
-                    return false;
-                }
+                    .unwrap_or(false)
+            })
+            .collect();
+        // No Pod objects exist for this RS (the RS controller hasn't created
+        // them yet, or — in unit/integration tests — only RS status is
+        // maintained). Fall back to the RS's reported availableReplicas so
+        // availability isn't under-counted to 0, which would stall the rolling
+        // update. When pods DO exist we count them directly (lag-free,
+        // minReadySeconds-aware) — that is what fixes the rollover scale-down
+        // (#310) where rs.status lagged behind reality.
+        if owned.is_empty() {
+            return rs
+                .status
+                .as_ref()
+                .map(|s| s.available_replicas)
+                .unwrap_or(0);
+        }
+        owned
+            .iter()
+            .filter(|pod| {
                 let ready_cond = pod
                     .status
                     .as_ref()
@@ -1528,10 +1544,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                             .find(|cond| cond.condition_type == "Ready" && cond.status == "True")
                     });
                 match ready_cond {
-                    Some(cond) if min_ready == 0 => {
-                        let _ = cond;
-                        true
-                    }
+                    Some(_) if min_ready == 0 => true,
                     Some(cond) => match cond.last_transition_time {
                         Some(t) => (now - t).num_seconds() >= min_ready,
                         None => true,
