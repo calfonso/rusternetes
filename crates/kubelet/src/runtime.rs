@@ -2017,6 +2017,16 @@ impl ContainerRuntime {
 
         let hosts_path = format!("{}/hosts", pod_dir);
 
+        // If a same-name pod incarnation's volume cleanup raced with this pod's
+        // startup (StatefulSet rolling updates reuse pod names), a container may
+        // have bind-mounted the not-yet-written hosts path, so Docker created it
+        // as a DIRECTORY. `write_file_atomic`'s rename onto a directory then
+        // fails forever, wedging pod startup (#350). Remove a stale directory so
+        // the real file can be written.
+        if std::path::Path::new(&hosts_path).is_dir() {
+            let _ = std::fs::remove_dir_all(&hosts_path);
+        }
+
         // Idempotency fast-path: the kubelet's parallel sync workers
         // frequently call this for the same pod within a few ms of each
         // other (pod sync, container ready transition, status update —
@@ -5318,6 +5328,13 @@ impl ContainerRuntime {
                 std::fs::create_dir_all(format!("{}/{}", self.volumes_base_path, pod_name))
                     .context("Failed to create pod directory for resolv.conf")?;
 
+                // A racing same-name pod cleanup can leave Docker having created
+                // this path as a directory (see create_pod_hosts_file). Clear it
+                // so the file write succeeds.
+                if std::path::Path::new(&resolv_conf_path).is_dir() {
+                    let _ = std::fs::remove_dir_all(&resolv_conf_path);
+                }
+
                 // Write custom resolv.conf
                 std::fs::write(&resolv_conf_path, &final_content).with_context(|| {
                     format!("Failed to write custom resolv.conf for pod {}", pod_name)
@@ -6319,6 +6336,26 @@ impl ContainerRuntime {
         Self::teardown_hostport_rules(pod_name);
 
         let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
+
+        // Don't delete the per-pod volume dir if a live pod incarnation with the
+        // same name is running (StatefulSet rolling updates delete+recreate a pod
+        // under the same name). The dir is name-keyed, so removing it here would
+        // pull the hosts/resolv.conf/SA files out from under the new pod's
+        // containers, and Docker would recreate the bind sources as directories,
+        // wedging startup (#350). The new incarnation owns the dir. Check for a
+        // RUNNING pause container — a stopped one is just this pod being torn
+        // down, whose dir SHOULD be removed.
+        if self
+            .is_container_running(&format!("{}_pause", pod_name))
+            .await
+            .unwrap_or(false)
+        {
+            debug!(
+                "Skipping volume cleanup for {}: a live pod incarnation is running",
+                pod_name
+            );
+            return Ok(());
+        }
 
         if std::path::Path::new(&volume_dir).exists() {
             if let Err(e) = std::fs::remove_dir_all(&volume_dir) {
