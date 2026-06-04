@@ -523,7 +523,13 @@ fn collect_host_ports(pod: &Pod) -> Vec<(u16, String, String)> {
         for container in &spec.containers {
             if let Some(ports) = &container.ports {
                 for port in ports {
-                    if let Some(host_port) = port.host_port {
+                    // hostPort == 0 means "no host port" — it must NOT be tracked
+                    // as a used port, otherwise two pods that both leave hostPort
+                    // unset (0) would falsely conflict. The conformance netexec
+                    // pods (Networking Granular Checks, HostPort) declare
+                    // containerPort with hostPort: 0; treating 0 as a real port
+                    // made the 2nd/3rd such pod unschedulable on every node.
+                    if let Some(host_port) = port.host_port.filter(|&p| p != 0) {
                         let protocol = port.protocol.clone().unwrap_or_else(|| "TCP".to_string());
                         let host_ip = port.host_ip.clone().unwrap_or_default();
                         result.push((host_port, protocol, host_ip));
@@ -536,7 +542,7 @@ fn collect_host_ports(pod: &Pod) -> Vec<(u16, String, String)> {
             for container in init_containers {
                 if let Some(ports) = &container.ports {
                     for port in ports {
-                        if let Some(host_port) = port.host_port {
+                        if let Some(host_port) = port.host_port.filter(|&p| p != 0) {
                             let protocol =
                                 port.protocol.clone().unwrap_or_else(|| "TCP".to_string());
                             let host_ip = port.host_ip.clone().unwrap_or_default();
