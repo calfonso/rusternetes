@@ -7841,13 +7841,18 @@ impl ProtoRegistry {
                 }
             }
             FieldType::Bool => {
+                // Encode the bool whenever the JSON key is present (callers only
+                // reach here for present, non-null values — see
+                // `encode_with_schema`). Upstream `*bool` fields like
+                // `securityContext.allowPrivilegeEscalation` use explicit
+                // presence, so a `false` MUST go on the wire; omitting it makes
+                // the typed (protobuf) client decode `nil` instead of `&false`,
+                // which diverges from the JSON read of the same object and
+                // breaks `Semantic.DeepEqual` (e.g. the InPlace-resize replace
+                // conformance test, #477). Emitting `false` for a plain proto3
+                // bool is harmless — it decodes back to the same `false`.
                 let b = val.as_bool().unwrap_or(false);
-                if b {
-                    push_varint_field(buf, tag, 1);
-                } else {
-                    // proto2 omits false; emit only when present-and-true to
-                    // match the decoder which treats missing as default.
-                }
+                push_varint_field(buf, tag, if b { 1 } else { 0 });
             }
             FieldType::Double => {
                 if let Some(f) = val.as_f64() {
