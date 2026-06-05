@@ -1854,7 +1854,21 @@ pub async fn apply_pod_resize_with_retry<S: Storage>(
         // Always re-read so the storage CAS compares against the freshest resourceVersion.
         let mut fresh: rusternetes_common::resources::Pod = storage.get(&key).await?;
 
+        // Bump metadata.generation when the resize actually changes the pod
+        // spec (KEP-1287 resize mutates spec.containers[*].resources). Upstream
+        // does this generically in the registry's PrepareForUpdate; the
+        // conformance "resize pod via the replace endpoint" test asserts the
+        // generation goes 1 -> 2 after one resize (pod_resize.go:761). Compare
+        // before/after the merge but before the status mutation, so a status-only
+        // change never trips a bump.
+        let before = serde_json::to_value(&fresh).unwrap_or(serde_json::Value::Null);
         merge_container_resources_from(&mut fresh, desired);
+        let after = serde_json::to_value(&fresh).unwrap_or(serde_json::Value::Null);
+        crate::handlers::lifecycle::maybe_increment_generation(
+            &before,
+            &after,
+            &mut fresh.metadata,
+        );
         fresh.status.get_or_insert_with(Default::default).resize = Some("Proposed".to_string());
 
         match storage.update(&key, &fresh).await {
@@ -2116,6 +2130,76 @@ mod tests {
         assert_eq!(
             disruptions_after, 1,
             "Should allow 1 disruption after lowering minAvailable to 0"
+        );
+    }
+
+    /// A pod resize via the `/resize` subresource MUST bump `metadata.generation`
+    /// when it changes `spec.containers[*].resources`, and MUST leave it unchanged
+    /// for a no-op (idempotent) resize. Upstream conformance
+    /// `[sig-node] Pod InPlace Resize Container resize pod via the replace endpoint`
+    /// asserts `updatedPod.Generation == 2` after one resize of a freshly-created
+    /// (generation 1) pod (pod_resize.go:761).
+    #[tokio::test]
+    async fn test_resize_bumps_generation_on_spec_change() {
+        let storage = Arc::new(MemoryStorage::new());
+        let ns = "test-resize-gen";
+
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "p1", "namespace": ns, "generation": 1 },
+            "spec": { "containers": [{
+                "name": "c1",
+                "image": "nginx",
+                "resources": { "requests": { "cpu": "1" }, "limits": { "cpu": "1" } }
+            }]},
+            "status": { "phase": "Running" }
+        }))
+        .unwrap();
+        let key = rusternetes_storage::build_key("pods", Some(ns), "p1");
+        storage.create(&key, &pod).await.unwrap();
+
+        // Resize c1 from cpu=1 to cpu=2.
+        let desired: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "p1", "namespace": ns },
+            "spec": { "containers": [{
+                "name": "c1",
+                "image": "nginx",
+                "resources": { "requests": { "cpu": "2" }, "limits": { "cpu": "2" } }
+            }]}
+        }))
+        .unwrap();
+
+        let updated = apply_pod_resize_with_retry(&*storage, ns, "p1", &desired)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.metadata.generation,
+            Some(2),
+            "resize that changes resources must bump generation 1 -> 2"
+        );
+        let cpu = updated.spec.as_ref().unwrap().containers[0]
+            .resources
+            .as_ref()
+            .unwrap()
+            .requests
+            .as_ref()
+            .unwrap()
+            .get("cpu")
+            .unwrap();
+        assert_eq!(cpu, "2", "resized cpu request must be applied");
+
+        // Idempotent re-resize with the same desired resources must NOT bump again.
+        let again = apply_pod_resize_with_retry(&*storage, ns, "p1", &desired)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.metadata.generation,
+            Some(2),
+            "no-op resize must not bump generation"
         );
     }
 
