@@ -109,11 +109,38 @@ RUN apt-get update && apt-get install -y \
     && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache \
     && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
 
-ENV RUSTC_WRAPPER=sccache \
-    SCCACHE_DIR=/sccache \
+# sccache vs cargo-incremental — chosen per-build via USE_SCCACHE (set in
+# the cargo RUN blocks below), NOT baked into ENV. Measured on this repo's
+# cargo-builder stage (all 6 service bins):
+#
+#   build                       cold        incremental (1 leaf-crate edit)
+#   ----------------------      --------    -------------------------------
+#   sccache + INCREMENTAL=0     459s        39s   (cargo 36.2s, 0% sccache hits)
+#   no-sccache + INCREMENTAL=1  486s         4s   (cargo  1.9s)
+#
+# sccache wraps rustc so identical (crate, source, flags) compilations hit
+# the /sccache BuildKit mount instead of re-running rustc. But that mount is
+# single-machine: on a persistent dev box cargo's own fingerprinting already
+# skips unchanged crates for free, and forcing CARGO_INCREMENTAL=0 (sccache
+# requires it) makes every dirty-crate rebuild pay full codegen — ~10x slower
+# iteration. On the ephemeral ARC DinD runner the mount is cold every job
+# (0% hits), so sccache buys nothing there either; the canary build is always
+# cold (~tie). Net: sccache only helps a SHARED/distributed cache, which this
+# docker path does not have (the sccache->MinIO backend is host-cargo only —
+# clippy/nextest via RUSTC_WRAPPER, never this build).
+#
+# So: default ON for safety/parity (USE_SCCACHE=1) — CI keeps the exact prior
+# behavior — but compose.sqlite.yml flips it OFF locally (USE_SCCACHE="" when
+# GITHUB_ACTIONS is unset), giving the dev box incremental's ~10x iteration win.
+# Override anywhere with `USE_SCCACHE=1 docker compose ... build`.
+ARG USE_SCCACHE=1
+
+# Static sccache config (only consulted when USE_SCCACHE=1 turns the wrapper
+# on inside the cargo RUN blocks). RUSTC_WRAPPER / CARGO_INCREMENTAL are set
+# there, not here, so the two modes don't leak into each other.
+ENV SCCACHE_DIR=/sccache \
     SCCACHE_CACHE_SIZE=20G \
-    SCCACHE_IDLE_TIMEOUT=0 \
-    CARGO_INCREMENTAL=0
+    SCCACHE_IDLE_TIMEOUT=0
 
 WORKDIR /app
 
@@ -194,6 +221,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
+    if [ "$USE_SCCACHE" = "1" ]; then \
+        export RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0; \
+    else \
+        export CARGO_INCREMENTAL=1; \
+    fi; \
     cargo build --profile release-fast $CARGO_FEATURES \
         --bin api-server \
         --bin kubelet \
@@ -213,7 +245,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes \
         -p rusternetes-scheduler \
         -p rusternetes-storage \
- && sccache --show-stats
+ && { [ "$USE_SCCACHE" = "1" ] && sccache --show-stats || true; }
 
 # ----- PASS 2: real source compile (only changed workspace crates rebuild) -----
 
@@ -261,6 +293,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
+    if [ "$USE_SCCACHE" = "1" ]; then \
+        export RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0; \
+    else \
+        export CARGO_INCREMENTAL=1; \
+    fi; \
     cargo build --profile release-fast $CARGO_FEATURES \
         --bin api-server \
         --bin kubelet \
@@ -268,7 +305,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --bin controller-manager \
         --bin kube-proxy \
         --bin rusternetes-dns \
- && sccache --show-stats \
+ && { [ "$USE_SCCACHE" = "1" ] && sccache --show-stats || true; } \
  && mkdir -p /out \
  && cp target/release-fast/api-server         /out/api-server \
  && cp target/release-fast/kubelet            /out/kubelet \

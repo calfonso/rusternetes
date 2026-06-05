@@ -13,6 +13,16 @@
 #     rusternetes/   (this repo)
 #     rhino/         (https://github.com/calfonso/rhino)
 
+# Per-build sccache toggle for the Dockerfile.services cargo-builder stage.
+# CI (GITHUB_ACTIONS=true) -> USE_SCCACHE=1 -> sccache (prior behavior, no
+# regression). Local dev (GITHUB_ACTIONS unset) -> USE_SCCACHE="" -> cargo
+# incremental, ~10x faster leaf-crate rebuilds (4s vs 39s, measured). The
+# /sccache mount is single-machine and never reaches MinIO from this docker
+# path, so it only costs the CARGO_INCREMENTAL=0 tax locally. Force either
+# way with `USE_SCCACHE=1 docker compose ... build`.
+x-sccache-args: &sccache-args
+  USE_SCCACHE: "${USE_SCCACHE-${GITHUB_ACTIONS:+1}}"
+
 services:
   # Rhino - etcd-compatible gRPC server backed by SQLite
   rhino:
@@ -48,6 +58,7 @@ services:
       dockerfile: Dockerfile.services
       additional_contexts:
         rhino: ./rhino
+      args: *sccache-args
       target: api-server
     container_name: rusternetes-api-server
     restart: unless-stopped
@@ -89,6 +100,7 @@ services:
       dockerfile: Dockerfile.services
       additional_contexts:
         rhino: ./rhino
+      args: *sccache-args
       target: scheduler
     container_name: rusternetes-scheduler
     restart: unless-stopped
@@ -108,6 +120,7 @@ services:
       dockerfile: Dockerfile.services
       additional_contexts:
         rhino: ./rhino
+      args: *sccache-args
       target: controller-manager
     container_name: rusternetes-controller-manager
     restart: unless-stopped
@@ -129,6 +142,7 @@ services:
       dockerfile: Dockerfile.services
       additional_contexts:
         rhino: ./rhino
+      args: *sccache-args
       target: kubelet
     container_name: rusternetes-kubelet
     restart: unless-stopped
@@ -161,6 +175,7 @@ services:
       dockerfile: Dockerfile.services
       additional_contexts:
         rhino: ./rhino
+      args: *sccache-args
       target: kubelet
     container_name: rusternetes-kubelet2
     restart: unless-stopped
@@ -193,6 +208,7 @@ services:
       dockerfile: Dockerfile.services
       additional_contexts:
         rhino: ./rhino
+      args: *sccache-args
       target: kube-proxy
     container_name: rusternetes-kube-proxy
     restart: unless-stopped
@@ -225,6 +241,7 @@ services:
       target: dns
       additional_contexts:
         rhino: ./rhino
+      args: *sccache-args
     container_name: rusternetes-dns
     restart: unless-stopped
     depends_on:
