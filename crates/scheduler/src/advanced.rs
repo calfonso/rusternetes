@@ -651,12 +651,15 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
                         if let Some(memory) = requests.get("memory") {
                             used_memory += parse_resource_quantity(memory, "memory");
                         }
-                        // Track extended resource usage
+                        // Track extended resource usage. Quantities use the
+                        // full k8s format (e.g. "1k" == 1000), so parse with
+                        // parse_resource_quantity, not a raw i64 parse — a
+                        // canonicalized value like "1k" would otherwise parse
+                        // to 0 and silently under-count usage.
                         for (key, val) in requests {
                             if key != "cpu" && key != "memory" && key != "ephemeral-storage" {
-                                if let Ok(n) = val.parse::<i64>() {
-                                    *used_extended.entry(key.clone()).or_insert(0) += n;
-                                }
+                                *used_extended.entry(key.clone()).or_insert(0) +=
+                                    parse_resource_quantity(val, key);
                             }
                         }
                     }
@@ -673,15 +676,21 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
                 if let Some(ref requests) = resources.requests {
                     for (key, val) in requests {
                         if key != "cpu" && key != "memory" && key != "ephemeral-storage" {
-                            if let Ok(requested) = val.parse::<i64>() {
-                                let node_capacity = allocatable
-                                    .get(key)
-                                    .and_then(|s| s.parse::<i64>().ok())
-                                    .unwrap_or(0);
-                                let used = used_extended.get(key).copied().unwrap_or(0);
-                                if used + requested > node_capacity {
-                                    return 0; // Extended resource insufficient
-                                }
+                            // Both the request and the node's advertised capacity
+                            // use the full k8s quantity format. The conformance
+                            // `AddExtendedResource` helper writes `resource.MustParse`d
+                            // values, which serialize canonically (e.g. 1000 -> "1k"),
+                            // so a raw i64 parse of the node capacity yields 0 and
+                            // wrongly rejects the pod. Parse both with
+                            // parse_resource_quantity. (#542)
+                            let requested = parse_resource_quantity(val, key);
+                            let node_capacity = allocatable
+                                .get(key)
+                                .map(|s| parse_resource_quantity(s, key))
+                                .unwrap_or(0);
+                            let used = used_extended.get(key).copied().unwrap_or(0);
+                            if used + requested > node_capacity {
+                                return 0; // Extended resource insufficient
                             }
                         }
                     }
@@ -1575,6 +1584,68 @@ mod tests {
             ..Default::default()
         };
         Pod::new(name, spec)
+    }
+
+    /// Extended-resource fit must honor canonical k8s quantity strings on the
+    /// node's advertised capacity. The conformance `AddExtendedResource` helper
+    /// writes `resource.MustParse("1000")`, which serializes as "1k"; a raw i64
+    /// parse of "1k" yields 0 and wrongly rejects a pod that requests the
+    /// resource (#542 — SchedulerPreemption PreemptionExecutionPath).
+    #[test]
+    fn test_extended_resource_fit_with_canonical_quantity() {
+        let mut alloc = HashMap::new();
+        alloc.insert("cpu".to_string(), "4".to_string());
+        alloc.insert("memory".to_string(), "8Gi".to_string());
+        alloc.insert("example.com/fakecpu".to_string(), "1k".to_string()); // == 1000
+        let mut node = Node::new("node-2");
+        node.status = Some(NodeStatus {
+            capacity: None,
+            allocatable: Some(alloc),
+            conditions: None,
+            addresses: None,
+            node_info: None,
+            images: None,
+            volumes_in_use: None,
+            volumes_attached: None,
+            daemon_endpoints: None,
+            config: None,
+            features: None,
+            runtime_handlers: None,
+            declared_features: None,
+        });
+
+        let fakecpu_pod = |name: &str, req: &str| {
+            let mut requests = HashMap::new();
+            requests.insert("example.com/fakecpu".to_string(), req.to_string());
+            let mut container = make_container("0", "0");
+            container.resources = Some(rusternetes_common::types::ResourceRequirements {
+                requests: Some(requests),
+                limits: None,
+                claims: None,
+            });
+            Pod::new(
+                name,
+                rusternetes_common::resources::PodSpec {
+                    containers: vec![container],
+                    ..Default::default()
+                },
+            )
+        };
+
+        // 200 of 1000 ("1k") MUST fit (score > 0).
+        let pod = fakecpu_pod("rs-pod1", "200");
+        assert!(
+            calculate_resource_score_with_pods(&node, &pod, &[]) > 0,
+            "pod requesting 200 of a 1k extended resource must fit"
+        );
+
+        // 2k (2000) of 1000 MUST NOT fit (score == 0).
+        let big = fakecpu_pod("too-big", "2k");
+        assert_eq!(
+            calculate_resource_score_with_pods(&node, &big, &[]),
+            0,
+            "pod requesting 2k of a 1k extended resource must not fit"
+        );
     }
 
     #[test]
