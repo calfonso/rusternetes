@@ -20,6 +20,7 @@ services:
       context: ./rhino
       dockerfile: ../Dockerfile.rhino
     container_name: rusternetes-rhino
+    restart: unless-stopped
     ports:
       - "2379:2379"
     volumes:
@@ -49,6 +50,7 @@ services:
         rhino: ./rhino
       target: api-server
     container_name: rusternetes-api-server
+    restart: unless-stopped
     ports:
       - "6443:6443"
     depends_on:
@@ -89,6 +91,7 @@ services:
         rhino: ./rhino
       target: scheduler
     container_name: rusternetes-scheduler
+    restart: unless-stopped
     depends_on:
       - rhino
       - api-server
@@ -107,6 +110,7 @@ services:
         rhino: ./rhino
       target: controller-manager
     container_name: rusternetes-controller-manager
+    restart: unless-stopped
     depends_on:
       - rhino
       - api-server
@@ -127,6 +131,7 @@ services:
         rhino: ./rhino
       target: kubelet
     container_name: rusternetes-kubelet
+    restart: unless-stopped
     privileged: true
     depends_on:
       - rhino
@@ -158,6 +163,7 @@ services:
         rhino: ./rhino
       target: kubelet
     container_name: rusternetes-kubelet2
+    restart: unless-stopped
     privileged: true
     depends_on:
       - rhino
@@ -189,6 +195,7 @@ services:
         rhino: ./rhino
       target: kube-proxy
     container_name: rusternetes-kube-proxy
+    restart: unless-stopped
     privileged: true
     network_mode: host
     user: "0:0"
@@ -219,6 +226,7 @@ services:
       additional_contexts:
         rhino: ./rhino
     container_name: rusternetes-dns
+    restart: unless-stopped
     depends_on:
       rhino:
         condition: service_healthy
