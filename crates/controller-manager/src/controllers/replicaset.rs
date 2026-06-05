@@ -3,15 +3,45 @@ use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicaSet, ReplicaSetStatus},
     types::{ObjectMeta, Phase},
 };
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
+
+/// How long an unmet expectation is honored before it is considered stale and
+/// the controller is allowed to act again. Mirrors upstream
+/// `ExpectationsTimeout` (5 minutes) — a safety net so a create/delete event
+/// that is never observed (e.g. dropped watch) cannot wedge a ReplicaSet
+/// forever.
+const EXPECTATIONS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Pending pod create/delete operations a ReplicaSet has issued but not yet
+/// observed via the pod watch. Mirrors upstream
+/// `ControllerExpectations` (k8s pkg/controller/controller_utils.go).
+#[derive(Debug)]
+struct Expectation {
+    /// Number of creations still expected to be observed (counts down to 0).
+    add: i64,
+    /// Number of deletions still expected to be observed.
+    del: i64,
+    /// When the expectation was last set, for staleness expiry.
+    timestamp: Instant,
+}
 
 /// ReplicaSetController reconciles ReplicaSet resources
 /// A ReplicaSet ensures that a specified number of pod replicas are running at any given time
 pub struct ReplicaSetController<S: Storage> {
     storage: Arc<S>,
     interval: Duration,
+    /// Per-ReplicaSet (keyed by "ns/name") expectations of in-flight pod
+    /// creates/deletes. Prevents a burst of duplicate pods when the controller
+    /// re-reconciles (on rapid pod watch events or resync) before a prior
+    /// create/delete is reflected in a `list` — the read-after-write window of
+    /// the storage backend. Without this, preemption churn made a replicas=1
+    /// ReplicaSet spawn ~8 pods in 400ms (#542).
+    expectations: Arc<Mutex<HashMap<String, Expectation>>>,
 }
 
 impl<S: Storage + 'static> ReplicaSetController<S> {
@@ -19,7 +49,67 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         Self {
             storage,
             interval: Duration::from_secs(interval_secs),
+            expectations: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Key used to track expectations for a ReplicaSet ("ns/name").
+    fn expectation_key(replicaset: &ReplicaSet) -> String {
+        format!(
+            "{}/{}",
+            replicaset.metadata.namespace.as_deref().unwrap_or(""),
+            replicaset.metadata.name
+        )
+    }
+
+    /// True if the ReplicaSet has no outstanding (unobserved) create/delete
+    /// operations, or its expectation has expired. When false, the controller
+    /// must NOT issue further creates/deletes — it is still waiting to observe
+    /// the pods from its previous action.
+    fn expectations_satisfied(&self, key: &str) -> bool {
+        let map = self.expectations.lock().unwrap();
+        match map.get(key) {
+            None => true,
+            Some(exp) => {
+                (exp.add <= 0 && exp.del <= 0) || exp.timestamp.elapsed() > EXPECTATIONS_TIMEOUT
+            }
+        }
+    }
+
+    /// Record that the controller is about to create `adds` and delete `dels`
+    /// pods; reconciliation is then gated until they are observed.
+    fn set_expectations(&self, key: &str, adds: i64, dels: i64) {
+        let mut map = self.expectations.lock().unwrap();
+        map.insert(
+            key.to_string(),
+            Expectation {
+                add: adds,
+                del: dels,
+                timestamp: Instant::now(),
+            },
+        );
+    }
+
+    /// Lower the outstanding-create count after observing a pod creation (or
+    /// after a create call failed, so we don't wait on a pod that never lands).
+    fn observe_creation(&self, key: &str) {
+        let mut map = self.expectations.lock().unwrap();
+        if let Some(exp) = map.get_mut(key) {
+            exp.add -= 1;
+        }
+    }
+
+    /// Lower the outstanding-delete count after observing a pod deletion.
+    fn observe_deletion(&self, key: &str) {
+        let mut map = self.expectations.lock().unwrap();
+        if let Some(exp) = map.get_mut(key) {
+            exp.del -= 1;
+        }
+    }
+
+    /// Drop all expectations for a ReplicaSet (e.g. when it is deleted).
+    fn clear_expectations(&self, key: &str) {
+        self.expectations.lock().unwrap().remove(key);
     }
 
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
@@ -131,7 +221,9 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                     }
                 },
                 Err(_) => {
-                    // Resource was deleted — nothing to reconcile
+                    // Resource was deleted — nothing to reconcile; drop any
+                    // tracked expectations so the map doesn't leak entries.
+                    self.clear_expectations(&format!("{}/{}", ns, name));
                     queue.forget(&key).await;
                 }
             }
@@ -160,13 +252,19 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         }
     }
 
-    /// When a pod changes, check its ownerReferences for a ReplicaSet owner
-    /// and enqueue that ReplicaSet for reconciliation.
-    async fn enqueue_owner_replicaset(
-        &self,
-        queue: &WorkQueue,
-        event: &rusternetes_storage::WatchEvent,
-    ) {
+    /// When a pod changes, check its ownerReferences for a ReplicaSet owner,
+    /// update that ReplicaSet's create/delete expectations, and enqueue it for
+    /// reconciliation.
+    ///
+    /// The owner is parsed from the event's embedded value (the pod JSON, or
+    /// the *previous* pod JSON for a Deleted event) rather than re-fetched from
+    /// storage — a re-fetch races the delete and previously forced a fallback
+    /// that enqueued every ReplicaSet in the namespace. Parsing the event value
+    /// also lets us observe creations/deletions precisely:
+    ///   * Added   → a create we were waiting for landed (`observe_creation`)
+    ///   * Deleted → a delete we issued (or a preemption/GC delete) completed
+    ///     (`observe_deletion`)
+    async fn enqueue_owner_replicaset(&self, queue: &WorkQueue, event: &WatchEvent) {
         let pod_key = extract_key(event);
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -174,33 +272,51 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             None => return,
         };
 
-        let storage_key = format!("/registry/{}", pod_key);
-        match self.storage.get::<Pod>(&storage_key).await {
-            Ok(pod) => {
-                if let Some(refs) = &pod.metadata.owner_references {
-                    for owner_ref in refs {
-                        if owner_ref.kind == "ReplicaSet" {
-                            queue
-                                .add(format!("replicasets/{}/{}", ns, owner_ref.name))
-                                .await;
-                        }
-                    }
+        let (value, is_add, is_del) = match event {
+            WatchEvent::Added(_, v) => (v, true, false),
+            WatchEvent::Modified(_, v) => (v, false, false),
+            WatchEvent::Deleted(_, v) => (v, false, true),
+        };
+
+        // Extract ReplicaSet owner names from the pod JSON in the event.
+        let owners: Vec<String> = serde_json::from_str::<Pod>(value)
+            .ok()
+            .and_then(|pod| pod.metadata.owner_references)
+            .map(|refs| {
+                refs.into_iter()
+                    .filter(|r| r.kind == "ReplicaSet")
+                    .map(|r| r.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if owners.is_empty() {
+            // Could not determine owner from the event value (e.g. malformed
+            // or owner-less pod). Fall back to re-enqueuing every ReplicaSet in
+            // the namespace so a relevant one is not missed; do not touch
+            // expectations since we can't attribute the event.
+            if let Ok(items) = self
+                .storage
+                .list::<ReplicaSet>(&build_prefix("replicasets", Some(ns)))
+                .await
+            {
+                for rs in &items {
+                    queue
+                        .add(format!("replicasets/{}/{}", ns, rs.metadata.name))
+                        .await;
                 }
             }
-            Err(_) => {
-                // Pod deleted — enqueue all ReplicaSets in this namespace
-                if let Ok(items) = self
-                    .storage
-                    .list::<ReplicaSet>(&build_prefix("replicasets", Some(ns)))
-                    .await
-                {
-                    for rs in &items {
-                        queue
-                            .add(format!("replicasets/{}/{}", ns, rs.metadata.name))
-                            .await;
-                    }
-                }
+            return;
+        }
+
+        for owner in owners {
+            let exp_key = format!("{}/{}", ns, owner);
+            if is_add {
+                self.observe_creation(&exp_key);
+            } else if is_del {
+                self.observe_deletion(&exp_key);
             }
+            queue.add(format!("replicasets/{}/{}", ns, owner)).await;
         }
     }
 
@@ -286,16 +402,34 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             desired_replicas
         );
 
-        // Reconcile pod count
-        if current_replicas < desired_replicas {
+        // Reconcile pod count — but only if we are not still waiting to observe
+        // pods from a previous create/delete. Acting while expectations are
+        // unmet is exactly what caused the #542 burst: a re-reconcile (rapid
+        // pod watch event or 5s resync) would `list` before the prior create
+        // was visible, see current<desired again, and create a duplicate.
+        let exp_key = Self::expectation_key(replicaset);
+        if !self.expectations_satisfied(&exp_key) {
+            debug!(
+                "ReplicaSet {}/{}: expectations unmet, deferring create/delete this sync",
+                namespace, replicaset.metadata.name
+            );
+        } else if current_replicas < desired_replicas {
             // Need to create more pods
             let to_create = desired_replicas - current_replicas;
             info!(
                 "Creating {} pods for replicaset {}/{}",
                 to_create, namespace, replicaset.metadata.name
             );
+            // Record the expectation BEFORE issuing creates so a concurrent
+            // re-sync that races the watch sees an unmet expectation.
+            self.set_expectations(&exp_key, to_create as i64, 0);
             for _ in 0..to_create {
-                self.create_pod(replicaset).await?;
+                if let Err(e) = self.create_pod(replicaset).await {
+                    // The create never landed — don't wait forever to observe
+                    // a pod that won't appear.
+                    self.observe_creation(&exp_key);
+                    return Err(e);
+                }
             }
         } else if current_replicas > desired_replicas {
             // Need to delete excess pods
@@ -304,8 +438,12 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 "Deleting {} excess pods for replicaset {}/{}",
                 to_delete, namespace, replicaset.metadata.name
             );
+            self.set_expectations(&exp_key, 0, to_delete as i64);
             for pod in replicaset_pods.iter().take(to_delete as usize) {
-                self.delete_pod(&pod.metadata.name, namespace).await?;
+                if let Err(e) = self.delete_pod(&pod.metadata.name, namespace).await {
+                    self.observe_deletion(&exp_key);
+                    return Err(e);
+                }
             }
         }
 
@@ -970,6 +1108,73 @@ mod tests {
             pods.len(),
             2,
             "second reconcile must match existing pods, not create more"
+        );
+    }
+
+    #[test]
+    fn test_expectations_primitives() {
+        let c = ReplicaSetController::new(Arc::new(MemoryStorage::new()), 30);
+        // No entry → satisfied.
+        assert!(c.expectations_satisfied("default/rs"));
+        // Outstanding create → not satisfied until observed.
+        c.set_expectations("default/rs", 2, 0);
+        assert!(!c.expectations_satisfied("default/rs"));
+        c.observe_creation("default/rs");
+        assert!(!c.expectations_satisfied("default/rs"));
+        c.observe_creation("default/rs");
+        assert!(c.expectations_satisfied("default/rs"));
+        // Outstanding delete → not satisfied until observed.
+        c.set_expectations("default/rs", 0, 1);
+        assert!(!c.expectations_satisfied("default/rs"));
+        c.observe_deletion("default/rs");
+        assert!(c.expectations_satisfied("default/rs"));
+        // Clearing removes the entry (treated as satisfied).
+        c.set_expectations("default/rs", 5, 0);
+        c.clear_expectations("default/rs");
+        assert!(c.expectations_satisfied("default/rs"));
+    }
+
+    /// The core #542 guard: while a ReplicaSet has unmet create expectations
+    /// (pods created but not yet observed via the watch), a re-reconcile that
+    /// momentarily sees too few pods MUST NOT create duplicates.
+    #[tokio::test]
+    async fn test_reconcile_defers_create_while_expectations_unmet() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
+        let labels = make_labels(&[("name", "pod1")]);
+        let rs = make_replicaset("rs1", labels.clone(), 2);
+        let rs_key = build_key("replicasets", Some("default"), "rs1");
+        storage.create(&rs_key, &rs).await.unwrap();
+
+        // Simulate "we already issued 2 creates that haven't been observed yet"
+        // — i.e. the storage list does not yet reflect them.
+        controller.set_expectations("default/rs1", 2, 0);
+
+        controller.reconcile_replicaset(&rs).await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(
+            pods.len(),
+            0,
+            "must not create pods while create expectations are unmet (got {})",
+            pods.len()
+        );
+
+        // Once both creations are observed, the next reconcile may act.
+        controller.observe_creation("default/rs1");
+        controller.observe_creation("default/rs1");
+        controller.reconcile_replicaset(&rs).await.unwrap();
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(
+            pods.len(),
+            2,
+            "after expectations satisfied, reconcile creates the desired pods"
         );
     }
 }
