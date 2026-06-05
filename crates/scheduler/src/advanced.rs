@@ -618,6 +618,12 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
     let mut used_extended: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
     let node_name = &node.metadata.name;
+
+    // Candidate identity + priority, for nominated-pod space reservation below.
+    let candidate_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
+    let candidate_name = pod.metadata.name.as_str();
+    let candidate_ns = pod.metadata.namespace.as_deref().unwrap_or("");
+
     for existing_pod in all_pods {
         let scheduled_on_this_node = existing_pod
             .spec
@@ -625,7 +631,31 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
             .and_then(|s| s.node_name.as_ref())
             .map(|n| n == node_name)
             .unwrap_or(false);
-        if !scheduled_on_this_node {
+
+        // Reserve space for higher-or-equal-priority pods NOMINATED to this node
+        // by preemption but not yet bound. Without this, a lower-priority pod
+        // schedules into the space the preemptor just freed, gets preempted
+        // again, and the owning controller recreates it — an endless
+        // preemption live-lock (#542 PreemptionExecutionPath). Mirrors upstream
+        // `addNominatedPods`, which runs the fit predicate with nominated pods
+        // of >= priority added to the node.
+        let is_self = existing_pod.metadata.name == candidate_name
+            && existing_pod.metadata.namespace.as_deref().unwrap_or("") == candidate_ns;
+        let nominated_here = existing_pod
+            .status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_ref())
+            .map(|n| n == node_name)
+            .unwrap_or(false);
+        let existing_priority = existing_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.priority)
+            .unwrap_or(0);
+        let reserve_for_nominee =
+            !is_self && nominated_here && existing_priority >= candidate_priority;
+
+        if !scheduled_on_this_node && !reserve_for_nominee {
             continue;
         }
         // K8s tracks UsedPorts for ALL pods assigned to a node (including
@@ -1645,6 +1675,84 @@ mod tests {
             calculate_resource_score_with_pods(&node, &big, &[]),
             0,
             "pod requesting 2k of a 1k extended resource must not fit"
+        );
+    }
+
+    /// A node's freed space must be reserved for a higher-or-equal-priority pod
+    /// already NOMINATED to it (by preemption), so a lower-priority candidate
+    /// does not schedule into it and get re-preempted in a loop (#542).
+    #[test]
+    fn test_nominated_pod_reserves_extended_resource() {
+        let mut alloc = HashMap::new();
+        alloc.insert("cpu".to_string(), "4".to_string());
+        alloc.insert("memory".to_string(), "8Gi".to_string());
+        alloc.insert("example.com/fakecpu".to_string(), "1k".to_string()); // 1000
+        let mut node = Node::new("node-2");
+        node.status = Some(NodeStatus {
+            capacity: None,
+            allocatable: Some(alloc),
+            conditions: None,
+            addresses: None,
+            node_info: None,
+            images: None,
+            volumes_in_use: None,
+            volumes_attached: None,
+            daemon_endpoints: None,
+            config: None,
+            features: None,
+            runtime_handlers: None,
+            declared_features: None,
+        });
+
+        let fakecpu_pod = |name: &str, req: &str, priority: i32| {
+            let mut requests = HashMap::new();
+            requests.insert("example.com/fakecpu".to_string(), req.to_string());
+            let mut container = make_container("0", "0");
+            container.resources = Some(rusternetes_common::types::ResourceRequirements {
+                requests: Some(requests),
+                limits: None,
+                claims: None,
+            });
+            let mut pod = Pod::new(
+                name,
+                rusternetes_common::resources::PodSpec {
+                    containers: vec![container],
+                    priority: Some(priority),
+                    ..Default::default()
+                },
+            );
+            pod.metadata = pod.metadata.with_namespace("default");
+            pod
+        };
+
+        // A high-priority preemptor (900) nominated to node-2 but not yet bound.
+        let mut nominee = fakecpu_pod("preemptor", "900", 100);
+        nominee.status = Some(rusternetes_common::resources::PodStatus {
+            phase: Some(rusternetes_common::types::Phase::Pending),
+            nominated_node_name: Some("node-2".to_string()),
+            ..Default::default()
+        });
+
+        // Low-priority candidate (priority 1) requesting 200.
+        let candidate = fakecpu_pod("rs-pod1", "200", 1);
+
+        // Without the nominee, 200 of 1000 fits.
+        assert!(
+            calculate_resource_score_with_pods(&node, &candidate, &[]) > 0,
+            "200 of 1000 must fit when nothing is reserved"
+        );
+
+        // With the higher-priority nominee reserving 900, only 100 is free → 200 must NOT fit.
+        assert_eq!(
+            calculate_resource_score_with_pods(&node, &candidate, std::slice::from_ref(&nominee)),
+            0,
+            "candidate must not schedule into space reserved for a higher-priority nominee"
+        );
+
+        // The nominee itself is not reserved against itself — it still fits its nominated node.
+        assert!(
+            calculate_resource_score_with_pods(&node, &nominee, std::slice::from_ref(&nominee)) > 0,
+            "the nominee must still fit its own nominated node"
         );
     }
 
