@@ -468,6 +468,18 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         let final_current_replicas = replicaset_pods_after.len() as i32;
 
+        // Satisfy expectations from observation: if the post-action pod count
+        // has reached the desired count, the create/delete we issued is now
+        // reflected in storage, so clear the expectation. This is what releases
+        // the gate when the storage backend is read-after-write consistent
+        // (the watch-based observe_creation/observe_deletion handles the
+        // eventually-consistent case in production). Without it, a controller
+        // driven by direct reconcile calls (no pod watch) would stay gated
+        // forever after its first action.
+        if final_current_replicas == desired_replicas {
+            self.clear_expectations(&exp_key);
+        }
+
         // Update status with accurate counts
         self.update_status(
             replicaset,
