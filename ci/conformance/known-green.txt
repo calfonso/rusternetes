@@ -396,6 +396,7 @@
 [sig-storage] Downward API volume should update annotations on modification [NodeConformance] [Conformance]
 [sig-storage] Downward API volume should update labels on modification [NodeConformance] [Conformance]
 [sig-storage] EmptyDir wrapper volumes should not conflict [Conformance]
+[sig-storage] PersistentVolumes CSI Conformance should run through the lifecycle of a PV and a PVC [Conformance]
 [sig-storage] Projected combined should project all components that make up the projection API [Projection] [NodeConformance] [Conformance]
 [sig-storage] Projected configMap updates should be reflected in volume [NodeConformance] [Conformance]
 [sig-storage] Projected downwardAPI should provide node allocatable (cpu) as default cpu limit if the limit is not set [NodeConformance] [Conformance]
