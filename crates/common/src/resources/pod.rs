@@ -1199,10 +1199,20 @@ pub struct PodCondition {
     /// Optional in the API and currently not populated by the kubelet, but
     /// strict decoding requires the field to be recognised when clients
     /// echo it back on Pod updates (e.g. e2e conformance test fixtures).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize",
+        default
+    )]
     pub last_probe_time: Option<chrono::DateTime<chrono::Utc>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize",
+        default
+    )]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1245,7 +1255,12 @@ pub struct PodStatus {
     pub qos_class: Option<String>,
 
     /// Time at which the pod was acknowledged by the kubelet
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize",
+        default
+    )]
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Pod-level conditions (Ready, ContainersReady, Initialized, PodScheduled)
@@ -1372,6 +1387,12 @@ pub enum ContainerState {
         message: Option<String>,
     },
     Running {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::types::k8s_time_str::serialize",
+            deserialize_with = "crate::types::k8s_time_str::deserialize"
+        )]
         started_at: Option<String>,
     },
     Terminated {
@@ -1379,7 +1400,19 @@ pub enum ContainerState {
         signal: Option<i32>,
         reason: Option<String>,
         message: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::types::k8s_time_str::serialize",
+            deserialize_with = "crate::types::k8s_time_str::deserialize"
+        )]
         started_at: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::types::k8s_time_str::serialize",
+            deserialize_with = "crate::types::k8s_time_str::deserialize"
+        )]
         finished_at: Option<String>,
         container_id: Option<String>,
     },
@@ -1719,6 +1752,38 @@ pub struct PodResourceClaimStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pod condition timestamps MUST serialize at whole-second precision, like
+    /// upstream `metav1.Time.MarshalJSON`. Sub-second precision diverges from
+    /// the protobuf/typed-client representation and breaks the
+    /// `[sig-node] ... resize pod via the replace endpoint` conformance test,
+    /// whose `Semantic.DeepEqual` compares the `/resize` (JSON) read against the
+    /// main (typed) read of the same pod (#477).
+    #[test]
+    fn test_pod_condition_timestamp_serializes_at_second_precision() {
+        let cond = PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: Some(
+                "2026-06-05T07:21:39.569909935Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap(),
+            ),
+            observed_generation: None,
+        };
+        let json = serde_json::to_string(&cond).unwrap();
+        assert!(
+            json.contains("\"lastTransitionTime\":\"2026-06-05T07:21:39Z\""),
+            "condition timestamp must serialize at second precision: {json}"
+        );
+        assert!(
+            !json.contains(".569909935"),
+            "must not emit sub-second precision: {json}"
+        );
+    }
 
     #[test]
     fn test_pod_with_pvc_volume_serialization() {

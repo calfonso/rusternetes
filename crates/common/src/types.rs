@@ -51,6 +51,43 @@ pub mod k8s_time {
     }
 }
 
+/// Serde for RFC3339 timestamp fields that are stored as `Option<String>`
+/// rather than a typed `DateTime` (e.g. `ContainerState` `startedAt` /
+/// `finishedAt`, which the kubelet writes as preformatted strings). Normalises
+/// to whole-second precision on serialize so JSON matches the protobuf /
+/// typed-client representation (`metav1.Time` is second-precision). A value
+/// that does not parse as RFC3339 is emitted unchanged.
+pub mod k8s_time_str {
+    use chrono::{DateTime, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(raw) => {
+                let normalized = DateTime::parse_from_rfc3339(raw)
+                    .map(|dt| {
+                        dt.with_timezone(&Utc)
+                            .format("%Y-%m-%dT%H:%M:%SZ")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|_| raw.clone());
+                serializer.serialize_str(&normalized)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)
+    }
+}
+
 /// Serde for `map[string]metav1.Time` fields (e.g. `PodDisruptionBudgetStatus.disruptedPods`).
 ///
 /// Upstream `metav1.Time` normally marshals to an RFC3339 string, but apply
