@@ -1255,7 +1255,12 @@ pub struct PodStatus {
     pub qos_class: Option<String>,
 
     /// Time at which the pod was acknowledged by the kubelet
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize",
+        default
+    )]
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Pod-level conditions (Ready, ContainersReady, Initialized, PodScheduled)
@@ -1382,6 +1387,12 @@ pub enum ContainerState {
         message: Option<String>,
     },
     Running {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::types::k8s_time_str::serialize",
+            deserialize_with = "crate::types::k8s_time_str::deserialize"
+        )]
         started_at: Option<String>,
     },
     Terminated {
@@ -1389,7 +1400,19 @@ pub enum ContainerState {
         signal: Option<i32>,
         reason: Option<String>,
         message: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::types::k8s_time_str::serialize",
+            deserialize_with = "crate::types::k8s_time_str::deserialize"
+        )]
         started_at: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::types::k8s_time_str::serialize",
+            deserialize_with = "crate::types::k8s_time_str::deserialize"
+        )]
         finished_at: Option<String>,
         container_id: Option<String>,
     },
