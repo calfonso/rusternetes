@@ -1,4 +1,4 @@
-//! StorageClass controller (stub).
+//! StorageClass controller.
 //!
 //! This controller is responsible for managing `StorageClass` objects:
 //! enforcing the single-default-class invariant
@@ -6,14 +6,6 @@
 //! provisioner parameters, propagating mount options to dynamically
 //! provisioned `PersistentVolume` objects, and defaulting the reclaim
 //! policy when one is not specified.
-//!
-//! The implementation is intentionally a stub right now — its sole purpose
-//! is to give the rest of the controller-manager wiring a stable type to
-//! reference while the behaviour is built out incrementally. The companion
-//! integration tests under
-//! `crates/controller-manager/tests/storageclass_controller_test.rs`
-//! encode the expected behaviour as `#[ignore]`'d RED-state assertions and
-//! will be flipped on as each piece of functionality lands.
 //!
 //! Upstream reference: `kubernetes/test/e2e/storage/storage_class.go`.
 
@@ -43,16 +35,16 @@ pub const IS_DEFAULT_STORAGE_CLASS_ANNOTATION: &str = "storageclass.kubernetes.i
 
 /// Legacy beta variant of [`IS_DEFAULT_STORAGE_CLASS_ANNOTATION`]. Still
 /// accepted by the api-server admission layer; kept here so the
-/// controller's RED-state coverage can be extended once it learns to read
-/// it. Not yet referenced by the stub.
+/// controller's coverage can be extended once it learns to read
+/// it. Not yet referenced by the controller.
 #[allow(dead_code)]
 pub const IS_DEFAULT_STORAGE_CLASS_BETA_ANNOTATION: &str =
     "storageclass.beta.kubernetes.io/is-default-class";
 
-/// `StorageClassController` reconciles `StorageClass` objects.
-///
-/// Currently a stub: `reconcile_all` is a no-op and `run` just sleeps on
-/// the configured interval. See module docs for the intended behaviour.
+/// `StorageClassController` reconciles `StorageClass` objects: it defaults a
+/// missing `reclaim_policy` to `Delete`, enforces the single-default-class
+/// invariant via the `is-default-class` annotation, and backfills
+/// `mount_options` onto bound `PersistentVolume`s.
 pub struct StorageClassController<S: Storage> {
     storage: Arc<S>,
     interval: Duration,
@@ -76,7 +68,7 @@ impl<S: Storage + 'static> StorageClassController<S> {
     /// pass are intentionally swallowed — the controller will retry on
     /// the next tick.
     pub async fn run(&self) -> Result<()> {
-        info!("Starting StorageClass Controller (stub)");
+        info!("Starting StorageClass Controller");
         loop {
             if let Err(e) = self.reconcile_all().await {
                 tracing::error!("StorageClass reconcile failed: {}", e);
@@ -168,6 +160,8 @@ impl<S: Storage + 'static> StorageClassController<S> {
                 let Some(opts) = mount_opts_by_class.get(scn) else {
                     continue;
                 };
+                // Only fill the gap — PVs that already carry mount options are
+                // left untouched; we never overwrite an existing value.
                 let missing = pv
                     .spec
                     .mount_options
