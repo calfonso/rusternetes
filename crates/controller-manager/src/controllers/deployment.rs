@@ -1744,6 +1744,30 @@ impl<S: Storage + 'static> DeploymentController<S> {
             });
         }
 
+        // Surface ReplicaFailure from owned ReplicaSets. Upstream
+        // (pkg/controller/deployment/sync.go calculateStatus) copies the RS
+        // ReplicaFailure condition onto the Deployment so callers see the
+        // underlying pod-creation failure (e.g. quota exceeded).
+        if let Some((reason, message)) = owned_replicasets.iter().find_map(|rs| {
+            rs.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .and_then(|cs| {
+                    cs.iter()
+                        .find(|c| c.condition_type == "ReplicaFailure" && c.status == "True")
+                })
+                .map(|c| (c.reason.clone(), c.message.clone()))
+        }) {
+            conditions.push(DeploymentCondition {
+                condition_type: "ReplicaFailure".to_string(),
+                status: "True".to_string(),
+                last_transition_time: Some(Utc::now()),
+                last_update_time: Some(Utc::now()),
+                reason,
+                message,
+            });
+        }
+
         let new_status = DeploymentStatus {
             replicas: Some(total_replicas),
             ready_replicas: Some(ready_replicas),

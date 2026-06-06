@@ -190,7 +190,6 @@ async fn test_deployment_progress_deadline_seconds_exceeded() {
 /// `status.available_replicas` must be 0 — the readiness gate is not
 /// satisfied yet.
 #[tokio::test]
-#[ignore = "RED-state: deployment.rs counts pods via Ready=True regardless of minReadySeconds; upstream IsPodAvailable also gates on age"]
 async fn test_deployment_min_ready_seconds_enforcement() {
     let storage = setup_test().await;
     let dep_controller = DeploymentController::new(storage.clone(), 10);
@@ -726,7 +725,6 @@ async fn test_deployment_conditions_lifecycle_unavailable() {
 /// Setup: deployment + RS where the RS publishes a `ReplicaFailure=True`
 /// condition. The deployment controller must surface the same condition.
 #[tokio::test]
-#[ignore = "RED-state: deployment controller does not yet copy ReplicaFailure from owned RS status conditions"]
 async fn test_deployment_replica_failure_condition_surfaces_from_rs() {
     let storage = setup_test().await;
     let dep_controller = DeploymentController::new(storage.clone(), 10);
