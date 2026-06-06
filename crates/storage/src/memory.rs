@@ -215,12 +215,21 @@ impl Storage for MemoryStorage {
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         let data = self.data.read().unwrap();
-        let mut results = Vec::new();
+        // Return matches in key (lexicographic) order. A plain HashMap iterates
+        // randomly, which makes order-dependent tests flaky AND lets a test pass
+        // on MemoryStorage while behaving differently on the etcd/rhino backends,
+        // whose range scans return key-sorted results (as does the real apiserver
+        // List). Sorting by key here keeps MemoryStorage faithful to production.
+        let mut matched: Vec<(&str, &str)> = data
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(b.0));
 
-        for (key, value) in data.iter() {
-            if key.starts_with(prefix) {
-                results.push(serde_json::from_str(value)?);
-            }
+        let mut results = Vec::with_capacity(matched.len());
+        for (_, value) in matched {
+            results.push(serde_json::from_str(value)?);
         }
 
         Ok(results)
