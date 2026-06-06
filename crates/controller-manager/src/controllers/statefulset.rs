@@ -994,7 +994,163 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
+        // GC ControllerRevisions beyond revisionHistoryLimit.
+        // Mirrors upstream truncateHistory() in
+        // pkg/controller/statefulset/stateful_set_control.go.
+        // The limit caps the TOTAL number of retained revisions (including the
+        // current one). Oldest revisions are deleted first; the current revision
+        // (matching the live update_revision hash) is never deleted.
+        if let Some(limit) = statefulset.spec.revision_history_limit {
+            self.truncate_history(namespace, name, &statefulset.metadata.uid, &revision, limit)
+                .await;
+        }
+
         Ok(())
+    }
+
+    /// Delete ControllerRevisions owned by this StatefulSet beyond `limit`.
+    /// Oldest-first deletion order mirrors upstream `truncateHistory`. A revision
+    /// is never deleted if it is the current one OR still referenced by a live
+    /// pod (a pod mid-rollout below the partition runs an older revision —
+    /// deleting its ControllerRevision would break partition rollouts and
+    /// rollback). Ownership is matched by ownerReference uid (with name as a
+    /// fallback for revisions written before a uid was assigned).
+    async fn truncate_history(
+        &self,
+        namespace: &str,
+        statefulset_name: &str,
+        statefulset_uid: &str,
+        current_revision_hash: &str,
+        limit: i32,
+    ) {
+        if limit < 0 {
+            return;
+        }
+
+        let owned_by_this = |refs: &[serde_json::Value]| {
+            refs.iter().any(|r| {
+                r.pointer("/kind").and_then(|v| v.as_str()) == Some("StatefulSet")
+                    && (r.pointer("/uid").and_then(|v| v.as_str()) == Some(statefulset_uid)
+                        || r.pointer("/name").and_then(|v| v.as_str()) == Some(statefulset_name))
+            })
+        };
+
+        // Revision hashes still referenced by live pods owned by this
+        // StatefulSet — these must never be GC'd. Mirrors upstream, which keeps
+        // any revision a current pod is running.
+        let pods_prefix = format!("/registry/pods/{}/", namespace);
+        let live_pods: Vec<serde_json::Value> =
+            self.storage.list(&pods_prefix).await.unwrap_or_default();
+        let mut live_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        live_hashes.insert(current_revision_hash.to_string());
+        for pod in &live_pods {
+            let owned = pod
+                .pointer("/metadata/ownerReferences")
+                .and_then(|v| v.as_array())
+                .map(|refs| owned_by_this(refs))
+                .unwrap_or(false);
+            if !owned {
+                continue;
+            }
+            if let Some(h) = pod
+                .pointer("/metadata/labels/controller-revision-hash")
+                .and_then(|v| v.as_str())
+            {
+                if !h.is_empty() {
+                    live_hashes.insert(h.to_string());
+                }
+            }
+        }
+
+        let prefix = format!("/registry/controllerrevisions/{}/", namespace);
+        let mut revisions: Vec<serde_json::Value> = match self.storage.list(&prefix).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "ControllerRevision GC: failed to list revisions for {}/{}: {}",
+                    namespace, statefulset_name, e
+                );
+                return;
+            }
+        };
+
+        // Keep only revisions owned by this StatefulSet.
+        revisions.retain(|cr| {
+            cr.pointer("/metadata/ownerReferences")
+                .and_then(|v| v.as_array())
+                .map(|refs| owned_by_this(refs))
+                .unwrap_or(false)
+        });
+
+        let total = revisions.len() as i32;
+        if total <= limit {
+            return;
+        }
+
+        // Sort by creationTimestamp ascending (oldest first), tie-broken by name
+        // so the deletion order is fully deterministic.
+        revisions.sort_by(|a, b| {
+            let ts_a = a
+                .pointer("/metadata/creationTimestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ts_b = b
+                .pointer("/metadata/creationTimestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let name_a = a
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let name_b = b
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            ts_a.cmp(ts_b).then_with(|| name_a.cmp(name_b))
+        });
+
+        // Delete oldest revisions until we are at or below the limit, but never
+        // delete the current revision or one still referenced by a live pod.
+        let to_delete = (total - limit) as usize;
+        let mut deleted = 0;
+        for cr in &revisions {
+            if deleted >= to_delete {
+                break;
+            }
+            let hash = cr
+                .pointer("/metadata/labels/controller.kubernetes.io~1hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if live_hashes.contains(hash) {
+                continue;
+            }
+            let cr_name = cr
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if cr_name.is_empty() {
+                continue;
+            }
+            let key = format!("/registry/controllerrevisions/{}/{}", namespace, cr_name);
+            match self.storage.delete(&key).await {
+                Ok(_) => {
+                    info!(
+                        "ControllerRevision GC: deleted {} for StatefulSet {}/{}",
+                        cr_name, namespace, statefulset_name
+                    );
+                    deleted += 1;
+                }
+                Err(rusternetes_common::Error::NotFound(_)) => {
+                    deleted += 1; // already gone, count it
+                }
+                Err(e) => {
+                    warn!(
+                        "ControllerRevision GC: failed to delete {} for {}/{}: {}",
+                        cr_name, namespace, statefulset_name, e
+                    );
+                }
+            }
+        }
     }
 
     async fn ensure_pvcs_for_ordinal(
@@ -1224,12 +1380,16 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
-        // Stamp `pod.spec.subdomain` from `statefulset.spec.serviceName` so the
-        // headless governing Service generates per-pod DNS A records under
+        // Stamp `pod.spec.subdomain` from `statefulset.spec.serviceName` and
+        // `pod.spec.hostname` from the pod name so the headless governing
+        // Service generates per-pod DNS A records under
         // `<pod>.<serviceName>.<ns>.svc.cluster.local`.
+        // Mirrors upstream initIdentity() in
+        // pkg/controller/statefulset/stateful_set_utils.go.
         let mut pod_spec = template.spec.clone();
         if !statefulset.spec.service_name.is_empty() {
             pod_spec.subdomain = Some(statefulset.spec.service_name.clone());
+            pod_spec.hostname = Some(pod_name.clone());
         }
 
         let pod = Pod {
@@ -1317,12 +1477,12 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
-        // Stamp `pod.spec.subdomain` from `statefulset.spec.serviceName` so the
-        // headless governing Service generates per-pod DNS A records under
-        // `<pod>.<serviceName>.<ns>.svc.cluster.local`.
+        // Stamp `pod.spec.subdomain` from `statefulset.spec.serviceName` and
+        // `pod.spec.hostname` from the pod name (mirrors initIdentity()).
         let mut pod_spec = template.spec.clone();
         if !statefulset.spec.service_name.is_empty() {
             pod_spec.subdomain = Some(statefulset.spec.service_name.clone());
+            pod_spec.hostname = Some(pod_name.clone());
         }
 
         let pod = Pod {

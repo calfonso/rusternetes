@@ -481,7 +481,6 @@ async fn statefulset_pvc_retention_delete_on_scale_down() {
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/statefulset.go
 /// Tests that each pod gets a stable DNS name: <pod-name>.<service-name>.<namespace>.svc.cluster.local
 #[tokio::test]
-#[ignore = "RED-state: StatefulSet controller does not set pod.spec.hostname / pod.spec.subdomain when a matching headless service exists"]
 async fn statefulset_pods_should_have_stable_network_identity() {
     let storage = setup_test().await;
     let ns = "default";
@@ -543,7 +542,8 @@ async fn statefulset_pods_should_have_stable_network_identity() {
     controller.reconcile_all().await.unwrap();
     mark_all_pods_ready(&storage, ns).await;
 
-    let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    let mut pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    pods.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
     assert_eq!(pods.len(), 2);
 
     // Verify pod hostnames and subdomains are set correctly
@@ -769,7 +769,6 @@ async fn statefulset_status_should_be_accurate_during_scaling() {
 /// Upstream: k8s.io/kubernetes/pkg/controller/statefulset/stateful_set_controller_test.go
 /// Tests that old ControllerRevisions are garbage collected when limit is exceeded.
 #[tokio::test]
-#[ignore = "RED-state: StatefulSet controller does not garbage-collect ControllerRevisions beyond spec.revisionHistoryLimit"]
 async fn statefulset_should_respect_revision_history_limit() {
     let storage = setup_test().await;
     let ns = "default";
@@ -1037,7 +1036,6 @@ async fn statefulset_pods_have_subdomain_for_headless_dns() {
 /// Upstream: kubernetes/test/e2e/apps/statefulset.go — "should perform rolling
 /// updates and roll backs of template modifications".
 #[tokio::test]
-#[ignore = "RED-state: StatefulSet controller advances currentRevision but does not preserve a stable rollback target; force-rollback to a previous revision requires ControllerRevision history walk that is not yet implemented"]
 async fn statefulset_force_rollback_to_previous_revision() {
     let storage = setup_test().await;
     let ns = "default";
@@ -1231,7 +1229,6 @@ async fn statefulset_propagates_init_containers_in_order() {
 /// Upstream: kubernetes/test/e2e/apps/statefulset.go — "should not resize
 /// existing PVCs when VCT is updated" / KEP-661 (VolumeClaimTemplate update).
 #[tokio::test]
-#[ignore = "RED-state: StatefulSet controller does not re-evaluate the volumeClaimTemplate after creation; PVCs for new ordinals after a VCT change are not yet created with the updated spec"]
 async fn statefulset_vct_update_applies_to_new_ordinal_pvcs() {
     let storage = setup_test().await;
     let ns = "default";
