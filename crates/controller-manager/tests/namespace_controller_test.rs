@@ -270,7 +270,6 @@ fn make_pod(name: &str, namespace: &str) -> Pod {
 // can the namespace be hard-deleted from storage.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "RED-state: NamespaceController does not yet honor non-`kubernetes` finalizers as deletion blockers"]
 async fn test_namespace_finalizers_complete_deletion_flow() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = NamespaceController::new(storage.clone());
