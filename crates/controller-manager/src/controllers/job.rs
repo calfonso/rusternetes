@@ -217,6 +217,22 @@ impl<S: Storage + 'static> JobController<S> {
             return Ok(());
         }
 
+        // Honour spec.managedBy: when a Job is managed by an external controller
+        // (anything other than the in-tree "kubernetes.io/job-controller"), the
+        // in-tree controller must not act on it — no pod creation, no status
+        // mutation. K8s ref: pkg/controller/job/job_controller.go syncJob
+        // early-returns when controllerName != JobControllerName.
+        const JOB_CONTROLLER_NAME: &str = "kubernetes.io/job-controller";
+        if let Some(managed_by) = job.spec.managed_by.as_deref() {
+            if managed_by != JOB_CONTROLLER_NAME {
+                debug!(
+                    "Skipping Job {}/{}: managedBy={} is not the in-tree controller",
+                    namespace, name, managed_by
+                );
+                return Ok(());
+            }
+        }
+
         debug!("Reconciling Job {}/{}", namespace, name);
 
         // For completed/failed jobs, still update terminating count
@@ -230,6 +246,33 @@ impl<S: Storage + 'static> JobController<S> {
                         && c.status == "True"
                 });
                 if is_finished {
+                    // Honour spec.ttlSecondsAfterFinished: once the TTL has
+                    // elapsed relative to the job's completionTime, mark the job
+                    // for deletion (set deletionTimestamp). K8s ref:
+                    // pkg/controller/ttlafterfinished — the TTL-after-finished
+                    // controller deletes finished jobs whose TTL has expired.
+                    if let Some(ttl) = job.spec.ttl_seconds_after_finished {
+                        if let Some(completion_time) = status.completion_time {
+                            let elapsed = chrono::Utc::now()
+                                .signed_duration_since(completion_time)
+                                .num_seconds();
+                            if elapsed >= ttl as i64 && !job.metadata.is_being_deleted() {
+                                info!(
+                                    "Job {}/{} TTL ({}s) elapsed {}s after completion — marking for deletion",
+                                    namespace, name, ttl, elapsed
+                                );
+                                let key = build_key("jobs", Some(namespace), name);
+                                if let Ok(mut fresh_job) = self.storage.get::<Job>(&key).await {
+                                    if fresh_job.metadata.deletion_timestamp.is_none() {
+                                        fresh_job.metadata.deletion_timestamp =
+                                            Some(chrono::Utc::now());
+                                        let _ = self.storage.update(&key, &fresh_job).await;
+                                    }
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
                     // Still update terminating count for finished jobs
                     let pod_prefix = format!("/registry/pods/{}/", namespace);
                     let all_pods: Vec<Pod> = self.storage.list(&pod_prefix).await?;
@@ -343,14 +386,21 @@ impl<S: Storage + 'static> JobController<S> {
                 let labels = pod.metadata.labels.as_ref();
                 let matches = labels.is_some_and(|l| sel.iter().all(|(k, v)| l.get(k) == Some(v)));
                 if !matches {
-                    // Pod no longer matches selector — release it by removing ownerReference
-                    // Use CAS retry to handle concurrent updates
+                    // Pod no longer matches selector — release it. Upstream removes
+                    // the controller ownerRef AND sets a deletionTimestamp so the
+                    // disowned pod is cleaned up rather than left running. K8s ref:
+                    // pkg/controller/controller_ref_manager.go ReleasePod.
+                    // Use CAS retry to handle concurrent updates.
                     let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
                     for _ in 0..3 {
                         match self.storage.get::<Pod>(&pod_key).await {
                             Ok(mut fresh_pod) => {
                                 if let Some(ref mut refs) = fresh_pod.metadata.owner_references {
                                     refs.retain(|r| &r.uid != job_uid);
+                                }
+                                if fresh_pod.metadata.deletion_timestamp.is_none() {
+                                    fresh_pod.metadata.deletion_timestamp =
+                                        Some(chrono::Utc::now());
                                 }
                                 match self.storage.update(&pod_key, &fresh_pod).await {
                                     Ok(_) => {
