@@ -714,40 +714,42 @@ impl<S: Storage + 'static> NamespaceController<S> {
             return Ok(());
         }
 
-        // All resources deleted — remove the "kubernetes" finalizer
-        if let Some(finalizers) = &namespace.metadata.finalizers {
-            if finalizers.contains(&"kubernetes".to_string()) {
-                info!("Removing kubernetes finalizer from namespace {}", name);
-                let key = build_key("namespaces", None, name);
-                let mut ns: Namespace = self.storage.get(&key).await?;
-                if let Some(ref mut fins) = ns.metadata.finalizers {
-                    fins.retain(|f| f != "kubernetes");
+        // Re-fetch the live namespace, then retire ONLY the built-in
+        // `kubernetes` finalizer — custom finalizers belong to external actors
+        // and must keep the namespace Terminating until they clear them
+        // (upstream pkg/controller/namespace/deletion). Hard-delete once the
+        // finalizer slice is fully empty, regardless of which finalizer was the
+        // last to go — so a namespace whose custom finalizer is cleared AFTER
+        // `kubernetes` was already removed still gets collected.
+        let key = build_key("namespaces", None, name);
+        let mut ns: Namespace = self.storage.get(&key).await?;
+
+        let had_kubernetes = ns
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|f| f.iter().any(|x| x == "kubernetes"));
+        if let Some(ref mut fins) = ns.metadata.finalizers {
+            fins.retain(|f| f != "kubernetes");
+        }
+
+        let no_finalizers = ns.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty());
+        if no_finalizers {
+            info!(
+                "All finalizers cleared, deleting namespace {} from storage",
+                name
+            );
+            match self.storage.delete(&key).await {
+                Ok(_) => {
+                    info!("Namespace {} fully deleted", name);
+                    return Ok(());
                 }
-
-                // If no finalizers remain, the namespace can be fully deleted
-                let no_finalizers = ns.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty());
-
-                if no_finalizers {
-                    // Delete the namespace from storage
-                    info!(
-                        "All finalizers removed, deleting namespace {} from storage",
-                        name
-                    );
-                    match self.storage.delete(&key).await {
-                        Ok(_) => {
-                            info!("Namespace {} fully deleted", name);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            warn!("Failed to delete namespace {}: {}", name, e);
-                            // Fall through to just update
-                        }
-                    }
-                }
-
-                // Update with finalizer removed
-                let _ = self.storage.update(&key, &ns).await;
+                Err(e) => warn!("Failed to delete namespace {}: {}", name, e),
             }
+        } else if had_kubernetes {
+            // Custom finalizers remain — persist the kubernetes-finalizer
+            // removal and leave the namespace Terminating.
+            let _ = self.storage.update(&key, &ns).await;
         }
 
         info!("Namespace {} finalization complete", name);
