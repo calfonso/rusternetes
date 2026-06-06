@@ -122,8 +122,7 @@ else
     # in one pass; the leading backslash escapes the backslash itself in the
     # output, so '[Conformance]' becomes '\[Conformance\]'.
     # Escape regex metacharacters so the user can pass a literal test
-    # description. Match the canary runner exactly so a line that works
-    # in known-green.txt also works here. Substring match (no ^…$
+    # description. Substring match (no ^…$
     # anchors) — Ginkgo's `--focus` is regex-anchorless, and real
     # testcase names carry `[NodeConformance] [Conformance]` suffixes
     # that anchoring would reject.

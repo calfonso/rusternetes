@@ -31,7 +31,7 @@ env:
 #
 # `cargo nextest` and `cargo clippy` are REQUIRED status checks. To keep
 # them mergeable without burning a full compile on PRs that touch no Rust
-# (docs / scripts / compose / known-green.txt only), each job stays
+# (docs / scripts / compose only), each job stays
 # always-triggered but gates its cache+build steps on a change-detection
 # step — so the required check still reports green in seconds when there's
 # no Rust to build. Pushes to main always run the full job.

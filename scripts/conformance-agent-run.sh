@@ -6,8 +6,8 @@
 # Usage:
 #   AGENT_ID=1 bash scripts/conformance-agent-run.sh '\[sig-node\] Pods.*should be submitted and removed'
 #
-# Or pass --focus / --known-green:
-#   AGENT_ID=1 bash scripts/conformance-agent-run.sh --known-green
+# Or pass --focus explicitly:
+#   AGENT_ID=1 bash scripts/conformance-agent-run.sh --focus '\[Conformance\]'
 #
 # Output: ${AGENT_WORKDIR}/.rusternetes/agents/${AGENT_ID}/results/{e2e.log,junit_01.xml,…}
 # Exit code mirrors hydrophone's: 0 on pass, non-zero on any failure.
@@ -21,12 +21,10 @@ source "${SCRIPT_DIR}/conformance-agent-common.sh"
 CONFORMANCE_IMAGE="${CONFORMANCE_IMAGE:-registry.k8s.io/conformance:v1.35.0}"
 HYDROPHONE_VERSION="${HYDROPHONE_VERSION:-v0.7.0}"
 FOCUS=""
-USE_KNOWN_GREEN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --focus) FOCUS="$2"; shift 2 ;;
-    --known-green) USE_KNOWN_GREEN=1; shift ;;
     --conformance-image) CONFORMANCE_IMAGE="$2"; shift 2 ;;
     -*) echo "unknown flag: $1" >&2; exit 64 ;;
     *)
@@ -36,12 +34,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$USE_KNOWN_GREEN" -eq 1 && -n "$FOCUS" ]]; then
-  echo "--known-green and --focus are mutually exclusive" >&2
-  exit 64
-fi
-if [[ "$USE_KNOWN_GREEN" -eq 0 && -z "$FOCUS" ]]; then
-  echo "either --focus REGEX or --known-green required" >&2
+if [[ -z "$FOCUS" ]]; then
+  echo "--focus REGEX (or a positional focus regex) is required" >&2
   exit 64
 fi
 
@@ -67,19 +61,6 @@ docker exec "$DIND_NAME" sh -c '
   tar -xzf /tmp/hydrophone.tgz -C /usr/local/bin hydrophone
   chmod +x /usr/local/bin/hydrophone
 '
-
-# --- assemble the focus regex ------------------------------------------------
-if [[ "$USE_KNOWN_GREEN" -eq 1 ]]; then
-  # Reuse the canary harness — it understands known-green.txt + ratchet.
-  agent_banner "delegating to conformance-canary-run.sh (known-green ratchet)"
-  docker exec -w /workspace \
-    -e KUBECONFIG="/workspace/.rusternetes/agents/${AGENT_ID}/kubeconfig-internal" \
-    "$DIND_NAME" \
-    bash scripts/conformance-canary-run.sh \
-      --output-dir "/workspace/.rusternetes/agents/${AGENT_ID}/results" \
-      --conformance-image "$CONFORMANCE_IMAGE"
-  exit $?
-fi
 
 # --- direct hydrophone invocation --------------------------------------------
 agent_banner "hydrophone --focus '$FOCUS'"
