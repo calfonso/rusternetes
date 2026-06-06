@@ -171,7 +171,6 @@ async fn test_storageclass_default_designation_zero_defaults() {
 /// preserved verbatim through reconciliation; the controller has no
 /// business mutating opaque driver config.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_provisioner_parameters_preserved() {
     let storage = setup_test().await;
 
@@ -296,7 +295,6 @@ async fn test_storageclass_mount_options_propagation_to_pv() {
 /// defaulted to `Delete` by the controller (matches upstream
 /// `pkg/registry/storage/storageclass/strategy.go` defaulting).
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_reclaim_policy_default_delete() {
     let storage = setup_test().await;
 
@@ -331,7 +329,6 @@ async fn test_storageclass_reclaim_policy_default_delete() {
 /// must default only when the field is empty, never overwrite a valid
 /// caller-supplied value.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_reclaim_policy_retain_preserved() {
     let storage = setup_test().await;
 

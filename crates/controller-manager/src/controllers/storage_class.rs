@@ -18,7 +18,11 @@
 //! Upstream reference: `kubernetes/test/e2e/storage/storage_class.go`.
 
 use anyhow::Result;
-use rusternetes_storage::Storage;
+use rusternetes_common::resources::volume::{
+    PersistentVolume, PersistentVolumeReclaimPolicy, StorageClass,
+};
+use rusternetes_storage::{build_key, Storage};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -50,7 +54,6 @@ pub const IS_DEFAULT_STORAGE_CLASS_BETA_ANNOTATION: &str =
 /// Currently a stub: `reconcile_all` is a no-op and `run` just sleeps on
 /// the configured interval. See module docs for the intended behaviour.
 pub struct StorageClassController<S: Storage> {
-    #[allow(dead_code)]
     storage: Arc<S>,
     interval: Duration,
 }
@@ -84,10 +87,56 @@ impl<S: Storage + 'static> StorageClassController<S> {
 
     /// Reconcile every `StorageClass` in the cluster.
     ///
-    /// Currently a no-op; the RED-state tests in
-    /// `tests/storageclass_controller_test.rs` describe the behaviour
-    /// this method must eventually implement.
+    /// Currently implements reclaim-policy defaulting: a `StorageClass`
+    /// created without an explicit `reclaim_policy` is defaulted to
+    /// `Delete`, matching upstream Kubernetes defaulting in
+    /// `pkg/apis/storage/v1/defaults.go`.
     pub async fn reconcile_all(&self) -> Result<()> {
+        let classes: Vec<StorageClass> =
+            self.storage.list("/registry/storageclasses/").await?;
+
+        for sc in classes {
+            let mut sc = sc;
+            let mut changed = false;
+
+            // Default a missing reclaim policy to Delete. Upstream does this in
+            // the api-server defaulting layer (pkg/apis/storage/v1/defaults.go
+            // SetDefaults_StorageClass); we port it into the controller. Never
+            // overwrite an explicit value, and never touch provisioner/parameters.
+            if sc.reclaim_policy.is_none() {
+                sc.reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
+                changed = true;
+            }
+
+            if changed {
+                let key = build_key("storageclasses", None, &sc.metadata.name);
+                self.storage.update(&key, &sc).await?;
+            }
+        }
+
         Ok(())
     }
+}
+
+/// True when the StorageClass carries the GA default-class annotation set to
+/// `"true"`.
+fn is_default(sc: &StorageClass) -> bool {
+    sc.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(IS_DEFAULT_STORAGE_CLASS_ANNOTATION))
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Set the GA default-class annotation to `val`, creating the annotations map
+/// if absent.
+fn set_default_annotation(sc: &mut StorageClass, val: &str) {
+    sc.metadata
+        .annotations
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            IS_DEFAULT_STORAGE_CLASS_ANNOTATION.to_string(),
+            val.to_string(),
+        );
 }
