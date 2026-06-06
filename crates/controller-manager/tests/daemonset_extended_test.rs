@@ -364,7 +364,6 @@ async fn daemonset_with_tolerations_should_schedule_on_tainted_nodes() {
 /// Upstream: k8s.io/kubernetes/test/e2e/apps/daemon_set.go
 /// Tests that nodeAffinity constraints filter eligible nodes.
 #[tokio::test]
-#[ignore = "RED-state: DaemonSet controller does not honour requiredDuringSchedulingIgnoredDuringExecution node affinity — schedules on all nodes regardless of nodeSelectorTerms"]
 async fn daemonset_with_node_affinity_should_filter_nodes() {
     let storage = setup_test().await;
     let ns = "default";
@@ -533,7 +532,6 @@ async fn daemonset_rolling_update_respects_max_unavailable() {
 /// Upstream: k8s.io/kubernetes/pkg/controller/daemon/daemon_controller_test.go
 /// Tests that OnDelete requires manual pod deletion for updates.
 #[tokio::test]
-#[ignore = "RED-state: DaemonSet controller does not name pods using the `<ds>-<node>` convention upstream uses, so manual-delete-by-name does not work"]
 async fn daemonset_ondelete_strategy_requires_manual_deletion() {
     let storage = setup_test().await;
     let ns = "default";
@@ -755,7 +753,6 @@ async fn daemonset_status_should_be_accurate_during_update() {
 /// Upstream: k8s.io/kubernetes/pkg/controller/daemon/daemon_controller_test.go
 /// Tests that old ControllerRevisions are garbage collected.
 #[tokio::test]
-#[ignore = "RED-state: DaemonSet controller does not garbage-collect ControllerRevisions beyond spec.revisionHistoryLimit"]
 async fn daemonset_should_respect_revision_history_limit() {
     let storage = setup_test().await;
     let ns = "default";
@@ -1144,9 +1141,6 @@ async fn daemonset_status_counters_steady_state_all_fields() {
 /// block the DS from co-locating. Rusternetes' controller does not yet
 /// consult `podAntiAffinity`, so this is RED-state.
 #[tokio::test]
-#[ignore = "RED-state: DaemonSet controller does not honour podAntiAffinity \
-            requiredDuringSchedulingIgnoredDuringExecution — schedules even when a \
-            conflicting pod already occupies the topology"]
 async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
     use rusternetes_common::resources::pod::{PodAffinityTerm, PodAntiAffinity};
 
