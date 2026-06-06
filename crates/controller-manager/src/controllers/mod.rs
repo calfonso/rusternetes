@@ -32,7 +32,6 @@ pub mod resourceclaim;
 pub mod service;
 pub mod serviceaccount;
 pub mod statefulset;
-#[allow(dead_code)]
 pub mod storage_class;
 pub mod taint_eviction;
 pub mod ttl_controller;

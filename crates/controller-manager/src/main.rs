@@ -29,6 +29,7 @@ use controllers::{
     service::ServiceController,
     serviceaccount::ServiceAccountController,
     statefulset::StatefulSetController,
+    storage_class::StorageClassController,
     ttl_controller::TTLController,
     volume_expansion::VolumeExpansionController,
     volume_snapshot::VolumeSnapshotController,
@@ -394,6 +395,17 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("Volume Expansion controller error: {}", e);
+            }
+        }
+    });
+
+    // Start StorageClass controller
+    let storage_class_controller = Arc::new(StorageClassController::new(storage.clone()));
+    spawn_controller!("StorageClass controller", leader_elector, {
+        let controller = storage_class_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("StorageClass controller error: {}", e);
             }
         }
     });

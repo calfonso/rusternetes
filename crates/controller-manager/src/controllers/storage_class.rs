@@ -28,9 +28,9 @@ use tracing::info;
 ///
 /// Note: the api-server admission layer (`crates/api-server/src/admission.rs`)
 /// also honours the legacy beta variant
-/// `storageclass.beta.kubernetes.io/is-default-class`. When this controller
-/// grows real reconcile logic it must inspect *both* annotations to remain
-/// consistent with admission; tracking that as a follow-up.
+/// `storageclass.beta.kubernetes.io/is-default-class`. The controller should
+/// also inspect the beta annotation to stay consistent with admission;
+/// tracking that as a follow-up.
 pub const IS_DEFAULT_STORAGE_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
 
 /// Legacy beta variant of [`IS_DEFAULT_STORAGE_CLASS_ANNOTATION`]. Still

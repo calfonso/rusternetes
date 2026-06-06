@@ -29,6 +29,7 @@ use controllers::{
     service::ServiceController,
     serviceaccount::ServiceAccountController,
     statefulset::StatefulSetController,
+    storage_class::StorageClassController,
     ttl_controller::TTLController,
     volume_expansion::VolumeExpansionController,
     volume_snapshot::VolumeSnapshotController,
@@ -156,6 +157,14 @@ pub async fn run(
         let c = Arc::new(VolumeExpansionController::new(s));
         if let Err(e) = c.run().await {
             error!("Volume Expansion controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
+        let c = Arc::new(StorageClassController::new(s));
+        if let Err(e) = c.run().await {
+            error!("StorageClass controller error: {}", e);
         }
     });
 
