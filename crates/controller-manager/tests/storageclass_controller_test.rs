@@ -213,7 +213,6 @@ async fn test_storageclass_provisioner_parameters_preserved() {
 /// provisioning time via the external provisioner; an in-process port
 /// may legitimately choose to backfill instead.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_mount_options_propagation_to_pv() {
     let storage = setup_test().await;
 

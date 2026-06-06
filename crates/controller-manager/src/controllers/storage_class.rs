@@ -18,7 +18,9 @@
 //! Upstream reference: `kubernetes/test/e2e/storage/storage_class.go`.
 
 use anyhow::Result;
-use rusternetes_common::resources::volume::{PersistentVolumeReclaimPolicy, StorageClass};
+use rusternetes_common::resources::volume::{
+    PersistentVolume, PersistentVolumeReclaimPolicy, StorageClass,
+};
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,6 +115,18 @@ impl<S: Storage + 'static> StorageClassController<S> {
         });
         let winner: Option<String> = defaults.first().map(|sc| sc.metadata.name.clone());
 
+        // class-name -> mount options, for the PV backfill below. Built before the
+        // mutation loop consumes `classes`.
+        let mount_opts_by_class: HashMap<String, Vec<String>> = classes
+            .iter()
+            .filter_map(|sc| {
+                sc.mount_options
+                    .as_ref()
+                    .filter(|o| !o.is_empty())
+                    .map(|o| (sc.metadata.name.clone(), o.clone()))
+            })
+            .collect();
+
         for mut sc in classes {
             let mut changed = false;
 
@@ -133,6 +147,39 @@ impl<S: Storage + 'static> StorageClassController<S> {
             if changed {
                 let key = build_key("storageclasses", None, &sc.metadata.name);
                 self.storage.update(&key, &sc).await?;
+            }
+        }
+
+        // Backfill StorageClass.mount_options onto bound PVs that reference the
+        // class but carry no mount options of their own (steady-state invariant
+        // PV.spec.mount_options == StorageClass.mount_options). DIVERGENCE: upstream
+        // sets these only at provision time when creating the PV
+        // (pkg/controller/volume/persistentvolume/pv_controller.go ~L1677,
+        // options.MountOptions = storageClass.MountOptions); it never backfills
+        // existing PVs. Backfilling is an in-process port choice the RED-state test
+        // explicitly sanctions.
+        if !mount_opts_by_class.is_empty() {
+            let pvs: Vec<PersistentVolume> =
+                self.storage.list("/registry/persistentvolumes/").await?;
+            for pv in pvs {
+                let Some(scn) = pv.spec.storage_class_name.as_deref() else {
+                    continue;
+                };
+                let Some(opts) = mount_opts_by_class.get(scn) else {
+                    continue;
+                };
+                let missing = pv
+                    .spec
+                    .mount_options
+                    .as_ref()
+                    .map(|o| o.is_empty())
+                    .unwrap_or(true);
+                if missing {
+                    let mut pv = pv;
+                    pv.spec.mount_options = Some(opts.clone());
+                    let key = build_key("persistentvolumes", None, &pv.metadata.name);
+                    self.storage.update(&key, &pv).await?;
+                }
             }
         }
 
