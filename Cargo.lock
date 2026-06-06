@@ -4337,6 +4337,7 @@ dependencies = [
  "rcgen",
  "rusternetes-cloud-providers",
  "rusternetes-common",
+ "rusternetes-scheduler",
  "rusternetes-storage",
  "serde",
  "serde_json",

@@ -401,9 +401,27 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             .as_deref()
             .unwrap_or(&[]);
 
-        // Filter nodes based on node selector AND taint toleration
+        // Build a candidate pod from the DaemonSet template. This mirrors
+        // upstream `NewPod(ds, nodeName)` (pkg/controller/daemon/daemon_controller.go),
+        // which constructs a pod with the template's PodSpec so the scheduling
+        // predicates (nodeAffinity, podAntiAffinity) can be evaluated against
+        // each candidate node before placing a DS pod there.
+        let candidate_pod = Self::candidate_pod_from_template(daemonset);
+
+        // For pod (anti-)affinity we need to know what pods already run in the
+        // namespace and on which nodes. `check_pod_anti_affinity` resolves a
+        // matching pod's node topology against the candidate node, so it needs
+        // both the pod list and the full node list.
+        let ns_pods: Vec<Pod> = self
+            .storage
+            .list(&format!("/registry/pods/{}/", namespace))
+            .await
+            .unwrap_or_default();
+
+        // Filter nodes based on node selector, taint toleration, required
+        // nodeAffinity, and required podAntiAffinity.
         let eligible_nodes: Vec<Node> = nodes
-            .into_iter()
+            .iter()
             .filter(|node| {
                 if !self.matches_node_selector(node, daemonset) {
                     return false;
@@ -421,8 +439,41 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     );
                     return false;
                 }
+                // Honour required nodeAffinity from the template. Upstream's
+                // `predicates()` calls
+                // `nodeaffinity.GetRequiredNodeAffinity(pod).Match(node)`; we
+                // reuse the scheduler crate's `check_node_affinity`, which
+                // evaluates the same required NodeSelectorTerms.
+                let (node_affinity_ok, _) =
+                    rusternetes_scheduler::advanced::check_node_affinity(node, &candidate_pod);
+                if !node_affinity_ok {
+                    debug!(
+                        "DaemonSet {}/{}: skipping node {} due to nodeAffinity mismatch",
+                        namespace, name, node.metadata.name
+                    );
+                    return false;
+                }
+                // Honour required podAntiAffinity: skip a node when an existing
+                // pod in the same topology domain matches the anti-affinity
+                // labelSelector. Reuses the scheduler crate's
+                // `check_pod_anti_affinity` (interpodaffinity predicate parity).
+                let (anti_affinity_ok, _) =
+                    rusternetes_scheduler::advanced::check_pod_anti_affinity(
+                        node,
+                        &candidate_pod,
+                        &ns_pods,
+                        &nodes,
+                    );
+                if !anti_affinity_ok {
+                    debug!(
+                        "DaemonSet {}/{}: skipping node {} due to podAntiAffinity conflict",
+                        namespace, name, node.metadata.name
+                    );
+                    return false;
+                }
                 true
             })
+            .cloned()
             .collect();
 
         debug!(
@@ -790,6 +841,13 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             })
             .count() as i32;
 
+        // Garbage-collect old ControllerRevisions beyond revisionHistoryLimit.
+        // Mirrors upstream `cleanupHistory` (pkg/controller/daemon/update.go):
+        // delete oldest revisions first, never touching a revision whose hash
+        // is still carried by a live pod (nor the current template's revision).
+        self.cleanup_history(daemonset, &template_hash, &daemonset_pods_after)
+            .await;
+
         // Preserve existing conditions from current status (merge pattern)
         let existing_conditions = daemonset.status.as_ref().and_then(|s| s.conditions.clone());
 
@@ -848,6 +906,109 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         Ok(())
     }
 
+    /// Garbage-collect ControllerRevisions owned by this DaemonSet that exceed
+    /// `spec.revisionHistoryLimit`. Mirrors upstream `cleanupHistory`
+    /// (pkg/controller/daemon/update.go) with one rusternetes refinement: the
+    /// limit caps the *total* number of retained revisions (current included),
+    /// matching the controller-level contract our tests assert.
+    ///
+    /// Deletion order is oldest-revision-first. A revision is never deleted if
+    /// it is the current template's revision (`current_hash`) or if its hash is
+    /// still carried by a live DaemonSet pod — those are needed for OnDelete
+    /// pods and in-flight rollbacks.
+    ///
+    /// The helper is intentionally self-contained (operates on a revision list +
+    /// a set of live hashes) so the StatefulSet controller can reuse the same
+    /// shape later.
+    async fn cleanup_history(&self, daemonset: &DaemonSet, current_hash: &str, live_pods: &[Pod]) {
+        // revisionHistoryLimit defaults to 10 in Kubernetes; when unset there is
+        // effectively a generous cap, so only GC when the field is present.
+        let limit = match daemonset.spec.revision_history_limit {
+            Some(l) if l >= 0 => l,
+            _ => return,
+        };
+
+        let namespace = match daemonset.metadata.namespace.as_deref() {
+            Some(ns) => ns,
+            None => return,
+        };
+
+        let cr_prefix = rusternetes_storage::build_prefix("controllerrevisions", Some(namespace));
+        let mut owned: Vec<ControllerRevision> = match self.storage.list(&cr_prefix).await {
+            Ok(list) => list
+                .into_iter()
+                .filter(|r: &ControllerRevision| {
+                    r.metadata
+                        .owner_references
+                        .as_ref()
+                        .map(|refs| {
+                            refs.iter().any(|owner| {
+                                owner.uid == daemonset.metadata.uid
+                                    || owner.name == daemonset.metadata.name
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+                .collect(),
+            Err(_) => return,
+        };
+
+        let to_kill = owned.len() as i32 - limit;
+        if to_kill <= 0 {
+            return;
+        }
+
+        // Hashes still carried by live pods must be preserved.
+        let live_hashes: std::collections::HashSet<&str> = live_pods
+            .iter()
+            .filter_map(|p| {
+                p.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("controller-revision-hash"))
+                    .map(|s| s.as_str())
+            })
+            .collect();
+
+        // Oldest revision first.
+        owned.sort_by_key(|r| r.revision);
+
+        let mut remaining_to_kill = to_kill;
+        for revision in &owned {
+            if remaining_to_kill <= 0 {
+                break;
+            }
+            // Never delete the current template's revision.
+            let rev_hash = revision
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("controller-revision-hash"))
+                .map(|s| s.as_str());
+            if rev_hash == Some(current_hash) {
+                continue;
+            }
+            // Never delete a revision whose hash is still in use by a live pod.
+            if let Some(h) = rev_hash {
+                if live_hashes.contains(h) {
+                    continue;
+                }
+            }
+            let cr_key = rusternetes_storage::build_key(
+                "controllerrevisions",
+                Some(namespace),
+                &revision.metadata.name,
+            );
+            if self.storage.delete(&cr_key).await.is_ok() {
+                info!(
+                    "Garbage-collected old ControllerRevision {} (revision {}) for DaemonSet {}/{}",
+                    revision.metadata.name, revision.revision, namespace, daemonset.metadata.name
+                );
+                remaining_to_kill -= 1;
+            }
+        }
+    }
+
     fn matches_node_selector(&self, node: &Node, daemonset: &DaemonSet) -> bool {
         // Check if node matches the DaemonSet's node selector
         let node_labels = match &node.metadata.labels {
@@ -876,23 +1037,40 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         namespace: &str,
     ) -> Result<()> {
         let daemonset_name = &daemonset.metadata.name;
-        // Use a random suffix like K8s does (via generateName).
-        // K8s generates unique pod names each time, so when a failed pod
-        // is deleted and a replacement created, the replacement has a DIFFERENT
-        // name. This is critical for the conformance test "should retry creating
-        // failed daemon pods" which checks that the original failed pod's name
-        // returns NotFound via GET.
-        let suffix: String = {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            (0..5)
-                .map(|_| {
-                    const CHARSET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
-                    CHARSET[rng.random_range(0..CHARSET.len())] as char
-                })
-                .collect()
+        // Pod naming depends on the update strategy.
+        //
+        // OnDelete: the controller never auto-replaces a pod, so the pod is a
+        // stable per-node identity. We name it deterministically as
+        // `<ds-name>-<node-name>` so an operator can target it by name with
+        // `kubectl delete pod <ds>-<node>` to trigger a manual roll, matching
+        // the upstream OnDelete workflow (pkg/controller/daemon/update.go —
+        // OnDelete leaves pod replacement to manual deletion).
+        //
+        // RollingUpdate (and the default): use a random suffix like upstream's
+        // `generateName: <ds-name>-`. A fresh suffix on every create means a
+        // rolled pod always gets a NEW name, so the failed-pod's old name
+        // returns NotFound and rolling-update replacement is observable.
+        let on_delete = daemonset
+            .spec
+            .update_strategy
+            .as_ref()
+            .and_then(|s| s.strategy_type.as_deref())
+            == Some("OnDelete");
+        let pod_name = if on_delete {
+            format!("{}-{}", daemonset_name, node_name)
+        } else {
+            let suffix: String = {
+                use rand::Rng;
+                let mut rng = rand::rng();
+                (0..5)
+                    .map(|_| {
+                        const CHARSET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
+                        CHARSET[rng.random_range(0..CHARSET.len())] as char
+                    })
+                    .collect()
+            };
+            format!("{}-{}", daemonset_name, suffix)
         };
-        let pod_name = format!("{}-{}", daemonset_name, suffix);
 
         // Create pod from template
         let template = &daemonset.spec.template;
@@ -1109,6 +1287,34 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     container.volume_mounts = Some(vec![sa_token_mount.clone()]);
                 }
             }
+        }
+    }
+
+    /// Build a candidate `Pod` from the DaemonSet template for scheduling
+    /// predicate evaluation (nodeAffinity / podAntiAffinity). Mirrors upstream
+    /// `NewPod(ds, nodeName)` in pkg/controller/daemon/daemon_controller.go,
+    /// which copies the template's PodSpec and ObjectMeta into a fresh pod.
+    ///
+    /// The `nodeName` is intentionally left unset: predicates evaluate the
+    /// candidate pod against each node in turn, so it must not be pre-bound.
+    fn candidate_pod_from_template(daemonset: &DaemonSet) -> Pod {
+        let template = &daemonset.spec.template;
+        let metadata = template
+            .metadata
+            .clone()
+            .map(|mut m| {
+                m.namespace = daemonset.metadata.namespace.clone();
+                m
+            })
+            .unwrap_or_default();
+        Pod {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata,
+            spec: Some(template.spec.clone()),
+            status: None,
         }
     }
 
