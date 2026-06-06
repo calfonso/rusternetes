@@ -22,6 +22,7 @@ use controllers::{
     network_policy::NetworkPolicyController,
     node::NodeController,
     pod_disruption_budget::{PodDisruptionBudgetController, StalePodDisruptionController},
+    priorityclass::PriorityClassController,
     pv_binder::PVBinderController,
     replicaset::ReplicaSetController,
     replicationcontroller::ReplicationControllerController,
@@ -305,6 +306,14 @@ pub async fn run(
         let c = Arc::new(NodeController::new(s));
         if let Err(e) = c.run().await {
             error!("Node controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
+        let c = Arc::new(PriorityClassController::new(s));
+        if let Err(e) = c.run().await {
+            error!("PriorityClass controller error: {}", e);
         }
     });
 

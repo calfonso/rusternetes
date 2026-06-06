@@ -129,7 +129,6 @@ async fn priority_class_preemption_evicts_lower_priority_pod() {
 /// `priorityClassName` ends up with `spec.priority` equal to that class's
 /// `value`.
 #[tokio::test]
-#[ignore = "RED-state: PriorityClassController is a stub"]
 async fn priority_class_global_default_applies_to_unset_pods() {
     let storage = Arc::new(MemoryStorage::new());
     storage.clear();
@@ -167,7 +166,6 @@ async fn priority_class_global_default_applies_to_unset_pods() {
 /// that omit `priorityClassName` should inherit the namespace default, not
 /// the cluster `globalDefault`.
 #[tokio::test]
-#[ignore = "RED-state: PriorityClassController is a stub"]
 async fn priority_class_namespace_default_overrides_global_default() {
     let storage = Arc::new(MemoryStorage::new());
     storage.clear();
@@ -227,7 +225,6 @@ async fn priority_class_namespace_default_overrides_global_default() {
 /// ordering of the named PriorityClass values; this is what the scheduler
 /// and preemptor consume.
 #[tokio::test]
-#[ignore = "RED-state: PriorityClassController is a stub"]
 async fn priority_class_value_ordering_is_preserved_on_pods() {
     let storage = Arc::new(MemoryStorage::new());
     storage.clear();
@@ -342,7 +339,6 @@ async fn priority_class_preemption_policy_never_does_not_evict() {
 /// mistake), the controller must surface this as an error rather than
 /// silently picking one — we encode that as `reconcile_all` returning `Err`.
 #[tokio::test]
-#[ignore = "RED-state: PriorityClassController is a stub"]
 async fn priority_class_rejects_multiple_global_defaults() {
     let storage = Arc::new(MemoryStorage::new());
     storage.clear();
