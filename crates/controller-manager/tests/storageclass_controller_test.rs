@@ -57,7 +57,6 @@ fn make_storage_class(
 /// (the API server actually) and the controller backstops it. We assert
 /// the steady-state invariant after reconcile.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_default_designation_single_default() {
     let storage = setup_test().await;
 
@@ -123,7 +122,6 @@ async fn test_storageclass_default_designation_single_default() {
 /// remain untouched — the controller must never promote a non-default to
 /// default on its own.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_default_designation_zero_defaults() {
     let storage = setup_test().await;
 

@@ -18,9 +18,7 @@
 //! Upstream reference: `kubernetes/test/e2e/storage/storage_class.go`.
 
 use anyhow::Result;
-use rusternetes_common::resources::volume::{
-    PersistentVolume, PersistentVolumeReclaimPolicy, StorageClass,
-};
+use rusternetes_common::resources::volume::{PersistentVolumeReclaimPolicy, StorageClass};
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,24 +85,48 @@ impl<S: Storage + 'static> StorageClassController<S> {
 
     /// Reconcile every `StorageClass` in the cluster.
     ///
-    /// Currently implements reclaim-policy defaulting: a `StorageClass`
-    /// created without an explicit `reclaim_policy` is defaulted to
-    /// `Delete`, matching upstream Kubernetes defaulting in
-    /// `pkg/apis/storage/v1/defaults.go`.
+    /// Implements two invariants:
+    ///
+    /// 1. **Reclaim-policy defaulting** — a `StorageClass` created without an
+    ///    explicit `reclaim_policy` is defaulted to `Delete`, matching upstream
+    ///    Kubernetes defaulting in `pkg/apis/storage/v1/defaults.go`.
+    ///
+    /// 2. **Single-default-class invariant** — at most one `StorageClass` may
+    ///    carry `storageclass.kubernetes.io/is-default-class=true`. When
+    ///    multiple classes claim the default, the controller picks the winner
+    ///    using the same ordering as upstream `GetDefaultClass`
+    ///    (`pkg/volume/util/storageclass.go`): newest `creationTimestamp`,
+    ///    tie-broken by name ascending. All losers are demoted to `"false"`.
     pub async fn reconcile_all(&self) -> Result<()> {
-        let classes: Vec<StorageClass> =
-            self.storage.list("/registry/storageclasses/").await?;
+        let classes: Vec<StorageClass> = self.storage.list("/registry/storageclasses/").await?;
 
-        for sc in classes {
-            let mut sc = sc;
+        // Select the single default upstream would honor (GetDefaultClass,
+        // pkg/volume/util/storageclass.go): newest creationTimestamp, tie-broken
+        // by name ascending. We then demote the losers (rusternetes-specific;
+        // upstream tolerates multiple and only picks).
+        let mut defaults: Vec<&StorageClass> = classes.iter().filter(|sc| is_default(sc)).collect();
+        defaults.sort_by(|a, b| {
+            b.metadata
+                .creation_timestamp
+                .cmp(&a.metadata.creation_timestamp)
+                .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+        });
+        let winner: Option<String> = defaults.first().map(|sc| sc.metadata.name.clone());
+
+        for mut sc in classes {
             let mut changed = false;
 
-            // Default a missing reclaim policy to Delete. Upstream does this in
-            // the api-server defaulting layer (pkg/apis/storage/v1/defaults.go
-            // SetDefaults_StorageClass); we port it into the controller. Never
-            // overwrite an explicit value, and never touch provisioner/parameters.
+            // Default a missing reclaim policy to Delete; never overwrite an
+            // explicit value or touch provisioner/parameters.
             if sc.reclaim_policy.is_none() {
                 sc.reclaim_policy = Some(PersistentVolumeReclaimPolicy::Delete);
+                changed = true;
+            }
+
+            // Demote any default class that is not the winner. A class explicitly
+            // set to "false" is never promoted (is_default is false for it).
+            if is_default(&sc) && winner.as_deref() != Some(sc.metadata.name.as_str()) {
+                set_default_annotation(&mut sc, "false");
                 changed = true;
             }
 
