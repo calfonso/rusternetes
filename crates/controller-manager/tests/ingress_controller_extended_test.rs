@@ -10,7 +10,7 @@ use rusternetes_common::resources::ingress::{
     HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressServiceBackend,
     IngressSpec, IngressTLS, ServiceBackendPort,
 };
-use rusternetes_common::resources::{Ingress, Service, ServiceSpec};
+use rusternetes_common::resources::{Ingress, Secret, Service, ServiceSpec};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::ingress::IngressController;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
@@ -66,6 +66,12 @@ async fn store_ingress(storage: &Arc<MemoryStorage>, ingress: &Ingress) {
         &ingress.metadata.name,
     );
     storage.create(&key, ingress).await.unwrap();
+}
+
+async fn store_secret(storage: &Arc<MemoryStorage>, name: &str, namespace: &str) {
+    let secret = Secret::new(name, namespace);
+    let key = build_key("secrets", Some(namespace), name);
+    storage.create(&key, &secret).await.unwrap();
 }
 
 async fn store_service(storage: &Arc<MemoryStorage>, name: &str, namespace: &str) {
@@ -157,6 +163,7 @@ async fn invalid_path_type_skips_status_population() {
 async fn tls_block_accepted_and_persisted() {
     let storage = setup_test().await;
     store_service(&storage, "tls-svc", "default").await;
+    store_secret(&storage, "tls-secret", "default").await;
 
     let backend = make_backend("tls-svc", 443);
     let spec = IngressSpec {
@@ -197,7 +204,6 @@ async fn tls_block_accepted_and_persisted() {
 }
 
 #[tokio::test]
-#[ignore = "RED-state: controller does not yet verify the referenced TLS Secret exists"]
 async fn tls_referencing_missing_secret_fails_validation() {
     let storage = setup_test().await;
     store_service(&storage, "tls-svc", "default").await;
@@ -349,7 +355,6 @@ async fn ingress_class_name_is_preserved_after_reconcile() {
 }
 
 #[tokio::test]
-#[ignore = "RED-state: controller does not yet verify the referenced IngressClass exists"]
 async fn ingress_referencing_unknown_class_is_rejected() {
     let storage = setup_test().await;
     store_service(&storage, "orphan-svc", "default").await;
