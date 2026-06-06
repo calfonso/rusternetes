@@ -24,21 +24,32 @@ name: Conformance canary
 # vs the all-in-one stack.
 #
 # Purpose: prove the ARC → DinD → compose → bootstrap → hydrophone
-# pipeline end-to-end, and produce a per-PR regression signal for the
-# canary's known-green ratchet (ci/conformance/known-green.txt).
+# pipeline end-to-end, and report the conformance pass/fail delta across
+# the full upstream [Conformance] tag set.
+#
+# Coverage: the canary no longer enforces the ci/conformance/known-green.txt
+# ratchet. It now runs the canonical two-phase [Conformance] tag split via
+# `scripts/conformance-tags-run.sh` (phase 1: parallel, skipping
+# [Slow]/[Serial]/[Flaky]; phase 2: the [Serial]/[Slow] conformance subset,
+# single-threaded). This is DISCOVERY/REPORTING, not a gate: rusternetes is
+# not yet 100% conformant, so test failures are expected and do NOT fail the
+# job — only an infra failure (hydrophone producing no junit) does. Track the
+# delta via the printed counts and the uploaded junit, not a red/green job.
 #
 # Triggers:
 #   * workflow_dispatch — manual button on the Actions tab.
 #   * push to main — post-merge smoke test. PR-trigger removed because
 #     a full hydrophone run blocks PRs for 30–60 min on cold caches
-#     and the canary's value (catching ratchet regressions before they
-#     reach main) is preserved by the post-merge run plus operator-
-#     driven manual dispatches when warranted.
+#     and the canary's value (post-merge conformance reporting) is
+#     preserved by the post-merge run plus operator-driven manual
+#     dispatches when warranted.
 #
 # Open follow-ups (canary backlog):
 #   - [x] Replace etcd with the SQLite backend for the canary (done: now uses
 #         compose.sqlite.yml + rhino). This also removes the etcd 8 GiB
 #         NOSPACE wedge that capped long runs — see Stack note above.
+#   - [x] Retire the known-green.txt ratchet in favour of the two-phase
+#         [Conformance] tag split (conformance-tags-run.sh).
 
 on:
   workflow_dispatch:
@@ -46,8 +57,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/conformance-canary.yml'
-      - 'ci/conformance/known-green.txt'
-      - 'scripts/conformance-canary-run.sh'
+      - 'scripts/conformance-tags-run.sh'
       - 'compose.sqlite.yml'
       - 'compose.dind.yml'
       - 'Dockerfile.services'
@@ -60,26 +70,27 @@ env:
   DOCKER_HOST: unix:///var/run/docker.sock
   # Pin Hydrophone to a known release so a tag-rename upstream doesn't
   # silently break the workflow. The conformance image itself is pinned
-  # by `scripts/conformance-canary-run.sh` (defaults to v1.35.0).
+  # by `scripts/conformance-tags-run.sh` (defaults to v1.35.0).
   HYDROPHONE_VERSION: v0.7.0
 
 jobs:
   hydrophone:
-    name: hydrophone (focused canary)
+    name: hydrophone (conformance tags)
     # Targets the DinD-enabled scale set. If the scale set isn't
     # deployed on the operator's cluster, this job will sit "queued"
     # forever — operator install of the helm release is a manual
     # one-off (not in this repo by design; see PR #191 policy).
     runs-on: arc-runner-set-conformance
-    # 60 min from prior measurements: pre-#190 the conformance tier
-    # (3 cpu) compiled each of the five service Dockerfiles separately,
-    # ~40-50 min cold. Run 26126002894 timed out at the 30-min ceiling
-    # on the scheduler build. PR #190 (Dockerfile.services) consolidated
-    # those into one shared builder stage; the new steady-state cold
-    # build hasn't been measured yet. Build is ~12 min; the conformance
-    # step itself needs up to 90 min (322 focused specs, single ginkgo
-    # thread). Job ceiling must clear build + 90 + teardown, hence 150.
-    timeout-minutes: 150
+    # Build is ~12 min (Dockerfile.services shared builder, PR #190). The
+    # two-phase conformance run is the long pole: unlike the old known-green
+    # subset (322 specs that all PASS quickly), the full [Conformance] tag
+    # set includes specs rusternetes does not yet pass, and each FAILING
+    # spec burns its per-test ginkgo timeout before moving on — so wall time
+    # scales with the failure count, not just the spec count. The 300-min
+    # run-step ceiling bounds a wedged run; the job ceiling clears build +
+    # 300 + teardown. If runs routinely hit the ceiling, narrow the focus or
+    # split the phases into separate jobs.
+    timeout-minutes: 330
 
     steps:
       - name: Checkout
@@ -261,18 +272,20 @@ jobs:
           chmod +x "$HOME/.local/bin/hydrophone"
           hydrophone --help | head -5
 
-      - name: Run conformance canary
-        # `scripts/conformance-canary-run.sh` reads ci/conformance/known-green.txt,
-        # builds a single hydrophone --focus regex (alternation of all entries,
-        # regex-escaped per entry), runs hydrophone, parses the junit, and
-        # exits non-zero if any expected-green test does not pass. Pins the
-        # conformance image to v1.35.0 by default — see the script's --help.
-        # 322 focused specs on a single ginkgo thread; 15 min was too tight
-        # (run 26633232630 ran out mid-suite). Self-hosted runner, no GH
-        # minute cost, so give it room.
-        timeout-minutes: 90
+      - name: Run conformance tag suite
+        # `scripts/conformance-tags-run.sh` runs the canonical two-phase
+        # [Conformance] split (phase 1: parallel, skip [Slow]/[Serial]/[Flaky];
+        # phase 2: the [Serial]/[Slow] conformance subset, single-threaded),
+        # parses each junit, and prints pass/fail/skip counts. It is
+        # NON-GATING: test failures are expected (rusternetes is not yet 100%
+        # conformant) and do NOT fail this step — only an infra failure
+        # (hydrophone producing no junit) exits non-zero. Pins the conformance
+        # image to v1.35.0 by default — see the script's --help. Self-hosted
+        # runner, no GH minute cost; the long ceiling covers failing specs
+        # each burning their per-test timeout (see job timeout note above).
+        timeout-minutes: 300
         run: |
-          bash scripts/conformance-canary-run.sh \
+          bash scripts/conformance-tags-run.sh \
             --output-dir conformance-out
 
       - name: Upload conformance artifacts
