@@ -284,7 +284,6 @@ async fn job_should_adopt_matching_orphan_pods() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RED-state: Job controller does not release pods whose labels no longer match the job selector (no deletionTimestamp set)"]
 async fn job_should_release_non_matching_pods() {
     let storage = setup_test().await;
     let namespace = "default";
@@ -542,11 +541,16 @@ async fn job_with_managed_by_should_coordinate_with_external_controller() {
     let job_key = build_key("jobs", Some(namespace), "managed-job");
     storage.create(&job_key, &job).await.unwrap();
 
-    // Reconcile - the Job controller should respect managedBy and not take full control
+    // Reconcile - the in-tree controller must respect managedBy: when an
+    // external controller owns the Job, the in-tree controller takes no action
+    // (no pods, no status mutation). K8s ref:
+    // pkg/controller/job/job_controller.go syncJob early-returns on a managedBy
+    // mismatch.
     let controller = JobController::new(storage.clone());
     controller.reconcile_all().await.unwrap();
 
-    // Verify the managedBy field is preserved
+    // Verify the managedBy field is preserved (the in-tree controller didn't
+    // touch the spec).
     let updated_job: Job = storage.get(&job_key).await.unwrap();
     assert_eq!(
         updated_job.spec.managed_by,
@@ -554,14 +558,15 @@ async fn job_with_managed_by_should_coordinate_with_external_controller() {
         "managedBy field should be preserved"
     );
 
-    // Pods should still be created, but the external controller coordinates
+    // No pods are created — the external controller owns the Job's lifecycle.
     let pods: Vec<Pod> = storage
         .list(&format!("/registry/pods/{}/", namespace))
         .await
         .unwrap();
     assert!(
-        !pods.is_empty(),
-        "Pods should be created even with managedBy"
+        pods.is_empty(),
+        "In-tree controller must not create pods when managedBy points at an external controller (got {} pods)",
+        pods.len()
     );
 }
 
@@ -752,7 +757,6 @@ async fn job_with_pod_failure_policy_ignore_should_continue_on_disruption() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RED-state: Job controller does not honour ttlSecondsAfterFinished — completed jobs are not marked for deletion after the TTL elapses"]
 async fn job_with_ttl_should_be_cleaned_up_after_completion() {
     let storage = setup_test().await;
     let namespace = "default";
@@ -812,7 +816,7 @@ async fn job_with_ttl_should_be_cleaned_up_after_completion() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RED-state: Job controller off-by-one when tracking completions vs. live pods across reconciles (completions=10 parallelism=3 produced 6 not 9 after 6 succeeded)"]
+#[ignore = "RED-state: test assumes list() returns pods in creation order (pods[3..6]); production etcd/rhino backends return key-sorted order, under which this fails. Needs an order-independent rewrite (select succeeded pods by identity, not slice index) — tracked separately."]
 async fn job_should_respect_parallelism_across_multiple_reconciles() {
     let storage = setup_test().await;
     let namespace = "default";
@@ -1368,7 +1372,6 @@ async fn job_with_managed_by_default_controller_should_reconcile_normally() {
 // pkg/controller/job/job_controller.go:syncJob — early-return on managedBy
 // mismatch. Pin as ignored until we implement the same gate.
 #[tokio::test]
-#[ignore = "RED-state: Job controller does not honour managedBy — it still creates pods for jobs owned by external controllers"]
 async fn job_with_external_managed_by_should_skip_pod_creation() {
     let storage = setup_test().await;
     let namespace = "default";
