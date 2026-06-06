@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusternetes_common::resources::{
     ingress::{HTTPIngressPath, IngressBackend, IngressRule, IngressSpec, IngressTLS},
-    Ingress, Service,
+    Ingress, IngressClass, Secret, Service,
 };
 use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
@@ -193,11 +193,26 @@ impl<S: Storage + 'static> IngressController<S> {
 
     /// Validate Ingress spec
     async fn validate_ingress_spec(&self, spec: &IngressSpec, namespace: &str) -> Result<()> {
-        // Validate IngressClass if specified
+        // The referenced IngressClass (cluster-scoped) must exist — upstream
+        // rejects an Ingress naming an unknown class.
         if let Some(class_name) = &spec.ingress_class_name {
-            debug!("Validating IngressClass: {}", class_name);
-            // In production, would verify IngressClass exists
-            // For now, just log it
+            let class_key = build_key("ingressclasses", None, class_name);
+            match self.storage.get::<IngressClass>(&class_key).await {
+                Ok(_) => {}
+                Err(rusternetes_common::Error::NotFound(_)) => {
+                    return Err(anyhow::anyhow!("IngressClass {} not found", class_name));
+                }
+                // A transport/decode error is NOT a missing class — surface it
+                // accurately rather than mislabelling it "not found". The
+                // reconcile retries next interval.
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to look up IngressClass {}: {}",
+                        class_name,
+                        e
+                    ));
+                }
+            }
         }
 
         // Validate default backend if specified
@@ -261,14 +276,32 @@ impl<S: Storage + 'static> IngressController<S> {
         Ok(())
     }
 
-    /// Validate TLS configuration
-    async fn validate_tls_config(&self, _tls: &IngressTLS, _namespace: &str) -> Result<()> {
-        // In production, would:
-        // 1. Verify secret exists
-        // 2. Validate certificate format
-        // 3. Check certificate expiry
-
-        // For conformance, basic validation is sufficient
+    /// Validate TLS configuration — the referenced Secret must exist in the
+    /// Ingress namespace, else status population is blocked.
+    async fn validate_tls_config(&self, tls: &IngressTLS, namespace: &str) -> Result<()> {
+        if let Some(secret_name) = &tls.secret_name {
+            let secret_key = build_key("secrets", Some(namespace), secret_name);
+            match self.storage.get::<Secret>(&secret_key).await {
+                Ok(_) => {}
+                Err(rusternetes_common::Error::NotFound(_)) => {
+                    return Err(anyhow::anyhow!(
+                        "TLS secret {} not found in namespace {}",
+                        secret_name,
+                        namespace
+                    ));
+                }
+                // Transport/decode error — not a missing secret; report it
+                // accurately. The reconcile retries next interval.
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to look up TLS secret {} in namespace {}: {}",
+                        secret_name,
+                        namespace,
+                        e
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -650,6 +683,14 @@ mod tests {
             spec: Some(spec),
             status: None,
         };
+
+        // Create the IngressClass "nginx" so validation passes
+        use rusternetes_common::resources::IngressClass;
+        let class_key = build_key("ingressclasses", None, "nginx");
+        storage
+            .create(&class_key, &IngressClass::new("nginx"))
+            .await
+            .unwrap();
 
         // Create ingress in storage first (like API server would)
         let ingress_key = build_key("ingresses", Some("default"), "test-ingress");
