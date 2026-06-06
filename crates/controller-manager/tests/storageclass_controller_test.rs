@@ -57,7 +57,6 @@ fn make_storage_class(
 /// (the API server actually) and the controller backstops it. We assert
 /// the steady-state invariant after reconcile.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_default_designation_single_default() {
     let storage = setup_test().await;
 
@@ -123,7 +122,6 @@ async fn test_storageclass_default_designation_single_default() {
 /// remain untouched — the controller must never promote a non-default to
 /// default on its own.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_default_designation_zero_defaults() {
     let storage = setup_test().await;
 
@@ -171,7 +169,6 @@ async fn test_storageclass_default_designation_zero_defaults() {
 /// preserved verbatim through reconciliation; the controller has no
 /// business mutating opaque driver config.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_provisioner_parameters_preserved() {
     let storage = setup_test().await;
 
@@ -216,7 +213,6 @@ async fn test_storageclass_provisioner_parameters_preserved() {
 /// provisioning time via the external provisioner; an in-process port
 /// may legitimately choose to backfill instead.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_mount_options_propagation_to_pv() {
     let storage = setup_test().await;
 
@@ -296,7 +292,6 @@ async fn test_storageclass_mount_options_propagation_to_pv() {
 /// defaulted to `Delete` by the controller (matches upstream
 /// `pkg/registry/storage/storageclass/strategy.go` defaulting).
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_reclaim_policy_default_delete() {
     let storage = setup_test().await;
 
@@ -331,7 +326,6 @@ async fn test_storageclass_reclaim_policy_default_delete() {
 /// must default only when the field is empty, never overwrite a valid
 /// caller-supplied value.
 #[tokio::test]
-#[ignore = "RED-state: StorageClassController is a stub"]
 async fn test_storageclass_reclaim_policy_retain_preserved() {
     let storage = setup_test().await;
 
