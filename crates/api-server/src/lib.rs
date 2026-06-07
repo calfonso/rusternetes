@@ -1,7 +1,7 @@
 pub mod admission;
 pub mod admission_webhook;
 pub mod bootstrap;
-pub mod cbor;
+pub use rusternetes_middleware::cbor;
 pub mod cel;
 pub mod conversion;
 pub mod dynamic_routes;
@@ -10,7 +10,7 @@ pub mod flow_control;
 pub mod gnostic;
 pub mod handlers;
 pub mod ip_allocator;
-pub mod middleware;
+pub use rusternetes_middleware as middleware;
 pub mod openapi;
 pub mod patch;
 pub mod prometheus_client;

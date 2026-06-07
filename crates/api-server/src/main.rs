@@ -1,7 +1,6 @@
 mod admission;
 mod admission_webhook;
 mod bootstrap;
-mod cbor;
 mod cel;
 mod conversion;
 mod dynamic_routes;
@@ -10,7 +9,7 @@ mod flow_control;
 mod gnostic;
 mod handlers;
 mod ip_allocator;
-mod middleware;
+use rusternetes_middleware as middleware;
 mod openapi;
 mod patch;
 mod prometheus_client;

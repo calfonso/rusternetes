@@ -1,3 +1,7 @@
+pub mod cbor;
+pub mod response;
+pub mod table;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -13,11 +17,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
 
-use crate::cbor;
-
 /// Global protobuf schema registry — initialized once on first use
-static PROTO_REGISTRY: LazyLock<crate::protobuf::ProtoRegistry> =
-    LazyLock::new(crate::protobuf::ProtoRegistry::new);
+static PROTO_REGISTRY: LazyLock<rusternetes_protobuf::ProtoRegistry> =
+    LazyLock::new(rusternetes_protobuf::ProtoRegistry::new);
 
 /// Standard Kubernetes impersonation request headers. Mirrors the constants in
 /// upstream `k8s.io/api/authentication/v1/types.go` and the filter in
@@ -858,7 +860,7 @@ pub async fn normalize_content_type_middleware(
                         None
                     };
                     if let Some(status_obj) = typed_status {
-                        let pb = crate::protobuf::encode_status_protobuf(&status_obj);
+                        let pb = rusternetes_protobuf::encode_status_protobuf(&status_obj);
                         let mut resp = Response::from_parts(parts, Body::from(pb));
                         resp.headers_mut().insert(
                             axum::http::header::CONTENT_TYPE,
@@ -1131,12 +1133,12 @@ fn parse_accept_as_target(accept: &str) -> Option<AsNegotiation> {
 /// Convert a single object or List into a `meta.k8s.io/v1.Table`.
 ///
 /// Column and row definitions come from the canonical printers in
-/// [`crate::handlers::table`], the same source the resource LIST handlers use,
+/// [`crate::table`], the same source the resource LIST handlers use,
 /// so a single-resource GET (which lands here) renders identically to its LIST
 /// — including the `-o wide` columns. Kinds without a rich printer fall back to
 /// the minimal NAME/AGE table.
 fn convert_to_table(value: serde_json::Value) -> serde_json::Value {
-    use crate::handlers::table;
+    use crate::table;
 
     let (items, list_metadata) = extract_items(&value);
     let kind_hint = items

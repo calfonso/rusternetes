@@ -1,0 +1,26 @@
+[package]
+name = "rusternetes-middleware"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "rusternetes_middleware"
+path = "src/lib.rs"
+
+[dependencies]
+rusternetes-common = { path = "../common", features = ["axum-support"] }
+rusternetes-protobuf = { path = "../protobuf" }
+rusternetes-storage = { path = "../storage" }
+axum = { workspace = true, features = ["ws"] }
+serde.workspace = true
+serde_json.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+prost.workspace = true
+base64 = "0.22"
+bytes = "1.5"
+http-body = "1"
