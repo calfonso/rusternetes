@@ -4239,6 +4239,7 @@ dependencies = [
  "reqwest",
  "rusternetes-common",
  "rusternetes-controller-manager",
+ "rusternetes-protobuf",
  "rusternetes-storage",
  "serde",
  "serde_ignored",
@@ -4471,6 +4472,17 @@ dependencies = [
  "tokio-tun",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rusternetes-protobuf"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "rusternetes-common",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

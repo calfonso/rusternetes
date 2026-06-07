@@ -14,7 +14,7 @@ pub mod middleware;
 pub mod openapi;
 pub mod patch;
 pub mod prometheus_client;
-pub mod protobuf;
+pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
 pub mod response;
 pub mod router;
