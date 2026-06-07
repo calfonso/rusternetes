@@ -806,10 +806,11 @@ async fn statefulset_should_respect_revision_history_limit() {
         .await
         .unwrap_or_default();
 
-    // Should have at most 2 revisions (the limit)
+    // revisionHistoryLimit=2 caps the NON-current history (upstream
+    // truncateHistory), so at most 2 old revisions plus the current one survive.
     assert!(
-        revisions.len() <= 2,
-        "Should have at most 2 revisions, found {}",
+        revisions.len() <= 3,
+        "Should have at most 3 revisions (2 non-current + current), found {}",
         revisions.len()
     );
 }

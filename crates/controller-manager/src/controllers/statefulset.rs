@@ -1082,8 +1082,22 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 .unwrap_or(false)
         });
 
+        // Protected revisions — the current one and any still referenced by a
+        // live pod (already collected in `live_hashes`) — are never deleted and
+        // do NOT count against revisionHistoryLimit. The limit caps only the
+        // NON-current history, matching upstream truncateHistory.
         let total = revisions.len() as i32;
-        if total <= limit {
+        let protected = revisions
+            .iter()
+            .filter(|cr| {
+                let h = cr
+                    .pointer("/metadata/labels/controller.kubernetes.io~1hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                live_hashes.contains(h)
+            })
+            .count() as i32;
+        if (total - protected) <= limit {
             return;
         }
 
@@ -1111,7 +1125,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
 
         // Delete oldest revisions until we are at or below the limit, but never
         // delete the current revision or one still referenced by a live pod.
-        let to_delete = (total - limit) as usize;
+        let to_delete = ((total - protected) - limit) as usize;
         let mut deleted = 0;
         for cr in &revisions {
             if deleted >= to_delete {

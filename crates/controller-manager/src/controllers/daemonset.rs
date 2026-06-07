@@ -953,11 +953,6 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             Err(_) => return,
         };
 
-        let to_kill = owned.len() as i32 - limit;
-        if to_kill <= 0 {
-            return;
-        }
-
         // Hashes still carried by live pods must be preserved.
         let live_hashes: std::collections::HashSet<&str> = live_pods
             .iter()
@@ -969,6 +964,27 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     .map(|s| s.as_str())
             })
             .collect();
+
+        // Protected revisions — the current template's revision and any still
+        // carried by a live pod — are never deleted and do NOT count against
+        // revisionHistoryLimit. The limit caps only the NON-current history,
+        // matching upstream cleanupHistory (keep `limit` old + the live ones).
+        let protected = owned
+            .iter()
+            .filter(|r| {
+                let h = r
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("controller-revision-hash"))
+                    .map(|s| s.as_str());
+                h == Some(current_hash) || h.map(|h| live_hashes.contains(h)).unwrap_or(false)
+            })
+            .count() as i32;
+        let to_kill = (owned.len() as i32 - protected) - limit;
+        if to_kill <= 0 {
+            return;
+        }
 
         // Oldest revision first.
         owned.sort_by_key(|r| r.revision);
