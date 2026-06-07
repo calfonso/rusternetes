@@ -683,6 +683,21 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             all_pods.len()
         );
 
+        // Topology-aware routing. When a Service requests topology hints — via
+        // `trafficDistribution: PreferClose` or the
+        // `service.kubernetes.io/topology-mode: Auto` annotation — the
+        // EndpointSlice controller stamps each endpoint with its node's zone
+        // and a matching `hints.forZones` so kube-proxy can prefer same-zone
+        // endpoints. Mirrors upstream pkg/controller/endpointslice/topologycache
+        // (here simplified to a per-endpoint same-zone hint rather than the full
+        // proportional-allocation heuristic).
+        let topology_enabled = Self::topology_hints_requested(service);
+        let node_zones: HashMap<String, String> = if topology_enabled {
+            self.build_node_zone_map().await
+        } else {
+            HashMap::new()
+        };
+
         // Group pods by their resolved port mapping.
         // Each group gets its own EndpointSlice with only the ports those pods serve.
         // This follows K8s's reconcileByAddressType / getEndpointPorts pattern.
@@ -757,6 +772,27 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 hints: None,
                 deprecated_topology: None,
             };
+
+            // Stamp zone + same-zone hint when topology routing is enabled and
+            // the backing node carries a topology.kubernetes.io/zone label.
+            let mut endpoint = endpoint;
+            if topology_enabled {
+                if let Some(node_name) = endpoint.node_name.as_ref() {
+                    if let Some(zone) = node_zones.get(node_name) {
+                        endpoint.zone = Some(zone.clone());
+                        endpoint.hints = Some(
+                            rusternetes_common::resources::endpointslice::EndpointHints {
+                                for_zones: Some(vec![
+                                    rusternetes_common::resources::endpointslice::ForZone {
+                                        name: zone.clone(),
+                                    },
+                                ]),
+                                for_nodes: None,
+                            },
+                        );
+                    }
+                }
+            }
 
             let port_key = serde_json::to_string(&endpoint_ports).unwrap_or_default();
             port_groups
@@ -907,6 +943,45 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         }
 
         Ok(())
+    }
+
+    /// Whether a Service requests topology-aware endpoint hints. Mirrors
+    /// upstream which enables hints for `trafficDistribution: PreferClose` or
+    /// the legacy `service.kubernetes.io/topology-mode: Auto` annotation.
+    fn topology_hints_requested(service: &Service) -> bool {
+        if service.spec.traffic_distribution.as_deref() == Some("PreferClose") {
+            return true;
+        }
+        service
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("service.kubernetes.io/topology-mode"))
+            .map(|mode| mode == "Auto")
+            .unwrap_or(false)
+    }
+
+    /// Build a map of node name -> zone from the `topology.kubernetes.io/zone`
+    /// label on each Node. Nodes without the label are omitted.
+    async fn build_node_zone_map(&self) -> HashMap<String, String> {
+        let nodes: Vec<rusternetes_common::resources::Node> = self
+            .storage
+            .list(&build_prefix("nodes", None))
+            .await
+            .unwrap_or_default();
+
+        let mut map = HashMap::new();
+        for node in nodes {
+            if let Some(zone) = node
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("topology.kubernetes.io/zone"))
+            {
+                map.insert(node.metadata.name.clone(), zone.clone());
+            }
+        }
+        map
     }
 
     /// Compute endpoint ports for a pod based on the service's port definitions.

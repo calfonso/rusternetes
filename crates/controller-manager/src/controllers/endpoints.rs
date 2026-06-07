@@ -69,6 +69,66 @@ fn truncate_endpoint_subsets(subsets: &mut [EndpointSubset], cap: usize) -> bool
     true
 }
 
+/// Split each subset into per-node subsets so no resulting subset contains
+/// addresses from more than one node. Each output subset preserves the ports
+/// of the input subset its addresses came from — when the named-targetPort
+/// path produced multiple subsets with different resolved ports, the per-node
+/// grouping must keep each (node, ports) combination distinct so pods on
+/// different nodes are not stamped with another node's resolved port.
+/// Addresses with no `node_name` are grouped under a single empty-node bucket.
+/// Output is sorted by (node name, serialized ports) for deterministic,
+/// order-independent results. Used to enforce `internalTrafficPolicy=Local`.
+fn split_subsets_by_node(subsets: Vec<EndpointSubset>) -> Vec<EndpointSubset> {
+    use std::collections::BTreeMap;
+
+    // (node, serialized-ports) -> (ready, notReady, actual ports). The ports
+    // are keyed alongside the node so distinct port tuples (from the
+    // named-targetPort multi-subset path) yield distinct output subsets.
+    #[allow(clippy::type_complexity)]
+    let mut by_node: BTreeMap<
+        (String, String),
+        (
+            Vec<EndpointAddress>,
+            Vec<EndpointAddress>,
+            Option<Vec<EndpointPort>>,
+        ),
+    > = BTreeMap::new();
+
+    for subset in subsets {
+        let ports = subset.ports.clone();
+        let ports_key = serde_json::to_string(&ports).unwrap_or_default();
+        for addr in subset.addresses.into_iter().flatten() {
+            let node = addr.node_name.clone().unwrap_or_default();
+            by_node
+                .entry((node, ports_key.clone()))
+                .or_insert_with(|| (Vec::new(), Vec::new(), ports.clone()))
+                .0
+                .push(addr);
+        }
+        for addr in subset.not_ready_addresses.into_iter().flatten() {
+            let node = addr.node_name.clone().unwrap_or_default();
+            by_node
+                .entry((node, ports_key.clone()))
+                .or_insert_with(|| (Vec::new(), Vec::new(), ports.clone()))
+                .1
+                .push(addr);
+        }
+    }
+
+    by_node
+        .into_values()
+        .map(|(ready, not_ready, ports)| EndpointSubset {
+            addresses: if ready.is_empty() { None } else { Some(ready) },
+            not_ready_addresses: if not_ready.is_empty() {
+                None
+            } else {
+                Some(not_ready)
+            },
+            ports,
+        })
+        .collect()
+}
+
 /// EndpointsController watches Services and Pods to automatically maintain Endpoints resources.
 /// It creates/updates Endpoints based on:
 /// 1. Service selector matching pod labels
@@ -391,6 +451,19 @@ impl<S: Storage + 'static> EndpointsController<S> {
         let publish_not_ready = service.spec.publish_not_ready_addresses.unwrap_or(false);
         let mut subsets =
             self.build_endpoint_subsets(&matching_pods, &service.spec.ports, publish_not_ready);
+
+        // internalTrafficPolicy=Local: segregate addresses by node so a
+        // node-local kube-proxy only consumes endpoints scheduled on the same
+        // node. Mirrors upstream behavior where the proxy filters endpoints by
+        // the local node's name (pkg/proxy topology / internalTrafficPolicy).
+        // We surface that here as one EndpointSubset per node, ensuring no
+        // subset mixes addresses from more than one node.
+        if matches!(
+            service.spec.internal_traffic_policy,
+            Some(rusternetes_common::resources::ServiceInternalTrafficPolicy::Local)
+        ) {
+            subsets = split_subsets_by_node(subsets);
+        }
 
         // Enforce the upstream 1000-address Endpoints capacity cap and emit
         // the `endpoints.kubernetes.io/over-capacity=truncated` annotation
@@ -1424,5 +1497,81 @@ mod tests {
             addr_no_subdomain.hostname, None,
             "EndpointAddress should NOT have hostname when pod has no subdomain"
         );
+    }
+
+    /// Bug regression: `split_subsets_by_node` (internalTrafficPolicy=Local)
+    /// must preserve each input subset's ports per node. When the named-port
+    /// path produces multiple subsets with DIFFERENT resolved container ports,
+    /// pods on a given node must keep the port from the subset they came from —
+    /// not the first subset's port applied to every node.
+    #[test]
+    fn test_split_subsets_by_node_preserves_per_subset_ports() {
+        let addr = |ip: &str, node: &str| EndpointAddress {
+            ip: ip.to_string(),
+            hostname: None,
+            node_name: Some(node.to_string()),
+            target_ref: None,
+        };
+        let port = |p: u16| {
+            Some(vec![EndpointPort {
+                name: Some("http".to_string()),
+                port: p,
+                protocol: Some("TCP".to_string()),
+                app_protocol: None,
+            }])
+        };
+
+        // Subset A resolves the named port to 8080 and holds a pod on each node;
+        // subset B resolves it to 9090 and holds a different pod on each node.
+        let subsets = vec![
+            EndpointSubset {
+                addresses: Some(vec![addr("10.0.0.1", "node-1"), addr("10.0.0.2", "node-2")]),
+                not_ready_addresses: None,
+                ports: port(8080),
+            },
+            EndpointSubset {
+                addresses: Some(vec![addr("10.0.1.1", "node-1"), addr("10.0.1.2", "node-2")]),
+                not_ready_addresses: None,
+                ports: port(9090),
+            },
+        ];
+
+        let out = split_subsets_by_node(subsets);
+
+        // No subset may mix nodes.
+        for s in &out {
+            let nodes: std::collections::HashSet<&str> = s
+                .addresses
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|a| a.node_name.as_deref())
+                .collect();
+            assert!(nodes.len() <= 1, "subset mixes nodes: {s:?}");
+        }
+
+        // Every address must carry the port from its ORIGINAL subset, not a
+        // foreign one. Build the expected ip->port mapping and assert it holds.
+        let expected: std::collections::HashMap<&str, u16> = [
+            ("10.0.0.1", 8080),
+            ("10.0.0.2", 8080),
+            ("10.0.1.1", 9090),
+            ("10.0.1.2", 9090),
+        ]
+        .into_iter()
+        .collect();
+
+        for s in &out {
+            let subset_port = s.ports.as_ref().and_then(|p| p.first()).map(|p| p.port);
+            for a in s.addresses.as_deref().unwrap_or(&[]) {
+                assert_eq!(
+                    subset_port,
+                    Some(expected[a.ip.as_str()]),
+                    "address {} got wrong port; subset={:?}",
+                    a.ip,
+                    s,
+                );
+            }
+        }
     }
 }
