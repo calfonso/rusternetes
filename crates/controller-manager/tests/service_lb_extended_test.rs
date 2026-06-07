@@ -579,7 +579,6 @@ async fn test_service_ip_family_policy_single_stack_ipv4() {
 /// `ServiceController` only allocates a single IPv4 address, so this
 /// assertion fails today.
 #[tokio::test]
-#[ignore = "RED-state: ServiceController does not allocate per-family IPs for dual-stack"]
 async fn test_service_ip_family_policy_dual_stack_allocates_both_families() {
     let storage = setup_test().await;
     let controller = ServiceController::new(storage.clone());
@@ -622,7 +621,6 @@ async fn test_service_ip_family_policy_dual_stack_allocates_both_families() {
 /// today — the EndpointsController happily fans out across nodes and the
 /// ServiceController never sets `healthCheckNodePort`.
 #[tokio::test]
-#[ignore = "RED-state: externalTrafficPolicy=Local + healthCheckNodePort not implemented"]
 async fn test_service_external_traffic_policy_local_allocates_health_check_node_port() {
     let storage = setup_test().await;
     let svc_controller = ServiceController::new(storage.clone());
@@ -659,7 +657,6 @@ async fn test_service_external_traffic_policy_local_allocates_health_check_node_
 /// node, so the test asserts the controller writes per-node EndpointSlice
 /// hints — which it does not yet do.
 #[tokio::test]
-#[ignore = "RED-state: internalTrafficPolicy=Local not honored by EndpointsController"]
 async fn test_service_internal_traffic_policy_local_filters_by_node() {
     let storage = setup_test().await;
     let controller = EndpointsController::new(storage.clone());
@@ -745,7 +742,6 @@ async fn test_service_internal_traffic_policy_local_filters_by_node() {
 /// the failure surface points at the missing hint rather than missing
 /// slices.
 #[tokio::test]
-#[ignore = "RED-state: topology-aware EndpointSlice hints (for_zones) not implemented"]
 async fn test_service_topology_keys_emit_for_zone_hints() {
     use rusternetes_controller_manager::controllers::endpointslice::EndpointSliceController;
 
@@ -831,7 +827,6 @@ async fn test_service_topology_keys_emit_for_zone_hints() {
 /// `LoadBalancerSourceUnhealthy`. Neither happens today — the controller
 /// blindly trusts the cloud provider's return value.
 #[tokio::test]
-#[ignore = "RED-state: LoadBalancer health gating on Endpoints readiness not implemented"]
 async fn test_loadbalancer_health_check_gates_status_on_endpoint_readiness() {
     let storage = setup_test().await;
     let endpoints_controller = EndpointsController::new(storage.clone());

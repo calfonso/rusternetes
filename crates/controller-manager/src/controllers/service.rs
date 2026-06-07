@@ -14,15 +14,18 @@ use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::Service;
 use rusternetes_common::resources::ServiceType;
+use rusternetes_common::resources::{IPFamily, IPFamilyPolicy, ServiceExternalTrafficPolicy};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// Default service CIDR for ClusterIP allocation
 const DEFAULT_SERVICE_CIDR: &str = "10.96.0.0/12";
+/// Default IPv6 service CIDR for dual-stack ClusterIP allocation
+const DEFAULT_SERVICE_CIDR_V6: &str = "fd00:10:96::/112";
 /// Default NodePort range (Kubernetes standard)
 const NODE_PORT_MIN: u16 = 30000;
 const NODE_PORT_MAX: u16 = 32767;
@@ -38,6 +41,8 @@ pub struct ServiceController<S: Storage> {
     allocated_node_ports: Arc<Mutex<HashSet<u16>>>,
     /// Service CIDR for ClusterIP allocation
     service_cidr: String,
+    /// Secondary IPv6 service CIDR for dual-stack ClusterIP allocation
+    service_cidr_v6: String,
 }
 
 impl<S: Storage + 'static> ServiceController<S> {
@@ -47,6 +52,7 @@ impl<S: Storage + 'static> ServiceController<S> {
             allocated_ips: Arc::new(Mutex::new(HashSet::new())),
             allocated_node_ports: Arc::new(Mutex::new(HashSet::new())),
             service_cidr: DEFAULT_SERVICE_CIDR.to_string(),
+            service_cidr_v6: DEFAULT_SERVICE_CIDR_V6.to_string(),
         }
     }
 
@@ -138,6 +144,15 @@ impl<S: Storage + 'static> ServiceController<S> {
             for port in &service.spec.ports {
                 if let Some(node_port) = port.node_port {
                     ports.insert(node_port);
+                }
+            }
+
+            // Track healthCheckNodePort: it is drawn from the same NodePort
+            // range, so it must be visible to the allocator after a restart or
+            // a later allocation could collide with it.
+            if let Some(hcnp) = service.spec.health_check_node_port {
+                if let Ok(hcnp) = u16::try_from(hcnp) {
+                    ports.insert(hcnp);
                 }
             }
         }
@@ -240,7 +255,13 @@ impl<S: Storage + 'static> ServiceController<S> {
 
         // Handle ClusterIP allocation
         if service_type != &ServiceType::ExternalName {
-            if service.spec.cluster_ip.is_none()
+            if service.spec.cluster_ip.as_ref() == Some(&"None".to_string()) {
+                // Headless service - don't allocate IP
+                debug!(
+                    "Service {}/{} is headless, skipping ClusterIP allocation",
+                    namespace, service_name
+                );
+            } else if service.spec.cluster_ip.is_none()
                 || service
                     .spec
                     .cluster_ip
@@ -248,21 +269,31 @@ impl<S: Storage + 'static> ServiceController<S> {
                     .map(|s| s.is_empty())
                     .unwrap_or(false)
             {
-                // Allocate a new ClusterIP
-                let cluster_ip = self.allocate_cluster_ip().await?;
-                info!(
-                    "Allocated ClusterIP {} for service {}/{}",
-                    cluster_ip, namespace, service_name
-                );
-                updated_service.spec.cluster_ip = Some(cluster_ip.clone());
-                updated_service.spec.cluster_ips = Some(vec![cluster_ip]);
+                // Determine the requested IP families. Mirrors upstream
+                // pkg/registry/core/service/storage which derives families
+                // from spec.ipFamilies (ordered) and spec.ipFamilyPolicy.
+                let families = self.resolve_ip_families(service);
+
+                let mut cluster_ips: Vec<String> = Vec::with_capacity(families.len());
+                for family in &families {
+                    let ip = match family {
+                        IPFamily::IPv4 => self.allocate_cluster_ip().await?,
+                        IPFamily::IPv6 => self.allocate_cluster_ip_v6().await?,
+                    };
+                    info!(
+                        "Allocated ClusterIP {} ({:?}) for service {}/{}",
+                        ip, family, namespace, service_name
+                    );
+                    cluster_ips.push(ip);
+                }
+
+                // spec.clusterIP is the primary (first) family's address; the
+                // full ordered list lives in spec.clusterIPs. Family ordering
+                // matches spec.ipFamilies.
+                updated_service.spec.cluster_ip = cluster_ips.first().cloned();
+                updated_service.spec.ip_families = Some(families);
+                updated_service.spec.cluster_ips = Some(cluster_ips);
                 needs_update = true;
-            } else if service.spec.cluster_ip.as_ref() == Some(&"None".to_string()) {
-                // Headless service - don't allocate IP
-                debug!(
-                    "Service {}/{} is headless, skipping ClusterIP allocation",
-                    namespace, service_name
-                );
             }
         }
 
@@ -285,10 +316,31 @@ impl<S: Storage + 'static> ServiceController<S> {
             }
         }
 
+        // Handle healthCheckNodePort allocation for LoadBalancer Services with
+        // externalTrafficPolicy=Local. Mirrors upstream
+        // pkg/registry/core/service/storage allocHealthCheckNodePort: the LB
+        // health check needs a dedicated nodePort so external balancers can
+        // detect nodes without local endpoints and stop sending them traffic.
+        if service_type == &ServiceType::LoadBalancer
+            && service.spec.external_traffic_policy == Some(ServiceExternalTrafficPolicy::Local)
+            && service.spec.health_check_node_port.is_none()
+        {
+            let hcnp = self.allocate_node_port().await?;
+            info!(
+                "Allocated healthCheckNodePort {} for service {}/{}",
+                hcnp, namespace, service_name
+            );
+            updated_service.spec.health_check_node_port = Some(i32::from(hcnp));
+            needs_update = true;
+        }
+
         // Handle service type downgrades (e.g., LoadBalancer -> ClusterIP)
-        // If service was previously NodePort/LoadBalancer but now is ClusterIP, release NodePorts
+        // If service was previously NodePort/LoadBalancer but now is ClusterIP,
+        // release NodePorts and any healthCheckNodePort (only LoadBalancer +
+        // externalTrafficPolicy=Local services own an HCNP).
         if service_type == &ServiceType::ClusterIP
-            && service.spec.ports.iter().any(|p| p.node_port.is_some())
+            && (service.spec.ports.iter().any(|p| p.node_port.is_some())
+                || service.spec.health_check_node_port.is_some())
         {
             warn!(
                 "Service {}/{} changed from NodePort/LoadBalancer to ClusterIP, releasing NodePorts",
@@ -304,6 +356,17 @@ impl<S: Storage + 'static> ServiceController<S> {
                     );
                     needs_update = true;
                 }
+            }
+            // Release the healthCheckNodePort back to the allocator.
+            if let Some(hcnp) = updated_service.spec.health_check_node_port.take() {
+                if let Ok(hcnp) = u16::try_from(hcnp) {
+                    ports_lock.remove(&hcnp);
+                }
+                info!(
+                    "Released healthCheckNodePort {} for service {}/{}",
+                    hcnp, namespace, service_name
+                );
+                needs_update = true;
             }
         }
 
@@ -359,6 +422,74 @@ impl<S: Storage + 'static> ServiceController<S> {
         Err(anyhow::anyhow!(
             "No available ClusterIPs in service CIDR {}",
             self.service_cidr
+        ))
+    }
+
+    /// Resolve the ordered list of IP families a Service should be allocated.
+    ///
+    /// Mirrors upstream `pkg/registry/core/service/storage` family inference:
+    /// an explicit `spec.ipFamilies` list wins (order preserved); otherwise the
+    /// `ipFamilyPolicy` decides single- vs dual-stack. The cluster default
+    /// primary family is IPv4. For dual-stack policies without an explicit
+    /// family list we default to `[IPv4, IPv6]`.
+    fn resolve_ip_families(&self, service: &Service) -> Vec<IPFamily> {
+        if let Some(families) = &service.spec.ip_families {
+            if !families.is_empty() {
+                return families.clone();
+            }
+        }
+
+        match service.spec.ip_family_policy {
+            Some(IPFamilyPolicy::PreferDualStack) | Some(IPFamilyPolicy::RequireDualStack) => {
+                vec![IPFamily::IPv4, IPFamily::IPv6]
+            }
+            _ => vec![IPFamily::IPv4],
+        }
+    }
+
+    /// Allocate a ClusterIP from the IPv6 service CIDR range.
+    async fn allocate_cluster_ip_v6(&self) -> Result<String> {
+        let mut ips = self.allocated_ips.lock().await;
+
+        let cidr_parts: Vec<&str> = self.service_cidr_v6.split('/').collect();
+        if cidr_parts.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "Invalid IPv6 service CIDR: {}",
+                self.service_cidr_v6
+            ));
+        }
+
+        let base_ip: Ipv6Addr = cidr_parts[0]
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid IPv6 service CIDR IP: {}", e))?;
+        let prefix_len: u32 = cidr_parts[1]
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid IPv6 service CIDR prefix length: {}", e))?;
+
+        let host_bits = 128 - prefix_len;
+        // Cap the scan window so a very large host space doesn't spin forever;
+        // the service range only needs a modest number of addresses.
+        let max_offset: u128 = if host_bits >= 32 {
+            u32::MAX as u128
+        } else {
+            (1u128 << host_bits) - 1
+        };
+        let base_ip_u128: u128 = base_ip.into();
+
+        // Skip .0 and start from offset 2 (matching the IPv4 convention of
+        // reserving the network address).
+        for offset in 2..=max_offset {
+            let candidate_ip = Ipv6Addr::from(base_ip_u128 + offset);
+            let candidate_str = candidate_ip.to_string();
+            if !ips.contains(&candidate_str) {
+                ips.insert(candidate_str.clone());
+                return Ok(candidate_str);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "No available ClusterIPs in IPv6 service CIDR {}",
+            self.service_cidr_v6
         ))
     }
 
@@ -427,6 +558,17 @@ impl<S: Storage + 'static> ServiceController<S> {
                             node_port, namespace, service_name
                         );
                     }
+                }
+
+                // Release healthCheckNodePort (drawn from the same range).
+                if let Some(hcnp) = service.spec.health_check_node_port {
+                    if let Ok(hcnp) = u16::try_from(hcnp) {
+                        ports.remove(&hcnp);
+                    }
+                    info!(
+                        "Released healthCheckNodePort {} for service {}/{}",
+                        hcnp, namespace, service_name
+                    );
                 }
 
                 Ok(())

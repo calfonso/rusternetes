@@ -383,6 +383,38 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
 
         debug!("Reconciling LoadBalancer service {}/{}", namespace, name);
 
+        // Health-gate the LB status on endpoint readiness. Mirrors upstream
+        // e2e/network/loadbalancer.go "should only target nodes with
+        // endpoints": when a selector-backed Service has zero Ready endpoints,
+        // an external LB health check would fail every node, so we withhold
+        // the ingress status and surface a Warning Event rather than
+        // advertising an unreachable VIP. The next reconcile (once a pod
+        // becomes Ready) populates ingress normally.
+        //
+        // Only selector-backed Services are gated: Services with no/empty
+        // selector rely on manually-managed Endpoints (or none at all), so the
+        // controller cannot infer readiness from a missing Endpoints object
+        // and must not withhold their status.
+        let has_selector = service
+            .spec
+            .selector
+            .as_ref()
+            .map(|sel| !sel.is_empty())
+            .unwrap_or(false);
+        if has_selector && !self.has_ready_endpoints(namespace, name).await {
+            warn!(
+                "LoadBalancer service {}/{} has no ready endpoints; withholding ingress status",
+                namespace, name
+            );
+            self.record_warning_event(
+                service,
+                "LoadBalancerSourceUnhealthy",
+                "No ready endpoints backing the LoadBalancer; withholding ingress status",
+            )
+            .await;
+            return Ok(());
+        }
+
         // Ensure NodePorts are allocated
         let has_node_ports = service.spec.ports.iter().all(|p| p.node_port.is_some());
 
@@ -452,6 +484,25 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
         );
 
         Ok(())
+    }
+
+    /// Whether the Service has at least one ready endpoint. Reads the
+    /// Endpoints object the EndpointsController publishes (same name as the
+    /// Service) and checks for any non-empty `addresses` (ready) entry across
+    /// its subsets. A missing Endpoints object or only `notReadyAddresses`
+    /// counts as "no ready endpoints".
+    async fn has_ready_endpoints(&self, namespace: &str, name: &str) -> bool {
+        let key = rusternetes_storage::build_key("endpoints", Some(namespace), name);
+        let ep: rusternetes_common::resources::Endpoints = match self.storage.get(&key).await {
+            Ok(ep) => ep,
+            Err(_) => return false,
+        };
+        ep.subsets.iter().any(|s| {
+            s.addresses
+                .as_ref()
+                .map(|addrs| !addrs.is_empty())
+                .unwrap_or(false)
+        })
     }
 
     /// Update `service.status.loadBalancer` with the cloud-provider result.
