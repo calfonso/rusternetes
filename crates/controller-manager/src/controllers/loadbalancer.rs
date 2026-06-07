@@ -324,6 +324,30 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
             };
             let name = svc.metadata.name.as_str();
 
+            // Apply the same endpoint-readiness health gate as `reconcile_service`:
+            // for selector-backed Services, withhold stub ingress and emit a
+            // warning event until at least one endpoint is Ready.  Selector-less
+            // Services (manually-managed endpoints) are not gated.
+            let has_selector = svc
+                .spec
+                .selector
+                .as_ref()
+                .map(|sel| !sel.is_empty())
+                .unwrap_or(false);
+            if has_selector && !self.has_ready_endpoints(ns, name).await {
+                warn!(
+                    "LoadBalancer service {}/{} has no ready endpoints; withholding stub ingress",
+                    ns, name
+                );
+                self.record_warning_event(
+                    &svc,
+                    "LoadBalancerSourceUnhealthy",
+                    "No ready endpoints backing the LoadBalancer; withholding ingress status",
+                )
+                .await;
+                continue;
+            }
+
             // Order: node InternalIP, spec.loadBalancerIP, spec.clusterIP, sentinel.
             // Upstream e2e only checks that ingress is non-empty, not the IP value.
             let ingress_ip = node_ingress
