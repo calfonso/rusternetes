@@ -10,7 +10,7 @@ use rusternetes_common::resources::ingress::{
     HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressServiceBackend,
     IngressSpec, IngressTLS, ServiceBackendPort,
 };
-use rusternetes_common::resources::{Ingress, Secret, Service, ServiceSpec};
+use rusternetes_common::resources::{Ingress, IngressClass, Secret, Service, ServiceSpec};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::ingress::IngressController;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
@@ -327,6 +327,18 @@ async fn ingress_class_name_is_preserved_after_reconcile() {
     let storage = setup_test().await;
     store_service(&storage, "classed-svc", "default").await;
 
+    // Pre-create the referenced IngressClass so the controller's existence
+    // check passes and the ingress is actually reconciled (status populated).
+    // Without this the test would pass trivially: validation would fail, the
+    // ingress would be skipped, and the spec field would round-trip untouched.
+    storage
+        .create(
+            &build_key("ingressclasses", None, "nginx"),
+            &IngressClass::new("nginx"),
+        )
+        .await
+        .unwrap();
+
     let spec = IngressSpec {
         ingress_class_name: Some("nginx".to_string()),
         default_backend: None,
@@ -351,6 +363,10 @@ async fn ingress_class_name_is_preserved_after_reconcile() {
         stored.spec.unwrap().ingress_class_name.as_deref(),
         Some("nginx"),
         "ingressClassName must round-trip through reconcile"
+    );
+    assert!(
+        stored.status.is_some(),
+        "an ingress whose IngressClass exists must be reconciled and get LB status"
     );
 }
 
