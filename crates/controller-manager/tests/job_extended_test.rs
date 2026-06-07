@@ -816,7 +816,6 @@ async fn job_with_ttl_should_be_cleaned_up_after_completion() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RED-state: test assumes list() returns pods in creation order (pods[3..6]); production etcd/rhino backends return key-sorted order, under which this fails. Needs an order-independent rewrite (select succeeded pods by identity, not slice index) — tracked separately."]
 async fn job_should_respect_parallelism_across_multiple_reconciles() {
     let storage = setup_test().await;
     let namespace = "default";
@@ -859,8 +858,14 @@ async fn job_should_respect_parallelism_across_multiple_reconciles() {
         "Should create 3 more pods after first batch succeeds"
     );
 
-    // Mark next 3 as succeeded
-    for pod in &pods[3..6] {
+    // Mark the freshly-created (not-yet-succeeded) pods as succeeded. Selecting
+    // by state rather than slice index keeps this order-independent: list()
+    // returns key-sorted (not creation-ordered) results, so a new pod may sort
+    // among the already-succeeded ones.
+    for pod in pods
+        .iter()
+        .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&Phase::Succeeded))
+    {
         let mut success_pod = pod.clone();
         success_pod.status = Some(PodStatus {
             phase: Some(Phase::Succeeded),
@@ -878,8 +883,12 @@ async fn job_should_respect_parallelism_across_multiple_reconciles() {
         .unwrap();
     assert_eq!(pods.len(), 9, "Should create 3 more pods");
 
-    // Mark next 3 as succeeded
-    for pod in &pods[6..9] {
+    // Mark the freshly-created (not-yet-succeeded) pods as succeeded
+    // (state-based selection — order-independent, see note above).
+    for pod in pods
+        .iter()
+        .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&Phase::Succeeded))
+    {
         let mut success_pod = pod.clone();
         success_pod.status = Some(PodStatus {
             phase: Some(Phase::Succeeded),
