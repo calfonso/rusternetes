@@ -3,6 +3,8 @@
 // This module implements the client for calling external admission webhooks
 // and processing their responses.
 
+pub mod cel_evaluators;
+
 use rusternetes_common::{
     admission::{
         AdmissionResponse, AdmissionReview, AdmissionReviewRequest, AdmissionReviewResponse,
@@ -762,7 +764,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     }
 
                     // Evaluate matchConditions (CEL expressions) for validating webhooks.
-                    // Source of truth: `crate::cel::MatchConditionEvaluator`.
+                    // Source of truth: `crate::cel_evaluators::MatchConditionEvaluator`.
                     if let Some(ref conditions) = webhook.match_conditions {
                         if !conditions.is_empty() {
                             let request = build_admission_request_for_match(
@@ -774,11 +776,12 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 old_object.as_ref(),
                                 Some(user_info),
                             );
-                            let mut evaluator = crate::cel::MatchConditionEvaluator::new();
+                            let mut evaluator =
+                                crate::cel_evaluators::MatchConditionEvaluator::new();
                             let outcome = evaluator.evaluate(conditions, &request, None);
                             match outcome {
-                                crate::cel::MatchOutcome::Matched => {}
-                                crate::cel::MatchOutcome::NotMatched => {
+                                crate::cel_evaluators::MatchOutcome::Matched => {}
+                                crate::cel_evaluators::MatchOutcome::NotMatched => {
                                     debug!(
                                         "Skipping validating webhook {} — matchConditions not met for {}/{}",
                                         webhook.name,
@@ -787,7 +790,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                     );
                                     continue;
                                 }
-                                crate::cel::MatchOutcome::Error(msg) => {
+                                crate::cel_evaluators::MatchOutcome::Error(msg) => {
                                     // Upstream `matcher.go` treats compile/runtime
                                     // errors as "no match" — the webhook is skipped.
                                     // The caller can layer failurePolicy on top of the
@@ -1159,7 +1162,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     }
 
                     // Evaluate matchConditions (CEL expressions) for mutating webhooks.
-                    // Source of truth: `crate::cel::MatchConditionEvaluator`.
+                    // Source of truth: `crate::cel_evaluators::MatchConditionEvaluator`.
                     // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/rules/rules.go
                     if let Some(ref conditions) = webhook.match_conditions {
                         if !conditions.is_empty() {
@@ -1172,11 +1175,12 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 old_object.as_ref(),
                                 Some(user_info),
                             );
-                            let mut evaluator = crate::cel::MatchConditionEvaluator::new();
+                            let mut evaluator =
+                                crate::cel_evaluators::MatchConditionEvaluator::new();
                             let outcome = evaluator.evaluate(conditions, &request, None);
                             match outcome {
-                                crate::cel::MatchOutcome::Matched => {}
-                                crate::cel::MatchOutcome::NotMatched => {
+                                crate::cel_evaluators::MatchOutcome::Matched => {}
+                                crate::cel_evaluators::MatchOutcome::NotMatched => {
                                     debug!(
                                         "Skipping mutating webhook {} — matchConditions not met for {}/{}",
                                         webhook.name,
@@ -1185,7 +1189,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                     );
                                     continue;
                                 }
-                                crate::cel::MatchOutcome::Error(msg) => {
+                                crate::cel_evaluators::MatchOutcome::Error(msg) => {
                                     debug!(
                                         "Skipping mutating webhook {} — matchCondition error: {}",
                                         webhook.name, msg
@@ -1616,7 +1620,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             Ok(c) => c,
             Err(_) => return,
         };
-        crate::handlers::custom_resource::prune_custom_resource_value(&crd, &gvr.version, object);
+        rusternetes_common::resources::crd::prune_custom_resource_value(&crd, &gvr.version, object);
     }
 
     /// Check if a webhook matches the given request
@@ -1928,7 +1932,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             }
 
             // Check matchConditions from the policy spec.
-            // Source of truth: `crate::cel::MatchConditionEvaluator`.
+            // Source of truth: `crate::cel_evaluators::MatchConditionEvaluator`.
             let obj_name = object
                 .and_then(|o| o.pointer("/metadata/name"))
                 .and_then(|n| n.as_str())
@@ -2104,7 +2108,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 .unwrap_or("Fail");
 
             // Evaluate validations.
-            // Source of truth: `crate::cel::ValidationEvaluator`.
+            // Source of truth: `crate::cel_evaluators::ValidationEvaluator`.
             if let Some(validations) = policy
                 .get("spec")
                 .and_then(|s| s.get("validations"))
@@ -2122,7 +2126,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         validation.get("messageExpression").and_then(|m| m.as_str());
                     let static_message = validation.get("message").and_then(|m| m.as_str());
 
-                    let outcome = crate::cel::ValidationEvaluator::evaluate_one(
+                    let outcome = crate::cel_evaluators::ValidationEvaluator::evaluate_one(
                         expression,
                         message_expression,
                         static_message,
@@ -2131,14 +2135,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     );
 
                     match outcome {
-                        crate::cel::ValidationOutcome::Pass => {
+                        crate::cel_evaluators::ValidationOutcome::Pass => {
                             tracing::debug!(
                                 "VAP {} expression '{}' passed",
                                 policy_name,
                                 expression
                             );
                         }
-                        crate::cel::ValidationOutcome::Fail { message } => {
+                        crate::cel_evaluators::ValidationOutcome::Fail { message } => {
                             tracing::info!(
                                 "VAP {} expression '{}' DENIED for {} in ns {:?}",
                                 policy_name,
@@ -2166,7 +2170,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 )));
                             }
                         }
-                        crate::cel::ValidationOutcome::Error { message } => {
+                        crate::cel_evaluators::ValidationOutcome::Error { message } => {
                             tracing::warn!(
                                 "CEL evaluation error for policy {}: {}",
                                 policy_name,
@@ -2185,7 +2189,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             }
 
             // Evaluate auditAnnotations.
-            // Source of truth: `crate::cel::AuditAnnotationEvaluator`.
+            // Source of truth: `crate::cel_evaluators::AuditAnnotationEvaluator`.
             //
             // Upstream emits resolved annotations on the audit event under
             // `<policy-name>/<key>` once we have an audit sink, we will plumb
@@ -2208,14 +2212,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         continue;
                     }
 
-                    let outcome = crate::cel::AuditAnnotationEvaluator::evaluate_one(
+                    let outcome = crate::cel_evaluators::AuditAnnotationEvaluator::evaluate_one(
                         key,
                         value_expression,
                         &mut evaluator,
                         &context,
                     );
                     match outcome {
-                        crate::cel::AuditAnnotationOutcome::Emit { key, value } => {
+                        crate::cel_evaluators::AuditAnnotationOutcome::Emit { key, value } => {
                             tracing::info!(
                                 "VAP {} audit annotation {}/{} = {}",
                                 policy_name,
@@ -2224,14 +2228,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 value
                             );
                         }
-                        crate::cel::AuditAnnotationOutcome::Skip => {
+                        crate::cel_evaluators::AuditAnnotationOutcome::Skip => {
                             tracing::debug!(
                                 "VAP {} audit annotation {} skipped (valueExpression returned null)",
                                 policy_name,
                                 key
                             );
                         }
-                        crate::cel::AuditAnnotationOutcome::Error { message } => {
+                        crate::cel_evaluators::AuditAnnotationOutcome::Error { message } => {
                             tracing::warn!(
                                 "VAP {} audit annotation error: {}",
                                 policy_name,
@@ -2254,7 +2258,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     /// Evaluate matchConditions for a VAP. Returns true if all conditions pass
     /// (or none exist), false if any condition fails or errors.
     ///
-    /// Thin wrapper around [`crate::cel::MatchConditionEvaluator`] — the source
+    /// Thin wrapper around [`crate::cel_evaluators::MatchConditionEvaluator`] — the source
     /// of truth for the CEL semantics. The VAP-specific concern handled here
     /// is the JSON shape of `spec.matchConditions[]`: each entry has a `name`
     /// and `expression` field, which we deserialize into the typed
@@ -2292,10 +2296,10 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             operation, gvk, namespace, name, object, old_object, user_info,
         );
 
-        let mut evaluator = crate::cel::MatchConditionEvaluator::new();
+        let mut evaluator = crate::cel_evaluators::MatchConditionEvaluator::new();
         matches!(
             evaluator.evaluate(&conditions, &request, None),
-            crate::cel::MatchOutcome::Matched
+            crate::cel_evaluators::MatchOutcome::Matched
         )
     }
 }
@@ -2303,7 +2307,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
 /// Build a typed `AdmissionRequest` from the loose params used inside the
 /// admission_webhook dispatcher. Used by all three match-condition call sites
 /// (VAP, validating webhook, mutating webhook) to feed
-/// [`crate::cel::MatchConditionEvaluator`].
+/// [`crate::cel_evaluators::MatchConditionEvaluator`].
 ///
 /// `user_info` is optional because VAP runs in-server (no remote webhook) and
 /// the original `run_validating_admission_policies_ext` does not propagate the
@@ -4651,7 +4655,7 @@ mod tests {
         let mut cr: CustomResource = serde_json::from_value(cr_json).unwrap();
 
         // Reuse the same pruning function the create handler calls.
-        crate::handlers::custom_resource::test_prune_custom_resource(&crd, "v1", &mut cr);
+        rusternetes_common::resources::crd::prune_custom_resource(&crd, "v1", &mut cr);
 
         let pruned_spec = cr.spec.expect("spec preserved");
         assert_eq!(pruned_spec.get("replicas"), Some(&json!(3)));

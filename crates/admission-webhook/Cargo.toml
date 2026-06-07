@@ -1,0 +1,28 @@
+[package]
+name = "rusternetes-admission-webhook"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "rusternetes_admission_webhook"
+path = "src/lib.rs"
+
+[dependencies]
+rusternetes-common = { path = "../common" }
+rusternetes-storage = { path = "../storage" }
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64.workspace = true
+cel.workspace = true
+uuid.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+rusternetes-storage = { path = "../storage" }
+axum.workspace = true
+chrono.workspace = true

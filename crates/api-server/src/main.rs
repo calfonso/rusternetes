@@ -1,7 +1,7 @@
 mod admission;
-mod admission_webhook;
+pub use rusternetes_admission_webhook as admission_webhook;
 mod bootstrap;
-mod cel;
+pub use rusternetes_admission_webhook::cel_evaluators as cel;
 mod conversion;
 mod dynamic_routes;
 #[allow(dead_code)]

@@ -1,8 +1,8 @@
 pub mod admission;
-pub mod admission_webhook;
+pub use rusternetes_admission_webhook as admission_webhook;
 pub mod bootstrap;
+pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
-pub mod cel;
 pub mod conversion;
 pub mod dynamic_routes;
 #[allow(dead_code)]
