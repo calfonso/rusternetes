@@ -8,12 +8,12 @@ use rusternetes_common::{
 #[cfg(feature = "aws")]
 use std::collections::HashMap;
 #[cfg(feature = "aws")]
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "aws")]
 use aws_sdk_elasticloadbalancingv2::{
     types::{
-        Action, ActionTypeEnum, ForwardActionConfig, IpAddressType, Listener, LoadBalancer,
+        Action, ActionTypeEnum, ForwardActionConfig, IpAddressType, LoadBalancer,
         LoadBalancerSchemeEnum, LoadBalancerTypeEnum, TargetGroup, TargetGroupIpAddressTypeEnum,
         TargetTypeEnum,
     },
@@ -35,12 +35,12 @@ impl AwsProvider {
     /// Create a new AWS provider
     pub async fn new(cluster_name: String, region: Option<String>) -> Result<Self> {
         let config = if let Some(r) = region {
-            aws_config::from_env()
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .region(aws_config::Region::new(r))
                 .load()
                 .await
         } else {
-            aws_config::load_from_env().await
+            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
         };
 
         let elb_client = ElbClient::new(&config);
@@ -81,32 +81,32 @@ impl AwsProvider {
 
     /// Generate load balancer name from service
     fn lb_name(&self, service: &LoadBalancerService) -> String {
-        // AWS LB names max 32 chars, must be alphanumeric and hyphens
-        let name = format!(
-            "{}-{}-{}",
-            self.cluster_name, service.namespace, service.name
-        );
-
-        // Truncate and sanitize
-        name.chars()
-            .take(32)
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
+        Self::lb_name_for(&self.cluster_name, service)
     }
 
     /// Generate target group name
     fn tg_name(&self, service: &LoadBalancerService, port: u16) -> String {
+        Self::tg_name_for(&self.cluster_name, service, port)
+    }
+
+    /// Generate load balancer name from cluster + service (pure helper)
+    fn lb_name_for(cluster_name: &str, service: &LoadBalancerService) -> String {
+        // AWS LB names max 32 chars, must be alphanumeric and hyphens
+        let name = format!("{}-{}-{}", cluster_name, service.namespace, service.name);
+        Self::sanitize_name(&name)
+    }
+
+    /// Generate target group name from cluster + service (pure helper)
+    fn tg_name_for(cluster_name: &str, service: &LoadBalancerService, port: u16) -> String {
         let name = format!(
             "{}-{}-{}-{}",
-            self.cluster_name, service.namespace, service.name, port
+            cluster_name, service.namespace, service.name, port
         );
+        Self::sanitize_name(&name)
+    }
 
+    /// Truncate to 32 chars and replace disallowed characters with hyphens
+    fn sanitize_name(name: &str) -> String {
         name.chars()
             .take(32)
             .map(|c| {
@@ -511,15 +511,7 @@ mod tests {
 
     #[test]
     fn test_lb_name_generation() {
-        let provider = AwsProvider {
-            elb_client: unsafe { std::mem::zeroed() },
-            vpc_id: Some("vpc-123".to_string()),
-            subnet_ids: vec![],
-            cluster_name: "my-cluster".to_string(),
-            tags: HashMap::new(),
-        };
-
-        let service = CloudLBService {
+        let service = LoadBalancerService {
             namespace: "default".to_string(),
             name: "my-service".to_string(),
             cluster_name: "my-cluster".to_string(),
@@ -529,7 +521,7 @@ mod tests {
             annotations: HashMap::new(),
         };
 
-        let lb_name = provider.lb_name(&service);
+        let lb_name = AwsProvider::lb_name_for("my-cluster", &service);
 
         // Should be truncated to 32 chars and alphanumeric + hyphens only
         assert!(lb_name.len() <= 32);
@@ -541,15 +533,7 @@ mod tests {
 
     #[test]
     fn test_lb_name_sanitization() {
-        let provider = AwsProvider {
-            elb_client: unsafe { std::mem::zeroed() },
-            vpc_id: Some("vpc-123".to_string()),
-            subnet_ids: vec![],
-            cluster_name: "test_cluster".to_string(),
-            tags: HashMap::new(),
-        };
-
-        let service = CloudLBService {
+        let service = LoadBalancerService {
             namespace: "my@namespace".to_string(),
             name: "service#123".to_string(),
             cluster_name: "test_cluster".to_string(),
@@ -559,7 +543,7 @@ mod tests {
             annotations: HashMap::new(),
         };
 
-        let lb_name = provider.lb_name(&service);
+        let lb_name = AwsProvider::lb_name_for("test_cluster", &service);
 
         // All special characters should be converted to hyphens
         assert!(!lb_name.contains('@'));
@@ -569,15 +553,7 @@ mod tests {
 
     #[test]
     fn test_tg_name_generation() {
-        let provider = AwsProvider {
-            elb_client: unsafe { std::mem::zeroed() },
-            vpc_id: Some("vpc-123".to_string()),
-            subnet_ids: vec![],
-            cluster_name: "cluster".to_string(),
-            tags: HashMap::new(),
-        };
-
-        let service = CloudLBService {
+        let service = LoadBalancerService {
             namespace: "ns".to_string(),
             name: "svc".to_string(),
             cluster_name: "cluster".to_string(),
@@ -587,7 +563,7 @@ mod tests {
             annotations: HashMap::new(),
         };
 
-        let tg_name = provider.tg_name(&service, 80);
+        let tg_name = AwsProvider::tg_name_for("cluster", &service, 80);
 
         assert!(tg_name.len() <= 32);
         assert!(tg_name.contains("80"));
@@ -607,9 +583,11 @@ mod tests {
 // Helper trait implementation for testing
 #[cfg(all(test, feature = "aws"))]
 impl AwsProvider {
-    fn is_driver_supported(_driver: &str) -> bool {
-        // This is just for testing naming functions
-        // Real driver support would be in a different context
-        true
+    fn is_driver_supported(driver: &str) -> bool {
+        // Strip an optional `rusternetes.io/` vendor prefix, then accept the
+        // in-tree hostpath snapshotter driver. Anything else (e.g. the upstream
+        // `kubernetes.io/*` drivers) is not supported by this provider.
+        let bare = driver.strip_prefix("rusternetes.io/").unwrap_or(driver);
+        bare == "hostpath-snapshotter"
     }
 }
