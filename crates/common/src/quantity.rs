@@ -199,6 +199,36 @@ impl Quantity {
         self.cmp_value(other) == std::cmp::Ordering::Equal
     }
 
+    /// Subtract `other` from `self`, returning a new `Quantity`.
+    ///
+    /// The result inherits the format of `self` (the "capacity" side)
+    /// so that `8Gi - 1Gi` canonicalises as `7Gi`.  Returns `None` on
+    /// overflow (i128 mantissa).
+    ///
+    /// Used by `NodeController` to compute `allocatable = capacity - reserved`.
+    pub fn sub(&self, other: &Quantity) -> Option<Quantity> {
+        // Bring both operands to a common scale = min(self.scale, other.scale)
+        // so the mantissas can be subtracted directly.
+        let common = self.scale.min(other.scale);
+        let shift_a = (self.scale - common) as u32;
+        let shift_b = (other.scale - common) as u32;
+        let a = self.mantissa.checked_mul(10i128.checked_pow(shift_a)?)?;
+        let b = other.mantissa.checked_mul(10i128.checked_pow(shift_b)?)?;
+        let result = a.checked_sub(b)?;
+        Some(Quantity {
+            mantissa: result,
+            scale: common,
+            format: self.format,
+        })
+    }
+
+    /// True when this quantity represents a negative value. Used to clamp
+    /// `allocatable = capacity - reserved` to zero when a node reserves more
+    /// than its capacity (upstream `getNodeAllocatableAbsolute` clamps to 0).
+    pub fn is_negative(&self) -> bool {
+        self.mantissa < 0
+    }
+
     /// Canonical-form string for this quantity. Matches upstream
     /// `Quantity.String()`.
     pub fn canonical_string(&self) -> String {
@@ -555,5 +585,23 @@ mod tests {
         assert!(Quantity::parse("-3.01e-").is_err());
         // "0.1mi" — lowercase `mi` is not a suffix.
         assert!(Quantity::parse("0.1mi").is_err());
+    }
+
+    #[test]
+    fn sub_value_and_clamp() {
+        let q = |s: &str| Quantity::parse(s).unwrap();
+        // Same binary unit.
+        assert!(q("8Gi").sub(&q("1Gi")).unwrap().value_eq(&q("7Gi")));
+        // Different decimal scales (cores minus millicores).
+        assert!(q("4").sub(&q("500m")).unwrap().value_eq(&q("3500m")));
+        // Cross binary units.
+        assert!(q("1Gi").sub(&q("512Mi")).unwrap().value_eq(&q("512Mi")));
+        // Subtracting zero is identity; equal operands net to zero.
+        assert!(q("4").sub(&q("0")).unwrap().value_eq(&q("4")));
+        assert!(q("1Gi").sub(&q("1Gi")).unwrap().value_eq(&q("0")));
+        // Reserved exceeding capacity yields a negative quantity (callers clamp).
+        let neg = q("100m").sub(&q("500m")).unwrap();
+        assert!(neg.is_negative());
+        assert!(!q("500m").sub(&q("100m")).unwrap().is_negative());
     }
 }
