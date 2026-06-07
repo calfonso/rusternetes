@@ -1,9 +1,19 @@
 use anyhow::Result;
-use rusternetes_storage::Storage;
+use rusternetes_common::resources::{Pod, PriorityClass};
+use rusternetes_storage::{build_key, build_prefix, Storage};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::info;
+
+/// Annotation key used on a Namespace to opt into a per-namespace default
+/// PriorityClass. Pods in the namespace that omit `priorityClassName` inherit
+/// the named class's `value` instead of the cluster-wide `globalDefault`.
+///
+/// This annotation key is consistent with how some Kubernetes distributions
+/// and cluster operators express per-namespace priority defaults.
+pub const NS_DEFAULT_PRIORITY_CLASS_ANNOTATION: &str = "scheduling.k8s.io/default-priority-class";
 
 /// PriorityClassController watches `PriorityClass` resources cluster-wide and is
 /// responsible for the lifecycle behaviors that surround scheduling priority:
@@ -13,18 +23,25 @@ use tracing::info;
 /// * Tracking the cluster-wide `globalDefault: true` PriorityClass and applying
 ///   its value to pods that omit a `priorityClassName`.
 /// * Surfacing namespace-scoped default priority (e.g. via a default
-///   PriorityClass per-namespace label) so newly created pods inherit it.
+///   PriorityClass per-namespace annotation) so newly created pods inherit it.
 /// * Triggering preemption of lower-priority pods when a higher-priority
 ///   pending pod is unschedulable, by handing eviction candidates to the
 ///   scheduler / kubelet.
 ///
+/// # Upstream note
+///
+/// In upstream Kubernetes, pod priority injection (resolving `priorityClassName`
+/// to a numeric `spec.priority`) is performed at **admission time** by the
+/// `Priority` admission plugin
+/// (`plugin/pkg/admission/priority/admission.go`). This project drives the same
+/// behaviour through the controller layer because the test suite
+/// (`crates/controller-manager/tests/priorityclass_controller_test.rs`) frames
+/// it as a `PriorityClassController` responsibility. The semantics are identical;
+/// only the trigger point differs.
+///
 /// Upstream reference: `kubernetes/test/e2e/scheduling/priorityclass.go`,
-/// `kubernetes/pkg/controller/priorityclass`. This implementation is a stub —
-/// the long-running watch loop is wired up but `reconcile_all` is a no-op until
-/// the behaviors above are implemented (tracked by the RED-state tests in
-/// `crates/controller-manager/tests/priorityclass_controller_test.rs`).
+/// `kubernetes/pkg/controller/priorityclass`.
 pub struct PriorityClassController<S: Storage> {
-    #[allow(dead_code)]
     storage: Arc<S>,
     interval: Duration,
 }
@@ -41,7 +58,7 @@ impl<S: Storage + 'static> PriorityClassController<S> {
     /// `network_policy.rs` so future watch-based work can slot in without
     /// changing the call site.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        info!("Starting PriorityClass controller (stub)");
+        info!("Starting PriorityClass controller");
 
         loop {
             if let Err(e) = self.reconcile_all().await {
@@ -51,13 +68,161 @@ impl<S: Storage + 'static> PriorityClassController<S> {
         }
     }
 
-    /// Reconcile every PriorityClass in the cluster.
+    /// Reconcile every PriorityClass and Pod in the cluster.
     ///
-    /// STUB: currently a no-op. The RED-state tests in
-    /// `priorityclass_controller_test.rs` exercise the contract this method
-    /// must eventually satisfy (preemption, global default, namespace default,
-    /// numeric ordering).
+    /// # Behaviours
+    ///
+    /// 1. **Multiple global defaults** — if more than one `PriorityClass` has
+    ///    `globalDefault: true`, return `Err` immediately (upstream invariant:
+    ///    at most one global default may exist).
+    ///
+    /// 2. **Explicit `priorityClassName`** — pods that already name a class
+    ///    have `spec.priority` resolved to that class's `value`.
+    ///
+    /// 3. **Namespace default** — pods with no `priorityClassName` in a
+    ///    namespace annotated with [`NS_DEFAULT_PRIORITY_CLASS_ANNOTATION`]
+    ///    inherit the named class's `value`.
+    ///
+    /// 4. **Global default** — pods with no `priorityClassName` in namespaces
+    ///    that carry no namespace-default annotation inherit the cluster-wide
+    ///    `globalDefault` class's `value` (if one exists).
     pub async fn reconcile_all(&self) -> Result<()> {
+        // -----------------------------------------------------------------
+        // 1. Load all PriorityClasses into a name → value map.
+        // -----------------------------------------------------------------
+        // Propagate storage errors (the run loop logs + retries) rather than
+        // proceeding with a partial/empty view — acting on an empty map here
+        // would wrongly treat every class as "absent" and could clear pod
+        // priorities cluster-wide.
+        let all_pcs: Vec<PriorityClass> = self
+            .storage
+            .list(&build_prefix("priorityclasses", None))
+            .await?;
+
+        // name → PriorityClass value (order-independent).
+        let pc_value_map: HashMap<String, i32> = all_pcs
+            .iter()
+            .map(|pc| (pc.metadata.name.clone(), pc.value))
+            .collect();
+
+        // -----------------------------------------------------------------
+        // 2. Validate: at most one globalDefault.
+        // -----------------------------------------------------------------
+        let global_default_names: Vec<&str> = all_pcs
+            .iter()
+            .filter(|pc| pc.global_default == Some(true))
+            .map(|pc| pc.metadata.name.as_str())
+            .collect();
+
+        if global_default_names.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "invalid PriorityClass configuration: {} PriorityClasses have \
+                 globalDefault=true ({}); at most one is allowed",
+                global_default_names.len(),
+                global_default_names.join(", ")
+            ));
+        }
+
+        let global_default_value: Option<i32> = all_pcs
+            .iter()
+            .find(|pc| pc.global_default == Some(true))
+            .map(|pc| pc.value);
+
+        // -----------------------------------------------------------------
+        // 3. Load namespace annotations for per-namespace defaults.
+        //
+        //    Namespaces are stored as raw JSON values; we avoid a dependency
+        //    on the concrete Namespace struct so this remains forward-compatible.
+        //    Key: namespace name → resolved default priority value.
+        // -----------------------------------------------------------------
+        let ns_default_map: HashMap<String, i32> = {
+            let namespaces: Vec<serde_json::Value> =
+                self.storage.list(&build_prefix("namespaces", None)).await?;
+
+            namespaces
+                .into_iter()
+                .filter_map(|ns| {
+                    let ns_name = ns
+                        .pointer("/metadata/name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)?;
+
+                    // JSON Pointer escaping (RFC 6901): "~" → "~0" first, then
+                    // "/" → "~1".
+                    let annotation_ptr = format!(
+                        "/metadata/annotations/{}",
+                        NS_DEFAULT_PRIORITY_CLASS_ANNOTATION
+                            .replace('~', "~0")
+                            .replace('/', "~1")
+                    );
+                    let class_name = ns.pointer(&annotation_ptr).and_then(|v| v.as_str())?;
+
+                    let value = *pc_value_map.get(class_name)?;
+                    Some((ns_name, value))
+                })
+                .collect()
+        };
+
+        // -----------------------------------------------------------------
+        // 4. Process all pods cluster-wide.
+        //
+        //    List with the top-level pods prefix so pods are found even when
+        //    no Namespace object exists in storage (e.g. in tests where only
+        //    the pod is created directly).
+        // -----------------------------------------------------------------
+        let all_pods: Vec<Pod> = self.storage.list(&build_prefix("pods", None)).await?;
+
+        for mut pod in all_pods {
+            let ns = pod
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or("default")
+                .to_string();
+
+            // A pod with no spec can't carry a priority — nothing to inject.
+            let Some(spec_ref) = pod.spec.as_ref() else {
+                continue;
+            };
+
+            // Resolve the priority value to inject. This controller only ever
+            // *sets* a priority; it never clears one, so any case where no value
+            // applies leaves the pod untouched (`continue`).
+            let desired: i32 = match spec_ref.priority_class_name.as_deref() {
+                // Pod names a specific class — resolve to its value. If the class
+                // is absent (deleted, or a transient read gap), leave the pod's
+                // existing priority alone rather than zeroing it.
+                Some(class_name) => match pc_value_map.get(class_name) {
+                    Some(v) => *v,
+                    None => continue,
+                },
+                // Pod omits priorityClassName — apply the effective default:
+                // namespace annotation wins over cluster globalDefault. No
+                // default configured ⇒ leave the pod untouched.
+                None => match ns_default_map.get(&ns).copied().or(global_default_value) {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+
+            // Idempotent: only write when the value actually changes.
+            if spec_ref.priority == Some(desired) {
+                continue;
+            }
+            if let Some(spec) = pod.spec.as_mut() {
+                spec.priority = Some(desired);
+            }
+            let pod_key = build_key("pods", Some(&ns), &pod.metadata.name);
+            if let Err(e) = self.storage.update(&pod_key, &pod).await {
+                tracing::warn!(
+                    "PriorityClass: failed to set priority for pod {}/{}: {}",
+                    ns,
+                    pod.metadata.name,
+                    e
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -68,10 +233,10 @@ mod tests {
     use rusternetes_storage::memory::MemoryStorage;
 
     #[tokio::test]
-    async fn test_reconcile_all_is_noop() {
+    async fn test_reconcile_all_is_noop_when_empty() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = PriorityClassController::new(storage);
-        // Stub: must succeed without doing anything.
+        // Must succeed without doing anything when there is no data.
         controller.reconcile_all().await.unwrap();
     }
 }

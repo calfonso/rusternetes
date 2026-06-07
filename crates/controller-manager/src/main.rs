@@ -22,6 +22,7 @@ use controllers::{
     network_policy::NetworkPolicyController,
     node::NodeController,
     pod_disruption_budget::{PodDisruptionBudgetController, StalePodDisruptionController},
+    priorityclass::PriorityClassController,
     pv_binder::PVBinderController,
     replicaset::ReplicaSetController,
     replicationcontroller::ReplicationControllerController,
@@ -615,6 +616,17 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = controller.run().await {
                 tracing::error!("Node controller error: {}", e);
+            }
+        }
+    });
+
+    // Start PriorityClass controller
+    let priorityclass_controller = Arc::new(PriorityClassController::new(storage.clone()));
+    spawn_controller!("PriorityClass controller", leader_elector, {
+        let controller = priorityclass_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("PriorityClass controller error: {}", e);
             }
         }
     });
