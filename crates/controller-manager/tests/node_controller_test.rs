@@ -315,7 +315,6 @@ fn make_node(name: &str, conditions: Option<Vec<NodeCondition>>) -> Node {
 // ----------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RED-state: NodeController does not yet apply node.kubernetes.io/shutdown taint based on Ready=False/reason=NodeShutdown (upstream pkg/controller/nodelifecycle)"]
 async fn test_node_shutdown_taint_applied_on_graceful_shutdown() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = NodeController::new(storage.clone());
@@ -645,7 +644,6 @@ async fn test_node_remains_ready_when_lease_is_fresh_despite_stale_heartbeat() {
 }
 
 #[tokio::test]
-#[ignore = "RED-state: NodeController consumes Lease.renewTime but does not itself renew the node Lease (kubelet responsibility upstream); test pinned until rusternetes grows controller-side Lease maintenance"]
 async fn test_node_lease_renewal_bumps_renew_time() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = NodeController::new(storage.clone());
@@ -721,7 +719,6 @@ async fn test_node_lease_renewal_bumps_renew_time() {
 // ----------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RED-state: NodeController does not yet compute Allocatable = Capacity - Reserved (upstream pkg/kubelet/cm/node_container_manager)"]
 async fn test_node_allocatable_equals_capacity_minus_reserved() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = NodeController::new(storage.clone());

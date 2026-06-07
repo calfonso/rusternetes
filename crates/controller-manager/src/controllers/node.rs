@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use futures::StreamExt;
-use rusternetes_common::resources::{Node, NodeCondition, NodeStatus, Pod, PodStatus};
+use rusternetes_common::quantity::Quantity;
+use rusternetes_common::resources::{Lease, Node, NodeCondition, NodeStatus, Pod, PodStatus};
 use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
@@ -212,6 +213,44 @@ impl<S: Storage + 'static> NodeController<S> {
             // Node is Ready — ensure not-ready taint is removed
             self.remove_not_ready_taint(node).await?;
         }
+
+        // Apply the shutdown taint when the node reports a graceful shutdown.
+        //
+        // Upstream (pkg/controller/nodelifecycle): when the kubelet enters its
+        // graceful-shutdown sequence it sets Ready=False with reason "NodeShutdown".
+        // The node lifecycle controller then applies `node.kubernetes.io/shutdown`
+        // (NoSchedule) so the scheduler stops admitting pods to the shutting-down node.
+        let is_shutdown = node
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|cs| cs.iter().find(|c| c.condition_type == "Ready"))
+            .and_then(|c| c.reason.as_deref())
+            .map(|r| r == "NodeShutdown")
+            .unwrap_or(false);
+        if is_shutdown {
+            self.add_shutdown_taint(node).await?;
+        }
+
+        // Refresh the node's coordination Lease renewTime.
+        //
+        // NOTE: divergence from upstream — upstream has the *kubelet* renew the
+        // node Lease (pkg/kubelet/node_manager.go -> nodeLeaseController); the
+        // controller only reads the Lease to determine readiness. rusternetes
+        // drives Lease renewal controller-side because the test suite pins this
+        // behaviour here and the kubelet stub does not yet emit Lease updates.
+        self.renew_node_lease(node_name).await?;
+
+        // Compute status.allocatable = status.capacity − kube-reserved.
+        //
+        // Upstream contract (pkg/kubelet/cm/node_container_manager_linux.go
+        // → setNodeStatusMachineInfo / getNodeAllocatableAbsolute):
+        //   allocatable = capacity − kube-reserved − system-reserved − eviction-hard
+        // rusternetes reads reservation amounts from the annotation
+        // `node.alpha.kubernetes.io/kube-reserved` (comma-separated key=value list,
+        // e.g. "cpu=500m,memory=1Gi") as a proxy for the kubelet flag plumbing that
+        // the kubelet stub does not yet surface.
+        self.compute_allocatable(node).await?;
 
         // Evict pods from nodes that have been NotReady for too long
         if !is_ready && self.should_evict_pods(node) {
@@ -487,6 +526,140 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
+    /// Apply the `node.kubernetes.io/shutdown` taint (NoSchedule) when the kubelet
+    /// has started a graceful shutdown (Ready=False, reason="NodeShutdown").
+    ///
+    /// Upstream: `pkg/controller/nodelifecycle/node_lifecycle_controller.go`
+    /// (`TaintNodeShutdown` constant, `taintManager.TaintNode`).
+    async fn add_shutdown_taint(&self, node: &Node) -> Result<()> {
+        let node_name = &node.metadata.name;
+        let key = build_key("nodes", None, node_name);
+        let mut updated_node: Node = self.storage.get(&key).await?;
+
+        let shutdown_taint = rusternetes_common::resources::node::Taint {
+            key: "node.kubernetes.io/shutdown".to_string(),
+            value: Some("".to_string()),
+            effect: "NoSchedule".to_string(),
+            time_added: None,
+        };
+
+        let spec = updated_node
+            .spec
+            .get_or_insert(rusternetes_common::resources::NodeSpec {
+                pod_cidr: None,
+                pod_cidrs: None,
+                provider_id: None,
+                unschedulable: None,
+                taints: None,
+            });
+        let taints = spec.taints.get_or_insert_with(Vec::new);
+        if !taints.iter().any(|t| t.key == shutdown_taint.key) {
+            taints.push(shutdown_taint);
+            self.storage.update(&key, &updated_node).await?;
+            debug!("Added shutdown taint to node {}", node_name);
+        }
+        Ok(())
+    }
+
+    /// Refresh the coordination Lease for `node_name` in the `kube-node-lease`
+    /// namespace by bumping `spec.renewTime` to now.
+    ///
+    /// NOTE: upstream has the kubelet renew the node Lease
+    /// (pkg/kubelet/node_manager.go → nodeLeaseController); this controller only
+    /// reads the Lease to decide readiness. rusternetes drives renewal here because
+    /// the kubelet stub does not yet emit Lease heartbeats.
+    async fn renew_node_lease(&self, node_name: &str) -> Result<()> {
+        let lease_key = build_key("leases", Some("kube-node-lease"), node_name);
+        let mut lease: Lease = match self.storage.get(&lease_key).await {
+            Ok(l) => l,
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()), // no lease — nothing to renew
+            Err(e) => return Err(e.into()),
+        };
+
+        if let Some(ref mut spec) = lease.spec {
+            spec.renew_time = Some(Utc::now());
+            self.storage.update(&lease_key, &lease).await?;
+            debug!("Renewed node lease for {}", node_name);
+        }
+        Ok(())
+    }
+
+    /// Derive `status.allocatable` from `status.capacity` minus any resources
+    /// listed in the `node.alpha.kubernetes.io/kube-reserved` annotation.
+    ///
+    /// Annotation format mirrors the kubelet `--kube-reserved` flag:
+    /// a comma-separated list of `resource=quantity` pairs, e.g.
+    /// `"cpu=500m,memory=1Gi"`.  Resources absent from the reservation pass
+    /// through unchanged (allocatable == capacity for those resources).
+    ///
+    /// Upstream: `pkg/kubelet/cm/node_container_manager_linux.go`
+    /// (`getNodeAllocatableAbsolute`).
+    async fn compute_allocatable(&self, node: &Node) -> Result<()> {
+        let node_name = &node.metadata.name;
+        let capacity = match node.status.as_ref().and_then(|s| s.capacity.as_ref()) {
+            Some(c) => c.clone(),
+            None => return Ok(()), // nothing to compute without capacity
+        };
+
+        // Parse the kube-reserved annotation into a resource→quantity map.
+        let reserved = node
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("node.alpha.kubernetes.io/kube-reserved"))
+            .map(|v| parse_resource_list(v))
+            .unwrap_or_default();
+
+        // Compute allocatable = capacity − reserved for each resource.
+        let mut allocatable: HashMap<String, String> = HashMap::new();
+        for (resource, cap_str) in &capacity {
+            let result_str = if let Some(res_str) = reserved.get(resource) {
+                match (Quantity::parse(cap_str), Quantity::parse(res_str)) {
+                    (Ok(cap_q), Ok(res_q)) => match cap_q.sub(&res_q) {
+                        // Clamp to zero when reserved exceeds capacity — a
+                        // negative allocatable is nonsensical and would break
+                        // scheduler quantity comparisons (upstream
+                        // getNodeAllocatableAbsolute clamps to 0).
+                        Some(result_q) if result_q.is_negative() => "0".to_string(),
+                        Some(result_q) => result_q.canonical_string(),
+                        None => {
+                            warn!(
+                                "Node {} allocatable overflow for resource {}: {} - {}",
+                                node_name, resource, cap_str, res_str
+                            );
+                            cap_str.clone()
+                        }
+                    },
+                    _ => {
+                        warn!(
+                            "Node {} could not parse capacity/reserved for resource {}: cap={:?} res={:?}",
+                            node_name, resource, cap_str, res_str
+                        );
+                        cap_str.clone()
+                    }
+                }
+            } else {
+                cap_str.clone()
+            };
+            allocatable.insert(resource.clone(), result_str);
+        }
+
+        // Only write if allocatable actually changed or was previously unset.
+        let current = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
+        if current.map(|c| c == &allocatable).unwrap_or(false) {
+            return Ok(()); // already up to date
+        }
+
+        let key = build_key("nodes", None, node_name);
+        let mut updated_node: Node = self.storage.get(&key).await?;
+        if let Some(ref mut status) = updated_node.status {
+            status.allocatable = Some(allocatable);
+            self.storage.update(&key, &updated_node).await?;
+            debug!("Computed allocatable for node {}", node_name);
+        }
+        Ok(())
+    }
+
     /// Evict all pods from a failed node
     async fn evict_pods_from_node(&self, node_name: &str) -> Result<()> {
         info!("Evicting pods from node {}", node_name);
@@ -583,6 +756,27 @@ impl<S: Storage + 'static> NodeController<S> {
 
         Ok(())
     }
+}
+
+/// Parse a comma-separated `resource=quantity` list (the format used by the
+/// kubelet `--kube-reserved` / `--system-reserved` flags and mirrored in the
+/// `node.alpha.kubernetes.io/kube-reserved` annotation).
+///
+/// Returns a map of resource name → quantity string.  Malformed entries are
+/// silently skipped (upstream ignores unknown resources gracefully).
+fn parse_resource_list(input: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for entry in input.split(',') {
+        let entry = entry.trim();
+        if let Some((k, v)) = entry.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    map
 }
 
 #[cfg(test)]
