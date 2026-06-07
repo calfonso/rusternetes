@@ -1,0 +1,17 @@
+[package]
+name = "rusternetes-protobuf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "rusternetes_protobuf"
+path = "src/lib.rs"
+
+[dependencies]
+rusternetes-common = { path = "../common" }
+serde_json.workspace = true
+tracing.workspace = true
+base64 = "0.22"
+chrono.workspace = true

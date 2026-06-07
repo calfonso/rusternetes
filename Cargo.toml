@@ -8,6 +8,7 @@ members = [
     "crates/kube-proxy",
     "crates/kubectl",
     "crates/common",
+    "crates/protobuf",
     "crates/storage",
     "crates/cloud-providers",
     "crates/dns",
