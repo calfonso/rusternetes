@@ -291,6 +291,15 @@ impl<S: Storage + 'static> ServiceController<S> {
                 // full ordered list lives in spec.clusterIPs. Family ordering
                 // matches spec.ipFamilies.
                 updated_service.spec.cluster_ip = cluster_ips.first().cloned();
+                // Reflect what was actually allocated back into ipFamilyPolicy so
+                // clients see the real outcome.  Mirrors upstream
+                // pkg/registry/core/service/storage which stamps the policy after
+                // assignment.  Only RequireDualStack is stamped explicitly; for a
+                // single family we leave the existing value intact (it may already
+                // be SingleStack or PreferDualStack and neither is wrong).
+                if cluster_ips.len() >= 2 {
+                    updated_service.spec.ip_family_policy = Some(IPFamilyPolicy::RequireDualStack);
+                }
                 updated_service.spec.ip_families = Some(families);
                 updated_service.spec.cluster_ips = Some(cluster_ips);
                 needs_update = true;
@@ -476,8 +485,12 @@ impl<S: Storage + 'static> ServiceController<S> {
         };
         let base_ip_u128: u128 = base_ip.into();
 
-        // Skip .0 and start from offset 2 (matching the IPv4 convention of
-        // reserving the network address).
+        // Start from offset 2, reserving ::0 (network address) and ::1 as a
+        // conventional cluster-DNS / gateway reservation, mirroring the IPv4
+        // allocator's treatment of .0 and .1.  Unlike IPv4 there is no broadcast
+        // address to reserve in IPv6, so the only skipped addresses are ::0/::1.
+        // TODO: make the IPv6 CIDR (currently DEFAULT_SERVICE_CIDR_V6) a
+        //       constructor parameter alongside the IPv4 CIDR for full parity.
         for offset in 2..=max_offset {
             let candidate_ip = Ipv6Addr::from(base_ip_u128 + offset);
             let candidate_str = candidate_ip.to_string();
