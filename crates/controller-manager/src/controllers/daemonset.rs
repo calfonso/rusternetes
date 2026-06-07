@@ -442,10 +442,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 // Honour required nodeAffinity from the template. Upstream's
                 // `predicates()` calls
                 // `nodeaffinity.GetRequiredNodeAffinity(pod).Match(node)`; we
-                // reuse the scheduler crate's `check_node_affinity`, which
-                // evaluates the same required NodeSelectorTerms.
+                // reuse `rusternetes_common::affinity::check_node_affinity`,
+                // which evaluates the same required NodeSelectorTerms.
                 let (node_affinity_ok, _) =
-                    rusternetes_scheduler::advanced::check_node_affinity(node, &candidate_pod);
+                    rusternetes_common::affinity::check_node_affinity(node, &candidate_pod);
                 if !node_affinity_ok {
                     debug!(
                         "DaemonSet {}/{}: skipping node {} due to nodeAffinity mismatch",
@@ -455,15 +455,15 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 }
                 // Honour required podAntiAffinity: skip a node when an existing
                 // pod in the same topology domain matches the anti-affinity
-                // labelSelector. Reuses the scheduler crate's
-                // `check_pod_anti_affinity` (interpodaffinity predicate parity).
-                let (anti_affinity_ok, _) =
-                    rusternetes_scheduler::advanced::check_pod_anti_affinity(
-                        node,
-                        &candidate_pod,
-                        &ns_pods,
-                        &nodes,
-                    );
+                // labelSelector. Reuses
+                // `rusternetes_common::affinity::check_pod_anti_affinity`
+                // (interpodaffinity predicate parity).
+                let (anti_affinity_ok, _) = rusternetes_common::affinity::check_pod_anti_affinity(
+                    node,
+                    &candidate_pod,
+                    &ns_pods,
+                    &nodes,
+                );
                 if !anti_affinity_ok {
                     debug!(
                         "DaemonSet {}/{}: skipping node {} due to podAntiAffinity conflict",

@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage" }
-rusternetes-scheduler = { path = "../scheduler" }
 rusternetes-cloud-providers = { path = "../cloud-providers", optional = true }
 tokio.workspace = true
 fnv = "1.0"
