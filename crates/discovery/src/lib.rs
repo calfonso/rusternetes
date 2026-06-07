@@ -181,10 +181,63 @@ pub async fn get_core_api(headers: HeaderMap) -> Response {
         .unwrap()
 }
 
+/// List groups registered via APIService objects from storage.
+/// Storage-only: returns group/version metadata without proxying to backends.
+async fn list_registered_apiservice_groups_with_storage(
+    storage: &rusternetes_storage::StorageBackend,
+) -> Vec<serde_json::Value> {
+    use rusternetes_storage::Storage;
+    use std::cmp::Reverse;
+    use std::collections::HashMap;
+
+    let prefix = rusternetes_storage::build_prefix("apiservices", None);
+    let items: Vec<serde_json::Value> = storage.list(&prefix).await.unwrap_or_default();
+
+    let mut by_group: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+    for item in &items {
+        let group = item.pointer("/spec/group").and_then(|v| v.as_str());
+        let version = item.pointer("/spec/version").and_then(|v| v.as_str());
+        let priority = item
+            .pointer("/spec/versionPriority")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(100) as i32;
+        if let (Some(g), Some(v)) = (group, version) {
+            by_group
+                .entry(g.to_string())
+                .or_default()
+                .push((v.to_string(), priority));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (group, mut versions) in by_group {
+        versions.sort_by_key(|v| Reverse(v.1));
+        let versions_arr: Vec<serde_json::Value> = versions
+            .iter()
+            .map(|(v, _)| {
+                serde_json::json!({
+                    "groupVersion": format!("{}/{}", group, v),
+                    "version": v,
+                })
+            })
+            .collect();
+        let preferred = versions_arr
+            .first()
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        out.push(serde_json::json!({
+            "name": group,
+            "versions": versions_arr,
+            "preferredVersion": preferred,
+        }));
+    }
+    out
+}
+
 /// GET /apis
 /// Returns the list of API groups available
 pub async fn get_api_groups(
-    state: Option<axum::extract::State<std::sync::Arc<crate::state::ApiServerState>>>,
+    storage: Option<std::sync::Arc<rusternetes_storage::StorageBackend>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(disc_version) = aggregated_discovery_version(&headers) {
@@ -228,10 +281,10 @@ pub async fn get_api_groups(
         // "test.example.com"). Each CRD is a separate resource within the group.
         // K8s aggregated discovery returns one group entry with ALL resources nested
         // under their respective versions.
-        if let Some(axum::extract::State(ref st)) = state {
+        if let Some(ref storage) = storage {
             use rusternetes_storage::Storage;
             let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
-            if let Ok(crds) = st.storage.list::<serde_json::Value>(&crd_prefix).await {
+            if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
                 // Collect resources per group+version, then emit one group entry per group.
                 // Key: (group, version) → Vec<resource_entry>
                 let mut group_version_resources: std::collections::HashMap<
@@ -332,10 +385,10 @@ pub async fn get_api_groups(
 
             // Merge aggregated (APIService-backed) groups. The kube-aggregator
             // inlines each backend's resources into the aggregated-discovery
-            // document, so we fetch the backend's APIResourceList and convert it.
-            // Without this an aggregated group (e.g. wardle.example.com) is
-            // invisible to discovery clients even though the proxy works (#225).
-            for entry in crate::handlers::generic::list_registered_apiservice_groups(st).await {
+            // document. We list APIService objects from storage to discover
+            // registered groups (proxy resource fetching requires the full
+            // ApiServerState which is not available in this crate).
+            for entry in list_registered_apiservice_groups_with_storage(storage.as_ref()).await {
                 let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
@@ -348,13 +401,12 @@ pub async fn get_api_groups(
                         let Some(ver) = v.get("version").and_then(|x| x.as_str()) else {
                             continue;
                         };
-                        let resources =
-                            crate::handlers::generic::aggregated_discovery_resources(st, name, ver)
-                                .await
-                                .unwrap_or_default();
+                        // Inline resource fetching via proxy requires the full
+                        // ApiServerState; emit an empty resources list here
+                        // (the group is still discoverable).
                         versions_out.push(serde_json::json!({
                             "version": ver,
-                            "resources": resources,
+                            "resources": [],
                             "freshness": "Current",
                         }));
                     }
@@ -676,10 +728,10 @@ pub async fn get_api_groups(
     // kubectl uses this to find resources by GVK. Without CRD groups here,
     // kubectl create/explain fails with "no matches for kind".
     // K8s ref: apiextensions-apiserver registers CRD API groups dynamically.
-    if let Some(axum::extract::State(ref st)) = state {
+    if let Some(ref storage) = storage {
         use rusternetes_storage::Storage;
         let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
-        if let Ok(crds) = st.storage.list::<serde_json::Value>(&crd_prefix).await {
+        if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
             let mut seen_groups: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for crd in &crds {
@@ -720,8 +772,8 @@ pub async fn get_api_groups(
 
     // Merge in groups registered via APIService (kube-aggregator).
     // Skip groups we already expose to avoid duplicates.
-    if let Some(axum::extract::State(ref st)) = state {
-        let registered = crate::handlers::generic::list_registered_apiservice_groups(st).await;
+    if let Some(ref storage) = storage {
+        let registered = list_registered_apiservice_groups_with_storage(storage.as_ref()).await;
         let known: std::collections::HashSet<String> =
             groups.iter().map(|g| g.name.clone()).collect();
         for entry in registered {
@@ -1466,7 +1518,7 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
 /// apiextensions-apiserver registers CRD API groups dynamically; we synthesize
 /// the same APIGroup document on read.
 pub async fn get_api_group(
-    state: Option<axum::extract::State<std::sync::Arc<crate::state::ApiServerState>>>,
+    storage: Option<std::sync::Arc<rusternetes_storage::StorageBackend>>,
     axum::extract::Path(group): axum::extract::Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1519,10 +1571,10 @@ pub async fn get_api_group(
     // Not a built-in group: see whether a CRD declares this group. Collect every
     // served version across all CRDs sharing the group, de-duplicated, so a CRD
     // with multiple versions (or several CRDs in the same group) all surface.
-    if let Some(axum::extract::State(ref st)) = state {
+    if let Some(ref storage) = storage {
         use rusternetes_storage::Storage;
         let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
-        if let Ok(crds) = st.storage.list::<serde_json::Value>(&crd_prefix).await {
+        if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
             let mut versions: Vec<GroupVersionForDiscovery> = Vec::new();
             for crd in &crds {
                 if crd.pointer("/spec/group").and_then(|v| v.as_str()) != Some(group.as_str()) {

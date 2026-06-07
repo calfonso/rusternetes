@@ -4239,6 +4239,7 @@ dependencies = [
  "reqwest",
  "rusternetes-common",
  "rusternetes-controller-manager",
+ "rusternetes-discovery",
  "rusternetes-middleware",
  "rusternetes-protobuf",
  "rusternetes-storage",
@@ -4348,6 +4349,17 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x509-parser",
+]
+
+[[package]]
+name = "rusternetes-discovery"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "rusternetes-storage",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

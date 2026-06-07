@@ -1,0 +1,19 @@
+[package]
+name = "rusternetes-discovery"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "rusternetes_discovery"
+path = "src/lib.rs"
+
+[dependencies]
+rusternetes-storage = { path = "../storage" }
+axum = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

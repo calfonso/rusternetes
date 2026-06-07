@@ -687,9 +687,35 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         .route("/api/", get(handlers::discovery::get_core_api))
         .route("/api/v1", get(handlers::discovery::get_core_resources))
         .route("/api/v1/", get(handlers::discovery::get_core_resources))
-        .route("/apis", get(handlers::discovery::get_api_groups))
-        .route("/apis/", get(handlers::discovery::get_api_groups))
-        .route("/apis/:group/", get(handlers::discovery::get_api_group))
+        .route(
+            "/apis",
+            get(
+                |State(s): State<Arc<ApiServerState>>, headers: axum::http::HeaderMap| async move {
+                    handlers::discovery::get_api_groups(Some(s.storage.clone()), headers).await
+                },
+            ),
+        )
+        .route(
+            "/apis/",
+            get(
+                |State(s): State<Arc<ApiServerState>>, headers: axum::http::HeaderMap| async move {
+                    handlers::discovery::get_api_groups(Some(s.storage.clone()), headers).await
+                },
+            ),
+        )
+        .route(
+            "/apis/:group/",
+            get(
+                |State(s): State<Arc<ApiServerState>>,
+                 axum::extract::Path(group): axum::extract::Path<String>| async move {
+                    handlers::discovery::get_api_group(
+                        Some(s.storage.clone()),
+                        axum::extract::Path(group),
+                    )
+                    .await
+                },
+            ),
+        )
         .route(
             "/apis/apps/v1",
             get(handlers::discovery::get_apps_v1_resources),
