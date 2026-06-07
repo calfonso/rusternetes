@@ -230,6 +230,12 @@ impl<S: Storage + 'static> NodeController<S> {
             .unwrap_or(false);
         if is_shutdown {
             self.add_shutdown_taint(node).await?;
+        } else {
+            // Node is no longer shutting down — clear any stale shutdown taint so
+            // scheduling resumes. Without this the taint persists indefinitely
+            // and blocks all pods if a node recovers without re-registering.
+            // Upstream's taintManager removes the taint on the same transition.
+            self.remove_shutdown_taint(node).await?;
         }
 
         // Refresh the node's coordination Lease renewTime.
@@ -557,6 +563,38 @@ impl<S: Storage + 'static> NodeController<S> {
             taints.push(shutdown_taint);
             self.storage.update(&key, &updated_node).await?;
             debug!("Added shutdown taint to node {}", node_name);
+        }
+        Ok(())
+    }
+
+    /// Remove the `node.kubernetes.io/shutdown` taint once the node is no longer
+    /// reporting a graceful shutdown, so scheduling resumes. Mirrors the removal
+    /// side of upstream's taintManager. No-op (no write) when the taint is absent.
+    async fn remove_shutdown_taint(&self, node: &Node) -> Result<()> {
+        // Cheap pre-check on the passed-in node to avoid a storage round-trip
+        // on the common path (no shutdown taint present).
+        let has_taint = node
+            .spec
+            .as_ref()
+            .and_then(|s| s.taints.as_ref())
+            .map(|ts| ts.iter().any(|t| t.key == "node.kubernetes.io/shutdown"))
+            .unwrap_or(false);
+        if !has_taint {
+            return Ok(());
+        }
+
+        let node_name = &node.metadata.name;
+        let key = build_key("nodes", None, node_name);
+        let mut updated_node: Node = self.storage.get(&key).await?;
+        if let Some(spec) = updated_node.spec.as_mut() {
+            if let Some(taints) = spec.taints.as_mut() {
+                let before = taints.len();
+                taints.retain(|t| t.key != "node.kubernetes.io/shutdown");
+                if taints.len() != before {
+                    self.storage.update(&key, &updated_node).await?;
+                    debug!("Removed shutdown taint from node {}", node_name);
+                }
+            }
         }
         Ok(())
     }

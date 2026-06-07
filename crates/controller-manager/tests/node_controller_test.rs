@@ -362,6 +362,66 @@ async fn test_node_shutdown_taint_applied_on_graceful_shutdown() {
     storage.delete(&key).await.unwrap();
 }
 
+#[tokio::test]
+async fn test_node_shutdown_taint_removed_on_recovery() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = NodeController::new(storage.clone());
+
+    let now = Utc::now();
+
+    // A recovered node: Ready=True with a fresh heartbeat and no NodeShutdown
+    // reason, but still carrying a stale shutdown taint from a prior graceful
+    // shutdown. The controller must clear it so scheduling resumes.
+    let mut node = make_node(
+        "test-node-recovered",
+        Some(vec![NodeCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            last_heartbeat_time: Some(now),
+            last_transition_time: Some(now),
+            reason: Some("KubeletReady".to_string()),
+            message: Some("kubelet is posting ready status".to_string()),
+        }]),
+    );
+    node.spec
+        .get_or_insert(rusternetes_common::resources::NodeSpec {
+            pod_cidr: None,
+            pod_cidrs: None,
+            provider_id: None,
+            unschedulable: None,
+            taints: None,
+        })
+        .taints = Some(vec![rusternetes_common::resources::node::Taint {
+        key: "node.kubernetes.io/shutdown".to_string(),
+        value: Some("".to_string()),
+        effect: "NoSchedule".to_string(),
+        time_added: None,
+    }]);
+
+    let key = build_key("nodes", None, "test-node-recovered");
+    storage.create(&key, &node).await.unwrap();
+
+    controller.seed_first_seen_for_test("test-node-recovered");
+    controller.reconcile_all().await.unwrap();
+
+    let updated: Node = storage.get(&key).await.unwrap();
+    let taints = updated
+        .spec
+        .as_ref()
+        .and_then(|s| s.taints.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !taints
+            .iter()
+            .any(|t| t.key == "node.kubernetes.io/shutdown"),
+        "shutdown taint should be removed once the node recovers; taints: {:?}",
+        taints.iter().map(|t| &t.key).collect::<Vec<_>>()
+    );
+
+    storage.delete(&key).await.unwrap();
+}
+
 // ----------------------------------------------------------------------------
 // Multi-condition monitoring
 //
