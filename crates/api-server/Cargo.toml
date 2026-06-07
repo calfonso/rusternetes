@@ -23,6 +23,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "
 
 [dependencies]
 rusternetes-common = { path = "../common", features = ["axum-support"] }
+rusternetes-middleware = { path = "../middleware" }
 rusternetes-protobuf = { path = "../protobuf" }
 rusternetes-storage = { path = "../storage" }
 tokio.workspace = true

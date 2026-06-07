@@ -4239,6 +4239,7 @@ dependencies = [
  "reqwest",
  "rusternetes-common",
  "rusternetes-controller-manager",
+ "rusternetes-middleware",
  "rusternetes-protobuf",
  "rusternetes-storage",
  "serde",
@@ -4448,6 +4449,26 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "rusternetes-middleware"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "ciborium",
+ "http-body 1.0.1",
+ "prost",
+ "rusternetes-common",
+ "rusternetes-protobuf",
+ "rusternetes-storage",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
