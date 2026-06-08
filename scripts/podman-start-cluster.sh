@@ -138,7 +138,7 @@ podman run -d \
   --node-name node-2 \
   --etcd-servers http://etcd:2379 \
   --cluster-dns 10.96.0.10 \
-  --metrics-port 10251 \
+  --metrics-port 10250 \
   --sync-interval 3
 
 # Start kube-proxy

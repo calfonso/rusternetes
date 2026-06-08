@@ -109,8 +109,11 @@ pub struct Kubelet {
     /// Port the kubelet API server listens on (the `--metrics-port` flag).
     /// Advertised in the node's `status.daemonEndpoints.kubeletEndpoint.Port`
     /// so the api-server proxies log/exec/metrics requests to the right port.
-    /// A second node on the same host runs on a different port (e.g. 10251)
-    /// to avoid a clash, so this must NOT be hardcoded to 10250.
+    /// Every node uses the standard 10250 (each kubelet has its own network
+    /// namespace, so there is no clash); the value stays configurable rather
+    /// than hardcoded so a future shared-host topology can override it without
+    /// the advertised port drifting from the bind port (the conformance
+    /// framework hardcodes `<node>:10250`, so deviating breaks node-proxy).
     metrics_port: u16,
 }
 
@@ -715,9 +718,11 @@ impl Kubelet {
             volumes_attached: None,
             // Advertise the port the kubelet API server actually listens on
             // (the --metrics-port flag), so the api-server proxies log/exec/
-            // metrics to the right port. A second kubelet on the same host
-            // runs on e.g. 10251 to avoid a clash; hardcoding 10250 made every
-            // proxy request to that node hit a closed port and time out.
+            // metrics to the right port. Every node uses the standard 10250
+            // (separate network namespaces, no clash); advertising the actual
+            // bind port — rather than hardcoding 10250 — keeps the two in sync
+            // if a future topology overrides it. The conformance framework
+            // hardcodes <node>:10250, so the bind port must stay 10250.
             // See: pkg/kubelet/kubelet.go:505 — DaemonEndpoints{KubeletEndpoint{Port: kubeCfg.Port}}
             daemon_endpoints: Some(rusternetes_common::resources::NodeDaemonEndpoints {
                 kubelet_endpoint: Some(rusternetes_common::resources::DaemonEndpoint {

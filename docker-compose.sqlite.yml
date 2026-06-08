@@ -161,7 +161,7 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-    command: ["--node-name", "node-2", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10251", "--sync-interval", "3"]
+    command: ["--node-name", "node-2", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   # Kube-proxy - network proxy (host network mode for iptables)
   kube-proxy:

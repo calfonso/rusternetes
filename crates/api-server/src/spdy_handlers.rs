@@ -21,7 +21,7 @@ fn get_kubelet_url(pod: &Pod) -> String {
     // Map node names to kubelet container hostnames and ports
     let (host, port) = match node_name {
         "node-1" => ("rusternetes-kubelet", 10250),
-        "node-2" => ("rusternetes-kubelet2", 10251),
+        "node-2" => ("rusternetes-kubelet2", 10250),
         _ => ("rusternetes-kubelet", 10250),
     };
 
