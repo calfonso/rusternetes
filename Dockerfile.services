@@ -161,6 +161,7 @@ COPY Cargo.toml Cargo.lock* ./
 # Crates: api-server, cloud-providers, common, controller-manager, dns,
 #         kubectl, kubelet, kube-proxy, netstack, rusternetes, scheduler,
 #         storage
+COPY crates/admission-webhook/Cargo.toml  crates/admission-webhook/Cargo.toml
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
 COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
@@ -169,7 +170,9 @@ COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
 COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
 COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
 COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
+COPY crates/middleware/Cargo.toml         crates/middleware/Cargo.toml
 COPY crates/netstack/Cargo.toml           crates/netstack/Cargo.toml
+COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
@@ -188,7 +191,7 @@ COPY crates/api-server/proto    crates/api-server/proto
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in common storage cloud-providers netstack; do \
+    for c in common storage cloud-providers netstack protobuf middleware admission-webhook; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -234,9 +237,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --bin kube-proxy \
         --bin rusternetes-dns \
  && cargo clean --profile release-fast \
+        -p rusternetes-admission-webhook \
         -p rusternetes-api-server \
         -p rusternetes-cloud-providers \
         -p rusternetes-common \
+        -p rusternetes-middleware \
+        -p rusternetes-protobuf \
         -p rusternetes-controller-manager \
         -p rusternetes-dns \
         -p rusternetes-kubectl \
@@ -256,9 +262,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # untouched. Tests/ aren't strictly required for the release build
 # but are kept so future `cargo test` inside this image works
 # without an extra COPY pass.
+COPY crates/admission-webhook/src    crates/admission-webhook/src
 COPY crates/api-server/src           crates/api-server/src
 COPY crates/api-server/tests         crates/api-server/tests
 COPY crates/cloud-providers/src      crates/cloud-providers/src
+COPY crates/middleware/src           crates/middleware/src
+COPY crates/protobuf/src             crates/protobuf/src
 COPY crates/common/src               crates/common/src
 COPY crates/common/tests             crates/common/tests
 COPY crates/controller-manager/src   crates/controller-manager/src
