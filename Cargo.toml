@@ -10,6 +10,7 @@ members = [
     "crates/kubectl",
     "crates/common",
     "crates/protobuf",
+    "crates/admission-webhook",
     "crates/storage",
     "crates/cloud-providers",
     "crates/dns",

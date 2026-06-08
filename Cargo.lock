@@ -4209,6 +4209,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-admission-webhook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "cel",
+ "chrono",
+ "futures",
+ "reqwest",
+ "rusternetes-common",
+ "rusternetes-storage",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rusternetes-api-server"
 version = "0.1.0"
 dependencies = [
@@ -4237,6 +4256,7 @@ dependencies = [
  "prost-types",
  "protox-parse",
  "reqwest",
+ "rusternetes-admission-webhook",
  "rusternetes-common",
  "rusternetes-controller-manager",
  "rusternetes-middleware",
