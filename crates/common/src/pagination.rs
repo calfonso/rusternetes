@@ -305,6 +305,68 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_continue_token_resumes_from_offset_not_zero() {
+        // Reproduces the [sig-api-machinery] API chunking conformance failure:
+        // after a continue token's resourceVersion is compacted away, the server
+        // returns 410 with a fresh "inconsistent" continue token; re-listing with
+        // it must resume from the SAME offset (not restart at 0).
+        let items: Vec<i32> = (0..400).collect();
+
+        // Page 1: limit 40.
+        let p1 = paginate(
+            items.clone(),
+            PaginationParams {
+                limit: Some(40),
+                continue_token: None,
+            },
+            "100",
+        )
+        .unwrap();
+        assert_eq!(p1.items.len(), 40);
+        assert_eq!(p1.remaining_item_count, Some(360));
+        let first = p1.continue_token.unwrap();
+        assert_eq!(ContinuationToken::decode(&first).unwrap().start, 40);
+
+        // Forge a stale page-1 token (ancient created_at) to drive the 410 path.
+        let mut cont = ContinuationToken::decode(&first).unwrap();
+        cont.created_at = 1;
+        let stale = cont.encode().unwrap();
+
+        let err = paginate(
+            items.clone(),
+            PaginationParams {
+                limit: Some(40),
+                continue_token: Some(stale),
+            },
+            "200",
+        )
+        .unwrap_err();
+        let fresh = err
+            .fresh_continue_token
+            .expect("stale token must yield a fresh continue token");
+        assert_eq!(
+            ContinuationToken::decode(&fresh).unwrap().start,
+            40,
+            "fresh (inconsistent) token must resume at offset 40, not 0"
+        );
+
+        // Re-list with the fresh token: exactly `limit` items from offset 40,
+        // remaining = 400 - 80 = 320.
+        let p2 = paginate(
+            items,
+            PaginationParams {
+                limit: Some(40),
+                continue_token: Some(fresh),
+            },
+            "200",
+        )
+        .unwrap();
+        assert_eq!(p2.items.len(), 40);
+        assert_eq!(p2.items[0], 40, "second page must start at item 40");
+        assert_eq!(p2.remaining_item_count, Some(320));
+    }
+
+    #[test]
     fn test_last_page() {
         let items = vec![1, 2, 3, 4, 5];
 
