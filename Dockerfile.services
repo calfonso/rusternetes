@@ -166,6 +166,7 @@ COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
 COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/discovery/Cargo.toml          crates/discovery/Cargo.toml
 COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
 COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
 COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
@@ -191,7 +192,7 @@ COPY crates/api-server/proto    crates/api-server/proto
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in common storage cloud-providers netstack protobuf middleware admission-webhook; do \
+    for c in common storage cloud-providers netstack protobuf middleware admission-webhook discovery; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -244,6 +245,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-middleware \
         -p rusternetes-protobuf \
         -p rusternetes-controller-manager \
+        -p rusternetes-discovery \
         -p rusternetes-dns \
         -p rusternetes-kubectl \
         -p rusternetes-kubelet \
@@ -272,6 +274,7 @@ COPY crates/common/src               crates/common/src
 COPY crates/common/tests             crates/common/tests
 COPY crates/controller-manager/src   crates/controller-manager/src
 COPY crates/controller-manager/tests crates/controller-manager/tests
+COPY crates/discovery/src            crates/discovery/src
 COPY crates/dns/src                  crates/dns/src
 COPY crates/kubectl/src              crates/kubectl/src
 COPY crates/kubectl/tests            crates/kubectl/tests
