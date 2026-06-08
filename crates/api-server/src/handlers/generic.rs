@@ -684,6 +684,7 @@ pub async fn forward_to_aggregator(
 /// per the APIService (caBundle / insecure), and DNS of the service name pinned
 /// to the resolved pod IP (so the cert — issued for the service DNS name — still
 /// verifies while we connect to a reachable address).
+#[allow(dead_code)]
 fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -711,6 +712,7 @@ fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client>
 /// entries (`apidiscovery.k8s.io` shape). Used to inline an aggregated group's
 /// resources into the `/apis` aggregated-discovery document. Returns `None`
 /// when there is no backend, it is unreachable, or it serves nothing.
+#[allow(dead_code)]
 pub async fn aggregated_discovery_resources(
     state: &Arc<ApiServerState>,
     group: &str,
@@ -813,6 +815,7 @@ fn service_unavailable_response(message: &str) -> Response {
 /// Discovery merge: produce APIGroup entries for APIServices whose backing
 /// `{group}/{version}` is not one of the built-in groups. Caller is
 /// responsible for filtering out built-in groups it already exposes.
+#[allow(dead_code)]
 pub async fn list_registered_apiservice_groups(state: &Arc<ApiServerState>) -> Vec<Value> {
     list_registered_apiservice_groups_with_storage(state.storage.as_ref()).await
 }
