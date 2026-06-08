@@ -11,7 +11,7 @@ use rusternetes_common::resources::{
 use rusternetes_common::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// ConversionReview is the request/response object for conversion webhooks
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,28 +149,45 @@ impl ConversionWebhookClient {
             response: None,
         };
 
+        // Build a TLS client that trusts the webhook's caBundle. A conversion
+        // webhook in K8s e2e serves with a self-signed cert; without trusting
+        // the provided CA the TLS handshake fails. Mirrors the admission webhook
+        // client in crates/admission-webhook.
+        let client = {
+            let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+            if let Some(ca_b64) = webhook.client_config.ca_bundle.as_ref() {
+                use base64::Engine;
+                let ca_data = base64::engine::general_purpose::STANDARD
+                    .decode(ca_b64)
+                    .unwrap_or_else(|_| ca_b64.as_bytes().to_vec());
+                if let Ok(cert) = reqwest::Certificate::from_pem(&ca_data) {
+                    builder = builder.add_root_certificate(cert);
+                }
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            builder.build().map_err(|e| {
+                rusternetes_common::Error::Network(format!(
+                    "Failed to build conversion webhook client: {}",
+                    e
+                ))
+            })?
+        };
+
         // Call webhook
         debug!("Sending conversion request: {:?}", review);
 
-        let response = match self.client.post(&url).json(&review).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                // Webhook unreachable — return objects unconverted
-                warn!(
-                    "Conversion webhook unreachable, returning unconverted: {}",
-                    e
-                );
-                return Ok(objects.to_vec());
-            }
-        };
+        // A failed conversion webhook is a hard error (surfaced as 500) — it must
+        // NOT silently pass through the stored objects unconverted, which would
+        // serve the wrong apiVersion than the client requested.
+        let response = client.post(&url).json(&review).send().await.map_err(|e| {
+            rusternetes_common::Error::Network(format!("Conversion webhook {url} unreachable: {e}"))
+        })?;
 
         if !response.status().is_success() {
-            // Webhook returned error — return objects unconverted
-            warn!(
-                "Conversion webhook returned {}, returning unconverted",
+            return Err(rusternetes_common::Error::Network(format!(
+                "Conversion webhook {url} returned status {}",
                 response.status()
-            );
-            return Ok(objects.to_vec());
+            )));
         }
 
         let review_response: ConversionReview =
