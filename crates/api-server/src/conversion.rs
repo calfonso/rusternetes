@@ -200,13 +200,16 @@ impl ConversionWebhookClient {
             )));
         }
 
-        let review_response: ConversionReview =
-            response.json::<ConversionReview>().await.map_err(|e| {
-                rusternetes_common::Error::Network(format!(
-                    "Failed to parse webhook response: {}",
-                    e
-                ))
-            })?;
+        // Parse with a universal deserializer: K8s webhooks (notably the e2e
+        // CRD conversion webhook) may reply with YAML rather than JSON, and the
+        // upstream apiserver tolerates both. serde_yaml accepts JSON too (JSON
+        // is a YAML subset), so it covers both content types.
+        let body = response.text().await.map_err(|e| {
+            rusternetes_common::Error::Network(format!("Failed to read webhook response body: {e}"))
+        })?;
+        let review_response: ConversionReview = serde_yaml::from_str(&body).map_err(|e| {
+            rusternetes_common::Error::Network(format!("Failed to parse webhook response: {e}"))
+        })?;
 
         debug!("Received conversion response: {:?}", review_response);
 
