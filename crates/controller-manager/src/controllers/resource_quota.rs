@@ -296,10 +296,14 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         // that cause resourceVersion conflicts with concurrent test PATCH operations
         if quota.status != new_status {
             let key = build_key("resourcequotas", Some(namespace), quota_name);
-            // Re-read for fresh resourceVersion to avoid CAS conflicts
+            // Re-read for fresh resourceVersion to avoid CAS conflicts. If the
+            // quota was deleted concurrently (e.g. a DeleteCollection racing this
+            // reconcile), the re-read fails — skip the status update rather than
+            // writing back the stale cached copy, which would resurrect the
+            // just-deleted quota.
             let mut updated_quota: ResourceQuota = match self.storage.get(&key).await {
                 Ok(q) => q,
-                Err(_) => quota.clone(),
+                Err(_) => return Ok(()),
             };
             // Check again after re-read (may have been updated concurrently)
             if updated_quota.status != new_status {
