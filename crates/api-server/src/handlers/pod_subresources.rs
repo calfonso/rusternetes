@@ -215,15 +215,21 @@ pub async fn get_logs(
         }
     }
 
-    // Get logs from the container runtime
-    let logs = match get_container_logs(&pod, &container_name, &query).await {
-        Ok(logs) => logs,
-        Err(e) => {
-            info!("Failed to get real container logs, using fallback: {}", e);
-            // Fallback to synthetic logs if container runtime is not available
-            generate_pod_logs(&pod, &container_name, &query)
-        }
-    };
+    // Get logs from the container runtime. Never fabricate output: a failure to
+    // read the real container logs must surface as an error so clients (and the
+    // e2e framework, which retries on error) do not receive synthetic content
+    // masquerading as the container's stdout/stderr.
+    let logs = get_container_logs(&pod, &container_name, &query)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                "Failed to get container logs for {}/{}: {}",
+                pod.metadata.name,
+                container_name,
+                e
+            );
+            Error::Internal(format!("unable to retrieve container logs: {e}"))
+        })?;
 
     // If WebSocket upgrade requested, send logs as the upstream Kubernetes
     // log-subresource websocket subprotocols expect.
@@ -453,77 +459,6 @@ async fn stream_container_logs(
     });
 
     Ok(stream)
-}
-
-/// Generate synthetic logs for a pod container
-fn generate_pod_logs(
-    pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
-) -> String {
-    use chrono::Utc;
-
-    let mut lines = vec![];
-
-    // Get pod status phase
-    let phase = pod
-        .status
-        .as_ref()
-        .map(|s| format!("{:?}", s.phase))
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    // Generate log entries
-    let base_time = pod.metadata.creation_timestamp.unwrap_or_else(Utc::now);
-
-    let mut log_lines = vec![
-        format!(
-            "Container {} starting in pod {}",
-            container_name, pod.metadata.name
-        ),
-        format!("Pod phase: {}", phase),
-        format!("Environment initialized"),
-        format!("Starting application process"),
-        format!("Application ready to serve traffic"),
-        format!("Health check passed"),
-        format!("Serving requests"),
-    ];
-
-    // Apply tail_lines if specified
-    if let Some(tail) = query.tail_lines {
-        let tail = tail as usize;
-        if tail < log_lines.len() {
-            log_lines = log_lines.drain(log_lines.len() - tail..).collect();
-        }
-    }
-
-    // Format log lines with timestamps if requested
-    for (i, line) in log_lines.iter().enumerate() {
-        let log_time = base_time + chrono::Duration::seconds(i as i64 * 5);
-
-        let formatted_line = if query.timestamps {
-            format!("{} {}", log_time.to_rfc3339(), line)
-        } else {
-            line.clone()
-        };
-
-        lines.push(formatted_line);
-    }
-
-    let result = if lines.is_empty() {
-        String::new()
-    } else {
-        lines.join("\n")
-    };
-
-    // Apply limit_bytes if specified
-    if let Some(limit) = query.limit_bytes {
-        let limit = limit as usize;
-        if result.len() > limit {
-            return result[..limit].to_string();
-        }
-    }
-
-    result
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec

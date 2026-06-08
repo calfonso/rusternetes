@@ -181,9 +181,10 @@ fn extract_field_value(resource: &Value, field_path: &str) -> Option<String> {
     // K8s field selector aliases — some fields are shorthands for nested paths
     let resolved_path = match field_path {
         // Event source.component is queried as just "source"
-        // Also check reportingComponent for events.k8s.io/v1 events
         "source" => "source.component",
-        "reportingController" => "reportingComponent",
+        // events.k8s.io/v1 `reportingController` is a top-level field (it
+        // serializes under that exact name), so the selector key resolves to
+        // itself via the default arm below.
         // Event type is at top level
         "type" => "type",
         // Event reason

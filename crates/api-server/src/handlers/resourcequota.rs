@@ -380,16 +380,22 @@ pub async fn deletecollection_resourcequotas(
         )
         .await?;
 
-        // Handle deletion with finalizers
-        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+        // Handle deletion with finalizers. DeleteCollection is idempotent: if an
+        // item vanished between the list and this delete (e.g. the quota
+        // controller updated status concurrently and the backend delete races to
+        // 0 rows), treat NotFound as already-deleted instead of failing the whole
+        // collection delete with a 404.
+        match crate::handlers::finalizers::handle_delete_with_finalizers(
             &state.storage,
             &key,
             &item,
         )
-        .await?;
-
-        if deleted_immediately {
-            deleted_count += 1;
+        .await
+        {
+            Ok(false) => deleted_count += 1, // deleted immediately (no finalizers)
+            Ok(true) => {}                   // finalizers pending — not counted
+            Err(rusternetes_common::Error::NotFound(_)) => deleted_count += 1,
+            Err(e) => return Err(e),
         }
     }
 

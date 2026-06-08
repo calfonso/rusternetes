@@ -291,6 +291,19 @@ pub async fn update(
         if !existing.metadata.uid.is_empty() {
             event.metadata.uid = existing.metadata.uid.clone();
         }
+        // Events allow unconditional updates (upstream Event.Strategy
+        // AllowUnconditionalUpdate == true): if the client omits
+        // resourceVersion, back-fill it from the stored object before
+        // validation, mirroring registry/generic/registry/store.go.
+        if event
+            .metadata
+            .resource_version
+            .as_deref()
+            .unwrap_or("")
+            .is_empty()
+        {
+            event.metadata.resource_version = existing.metadata.resource_version.clone();
+        }
     }
 
     // Field validation (mirrors upstream ValidateEventUpdate, core/v1 path).
@@ -815,6 +828,19 @@ pub async fn update_events_v1(
         // Also preserve UID — must not change on update
         if !existing.metadata.uid.is_empty() {
             event.metadata.uid = existing.metadata.uid.clone();
+        }
+        // Events allow unconditional updates (upstream Event.Strategy
+        // AllowUnconditionalUpdate == true): if the client omits
+        // resourceVersion, back-fill it from the stored object before
+        // validation, mirroring registry/generic/registry/store.go.
+        if event
+            .metadata
+            .resource_version
+            .as_deref()
+            .unwrap_or("")
+            .is_empty()
+        {
+            event.metadata.resource_version = existing.metadata.resource_version.clone();
         }
     }
 
