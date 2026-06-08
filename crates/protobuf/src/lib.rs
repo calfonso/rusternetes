@@ -13209,6 +13209,17 @@ pub fn encode_status_protobuf(status: &rusternetes_common::types::Status) -> Vec
 pub fn encode_status_native(status: &rusternetes_common::types::Status) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
 
+    // field 1: metadata (ListMeta). Normally zero-valued and thus omitted, but a
+    // 410 ResourceExpired response for API chunking carries the inconsistent
+    // `continue` token in metadata.continue — it MUST survive protobuf encoding
+    // or protobuf clients silently restart the list from page 1.
+    if let Some(ref m) = status.metadata {
+        let inner = encode_list_meta_native(m);
+        if !inner.is_empty() {
+            push_length_delimited_field(&mut buf, 1, &inner);
+        }
+    }
+
     if let Some(ref s) = status.status {
         push_string_field(&mut buf, 2, s.as_bytes());
     }
@@ -13224,6 +13235,27 @@ pub fn encode_status_native(status: &rusternetes_common::types::Status) -> Vec<u
     }
     if let Some(code) = status.code {
         push_varint_field(&mut buf, 6, code as u64);
+    }
+    buf
+}
+
+/// Encode a `meta/v1.ListMeta` to native protobuf bytes. Field numbers per
+/// `apimachinery/pkg/apis/meta/v1/generated.proto`:
+/// selfLink=1, resourceVersion=2, continue=3, remainingItemCount=4.
+fn encode_list_meta_native(m: &rusternetes_common::types::ListMeta) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    if let Some(ref rv) = m.resource_version {
+        if !rv.is_empty() {
+            push_string_field(&mut buf, 2, rv.as_bytes());
+        }
+    }
+    if let Some(ref c) = m.continue_token {
+        if !c.is_empty() {
+            push_string_field(&mut buf, 3, c.as_bytes());
+        }
+    }
+    if let Some(ric) = m.remaining_item_count {
+        push_varint_field(&mut buf, 4, ric as u64);
     }
     buf
 }
