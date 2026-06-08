@@ -40,8 +40,23 @@ pub struct ConversionRequest {
     /// `staging/src/k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/types.go`.
     #[serde(rename = "desiredAPIVersion")]
     pub desired_api_version: String,
-    /// Objects is the list of custom resources to convert
+    /// Objects is the list of custom resources to convert.
+    ///
+    /// Tolerate an explicit `null` on deserialize: webhook responses echo the
+    /// request with `objects: null`, and we only read the `response` field, so a
+    /// null here must not fail the whole parse.
+    #[serde(default, deserialize_with = "deserialize_null_default_vec")]
     pub objects: Vec<serde_json::Value>,
+}
+
+/// Deserialize a possibly-`null` sequence as an empty Vec.
+fn deserialize_null_default_vec<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<serde_json::Value>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// ConversionResponse describes the conversion response
