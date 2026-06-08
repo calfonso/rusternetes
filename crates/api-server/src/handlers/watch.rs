@@ -306,14 +306,22 @@ where
     // By pre-populating the channel, Hyper has data available immediately
     // when it first polls the Body stream.
     let mut initial_latest_rv: Option<String> = None;
+    // Tracks object names that do NOT currently match the label+field selector,
+    // so a later MODIFIED that transitions INTO the selector emits a synthetic
+    // ADDED. Seeded from the initial list, then moved into the watch task.
+    let mut deleted_from_watch: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     if should_send_initial {
         for object in &existing_resources {
             if let Some(rv) = object.metadata().resource_version.as_ref() {
                 initial_latest_rv = Some(rv.clone());
             }
-            if !matches_label_selector(object.metadata(), &label_selector)
-                || !matches_field_selector(object.metadata(), &field_selector)
-            {
+            if !watch_added_matches(
+                object,
+                &label_selector,
+                &field_selector,
+                &mut deleted_from_watch,
+            ) {
                 continue;
             }
             let k8s_event = K8sWatchEvent {
@@ -418,10 +426,6 @@ where
             Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
         > = Box::pin(watch_stream);
 
-        // Track objects DELETED from watch due to label selector mismatch.
-        let mut deleted_from_watch: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
         // Watch loop with timeout support
         let watch_future = async {
             loop {
@@ -437,10 +441,14 @@ where
                                         latest_resource_version = Some(rv.clone());
                                     }
 
-                                    // Filter by label and field selectors
-                                    if !matches_label_selector(object.metadata(), &label_selector)
-                                        || !matches_field_selector(object.metadata(), &field_selector)
-                                    {
+                                    // Apply label+field selectors; track exclusions so a
+                                    // later transition INTO the selector emits ADDED.
+                                    if !watch_added_matches(
+                                        &object,
+                                        &label_selector,
+                                        &field_selector,
+                                        &mut deleted_from_watch,
+                                    ) {
                                         continue;
                                     }
 
@@ -471,27 +479,18 @@ where
                                         latest_resource_version = Some(rv.clone());
                                     }
 
-                                    if !matches_field_selector(object.metadata(), &field_selector)
-                                    {
-                                        continue;
-                                    }
-
-                                    // For label-filtered watches, MODIFIED events need special handling:
-                                    // - If labels NOW match but didn't before → synthetic ADDED
-                                    // - If labels DON'T match but did before → synthetic DELETED
-                                    // K8s watch semantics for label selectors:
-                                    // - If labels no longer match → DELETED
-                                    // - If labels now match but didn't before → ADDED
-                                    // - If labels match and matched before → MODIFIED
-                                    let matches_labels = matches_label_selector(object.metadata(), &label_selector);
-                                    let obj_key = object.metadata().name.clone();
-                                    let event_type = if label_selector.is_some() && !matches_labels {
-                                        deleted_from_watch.insert(obj_key);
-                                        WatchEventType::Deleted
-                                    } else if label_selector.is_some() && deleted_from_watch.remove(&obj_key) {
-                                        WatchEventType::Added
-                                    } else {
-                                        WatchEventType::Modified
+                                    // Determine the ADDED/MODIFIED/DELETED transition under
+                                    // the combined label+field selector. None = suppress (still
+                                    // unmatched and already excluded). A field that changes INTO
+                                    // the selector yields ADDED, out of it yields DELETED.
+                                    let event_type = match watch_modified_event_type(
+                                        &object,
+                                        &label_selector,
+                                        &field_selector,
+                                        &mut deleted_from_watch,
+                                    ) {
+                                        Some(et) => et,
+                                        None => continue,
                                     };
 
                                     let k8s_event = K8sWatchEvent {
@@ -524,7 +523,7 @@ where
                                     // deleted object — otherwise watchers receive spurious deletes
                                     // for objects they never saw as ADDED.
                                     if !matches_label_selector(object.metadata(), &label_selector)
-                                        || !matches_field_selector(object.metadata(), &field_selector)
+                                        || !matches_field_selector(&object, &field_selector)
                                     {
                                         continue;
                                     }
@@ -820,6 +819,12 @@ where
             Some(rv.to_string())
         };
 
+        // Tracks object names that do NOT currently match the label+field
+        // selector, so a later MODIFIED that transitions INTO the selector emits
+        // a synthetic ADDED. Seeded from the initial list.
+        let mut deleted_from_watch: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         // Send initial state as ADDED events (only when appropriate)
         if should_send_initial {
             for object in &existing_resources {
@@ -828,10 +833,13 @@ where
                     latest_resource_version = Some(rv.clone());
                 }
 
-                // Filter by label and field selectors
-                if !matches_label_selector(object.metadata(), &label_selector)
-                    || !matches_field_selector(object.metadata(), &field_selector)
-                {
+                // Apply label+field selectors; track exclusions for transitions.
+                if !watch_added_matches(
+                    object,
+                    &label_selector,
+                    &field_selector,
+                    &mut deleted_from_watch,
+                ) {
                     continue;
                 }
 
@@ -927,10 +935,6 @@ where
             Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
         > = Box::pin(watch_stream);
 
-        // Track objects DELETED from watch due to label selector mismatch.
-        let mut deleted_from_watch: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
         // Watch loop with timeout support
         let watch_future = async {
             loop {
@@ -946,10 +950,14 @@ where
                                         latest_resource_version = Some(rv.clone());
                                     }
 
-                                    // Filter by label and field selectors
-                                    if !matches_label_selector(object.metadata(), &label_selector)
-                                        || !matches_field_selector(object.metadata(), &field_selector)
-                                    {
+                                    // Apply label+field selectors; track exclusions so a
+                                    // later transition INTO the selector emits ADDED.
+                                    if !watch_added_matches(
+                                        &object,
+                                        &label_selector,
+                                        &field_selector,
+                                        &mut deleted_from_watch,
+                                    ) {
                                         continue;
                                     }
 
@@ -973,27 +981,18 @@ where
                                         latest_resource_version = Some(rv.clone());
                                     }
 
-                                    if !matches_field_selector(object.metadata(), &field_selector)
-                                    {
-                                        continue;
-                                    }
-
-                                    // For label-filtered watches, MODIFIED events need special handling:
-                                    // - If labels NOW match but didn't before → synthetic ADDED
-                                    // - If labels DON'T match but did before → synthetic DELETED
-                                    // K8s watch semantics for label selectors:
-                                    // - If labels no longer match → DELETED
-                                    // - If labels now match but didn't before → ADDED
-                                    // - If labels match and matched before → MODIFIED
-                                    let matches_labels = matches_label_selector(object.metadata(), &label_selector);
-                                    let obj_key = object.metadata().name.clone();
-                                    let event_type = if label_selector.is_some() && !matches_labels {
-                                        deleted_from_watch.insert(obj_key);
-                                        WatchEventType::Deleted
-                                    } else if label_selector.is_some() && deleted_from_watch.remove(&obj_key) {
-                                        WatchEventType::Added
-                                    } else {
-                                        WatchEventType::Modified
+                                    // Determine the ADDED/MODIFIED/DELETED transition under
+                                    // the combined label+field selector. None = suppress (still
+                                    // unmatched and already excluded). A field that changes INTO
+                                    // the selector yields ADDED, out of it yields DELETED.
+                                    let event_type = match watch_modified_event_type(
+                                        &object,
+                                        &label_selector,
+                                        &field_selector,
+                                        &mut deleted_from_watch,
+                                    ) {
+                                        Some(et) => et,
+                                        None => continue,
                                     };
 
                                     let k8s_event = K8sWatchEvent {
@@ -1026,7 +1025,7 @@ where
                                     // deleted object — otherwise watchers receive spurious deletes
                                     // for objects they never saw as ADDED.
                                     if !matches_label_selector(object.metadata(), &label_selector)
-                                        || !matches_field_selector(object.metadata(), &field_selector)
+                                        || !matches_field_selector(&object, &field_selector)
                                     {
                                         continue;
                                     }
@@ -1291,28 +1290,84 @@ fn split_label_requirements(selector: &str) -> Vec<&str> {
     results
 }
 
-/// Check if an object matches a field selector (common: metadata.name, metadata.namespace)
-fn matches_field_selector(metadata: &ObjectMeta, selector: &Option<String>) -> bool {
+/// Check if an object matches a field selector.
+///
+/// Serializes the full object to JSON and evaluates the selector against every
+/// field path (metadata.name, metadata.namespace AND arbitrary spec/status paths
+/// such as a CRD's selectableFields like `spec.color`). The old metadata-only
+/// version silently passed any non-metadata field, so watch streams ignored CR
+/// field selectors entirely (conformance: CustomResourceFieldSelectors watch).
+/// Mirrors the LIST path (`handlers::filtering::apply_field_selector`).
+fn matches_field_selector<T: Serialize>(object: &T, selector: &Option<String>) -> bool {
     let selector = match selector {
         Some(s) if !s.is_empty() => s,
         _ => return true,
     };
-
-    for requirement in selector.split(',') {
-        let requirement = requirement.trim();
-        if let Some((field, value)) = requirement.split_once('=') {
-            match field {
-                "metadata.name" if metadata.name != value => {
-                    return false;
-                }
-                "metadata.namespace" if metadata.namespace.as_deref() != Some(value) => {
-                    return false;
-                }
-                _ => {} // Unknown fields pass through
-            }
-        }
+    let parsed = match rusternetes_common::field_selector::FieldSelector::parse(selector) {
+        Ok(p) => p,
+        Err(_) => return true, // unparseable selector: don't drop events
+    };
+    match serde_json::to_value(object) {
+        Ok(value) => parsed.matches(&value),
+        Err(_) => true,
     }
-    true
+}
+
+/// Decide whether an ADDED/initial object passes the combined label+field
+/// selector, maintaining `excluded` — the set of object names currently NOT
+/// matching the selector. Tracking exclusions lets a later MODIFIED that
+/// transitions a field INTO the selector emit a synthetic ADDED (K8s watch
+/// semantics), instead of a MODIFIED the client's accumulator ignores.
+fn watch_added_matches<T: Serialize + HasMetadata>(
+    object: &T,
+    label_selector: &Option<String>,
+    field_selector: &Option<String>,
+    excluded: &mut std::collections::HashSet<String>,
+) -> bool {
+    let matches = matches_label_selector(object.metadata(), label_selector)
+        && matches_field_selector(object, field_selector);
+    let key = object.metadata().name.clone();
+    if matches {
+        excluded.remove(&key);
+        true
+    } else {
+        if label_selector.is_some() || field_selector.is_some() {
+            excluded.insert(key);
+        }
+        false
+    }
+}
+
+/// Decide the watch event type for a MODIFIED storage event under the combined
+/// label+field selector. Applies the same transition semantics to BOTH selector
+/// kinds: into-match → ADDED, out-of-match → DELETED (once), match→match →
+/// MODIFIED. Returns `None` when the event must be suppressed (object still
+/// doesn't match and was already excluded).
+fn watch_modified_event_type<T: Serialize + HasMetadata>(
+    object: &T,
+    label_selector: &Option<String>,
+    field_selector: &Option<String>,
+    excluded: &mut std::collections::HashSet<String>,
+) -> Option<WatchEventType> {
+    let has_selector = label_selector.is_some() || field_selector.is_some();
+    let matches = matches_label_selector(object.metadata(), label_selector)
+        && matches_field_selector(object, field_selector);
+    let key = object.metadata().name.clone();
+    if !matches {
+        if !has_selector {
+            return Some(WatchEventType::Modified);
+        }
+        // No longer matches: emit DELETED the first time, then suppress.
+        if excluded.insert(key) {
+            Some(WatchEventType::Deleted)
+        } else {
+            None
+        }
+    } else if has_selector && excluded.remove(&key) {
+        Some(WatchEventType::Added)
+    } else {
+        Some(WatchEventType::Modified)
+    }
 }
 
 /// Construct a fallback DELETE event JSON when typed deserialization fails.
