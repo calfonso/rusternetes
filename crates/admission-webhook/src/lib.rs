@@ -414,7 +414,7 @@ impl AdmissionWebhookClient {
     /// Resolve a K8s service URL to an endpoint IP.
     /// The API server can't resolve .svc DNS names — look up the service's
     /// endpoint IPs from storage instead.
-    async fn resolve_service_url<S2: Storage>(url: &str, storage: &Arc<S2>) -> String {
+    pub async fn resolve_service_url<S2: Storage>(url: &str, storage: &Arc<S2>) -> String {
         // Parse service name and namespace from URL like https://name.ns.svc:port/path
         let url_without_scheme = url
             .strip_prefix("https://")

@@ -350,7 +350,7 @@ pub async fn get_custom_resource(
     // Convert the CR if the request version differs from the stored version.
     // For `Webhook` strategy this round-trips through the configured webhook;
     // for the default `None` strategy this just rewrites `apiVersion`.
-    cr = crate::conversion::convert_custom_resource(&crd, cr, &version).await?;
+    cr = crate::conversion::convert_custom_resource(&crd, cr, &version, &state.storage).await?;
 
     Ok(Json(cr))
 }
@@ -410,7 +410,7 @@ pub async fn list_custom_resources(
     // Convert any CR whose stored version differs from the request version.
     // `convert_custom_resources` batches Webhook calls into a single
     // ConversionReview round-trip (mirrors upstream non-homogeneous list path).
-    crs = crate::conversion::convert_custom_resources(&crd, crs, &version).await?;
+    crs = crate::conversion::convert_custom_resources(&crd, crs, &version, &state.storage).await?;
 
     // Filter by field selector (e.g. spec.color=red, driven by the version's
     // x-kubernetes-selectable-fields) and label selector. The shared helper
