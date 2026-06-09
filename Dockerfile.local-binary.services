@@ -62,7 +62,10 @@ COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
 
 COPY target/release/kubelet /app/kubelet
 
-VOLUME ["/var/run"]
+# Do NOT declare `VOLUME ["/var/run"]` — the runtime socket comes from the
+# compose bind mount, not a volume. A /var/run VOLUME creates a fresh anonymous
+# volume per container start that becomes the copy target for an rshared mount
+# propagation explosion on kubelet restart. See #66 / Dockerfile.services.
 
 ENTRYPOINT ["/app/kubelet"]
 CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]
