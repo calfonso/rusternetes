@@ -841,6 +841,43 @@ fn test_validate_init_containers_error_readiness_probe_forbidden() {
 }
 
 #[test]
+fn test_validate_restartable_init_container_allows_readiness_probe() {
+    // A restartable init container (sidecar: restartPolicy=Always) MAY have a
+    // readinessProbe — unlike a plain init container. Mirrors upstream
+    // validateInitContainers (forbidden only "without restartPolicy=Always").
+    let pod = pod_with_spec(PodSpec {
+        init_containers: Some(vec![Container {
+            name: "sidecar".to_string(),
+            image: "busybox".to_string(),
+            restart_policy: Some("Always".to_string()),
+            readiness_probe: Some(Probe {
+                exec: Some(ExecAction {
+                    command: vec!["true".to_string()],
+                }),
+                http_get: None,
+                tcp_socket: None,
+                grpc: None,
+                initial_delay_seconds: None,
+                timeout_seconds: None,
+                period_seconds: None,
+                success_threshold: None,
+                failure_threshold: None,
+                termination_grace_period_seconds: None,
+            }),
+            ..Container::default()
+        }]),
+        containers: vec![minimal_container("c", "nginx")],
+        ..PodSpec::default()
+    });
+    let errs = validate_pod_create(&pod, true);
+    assert!(
+        !contains_detail(&errs, "must not be set for init containers"),
+        "restartable init container readinessProbe must be allowed: {:?}",
+        errs
+    );
+}
+
+#[test]
 fn test_validate_init_containers_error_lifecycle_forbidden() {
     use rusternetes_common::resources::pod::LifecycleHandler;
     // Init containers may not have lifecycle hooks.

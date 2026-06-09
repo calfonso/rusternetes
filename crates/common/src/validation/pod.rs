@@ -214,13 +214,19 @@ fn validate_container(c: &Container, is_init: bool, fld_path: &Path) -> ErrorLis
         errs.extend(validate_container_ports(ports, &fld_path.child("ports")));
     }
 
+    // Restartable init containers (sidecars: restartPolicy=Always) may carry
+    // livenessProbe/readinessProbe/startupProbe/lifecycle — they run for the
+    // life of the pod like regular containers. Plain init containers may not.
+    // Upstream: pkg/apis/core/validation/validation.go validateInitContainers
+    // (forbidden only "for init containers without restartPolicy=Always").
+    let is_restartable_init = is_init && c.restart_policy.as_deref() == Some("Always");
+
     // probes.
     if let Some(ref p) = c.liveness_probe {
         errs.extend(validate_probe(p, &fld_path.child("livenessProbe")));
     }
     if let Some(ref p) = c.readiness_probe {
-        if is_init {
-            // Upstream: init containers may not have readinessProbe.
+        if is_init && !is_restartable_init {
             errs.push(Error::forbidden(
                 &fld_path.child("readinessProbe"),
                 "must not be set for init containers",
@@ -233,8 +239,8 @@ fn validate_container(c: &Container, is_init: bool, fld_path: &Path) -> ErrorLis
         errs.extend(validate_probe(p, &fld_path.child("startupProbe")));
     }
 
-    // lifecycle — init containers may not have lifecycle hooks.
-    if is_init && c.lifecycle.is_some() {
+    // lifecycle — only restartable init containers may have lifecycle hooks.
+    if is_init && !is_restartable_init && c.lifecycle.is_some() {
         errs.push(Error::forbidden(
             &fld_path.child("lifecycle"),
             "must not be set for init containers",
