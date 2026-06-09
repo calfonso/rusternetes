@@ -13260,6 +13260,205 @@ fn encode_list_meta_native(m: &rusternetes_common::types::ListMeta) -> Vec<u8> {
     buf
 }
 
+// ---------------------------------------------------------------------------
+// PartialObjectMetadata(List) native protobuf encoders
+//
+// Metadata-only informers (controller-runtime / cert-manager's cainjector, the
+// garbage collector, …) request `as=PartialObjectMetadata` over
+// `application/vnd.kubernetes.protobuf`. The body MUST be a real protobuf
+// message inside the `k8s\0` runtime.Unknown envelope — embedding JSON in the
+// envelope makes client-go's protobuf decoder fail with "illegal wireType",
+// which silently breaks those informers. These encoders take the
+// already-converted JSON Value (see middleware `convert_to_partial_object_*`)
+// and emit the metav1 protobuf wire form. Field numbers per
+// `apimachinery/pkg/apis/meta/v1/generated.proto`.
+// ---------------------------------------------------------------------------
+
+/// Encode a metav1.Time `{seconds=1, nanos=2}` sub-message from an RFC3339 string.
+fn encode_metav1_time(s: &str) -> Option<Vec<u8>> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    let mut buf = Vec::with_capacity(12);
+    push_varint_field(&mut buf, 1, dt.timestamp() as u64);
+    let nanos = dt.timestamp_subsec_nanos();
+    if nanos != 0 {
+        push_varint_field(&mut buf, 2, nanos as u64);
+    }
+    Some(buf)
+}
+
+/// Encode a `map<string,string>` field (labels/annotations). Keys are emitted
+/// in sorted order for deterministic output.
+fn encode_metav1_string_map(buf: &mut Vec<u8>, field: u32, v: Option<&serde_json::Value>) {
+    if let Some(obj) = v.and_then(|x| x.as_object()) {
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(val) = obj.get(k).and_then(|x| x.as_str()) {
+                let mut entry = Vec::with_capacity(k.len() + val.len() + 8);
+                push_string_field(&mut entry, 1, k.as_bytes());
+                push_string_field(&mut entry, 2, val.as_bytes());
+                push_length_delimited_field(buf, field, &entry);
+            }
+        }
+    }
+}
+
+/// Encode a metav1.OwnerReference sub-message.
+fn encode_owner_reference_value(o: &serde_json::Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    let s = |k: &str| o.get(k).and_then(|v| v.as_str()).filter(|x| !x.is_empty());
+    if let Some(v) = s("kind") {
+        push_string_field(&mut buf, 1, v.as_bytes());
+    }
+    if let Some(v) = s("name") {
+        push_string_field(&mut buf, 3, v.as_bytes());
+    }
+    if let Some(v) = s("uid") {
+        push_string_field(&mut buf, 4, v.as_bytes());
+    }
+    if let Some(v) = s("apiVersion") {
+        push_string_field(&mut buf, 5, v.as_bytes());
+    }
+    if o.get("controller").and_then(|v| v.as_bool()) == Some(true) {
+        push_varint_field(&mut buf, 6, 1);
+    }
+    if o.get("blockOwnerDeletion").and_then(|v| v.as_bool()) == Some(true) {
+        push_varint_field(&mut buf, 7, 1);
+    }
+    buf
+}
+
+/// Encode a metav1.ObjectMeta (as JSON) to native protobuf bytes.
+fn encode_object_meta_value(m: &serde_json::Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    let s = |k: &str| m.get(k).and_then(|v| v.as_str()).filter(|x| !x.is_empty());
+    if let Some(v) = s("name") {
+        push_string_field(&mut buf, 1, v.as_bytes());
+    }
+    if let Some(v) = s("generateName") {
+        push_string_field(&mut buf, 2, v.as_bytes());
+    }
+    if let Some(v) = s("namespace") {
+        push_string_field(&mut buf, 3, v.as_bytes());
+    }
+    if let Some(v) = s("selfLink") {
+        push_string_field(&mut buf, 4, v.as_bytes());
+    }
+    if let Some(v) = s("uid") {
+        push_string_field(&mut buf, 5, v.as_bytes());
+    }
+    if let Some(v) = s("resourceVersion") {
+        push_string_field(&mut buf, 6, v.as_bytes());
+    }
+    if let Some(g) = m.get("generation").and_then(|v| v.as_i64()) {
+        push_varint_field(&mut buf, 7, g as u64);
+    }
+    if let Some(t) = m
+        .get("creationTimestamp")
+        .and_then(|v| v.as_str())
+        .and_then(encode_metav1_time)
+    {
+        push_length_delimited_field(&mut buf, 8, &t);
+    }
+    if let Some(t) = m
+        .get("deletionTimestamp")
+        .and_then(|v| v.as_str())
+        .and_then(encode_metav1_time)
+    {
+        push_length_delimited_field(&mut buf, 9, &t);
+    }
+    if let Some(g) = m.get("deletionGracePeriodSeconds").and_then(|v| v.as_i64()) {
+        push_varint_field(&mut buf, 10, g as u64);
+    }
+    encode_metav1_string_map(&mut buf, 11, m.get("labels"));
+    encode_metav1_string_map(&mut buf, 12, m.get("annotations"));
+    if let Some(arr) = m.get("ownerReferences").and_then(|v| v.as_array()) {
+        for o in arr {
+            push_length_delimited_field(&mut buf, 13, &encode_owner_reference_value(o));
+        }
+    }
+    if let Some(arr) = m.get("finalizers").and_then(|v| v.as_array()) {
+        for f in arr {
+            if let Some(v) = f.as_str() {
+                push_string_field(&mut buf, 14, v.as_bytes());
+            }
+        }
+    }
+    buf
+}
+
+/// Encode a metav1.ListMeta from JSON.
+fn encode_list_meta_value(m: &serde_json::Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    let s = |k: &str| m.get(k).and_then(|v| v.as_str()).filter(|x| !x.is_empty());
+    if let Some(v) = s("selfLink") {
+        push_string_field(&mut buf, 1, v.as_bytes());
+    }
+    if let Some(v) = s("resourceVersion") {
+        push_string_field(&mut buf, 2, v.as_bytes());
+    }
+    if let Some(v) = s("continue") {
+        push_string_field(&mut buf, 3, v.as_bytes());
+    }
+    if let Some(v) = m.get("remainingItemCount").and_then(|v| v.as_i64()) {
+        push_varint_field(&mut buf, 4, v as u64);
+    }
+    buf
+}
+
+/// Encode a metav1.PartialObjectMetadata message: field 1 = metadata.
+fn encode_partial_object_metadata_value(pom: &serde_json::Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    if let Some(meta) = pom.get("metadata") {
+        push_length_delimited_field(&mut buf, 1, &encode_object_meta_value(meta));
+    }
+    buf
+}
+
+/// Encode a metav1.PartialObjectMetadataList: field 1 = metadata (ListMeta),
+/// field 2 = repeated items (PartialObjectMetadata).
+fn encode_partial_object_metadata_list_value(list: &serde_json::Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    if let Some(meta) = list.get("metadata") {
+        let lm = encode_list_meta_value(meta);
+        if !lm.is_empty() {
+            push_length_delimited_field(&mut buf, 1, &lm);
+        }
+    }
+    if let Some(items) = list.get("items").and_then(|v| v.as_array()) {
+        for it in items {
+            push_length_delimited_field(&mut buf, 2, &encode_partial_object_metadata_value(it));
+        }
+    }
+    buf
+}
+
+/// Encode a converted PartialObjectMetadata / PartialObjectMetadataList JSON
+/// Value as a fully framed `k8s\0` + runtime.Unknown protobuf response. `kind`
+/// is `"PartialObjectMetadata"` or `"PartialObjectMetadataList"`.
+pub fn encode_partial_object_metadata_k8s(value: &serde_json::Value, kind: &str) -> Vec<u8> {
+    let raw = if kind == "PartialObjectMetadataList" {
+        encode_partial_object_metadata_list_value(value)
+    } else {
+        encode_partial_object_metadata_value(value)
+    };
+
+    // runtime.Unknown envelope: typeMeta(1){apiVersion,kind}, raw(2), contentType(4).
+    let mut type_meta = Vec::with_capacity(48);
+    push_string_field(&mut type_meta, 1, b"meta.k8s.io/v1");
+    push_string_field(&mut type_meta, 2, kind.as_bytes());
+
+    let mut unknown = Vec::with_capacity(raw.len() + 64);
+    push_length_delimited_field(&mut unknown, 1, &type_meta);
+    push_length_delimited_field(&mut unknown, 2, &raw);
+    push_string_field(&mut unknown, 4, b"application/vnd.kubernetes.protobuf");
+
+    let mut out = Vec::with_capacity(unknown.len() + 4);
+    out.extend_from_slice(b"k8s\0");
+    out.extend_from_slice(&unknown);
+    out
+}
+
 fn encode_status_details_native(d: &rusternetes_common::types::StatusDetails) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32);
     if let Some(ref name) = d.name {
@@ -14189,6 +14388,46 @@ mod tests {
             first.get("field"),
             Some(&Value::String("spec.replicas".into())),
         );
+    }
+
+    /// Regression for the cainjector / cert-manager blocker: metadata-only
+    /// informers request `as=PartialObjectMetadataList` over protobuf. The
+    /// inner body must be REAL protobuf (it previously wrapped JSON, which made
+    /// client-go fail with "illegal wireType"). Assert the encoded bytes
+    /// decode back through the registry — exactly what client-go does.
+    #[test]
+    fn partial_object_metadata_list_encodes_decodable_protobuf() {
+        let value = json!({
+            "kind": "PartialObjectMetadataList",
+            "apiVersion": "meta.k8s.io/v1",
+            "metadata": { "resourceVersion": "123" },
+            "items": [{
+                "kind": "PartialObjectMetadata",
+                "apiVersion": "meta.k8s.io/v1",
+                "metadata": {
+                    "name": "cert-manager-webhook",
+                    "namespace": "cert-manager",
+                    "uid": "uid-1",
+                    "resourceVersion": "7",
+                    "labels": { "app": "webhook" },
+                    "creationTimestamp": "2024-01-02T03:04:05Z"
+                }
+            }]
+        });
+
+        let raw = encode_partial_object_metadata_list_value(&value);
+        let registry = ProtoRegistry::new();
+        let decoded = registry
+            .decode_message("PartialObjectMetadataList", &raw)
+            .expect("PartialObjectMetadataList should decode as protobuf");
+        assert_eq!(decoded["metadata"]["resourceVersion"], json!("123"));
+        let item0 = &decoded["items"][0];
+        assert_eq!(item0["metadata"]["name"], json!("cert-manager-webhook"));
+        assert_eq!(item0["metadata"]["namespace"], json!("cert-manager"));
+
+        // Fully framed output carries the k8s protobuf magic prefix.
+        let framed = encode_partial_object_metadata_k8s(&value, "PartialObjectMetadataList");
+        assert_eq!(&framed[..4], b"k8s\0");
     }
 
     /// Regression for `[sig-api-machinery] Namespaces should apply changes to a

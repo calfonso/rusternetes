@@ -1010,16 +1010,31 @@ pub async fn normalize_content_type_middleware(
                                         ),
                                     ),
                                     AsWire::Protobuf => {
-                                        // Wrap the converted JSON in the K8s
-                                        // protobuf Unknown envelope. TypeMeta
-                                        // carries the converted kind (e.g.
-                                        // PartialObjectMetadata) so clients
-                                        // know how to decode the inner body.
-                                        let pb = wrap_json_in_protobuf_with_type_meta(
-                                            &converted_json,
-                                            "meta.k8s.io/v1",
-                                            neg.target.name(),
-                                        );
+                                        // PartialObjectMetadata(List): emit a
+                                        // real protobuf message inside the K8s
+                                        // `k8s\0` Unknown envelope. Embedding
+                                        // JSON there makes client-go's protobuf
+                                        // decoder fail ("illegal wireType"),
+                                        // silently breaking metadata-only
+                                        // informers (cainjector, the GC).
+                                        // Table has no protobuf wire form
+                                        // upstream, so it keeps the JSON body.
+                                        let pb = match neg.target {
+                                            AsTarget::PartialObjectMetadata
+                                            | AsTarget::PartialObjectMetadataList => {
+                                                rusternetes_protobuf::encode_partial_object_metadata_k8s(
+                                                    &converted,
+                                                    neg.target.name(),
+                                                )
+                                            }
+                                            AsTarget::Table => {
+                                                wrap_json_in_protobuf_with_type_meta(
+                                                    &converted_json,
+                                                    "meta.k8s.io/v1",
+                                                    neg.target.name(),
+                                                )
+                                            }
+                                        };
                                         (
                                             pb,
                                             format!(
