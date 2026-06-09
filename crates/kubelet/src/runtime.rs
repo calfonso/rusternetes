@@ -7559,32 +7559,57 @@ impl ContainerRuntime {
             let failure_threshold = startup_probe.failure_threshold.unwrap_or(3);
             let success_threshold = startup_probe.success_threshold.unwrap_or(1);
 
-            let startup_passed = {
+            // Three outcomes: the startup probe has Passed (success threshold
+            // met → liveness becomes active), is still Pending (gate liveness,
+            // no restart), or has Failed hard (failure threshold exceeded →
+            // the container MUST be restarted, even if the liveness probe would
+            // otherwise succeed). Upstream kuberuntime kills a container whose
+            // startup probe fails; see kuberuntime_manager.go computePodActions.
+            enum StartupOutcome {
+                Passed,
+                Pending,
+                Failed,
+            }
+            let startup_outcome = {
                 let mut states = self.probe_states.lock().unwrap();
                 let state = states.entry(startup_key).or_default();
                 if raw_result {
                     state.consecutive_successes += 1;
                     state.consecutive_failures = 0;
-                    state.consecutive_successes >= success_threshold
+                    if state.consecutive_successes >= success_threshold {
+                        StartupOutcome::Passed
+                    } else {
+                        StartupOutcome::Pending
+                    }
                 } else {
                     state.consecutive_failures += 1;
                     state.consecutive_successes = 0;
                     if state.consecutive_failures >= failure_threshold {
-                        warn!(
-                            "Startup probe exceeded failure threshold ({}) for container {}",
-                            failure_threshold, container_name
-                        );
+                        // Reset so the restarted container starts fresh.
+                        state.consecutive_failures = 0;
+                        StartupOutcome::Failed
+                    } else {
+                        StartupOutcome::Pending
                     }
-                    false
                 }
             };
 
-            if !startup_passed {
-                debug!(
-                    "Startup probe not yet passing for container {}, skipping liveness check",
-                    container_name
-                );
-                return false;
+            match startup_outcome {
+                StartupOutcome::Passed => { /* liveness probe is now active */ }
+                StartupOutcome::Pending => {
+                    debug!(
+                        "Startup probe not yet passing for container {}, skipping liveness check",
+                        container_name
+                    );
+                    return false;
+                }
+                StartupOutcome::Failed => {
+                    warn!(
+                        "Startup probe exceeded failure threshold ({}) for container {} — restarting",
+                        failure_threshold, container_name
+                    );
+                    return true;
+                }
             }
         }
 
