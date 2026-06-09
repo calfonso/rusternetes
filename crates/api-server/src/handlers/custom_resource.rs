@@ -424,6 +424,96 @@ pub async fn list_custom_resources(
     Ok(Json(list))
 }
 
+/// Watch custom resources, converting every streamed object to the requested
+/// API `version` before field-selector filtering and emission — the watch-side
+/// counterpart to [`list_custom_resources`] (which converts at the
+/// `convert_custom_resources` call above).
+///
+/// Without this, a watch on a non-storage version (e.g. `v2` of a CRD whose
+/// storage version is `v1`) would field-select against the stored-version
+/// layout and emit stored-version objects, breaking the
+/// `CustomResourceFieldSelectors` conformance test.
+pub async fn watch_custom_resources(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    group: &str,
+    version: &str,
+    plural: &str,
+    namespace: Option<String>,
+    watch_params: crate::handlers::watch::WatchParams,
+) -> Result<axum::response::Response> {
+    let crd_name = format!("{plural}.{group}");
+    let crd = get_crd_for_resource(&state, &crd_name).await?;
+
+    // Same selectable-path gate LIST applies: reject selectors on paths the
+    // CRD version did not declare via `x-kubernetes-selectable-fields`.
+    if let Some(fs) = watch_params
+        .field_selector
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        validate_field_selector_paths(&crd, version, fs)?;
+    }
+
+    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
+
+    // Per-object converter: stored-version JSON -> requested-version JSON.
+    // Best-effort — on any failure the original object passes through unchanged,
+    // mirroring how LIST tolerates objects that won't convert.
+    let crd = Arc::new(crd);
+    let target_version = version.to_string();
+    let storage = state.storage.clone();
+    let converter: crate::handlers::watch::WatchObjectConverter =
+        Arc::new(move |val: serde_json::Value| {
+            let crd = crd.clone();
+            let target_version = target_version.clone();
+            let storage = storage.clone();
+            Box::pin(async move {
+                let cr: CustomResource = match serde_json::from_value(val.clone()) {
+                    Ok(c) => c,
+                    Err(_) => return val,
+                };
+                match crate::conversion::convert_custom_resource(
+                    &crd,
+                    cr,
+                    &target_version,
+                    &storage,
+                )
+                .await
+                {
+                    Ok(converted) => serde_json::to_value(converted).unwrap_or(val),
+                    Err(_) => val,
+                }
+            })
+        });
+
+    match namespace {
+        Some(ns) => {
+            crate::handlers::watch::watch_namespaced_converted::<CustomResource>(
+                state,
+                auth_ctx,
+                ns,
+                &resource_type,
+                group,
+                watch_params,
+                converter,
+            )
+            .await
+        }
+        None => {
+            crate::handlers::watch::watch_cluster_scoped_converted::<CustomResource>(
+                state,
+                auth_ctx,
+                &resource_type,
+                group,
+                watch_params,
+                converter,
+            )
+            .await
+        }
+    }
+}
+
 /// Reject `fieldSelector=<path>=<val>` when `<path>` is neither
 /// `metadata.name` / `metadata.namespace` nor declared in the CRD version's
 /// `x-kubernetes-selectable-fields`. Mirrors the upstream apiextensions
