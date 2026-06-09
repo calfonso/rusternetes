@@ -457,6 +457,14 @@ pub async fn watch_custom_resources(
 
     let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
 
+    // Stamp watch bookmarks with the CRD's real Kind + apiVersion (captured
+    // before `crd` moves into the converter). The generic resource_type
+    // heuristic would mangle a CR's resource_type (e.g.
+    // `cert-manager_io_certificates` → `Cert-manager_io_certificate`), and a
+    // bad bookmark kind breaks typed-client watch decoding (controller-runtime
+    // / cert-manager informers re-list in a hot loop).
+    let bookmark_gvk = Some((crd.spec.names.kind.clone(), format!("{group}/{version}")));
+
     // Per-object converter: stored-version JSON -> requested-version JSON.
     // Best-effort — on any failure the original object passes through unchanged,
     // mirroring how LIST tolerates objects that won't convert.
@@ -497,6 +505,7 @@ pub async fn watch_custom_resources(
                 group,
                 watch_params,
                 converter,
+                bookmark_gvk,
             )
             .await
         }
@@ -508,6 +517,7 @@ pub async fn watch_custom_resources(
                 group,
                 watch_params,
                 converter,
+                bookmark_gvk,
             )
             .await
         }

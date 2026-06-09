@@ -181,12 +181,16 @@ where
         api_group,
         params,
         None,
+        None,
     )
     .await
 }
 
 /// Like [`watch_namespaced`], but converts every streamed object through
 /// `converter` (e.g. CRD version conversion) before filtering and emitting it.
+/// `bookmark_gvk` overrides the (kind, apiVersion) stamped on watch bookmarks —
+/// custom resources pass their real CRD kind here so typed clients can decode
+/// the bookmark (the resource_type heuristic would mangle it).
 #[allow(clippy::too_many_arguments)]
 pub async fn watch_namespaced_converted<T>(
     state: Arc<ApiServerState>,
@@ -196,6 +200,7 @@ pub async fn watch_namespaced_converted<T>(
     api_group: &str,
     params: WatchParams,
     converter: WatchObjectConverter,
+    bookmark_gvk: Option<(String, String)>,
 ) -> Result<Response>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
@@ -208,6 +213,7 @@ where
         api_group,
         params,
         Some(converter),
+        bookmark_gvk,
     )
     .await
 }
@@ -221,6 +227,7 @@ async fn watch_namespaced_inner<T>(
     api_group: &str,
     params: WatchParams,
     converter: Option<WatchObjectConverter>,
+    bookmark_gvk: Option<(String, String)>,
 ) -> Result<Response>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
@@ -263,7 +270,7 @@ where
     let field_selector = params.field_selector.clone();
     let requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
 
     // Determine if we have a specific non-zero resourceVersion to replay from.
     // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
@@ -770,11 +777,23 @@ pub async fn watch_cluster_scoped<T>(
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
 {
-    watch_cluster_scoped_inner::<T>(state, auth_ctx, resource_type, api_group, params, None).await
+    watch_cluster_scoped_inner::<T>(
+        state,
+        auth_ctx,
+        resource_type,
+        api_group,
+        params,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Like [`watch_cluster_scoped`], but converts every streamed object through
 /// `converter` (e.g. CRD version conversion) before filtering and emitting it.
+/// `bookmark_gvk` overrides the (kind, apiVersion) on watch bookmarks (custom
+/// resources pass their real CRD kind so typed clients can decode bookmarks).
+#[allow(clippy::too_many_arguments)]
 pub async fn watch_cluster_scoped_converted<T>(
     state: Arc<ApiServerState>,
     auth_ctx: AuthContext,
@@ -782,6 +801,7 @@ pub async fn watch_cluster_scoped_converted<T>(
     api_group: &str,
     params: WatchParams,
     converter: WatchObjectConverter,
+    bookmark_gvk: Option<(String, String)>,
 ) -> Result<Response>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
@@ -793,6 +813,7 @@ where
         api_group,
         params,
         Some(converter),
+        bookmark_gvk,
     )
     .await
 }
@@ -805,6 +826,7 @@ async fn watch_cluster_scoped_inner<T>(
     api_group: &str,
     params: WatchParams,
     converter: Option<WatchObjectConverter>,
+    bookmark_gvk: Option<(String, String)>,
 ) -> Result<Response>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
@@ -849,7 +871,7 @@ where
     let field_selector = params.field_selector.clone();
     let requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
 
     // Determine if we have a specific non-zero resourceVersion to replay from.
     // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
@@ -1623,6 +1645,7 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         "csistoragecapacities" => "CSIStorageCapacity",
         "csidrivers" => "CSIDriver",
         "csinodes" => "CSINode",
+        "apiservices" => "APIService",
         other => {
             // CamelCase heuristic: capitalize first letter, remove trailing 's'
             let s = other.strip_suffix('s').unwrap_or(other);
@@ -2961,6 +2984,30 @@ pub async fn watch_namespaced_json(
         .header(header::TRANSFER_ENCODING, "chunked")
         .body(body)
         .unwrap())
+}
+
+#[cfg(test)]
+mod kind_table_tests {
+    use super::resource_type_to_kind_and_version;
+
+    /// APIService must map to the correct Kind + apiVersion. The CamelCase
+    /// fallback produced "Apiservice", which made client-go's APIService
+    /// informer fail to decode watch bookmarks.
+    #[test]
+    fn apiservice_maps_to_correct_kind() {
+        let (kind, api_version) =
+            resource_type_to_kind_and_version("apiservices", "apiregistration.k8s.io");
+        assert_eq!(kind, "APIService");
+        assert_eq!(api_version, "apiregistration.k8s.io/v1");
+    }
+
+    /// A built-in still resolves correctly (regression guard for the match).
+    #[test]
+    fn builtin_pod_maps_to_pod() {
+        let (kind, api_version) = resource_type_to_kind_and_version("pods", "");
+        assert_eq!(kind, "Pod");
+        assert_eq!(api_version, "v1");
+    }
 }
 
 #[cfg(test)]
