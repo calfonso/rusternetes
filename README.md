@@ -4,6 +4,8 @@
 
 This isn't a wrapper around the Go codebase or a partial mock. Every component — API server, scheduler, controller manager, kubelet, kube-proxy — is written from scratch in Rust, implementing the actual Kubernetes API surface, wire format, and behavioral semantics.
 
+> 📖 **New here?** [**OVERVIEW.md**](OVERVIEW.md) is the complete starting point — every binary and its CLI flags, the container images we build, the all-in-one binary, and deployment on bare metal or locally in Docker.
+
 ## The Goal
 
 Rūsternetes exists to answer one concrete question: **can a fully conformant Kubernetes run on hardware this small?**
