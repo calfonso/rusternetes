@@ -7862,10 +7862,21 @@ impl ContainerRuntime {
 
         // Kubernetes probes skip TLS verification (accept self-signed certs).
         // Disable proxy to ensure direct connection to pod IPs.
+        //
+        // Do NOT follow redirects: upstream's HTTP prober
+        // (pkg/probe/http/http.go) installs a CheckRedirect that refuses to
+        // follow a redirect to a *non-local* host and treats the 3xx response
+        // itself as the probe result. A 3xx is in the 200-399 success range, so
+        // a redirect (local or non-local) is a probe success — the container is
+        // not restarted. reqwest's default follows up to 10 redirects, so a
+        // non-local redirect chased to an unreachable host turned a healthy
+        // container into a restart loop (the "should *not* be restarted with a
+        // non-local redirect http liveness probe" conformance spec).
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(true)
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         // Build request with custom headers from probe spec (K8s sends these)
