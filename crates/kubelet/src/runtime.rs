@@ -2141,11 +2141,42 @@ impl ContainerRuntime {
     /// content, and the actual write goes through [`write_file_atomic`]
     /// so racing writers can't see partial state.
     fn create_pod_hosts_file(&self, pod: &Pod, pod_ip: Option<&str>) -> Result<Option<String>> {
-        // hostNetwork pods use the host's /etc/hosts directly — skip.
-        let Some(content) =
-            crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain)
-        else {
-            return Ok(None);
+        let spec = pod.spec.as_ref();
+        let is_host_network = spec.and_then(|s| s.host_network).unwrap_or(false);
+        let content = if is_host_network {
+            // A hostNetwork pod's container gets the container runtime's own
+            // /etc/hosts, which lacks the pod's spec.hostAliases. When hostAliases
+            // are set, build a managed file from the node's /etc/hosts plus the
+            // alias entries and bind it in (upstream ensureHostsFile, the
+            // useHostNetwork branch appends HostAliases to the node hosts file).
+            // Without hostAliases there is nothing to add — keep the default file.
+            let aliases: Vec<_> = spec
+                .and_then(|s| s.host_aliases.as_ref())
+                .map(|a| {
+                    a.iter()
+                        .filter(|al| al.hostnames.as_deref().is_some_and(|h| !h.is_empty()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if aliases.is_empty() {
+                return Ok(None);
+            }
+            let mut c = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+            if !c.is_empty() && !c.ends_with('\n') {
+                c.push('\n');
+            }
+            c.push_str("\n# Entries added by HostAliases.\n");
+            for al in aliases {
+                if let Some(h) = al.hostnames.as_deref() {
+                    c.push_str(&format!("{}\t{}\n", al.ip, h.join("\t")));
+                }
+            }
+            c
+        } else {
+            match crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain) {
+                Some(c) => c,
+                None => return Ok(None),
+            }
         };
 
         let pod_name = &pod.metadata.name;
