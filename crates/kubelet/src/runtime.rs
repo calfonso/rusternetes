@@ -6960,9 +6960,67 @@ impl ContainerRuntime {
             // Init container started=true if it's running or has terminated.
             // K8s sets started=true once the container has been started at least once.
             let has_started = is_running || is_terminated;
+
+            // Readiness: a RUNNING restartable init container (sidecar) is ready
+            // per its readiness probe (initialDelaySeconds + threshold), mirroring
+            // a regular container; a started sidecar with no readiness probe is
+            // ready. Its readiness counts toward the pod's ContainersReady
+            // condition (upstream pkg/kubelet/status/generate.go). A regular
+            // (non-restartable) init container is "ready" only when it has
+            // completed successfully (used for init-completion gating).
+            let is_sidecar = ic.restart_policy.as_deref() == Some("Always");
+            let ready = if is_running && is_sidecar {
+                match &ic.readiness_probe {
+                    None => true,
+                    Some(probe) => {
+                        let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
+                        let past_initial_delay = if initial_delay > 0 {
+                            if let ContainerState::Running {
+                                started_at: Some(ref s),
+                            } = &state
+                            {
+                                chrono::DateTime::parse_from_rfc3339(s)
+                                    .map(|started| {
+                                        Utc::now().signed_duration_since(started).num_seconds()
+                                            >= initial_delay as i64
+                                    })
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        } else {
+                            true
+                        };
+                        if !past_initial_delay {
+                            false
+                        } else {
+                            let raw = self
+                                .check_probe(&container_name, ic, probe)
+                                .await
+                                .unwrap_or(false);
+                            let success_threshold = probe.success_threshold.unwrap_or(1);
+                            let key = format!("{}/{}/readiness", pod_name, ic.name);
+                            let mut states = self.probe_states.lock().unwrap();
+                            let st = states.entry(key).or_default();
+                            if raw {
+                                st.consecutive_successes += 1;
+                                st.consecutive_failures = 0;
+                                st.consecutive_successes >= success_threshold
+                            } else {
+                                st.consecutive_failures += 1;
+                                st.consecutive_successes = 0;
+                                false
+                            }
+                        }
+                    }
+                }
+            } else {
+                is_terminated
+                    && matches!(&state, ContainerState::Terminated { exit_code, .. } if *exit_code == 0)
+            };
             statuses.push(ContainerStatus {
                 name: ic.name.clone(),
-                ready: is_terminated && matches!(&state, ContainerState::Terminated { exit_code, .. } if *exit_code == 0),
+                ready,
                 restart_count,
                 state: Some(state),
                 last_state,

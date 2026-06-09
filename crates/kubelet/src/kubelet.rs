@@ -3450,7 +3450,35 @@ impl Kubelet {
                         if let Ok(container_statuses) =
                             self.runtime.get_container_statuses(&readiness_pod).await
                         {
-                            let all_ready = container_statuses.iter().all(|s| s.ready);
+                            // Restartable init containers (sidecars) count toward
+                            // ContainersReady too (upstream status/generate.go):
+                            // every sidecar must be ready. Plain init containers
+                            // are excluded — they complete before the main
+                            // containers and aren't part of steady-state readiness.
+                            let init_sidecars_ready = match self
+                                .runtime
+                                .get_init_container_statuses(&readiness_pod)
+                                .await
+                            {
+                                Some(init) => {
+                                    let ics = readiness_pod
+                                        .spec
+                                        .as_ref()
+                                        .and_then(|sp| sp.init_containers.as_ref());
+                                    init.iter().all(|s| {
+                                        let is_sidecar = ics
+                                            .and_then(|list| {
+                                                list.iter().find(|ic| ic.name == s.name)
+                                            })
+                                            .and_then(|ic| ic.restart_policy.as_deref())
+                                            == Some("Always");
+                                        !is_sidecar || s.ready
+                                    })
+                                }
+                                None => true,
+                            };
+                            let all_ready =
+                                container_statuses.iter().all(|s| s.ready) && init_sidecars_ready;
 
                             // Check if all containers have terminated (for Never/OnFailure restart policies)
                             let restart_policy = pod
