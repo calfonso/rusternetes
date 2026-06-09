@@ -1,0 +1,75 @@
+name: cert-manager Smoke
+
+# Proves a real third-party operator (cert-manager) installs and functions
+# end-to-end on Rusternetes: CRDs, admission + cainjector webhooks, leader
+# leases, and the SelfSigned Issuer -> Certificate -> Secret reconcile path.
+# See scripts/run-cert-manager-smoke.sh and docs/PRODUCTION_READINESS.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cert_manager_version:
+        description: "cert-manager release tag"
+        required: false
+        default: "v1.16.2"
+  schedule:
+    # 04:00 UTC nightly (an hour after the node-conformance job). Self-hosted
+    # runner; respects the project's GH Actions minute budget.
+    - cron: "0 4 * * *"
+
+jobs:
+  cert-manager-smoke:
+    runs-on: arc-runner-set-conformance
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        # rhino is an in-tree submodule (./rhino) that the storage crate's
+        # `../../rhino` path dep needs on disk for `cargo metadata`.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Tool prereqs (fail fast on missing — no apt-get install)
+        run: |
+          set -euo pipefail
+          for t in docker jq curl openssl; do
+              command -v "$t" >/dev/null 2>&1 || { echo "missing required tool: $t"; exit 1; }
+          done
+
+      - name: Install kubectl
+        # The ARC runner image does not bake kubectl. Drop it into
+        # $HOME/.local/bin (no sudo). Pinned to v1.35 to match the target.
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION="v1.35.0"
+          mkdir -p "$HOME/.local/bin"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+            -o "$HOME/.local/bin/kubectl"
+          chmod +x "$HOME/.local/bin/kubectl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/kubectl" version --client
+
+      - name: Generate TLS certificates
+        run: bash scripts/generate-certs.sh
+
+      - name: Run cert-manager smoke
+        env:
+          CONTAINER_RUNTIME: docker
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
+          KUBECONFIG: ${{ github.workspace }}/.kube/rusternetes-config
+          CERT_MANAGER_VERSION: ${{ github.event.inputs.cert_manager_version || 'v1.16.2' }}
+        run: bash scripts/run-cert-manager-smoke.sh
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-manager-smoke-${{ github.run_id }}
+          path: /tmp/cert-manager-smoke/
+          if-no-files-found: warn
+
+      - name: Tear down stack
+        if: always()
+        run: |
+          docker compose -f compose.sqlite.yml -f compose.dind.yml down -v --remove-orphans || true

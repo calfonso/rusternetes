@@ -764,32 +764,35 @@ fn test_validate_service_invalid_cluster_ip() {
 // TestValidateService — port name format
 // ---------------------------------------------------------------------------
 
-/// Port name that is too long (> 15 chars) should fail.
+/// A 25-char port name that is a valid DNS-1123 label is ACCEPTED. Upstream
+/// validates ServicePort.Name with ValidateDNS1123Label (≤63 chars), not the
+/// 15-char IsValidPortName rule (which applies to the string targetPort).
 #[test]
-fn test_validate_service_port_name_too_long() {
+fn test_validate_service_port_name_long_dns_label_ok() {
     let svc = make_service(ServiceSpec {
         ports: vec![named_port("this-name-is-way-too-long", 80, "TCP")],
         ..ServiceSpec::default()
     });
     let errors = aggregate_errors(&svc);
     assert!(
-        errors.iter().any(|e| e.contains("spec.ports[0].name")),
-        "expected port name too long error, got: {:?}",
+        errors.is_empty(),
+        "25-char DNS-label port name should be valid, got: {:?}",
         errors
     );
 }
 
-/// Port name with no letter (all digits) should fail.
+/// An all-digit port name ("12345") is ACCEPTED — a valid DNS-1123 label does
+/// not require a letter (unlike IsValidPortName / IANA_SVC_NAME).
 #[test]
-fn test_validate_service_port_name_no_letter() {
+fn test_validate_service_port_name_all_digits_ok() {
     let svc = make_service(ServiceSpec {
         ports: vec![named_port("12345", 80, "TCP")],
         ..ServiceSpec::default()
     });
     let errors = aggregate_errors(&svc);
     assert!(
-        errors.iter().any(|e| e.contains("spec.ports[0].name")),
-        "expected port name no-letter error, got: {:?}",
+        errors.is_empty(),
+        "all-digit DNS-label port name should be valid, got: {:?}",
         errors
     );
 }
@@ -833,4 +836,84 @@ fn test_validate_service_udp_sctp_protocols() {
             errs
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// ServicePort.Name is a DNS-1123 label (≤63), NOT IsValidPortName (≤15)
+//
+// Upstream validates ServicePort.Name with ValidateDNS1123Label; only the
+// *string* targetPort uses the 15-char IANA_SVC_NAME rule. Regression for the
+// cert-manager smoke test, whose Service ships a 29-char port name.
+// ---------------------------------------------------------------------------
+
+/// A Service port named `tcp-prometheus-servicemonitor` (29 chars, a valid
+/// DNS-1123 label) must be accepted — it is rejected by the 15-char rule but
+/// allowed upstream, and blocked cert-manager's install.
+#[test]
+fn test_validate_service_long_dns_label_port_name_ok() {
+    let svc = make_service(ServiceSpec {
+        ports: vec![
+            named_port("tcp-prometheus-servicemonitor", 9402, "TCP"),
+            named_port("https", 443, "TCP"),
+        ],
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        errs.is_empty(),
+        "29-char DNS-label port name should be valid: {errs:?}"
+    );
+}
+
+/// A port name that is not a valid DNS-1123 label (uppercase) is still rejected.
+#[test]
+fn test_validate_service_invalid_port_name_rejected() {
+    let svc = make_service(ServiceSpec {
+        ports: vec![named_port("Bad_Name", 80, "TCP")],
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        !errs.is_empty(),
+        "uppercase/underscore port name should be rejected"
+    );
+}
+
+/// A port name longer than 63 chars (the DNS-1123 label max) is rejected.
+#[test]
+fn test_validate_service_port_name_over_63_rejected() {
+    let long = "a".repeat(64);
+    let svc = make_service(ServiceSpec {
+        ports: vec![named_port(&long, 80, "TCP")],
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        !errs.is_empty(),
+        "64-char port name should exceed the DNS-1123 label max"
+    );
+}
+
+/// A *string* targetPort keeps the 15-char IANA_SVC_NAME limit (must match a
+/// container port name), so a 29-char string targetPort is still rejected.
+#[test]
+fn test_validate_service_string_targetport_keeps_15_char_limit() {
+    let svc = make_service(ServiceSpec {
+        ports: vec![ServicePort {
+            name: Some("web".to_string()),
+            port: 80,
+            target_port: Some(IntOrString::String(
+                "tcp-prometheus-servicemonitor".to_string(),
+            )),
+            protocol: Some("TCP".to_string()),
+            node_port: None,
+            app_protocol: None,
+        }],
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        !errs.is_empty(),
+        "29-char string targetPort should still be rejected (IANA_SVC_NAME)"
+    );
 }
