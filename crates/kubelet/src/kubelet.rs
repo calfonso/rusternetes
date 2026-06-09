@@ -3837,7 +3837,17 @@ impl Kubelet {
             .unwrap_or_default();
 
         let now = Instant::now();
-        for c in &spec.containers {
+        // Restart regular containers and restartable init containers (sidecars:
+        // restartPolicy=Always) the same way. start_container handles both; the
+        // backoff map keys on the (unique) container name. Plain init containers
+        // run to completion and are not restarted here.
+        let restartable_inits = spec
+            .init_containers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
+        for c in spec.containers.iter().chain(restartable_inits) {
             let cname = format!("{}_{}", pod_name, c.name);
             if self
                 .runtime
@@ -3938,8 +3948,25 @@ impl Kubelet {
                         }
                     }
                 }
+                // Restartable init containers (sidecars) carry their own
+                // restart counts in init_container_statuses; overlay the backoff
+                // map there too so a restarted sidecar reports its count.
+                let mut init_statuses = self.runtime.get_init_container_statuses(&fresh_pod).await;
+                if let Some(ref mut list) = init_statuses {
+                    let map = self.restart_backoff.lock().unwrap();
+                    for cs in list.iter_mut() {
+                        if let Some(entry) =
+                            map.get(&format!("{}/{}/{}", namespace, pod_name, cs.name))
+                        {
+                            cs.restart_count = entry.restart_count;
+                        }
+                    }
+                }
                 if let Some(ref mut s) = fresh_pod.status {
                     s.container_statuses = Some(statuses);
+                    if init_statuses.is_some() {
+                        s.init_container_statuses = init_statuses;
+                    }
                 }
                 let _ = self.storage.update(&key, &fresh_pod).await;
             }
