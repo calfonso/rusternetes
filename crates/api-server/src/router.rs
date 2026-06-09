@@ -327,8 +327,10 @@ async fn custom_resource_fallback(
                 .unwrap_or(false);
 
             if is_watch {
-                // Watch custom resources using the JSON watch handler
-                let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
+                // Watch custom resources. The handler converts every streamed
+                // object to the requested API version before field-selector
+                // filtering (mirrors the LIST path), so a watch on a non-storage
+                // version selects/emits the requested-version layout.
                 let watch_params = crate::handlers::watch::WatchParams {
                     resource_version: crate::handlers::watch::normalize_resource_version(
                         query_params.get("resourceVersion").cloned(),
@@ -346,42 +348,21 @@ async fn custom_resource_fallback(
                         .get("sendInitialEvents")
                         .and_then(|v| v.parse::<bool>().ok()),
                 };
-                if let Some(ns) = namespace {
-                    match crate::handlers::watch::watch_namespaced::<
-                        rusternetes_common::resources::CustomResource,
-                    >(
-                        state.clone(),
-                        auth_ctx.clone(),
-                        ns.to_string(),
-                        &resource_type,
-                        group,
-                        watch_params,
-                    )
-                    .await
-                    {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            warn!("Error watching custom resources: {}", e);
-                            e.into_response()
-                        }
-                    }
-                } else {
-                    match crate::handlers::watch::watch_cluster_scoped::<
-                        rusternetes_common::resources::CustomResource,
-                    >(
-                        state.clone(),
-                        auth_ctx.clone(),
-                        &resource_type,
-                        group,
-                        watch_params,
-                    )
-                    .await
-                    {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            warn!("Error watching custom resources: {}", e);
-                            e.into_response()
-                        }
+                match handlers::custom_resource::watch_custom_resources(
+                    state.clone(),
+                    auth_ctx.clone(),
+                    group,
+                    version,
+                    plural,
+                    namespace.map(|ns| ns.to_string()),
+                    watch_params,
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        warn!("Error watching custom resources: {}", e);
+                        e.into_response()
                     }
                 }
             } else {

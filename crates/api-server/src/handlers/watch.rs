@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
+use futures::future::BoxFuture;
 use futures::StreamExt;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
@@ -135,7 +136,32 @@ pub fn watch_params_from_query(params: &std::collections::HashMap<String, String
     }
 }
 
-/// Generic watch handler for namespaced resources
+/// Async per-object converter applied to each raw stored JSON object before it
+/// is deserialized into the watched type `T`. Used by the custom-resource watch
+/// path to convert every event's object into the API version the client
+/// requested, mirroring the LIST conversion in `list_custom_resources`.
+/// Best-effort: on any conversion error the converter returns its input
+/// unchanged (LIST is likewise tolerant of objects that won't convert).
+pub type WatchObjectConverter =
+    Arc<dyn Fn(serde_json::Value) -> BoxFuture<'static, serde_json::Value> + Send + Sync>;
+
+/// Deserialize a raw JSON string into `T`, first running it through `converter`
+/// when present. Returns `None` if any stage (parse → convert → deserialize)
+/// fails — callers treat that exactly like the previous `from_str` failure.
+async fn deserialize_converted<T: DeserializeOwned>(
+    raw: &str,
+    converter: &Option<WatchObjectConverter>,
+) -> Option<T> {
+    match converter {
+        Some(convert) => {
+            let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+            serde_json::from_value(convert(value).await).ok()
+        }
+        None => serde_json::from_str::<T>(raw).ok(),
+    }
+}
+
+/// Generic watch handler for namespaced resources.
 pub async fn watch_namespaced<T>(
     state: Arc<ApiServerState>,
     auth_ctx: AuthContext,
@@ -143,6 +169,58 @@ pub async fn watch_namespaced<T>(
     resource_type: &str,
     api_group: &str,
     params: WatchParams,
+) -> Result<Response>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
+    watch_namespaced_inner::<T>(
+        state,
+        auth_ctx,
+        namespace,
+        resource_type,
+        api_group,
+        params,
+        None,
+    )
+    .await
+}
+
+/// Like [`watch_namespaced`], but converts every streamed object through
+/// `converter` (e.g. CRD version conversion) before filtering and emitting it.
+#[allow(clippy::too_many_arguments)]
+pub async fn watch_namespaced_converted<T>(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    namespace: String,
+    resource_type: &str,
+    api_group: &str,
+    params: WatchParams,
+    converter: WatchObjectConverter,
+) -> Result<Response>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
+    watch_namespaced_inner::<T>(
+        state,
+        auth_ctx,
+        namespace,
+        resource_type,
+        api_group,
+        params,
+        Some(converter),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn watch_namespaced_inner<T>(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    namespace: String,
+    resource_type: &str,
+    api_group: &str,
+    params: WatchParams,
+    converter: Option<WatchObjectConverter>,
 ) -> Result<Response>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
@@ -264,6 +342,18 @@ where
     // watch with HTTP 400. Upstream Kubernetes skips bad objects and
     // continues streaming valid ones.
     let raw_existing: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    // Convert each stored object to the requested version before it becomes an
+    // initial ADDED event, so field-selector filtering sees the requested-version
+    // layout (mirrors the LIST path). No-op when `converter` is None.
+    let raw_existing: Vec<serde_json::Value> = if let Some(ref convert) = converter {
+        let mut converted = Vec::with_capacity(raw_existing.len());
+        for v in raw_existing {
+            converted.push(convert(v).await);
+        }
+        converted
+    } else {
+        raw_existing
+    };
     let existing_resources: Vec<T> = raw_existing
         .into_iter()
         .filter_map(|v| match serde_json::from_value::<T>(v) {
@@ -435,7 +525,9 @@ where
                         match event_opt {
                             Some(Ok(WatchEvent::Added(key, value))) => {
                                 info!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
-                                if let Ok(object) = serde_json::from_str::<T>(&value) {
+                                if let Some(object) =
+                                    deserialize_converted::<T>(&value, &converter).await
+                                {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
                                         latest_resource_version = Some(rv.clone());
@@ -473,7 +565,9 @@ where
                             }
                             Some(Ok(WatchEvent::Modified(key, value))) => {
                                 info!("Watch MODIFIED event for key={}", key);
-                                if let Ok(object) = serde_json::from_str::<T>(&value) {
+                                if let Some(object) =
+                                    deserialize_converted::<T>(&value, &converter).await
+                                {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
                                         latest_resource_version = Some(rv.clone());
@@ -512,7 +606,9 @@ where
                                 // prev_kv can be empty after etcd compaction or when the storage
                                 // backend doesn't capture the previous value. Silently dropping
                                 // the DELETE event causes watchers to hang (conformance #4).
-                                if let Ok(object) = serde_json::from_str::<T>(&prev_value) {
+                                if let Some(object) =
+                                    deserialize_converted::<T>(&prev_value, &converter).await
+                                {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
                                         latest_resource_version = Some(rv.clone());
@@ -663,13 +759,52 @@ where
     Ok(response)
 }
 
-/// Generic watch handler for cluster-scoped resources
+/// Generic watch handler for cluster-scoped resources.
 pub async fn watch_cluster_scoped<T>(
     state: Arc<ApiServerState>,
     auth_ctx: AuthContext,
     resource_type: &str,
     api_group: &str,
     params: WatchParams,
+) -> Result<Response>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
+    watch_cluster_scoped_inner::<T>(state, auth_ctx, resource_type, api_group, params, None).await
+}
+
+/// Like [`watch_cluster_scoped`], but converts every streamed object through
+/// `converter` (e.g. CRD version conversion) before filtering and emitting it.
+pub async fn watch_cluster_scoped_converted<T>(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    resource_type: &str,
+    api_group: &str,
+    params: WatchParams,
+    converter: WatchObjectConverter,
+) -> Result<Response>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
+    watch_cluster_scoped_inner::<T>(
+        state,
+        auth_ctx,
+        resource_type,
+        api_group,
+        params,
+        Some(converter),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn watch_cluster_scoped_inner<T>(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    resource_type: &str,
+    api_group: &str,
+    params: WatchParams,
+    converter: Option<WatchObjectConverter>,
 ) -> Result<Response>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
@@ -777,6 +912,18 @@ where
     // watch with HTTP 400. Upstream Kubernetes skips bad objects and
     // continues streaming valid ones.
     let raw_existing: Vec<serde_json::Value> = state.storage.list(&prefix).await?;
+    // Convert each stored object to the requested version before it becomes an
+    // initial ADDED event, so field-selector filtering sees the requested-version
+    // layout (mirrors the LIST path). No-op when `converter` is None.
+    let raw_existing: Vec<serde_json::Value> = if let Some(ref convert) = converter {
+        let mut converted = Vec::with_capacity(raw_existing.len());
+        for v in raw_existing {
+            converted.push(convert(v).await);
+        }
+        converted
+    } else {
+        raw_existing
+    };
     let existing_resources: Vec<T> = raw_existing
         .into_iter()
         .filter_map(|v| match serde_json::from_value::<T>(v) {
@@ -944,7 +1091,9 @@ where
                         match event_opt {
                             Some(Ok(WatchEvent::Added(key, value))) => {
                                 info!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
-                                if let Ok(object) = serde_json::from_str::<T>(&value) {
+                                if let Some(object) =
+                                    deserialize_converted::<T>(&value, &converter).await
+                                {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
                                         latest_resource_version = Some(rv.clone());
@@ -975,7 +1124,9 @@ where
                             }
                             Some(Ok(WatchEvent::Modified(key, value))) => {
                                 info!("Watch MODIFIED event for key={}", key);
-                                if let Ok(object) = serde_json::from_str::<T>(&value) {
+                                if let Some(object) =
+                                    deserialize_converted::<T>(&value, &converter).await
+                                {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
                                         latest_resource_version = Some(rv.clone());
@@ -1014,7 +1165,9 @@ where
                                 // prev_kv can be empty after etcd compaction or when the storage
                                 // backend doesn't capture the previous value. Silently dropping
                                 // the DELETE event causes watchers to hang (conformance #4).
-                                if let Ok(object) = serde_json::from_str::<T>(&prev_value) {
+                                if let Some(object) =
+                                    deserialize_converted::<T>(&prev_value, &converter).await
+                                {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
                                         latest_resource_version = Some(rv.clone());
