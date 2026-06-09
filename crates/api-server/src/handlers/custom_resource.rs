@@ -36,6 +36,18 @@ pub async fn create_custom_resource(
         rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
     })?;
 
+    // Server-side name generation: when `metadata.name` is empty and
+    // `metadata.generateName` is set, synthesise a unique name by appending a
+    // random suffix (K8s ObjectMeta semantics). cert-manager creates
+    // CertificateRequests/Orders this way; without it the create is rejected
+    // ("name must be non-empty") and the controller re-queues forever.
+    if cr.metadata.name.is_empty() {
+        if let Some(prefix) = cr.metadata.generate_name.clone().filter(|p| !p.is_empty()) {
+            let suffix: String = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
+            cr.metadata.name = format!("{prefix}{suffix}");
+        }
+    }
+
     let cr_name = cr.metadata.name.clone();
     info!(
         "Creating custom resource {}/{}/{}: {}",
@@ -1147,27 +1159,24 @@ pub async fn patch_custom_resource_status(
         rusternetes_common::Error::InvalidResource(format!("Invalid patch JSON: {}", e))
     })?;
 
-    // Apply the patch to the status field only
-    let current_status = current
-        .status
-        .as_ref()
-        .unwrap_or(&serde_json::Value::Null)
-        .clone();
-
     let patch_type = crate::patch::PatchType::from_content_type(content_type).map_err(|e| {
         rusternetes_common::Error::InvalidResource(format!("Unsupported patch content type: {}", e))
     })?;
 
-    let patched_status = crate::patch::apply_patch(&current_status, &patch_value, patch_type)
-        .map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Failed to apply status patch: {}",
-                e
-            ))
-        })?;
+    // Status patches are object-relative (e.g. merge `{"status":{...}}` or
+    // JSON-Patch `/status/conditions/-`), so apply them to the FULL object and
+    // then keep only the resulting `.status` — the status subresource ignores
+    // spec/metadata changes. Applying an object-relative patch directly to the
+    // status value would nest it wrongly (`status.status.…`).
+    let full = serde_json::to_value(&current).map_err(|e| {
+        rusternetes_common::Error::Internal(format!("Failed to serialize resource: {}", e))
+    })?;
+    let patched_full = crate::patch::apply_patch(&full, &patch_value, patch_type).map_err(|e| {
+        rusternetes_common::Error::InvalidResource(format!("Failed to apply status patch: {}", e))
+    })?;
 
     // Update only the status field
-    current.status = Some(patched_status);
+    current.status = patched_full.get("status").cloned();
 
     // Save the updated resource
     let updated = state.storage.update(&key, &current).await?;
@@ -1727,8 +1736,14 @@ pub async fn update_custom_resource_status(
 
     let mut cr: CustomResource = state.storage.get(&key).await?;
 
-    // Update only the status field (optimistic concurrency control)
-    cr.status = Some(status);
+    // K8s status subresource semantics: the request body is the FULL object;
+    // the server persists ONLY its `.status` (spec/metadata changes via this
+    // endpoint are ignored). Extract `.status` from the body — NOT the whole
+    // body. Storing the entire object as the status nests it
+    // (`status.status.conditions`), so controllers that read the resource back
+    // never see their own condition and re-reconcile forever (cert-manager's
+    // Issuer/Certificate hot-loop).
+    cr.status = status.get("status").cloned();
 
     // Save the updated resource
     let updated = state.storage.update(&key, &cr).await?;
