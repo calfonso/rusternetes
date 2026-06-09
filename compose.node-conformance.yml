@@ -123,7 +123,14 @@ services:
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}
-    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    # --network must name THIS stack's bridge so the kubelet attaches pod
+    # (pause) containers to the same Docker network the kubelet itself runs on.
+    # Otherwise pods land on the kubelet's default `rusternetes-network` while
+    # the kubelet sits on `rusternetes-nc-net`, the two are disjoint, and every
+    # network liveness/readiness probe (httpGet/tcp/grpc) plus all pod-to-pod
+    # traffic is unreachable (rc=000) — which silently failed ~30 conformance
+    # specs once pods started scheduling.
+    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--network", "rusternetes-nc-net"]
 
   scheduler:
     build:
