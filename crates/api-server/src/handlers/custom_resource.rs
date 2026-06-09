@@ -418,7 +418,21 @@ pub async fn list_custom_resources(
     // sees the requested-version field layout.
     crate::handlers::filtering::apply_selectors(&mut crs, &params)?;
 
-    let mut list = List::new("List", "v1", crs);
+    // The list envelope MUST carry the typed list kind + the CRD's
+    // group/version (e.g. CertificateList / cert-manager.io/v1), not the
+    // generic ("List","v1"). A typed client (controller-runtime, cert-manager)
+    // decodes a LIST against its registered scheme; "List"/"v1" isn't
+    // registered there, so the list fails ("no kind \"List\" is registered for
+    // version \"v1\"") and the informer never populates.
+    let list_kind = crd
+        .spec
+        .names
+        .list_kind
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{}List", crd.spec.names.kind));
+    let list_api_version = format!("{group}/{version}");
+    let mut list = List::new(&list_kind, &list_api_version, crs);
     list.metadata.resource_version =
         Some(crate::handlers::list_collection_resource_version(&state.storage, &list.items).await);
     Ok(Json(list))
