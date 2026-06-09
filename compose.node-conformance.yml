@@ -1,31 +1,49 @@
 # Single-node compose for kubelet-scoped conformance testing.
-# Brings up only etcd + api-server + one kubelet — no scheduler,
-# no controller-manager, no kube-proxy, no second kubelet.
+# Brings up rhino (etcd-compatible gRPC over SQLite) + api-server + scheduler
+# + one kubelet — no controller-manager, no kube-proxy, no second kubelet.
+#
+# Storage is Rhino + SQLite, matching the conformance canary and CI
+# (compose.sqlite.yml) rather than etcd — reproduce conformance on the backend
+# we actually ship/test. Rhino speaks the etcd v3 gRPC API, so every component
+# keeps its existing `--etcd-servers` flag, pointed at rhino:2379.
+#
+# The scheduler is required: the upstream e2e.test creates conformance pods
+# with `schedulerName: default-scheduler` and no `spec.nodeName`, so without a
+# scheduler to bind them to node-1 every test pod sits Pending forever and the
+# suite times out (only ~8 of 191 [NodeConformance] specs ever started). The
+# per-namespace `kube-root-ca.crt` ConfigMap and default ServiceAccount that the
+# pods' projected `kube-api-access` volume needs are created by the api-server
+# on namespace creation (handlers/namespace.rs), so the controller-manager is
+# not needed here.
 #
 # Used by scripts/run-node-conformance.sh.
 
 services:
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.17
-    container_name: rusternetes-nc-etcd
-    command:
-      - /usr/local/bin/etcd
-      - --name=etcd
-      - --data-dir=/etcd-data
-      - --listen-client-urls=http://0.0.0.0:2379
-      - --advertise-client-urls=http://etcd:2379
-      - --listen-peer-urls=http://0.0.0.0:2380
+  # Rhino — etcd-compatible gRPC server backed by SQLite (see compose.sqlite.yml).
+  rhino:
+    build:
+      context: ./rhino
+      dockerfile: ../Dockerfile.rhino
+    container_name: rusternetes-nc-rhino
     ports:
       - "2379:2379"
+    volumes:
+      - rhino-data:/data/db
     networks:
       - nc-net
+    command:
+      - "--listen-address"
+      - "0.0.0.0:2379"
+      - "--endpoint"
+      - "/data/db/state.db"
+      - "--max-connections"
+      - "20"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    environment:
-      - ETCDCTL_API=3
+      test: ["CMD-SHELL", "true"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
 
   api-server:
     build:
@@ -39,7 +57,7 @@ services:
     ports:
       - "6443:6443"
     depends_on:
-      etcd:
+      rhino:
         condition: service_healthy
     networks:
       nc-net:
@@ -56,7 +74,7 @@ services:
       - "--bind-address"
       - "0.0.0.0:6443"
       - "--etcd-servers"
-      - "http://etcd:2379"
+      - "http://rhino:2379"
       - "--tls"
       - "--tls-cert-file"
       - "/etc/kubernetes/pki/api-server.crt"
@@ -78,7 +96,7 @@ services:
     container_name: rusternetes-nc-kubelet
     privileged: true
     depends_on:
-      - etcd
+      - rhino
       - api-server
     networks:
       - nc-net
@@ -105,9 +123,39 @@ services:
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}
-    command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    # --network must name THIS stack's bridge so the kubelet attaches pod
+    # (pause) containers to the same Docker network the kubelet itself runs on.
+    # Otherwise pods land on the kubelet's default `rusternetes-network` while
+    # the kubelet sits on `rusternetes-nc-net`, the two are disjoint, and every
+    # network liveness/readiness probe (httpGet/tcp/grpc) plus all pod-to-pod
+    # traffic is unreachable (rc=000) — which silently failed ~30 conformance
+    # specs once pods started scheduling.
+    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--network", "rusternetes-nc-net"]
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.services
+      target: scheduler
+      additional_contexts:
+        rhino: ./rhino
+    container_name: rusternetes-nc-scheduler
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - nc-net
+    environment:
+      - RUST_LOG=info
+    # Talks straight to rhino (etcd v3 gRPC). Tight 1s interval so the
+    # conformance pods bind promptly instead of pacing the suite.
+    command: ["--etcd-servers", "http://rhino:2379", "--interval", "1"]
 
 networks:
   nc-net:
     name: rusternetes-nc-net
     driver: bridge
+
+volumes:
+  rhino-data:
+    name: rusternetes-nc-rhino-data

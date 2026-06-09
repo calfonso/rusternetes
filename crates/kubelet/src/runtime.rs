@@ -7928,7 +7928,7 @@ impl ContainerRuntime {
         &self,
         container_name: &str,
         exec: &ExecAction,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<bool> {
         debug!("Exec probe: {:?}", exec.command);
 
@@ -7939,24 +7939,43 @@ impl ContainerRuntime {
             ..Default::default()
         };
 
-        let exec_id = self
-            .docker
-            .create_exec(container_name, exec_config)
-            .await?
-            .id;
+        // K8s kills an exec probe whose command exceeds `timeoutSeconds` and
+        // treats that as a probe failure (used by the "should be restarted with
+        // an exec liveness probe with timeout" conformance specs). Bound the
+        // whole create→run→inspect cycle on `timeout`; a timeout is a failure,
+        // exactly as if the command had exited non-zero.
+        let run = async {
+            let exec_id = self
+                .docker
+                .create_exec(container_name, exec_config)
+                .await?
+                .id;
 
-        let start_result = self.docker.start_exec(&exec_id, None).await?;
+            let start_result = self.docker.start_exec(&exec_id, None).await?;
 
-        match start_result {
-            StartExecResults::Attached { mut output, .. } => while output.next().await.is_some() {},
-            StartExecResults::Detached => {}
+            match start_result {
+                StartExecResults::Attached { mut output, .. } => {
+                    while output.next().await.is_some() {}
+                }
+                StartExecResults::Detached => {}
+            }
+
+            // Get exec inspect to check exit code
+            let inspect = self.docker.inspect_exec(&exec_id).await?;
+            Ok::<i64, anyhow::Error>(inspect.exit_code.unwrap_or(1))
+        };
+
+        match tokio::time::timeout(timeout, run).await {
+            Ok(Ok(exit_code)) => Ok(exit_code == 0),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                debug!(
+                    "Exec probe timed out after {:?} for container {}",
+                    timeout, container_name
+                );
+                Ok(false)
+            }
         }
-
-        // Get exec inspect to check exit code
-        let inspect = self.docker.inspect_exec(&exec_id).await?;
-        let exit_code = inspect.exit_code.unwrap_or(1);
-
-        Ok(exit_code == 0)
     }
 
     /// Check a gRPC health probe by connecting to the gRPC health service.

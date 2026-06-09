@@ -134,7 +134,17 @@ if [ ! -f "${BIN_DIR}/e2e.test" ] || [ ! -f "${BIN_DIR}/ginkgo" ]; then
     chmod +x "${BIN_DIR}/e2e.test" "${BIN_DIR}/ginkgo"
 fi
 
-echo "[6/7] Running ginkgo focus=${FOCUS}..."
+# Ginkgo parallelism + suite timeout. Both are required for the suite to
+# complete: ~150 [NodeConformance] specs run serially at ~30-60s each would
+# blow past ginkgo's default 1h suite timeout (historically only ~8 specs ran
+# before the cap — each blocked on an un-schedulable pod). Run several specs
+# concurrently (each in its own namespace; the single kubelet handles parallel
+# pods fine — measured 4-way locally) and raise the suite timeout to sit under
+# the workflow's 90-minute job cap. Both overridable via env.
+GINKGO_NODES="${GINKGO_NODES:-4}"
+GINKGO_TIMEOUT="${GINKGO_TIMEOUT:-85m}"
+
+echo "[6/7] Running ginkgo focus=${FOCUS} (nodes=${GINKGO_NODES}, timeout=${GINKGO_TIMEOUT})..."
 # Disable errexit + pipefail across the pipe so we can capture ginkgo's
 # real exit status from PIPESTATUS even when tee succeeds (or vice
 # versa) without killing the script. Re-enable immediately after.
@@ -148,6 +158,8 @@ KUBECONFIG="${KUBECONFIG_FILE}" \
 "${BIN_DIR}/ginkgo" \
     --focus="${FOCUS}" \
     --skip="${SKIP}" \
+    --nodes="${GINKGO_NODES}" \
+    --timeout="${GINKGO_TIMEOUT}" \
     --no-color \
     ${FAIL_FAST_FLAG} \
     "${BIN_DIR}/e2e.test" \
