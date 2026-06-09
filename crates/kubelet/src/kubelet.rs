@@ -3319,9 +3319,9 @@ impl Kubelet {
                 // Check liveness probes
                 // check_liveness may error on transient probe failures — treat errors as "no restart needed"
                 // to ensure the status update branch always runs
-                let needs_restart = self.runtime.check_liveness(pod).await.unwrap_or(false);
+                let restart_grace = self.runtime.check_liveness(pod).await.unwrap_or(None);
                 {
-                    if needs_restart {
+                    if let Some(probe_grace) = restart_grace {
                         let restart_policy = pod
                             .spec
                             .as_ref()
@@ -3369,12 +3369,15 @@ impl Kubelet {
                                     })
                                     .unwrap_or_default();
 
-                                // Stop and restart the pod
-                                let grace = pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.termination_grace_period_seconds)
-                                    .unwrap_or(30);
+                                // Stop and restart the pod using the failed
+                                // probe's terminationGracePeriodSeconds (falls
+                                // back to the pod's, then 30) — upstream uses the
+                                // probe's grace to kill a container that failed
+                                // its probe, not the (possibly much longer) pod
+                                // grace. Conformance "should override
+                                // timeoutGracePeriodSeconds when Liveness/
+                                // StartupProbe field is set".
+                                let grace = probe_grace;
                                 if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
                                     error!("Failed to stop pod for restart: {}", e);
                                 } else {

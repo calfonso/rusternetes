@@ -7528,7 +7528,7 @@ impl ContainerRuntime {
     ///
     /// Respects `failureThreshold` (default 3) and `successThreshold` (default 1)
     /// so that a single probe failure does not immediately trigger a restart.
-    pub async fn check_liveness(&self, pod: &Pod) -> Result<bool> {
+    pub async fn check_liveness(&self, pod: &Pod) -> Result<Option<i64>> {
         // Liveness probes are disabled once a pod is terminating: its containers
         // are draining (preStop/SIGTERM) and must NOT be restarted even if the
         // probe now fails (e.g. the app removed its health file on SIGTERM).
@@ -7536,7 +7536,7 @@ impl ContainerRuntime {
         // Conformance: "should mark readiness on pods to false and disable
         // liveness probes while pod is in progress of terminating".
         if pod.metadata.deletion_timestamp.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
 
         let pod_name = &pod.metadata.name;
@@ -7544,9 +7544,11 @@ impl ContainerRuntime {
 
         // Regular containers: a failed liveness probe restarts the whole pod
         // (existing behavior — the pod-restart path increments their counts).
+        // Some(grace) carries the failed probe's terminationGracePeriodSeconds
+        // so the caller kills the pod with the probe's grace, not the pod's.
         for container in &spec.containers {
-            if self.evaluate_container_liveness(pod, container).await {
-                return Ok(true);
+            if let Some(grace) = self.evaluate_container_liveness(pod, container).await {
+                return Ok(Some(grace));
             }
         }
 
@@ -7562,7 +7564,11 @@ impl ContainerRuntime {
             .iter()
             .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
         for container in restartable_inits {
-            if self.evaluate_container_liveness(pod, container).await {
+            if self
+                .evaluate_container_liveness(pod, container)
+                .await
+                .is_some()
+            {
                 let container_name = format!("{}_{}", pod_name, container.name);
                 warn!(
                     "Restarting sidecar (restartable init) container {} after failed liveness probe",
@@ -7578,16 +7584,31 @@ impl ContainerRuntime {
             }
         }
 
-        Ok(false) // No regular container needs a pod restart.
+        Ok(None) // No regular container needs a pod restart.
     }
 
     /// Evaluate a single container's startup + liveness probes with threshold
-    /// tracking. Returns `true` when the liveness probe has failed enough
-    /// consecutive times to warrant a restart. Shared by regular containers and
-    /// restartable init containers (sidecars).
-    async fn evaluate_container_liveness(&self, pod: &Pod, container: &Container) -> bool {
+    /// tracking. Returns `Some(grace_seconds)` when the startup/liveness probe
+    /// has failed enough consecutive times to warrant a restart, where
+    /// `grace_seconds` is the *probe-level* terminationGracePeriodSeconds when
+    /// set (falling back to the pod's, then 30) — upstream uses the probe's
+    /// grace to kill a unit that failed its probe ("override
+    /// timeoutGracePeriodSeconds when Liveness/StartupProbe field is set").
+    /// Returns `None` when no restart is warranted. Shared by regular containers
+    /// and restartable init containers (sidecars).
+    async fn evaluate_container_liveness(&self, pod: &Pod, container: &Container) -> Option<i64> {
         let pod_name = &pod.metadata.name;
         let container_name = format!("{}_{}", pod_name, container.name);
+        let pod_grace = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.termination_grace_period_seconds);
+        let grace_of = |probe: &Probe| {
+            probe
+                .termination_grace_period_seconds
+                .or(pod_grace)
+                .unwrap_or(30)
+        };
 
         // If a startup probe is defined, check it first.
         // Liveness probes are disabled until the startup probe succeeds.
@@ -7643,20 +7664,20 @@ impl ContainerRuntime {
                         "Startup probe not yet passing for container {}, skipping liveness check",
                         container_name
                     );
-                    return false;
+                    return None;
                 }
                 StartupOutcome::Failed => {
                     warn!(
                         "Startup probe exceeded failure threshold ({}) for container {} — restarting",
                         failure_threshold, container_name
                     );
-                    return true;
+                    return Some(grace_of(startup_probe));
                 }
             }
         }
 
         let Some(probe) = &container.liveness_probe else {
-            return false;
+            return None;
         };
 
         // Wait for initial delay
@@ -7674,7 +7695,7 @@ impl ContainerRuntime {
                             let elapsed = Utc::now().signed_duration_since(started);
                             if elapsed.num_seconds() < initial_delay as i64 {
                                 debug!("Skipping liveness check, within initial delay");
-                                return false;
+                                return None;
                             }
                         }
                     }
@@ -7690,7 +7711,7 @@ impl ContainerRuntime {
             .await
         {
             Ok(h) => h,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         let failure_threshold = probe.failure_threshold.unwrap_or(3);
         let liveness_key = format!("{}/{}/liveness", pod_name, container.name);
@@ -7700,7 +7721,7 @@ impl ContainerRuntime {
         if healthy {
             state.consecutive_successes += 1;
             state.consecutive_failures = 0;
-            false
+            None
         } else {
             state.consecutive_failures += 1;
             state.consecutive_successes = 0;
@@ -7711,13 +7732,13 @@ impl ContainerRuntime {
                 );
                 // Reset state so next cycle starts fresh after restart
                 state.consecutive_failures = 0;
-                true
+                Some(grace_of(probe))
             } else {
                 debug!(
                     "Liveness probe failed for container {} ({}/{} failures before restart)",
                     container_name, state.consecutive_failures, failure_threshold
                 );
-                false
+                None
             }
         }
     }
