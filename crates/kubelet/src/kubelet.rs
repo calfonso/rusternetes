@@ -1811,6 +1811,42 @@ impl Kubelet {
                 "Pod {}/{} terminating — stopping containers",
                 namespace, pod_name
             );
+
+            // A pod in the process of terminating is no longer Ready, and its
+            // liveness probes are disabled (see check_liveness, which short-
+            // circuits on a deletionTimestamp). Persist Ready=False /
+            // ContainersReady=False *before* the (blocking) container stop so
+            // watchers observe the readiness flip while the pod drains during
+            // its grace period — upstream marks a terminating pod NotReady
+            // (status_manager + the prober disabling probes on termination).
+            // Conformance: "should mark readiness on pods to false … while …
+            // terminating" waits for this via an informer.
+            {
+                let key = build_key("pods", Some(namespace), pod_name);
+                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                    let original = p.clone();
+                    if let Some(ref mut status) = p.status {
+                        status.conditions = Some(Self::merge_pod_conditions(
+                            status.conditions.as_deref().unwrap_or(&[]),
+                            Self::not_ready_pod_conditions(),
+                        ));
+                        if let Some(ref mut cs) = status.container_statuses {
+                            for c in cs.iter_mut() {
+                                c.ready = false;
+                            }
+                        }
+                        if let Some(ref mut ics) = status.init_container_statuses {
+                            for ic in ics.iter_mut() {
+                                ic.ready = false;
+                            }
+                        }
+                    }
+                    if !pod_status_equal(&original, &p) {
+                        let _ = self.storage.update(&key, &p).await;
+                    }
+                }
+            }
+
             let grace_period = pod
                 .metadata
                 .deletion_grace_period_seconds

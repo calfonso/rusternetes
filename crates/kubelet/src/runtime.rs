@@ -7498,6 +7498,16 @@ impl ContainerRuntime {
     /// Respects `failureThreshold` (default 3) and `successThreshold` (default 1)
     /// so that a single probe failure does not immediately trigger a restart.
     pub async fn check_liveness(&self, pod: &Pod) -> Result<bool> {
+        // Liveness probes are disabled once a pod is terminating: its containers
+        // are draining (preStop/SIGTERM) and must NOT be restarted even if the
+        // probe now fails (e.g. the app removed its health file on SIGTERM).
+        // Upstream's prober_manager stops liveness workers on pod deletion.
+        // Conformance: "should mark readiness on pods to false and disable
+        // liveness probes while pod is in progress of terminating".
+        if pod.metadata.deletion_timestamp.is_some() {
+            return Ok(false);
+        }
+
         let pod_name = &pod.metadata.name;
         let spec = pod.spec.as_ref().unwrap();
 
