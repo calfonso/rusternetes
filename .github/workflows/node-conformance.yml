@@ -23,7 +23,11 @@ on:
 jobs:
   node-conformance:
     runs-on: arc-runner-set-conformance
-    timeout-minutes: 90
+    # Image build + bootstrap (~15m) plus the ginkgo suite. The suite runs
+    # ~190 [NodeConformance] specs; with GINKGO_NODES=4 parallelism a full pass
+    # measured ~53m locally, and GINKGO_TIMEOUT defaults to 85m. 120m leaves
+    # headroom for setup + the 85m ginkgo ceiling + teardown/artifact upload.
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         # rhino is an in-tree submodule (./rhino) that the storage crate's
