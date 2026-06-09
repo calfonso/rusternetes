@@ -6995,7 +6995,7 @@ impl ContainerRuntime {
                             false
                         } else {
                             let raw = self
-                                .check_probe(&container_name, ic, probe)
+                                .check_probe(None, &container_name, ic, probe)
                                 .await
                                 .unwrap_or(false);
                             let success_threshold = probe.success_threshold.unwrap_or(1);
@@ -7295,7 +7295,7 @@ impl ContainerRuntime {
                     let startup_passed = if running {
                         if let Some(startup_probe) = &container.startup_probe {
                             let raw = self
-                                .check_probe(&container_name, container, startup_probe)
+                                .check_probe(None, &container_name, container, startup_probe)
                                 .await
                                 .unwrap_or(false);
                             let success_threshold = startup_probe.success_threshold.unwrap_or(1);
@@ -7351,7 +7351,7 @@ impl ContainerRuntime {
                                 false // Not ready yet, still within initial delay
                             } else {
                                 let raw = self
-                                    .check_probe(&container_name, container, probe)
+                                    .check_probe(None, &container_name, container, probe)
                                     .await
                                     .unwrap_or(false);
                                 let _failure_threshold = probe.failure_threshold.unwrap_or(3);
@@ -7504,7 +7504,7 @@ impl ContainerRuntime {
         // Regular containers: a failed liveness probe restarts the whole pod
         // (existing behavior — the pod-restart path increments their counts).
         for container in &spec.containers {
-            if self.evaluate_container_liveness(pod_name, container).await {
+            if self.evaluate_container_liveness(pod, container).await {
                 return Ok(true);
             }
         }
@@ -7521,7 +7521,7 @@ impl ContainerRuntime {
             .iter()
             .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
         for container in restartable_inits {
-            if self.evaluate_container_liveness(pod_name, container).await {
+            if self.evaluate_container_liveness(pod, container).await {
                 let container_name = format!("{}_{}", pod_name, container.name);
                 warn!(
                     "Restarting sidecar (restartable init) container {} after failed liveness probe",
@@ -7544,7 +7544,8 @@ impl ContainerRuntime {
     /// tracking. Returns `true` when the liveness probe has failed enough
     /// consecutive times to warrant a restart. Shared by regular containers and
     /// restartable init containers (sidecars).
-    async fn evaluate_container_liveness(&self, pod_name: &str, container: &Container) -> bool {
+    async fn evaluate_container_liveness(&self, pod: &Pod, container: &Container) -> bool {
+        let pod_name = &pod.metadata.name;
         let container_name = format!("{}_{}", pod_name, container.name);
 
         // If a startup probe is defined, check it first.
@@ -7552,7 +7553,7 @@ impl ContainerRuntime {
         if let Some(startup_probe) = &container.startup_probe {
             let startup_key = format!("{}/{}/startup", pod_name, container.name);
             let raw_result = self
-                .check_probe(&container_name, container, startup_probe)
+                .check_probe(Some(pod), &container_name, container, startup_probe)
                 .await
                 .unwrap_or(false);
 
@@ -7643,7 +7644,10 @@ impl ContainerRuntime {
         // Check liveness with threshold tracking. A probe *error* (as opposed
         // to a clean failure) is transient — skip this cycle without counting,
         // matching the original `?`-propagated behavior.
-        let healthy = match self.check_probe(&container_name, container, probe).await {
+        let healthy = match self
+            .check_probe(Some(pod), &container_name, container, probe)
+            .await
+        {
             Ok(h) => h,
             Err(_) => return false,
         };
@@ -7680,6 +7684,7 @@ impl ContainerRuntime {
     /// Execute a probe check
     async fn check_probe(
         &self,
+        event_pod: Option<&Pod>,
         container_name: &str,
         container: &Container,
         probe: &Probe,
@@ -7691,7 +7696,7 @@ impl ContainerRuntime {
         // HTTP GET probe
         if let Some(http_get) = &probe.http_get {
             return self
-                .check_http_probe(container_name, container, http_get, timeout)
+                .check_http_probe(event_pod, container_name, container, http_get, timeout)
                 .await;
         }
 
@@ -7958,6 +7963,7 @@ impl ContainerRuntime {
 
     async fn check_http_probe(
         &self,
+        event_pod: Option<&Pod>,
         container_name: &str,
         container: &Container,
         http_get: &HTTPGetAction,
@@ -7993,20 +7999,31 @@ impl ContainerRuntime {
         // Kubernetes probes skip TLS verification (accept self-signed certs).
         // Disable proxy to ensure direct connection to pod IPs.
         //
-        // Do NOT follow redirects: upstream's HTTP prober
-        // (pkg/probe/http/http.go) installs a CheckRedirect that refuses to
-        // follow a redirect to a *non-local* host and treats the 3xx response
-        // itself as the probe result. A 3xx is in the 200-399 success range, so
-        // a redirect (local or non-local) is a probe success — the container is
-        // not restarted. reqwest's default follows up to 10 redirects, so a
-        // non-local redirect chased to an unreachable host turned a healthy
-        // container into a restart loop (the "should *not* be restarted with a
-        // non-local redirect http liveness probe" conformance spec).
+        // Redirect handling mirrors upstream's HTTP prober
+        // (pkg/probe/http/request.go RedirectChecker, followNonLocalRedirects =
+        // false): FOLLOW a redirect to the *same* host (up to 10 hops), but
+        // STOP on a redirect to a *different* host and return the 3xx response
+        // as-is. A 3xx is in the 200-399 success range, so a stopped non-local
+        // redirect is a probe success — the container is NOT restarted — and a
+        // ProbeWarning event is emitted. A same-host redirect is followed to
+        // its real target, whose status then decides success/failure (so a
+        // local redirect to a failing endpoint still restarts the container).
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(true)
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let original_host = attempt.previous().first().and_then(|u| u.host_str());
+                let target_host = attempt.url().host_str();
+                if original_host.is_some() && target_host != original_host {
+                    // Non-local redirect: stop, surface the 3xx response.
+                    attempt.stop()
+                } else if attempt.previous().len() >= 10 {
+                    attempt.error("too many redirects")
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()?;
 
         // Build request with custom headers from probe spec (K8s sends these)
@@ -8024,6 +8041,28 @@ impl ContainerRuntime {
         match request.send().await {
             Ok(response) => {
                 let code = response.status().as_u16();
+                // A final 3xx means a redirect was stopped because it pointed
+                // at a non-local host (same-host redirects were followed above).
+                // Upstream treats this as a probe SUCCESS and records a
+                // ProbeWarning event carrying the response body — matching the
+                // "should *not* be restarted with a non-local redirect http
+                // liveness probe" conformance spec, which waits for that event.
+                if (300..400).contains(&code) {
+                    if let Some(pod) = event_pod {
+                        let body = response.text().await.unwrap_or_default();
+                        let message =
+                            format!("Probe terminated redirects, Response body: {}", body);
+                        self.emit_event(
+                            pod,
+                            Some(&container.name),
+                            "ProbeWarning",
+                            EventType::Warning,
+                            &message,
+                        )
+                        .await;
+                    }
+                    return Ok(true);
+                }
                 // K8s probes consider 200-399 as success
                 Ok((200..400).contains(&code))
             }
