@@ -36,6 +36,18 @@ pub async fn create_custom_resource(
         rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
     })?;
 
+    // Server-side name generation: when `metadata.name` is empty and
+    // `metadata.generateName` is set, synthesise a unique name by appending a
+    // random suffix (K8s ObjectMeta semantics). cert-manager creates
+    // CertificateRequests/Orders this way; without it the create is rejected
+    // ("name must be non-empty") and the controller re-queues forever.
+    if cr.metadata.name.is_empty() {
+        if let Some(prefix) = cr.metadata.generate_name.clone().filter(|p| !p.is_empty()) {
+            let suffix: String = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
+            cr.metadata.name = format!("{prefix}{suffix}");
+        }
+    }
+
     let cr_name = cr.metadata.name.clone();
     info!(
         "Creating custom resource {}/{}/{}: {}",
