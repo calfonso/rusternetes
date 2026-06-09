@@ -131,13 +131,22 @@ EOF
 
 applied=0
 for i in $(seq 1 30); do
-    if printf '%s' "${SMOKE_YAML}" | ${KUBECTL} apply -f - >/dev/null 2>&1; then
+    if printf '%s' "${SMOKE_YAML}" | ${KUBECTL} apply -f - >"${RESULTS_DIR}/issuer-apply.log" 2>&1; then
         applied=1
         break
     fi
     sleep 4
 done
-[ "${applied}" -eq 1 ] || { echo "ERROR: could not apply Issuer/Certificate (webhook never became ready)"; exit 1; }
+if [ "${applied}" -ne 1 ]; then
+    echo "ERROR: could not apply Issuer/Certificate. Last apply error:"
+    cat "${RESULTS_DIR}/issuer-apply.log" || true
+    # The validating webhook is the usual suspect — dump it for the artifact.
+    ${KUBECTL} -n cert-manager get validatingwebhookconfiguration cert-manager-webhook -o yaml \
+        >"${RESULTS_DIR}/cert-manager-validatingwebhook.yaml" 2>&1 || true
+    ${KUBECTL} -n cert-manager logs deploy/cert-manager-webhook --tail=50 \
+        >"${RESULTS_DIR}/cert-manager-webhook.log" 2>&1 || true
+    exit 1
+fi
 
 # The controller signs the Certificate; wait for Ready then assert the Secret.
 ${KUBECTL} wait --for=condition=Ready certificate/smoke-cert -n default --timeout=180s
