@@ -92,14 +92,24 @@ fn validate_service_port(
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    // name: required when multi-port; must be a valid IANA_SVC_NAME when present
+    // name: required when multi-port; must be a valid DNS-1123 label (≤63
+    // chars) when present.
+    //
+    // This is a DNS1123Label, NOT IsValidPortName. Upstream validates
+    // `ServicePort.Name` with `ValidateDNS1123Label` and reserves the 15-char
+    // IANA_SVC_NAME rule (`IsValidPortName`) for *ContainerPort.Name* and the
+    // *string* `targetPort` (handled below). Applying the 15-char rule here
+    // wrongly rejected valid real-world manifests — e.g. cert-manager's
+    // `tcp-prometheus-servicemonitor` (29 chars) Service port — which install
+    // fine on upstream Kubernetes.
     match &port.name {
         Some(name) if !name.is_empty() => {
-            if !is_valid_port_name(name) {
+            let label_errs = is_dns1123_label(name);
+            if !label_errs.is_empty() {
                 errs.push(Error::invalid(
                     &fld.child("name"),
                     name.clone(),
-                    "must be an IANA_SVC_NAME (at most 15 characters, matching regex [a-z0-9]([a-z0-9-]*[a-z0-9])* and it must contain at least one letter [a-z], e.g. 'http')",
+                    label_errs.join("; "),
                 ));
             }
         }
