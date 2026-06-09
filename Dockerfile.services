@@ -381,8 +381,15 @@ COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
 
 COPY --from=cargo-builder /out/kubelet /app/kubelet
 
-# Kubelet needs access to container runtime socket
-VOLUME ["/var/run"]
+# NOTE: do NOT declare `VOLUME ["/var/run"]` here. The container runtime
+# socket is provided by the compose *bind* mount (/run/.../podman.sock or
+# /var/run/docker.sock), not by a Docker volume. Declaring /var/run a VOLUME
+# makes Docker create a fresh anonymous volume at /var/run on every container
+# start; the bind-mounted sockets then live inside that volume, and with the
+# rshared KUBELET_VOLUMES_PATH bind joining the host's shared mount peer group,
+# each kubelet restart recursively copies the socket mounts into the
+# accumulating anonymous volumes' _data dirs — a 2^n host mount-table explosion
+# that exhausts fs.mount-max during crash-loops. See #66.
 
 ENTRYPOINT ["/app/kubelet"]
 CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]
