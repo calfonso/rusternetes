@@ -1147,27 +1147,24 @@ pub async fn patch_custom_resource_status(
         rusternetes_common::Error::InvalidResource(format!("Invalid patch JSON: {}", e))
     })?;
 
-    // Apply the patch to the status field only
-    let current_status = current
-        .status
-        .as_ref()
-        .unwrap_or(&serde_json::Value::Null)
-        .clone();
-
     let patch_type = crate::patch::PatchType::from_content_type(content_type).map_err(|e| {
         rusternetes_common::Error::InvalidResource(format!("Unsupported patch content type: {}", e))
     })?;
 
-    let patched_status = crate::patch::apply_patch(&current_status, &patch_value, patch_type)
-        .map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Failed to apply status patch: {}",
-                e
-            ))
-        })?;
+    // Status patches are object-relative (e.g. merge `{"status":{...}}` or
+    // JSON-Patch `/status/conditions/-`), so apply them to the FULL object and
+    // then keep only the resulting `.status` — the status subresource ignores
+    // spec/metadata changes. Applying an object-relative patch directly to the
+    // status value would nest it wrongly (`status.status.…`).
+    let full = serde_json::to_value(&current).map_err(|e| {
+        rusternetes_common::Error::Internal(format!("Failed to serialize resource: {}", e))
+    })?;
+    let patched_full = crate::patch::apply_patch(&full, &patch_value, patch_type).map_err(|e| {
+        rusternetes_common::Error::InvalidResource(format!("Failed to apply status patch: {}", e))
+    })?;
 
     // Update only the status field
-    current.status = Some(patched_status);
+    current.status = patched_full.get("status").cloned();
 
     // Save the updated resource
     let updated = state.storage.update(&key, &current).await?;
@@ -1727,8 +1724,14 @@ pub async fn update_custom_resource_status(
 
     let mut cr: CustomResource = state.storage.get(&key).await?;
 
-    // Update only the status field (optimistic concurrency control)
-    cr.status = Some(status);
+    // K8s status subresource semantics: the request body is the FULL object;
+    // the server persists ONLY its `.status` (spec/metadata changes via this
+    // endpoint are ignored). Extract `.status` from the body — NOT the whole
+    // body. Storing the entire object as the status nests it
+    // (`status.status.conditions`), so controllers that read the resource back
+    // never see their own condition and re-reconcile forever (cert-manager's
+    // Issuer/Certificate hot-loop).
+    cr.status = status.get("status").cloned();
 
     // Save the updated resource
     let updated = state.storage.update(&key, &cr).await?;
