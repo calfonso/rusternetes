@@ -1971,6 +1971,35 @@ impl Kubelet {
             .and_then(|s| s.phase.as_ref())
             .unwrap_or(&Phase::Pending);
 
+        // K8s kubelet admission: reject a pod whose declared OS does not match
+        // this node's OS. Our nodes are Linux, so a pod with spec.os.name set to
+        // anything but "linux" is rejected with Phase=Failed and reason
+        // PodOSNotSupported. K8s ref: pkg/kubelet/kubelet_pods.go — the PodOS
+        // admit handler (GetPodOSValidationError / "PodOSNotSupported").
+        if matches!(current_phase, Phase::Pending) && !is_running {
+            if let Some(os) = pod.spec.as_ref().and_then(|s| s.os.as_ref()) {
+                if os.name != "linux" {
+                    info!(
+                        "Pod {}/{} rejected: pod OS {:?} not supported on this (linux) node",
+                        namespace, pod_name, os.name
+                    );
+                    let key = build_key("pods", Some(namespace), pod_name);
+                    if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                        if let Some(ref mut status) = p.status {
+                            status.phase = Some(Phase::Failed);
+                            status.reason = Some("PodOSNotSupported".to_string());
+                            status.message = Some(
+                                "Pod was rejected as the node does not support the requested pod OS"
+                                    .to_string(),
+                            );
+                        }
+                        let _ = self.storage.update(&key, &p).await;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         // K8s kubelet admission: check hostPort conflicts before starting the pod.
         // K8s ref: pkg/kubelet/kubelet.go:2752 — allocationManager.AddPod
         // If a pod's hostPorts conflict with already-running pods on this node,
