@@ -2368,6 +2368,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     if skip_auth {
         // In skip-auth mode, inject a default admin user context
         protected_routes = protected_routes
+            // Runs after normalize_content_type (added below) so the body is
+            // always JSON here: synthesise metadata.name from generateName for
+            // every create handler in one place (#1052).
+            .layer(axum_middleware::from_fn(
+                middleware::generate_name_middleware,
+            ))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
@@ -2378,6 +2384,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     } else {
         // In normal mode, apply full authentication
         protected_routes = protected_routes
+            // Runs after normalize_content_type (added below) so the body is
+            // always JSON here: synthesise metadata.name from generateName for
+            // every create handler in one place (#1052).
+            .layer(axum_middleware::from_fn(
+                middleware::generate_name_middleware,
+            ))
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
