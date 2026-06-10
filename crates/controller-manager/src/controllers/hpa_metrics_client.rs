@@ -13,6 +13,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use reqwest::Client;
 use rusternetes_common::resources::CrossVersionObjectReference;
 use rusternetes_common::types::LabelSelector;
 use std::collections::HashMap;
@@ -148,6 +149,243 @@ impl MetricsClient for FakeMetricsClient {
             .map(|v| (v.clone(), Utc::now()))
             .ok_or_else(|| anyhow::anyhow!("no external metric for {metric}"))
     }
+}
+
+/// Config for the real metrics client.
+#[derive(Clone, Debug)]
+pub struct HttpMetricsConfig {
+    pub api_server_url: String,
+    pub ca_cert_path: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
+}
+
+impl Default for HttpMetricsConfig {
+    fn default() -> Self {
+        Self {
+            api_server_url: "https://api-server:6443".to_string(),
+            ca_cert_path: "/etc/kubernetes/pki/ca.crt".to_string(),
+            client_cert_path: "/etc/kubernetes/pki/controller-manager.crt".to_string(),
+            client_key_path: "/etc/kubernetes/pki/controller-manager.key".to_string(),
+        }
+    }
+}
+
+pub struct HttpMetricsClient {
+    base: String,
+    http: Client,
+}
+
+impl HttpMetricsClient {
+    pub fn new(cfg: HttpMetricsConfig) -> Result<Self> {
+        let ca = std::fs::read(&cfg.ca_cert_path)
+            .map_err(|e| anyhow::anyhow!("read CA {}: {e}", cfg.ca_cert_path))?;
+        let mut identity_pem = std::fs::read(&cfg.client_cert_path)
+            .map_err(|e| anyhow::anyhow!("read client cert {}: {e}", cfg.client_cert_path))?;
+        let mut key = std::fs::read(&cfg.client_key_path)
+            .map_err(|e| anyhow::anyhow!("read client key {}: {e}", cfg.client_key_path))?;
+        identity_pem.push(b'\n');
+        identity_pem.append(&mut key);
+
+        let http = Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&ca)?)
+            .identity(reqwest::Identity::from_pem(&identity_pem)?)
+            .build()?;
+        Ok(Self {
+            base: cfg.api_server_url.trim_end_matches('/').to_string(),
+            http,
+        })
+    }
+}
+
+#[async_trait]
+impl MetricsClient for HttpMetricsClient {
+    async fn get_resource_metric(
+        &self,
+        resource: &str,
+        namespace: &str,
+        _selector: &LabelSelector,
+    ) -> Result<PodMetricsInfo> {
+        let url = format!(
+            "{}/apis/metrics.k8s.io/v1beta1/namespaces/{}/pods",
+            self.base, namespace
+        );
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut info = PodMetricsInfo::new();
+        let now = Utc::now();
+        if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                let name = item
+                    .get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let mut usage = 0i64;
+                if let Some(containers) = item.get("containers").and_then(|c| c.as_array()) {
+                    for c in containers {
+                        if let Some(q) = c
+                            .get("usage")
+                            .and_then(|u| u.get(resource))
+                            .and_then(|v| v.as_str())
+                        {
+                            usage += parse_quantity_milli(q, resource);
+                        }
+                    }
+                }
+                info.insert(
+                    name,
+                    PodMetric {
+                        value: usage,
+                        utilization: Some(100),
+                        timestamp: now,
+                    },
+                );
+            }
+        }
+        if info.is_empty() {
+            anyhow::bail!("no pod metrics for namespace {namespace}");
+        }
+        Ok(info)
+    }
+
+    async fn get_raw_metric(
+        &self,
+        metric: &str,
+        namespace: &str,
+        _selector: &LabelSelector,
+    ) -> Result<PodMetricsInfo> {
+        let url = format!(
+            "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/pods/*/{}",
+            self.base, namespace, metric
+        );
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut info = PodMetricsInfo::new();
+        let now = Utc::now();
+        if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                let name = item
+                    .get("describedObject")
+                    .and_then(|o| o.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let value = item
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .map(|q| parse_quantity_milli(q, metric))
+                    .unwrap_or(0);
+                info.insert(
+                    name,
+                    PodMetric {
+                        value,
+                        utilization: None,
+                        timestamp: now,
+                    },
+                );
+            }
+        }
+        if info.is_empty() {
+            anyhow::bail!("no custom pod metrics for {metric}");
+        }
+        Ok(info)
+    }
+
+    async fn get_object_metric(
+        &self,
+        metric: &str,
+        namespace: &str,
+        object_ref: &CrossVersionObjectReference,
+    ) -> Result<(i64, DateTime<Utc>)> {
+        let url = format!(
+            "{}/apis/custom.metrics.k8s.io/v1beta2/namespaces/{}/{}/{}/{}",
+            self.base,
+            namespace,
+            object_ref.kind.to_lowercase(),
+            object_ref.name,
+            metric
+        );
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let value = body
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(|q| parse_quantity_milli(q, metric))
+            .ok_or_else(|| anyhow::anyhow!("object metric {metric} missing value"))?;
+        Ok((value, Utc::now()))
+    }
+
+    async fn get_external_metric(
+        &self,
+        metric: &str,
+        namespace: &str,
+        _selector: &LabelSelector,
+    ) -> Result<(Vec<i64>, DateTime<Utc>)> {
+        // external.metrics.k8s.io is not implemented server-side (deferred).
+        let url = format!(
+            "{}/apis/external.metrics.k8s.io/v1beta1/namespaces/{}/{}",
+            self.base, namespace, metric
+        );
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let values = body
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("value").and_then(|v| v.as_str()))
+                    .map(|q| parse_quantity_milli(q, metric))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if values.is_empty() {
+            anyhow::bail!("no external metric values for {metric}");
+        }
+        Ok((values, Utc::now()))
+    }
+}
+
+/// Parse a k8s quantity to an integer. CPU is returned in millicores; everything
+/// else as a whole number (best-effort; strips known suffixes).
+fn parse_quantity_milli(q: &str, resource: &str) -> i64 {
+    let q = q.trim();
+    if resource == "cpu" {
+        if let Some(stripped) = q.strip_suffix('m') {
+            return stripped.parse::<i64>().unwrap_or(0);
+        }
+        if let Ok(cores) = q.parse::<f64>() {
+            return (cores * 1000.0) as i64;
+        }
+    }
+    let digits: String = q.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<i64>().unwrap_or(0)
 }
 
 #[cfg(test)]
