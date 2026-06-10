@@ -615,7 +615,6 @@ async fn test_capacity_insufficient_pvc_stays_pending() {
 /// inspect `pv_spec.node_affinity` at all. Once node-aware binding lands
 /// (mirroring upstream `volume_scheduling`), this test should pass.
 #[tokio::test]
-#[ignore = "RED-state: PVBinderController does not yet evaluate spec.nodeAffinity"]
 async fn test_node_affinity_blocks_bind_when_no_matching_node() {
     let storage = setup_test().await;
 

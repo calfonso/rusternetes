@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::{Lease, Node, NodeCondition, NodeStatus, Pod, PodStatus};
@@ -21,9 +21,15 @@ const NODE_MONITOR_GRACE_PERIOD_SECONDS: i64 = 40;
 const POD_EVICTION_TIMEOUT_SECONDS: i64 = 300; // 5 minutes
 const NODE_STARTUP_GRACE_PERIOD_SECS: u64 = 60;
 
+/// Per-node, per-condition snapshot of the last status/transition-time the
+/// controller observed. Used to detect when a condition flips status without the
+/// reporter having refreshed its `lastTransitionTime`.
+type ObservedConditions = HashMap<String, HashMap<String, (String, Option<DateTime<Utc>>)>>;
+
 pub struct NodeController<S: Storage> {
     storage: Arc<S>,
     first_seen: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    observed_conditions: Arc<std::sync::Mutex<ObservedConditions>>,
 }
 
 impl<S: Storage + 'static> NodeController<S> {
@@ -31,6 +37,7 @@ impl<S: Storage + 'static> NodeController<S> {
         Self {
             storage,
             first_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            observed_conditions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -203,6 +210,12 @@ impl<S: Storage + 'static> NodeController<S> {
             info!("Node {} ready status changed to: {}", node_name, is_ready);
             self.update_node_status(node, is_ready).await?;
         }
+
+        // Refresh lastTransitionTime on any non-Ready condition that flipped
+        // status without its reporter (kubelet eviction manager) bumping the
+        // timestamp. Mirrors upstream pkg/controller/nodelifecycle, which keeps
+        // the pressure-condition transition times observable.
+        self.reconcile_condition_transitions(node).await?;
 
         // Manage not-ready/unreachable taints (K8s node lifecycle controller pattern).
         // Always check taints regardless of needs_update — the taint may have been
@@ -394,6 +407,92 @@ impl<S: Storage + 'static> NodeController<S> {
         }
 
         false
+    }
+
+    /// Track each condition's observed status across reconciles and, when a
+    /// non-Ready condition flips status without its reporter refreshing
+    /// `lastTransitionTime`, bump that timestamp to now.
+    ///
+    /// The Ready condition is excluded — its transition time is managed by
+    /// `update_node_status` — but it is still recorded so a spurious bump is
+    /// never applied to it here.
+    ///
+    /// Upstream: the kubelet eviction manager sets pressure conditions and their
+    /// transition times (pkg/kubelet/eviction); the node lifecycle controller
+    /// (pkg/controller/nodelifecycle) observes the flips. rusternetes folds the
+    /// transition-time refresh into the controller because the kubelet stub does
+    /// not yet emit it.
+    async fn reconcile_condition_transitions(&self, node: &Node) -> Result<()> {
+        let node_name = &node.metadata.name;
+        let conditions = match node.status.as_ref().and_then(|s| s.conditions.as_ref()) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        // Condition types whose lastTransitionTime must be refreshed now.
+        let mut to_bump: Vec<String> = Vec::new();
+        {
+            let mut observed = self.observed_conditions.lock().unwrap();
+            let node_cache = observed.entry(node_name.clone()).or_default();
+            for cond in conditions {
+                let prev = node_cache.get(&cond.condition_type).cloned();
+                if cond.condition_type != "Ready" {
+                    if let Some((prev_status, prev_ltt)) = &prev {
+                        if *prev_status != cond.status {
+                            // Status flipped. Did the reporter already bump LTT?
+                            let reporter_bumped = match (cond.last_transition_time, prev_ltt) {
+                                (Some(now_ltt), Some(old_ltt)) => now_ltt > *old_ltt,
+                                (Some(_), None) => true,
+                                _ => false,
+                            };
+                            if !reporter_bumped {
+                                to_bump.push(cond.condition_type.clone());
+                            }
+                        }
+                    }
+                }
+                node_cache.insert(
+                    cond.condition_type.clone(),
+                    (cond.status.clone(), cond.last_transition_time),
+                );
+            }
+        }
+
+        if to_bump.is_empty() {
+            return Ok(());
+        }
+
+        let key = build_key("nodes", None, node_name);
+        let mut updated: Node = self.storage.get(&key).await?;
+        let now = Utc::now();
+        if let Some(status) = updated.status.as_mut() {
+            if let Some(conds) = status.conditions.as_mut() {
+                for c in conds.iter_mut() {
+                    if to_bump.contains(&c.condition_type) {
+                        c.last_transition_time = Some(now);
+                        debug!(
+                            "Node {} condition {} flipped to {}; refreshed lastTransitionTime",
+                            node_name, c.condition_type, c.status
+                        );
+                    }
+                }
+            }
+        }
+        self.storage.update(&key, &updated).await?;
+
+        // Record the refreshed timestamps so the next reconcile sees no flip.
+        {
+            let mut observed = self.observed_conditions.lock().unwrap();
+            if let Some(node_cache) = observed.get_mut(node_name) {
+                for t in &to_bump {
+                    if let Some(entry) = node_cache.get_mut(t) {
+                        entry.1 = Some(now);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Update node status
