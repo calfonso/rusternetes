@@ -157,6 +157,11 @@ pub struct HttpMetricsConfig {
     pub ca_cert_path: String,
     pub client_cert_path: String,
     pub client_key_path: String,
+    /// Skip server-certificate chain verification. The cluster ships a
+    /// self-signed api-server cert (the CA file is a copy of the leaf), which
+    /// rustls rejects as `CaUsedAsEndEntity`. Matches the repo convention for
+    /// the other in-cluster api-server clients (e.g. kubectl).
+    pub insecure_skip_tls_verify: bool,
 }
 
 impl Default for HttpMetricsConfig {
@@ -164,8 +169,9 @@ impl Default for HttpMetricsConfig {
         Self {
             api_server_url: "https://api-server:6443".to_string(),
             ca_cert_path: "/etc/kubernetes/pki/ca.crt".to_string(),
-            client_cert_path: "/etc/kubernetes/pki/controller-manager.crt".to_string(),
-            client_key_path: "/etc/kubernetes/pki/controller-manager.key".to_string(),
+            client_cert_path: "/etc/kubernetes/pki/api-server.crt".to_string(),
+            client_key_path: "/etc/kubernetes/pki/api-server.key".to_string(),
+            insecure_skip_tls_verify: true,
         }
     }
 }
@@ -186,8 +192,6 @@ impl HttpMetricsClient {
             rustls::crypto::aws_lc_rs::default_provider(),
         );
 
-        let ca = std::fs::read(&cfg.ca_cert_path)
-            .map_err(|e| anyhow::anyhow!("read CA {}: {e}", cfg.ca_cert_path))?;
         let mut identity_pem = std::fs::read(&cfg.client_cert_path)
             .map_err(|e| anyhow::anyhow!("read client cert {}: {e}", cfg.client_cert_path))?;
         let mut key = std::fs::read(&cfg.client_key_path)
@@ -199,11 +203,17 @@ impl HttpMetricsClient {
         // reqwest with default features, so native-tls is unified in and would
         // otherwise be the default backend — incompatible with the rustls
         // identity built by `Identity::from_pem`.
-        let http = Client::builder()
+        let mut builder = Client::builder()
             .use_rustls_tls()
-            .add_root_certificate(reqwest::Certificate::from_pem(&ca)?)
-            .identity(reqwest::Identity::from_pem(&identity_pem)?)
-            .build()?;
+            .identity(reqwest::Identity::from_pem(&identity_pem)?);
+        if cfg.insecure_skip_tls_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        } else {
+            let ca = std::fs::read(&cfg.ca_cert_path)
+                .map_err(|e| anyhow::anyhow!("read CA {}: {e}", cfg.ca_cert_path))?;
+            builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&ca)?);
+        }
+        let http = builder.build()?;
         Ok(Self {
             base: cfg.api_server_url.trim_end_matches('/').to_string(),
             http,

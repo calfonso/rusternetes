@@ -268,6 +268,7 @@ async fn main() -> Result<()> {
                 ca_cert_path: args.client_ca_file.clone().unwrap_or_else(|| cert.clone()),
                 client_cert_path: cert.clone(),
                 client_key_path: key.clone(),
+                insecure_skip_tls_verify: true,
             }
         });
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
