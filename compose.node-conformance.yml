@@ -116,7 +116,13 @@ services:
       - "10250:10250"
     volumes:
       - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw
+      # rshared so the tmpfs mounts the kubelet makes for Memory-medium emptyDir
+      # propagate out to the host daemon and into pod containers — otherwise the
+      # pod sees the underlying (ext4) bind dir and the emptyDir-tmpfs
+      # NodeConformance specs fail with `mount type != tmpfs`. Mirrors
+      # compose.sqlite.yml / compose.yml; was missing here since the harness
+      # scaffold (#1066).
+      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw,rshared
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
     environment:
       - RUST_LOG=info
