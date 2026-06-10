@@ -149,6 +149,31 @@ fn spec_has_readiness_probe(spec: &rusternetes_common::resources::pod::PodSpec) 
         .unwrap_or(false)
 }
 
+/// True when every condition named in `spec.readinessGates` is present in
+/// `status.conditions` with status `"True"`. A pod with no readinessGates is
+/// trivially satisfied. Mirrors upstream `GeneratePodReadyCondition`: the Ready
+/// condition ANDs the gates on top of container readiness, so an unsatisfied
+/// gate must hold `Ready=False` even when all containers are ready.
+fn readiness_gates_satisfied(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.readiness_gates.as_ref())
+        .map(|gates| {
+            gates.iter().all(|gate| {
+                pod.status
+                    .as_ref()
+                    .and_then(|st| st.conditions.as_ref())
+                    .map(|conds| {
+                        conds
+                            .iter()
+                            .any(|c| c.condition_type == gate.condition_type && c.status == "True")
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(true)
+}
+
 pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
     serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
 }
@@ -2500,6 +2525,14 @@ impl Kubelet {
                                 .unwrap_or(false);
                             let conditions = if has_readiness_probe {
                                 Self::not_ready_pod_conditions()
+                            } else if !readiness_gates_satisfied(&new_pod) {
+                                // Containers are ready, but an unsatisfied
+                                // readinessGate must hold Ready=False (upstream
+                                // GeneratePodReadyCondition). ContainersReady stays
+                                // True; the gate condition arrives later via the
+                                // status subresource and the reconcile loop flips
+                                // Ready to True.
+                                Self::pod_readiness_conditions(true, false)
                             } else {
                                 Self::running_pod_conditions()
                             };
@@ -2947,6 +2980,13 @@ impl Kubelet {
                         .unwrap_or(false);
                     let conditions = if has_readiness_probe {
                         Self::not_ready_pod_conditions()
+                    } else if !readiness_gates_satisfied(&new_pod) {
+                        // Containers are ready, but an unsatisfied readinessGate
+                        // must hold Ready=False (upstream GeneratePodReadyCondition).
+                        // ContainersReady stays True; the gate condition arrives
+                        // later via the status subresource and the reconcile loop
+                        // flips Ready to True.
+                        Self::pod_readiness_conditions(true, false)
                     } else {
                         Self::running_pod_conditions()
                     };
@@ -3632,26 +3672,7 @@ impl Kubelet {
                             // conditions are supplied via the status subresource.
                             // ContainersReady ignores the gates; only Ready ANDs
                             // them in.
-                            let readiness_gates_satisfied = pod
-                                .spec
-                                .as_ref()
-                                .and_then(|s| s.readiness_gates.as_ref())
-                                .map(|gates| {
-                                    gates.iter().all(|gate| {
-                                        pod.status
-                                            .as_ref()
-                                            .and_then(|st| st.conditions.as_ref())
-                                            .map(|conds| {
-                                                conds.iter().any(|c| {
-                                                    c.condition_type == gate.condition_type
-                                                        && c.status == "True"
-                                                })
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                })
-                                .unwrap_or(true);
-                            let all_ready = containers_ready && readiness_gates_satisfied;
+                            let all_ready = containers_ready && readiness_gates_satisfied(pod);
 
                             // Check if all containers have terminated (for Never/OnFailure restart policies)
                             let restart_policy = pod
@@ -5201,6 +5222,57 @@ mod tests {
             Some("42"),
             "Fallback uses original resourceVersion"
         );
+    }
+
+    #[test]
+    fn readiness_gates_gate_ready_until_condition_true() {
+        use rusternetes_common::resources::pod::PodReadinessGate;
+
+        let gated_spec = || PodSpec {
+            containers: vec![make_container("app")],
+            readiness_gates: Some(vec![PodReadinessGate {
+                condition_type: "www.example.com/feature-1".to_string(),
+            }]),
+            ..Default::default()
+        };
+        let now = chrono::Utc::now();
+        let with_status = |spec: PodSpec, conds: Vec<PodCondition>| {
+            let mut pod = Pod::new("pod-ready", spec);
+            pod.status = Some(PodStatus {
+                conditions: Some(conds),
+                ..Default::default()
+            });
+            pod
+        };
+
+        // No readinessGates at all -> trivially satisfied.
+        let no_gates = Pod::new(
+            "pod-ready",
+            PodSpec {
+                containers: vec![make_container("app")],
+                ..Default::default()
+            },
+        );
+        assert!(super::readiness_gates_satisfied(&no_gates));
+
+        // Gate present but no matching condition -> NOT satisfied (this is the
+        // "initially Ready=False" case the conformance suite checks).
+        let pending = with_status(gated_spec(), vec![cond("ContainersReady", "True", now)]);
+        assert!(!super::readiness_gates_satisfied(&pending));
+
+        // Gate condition present but False -> NOT satisfied.
+        let gate_false = with_status(
+            gated_spec(),
+            vec![cond("www.example.com/feature-1", "False", now)],
+        );
+        assert!(!super::readiness_gates_satisfied(&gate_false));
+
+        // Gate condition present and True -> satisfied.
+        let gate_true = with_status(
+            gated_spec(),
+            vec![cond("www.example.com/feature-1", "True", now)],
+        );
+        assert!(super::readiness_gates_satisfied(&gate_true));
     }
 
     #[test]
