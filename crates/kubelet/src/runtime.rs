@@ -2141,11 +2141,42 @@ impl ContainerRuntime {
     /// content, and the actual write goes through [`write_file_atomic`]
     /// so racing writers can't see partial state.
     fn create_pod_hosts_file(&self, pod: &Pod, pod_ip: Option<&str>) -> Result<Option<String>> {
-        // hostNetwork pods use the host's /etc/hosts directly — skip.
-        let Some(content) =
-            crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain)
-        else {
-            return Ok(None);
+        let spec = pod.spec.as_ref();
+        let is_host_network = spec.and_then(|s| s.host_network).unwrap_or(false);
+        let content = if is_host_network {
+            // A hostNetwork pod's container gets the container runtime's own
+            // /etc/hosts, which lacks the pod's spec.hostAliases. When hostAliases
+            // are set, build a managed file from the node's /etc/hosts plus the
+            // alias entries and bind it in (upstream ensureHostsFile, the
+            // useHostNetwork branch appends HostAliases to the node hosts file).
+            // Without hostAliases there is nothing to add — keep the default file.
+            let aliases: Vec<_> = spec
+                .and_then(|s| s.host_aliases.as_ref())
+                .map(|a| {
+                    a.iter()
+                        .filter(|al| al.hostnames.as_deref().is_some_and(|h| !h.is_empty()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if aliases.is_empty() {
+                return Ok(None);
+            }
+            let mut c = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+            if !c.is_empty() && !c.ends_with('\n') {
+                c.push('\n');
+            }
+            c.push_str("\n# Entries added by HostAliases.\n");
+            for al in aliases {
+                if let Some(h) = al.hostnames.as_deref() {
+                    c.push_str(&format!("{}\t{}\n", al.ip, h.join("\t")));
+                }
+            }
+            c
+        } else {
+            match crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain) {
+                Some(c) => c,
+                None => return Ok(None),
+            }
         };
 
         let pod_name = &pod.metadata.name;
@@ -6546,7 +6577,16 @@ impl ContainerRuntime {
     pub async fn has_terminated_containers(&self, pod: &Pod) -> bool {
         let pod_name = &pod.metadata.name;
         if let Some(spec) = &pod.spec {
-            for container in &spec.containers {
+            // Regular containers plus restartable init containers (sidecars:
+            // restartPolicy=Always). A sidecar that exits must also trigger the
+            // restart reconcile, so it is treated like a regular container here.
+            let restartable_inits = spec
+                .init_containers
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
+            for container in spec.containers.iter().chain(restartable_inits) {
                 let container_name = format!("{}_{}", pod_name, container.name);
                 match self
                     .docker
@@ -6951,9 +6991,67 @@ impl ContainerRuntime {
             // Init container started=true if it's running or has terminated.
             // K8s sets started=true once the container has been started at least once.
             let has_started = is_running || is_terminated;
+
+            // Readiness: a RUNNING restartable init container (sidecar) is ready
+            // per its readiness probe (initialDelaySeconds + threshold), mirroring
+            // a regular container; a started sidecar with no readiness probe is
+            // ready. Its readiness counts toward the pod's ContainersReady
+            // condition (upstream pkg/kubelet/status/generate.go). A regular
+            // (non-restartable) init container is "ready" only when it has
+            // completed successfully (used for init-completion gating).
+            let is_sidecar = ic.restart_policy.as_deref() == Some("Always");
+            let ready = if is_running && is_sidecar {
+                match &ic.readiness_probe {
+                    None => true,
+                    Some(probe) => {
+                        let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
+                        let past_initial_delay = if initial_delay > 0 {
+                            if let ContainerState::Running {
+                                started_at: Some(ref s),
+                            } = &state
+                            {
+                                chrono::DateTime::parse_from_rfc3339(s)
+                                    .map(|started| {
+                                        Utc::now().signed_duration_since(started).num_seconds()
+                                            >= initial_delay as i64
+                                    })
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        } else {
+                            true
+                        };
+                        if !past_initial_delay {
+                            false
+                        } else {
+                            let raw = self
+                                .check_probe(None, &container_name, ic, probe)
+                                .await
+                                .unwrap_or(false);
+                            let success_threshold = probe.success_threshold.unwrap_or(1);
+                            let key = format!("{}/{}/readiness", pod_name, ic.name);
+                            let mut states = self.probe_states.lock().unwrap();
+                            let st = states.entry(key).or_default();
+                            if raw {
+                                st.consecutive_successes += 1;
+                                st.consecutive_failures = 0;
+                                st.consecutive_successes >= success_threshold
+                            } else {
+                                st.consecutive_failures += 1;
+                                st.consecutive_successes = 0;
+                                false
+                            }
+                        }
+                    }
+                }
+            } else {
+                is_terminated
+                    && matches!(&state, ContainerState::Terminated { exit_code, .. } if *exit_code == 0)
+            };
             statuses.push(ContainerStatus {
                 name: ic.name.clone(),
-                ready: is_terminated && matches!(&state, ContainerState::Terminated { exit_code, .. } if *exit_code == 0),
+                ready,
                 restart_count,
                 state: Some(state),
                 last_state,
@@ -7228,7 +7326,7 @@ impl ContainerRuntime {
                     let startup_passed = if running {
                         if let Some(startup_probe) = &container.startup_probe {
                             let raw = self
-                                .check_probe(&container_name, container, startup_probe)
+                                .check_probe(None, &container_name, container, startup_probe)
                                 .await
                                 .unwrap_or(false);
                             let success_threshold = startup_probe.success_threshold.unwrap_or(1);
@@ -7284,7 +7382,7 @@ impl ContainerRuntime {
                                 false // Not ready yet, still within initial delay
                             } else {
                                 let raw = self
-                                    .check_probe(&container_name, container, probe)
+                                    .check_probe(None, &container_name, container, probe)
                                     .await
                                     .unwrap_or(false);
                                 let _failure_threshold = probe.failure_threshold.unwrap_or(3);
@@ -7430,126 +7528,225 @@ impl ContainerRuntime {
     ///
     /// Respects `failureThreshold` (default 3) and `successThreshold` (default 1)
     /// so that a single probe failure does not immediately trigger a restart.
-    pub async fn check_liveness(&self, pod: &Pod) -> Result<bool> {
+    pub async fn check_liveness(&self, pod: &Pod) -> Result<Option<i64>> {
+        // Liveness probes are disabled once a pod is terminating: its containers
+        // are draining (preStop/SIGTERM) and must NOT be restarted even if the
+        // probe now fails (e.g. the app removed its health file on SIGTERM).
+        // Upstream's prober_manager stops liveness workers on pod deletion.
+        // Conformance: "should mark readiness on pods to false and disable
+        // liveness probes while pod is in progress of terminating".
+        if pod.metadata.deletion_timestamp.is_some() {
+            return Ok(None);
+        }
+
         let pod_name = &pod.metadata.name;
+        let spec = pod.spec.as_ref().unwrap();
 
-        for container in &pod.spec.as_ref().unwrap().containers {
-            let container_name = format!("{}_{}", pod_name, container.name);
+        // Regular containers: a failed liveness probe restarts the whole pod
+        // (existing behavior — the pod-restart path increments their counts).
+        // Some(grace) carries the failed probe's terminationGracePeriodSeconds
+        // so the caller kills the pod with the probe's grace, not the pod's.
+        for container in &spec.containers {
+            if let Some(grace) = self.evaluate_container_liveness(pod, container).await {
+                return Ok(Some(grace));
+            }
+        }
 
-            // If a startup probe is defined, check it first.
-            // Liveness probes are disabled until the startup probe succeeds.
-            if let Some(startup_probe) = &container.startup_probe {
-                let startup_key = format!("{}/{}/startup", pod_name, container.name);
-                let raw_result = self
-                    .check_probe(&container_name, container, startup_probe)
-                    .await
-                    .unwrap_or(false);
+        // Restartable init containers (sidecars: restartPolicy=Always) are
+        // restarted individually, NOT by restarting the whole pod (upstream
+        // pkg/kubelet/kuberuntime/kuberuntime_manager.go computePodActions).
+        // Stop just the failed sidecar; reconcile_container_restarts recreates
+        // it with backoff and bumps its init restartCount.
+        let restartable_inits = spec
+            .init_containers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
+        for container in restartable_inits {
+            if self
+                .evaluate_container_liveness(pod, container)
+                .await
+                .is_some()
+            {
+                let container_name = format!("{}_{}", pod_name, container.name);
+                warn!(
+                    "Restarting sidecar (restartable init) container {} after failed liveness probe",
+                    container_name
+                );
+                let _ = self
+                    .docker
+                    .stop_container(
+                        &container_name,
+                        Some(bollard::container::StopContainerOptions { t: 0 }),
+                    )
+                    .await;
+            }
+        }
 
-                let failure_threshold = startup_probe.failure_threshold.unwrap_or(3);
-                let success_threshold = startup_probe.success_threshold.unwrap_or(1);
+        Ok(None) // No regular container needs a pod restart.
+    }
 
-                let startup_passed = {
-                    let mut states = self.probe_states.lock().unwrap();
-                    let state = states.entry(startup_key).or_default();
-                    if raw_result {
-                        state.consecutive_successes += 1;
-                        state.consecutive_failures = 0;
-                        state.consecutive_successes >= success_threshold
+    /// Evaluate a single container's startup + liveness probes with threshold
+    /// tracking. Returns `Some(grace_seconds)` when the startup/liveness probe
+    /// has failed enough consecutive times to warrant a restart, where
+    /// `grace_seconds` is the *probe-level* terminationGracePeriodSeconds when
+    /// set (falling back to the pod's, then 30) — upstream uses the probe's
+    /// grace to kill a unit that failed its probe ("override
+    /// timeoutGracePeriodSeconds when Liveness/StartupProbe field is set").
+    /// Returns `None` when no restart is warranted. Shared by regular containers
+    /// and restartable init containers (sidecars).
+    async fn evaluate_container_liveness(&self, pod: &Pod, container: &Container) -> Option<i64> {
+        let pod_name = &pod.metadata.name;
+        let container_name = format!("{}_{}", pod_name, container.name);
+        let pod_grace = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.termination_grace_period_seconds);
+        let grace_of = |probe: &Probe| {
+            probe
+                .termination_grace_period_seconds
+                .or(pod_grace)
+                .unwrap_or(30)
+        };
+
+        // If a startup probe is defined, check it first.
+        // Liveness probes are disabled until the startup probe succeeds.
+        if let Some(startup_probe) = &container.startup_probe {
+            let startup_key = format!("{}/{}/startup", pod_name, container.name);
+            let raw_result = self
+                .check_probe(Some(pod), &container_name, container, startup_probe)
+                .await
+                .unwrap_or(false);
+
+            let failure_threshold = startup_probe.failure_threshold.unwrap_or(3);
+            let success_threshold = startup_probe.success_threshold.unwrap_or(1);
+
+            // Three outcomes: the startup probe has Passed (success threshold
+            // met → liveness becomes active), is still Pending (gate liveness,
+            // no restart), or has Failed hard (failure threshold exceeded →
+            // the container MUST be restarted, even if the liveness probe would
+            // otherwise succeed). Upstream kuberuntime kills a container whose
+            // startup probe fails; see kuberuntime_manager.go computePodActions.
+            enum StartupOutcome {
+                Passed,
+                Pending,
+                Failed,
+            }
+            let startup_outcome = {
+                let mut states = self.probe_states.lock().unwrap();
+                let state = states.entry(startup_key).or_default();
+                if raw_result {
+                    state.consecutive_successes += 1;
+                    state.consecutive_failures = 0;
+                    if state.consecutive_successes >= success_threshold {
+                        StartupOutcome::Passed
                     } else {
-                        state.consecutive_failures += 1;
-                        state.consecutive_successes = 0;
-                        if state.consecutive_failures >= failure_threshold {
-                            warn!(
-                                "Startup probe exceeded failure threshold ({}) for container {}",
-                                failure_threshold, container_name
-                            );
-                        }
-                        false
+                        StartupOutcome::Pending
                     }
-                };
+                } else {
+                    state.consecutive_failures += 1;
+                    state.consecutive_successes = 0;
+                    if state.consecutive_failures >= failure_threshold {
+                        // Reset so the restarted container starts fresh.
+                        state.consecutive_failures = 0;
+                        StartupOutcome::Failed
+                    } else {
+                        StartupOutcome::Pending
+                    }
+                }
+            };
 
-                if !startup_passed {
+            match startup_outcome {
+                StartupOutcome::Passed => { /* liveness probe is now active */ }
+                StartupOutcome::Pending => {
                     debug!(
                         "Startup probe not yet passing for container {}, skipping liveness check",
                         container_name
                     );
-                    continue;
+                    return None;
                 }
-            }
-
-            if let Some(probe) = &container.liveness_probe {
-                // Wait for initial delay
-                let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
-                if initial_delay > 0 {
-                    // Check container start time
-                    if let Ok(inspect) = self
-                        .docker
-                        .inspect_container(&container_name, None::<InspectContainerOptions>)
-                        .await
-                    {
-                        if let Some(state) = inspect.state {
-                            if let Some(started_at) = state.started_at {
-                                if let Ok(started) =
-                                    chrono::DateTime::parse_from_rfc3339(&started_at)
-                                {
-                                    let elapsed = Utc::now().signed_duration_since(started);
-                                    if elapsed.num_seconds() < initial_delay as i64 {
-                                        debug!("Skipping liveness check, within initial delay");
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Check liveness with threshold tracking
-                let healthy = self.check_probe(&container_name, container, probe).await?;
-                let failure_threshold = probe.failure_threshold.unwrap_or(3);
-                // For liveness probes, Kubernetes requires successThreshold=1
-                let _success_threshold = probe.success_threshold.unwrap_or(1);
-                let liveness_key = format!("{}/{}/liveness", pod_name, container.name);
-
-                let needs_restart = {
-                    let mut states = self.probe_states.lock().unwrap();
-                    let state = states.entry(liveness_key).or_default();
-                    if healthy {
-                        state.consecutive_successes += 1;
-                        state.consecutive_failures = 0;
-                        false
-                    } else {
-                        state.consecutive_failures += 1;
-                        state.consecutive_successes = 0;
-                        if state.consecutive_failures >= failure_threshold {
-                            warn!(
-                                "Liveness probe failed {} consecutive times (threshold {}) for container: {}",
-                                state.consecutive_failures, failure_threshold, container_name
-                            );
-                            // Reset state so next cycle starts fresh after restart
-                            state.consecutive_failures = 0;
-                            true
-                        } else {
-                            debug!(
-                                "Liveness probe failed for container {} ({}/{} failures before restart)",
-                                container_name, state.consecutive_failures, failure_threshold
-                            );
-                            false
-                        }
-                    }
-                };
-
-                if needs_restart {
-                    return Ok(true);
+                StartupOutcome::Failed => {
+                    warn!(
+                        "Startup probe exceeded failure threshold ({}) for container {} — restarting",
+                        failure_threshold, container_name
+                    );
+                    return Some(grace_of(startup_probe));
                 }
             }
         }
 
-        Ok(false) // All probes passed
+        let Some(probe) = &container.liveness_probe else {
+            return None;
+        };
+
+        // Wait for initial delay
+        let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
+        if initial_delay > 0 {
+            // Check container start time
+            if let Ok(inspect) = self
+                .docker
+                .inspect_container(&container_name, None::<InspectContainerOptions>)
+                .await
+            {
+                if let Some(state) = inspect.state {
+                    if let Some(started_at) = state.started_at {
+                        if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+                            let elapsed = Utc::now().signed_duration_since(started);
+                            if elapsed.num_seconds() < initial_delay as i64 {
+                                debug!("Skipping liveness check, within initial delay");
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check liveness with threshold tracking. A probe *error* (as opposed
+        // to a clean failure) is transient — skip this cycle without counting,
+        // matching the original `?`-propagated behavior.
+        let healthy = match self
+            .check_probe(Some(pod), &container_name, container, probe)
+            .await
+        {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        let failure_threshold = probe.failure_threshold.unwrap_or(3);
+        let liveness_key = format!("{}/{}/liveness", pod_name, container.name);
+
+        let mut states = self.probe_states.lock().unwrap();
+        let state = states.entry(liveness_key).or_default();
+        if healthy {
+            state.consecutive_successes += 1;
+            state.consecutive_failures = 0;
+            None
+        } else {
+            state.consecutive_failures += 1;
+            state.consecutive_successes = 0;
+            if state.consecutive_failures >= failure_threshold {
+                warn!(
+                    "Liveness probe failed {} consecutive times (threshold {}) for container: {}",
+                    state.consecutive_failures, failure_threshold, container_name
+                );
+                // Reset state so next cycle starts fresh after restart
+                state.consecutive_failures = 0;
+                Some(grace_of(probe))
+            } else {
+                debug!(
+                    "Liveness probe failed for container {} ({}/{} failures before restart)",
+                    container_name, state.consecutive_failures, failure_threshold
+                );
+                None
+            }
+        }
     }
 
     /// Execute a probe check
     async fn check_probe(
         &self,
+        event_pod: Option<&Pod>,
         container_name: &str,
         container: &Container,
         probe: &Probe,
@@ -7561,7 +7758,7 @@ impl ContainerRuntime {
         // HTTP GET probe
         if let Some(http_get) = &probe.http_get {
             return self
-                .check_http_probe(container_name, container, http_get, timeout)
+                .check_http_probe(event_pod, container_name, container, http_get, timeout)
                 .await;
         }
 
@@ -7828,6 +8025,7 @@ impl ContainerRuntime {
 
     async fn check_http_probe(
         &self,
+        event_pod: Option<&Pod>,
         container_name: &str,
         container: &Container,
         http_get: &HTTPGetAction,
@@ -7863,20 +8061,31 @@ impl ContainerRuntime {
         // Kubernetes probes skip TLS verification (accept self-signed certs).
         // Disable proxy to ensure direct connection to pod IPs.
         //
-        // Do NOT follow redirects: upstream's HTTP prober
-        // (pkg/probe/http/http.go) installs a CheckRedirect that refuses to
-        // follow a redirect to a *non-local* host and treats the 3xx response
-        // itself as the probe result. A 3xx is in the 200-399 success range, so
-        // a redirect (local or non-local) is a probe success — the container is
-        // not restarted. reqwest's default follows up to 10 redirects, so a
-        // non-local redirect chased to an unreachable host turned a healthy
-        // container into a restart loop (the "should *not* be restarted with a
-        // non-local redirect http liveness probe" conformance spec).
+        // Redirect handling mirrors upstream's HTTP prober
+        // (pkg/probe/http/request.go RedirectChecker, followNonLocalRedirects =
+        // false): FOLLOW a redirect to the *same* host (up to 10 hops), but
+        // STOP on a redirect to a *different* host and return the 3xx response
+        // as-is. A 3xx is in the 200-399 success range, so a stopped non-local
+        // redirect is a probe success — the container is NOT restarted — and a
+        // ProbeWarning event is emitted. A same-host redirect is followed to
+        // its real target, whose status then decides success/failure (so a
+        // local redirect to a failing endpoint still restarts the container).
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(true)
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let original_host = attempt.previous().first().and_then(|u| u.host_str());
+                let target_host = attempt.url().host_str();
+                if original_host.is_some() && target_host != original_host {
+                    // Non-local redirect: stop, surface the 3xx response.
+                    attempt.stop()
+                } else if attempt.previous().len() >= 10 {
+                    attempt.error("too many redirects")
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()?;
 
         // Build request with custom headers from probe spec (K8s sends these)
@@ -7894,6 +8103,28 @@ impl ContainerRuntime {
         match request.send().await {
             Ok(response) => {
                 let code = response.status().as_u16();
+                // A final 3xx means a redirect was stopped because it pointed
+                // at a non-local host (same-host redirects were followed above).
+                // Upstream treats this as a probe SUCCESS and records a
+                // ProbeWarning event carrying the response body — matching the
+                // "should *not* be restarted with a non-local redirect http
+                // liveness probe" conformance spec, which waits for that event.
+                if (300..400).contains(&code) {
+                    if let Some(pod) = event_pod {
+                        let body = response.text().await.unwrap_or_default();
+                        let message =
+                            format!("Probe terminated redirects, Response body: {}", body);
+                        self.emit_event(
+                            pod,
+                            Some(&container.name),
+                            "ProbeWarning",
+                            EventType::Warning,
+                            &message,
+                        )
+                        .await;
+                    }
+                    return Ok(true);
+                }
                 // K8s probes consider 200-399 as success
                 Ok((200..400).contains(&code))
             }

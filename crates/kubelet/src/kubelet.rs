@@ -1811,6 +1811,42 @@ impl Kubelet {
                 "Pod {}/{} terminating — stopping containers",
                 namespace, pod_name
             );
+
+            // A pod in the process of terminating is no longer Ready, and its
+            // liveness probes are disabled (see check_liveness, which short-
+            // circuits on a deletionTimestamp). Persist Ready=False /
+            // ContainersReady=False *before* the (blocking) container stop so
+            // watchers observe the readiness flip while the pod drains during
+            // its grace period — upstream marks a terminating pod NotReady
+            // (status_manager + the prober disabling probes on termination).
+            // Conformance: "should mark readiness on pods to false … while …
+            // terminating" waits for this via an informer.
+            {
+                let key = build_key("pods", Some(namespace), pod_name);
+                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                    let original = p.clone();
+                    if let Some(ref mut status) = p.status {
+                        status.conditions = Some(Self::merge_pod_conditions(
+                            status.conditions.as_deref().unwrap_or(&[]),
+                            Self::not_ready_pod_conditions(),
+                        ));
+                        if let Some(ref mut cs) = status.container_statuses {
+                            for c in cs.iter_mut() {
+                                c.ready = false;
+                            }
+                        }
+                        if let Some(ref mut ics) = status.init_container_statuses {
+                            for ic in ics.iter_mut() {
+                                ic.ready = false;
+                            }
+                        }
+                    }
+                    if !pod_status_equal(&original, &p) {
+                        let _ = self.storage.update(&key, &p).await;
+                    }
+                }
+            }
+
             let grace_period = pod
                 .metadata
                 .deletion_grace_period_seconds
@@ -1934,6 +1970,35 @@ impl Kubelet {
             .as_ref()
             .and_then(|s| s.phase.as_ref())
             .unwrap_or(&Phase::Pending);
+
+        // K8s kubelet admission: reject a pod whose declared OS does not match
+        // this node's OS. Our nodes are Linux, so a pod with spec.os.name set to
+        // anything but "linux" is rejected with Phase=Failed and reason
+        // PodOSNotSupported. K8s ref: pkg/kubelet/kubelet_pods.go — the PodOS
+        // admit handler (GetPodOSValidationError / "PodOSNotSupported").
+        if matches!(current_phase, Phase::Pending) && !is_running {
+            if let Some(os) = pod.spec.as_ref().and_then(|s| s.os.as_ref()) {
+                if os.name != "linux" {
+                    info!(
+                        "Pod {}/{} rejected: pod OS {:?} not supported on this (linux) node",
+                        namespace, pod_name, os.name
+                    );
+                    let key = build_key("pods", Some(namespace), pod_name);
+                    if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                        if let Some(ref mut status) = p.status {
+                            status.phase = Some(Phase::Failed);
+                            status.reason = Some("PodOSNotSupported".to_string());
+                            status.message = Some(
+                                "Pod was rejected as the node does not support the requested pod OS"
+                                    .to_string(),
+                            );
+                        }
+                        let _ = self.storage.update(&key, &p).await;
+                    }
+                    return Ok(());
+                }
+            }
+        }
 
         // K8s kubelet admission: check hostPort conflicts before starting the pod.
         // K8s ref: pkg/kubelet/kubelet.go:2752 — allocationManager.AddPod
@@ -3254,9 +3319,9 @@ impl Kubelet {
                 // Check liveness probes
                 // check_liveness may error on transient probe failures — treat errors as "no restart needed"
                 // to ensure the status update branch always runs
-                let needs_restart = self.runtime.check_liveness(pod).await.unwrap_or(false);
+                let restart_grace = self.runtime.check_liveness(pod).await.unwrap_or(None);
                 {
-                    if needs_restart {
+                    if let Some(probe_grace) = restart_grace {
                         let restart_policy = pod
                             .spec
                             .as_ref()
@@ -3304,12 +3369,15 @@ impl Kubelet {
                                     })
                                     .unwrap_or_default();
 
-                                // Stop and restart the pod
-                                let grace = pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.termination_grace_period_seconds)
-                                    .unwrap_or(30);
+                                // Stop and restart the pod using the failed
+                                // probe's terminationGracePeriodSeconds (falls
+                                // back to the pod's, then 30) — upstream uses the
+                                // probe's grace to kill a container that failed
+                                // its probe, not the (possibly much longer) pod
+                                // grace. Conformance "should override
+                                // timeoutGracePeriodSeconds when Liveness/
+                                // StartupProbe field is set".
+                                let grace = probe_grace;
                                 if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
                                     error!("Failed to stop pod for restart: {}", e);
                                 } else {
@@ -3450,7 +3518,35 @@ impl Kubelet {
                         if let Ok(container_statuses) =
                             self.runtime.get_container_statuses(&readiness_pod).await
                         {
-                            let all_ready = container_statuses.iter().all(|s| s.ready);
+                            // Restartable init containers (sidecars) count toward
+                            // ContainersReady too (upstream status/generate.go):
+                            // every sidecar must be ready. Plain init containers
+                            // are excluded — they complete before the main
+                            // containers and aren't part of steady-state readiness.
+                            let init_sidecars_ready = match self
+                                .runtime
+                                .get_init_container_statuses(&readiness_pod)
+                                .await
+                            {
+                                Some(init) => {
+                                    let ics = readiness_pod
+                                        .spec
+                                        .as_ref()
+                                        .and_then(|sp| sp.init_containers.as_ref());
+                                    init.iter().all(|s| {
+                                        let is_sidecar = ics
+                                            .and_then(|list| {
+                                                list.iter().find(|ic| ic.name == s.name)
+                                            })
+                                            .and_then(|ic| ic.restart_policy.as_deref())
+                                            == Some("Always");
+                                        !is_sidecar || s.ready
+                                    })
+                                }
+                                None => true,
+                            };
+                            let all_ready =
+                                container_statuses.iter().all(|s| s.ready) && init_sidecars_ready;
 
                             // Check if all containers have terminated (for Never/OnFailure restart policies)
                             let restart_policy = pod
@@ -3837,7 +3933,17 @@ impl Kubelet {
             .unwrap_or_default();
 
         let now = Instant::now();
-        for c in &spec.containers {
+        // Restart regular containers and restartable init containers (sidecars:
+        // restartPolicy=Always) the same way. start_container handles both; the
+        // backoff map keys on the (unique) container name. Plain init containers
+        // run to completion and are not restarted here.
+        let restartable_inits = spec
+            .init_containers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
+        for c in spec.containers.iter().chain(restartable_inits) {
             let cname = format!("{}_{}", pod_name, c.name);
             if self
                 .runtime
@@ -3938,8 +4044,25 @@ impl Kubelet {
                         }
                     }
                 }
+                // Restartable init containers (sidecars) carry their own
+                // restart counts in init_container_statuses; overlay the backoff
+                // map there too so a restarted sidecar reports its count.
+                let mut init_statuses = self.runtime.get_init_container_statuses(&fresh_pod).await;
+                if let Some(ref mut list) = init_statuses {
+                    let map = self.restart_backoff.lock().unwrap();
+                    for cs in list.iter_mut() {
+                        if let Some(entry) =
+                            map.get(&format!("{}/{}/{}", namespace, pod_name, cs.name))
+                        {
+                            cs.restart_count = entry.restart_count;
+                        }
+                    }
+                }
                 if let Some(ref mut s) = fresh_pod.status {
                     s.container_statuses = Some(statuses);
+                    if init_statuses.is_some() {
+                        s.init_container_statuses = init_statuses;
+                    }
                 }
                 let _ = self.storage.update(&key, &fresh_pod).await;
             }
