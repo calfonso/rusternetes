@@ -12,6 +12,8 @@ pub mod endpointslice;
 pub mod events;
 pub mod garbage_collector;
 pub mod hpa;
+pub mod hpa_metrics_client;
+pub mod hpa_replica_calculator;
 pub mod ingress;
 pub mod job;
 pub mod limitrange;

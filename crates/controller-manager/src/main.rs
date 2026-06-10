@@ -15,6 +15,7 @@ use controllers::{
     events::EventsController,
     garbage_collector::GarbageCollector,
     hpa::HorizontalPodAutoscalerController,
+    hpa_metrics_client::HttpMetricsConfig,
     ingress::IngressController,
     job::JobController,
     loadbalancer::LoadBalancerController,
@@ -96,6 +97,19 @@ struct Args {
     /// Leader election lease duration in seconds
     #[arg(long, default_value = "15")]
     leader_election_lease_duration: u64,
+
+    /// API server base URL for the HPA metrics client
+    #[arg(long, default_value = "https://api-server:6443")]
+    api_server_url: String,
+
+    /// Directory holding the controller-manager client cert/key + CA for the metrics client
+    #[arg(long, default_value = "/etc/kubernetes/pki")]
+    pki_dir: String,
+
+    /// Skip api-server cert verification for the HPA metrics client. Defaults to
+    /// true because the cluster ships a self-signed api-server cert.
+    #[arg(long, default_value_t = true)]
+    metrics_insecure_skip_tls_verify: bool,
 }
 
 #[tokio::main]
@@ -463,7 +477,17 @@ async fn main() -> Result<()> {
     });
 
     // Start HPA controller
-    let hpa_controller = Arc::new(HorizontalPodAutoscalerController::new(storage.clone()));
+    let hpa_metrics_cfg = HttpMetricsConfig {
+        api_server_url: args.api_server_url.clone(),
+        ca_cert_path: format!("{}/ca.crt", args.pki_dir),
+        client_cert_path: format!("{}/api-server.crt", args.pki_dir),
+        client_key_path: format!("{}/api-server.key", args.pki_dir),
+        insecure_skip_tls_verify: args.metrics_insecure_skip_tls_verify,
+    };
+    let hpa_controller = Arc::new(HorizontalPodAutoscalerController::with_config(
+        storage.clone(),
+        hpa_metrics_cfg,
+    ));
     spawn_controller!("HPA controller", leader_elector, {
         let controller = hpa_controller.clone();
         async move {

@@ -15,6 +15,7 @@ use controllers::{
     events::EventsController,
     garbage_collector::GarbageCollector,
     hpa::HorizontalPodAutoscalerController,
+    hpa_metrics_client::HttpMetricsConfig,
     ingress::IngressController,
     job::JobController,
     loadbalancer::LoadBalancerController,
@@ -43,6 +44,9 @@ use tracing::{error, info};
 /// Configuration for the controller-manager component.
 pub struct ControllerManagerConfig {
     pub sync_interval: u64,
+    /// Metrics client config for the HPA controller. When `None`,
+    /// `HttpMetricsConfig::default()` is used (api-server:6443 + /etc/kubernetes/pki).
+    pub metrics_config: Option<HttpMetricsConfig>,
 }
 
 /// Run the controller-manager component.
@@ -55,6 +59,7 @@ pub async fn run(
     info!("Starting Rusternetes Controller Manager");
 
     let interval = config.sync_interval;
+    let hpa_metrics_cfg = config.metrics_config.unwrap_or_default();
 
     // No leader election in all-in-one mode — single instance
     let cloud_provider: Option<Arc<dyn rusternetes_common::cloud_provider::CloudProvider>> = None;
@@ -207,7 +212,10 @@ pub async fn run(
 
     let s = storage.clone();
     tokio::spawn(async move {
-        let c = Arc::new(HorizontalPodAutoscalerController::new(s));
+        let c = Arc::new(HorizontalPodAutoscalerController::with_config(
+            s,
+            hpa_metrics_cfg,
+        ));
         if let Err(e) = c.run().await {
             error!("HPA controller error: {}", e);
         }

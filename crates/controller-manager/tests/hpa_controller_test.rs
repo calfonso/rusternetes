@@ -7,6 +7,7 @@ use rusternetes_common::resources::{
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::hpa::HorizontalPodAutoscalerController;
+use rusternetes_controller_manager::controllers::hpa_metrics_client::FakeMetricsClient;
 use rusternetes_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -158,7 +159,15 @@ fn create_test_hpa(
 #[tokio::test]
 async fn test_hpa_scales_deployment_up_when_cpu_high() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu @ 90% util vs target 80% ⇒ ratio 1.125 (outside ±10% band) ⇒
+    // ceil(2 * 90/80) = 3, genuinely scaling up as the test asserts.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(90))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     // Create deployment with 2 replicas
     let deployment = create_test_deployment("web-app", "default", 2);
@@ -212,7 +221,15 @@ async fn test_hpa_scales_deployment_up_when_cpu_high() {
 #[tokio::test]
 async fn test_hpa_respects_min_replicas() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu @ 5% util vs target 80% ⇒ raw desired ceil(1 * 5/80) = 1, which is
+    // below min_replicas (3) ⇒ the min clamp must raise it to 3.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(5))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     // Create deployment with only 1 replica
     let deployment = create_test_deployment("small-app", "default", 1);
@@ -247,7 +264,15 @@ async fn test_hpa_respects_min_replicas() {
 #[tokio::test]
 async fn test_hpa_respects_max_replicas() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu @ 90% util vs target 80% ⇒ raw desired ceil(20 * 90/80) = 23, far
+    // above max_replicas (5) ⇒ the max clamp must cap it at 5.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(90))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     // Create deployment with many replicas
     let deployment = create_test_deployment("large-app", "default", 20);
@@ -329,7 +354,15 @@ async fn test_hpa_handles_missing_target() {
 #[tokio::test]
 async fn test_hpa_updates_status_conditions() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // A successful cpu metric path so the controller writes the full set of
+    // status conditions (AbleToScale / ScalingActive / ScalingLimited).
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(85))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     // Create deployment
     let deployment = create_test_deployment("status-app", "default", 3);
@@ -505,7 +538,15 @@ async fn test_hpa_multiple_hpas_in_different_namespaces() {
 #[tokio::test]
 async fn test_hpa_scaling_limited_condition_at_max() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu @ 90% util vs target 80% ⇒ raw desired ceil(10 * 90/80) = 12, above
+    // max_replicas (10) ⇒ ScalingLimited=True with reason TooManyReplicas.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(90))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     // Create deployment at max replicas
     let deployment = create_test_deployment("max-app", "default", 10);
@@ -552,7 +593,15 @@ async fn test_hpa_scaling_limited_condition_at_max() {
 #[tokio::test]
 async fn test_hpa_current_metrics_populated() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // Seed a cpu resource reading so status.current_metrics surfaces a
+    // Resource/cpu entry with average_utilization populated.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(85))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     // Create deployment
     let deployment = create_test_deployment("metrics-app", "default", 3);
@@ -738,10 +787,15 @@ async fn test_hpa_scale_down_stabilization_window() {
 /// `Object` / `External` / `ContainerResource` to `current_replicas`
 /// instead of querying any metrics endpoint (see hpa.rs:385-393).
 #[tokio::test]
-#[ignore = "RED-state: custom metrics API not wired up (hpa.rs:385 returns current_replicas)"]
 async fn test_hpa_metrics_server_custom_metrics_integration() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    let mut fake = FakeMetricsClient::new();
+    fake.pods.insert(
+        "requests-per-second".to_string(),
+        FakeMetricsClient::pods_info(&[("p1", 200, None), ("p2", 200, None)]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("custom-metric-app", "default", 2);
     let deploy_key = build_key("deployments", Some("default"), "custom-metric-app");
@@ -814,10 +868,15 @@ async fn test_hpa_metrics_server_custom_metrics_integration() {
 /// RED-state: `External` is in the catch-all `Pods | Object | External |
 /// ContainerResource` arm that returns `current_replicas` unchanged.
 #[tokio::test]
-#[ignore = "RED-state: external metrics API not implemented in hpa.rs"]
 async fn test_hpa_external_metrics() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    let mut fake = FakeMetricsClient::new();
+    // ceil(120/30) = 4 replicas; the test only asserts the External reading
+    // is surfaced in status, not a precise replica count.
+    fake.external
+        .insert("sqs_queue_depth".to_string(), vec![120]);
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("queue-worker", "default", 3);
     let deploy_key = build_key("deployments", Some("default"), "queue-worker");
@@ -892,10 +951,14 @@ async fn test_hpa_external_metrics() {
 /// produce a different aggregate — proving the controller is actually
 /// looking at pod state instead of returning the canned value.
 #[tokio::test]
-#[ignore = "RED-state: per-pod averaging uses mocked utilization (hpa.rs:456-470)"]
 async fn test_hpa_average_utilization_per_pod_calculation() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // Empty fake: the resource metric fetch finds no pod utilization →
+    // fetch error → ScalingActive=False (cannot aggregate per-pod util).
+    let controller = HorizontalPodAutoscalerController::with_metrics_client(
+        storage.clone(),
+        Arc::new(FakeMetricsClient::new()),
+    );
 
     // Zero replicas → no pods → average utilization is undefined. A real
     // controller would surface a FailedGetResourceMetric / scaling-active
@@ -1198,7 +1261,20 @@ async fn test_hpa_behavior_field_round_trips() {
 #[tokio::test]
 async fn test_hpa_multiple_metrics_highest_wins() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu @ 90% util vs target 80% ⇒ ratio 1.125 (outside ±10% band) ⇒
+    // ceil(4 * 90/80) = 5; memory @ 70% util ⇒ ceil(4 * 70/80) = 4
+    // (no growth). Highest wins ⇒ 5.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(90))]),
+    );
+    fake.resource.insert(
+        "memory".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(70))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("multi-metric-app", "default", 4);
     let deploy_key = build_key("deployments", Some("default"), "multi-metric-app");
@@ -1275,10 +1351,14 @@ async fn test_hpa_multiple_metrics_highest_wins() {
 ///
 /// RED-state: hpa.rs treats `Object` as a no-op (returns current_replicas).
 #[tokio::test]
-#[ignore = "RED-state: Object metric type unhandled (hpa.rs:385 falls through to current_replicas)"]
 async fn test_hpa_object_metric_routing() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    let mut fake = FakeMetricsClient::new();
+    // Object metric value vs target=1000; the test asserts the Object reading
+    // is routed/surfaced in status, not a precise replica count.
+    fake.object.insert("requests-per-second".to_string(), 2000);
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("ingress-app", "default", 2);
     storage

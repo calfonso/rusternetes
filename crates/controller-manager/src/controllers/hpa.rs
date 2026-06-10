@@ -10,13 +10,46 @@ use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQue
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use crate::controllers::hpa_metrics_client::{
+    FakeMetricsClient, HttpMetricsClient, HttpMetricsConfig, MetricsClient,
+};
+use crate::controllers::hpa_replica_calculator as calc;
+
 pub struct HorizontalPodAutoscalerController<S: Storage> {
     storage: Arc<S>,
+    metrics_client: Arc<dyn MetricsClient>,
 }
 
 impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
+    /// Default-config constructor — builds an `HttpMetricsClient` from
+    /// `HttpMetricsConfig::default()`. Binaries thread explicit config via
+    /// `with_config`, so this is only used by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self::with_config(storage, HttpMetricsConfig::default())
+    }
+
+    pub fn with_config(storage: Arc<S>, cfg: HttpMetricsConfig) -> Self {
+        let metrics_client: Arc<dyn MetricsClient> = match HttpMetricsClient::new(cfg) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                warn!("HPA metrics client unavailable ({e:#}); metric fetches will fail");
+                Arc::new(FakeMetricsClient::new())
+            }
+        };
+        Self {
+            storage,
+            metrics_client,
+        }
+    }
+
+    /// Test/explicit constructor — inject any MetricsClient.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_metrics_client(storage: Arc<S>, metrics_client: Arc<dyn MetricsClient>) -> Self {
+        Self {
+            storage,
+            metrics_client,
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -185,11 +218,11 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         );
 
         // 2. Calculate desired replica count based on metrics
-        let desired_replicas = match self
+        let (desired_replicas, metric_statuses) = match self
             .calculate_desired_replicas(hpa, current_replicas, namespace)
             .await
         {
-            Ok(replicas) => replicas,
+            Ok(v) => v,
             Err(e) => {
                 warn!(
                     "Failed to calculate desired replicas for HPA {}/{}: {}",
@@ -232,7 +265,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         }
 
         // 4. Update HPA status
-        self.update_hpa_status_success(hpa, current_replicas, desired_replicas)
+        self.update_hpa_status_success(hpa, current_replicas, desired_replicas, metric_statuses)
             .await?;
 
         Ok(())
@@ -315,6 +348,45 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         Ok(())
     }
 
+    /// Resolve the label selector of the HPA's scale target (for pod metrics).
+    async fn target_selector(
+        &self,
+        namespace: &str,
+        target_ref: &rusternetes_common::resources::CrossVersionObjectReference,
+    ) -> rusternetes_common::types::LabelSelector {
+        use rusternetes_common::types::LabelSelector;
+        match target_ref.kind.as_str() {
+            "Deployment" => {
+                let key = build_key("deployments", Some(namespace), &target_ref.name);
+                self.storage
+                    .get::<Deployment>(&key)
+                    .await
+                    .ok()
+                    .map(|d| d.spec.selector)
+                    .unwrap_or_default()
+            }
+            "ReplicaSet" => {
+                let key = build_key("replicasets", Some(namespace), &target_ref.name);
+                self.storage
+                    .get::<ReplicaSet>(&key)
+                    .await
+                    .ok()
+                    .map(|r| r.spec.selector)
+                    .unwrap_or_default()
+            }
+            "StatefulSet" => {
+                let key = build_key("statefulsets", Some(namespace), &target_ref.name);
+                self.storage
+                    .get::<StatefulSet>(&key)
+                    .await
+                    .ok()
+                    .map(|s| s.spec.selector)
+                    .unwrap_or_default()
+            }
+            _ => LabelSelector::default(),
+        }
+    }
+
     /// Calculate desired replica count based on metrics
     /// Implements the HPA algorithm: desiredReplicas = ceil[currentReplicas * (currentMetricValue / targetMetricValue)]
     async fn calculate_desired_replicas(
@@ -322,150 +394,159 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         hpa: &HorizontalPodAutoscaler,
         current_replicas: i32,
         namespace: &str,
-    ) -> Result<i32> {
+    ) -> Result<(i32, Vec<MetricStatus>)> {
         let metrics = match &hpa.spec.metrics {
             Some(m) if !m.is_empty() => m,
-            _ => {
-                // No metrics specified - maintain current replicas
-                return Ok(current_replicas);
-            }
+            _ => return Ok((current_replicas, Vec::new())),
         };
 
-        let mut max_desired_replicas = current_replicas;
-
-        // Iterate through all metrics and take the maximum desired replicas
-        // (Kubernetes HPA uses the highest recommendation)
+        let mut max_desired = current_replicas;
+        let mut statuses = Vec::new();
         for metric in metrics {
-            let desired = self
+            let (desired, status) = self
                 .calculate_replicas_for_metric(metric, current_replicas, namespace, hpa)
                 .await?;
-            if desired > max_desired_replicas {
-                max_desired_replicas = desired;
+            if desired > max_desired {
+                max_desired = desired;
             }
+            statuses.push(status);
         }
 
-        // Apply min/max bounds
         let min_replicas = hpa.spec.min_replicas.unwrap_or(1);
         let max_replicas = hpa.spec.max_replicas;
-
-        let bounded_replicas = max_desired_replicas.max(min_replicas).min(max_replicas);
-
-        debug!(
-            "Calculated replicas: desired={}, min={}, max={}, bounded={}",
-            max_desired_replicas, min_replicas, max_replicas, bounded_replicas
-        );
-
-        Ok(bounded_replicas)
+        let bounded = max_desired.max(min_replicas).min(max_replicas);
+        Ok((bounded, statuses))
     }
 
-    /// Calculate desired replicas for a single metric
+    /// Calculate desired replicas + status for a single metric.
     async fn calculate_replicas_for_metric(
         &self,
         metric: &MetricSpec,
         current_replicas: i32,
         namespace: &str,
         hpa: &HorizontalPodAutoscaler,
-    ) -> Result<i32> {
+    ) -> Result<(i32, MetricStatus)> {
+        let selector = self
+            .target_selector(namespace, &hpa.spec.scale_target_ref)
+            .await;
         match metric.metric_type.as_str() {
             "Resource" => {
-                if let Some(resource) = &metric.resource {
-                    self.calculate_replicas_for_resource_metric(
-                        resource,
-                        current_replicas,
-                        namespace,
-                        hpa,
-                    )
-                    .await
-                } else {
-                    Err(anyhow::anyhow!(
-                        "Resource metric specified but resource field is None"
-                    ))
-                }
+                let r = metric
+                    .resource
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Resource metric without resource field"))?;
+                let target = r.target.average_utilization.unwrap_or(80);
+                let info = self
+                    .metrics_client
+                    .get_resource_metric(&r.name, namespace, &selector)
+                    .await?;
+                let (replicas, avg) = calc::get_resource_replicas(&info, current_replicas, target)?;
+                let status = MetricStatus {
+                    metric_type: "Resource".into(),
+                    resource: Some(ResourceMetricStatus {
+                        name: r.name.clone(),
+                        current: MetricValueStatus {
+                            value: None,
+                            average_value: None,
+                            average_utilization: Some(avg),
+                        },
+                    }),
+                    pods: None,
+                    object: None,
+                    external: None,
+                    container_resource: None,
+                };
+                Ok((replicas, status))
             }
-            "Pods" | "Object" | "External" | "ContainerResource" => {
-                // For now, these metric types are not implemented
-                // In a full implementation, would query custom metrics API
-                debug!(
-                    "Metric type {} not yet implemented, using current replicas",
-                    metric.metric_type
-                );
-                Ok(current_replicas)
+            "Pods" => {
+                let p = metric
+                    .pods
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Pods metric without pods field"))?;
+                let target = parse_target_avg(&p.target)?;
+                let info = self
+                    .metrics_client
+                    .get_raw_metric(&p.metric.name, namespace, &selector)
+                    .await?;
+                let (replicas, avg) = calc::get_metric_replicas(&info, current_replicas, target)?;
+                let status = MetricStatus {
+                    metric_type: "Pods".into(),
+                    resource: None,
+                    pods: Some(rusternetes_common::resources::PodsMetricStatus {
+                        metric: p.metric.clone(),
+                        current: MetricValueStatus {
+                            value: None,
+                            average_value: Some(avg.to_string()),
+                            average_utilization: None,
+                        },
+                    }),
+                    object: None,
+                    external: None,
+                    container_resource: None,
+                };
+                Ok((replicas, status))
             }
-            _ => {
-                warn!("Unknown metric type: {}", metric.metric_type);
-                Ok(current_replicas)
+            "Object" => {
+                let o = metric
+                    .object
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Object metric without object field"))?;
+                let target = parse_target_value(&o.target)?;
+                let (value, _) = self
+                    .metrics_client
+                    .get_object_metric(&o.metric.name, namespace, &o.described_object)
+                    .await?;
+                let (replicas, v) =
+                    calc::get_object_metric_replicas(value, current_replicas, target)?;
+                let status = MetricStatus {
+                    metric_type: "Object".into(),
+                    resource: None,
+                    pods: None,
+                    object: Some(rusternetes_common::resources::ObjectMetricStatus {
+                        metric: o.metric.clone(),
+                        described_object: o.described_object.clone(),
+                        current: MetricValueStatus {
+                            value: Some(v.to_string()),
+                            average_value: None,
+                            average_utilization: None,
+                        },
+                    }),
+                    external: None,
+                    container_resource: None,
+                };
+                Ok((replicas, status))
             }
-        }
-    }
-
-    /// Calculate desired replicas based on resource metric (CPU/memory)
-    async fn calculate_replicas_for_resource_metric(
-        &self,
-        resource: &rusternetes_common::resources::ResourceMetricSource,
-        current_replicas: i32,
-        _namespace: &str,
-        _hpa: &HorizontalPodAutoscaler,
-    ) -> Result<i32> {
-        debug!(
-            "Calculating replicas for resource metric: {}",
-            resource.name
-        );
-
-        // Get target utilization
-        let target_utilization = match resource.target.average_utilization {
-            Some(util) => util as f64,
-            None => {
-                // If no average_utilization, we'd need to use value or average_value
-                // For now, default to 80%
-                debug!("No target utilization specified, defaulting to 80%");
-                80.0
+            "External" => {
+                let e = metric
+                    .external
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("External metric without external field"))?;
+                let target = parse_target_avg(&e.target)?;
+                let default_sel = rusternetes_common::types::LabelSelector::default();
+                let sel = e.metric.selector.as_ref().unwrap_or(&default_sel);
+                let (values, _) = self
+                    .metrics_client
+                    .get_external_metric(&e.metric.name, namespace, sel)
+                    .await?;
+                let (replicas, sum) = calc::get_external_metric_replicas(&values, target)?;
+                let status = MetricStatus {
+                    metric_type: "External".into(),
+                    resource: None,
+                    pods: None,
+                    object: None,
+                    external: Some(rusternetes_common::resources::ExternalMetricStatus {
+                        metric: e.metric.clone(),
+                        current: MetricValueStatus {
+                            value: None,
+                            average_value: Some(sum.to_string()),
+                            average_utilization: None,
+                        },
+                    }),
+                    container_resource: None,
+                };
+                Ok((replicas, status))
             }
-        };
-
-        // In a real implementation, this would query the metrics API
-        // For now, we'll simulate by returning a mock current utilization
-        let current_utilization = self
-            .get_current_resource_utilization(&resource.name)
-            .await?;
-
-        debug!(
-            "Resource {} - current: {}%, target: {}%",
-            resource.name, current_utilization, target_utilization
-        );
-
-        // HPA formula: desiredReplicas = ceil[currentReplicas * (currentMetricValue / targetMetricValue)]
-        let ratio = current_utilization / target_utilization;
-        let desired_replicas = (current_replicas as f64 * ratio).ceil() as i32;
-
-        debug!(
-            "Calculated desired replicas: {} (ratio: {:.2})",
-            desired_replicas, ratio
-        );
-
-        Ok(desired_replicas)
-    }
-
-    /// Get current resource utilization from metrics API
-    /// In a real implementation, this would query metrics.k8s.io/v1beta1
-    /// For now, returns mock data based on simple heuristics
-    async fn get_current_resource_utilization(&self, resource_name: &str) -> Result<f64> {
-        // TODO: Query actual metrics from metrics API
-        // This is where we'd call GET /apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods
-        // and aggregate the metrics across all pods in the target
-
-        match resource_name {
-            "cpu" => {
-                // Mock: return a utilization that would trigger scaling
-                // In reality, this would be calculated from actual pod metrics
-                Ok(85.0) // 85% CPU utilization (above typical 80% target)
-            }
-            "memory" => {
-                Ok(70.0) // 70% memory utilization
-            }
-            _ => {
-                debug!("Unknown resource type: {}, returning 50%", resource_name);
-                Ok(50.0)
-            }
+            other => anyhow::bail!("unsupported metric type: {other}"),
         }
     }
 
@@ -475,6 +556,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         hpa: &HorizontalPodAutoscaler,
         current_replicas: i32,
         desired_replicas: i32,
+        metric_statuses: Vec<MetricStatus>,
     ) -> Result<()> {
         let namespace = hpa.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key(
@@ -485,27 +567,11 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         let mut updated_hpa = hpa.clone();
 
-        // Build metric status (simplified for now)
-        let current_metrics = hpa.spec.metrics.as_ref().map(|specs| {
-            specs
-                .iter()
-                .map(|spec| MetricStatus {
-                    metric_type: spec.metric_type.clone(),
-                    resource: spec.resource.as_ref().map(|r| ResourceMetricStatus {
-                        name: r.name.clone(),
-                        current: MetricValueStatus {
-                            value: None,
-                            average_value: None,
-                            average_utilization: Some(85), // Mock current utilization
-                        },
-                    }),
-                    pods: None,
-                    object: None,
-                    external: None,
-                    container_resource: None,
-                })
-                .collect()
-        });
+        let current_metrics = if metric_statuses.is_empty() {
+            None
+        } else {
+            Some(metric_statuses)
+        };
 
         // Build conditions
         let now = Utc::now();
@@ -677,9 +743,25 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     }
 }
 
+fn parse_target_avg(t: &rusternetes_common::resources::MetricTarget) -> Result<i64> {
+    t.average_value
+        .as_ref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("metric target missing/invalid averageValue"))
+}
+
+fn parse_target_value(t: &rusternetes_common::resources::MetricTarget) -> Result<i64> {
+    t.value
+        .as_ref()
+        .or(t.average_value.as_ref())
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("metric target missing/invalid value"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controllers::hpa_metrics_client::FakeMetricsClient;
     use rusternetes_common::resources::{
         CrossVersionObjectReference, DeploymentSpec, HorizontalPodAutoscalerSpec, MetricSpec,
         MetricTarget, ResourceMetricSource,
@@ -687,6 +769,18 @@ mod tests {
     use rusternetes_common::types::ObjectMeta;
     use rusternetes_storage::MemoryStorage;
     use std::collections::HashMap;
+
+    fn controller_with_cpu_util(
+        storage: std::sync::Arc<MemoryStorage>,
+        utilization: i32,
+    ) -> HorizontalPodAutoscalerController<MemoryStorage> {
+        let mut fake = FakeMetricsClient::new();
+        fake.resource.insert(
+            "cpu".to_string(),
+            FakeMetricsClient::pods_info(&[("pod-a", 0, Some(utilization))]),
+        );
+        HorizontalPodAutoscalerController::with_metrics_client(storage, std::sync::Arc::new(fake))
+    }
 
     #[tokio::test]
     async fn test_get_current_replicas_deployment() {
@@ -781,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn test_calculate_desired_replicas_with_bounds() {
         let storage = Arc::new(MemoryStorage::new());
-        let controller = HorizontalPodAutoscalerController::new(storage);
+        let controller = controller_with_cpu_util(storage, 85);
 
         let spec = HorizontalPodAutoscalerSpec {
             scale_target_ref: CrossVersionObjectReference {
@@ -813,7 +907,7 @@ mod tests {
         let hpa = HorizontalPodAutoscaler::new("test-hpa", "default", spec);
 
         // Test with current replicas = 1 (below min)
-        let desired = controller
+        let (desired, _) = controller
             .calculate_desired_replicas(&hpa, 1, "default")
             .await
             .unwrap();
@@ -824,7 +918,7 @@ mod tests {
         );
 
         // Test with current replicas = 20 (above max)
-        let desired = controller
+        let (desired, _) = controller
             .calculate_desired_replicas(&hpa, 20, "default")
             .await
             .unwrap();
@@ -937,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_hpa_status_idempotent_when_nothing_changes() {
         let storage = Arc::new(MemoryStorage::new());
-        let controller = HorizontalPodAutoscalerController::new(storage.clone());
+        let controller = controller_with_cpu_util(storage.clone(), 85);
 
         // Minimal Deployment with replicas matching what the HPA will compute.
         let mut deployment_spec = DeploymentSpec {
