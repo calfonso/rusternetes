@@ -76,6 +76,10 @@ env:
 jobs:
   hydrophone:
     name: hydrophone (conformance tags)
+    # contents:write lets the "Update badge" step push the latest pass-rate
+    # JSON to the orphan `badges` branch (best-effort; never fails the run).
+    permissions:
+      contents: write
     # Targets the DinD-enabled scale set. If the scale set isn't
     # deployed on the operator's cluster, this job will sit "queued"
     # forever — operator install of the helm release is a manual
@@ -287,6 +291,21 @@ jobs:
         run: |
           bash scripts/conformance-tags-run.sh \
             --output-dir conformance-out
+
+      - name: Update conformance badge
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          passed=0; failed=0
+          shopt -s nullglob
+          for j in conformance-out/*/junit_01.xml; do
+            p=$(grep -oE 'status="passed"' "$j" | wc -l | tr -d ' ')
+            f=$(grep -oE 'status="failed"' "$j" | wc -l | tr -d ' ')
+            passed=$((passed + p)); failed=$((failed + f))
+          done
+          bash scripts/update-badge.sh conformance "conformance" "$passed" "$((passed + failed))"
 
       - name: Upload conformance artifacts
         if: always()
