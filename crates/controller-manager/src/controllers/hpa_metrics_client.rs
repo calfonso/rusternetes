@@ -195,7 +195,12 @@ impl HttpMetricsClient {
         identity_pem.push(b'\n');
         identity_pem.append(&mut key);
 
+        // Force the rustls backend: another workspace crate (kubectl) pulls
+        // reqwest with default features, so native-tls is unified in and would
+        // otherwise be the default backend — incompatible with the rustls
+        // identity built by `Identity::from_pem`.
         let http = Client::builder()
+            .use_rustls_tls()
             .add_root_certificate(reqwest::Certificate::from_pem(&ca)?)
             .identity(reqwest::Identity::from_pem(&identity_pem)?)
             .build()?;
