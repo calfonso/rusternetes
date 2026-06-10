@@ -83,6 +83,10 @@ impl prost::Message for DecodedStatus {
 struct ProbeState {
     consecutive_failures: i32,
     consecutive_successes: i32,
+    /// Last time this probe was actually evaluated, used to honor the probe's
+    /// `periodSeconds` so the failure/success counters advance at most once per
+    /// period regardless of how often the reconcile loop ticks.
+    last_eval: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Per-pod networking implementation kubelet uses. Picked via the
@@ -7614,6 +7618,31 @@ impl ContainerRuntime {
         // Liveness probes are disabled until the startup probe succeeds.
         if let Some(startup_probe) = &container.startup_probe {
             let startup_key = format!("{}/{}/startup", pod_name, container.name);
+
+            // Honor periodSeconds: evaluate (and advance the failure/success
+            // counters) at most once per period, regardless of how often the
+            // reconcile loop ticks. Without this a startup probe with a high
+            // failureThreshold (e.g. 60) races to its threshold in seconds and
+            // restarts the container prematurely. Between periods the startup
+            // probe is still gating the liveness probe, so report no restart.
+            let period = startup_probe.period_seconds.unwrap_or(10).max(1) as i64;
+            let due = {
+                let mut states = self.probe_states.lock().unwrap();
+                let state = states.entry(startup_key.clone()).or_default();
+                let now = Utc::now();
+                let due = state
+                    .last_eval
+                    .map(|t| (now - t).num_seconds() >= period)
+                    .unwrap_or(true);
+                if due {
+                    state.last_eval = Some(now);
+                }
+                due
+            };
+            if !due {
+                return None;
+            }
+
             let raw_result = self
                 .check_probe(Some(pod), &container_name, container, startup_probe)
                 .await
@@ -10957,6 +10986,7 @@ mod tests {
         let mut state = super::ProbeState {
             consecutive_failures: 2,
             consecutive_successes: 0,
+            ..Default::default()
         };
 
         // Then a success resets failures
@@ -10972,6 +11002,7 @@ mod tests {
         let mut state = super::ProbeState {
             consecutive_successes: 1,
             consecutive_failures: 0,
+            ..Default::default()
         };
 
         // Then a failure resets successes
@@ -11050,6 +11081,7 @@ mod tests {
             super::ProbeState {
                 consecutive_failures: 2,
                 consecutive_successes: 0,
+                ..Default::default()
             },
         );
         states.insert(
@@ -11057,6 +11089,7 @@ mod tests {
             super::ProbeState {
                 consecutive_failures: 0,
                 consecutive_successes: 3,
+                ..Default::default()
             },
         );
         states.insert(
@@ -11064,6 +11097,7 @@ mod tests {
             super::ProbeState {
                 consecutive_failures: 1,
                 consecutive_successes: 0,
+                ..Default::default()
             },
         );
 
