@@ -309,13 +309,21 @@ impl ObjectMeta {
         self
     }
 
-    /// Ensure name is populated. If name is empty and generateName is set,
-    /// generate a unique name by appending a random 5-character suffix.
+    /// Resolve `generateName` into a concrete name. If `name` is empty and
+    /// `generateName` is a non-empty prefix, append a random 5-character suffix.
+    ///
+    /// When neither is set the name is left empty so downstream validation can
+    /// reject the object — this must NOT fabricate an `auto-<id>` name, which is
+    /// non-conformant (a create with no name and no generateName is invalid).
+    /// Server-side name generation is normally handled centrally by
+    /// `generate_name_middleware` before any handler runs; this remains for
+    /// in-process callers that build objects directly.
     pub fn ensure_name(&mut self) {
         if self.name.is_empty() {
-            let prefix = self.generate_name.as_deref().unwrap_or("auto-").to_string();
-            let suffix: String = uuid::Uuid::new_v4().to_string().chars().take(5).collect();
-            self.name = format!("{}{}", prefix, suffix);
+            if let Some(prefix) = self.generate_name.as_deref().filter(|p| !p.is_empty()) {
+                let suffix = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
+                self.name = format!("{prefix}{suffix}");
+            }
         }
     }
 

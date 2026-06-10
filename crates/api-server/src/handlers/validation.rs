@@ -752,67 +752,13 @@ pub fn validate_resource_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Apply Kubernetes server-side name generation (ObjectMeta semantics): when
-/// `metadata.name` is empty and `metadata.generateName` is set, synthesise a
-/// unique name as `<generateName><random-suffix>`.
-///
-/// Controllers routinely create objects this way — e.g. cert-manager's
-/// `certificates-key-manager` creates the next-private-key Secret, and the
-/// request manager creates CertificateRequests, with `generateName` and no
-/// name. Without this the create is rejected ("name must be non-empty") and the
-/// controller re-queues forever. Call this BEFORE [`validate_resource_name`] in
-/// every create handler.
-///
-/// No-op when a name is already present or no `generateName` is set.
-pub fn apply_generate_name(metadata: &mut rusternetes_common::types::ObjectMeta) {
-    if metadata.name.is_empty() {
-        if let Some(prefix) = metadata.generate_name.clone().filter(|p| !p.is_empty()) {
-            let suffix: String = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
-            metadata.name = format!("{prefix}{suffix}");
-        }
-    }
-}
+// Server-side name generation (metadata.generateName) is applied centrally by
+// `rusternetes_middleware::generate_name_middleware` for every create request
+// (#1052), so per-handler helpers are no longer needed here.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_apply_generate_name() {
-        use rusternetes_common::types::ObjectMeta;
-
-        // generateName set, name empty -> synthesise <prefix><suffix>
-        let mut m = ObjectMeta {
-            generate_name: Some("smoke-cert-".to_string()),
-            ..Default::default()
-        };
-        apply_generate_name(&mut m);
-        assert!(m.name.starts_with("smoke-cert-"), "got {:?}", m.name);
-        assert!(m.name.len() > "smoke-cert-".len());
-        validate_resource_name(&m.name).expect("synthesised name must be valid");
-
-        // explicit name present -> left untouched even if generateName set
-        let mut m2 = ObjectMeta {
-            name: "fixed".to_string(),
-            generate_name: Some("ignored-".to_string()),
-            ..Default::default()
-        };
-        apply_generate_name(&mut m2);
-        assert_eq!(m2.name, "fixed");
-
-        // neither name nor generateName -> stays empty (caller's validation rejects)
-        let mut m3 = ObjectMeta::default();
-        apply_generate_name(&mut m3);
-        assert!(m3.name.is_empty());
-
-        // empty-string generateName -> no synthesis
-        let mut m4 = ObjectMeta {
-            generate_name: Some(String::new()),
-            ..Default::default()
-        };
-        apply_generate_name(&mut m4);
-        assert!(m4.name.is_empty());
-    }
 
     /// A CRD whose validation schema sets standard JSON-Schema fields to their
     /// zero value (`exclusiveMaximum: false`, `nullable: false`,

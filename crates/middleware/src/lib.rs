@@ -2287,6 +2287,86 @@ fn try_brace_scan_or_type_meta(body_bytes: &[u8]) -> Vec<u8> {
 /// 4 MiB — matches Kubernetes' default max request size.
 const MAX_DUMP_BODY: usize = 4 * 1024 * 1024;
 
+// ============================================================================
+// generate_name_middleware: server-side metadata.generateName for every create
+// ============================================================================
+// Kubernetes lets clients POST an object with an empty `metadata.name` and a
+// `metadata.generateName` prefix; the API server synthesises a unique name.
+// Rather than wire this into ~40 per-resource create handlers (each parses its
+// own typed object), we do it once here, after `normalize_content_type_middleware`
+// has rewritten any CBOR/protobuf body to JSON — so a single JSON pass covers
+// every content type and every built-in (and custom) resource. GitHub #1052.
+
+/// 4 MiB — matches Kubernetes' default max request size.
+const MAX_GENERATE_NAME_BODY: usize = 4 * 1024 * 1024;
+
+/// If `body` is a JSON object whose `metadata.generateName` is a non-empty
+/// prefix and whose `metadata.name` is empty/absent, synthesise
+/// `metadata.name = <prefix><5 hex chars>` and return the rewritten JSON.
+///
+/// Returns `None` when no change is needed (not a JSON object, no generateName,
+/// or a name is already set), so the caller forwards the **original** bytes
+/// untouched — preserving raw-byte strict decoding (e.g. duplicate-field
+/// detection) for the overwhelmingly common path.
+pub fn synthesize_generate_name(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let metadata = value
+        .as_object_mut()?
+        .get_mut("metadata")?
+        .as_object_mut()?;
+
+    let name_already_set = metadata
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|n| !n.is_empty());
+    if name_already_set {
+        return None;
+    }
+
+    let prefix = metadata
+        .get("generateName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.is_empty())?
+        .to_string();
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string()[..5].to_string();
+    metadata.insert(
+        "name".to_string(),
+        serde_json::Value::String(format!("{prefix}{suffix}")),
+    );
+    serde_json::to_vec(&value).ok()
+}
+
+/// Apply server-side name generation to create (POST) requests carrying a JSON
+/// body. Runs after content-type normalisation, so the body is always JSON
+/// here. Non-POST, non-JSON, and already-named requests pass straight through
+/// with their original bytes intact.
+pub async fn generate_name_middleware(req: Request, next: Next) -> Response {
+    let is_json_create = req.method() == axum::http::Method::POST
+        && req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("json"));
+    if !is_json_create {
+        return next.run(req).await;
+    }
+
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_GENERATE_NAME_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "failed to read request body").into_response();
+        }
+    };
+
+    let new_body = match synthesize_generate_name(&bytes) {
+        Some(rewritten) => Body::from(rewritten),
+        None => Body::from(bytes),
+    };
+    next.run(Request::from_parts(parts, new_body)).await
+}
+
 pub async fn capture_payload(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -2811,5 +2891,36 @@ mod tests {
             !uri.path().contains("/watch/"),
             "regular path should not contain /watch/"
         );
+    }
+
+    #[test]
+    fn synthesize_generate_name_fills_empty_name_from_prefix() {
+        let body = br#"{"metadata":{"generateName":"my-cm-"},"data":{"k":"v"}}"#;
+        let out = synthesize_generate_name(body).expect("should synthesise a name");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let name = v["metadata"]["name"].as_str().unwrap();
+        assert!(name.starts_with("my-cm-"), "got {name}");
+        assert_eq!(name.len(), "my-cm-".len() + 5, "prefix + 5 char suffix");
+        // Other fields are preserved.
+        assert_eq!(v["data"]["k"], "v");
+        assert_eq!(v["metadata"]["generateName"], "my-cm-");
+    }
+
+    #[test]
+    fn synthesize_generate_name_noop_when_name_present() {
+        let body = br#"{"metadata":{"name":"fixed","generateName":"my-cm-"}}"#;
+        assert!(
+            synthesize_generate_name(body).is_none(),
+            "an explicit name must win over generateName"
+        );
+    }
+
+    #[test]
+    fn synthesize_generate_name_noop_without_generate_name() {
+        assert!(synthesize_generate_name(br#"{"metadata":{}}"#).is_none());
+        assert!(synthesize_generate_name(br#"{"metadata":{"generateName":""}}"#).is_none());
+        // Subresource/review bodies with no metadata object — left untouched.
+        assert!(synthesize_generate_name(br#"{"spec":{"x":1}}"#).is_none());
+        assert!(synthesize_generate_name(b"not json").is_none());
     }
 }

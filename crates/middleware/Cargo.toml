@@ -16,6 +16,7 @@ rusternetes-storage = { path = "../storage" }
 axum = { workspace = true, features = ["ws"] }
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 ciborium.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
