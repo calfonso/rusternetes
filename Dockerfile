@@ -15,17 +15,11 @@ WORKDIR /app
 # Copy workspace manifest
 COPY Cargo.toml Cargo.lock* ./
 
-# Copy all crate manifests
-COPY crates/api-server/Cargo.toml ./crates/api-server/
-COPY crates/common/Cargo.toml ./crates/common/
-COPY crates/storage/Cargo.toml ./crates/storage/
-COPY crates/scheduler/Cargo.toml ./crates/scheduler/
-COPY crates/controller-manager/Cargo.toml ./crates/controller-manager/
-COPY crates/kubelet/Cargo.toml ./crates/kubelet/
-COPY crates/kube-proxy/Cargo.toml ./crates/kube-proxy/
-COPY crates/kubectl/Cargo.toml ./crates/kubectl/
-
-# Copy all source code
+# Copy all crate manifests + source in one shot. No per-crate manifest
+# pre-copy here: there is no intermediate `cargo build` before the source
+# copy below, so a layered manifest cache buys nothing. (The cache-layered
+# two-pass build lives in Dockerfile.services / Dockerfile.all-in-one, whose
+# per-crate enumeration blocks must stay in sync with the workspace members.)
 COPY crates ./crates
 
 # Build for release
