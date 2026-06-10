@@ -128,6 +128,27 @@ pub struct Kubelet {
 /// doesn't get republished every reconcile cycle. Without this gate, the
 /// terminal-pod paths re-derive status from the runtime on every sync,
 /// write it back blindly, and emit a MODIFIED watch event — every cycle.
+/// Whether a pod's readiness should be gated on a readiness probe — i.e. the
+/// pod must start NOT-ready and only flip Ready once a probe succeeds. This
+/// covers regular containers AND restartable init containers (sidecars): a
+/// sidecar's readiness probe gates pod readiness just like a regular
+/// container's (upstream pkg/kubelet/status/generate.go). Missing this for
+/// sidecars marks the pod Ready immediately, before the probe's
+/// initialDelaySeconds (NodeConformance "readiness before initial delay", #1069).
+fn spec_has_readiness_probe(spec: &rusternetes_common::resources::pod::PodSpec) -> bool {
+    if spec.containers.iter().any(|c| c.readiness_probe.is_some()) {
+        return true;
+    }
+    spec.init_containers
+        .as_ref()
+        .map(|ics| {
+            ics.iter().any(|c| {
+                c.restart_policy.as_deref() == Some("Always") && c.readiness_probe.is_some()
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
     serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
 }
@@ -2475,7 +2496,7 @@ impl Kubelet {
                             let has_readiness_probe = new_pod
                                 .spec
                                 .as_ref()
-                                .map(|s| s.containers.iter().any(|c| c.readiness_probe.is_some()))
+                                .map(spec_has_readiness_probe)
                                 .unwrap_or(false);
                             let conditions = if has_readiness_probe {
                                 Self::not_ready_pod_conditions()
@@ -2922,7 +2943,7 @@ impl Kubelet {
                     let has_readiness_probe = new_pod
                         .spec
                         .as_ref()
-                        .map(|s| s.containers.iter().any(|c| c.readiness_probe.is_some()))
+                        .map(spec_has_readiness_probe)
                         .unwrap_or(false);
                     let conditions = if has_readiness_probe {
                         Self::not_ready_pod_conditions()
@@ -5180,6 +5201,49 @@ mod tests {
             Some("42"),
             "Fallback uses original resourceVersion"
         );
+    }
+
+    #[test]
+    fn spec_has_readiness_probe_includes_sidecars() {
+        use rusternetes_common::resources::pod::{PodSpec, Probe};
+
+        // A restartable init container (sidecar) with a readiness probe gates
+        // pod readiness (#1069).
+        let mut sidecar = make_container("sidecar");
+        sidecar.restart_policy = Some("Always".to_string());
+        sidecar.readiness_probe = Some(serde_json::from_str::<Probe>("{}").unwrap());
+        let spec = PodSpec {
+            containers: vec![make_container("app")],
+            init_containers: Some(vec![sidecar]),
+            ..Default::default()
+        };
+        assert!(super::spec_has_readiness_probe(&spec));
+
+        // No readiness probe anywhere -> not gated.
+        let spec_none = PodSpec {
+            containers: vec![make_container("app")],
+            ..Default::default()
+        };
+        assert!(!super::spec_has_readiness_probe(&spec_none));
+
+        // A regular container's readiness probe still gates.
+        let mut app = make_container("app");
+        app.readiness_probe = Some(serde_json::from_str::<Probe>("{}").unwrap());
+        let spec_reg = PodSpec {
+            containers: vec![app],
+            ..Default::default()
+        };
+        assert!(super::spec_has_readiness_probe(&spec_reg));
+
+        // A plain (non-restartable) init container's probe does NOT gate.
+        let mut plain_init = make_container("init");
+        plain_init.readiness_probe = Some(serde_json::from_str::<Probe>("{}").unwrap());
+        let spec_plain = PodSpec {
+            containers: vec![make_container("app")],
+            init_containers: Some(vec![plain_init]),
+            ..Default::default()
+        };
+        assert!(!super::spec_has_readiness_probe(&spec_plain));
     }
 
     // A container with state=Running signals that the container is still in
