@@ -116,8 +116,14 @@ echo "[4/7] Bootstrapping cluster (kubernetes service, default ServiceAccounts, 
 # pinned in compose.node-conformance.yml) instead of the default
 # `rusternetes-network` the discover-bridge-gateway helper assumes.
 # Point the helper at the right network so CoreDNS gets a valid gateway IP.
+#
+# SKIP_DNS_WIRING=1: this single-node stack ships no in-cluster DNS backend
+# (no rusternetes-dns container), and the [NodeConformance] suite has no
+# cluster-DNS-resolution specs. Skipping the wiring avoids a 30s wait and a
+# misleading "DNS will NOT be functional" warning every run.
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME}" \
 RUSTERNETES_NETWORK_NAME="${RUSTERNETES_NETWORK_NAME:-rusternetes-nc-net}" \
+SKIP_DNS_WIRING=1 \
 bash "${PROJECT_ROOT}/scripts/bootstrap-cluster.sh" || {
     echo "WARNING: bootstrap-cluster.sh exited non-zero — continuing anyway, some BeforeSuite checks may fail."
 }
