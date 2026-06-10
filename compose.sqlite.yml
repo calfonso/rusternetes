@@ -133,7 +133,7 @@ services:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
-    command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "5"]
+    command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "5", "--api-server-url", "https://api-server:6443"]
 
   # Kubelet
   kubelet:

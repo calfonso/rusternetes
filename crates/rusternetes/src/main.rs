@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
         tls_san: args.tls_san.clone(),
         skip_auth: args.skip_auth,
         console_dir: args.console_dir.map(std::path::PathBuf::from),
-        client_ca_file: args.client_ca_file,
+        client_ca_file: args.client_ca_file.clone(),
         ..Default::default()
     };
     let api_handle = tokio::spawn(async move {
@@ -250,8 +250,29 @@ async fn main() -> Result<()> {
 
     // --- Controller Manager ---
     let cm_storage = storage.clone();
+    // The HPA metrics client talks to the in-process api-server over loopback.
+    // Derive the port from the api-server bind address; fall back to 6443.
+    let api_port = args
+        .bind_address
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(6443);
+    let metrics_config = args
+        .tls_cert_file
+        .as_ref()
+        .zip(args.tls_key_file.as_ref())
+        .map(|(cert, key)| {
+            rusternetes_controller_manager::controllers::hpa_metrics_client::HttpMetricsConfig {
+                api_server_url: format!("https://127.0.0.1:{api_port}"),
+                ca_cert_path: args.client_ca_file.clone().unwrap_or_else(|| cert.clone()),
+                client_cert_path: cert.clone(),
+                client_key_path: key.clone(),
+            }
+        });
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
+        metrics_config,
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {

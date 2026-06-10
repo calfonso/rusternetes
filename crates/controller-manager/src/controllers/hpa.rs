@@ -21,7 +21,10 @@ pub struct HorizontalPodAutoscalerController<S: Storage> {
 }
 
 impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
-    /// Production constructor — builds an `HttpMetricsClient` from default config.
+    /// Default-config constructor — builds an `HttpMetricsClient` from
+    /// `HttpMetricsConfig::default()`. Binaries thread explicit config via
+    /// `with_config`, so this is only used by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(storage: Arc<S>) -> Self {
         Self::with_config(storage, HttpMetricsConfig::default())
     }
