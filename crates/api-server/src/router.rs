@@ -16,6 +16,92 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
+/// Serve the `/apis` discovery document, then (for the aggregated
+/// `apidiscovery.k8s.io/v2` inline-resources format) inline each
+/// aggregated/extension API group's resources.
+///
+/// The `rusternetes-discovery` crate is storage-only and cannot HTTP-proxy to
+/// an extension apiserver, so it emits `resources: []` for APIService-backed
+/// groups. Here in the router we have the full [`ApiServerState`] (aggregator
+/// proxy machinery), so we fill those in via
+/// [`crate::handlers::generic::aggregated_discovery_resources`]. Built-in / CRD
+/// groups already carry their resources and have no APIService backend, so they
+/// are left untouched (the resolve returns `None`). See issue #1046 / PR #1010.
+async fn api_groups_with_aggregated_resources(
+    state: Arc<ApiServerState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let resp = handlers::discovery::get_api_groups(Some(state.storage.clone()), headers).await;
+
+    // Only the aggregated v2 inline-resources document carries per-version
+    // `resources` arrays to enrich; the legacy `APIGroupList` has none.
+    let is_aggregated = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("APIGroupDiscoveryList"))
+        .unwrap_or(false);
+    if !is_aggregated {
+        return resp;
+    }
+
+    let (parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => return Response::from_parts(parts, axum::body::Body::empty()),
+    };
+    let mut doc: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Response::from_parts(parts, axum::body::Body::from(bytes)),
+    };
+
+    let mut changed = false;
+    if let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) {
+        for item in items.iter_mut() {
+            let Some(group) = item
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            else {
+                continue;
+            };
+            let Some(versions) = item.get_mut("versions").and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            for ver in versions.iter_mut() {
+                let empty = ver
+                    .get("resources")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(false);
+                if !empty {
+                    continue;
+                }
+                let Some(version) = ver
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                else {
+                    continue;
+                };
+                if let Some(resources) =
+                    handlers::generic::aggregated_discovery_resources(&state, &group, &version)
+                        .await
+                {
+                    ver["resources"] = serde_json::Value::Array(resources);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if !changed {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    let new_bytes = serde_json::to_vec(&doc).unwrap_or_else(|_| bytes.to_vec());
+    Response::from_parts(parts, axum::body::Body::from(new_bytes))
+}
+
 /// Fallback handler for custom resources defined by CRDs
 /// This handler is called for any route not matched by the static routes
 /// It checks if the request matches a CRD and routes to the appropriate handler
@@ -672,7 +758,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis",
             get(
                 |State(s): State<Arc<ApiServerState>>, headers: axum::http::HeaderMap| async move {
-                    handlers::discovery::get_api_groups(Some(s.storage.clone()), headers).await
+                    api_groups_with_aggregated_resources(s, headers).await
                 },
             ),
         )
@@ -680,7 +766,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/",
             get(
                 |State(s): State<Arc<ApiServerState>>, headers: axum::http::HeaderMap| async move {
-                    handlers::discovery::get_api_groups(Some(s.storage.clone()), headers).await
+                    api_groups_with_aggregated_resources(s, headers).await
                 },
             ),
         )
