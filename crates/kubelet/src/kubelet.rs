@@ -1697,6 +1697,42 @@ impl Kubelet {
         // Container removal is NOT done here — left to the container GC.
         if matches!(current_state, PodWorkerState::TerminatedPod) {
             let key = build_key("pods", Some(namespace), pod_name);
+
+            // Keep a gracefully-terminating pod visible (Terminating, NotReady)
+            // until its containers actually stop or the grace period elapses.
+            // stop_pod_for can return — or a concurrent sync can reach finalize —
+            // while a sidecar is still draining; finalizing then removes the pod
+            // from the API within ~2s of deletion, racing the readiness flip so
+            // watchers never observe Ready=False ("mark readiness on pods to
+            // false while pod is in progress of terminating"). Gate on the
+            // container state (fast pods, whose containers stop in ~1s, are not
+            // delayed) with a grace-period backstop for stuck containers.
+            if pod.metadata.deletion_timestamp.is_some() {
+                let grace = pod
+                    .metadata
+                    .deletion_grace_period_seconds
+                    .or_else(|| {
+                        pod.spec
+                            .as_ref()
+                            .and_then(|s| s.termination_grace_period_seconds)
+                    })
+                    .unwrap_or(30);
+                let grace_elapsed = pod
+                    .metadata
+                    .deletion_timestamp
+                    .map(|dt| (chrono::Utc::now() - dt).num_seconds() >= grace)
+                    .unwrap_or(true);
+                let containers_running =
+                    self.runtime.is_pod_running(pod_name).await.unwrap_or(false);
+                if containers_running && !grace_elapsed {
+                    debug!(
+                        "Pod {}/{} terminating — keeping visible until containers stop ({}s grace)",
+                        namespace, pod_name, grace
+                    );
+                    return Ok(());
+                }
+            }
+
             let has_finalizers = pod
                 .metadata
                 .finalizers
@@ -3907,6 +3943,12 @@ impl Kubelet {
     /// K8s ref: `pkg/kubelet/kuberuntime/kuberuntime_manager.go`
     /// (computePodActions + doBackOff) and `client-go/util/flowcontrol.Backoff`.
     async fn reconcile_container_restarts(&self, namespace: &str, pod_name: &str, pod: &Pod) {
+        // Never restart containers of a terminating pod: its containers are being
+        // shut down on purpose, and restarting a sidecar mid-drain would keep the
+        // pod alive past its grace period and prevent it from being finalized.
+        if pod.metadata.deletion_timestamp.is_some() {
+            return;
+        }
         let restart_policy = pod
             .spec
             .as_ref()
