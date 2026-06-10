@@ -7,6 +7,7 @@ use rusternetes_common::resources::{
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::hpa::HorizontalPodAutoscalerController;
+use rusternetes_controller_manager::controllers::hpa_metrics_client::FakeMetricsClient;
 use rusternetes_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -738,10 +739,15 @@ async fn test_hpa_scale_down_stabilization_window() {
 /// `Object` / `External` / `ContainerResource` to `current_replicas`
 /// instead of querying any metrics endpoint (see hpa.rs:385-393).
 #[tokio::test]
-#[ignore = "RED-state: custom metrics API not wired up (hpa.rs:385 returns current_replicas)"]
 async fn test_hpa_metrics_server_custom_metrics_integration() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    let mut fake = FakeMetricsClient::new();
+    fake.pods.insert(
+        "requests-per-second".to_string(),
+        FakeMetricsClient::pods_info(&[("p1", 200, None), ("p2", 200, None)]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("custom-metric-app", "default", 2);
     let deploy_key = build_key("deployments", Some("default"), "custom-metric-app");
@@ -814,10 +820,15 @@ async fn test_hpa_metrics_server_custom_metrics_integration() {
 /// RED-state: `External` is in the catch-all `Pods | Object | External |
 /// ContainerResource` arm that returns `current_replicas` unchanged.
 #[tokio::test]
-#[ignore = "RED-state: external metrics API not implemented in hpa.rs"]
 async fn test_hpa_external_metrics() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    let mut fake = FakeMetricsClient::new();
+    // ceil(120/30) = 4 replicas; the test only asserts the External reading
+    // is surfaced in status, not a precise replica count.
+    fake.external
+        .insert("sqs_queue_depth".to_string(), vec![120]);
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("queue-worker", "default", 3);
     let deploy_key = build_key("deployments", Some("default"), "queue-worker");
@@ -892,10 +903,14 @@ async fn test_hpa_external_metrics() {
 /// produce a different aggregate — proving the controller is actually
 /// looking at pod state instead of returning the canned value.
 #[tokio::test]
-#[ignore = "RED-state: per-pod averaging uses mocked utilization (hpa.rs:456-470)"]
 async fn test_hpa_average_utilization_per_pod_calculation() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // Empty fake: the resource metric fetch finds no pod utilization →
+    // fetch error → ScalingActive=False (cannot aggregate per-pod util).
+    let controller = HorizontalPodAutoscalerController::with_metrics_client(
+        storage.clone(),
+        Arc::new(FakeMetricsClient::new()),
+    );
 
     // Zero replicas → no pods → average utilization is undefined. A real
     // controller would surface a FailedGetResourceMetric / scaling-active
@@ -1275,10 +1290,14 @@ async fn test_hpa_multiple_metrics_highest_wins() {
 ///
 /// RED-state: hpa.rs treats `Object` as a no-op (returns current_replicas).
 #[tokio::test]
-#[ignore = "RED-state: Object metric type unhandled (hpa.rs:385 falls through to current_replicas)"]
 async fn test_hpa_object_metric_routing() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    let mut fake = FakeMetricsClient::new();
+    // Object metric value vs target=1000; the test asserts the Object reading
+    // is routed/surfaced in status, not a precise replica count.
+    fake.object.insert("requests-per-second".to_string(), 2000);
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("ingress-app", "default", 2);
     storage
