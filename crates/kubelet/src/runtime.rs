@@ -324,6 +324,15 @@ fn unmount_tmpfs(dir: &str) {
     }
 }
 
+/// Convert a sysctl name to the dot-separated form the container runtime and
+/// the kernel `/proc/sys` mapping expect. Kubernetes accepts `/` and `.`
+/// interchangeably as separators (e.g. `kernel/shm_rmid_forced` ==
+/// `kernel.shm_rmid_forced`); Docker's `HostConfig.Sysctls` keys must be
+/// dotted. Mirrors upstream `convertSysctlVariableToDotsSeparator`.
+fn sysctl_name_to_dotted(name: &str) -> String {
+    name.replace('/', ".")
+}
+
 /// Parse a Kubernetes resource.Quantity (e.g. `1Gi`, `512Mi`, `100M`) into a
 /// byte count. Returns None on unrecognised input. Supports the binary (Ki, Mi,
 /// Gi, Ti) and decimal (k/K, M, G, T) suffixes used for memory quantities.
@@ -2559,7 +2568,7 @@ impl ContainerRuntime {
             .map(|sysctls| {
                 sysctls
                     .iter()
-                    .map(|s| (s.name.clone(), s.value.clone()))
+                    .map(|s| (sysctl_name_to_dotted(&s.name), s.value.clone()))
                     .collect()
             });
 
@@ -9904,7 +9913,29 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_quantity_bytes, pod_dir_key, split_image_reference, write_file_atomic};
+    use super::{
+        parse_quantity_bytes, pod_dir_key, split_image_reference, sysctl_name_to_dotted,
+        write_file_atomic,
+    };
+
+    #[test]
+    fn sysctl_name_to_dotted_converts_slashes() {
+        // Docker's HostConfig.Sysctls keys must be dot-separated; Kubernetes
+        // accepts the slash form too (#1068).
+        assert_eq!(
+            sysctl_name_to_dotted("kernel/shm_rmid_forced"),
+            "kernel.shm_rmid_forced"
+        );
+        assert_eq!(
+            sysctl_name_to_dotted("net/ipv4/tcp_syncookies"),
+            "net.ipv4.tcp_syncookies"
+        );
+        // Already-dotted names are unchanged.
+        assert_eq!(
+            sysctl_name_to_dotted("kernel.shm_rmid_forced"),
+            "kernel.shm_rmid_forced"
+        );
+    }
 
     #[test]
     fn parse_quantity_bytes_handles_binary_and_decimal_suffixes() {
@@ -11440,7 +11471,7 @@ mod tests {
             .map(|sysctls| {
                 sysctls
                     .iter()
-                    .map(|s| (s.name.clone(), s.value.clone()))
+                    .map(|s| (sysctl_name_to_dotted(&s.name), s.value.clone()))
                     .collect()
             })
     }
