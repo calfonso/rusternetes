@@ -36,9 +36,10 @@ jsonwebtoken.workspace = true
 rcgen.workspace = true
 pem.workspace = true
 base64.workspace = true
+async-trait = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 x509-parser = { workspace = true }
 
 [features]
