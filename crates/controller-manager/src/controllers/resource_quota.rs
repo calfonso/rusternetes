@@ -296,20 +296,21 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         // that cause resourceVersion conflicts with concurrent test PATCH operations
         if quota.status != new_status {
             let key = build_key("resourcequotas", Some(namespace), quota_name);
-            // Re-read for fresh resourceVersion to avoid CAS conflicts. If the
-            // quota was deleted concurrently (e.g. a DeleteCollection racing this
-            // reconcile), the re-read fails — skip the status update rather than
-            // writing back the stale cached copy, which would resurrect the
-            // just-deleted quota.
-            let mut updated_quota: ResourceQuota = match self.storage.get(&key).await {
-                Ok(q) => q,
-                Err(_) => return Ok(()),
-            };
-            // Check again after re-read (may have been updated concurrently)
-            if updated_quota.status != new_status {
-                updated_quota.status = new_status;
-                self.storage.update(&key, &updated_quota).await?;
-                debug!("Updated quota {}/{} status", namespace, quota_name);
+            // Write the status SUBRESOURCE only. `update_status` re-reads the
+            // current object and grafts just `.status` onto it under a CAS
+            // retry, so this reconcile — which computed status from a possibly
+            // stale list snapshot — can never write a stale spec back. Writing
+            // the whole object here would revert a spec the client just updated
+            // (the ResourceQuota update+delete conformance flake, #268).
+            let mut desired = quota.clone();
+            desired.status = new_status;
+            match self.storage.update_status(&key, &desired).await {
+                Ok(_) => debug!("Updated quota {}/{} status", namespace, quota_name),
+                // Deleted concurrently (e.g. a DeleteCollection racing this
+                // reconcile): nothing to update, and update_status never
+                // re-creates, so the quota stays deleted (no resurrection).
+                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
             }
         }
 
