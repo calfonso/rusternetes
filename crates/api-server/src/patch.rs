@@ -1181,9 +1181,46 @@ pub fn deep_merge_objects(target: &mut serde_json::Value, patch: &serde_json::Va
                     .entry(k.clone())
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 deep_merge_objects(existing, v);
+            } else if v.is_array() && k == "conditions" {
+                // `conditions` arrays carry a strategic merge key of `type`
+                // (patchMergeKey). A sparse status patch — e.g. setting a single
+                // readinessGate condition — must update/add that condition by
+                // type without dropping the others. A plain insert would replace
+                // the whole array and lose previously-patched conditions.
+                let existing = target_obj
+                    .entry(k.clone())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                merge_conditions_by_type(existing, v);
             } else {
                 target_obj.insert(k.clone(), v.clone());
             }
+        }
+    }
+}
+
+/// Merge a `conditions` patch array into the target array by the `type` key:
+/// patch entries update the matching existing condition (deep-merged) or are
+/// appended; existing conditions absent from the patch are preserved.
+fn merge_conditions_by_type(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let Some(patch_arr) = patch.as_array() else {
+        return;
+    };
+    let target_arr = match target.as_array_mut() {
+        Some(a) => a,
+        None => {
+            *target = patch.clone();
+            return;
+        }
+    };
+    for pc in patch_arr {
+        let ptype = pc.get("type").and_then(|t| t.as_str());
+        match ptype.and_then(|pt| {
+            target_arr
+                .iter_mut()
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(pt))
+        }) {
+            Some(existing) => deep_merge_objects(existing, pc),
+            None => target_arr.push(pc.clone()),
         }
     }
 }
