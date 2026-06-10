@@ -74,6 +74,12 @@ pub async fn create(
     Query(params): Query<HashMap<String, String>>,
     DumpingJson(mut secret): DumpingJson<Secret>,
 ) -> Result<(StatusCode, Json<Secret>)> {
+    // Server-side name generation: cert-manager (and other controllers) create
+    // Secrets with `metadata.generateName` and no name (e.g. the next-private-key
+    // Secret). Synthesise the name before validation, or the create is rejected
+    // ("name must be non-empty") and the controller re-queues forever.
+    crate::handlers::validation::apply_generate_name(&mut secret.metadata);
+
     info!(
         "Creating secret: {} in namespace: {}",
         secret.metadata.name, namespace
