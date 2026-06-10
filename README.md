@@ -1,5 +1,8 @@
 # Rūsternetes
 
+[![Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fconformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/conformance-canary.yml)
+[![Node Conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Findyjonesnl%2Frusternetes%2Fbadges%2Fnode-conformance.json)](https://github.com/indyjonesnl/rusternetes/actions/workflows/node-conformance.yml)
+
 **A ground-up reimplementation of Kubernetes in Rust.** [Documentation Site](https://calfonso.github.io/rusternetes/)
 
 This isn't a wrapper around the Go codebase or a partial mock. Every component — API server, scheduler, controller manager, kubelet, kube-proxy — is written from scratch in Rust, implementing the actual Kubernetes API surface, wire format, and behavioral semantics.

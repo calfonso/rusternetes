@@ -23,6 +23,10 @@ on:
 jobs:
   node-conformance:
     runs-on: arc-runner-set-conformance
+    # contents:write lets the "Update badge" step push the latest pass-rate
+    # JSON to the orphan `badges` branch (best-effort; never fails the run).
+    permissions:
+      contents: write
     # Image build + bootstrap (~15m) plus the ginkgo suite. The suite runs
     # ~190 [NodeConformance] specs; with GINKGO_NODES=4 parallelism a full pass
     # measured ~53m locally, and GINKGO_TIMEOUT defaults to 85m. 120m leaves
@@ -81,6 +85,21 @@ jobs:
           name: node-conformance-log-${{ github.run_id }}
           path: /tmp/node-conformance/ginkgo.log
           if-no-files-found: warn
+
+      - name: Update node-conformance badge
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          log=/tmp/node-conformance/ginkgo.log
+          [ -f "$log" ] || { echo "no ginkgo.log — skipping badge"; exit 0; }
+          # ginkgo summary line, e.g. "SUCCESS! -- 180 Passed | 11 Failed | 0 Pending | 7157 Skipped"
+          line=$(grep -oE '[0-9]+ Passed \| [0-9]+ Failed' "$log" | tail -1)
+          passed=$(echo "$line" | grep -oE '^[0-9]+')
+          failed=$(echo "$line" | sed -nE 's/.*\| ([0-9]+) Failed/\1/p')
+          : "${passed:=0}"; : "${failed:=0}"
+          bash scripts/update-badge.sh node-conformance "node conformance" "$passed" "$((passed + failed))"
 
       - name: Tear down stack
         if: always()
