@@ -1027,10 +1027,11 @@ pub async fn inject_service_account_token<S: Storage>(
         spec.service_account_name = Some(sa_name.clone());
     }
 
-    // Look up the ServiceAccount to check its automount setting
+    // Look up the ServiceAccount once: we need both its automount setting and
+    // its imagePullSecrets list below.
     let sa_key = format!("/registry/serviceaccounts/{}/{}", namespace, sa_name);
-    let sa_automount = match storage.get::<ServiceAccount>(&sa_key).await {
-        Ok(sa) => sa.automount_service_account_token,
+    let service_account = match storage.get::<ServiceAccount>(&sa_key).await {
+        Ok(sa) => Some(sa),
         Err(_) => {
             warn!(
                 "Service account {}/{} does not exist, but proceeding with token injection",
@@ -1039,6 +1040,47 @@ pub async fn inject_service_account_token<S: Storage>(
             None
         }
     };
+    let sa_automount = service_account
+        .as_ref()
+        .and_then(|sa| sa.automount_service_account_token);
+
+    // Propagate the ServiceAccount's imagePullSecrets onto the pod.
+    //
+    // K8s ref: plugin/pkg/admission/serviceaccount/admission.go (release-1.35)
+    // `Plugin.Admit`: the SA's imagePullSecrets are copied onto the pod ONLY
+    // when the pod declares none of its own — there is no merge, a pod-level
+    // list wins outright. This runs regardless of automount (a pod can opt out
+    // of token mounting but still inherit pull secrets).
+    if let Some(sa) = service_account.as_ref() {
+        let pod_has_secrets = spec
+            .image_pull_secrets
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !pod_has_secrets {
+            if let Some(sa_secrets) = sa.image_pull_secrets.as_ref() {
+                if !sa_secrets.is_empty() {
+                    spec.image_pull_secrets = Some(
+                        sa_secrets
+                            .iter()
+                            .map(
+                                |r| rusternetes_common::resources::pod::LocalObjectReference {
+                                    name: r.name.clone(),
+                                },
+                            )
+                            .collect(),
+                    );
+                    info!(
+                        "Propagated {} imagePullSecret(s) from SA {}/{} to pod {}",
+                        sa_secrets.len(),
+                        namespace,
+                        sa_name,
+                        pod.metadata.name
+                    );
+                }
+            }
+        }
+    }
 
     // Determine whether to mount the SA token.
     // Pod-level setting takes precedence over SA-level.
@@ -1863,5 +1905,79 @@ mod tests {
             .admit(&storage, "ns", &pod)
             .await
             .expect("compliant restricted pod must be admitted");
+    }
+
+    // ---- imagePullSecrets propagation (SA admission, upstream parity) -------
+
+    async fn put_sa<S: Storage>(storage: &Arc<S>, ns: &str, name: &str, secrets: &[&str]) {
+        let sa: ServiceAccount = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": name, "namespace": ns},
+            "imagePullSecrets": secrets.iter().map(|s| serde_json::json!({"name": s})).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let key = format!("/registry/serviceaccounts/{}/{}", ns, name);
+        storage.create(&key, &sa).await.unwrap();
+    }
+
+    fn pull_secret_names(pod: &Pod) -> Vec<String> {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.image_pull_secrets.as_ref())
+            .map(|v| v.iter().map(|r| r.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn imagepullsecrets_propagated_from_sa_when_pod_has_none() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_sa(&storage, "ns", "default", &["regcred", "ghcr"]).await;
+        let mut pod = make_pod("p", None, None);
+        inject_service_account_token(&storage, "ns", &mut pod)
+            .await
+            .unwrap();
+        assert_eq!(pull_secret_names(&pod), vec!["regcred", "ghcr"]);
+    }
+
+    #[tokio::test]
+    async fn imagepullsecrets_pod_list_wins_no_merge() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_sa(&storage, "ns", "default", &["regcred"]).await;
+        let mut pod = make_pod("p", None, None);
+        // Pod already declares its own secret — SA list must NOT be appended.
+        pod.spec.as_mut().unwrap().image_pull_secrets = Some(vec![
+            rusternetes_common::resources::pod::LocalObjectReference {
+                name: "pod-own".to_string(),
+            },
+        ]);
+        inject_service_account_token(&storage, "ns", &mut pod)
+            .await
+            .unwrap();
+        assert_eq!(pull_secret_names(&pod), vec!["pod-own"]);
+    }
+
+    #[tokio::test]
+    async fn imagepullsecrets_noop_when_sa_has_none() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_sa(&storage, "ns", "default", &[]).await;
+        let mut pod = make_pod("p", None, None);
+        inject_service_account_token(&storage, "ns", &mut pod)
+            .await
+            .unwrap();
+        assert!(pull_secret_names(&pod).is_empty());
+    }
+
+    #[tokio::test]
+    async fn imagepullsecrets_propagated_even_when_automount_disabled() {
+        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        put_sa(&storage, "ns", "default", &["regcred"]).await;
+        let mut pod = make_pod("p", None, None);
+        // automount off must not block imagePullSecrets propagation.
+        pod.spec.as_mut().unwrap().automount_service_account_token = Some(false);
+        inject_service_account_token(&storage, "ns", &mut pod)
+            .await
+            .unwrap();
+        assert_eq!(pull_secret_names(&pod), vec!["regcred"]);
     }
 }
