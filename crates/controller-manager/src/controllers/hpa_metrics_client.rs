@@ -4,10 +4,9 @@
 //! impl (`HttpMetricsClient`) queries the api-server metrics endpoints over
 //! mTLS; tests inject `FakeMetricsClient`.
 //!
-//! The trait surface + test double land ahead of the consumer (a later task
-//! wires the HPA controller to it), so the whole module is `allow(dead_code)`
-//! until then — matching the pattern used by other staged controllers in this
-//! crate.
+//! Some surface (the `PodMetric::timestamp` field, the `pods_info` test helper)
+//! is only exercised in tests, so the module keeps `allow(dead_code)` to stay
+//! clean under `--all-targets` clippy on the binary crate.
 #![allow(dead_code)]
 
 use anyhow::Result;
