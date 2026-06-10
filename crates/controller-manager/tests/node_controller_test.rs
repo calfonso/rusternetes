@@ -481,7 +481,6 @@ async fn test_node_ready_condition_last_transition_time_preserved_on_no_flip() {
 }
 
 #[tokio::test]
-#[ignore = "RED-state: NodeController does not refresh NodeCondition.lastTransitionTime when a non-Ready condition (MemoryPressure here) flips status (upstream pkg/controller/nodelifecycle + pkg/kubelet/eviction)"]
 async fn test_node_pressure_condition_transitions_observed() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = NodeController::new(storage.clone());

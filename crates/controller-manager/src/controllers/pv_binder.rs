@@ -1,9 +1,10 @@
 use anyhow::Result;
 use rusternetes_common::resources::volume::{
-    PersistentVolumeClaimPhase, PersistentVolumeClaimStatus, PersistentVolumePhase,
+    NodeSelectorTerm, PersistentVolumeClaimPhase, PersistentVolumeClaimStatus,
+    PersistentVolumePhase, VolumeNodeAffinity,
 };
 use rusternetes_common::resources::{
-    PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus,
+    Node, PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus,
 };
 use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
@@ -174,6 +175,10 @@ impl<S: Storage + 'static> PVBinderController<S> {
 
         debug!("Found {} PVs to check for binding", pvs.len());
 
+        // Lazily-loaded node inventory, only fetched when a candidate PV
+        // actually declares node affinity (upstream `volume_scheduling`).
+        let mut nodes_cache: Option<Vec<Node>> = None;
+
         // Find a matching available PV
         for mut pv in pvs {
             debug!("Checking PV {} (storage_class={:?}, capacity={:?}, access_modes={:?}, claim_ref={:?})",
@@ -196,6 +201,31 @@ impl<S: Storage + 'static> PVBinderController<S> {
             );
             if !matches {
                 continue;
+            }
+
+            // Honor the PV's required node affinity (upstream parity with
+            // `pkg/controller/volume/scheduling`): a PV constrained to a node
+            // topology must not bind unless at least one node in the cluster
+            // satisfies that constraint. Otherwise the bound volume could never
+            // be mounted by any pod.
+            if let Some(node_affinity) = pv.spec.node_affinity.as_ref() {
+                if node_affinity.required.is_some() {
+                    let nodes = match nodes_cache.as_ref() {
+                        Some(n) => n,
+                        None => {
+                            let listed: Vec<Node> = self.storage.list("/registry/nodes/").await?;
+                            nodes_cache = Some(listed);
+                            nodes_cache.as_ref().unwrap()
+                        }
+                    };
+                    if !node_affinity_satisfied(node_affinity, nodes) {
+                        debug!(
+                            "Skipping PV {}: required nodeAffinity matches no node",
+                            pv.metadata.name
+                        );
+                        continue;
+                    }
+                }
             }
 
             info!(
@@ -341,6 +371,81 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 pv_storage >= pvc_storage
             }
         }
+    }
+}
+
+/// True if at least one node satisfies the PV's required node affinity.
+///
+/// `required.nodeSelectorTerms` are ORed; within a term every match expression
+/// and match field must hold (AND). Mirrors upstream
+/// `pkg/apis/core/v1/helper.MatchNodeSelectorTerms` semantics for the operators
+/// rusternetes models.
+fn node_affinity_satisfied(node_affinity: &VolumeNodeAffinity, nodes: &[Node]) -> bool {
+    let required = match &node_affinity.required {
+        Some(r) => r,
+        None => return true,
+    };
+    nodes.iter().any(|node| {
+        required
+            .node_selector_terms
+            .iter()
+            .any(|term| volume_term_matches(node, term))
+    })
+}
+
+/// A single node-selector term matches when all of its match expressions (over
+/// node labels) and match fields (over `metadata.name`) hold.
+fn volume_term_matches(node: &Node, term: &NodeSelectorTerm) -> bool {
+    let labels = node.metadata.labels.as_ref();
+    if let Some(exprs) = term.match_expressions.as_ref() {
+        for req in exprs {
+            let value = labels.and_then(|l| l.get(&req.key)).map(|s| s.as_str());
+            if !requirement_matches(value, &req.operator, req.values.as_deref()) {
+                return false;
+            }
+        }
+    }
+    if let Some(fields) = term.match_fields.as_ref() {
+        for req in fields {
+            let value = match req.key.as_str() {
+                "metadata.name" => Some(node.metadata.name.as_str()),
+                _ => None,
+            };
+            if !requirement_matches(value, &req.operator, req.values.as_deref()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Evaluate one selector requirement against a (possibly absent) node value.
+fn requirement_matches(value: Option<&str>, operator: &str, values: Option<&[String]>) -> bool {
+    let values = values.unwrap_or(&[]);
+    match operator {
+        "In" => value
+            .map(|v| values.iter().any(|x| x == v))
+            .unwrap_or(false),
+        "NotIn" => value
+            .map(|v| !values.iter().any(|x| x == v))
+            .unwrap_or(true),
+        "Exists" => value.is_some(),
+        "DoesNotExist" => value.is_none(),
+        "Gt" | "Lt" => {
+            let (node_val, req_val) = match (value, values.first()) {
+                (Some(v), Some(r)) => match (v.parse::<i64>(), r.parse::<i64>()) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            if operator == "Gt" {
+                node_val > req_val
+            } else {
+                node_val < req_val
+            }
+        }
+        _ => false,
     }
 }
 
