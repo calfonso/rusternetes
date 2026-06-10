@@ -46,6 +46,62 @@ pub trait Storage: Send + Sync {
     where
         T: Serialize + DeserializeOwned + Send + Sync;
 
+    /// Atomically update ONLY the `.status` subobject of the stored resource,
+    /// preserving the currently-stored spec and metadata.
+    ///
+    /// Mirrors the Kubernetes `/status` subresource (registry status strategy
+    /// forces `new.Spec = old.Spec`): a status write must never clobber a
+    /// concurrently-updated spec. A background controller computing status from
+    /// a stale snapshot would otherwise write its whole stale object back via
+    /// [`Storage::update`], reverting a spec the client just changed (this is
+    /// the ResourceQuota update+delete conformance flake, GitHub #268).
+    ///
+    /// Implemented as a compare-and-swap read-modify-write (upstream's
+    /// `guaranteedUpdate`): re-read the current object, graft only the incoming
+    /// `status` onto it, and write with the fresh resourceVersion so a racing
+    /// spec update either wins the CAS (and we retry onto its value) or is
+    /// preserved. Only `value`'s `status` field is ever applied.
+    async fn update_status<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        // Extract only the `status` subobject from the caller's value. The spec
+        // (and everything else) comes from the freshly-read stored object, so a
+        // stale caller can never overwrite spec.
+        let incoming = serde_json::to_value(value).map_err(Error::Serialization)?;
+        let new_status = incoming.get("status").cloned();
+
+        // CAS-retry read-modify-write: graft status onto the current object and
+        // write with its fresh resourceVersion. If a concurrent writer bumped
+        // the version between our read and write, `update`'s optimistic
+        // concurrency check fails with Conflict and we re-read onto its value.
+        const MAX_ATTEMPTS: usize = 8;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut current: serde_json::Value = self.get(key).await?;
+            if let Some(obj) = current.as_object_mut() {
+                match &new_status {
+                    Some(status) => {
+                        obj.insert("status".to_string(), status.clone());
+                    }
+                    None => {
+                        obj.remove("status");
+                    }
+                }
+            }
+            match self.update::<serde_json::Value>(key, &current).await {
+                Ok(updated) => {
+                    return serde_json::from_value(updated).map_err(Error::Serialization)
+                }
+                Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Conflict(format!(
+            "update_status: exhausted {} CAS retries for {}",
+            MAX_ATTEMPTS, key
+        )))
+    }
+
     /// Update a resource with raw JSON value (for GC operations)
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()>;
 
