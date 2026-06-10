@@ -42,6 +42,15 @@ cleanup() {
     echo "[teardown] collecting cert-manager state + tearing down stack..."
     ${KUBECTL} -n cert-manager get pods -o wide >"${RESULTS_DIR}/cert-manager-pods.txt" 2>&1 || true
     ${KUBECTL} get certificate,certificaterequest,issuer -A >"${RESULTS_DIR}/cert-manager-resources.txt" 2>&1 || true
+    # The reconcile loop only shows up in the controller log + the object
+    # conditions/events — without these the CI artifact can't explain a stuck
+    # Certificate. (Cost us a full debug session for the two bugs behind #1057.)
+    ${KUBECTL} -n cert-manager logs deploy/cert-manager --tail=200 \
+        >"${RESULTS_DIR}/cert-manager-controller.log" 2>&1 || true
+    ${KUBECTL} describe certificate,certificaterequest,issuer -A \
+        >"${RESULTS_DIR}/cert-manager-describe.txt" 2>&1 || true
+    ${KUBECTL} get certificaterequest -A -o yaml \
+        >"${RESULTS_DIR}/cert-manager-certificaterequests.yaml" 2>&1 || true
     # shellcheck disable=SC2086
     ${COMPOSE} down -v --remove-orphans >/dev/null 2>&1 || true
 }

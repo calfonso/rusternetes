@@ -98,7 +98,7 @@ impl OwnedPaths {
     pub fn to_fields_v1(&self) -> Value {
         let mut root = Map::new();
         for path in &self.0 {
-            let segments: Vec<&str> = path.split('/').collect();
+            let segments = split_pointer_segments(path);
             insert_segment(&mut root, &segments);
         }
         Value::Object(root)
@@ -118,6 +118,45 @@ impl OwnedPaths {
         }
         out
     }
+}
+
+/// Split an owned JSON-Pointer (no leading `/`) into the segments used to
+/// build the `fieldsV1` `f:`-prefixed tree.
+///
+/// A naive `path.split('/')` is wrong for string-map groups: a label or
+/// annotation KEY may itself contain `/` (e.g. `controller.cert-manager.io/fao`)
+/// or `.`. In Kubernetes `fieldsV1`, the map key is a single `f:<key>` segment —
+/// the slash is part of the key, not a path separator. Splitting it would emit
+/// `f:controller.cert-manager.io > f:fao` instead of the correct
+/// `f:controller.cert-manager.io/fao`, and an applier (e.g. cert-manager) that
+/// compares its managed fieldset would never converge — it re-applies forever.
+///
+/// So for the known map-group prefixes the trailing key is kept atomic; every
+/// other pointer (atomic leaves like `type`, `data/<key>` where keys can't
+/// contain `/`) splits normally.
+fn split_pointer_segments(path: &str) -> Vec<&str> {
+    // Longest-first so `metadata/labels` wins before any shorter match.
+    const MAP_GROUP_PREFIXES: &[&str] = &[
+        "metadata/labels",
+        "metadata/annotations",
+        "binaryData",
+        "stringData",
+        "data",
+    ];
+    for prefix in MAP_GROUP_PREFIXES {
+        if let Some(key) = path
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            // Empty key shouldn't occur, but guard against a trailing slash.
+            if !key.is_empty() {
+                let mut segments: Vec<&str> = prefix.split('/').collect();
+                segments.push(key);
+                return segments;
+            }
+        }
+    }
+    path.split('/').collect()
 }
 
 fn insert_segment(node: &mut Map<String, Value>, segments: &[&str]) {
@@ -465,6 +504,35 @@ mod tests {
 
         let decoded = OwnedPaths::from_fields_v1(&encoded);
         assert_eq!(decoded, paths);
+    }
+
+    #[test]
+    fn fields_v1_label_annotation_keys_with_slash_stay_atomic() {
+        // Regression: cert-manager labels/annotates Secrets with keys that
+        // contain '/' (e.g. controller.cert-manager.io/fao). The fieldsV1 key
+        // must be the WHOLE key, not split on the slash — otherwise the applier
+        // sees its managed fieldset diverge and re-applies forever (#1057).
+        let mut paths = OwnedPaths::new();
+        paths.insert("metadata/labels/controller.cert-manager.io/fao");
+        paths.insert("metadata/annotations/cert-manager.io/alt-names");
+        paths.insert("data/tls.crt");
+        paths.insert("type");
+
+        let encoded = paths.to_fields_v1();
+        assert_eq!(
+            encoded,
+            json!({
+                "f:type": {},
+                "f:data": { "f:tls.crt": {} },
+                "f:metadata": {
+                    "f:labels":      { "f:controller.cert-manager.io/fao": {} },
+                    "f:annotations": { "f:cert-manager.io/alt-names": {} }
+                }
+            })
+        );
+
+        // Round-trips: decoding the (correct) tree yields the same paths.
+        assert_eq!(OwnedPaths::from_fields_v1(&encoded), paths);
     }
 
     #[test]
