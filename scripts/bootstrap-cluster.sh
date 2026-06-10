@@ -228,7 +228,16 @@ fi
 # bootstrap-coredns.yaml and waits for the CoreDNS Pod to come up.
 USE_RUSTERNETES_DNS="${USE_RUSTERNETES_DNS:-1}"
 
-if [ "$USE_RUSTERNETES_DNS" = "1" ]; then
+# Some single-node stacks intentionally ship no in-cluster DNS backend (e.g.
+# compose.node-conformance.yml — the [NodeConformance] suite has no
+# cluster-DNS-resolution specs; those are full-cluster [Conformance]). For
+# those, SKIP_DNS_WIRING=1 avoids a pointless 30s wait + an alarming
+# "DNS will NOT be functional" warning. The kube-dns Service still exists
+# (created above) with no endpoints, which node-scoped tests don't need.
+if [ "${SKIP_DNS_WIRING:-0}" = "1" ]; then
+    print_step "Skipping DNS backend wiring (SKIP_DNS_WIRING=1)."
+    echo "  This stack has no in-cluster DNS backend; node-scoped tests don't need cluster DNS."
+elif [ "$USE_RUSTERNETES_DNS" = "1" ]; then
     print_step "Wiring kube-dns Service to rusternetes-dns container..."
 
     # No CoreDNS Pod/ConfigMap to tear down on this path — bootstrap-cluster.yaml
