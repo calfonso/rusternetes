@@ -114,6 +114,13 @@ struct Args {
     #[arg(long, default_value = "rusternetes-network")]
     network: String,
 
+    /// Comma-separated list of unsafe sysctls (or `*`-suffixed patterns) to
+    /// permit. Pods requesting an unsafe sysctl not in this list are rejected
+    /// with reason SysctlForbidden. Mirrors upstream kubelet
+    /// `--allowed-unsafe-sysctls`.
+    #[arg(long, value_delimiter = ',')]
+    allowed_unsafe_sysctls: Vec<String>,
+
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
     storage_backend: String,
@@ -378,6 +385,7 @@ async fn main() -> Result<()> {
             None,
             crate::runtime::PodNetworkMode::Cni,
             runtime_config.metrics_bind_port,
+            args.allowed_unsafe_sysctls.clone(),
         )
         .await?,
     );

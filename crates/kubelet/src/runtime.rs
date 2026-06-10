@@ -177,6 +177,12 @@ pub struct ContainerRuntime {
     /// app containers get their own UTS namespace and the kubelet sets the
     /// pod hostname explicitly on the bollard `Config.hostname` field.
     shared_uts_supported: bool,
+    /// Sysctls an operator has explicitly permitted despite being "unsafe"
+    /// (not in [`SAFE_SYSCTLS`]). Plumbed from the kubelet
+    /// `--allowed-unsafe-sysctls` flag; entries may use a `*` suffix pattern.
+    /// A pod requesting an unsafe sysctl not in this list is rejected with
+    /// reason `SysctlForbidden` (see [`forbidden_sysctls`]).
+    allowed_unsafe_sysctls: Vec<String>,
 }
 
 /// Join a list of strings into a shell-safe command string.
@@ -331,6 +337,53 @@ fn unmount_tmpfs(dir: &str) {
 /// dotted. Mirrors upstream `convertSysctlVariableToDotsSeparator`.
 fn sysctl_name_to_dotted(name: &str) -> String {
     name.replace('/', ".")
+}
+
+/// The default set of "safe" sysctls — namespaced and isolated, so always
+/// permitted. Mirrors upstream `pkg/kubelet/sysctl/safe_sysctls.go::safeSysctls`
+/// (the kernel-version-gated `net.ipv4.*` entries are treated as safe here,
+/// matching a modern kernel). Any sysctl not in this set is "unsafe" and must
+/// be explicitly enabled via `--allowed-unsafe-sysctls`.
+const SAFE_SYSCTLS: &[&str] = &[
+    "kernel.shm_rmid_forced",
+    "net.ipv4.ip_local_port_range",
+    "net.ipv4.tcp_syncookies",
+    "net.ipv4.ping_group_range",
+    "net.ipv4.ip_unprivileged_port_start",
+    "net.ipv4.ip_local_reserved_ports",
+    "net.ipv4.tcp_keepalive_time",
+    "net.ipv4.tcp_fin_timeout",
+    "net.ipv4.tcp_keepalive_intvl",
+    "net.ipv4.tcp_keepalive_probes",
+    "net.ipv4.tcp_rmem",
+    "net.ipv4.tcp_wmem",
+];
+
+/// Return the dotted names of requested sysctls that are unsafe and NOT enabled
+/// via `--allowed-unsafe-sysctls`. A non-empty result means the kubelet must
+/// reject the pod with reason `SysctlForbidden` (upstream
+/// `pkg/kubelet/sysctl/allowlist.go`). `allowed_unsafe` entries may use `*`
+/// suffix patterns (e.g. `net.*`), matching upstream.
+fn forbidden_sysctls(
+    sysctls: &[rusternetes_common::resources::pod::Sysctl],
+    allowed_unsafe: &[String],
+) -> Vec<String> {
+    sysctls
+        .iter()
+        // Kubernetes treats `/` and `.` as equivalent separators; classify on
+        // the dotted form.
+        .map(|s| sysctl_name_to_dotted(&s.name))
+        .filter(|name| {
+            if SAFE_SYSCTLS.contains(&name.as_str()) {
+                return false;
+            }
+            let allowed = allowed_unsafe.iter().any(|p| match p.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => p == name,
+            });
+            !allowed
+        })
+        .collect()
 }
 
 /// Parse a Kubernetes resource.Quantity (e.g. `1Gi`, `512Mi`, `100M`) into a
@@ -938,7 +991,15 @@ impl ContainerRuntime {
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
             shared_uts_supported,
+            allowed_unsafe_sysctls: Vec::new(),
         })
+    }
+
+    /// Set the operator-permitted unsafe sysctls (kubelet
+    /// `--allowed-unsafe-sysctls`). Entries may use a `*` suffix pattern.
+    pub fn with_allowed_unsafe_sysctls(mut self, allowed: Vec<String>) -> Self {
+        self.allowed_unsafe_sysctls = allowed;
+        self
     }
 
     /// Inject the embedded netstack handle. Called by the all-in-one
@@ -1488,6 +1549,37 @@ impl ContainerRuntime {
                 namespace, pod_name
             );
             return Ok(());
+        }
+
+        // Reject a pod requesting an unsafe sysctl that is not enabled via
+        // --allowed-unsafe-sysctls: set phase=Failed, reason=SysctlForbidden and
+        // do NOT create containers. Mirrors upstream kubelet admission
+        // (pkg/kubelet/sysctl/allowlist.go); the api-server intentionally defers
+        // this to the kubelet. NodeConformance "should not launch unsafe, but
+        // not explicitly enabled sysctls" (#1071).
+        if let Some(sysctls) = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.security_context.as_ref())
+            .and_then(|sc| sc.sysctls.as_ref())
+        {
+            let forbidden = forbidden_sysctls(sysctls, &self.allowed_unsafe_sysctls);
+            if !forbidden.is_empty() {
+                let message = format!("forbidden sysctl: {} not allowlisted", forbidden.join(", "));
+                warn!("Pod {}/{} rejected: {}", namespace, pod_name, message);
+                if let Some(ref storage) = self.storage {
+                    use rusternetes_storage::Storage;
+                    let pod_key = rusternetes_storage::build_key("pods", Some(namespace), pod_name);
+                    if let Ok(mut status_pod) = storage.get::<Pod>(&pod_key).await {
+                        let status = status_pod.status.get_or_insert_with(Default::default);
+                        status.phase = Some(rusternetes_common::types::Phase::Failed);
+                        status.reason = Some("SysctlForbidden".to_string());
+                        status.message = Some(message);
+                        let _ = storage.update(&pod_key, &status_pod).await;
+                    }
+                }
+                return Ok(());
+            }
         }
 
         info!("Starting pod: {}/{}", namespace, pod_name);
@@ -9934,6 +10026,39 @@ mod tests {
         assert_eq!(
             sysctl_name_to_dotted("kernel.shm_rmid_forced"),
             "kernel.shm_rmid_forced"
+        );
+    }
+
+    #[test]
+    fn forbidden_sysctls_flags_unsafe_not_allowlisted() {
+        use rusternetes_common::resources::pod::Sysctl;
+        let sc = |n: &str| Sysctl {
+            name: n.to_string(),
+            value: "1".to_string(),
+        };
+
+        // kernel.msgmax is unsafe and not allowlisted -> forbidden (the
+        // NodeConformance "unsafe, not explicitly enabled" spec, #1071).
+        assert_eq!(
+            super::forbidden_sysctls(&[sc("kernel.msgmax")], &[]),
+            vec!["kernel.msgmax".to_string()]
+        );
+        // Safe sysctls always permitted.
+        assert!(super::forbidden_sysctls(&[sc("kernel.shm_rmid_forced")], &[]).is_empty());
+        assert!(super::forbidden_sysctls(&[sc("net.ipv4.tcp_syncookies")], &[]).is_empty());
+        // Explicitly allowed unsafe (exact or `*` prefix) permitted.
+        assert!(
+            super::forbidden_sysctls(&[sc("kernel.msgmax")], &["kernel.msgmax".to_string()])
+                .is_empty()
+        );
+        assert!(
+            super::forbidden_sysctls(&[sc("net.core.somaxconn")], &["net.core.*".to_string()])
+                .is_empty()
+        );
+        // Slash form normalised before classification.
+        assert_eq!(
+            super::forbidden_sysctls(&[sc("kernel/msgmax")], &[]),
+            vec!["kernel.msgmax".to_string()]
         );
     }
 

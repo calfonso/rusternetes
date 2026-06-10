@@ -191,6 +191,7 @@ impl Kubelet {
             None,
             crate::runtime::PodNetworkMode::Cni,
             10250,
+            Vec::new(),
         )
         .await
     }
@@ -213,6 +214,7 @@ impl Kubelet {
         netstack: Option<Arc<dyn rusternetes_netstack::manager::NetstackHandle>>,
         pod_network_mode: crate::runtime::PodNetworkMode,
         metrics_port: u16,
+        allowed_unsafe_sysctls: Vec<String>,
     ) -> Result<Self> {
         let mut runtime = ContainerRuntime::new(
             volume_dir,
@@ -223,7 +225,8 @@ impl Kubelet {
         )
         .await?
         .with_storage(storage.clone())
-        .with_pod_network_mode(pod_network_mode);
+        .with_pod_network_mode(pod_network_mode)
+        .with_allowed_unsafe_sysctls(allowed_unsafe_sysctls);
         if let Some(ns) = netstack {
             runtime = runtime.with_netstack(ns);
         }
@@ -2435,6 +2438,24 @@ impl Kubelet {
                                 Ok(p) => p,
                                 _ => pod.clone(),
                             };
+
+                            // start_pod may have rejected the pod during admission
+                            // (e.g. an unsafe sysctl -> phase=Failed,
+                            // reason=SysctlForbidden) without creating any
+                            // containers. That status is terminal — don't overwrite
+                            // it with Running below (which would then let the
+                            // restartPolicy=Never reconcile flip it to Succeeded).
+                            let rejected = fresh_pod
+                                .status
+                                .as_ref()
+                                .map(|s| {
+                                    s.phase == Some(Phase::Failed)
+                                        && s.reason.as_deref() == Some("SysctlForbidden")
+                                })
+                                .unwrap_or(false);
+                            if rejected {
+                                return Ok(());
+                            }
 
                             // Get container statuses and pod IP
                             let container_statuses =
