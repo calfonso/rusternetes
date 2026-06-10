@@ -712,7 +712,6 @@ fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client>
 /// entries (`apidiscovery.k8s.io` shape). Used to inline an aggregated group's
 /// resources into the `/apis` aggregated-discovery document. Returns `None`
 /// when there is no backend, it is unreachable, or it serves nothing.
-#[allow(dead_code)]
 pub async fn aggregated_discovery_resources(
     state: &Arc<ApiServerState>,
     group: &str,
