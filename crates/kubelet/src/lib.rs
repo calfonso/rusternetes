@@ -141,6 +141,9 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             config.netstack,
             config.pod_network_mode,
             config.metrics_port,
+            // The all-in-one binary doesn't expose --allowed-unsafe-sysctls;
+            // default to none (unsafe sysctls rejected with SysctlForbidden).
+            Vec::new(),
         )
         .await?,
     );
