@@ -25,8 +25,9 @@
 #
 # Workspace member list (Cargo.toml [workspace] members) — keep the
 # three CRATE-ENUMERATION blocks below in sync:
-#   api-server, cloud-providers, common, controller-manager, dns,
-#   kubectl, kubelet, kube-proxy, rusternetes, scheduler, storage
+#   admission-webhook, api-server, cloud-providers, common,
+#   controller-manager, discovery, dns, kubectl, kubelet, kube-proxy,
+#   middleware, netstack, protobuf, rusternetes, scheduler, storage
 
 # Stage 1: Build the console SPA
 FROM node:24-slim AS console-builder
@@ -81,14 +82,19 @@ COPY rusternetes/rhino/src/ ./rusternetes/rhino/src/
 COPY rusternetes/Cargo.toml rusternetes/Cargo.lock* ./rusternetes/
 
 # CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
+COPY rusternetes/crates/admission-webhook/Cargo.toml  ./rusternetes/crates/admission-webhook/Cargo.toml
 COPY rusternetes/crates/api-server/Cargo.toml         ./rusternetes/crates/api-server/Cargo.toml
 COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud-providers/Cargo.toml
 COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
 COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
+COPY rusternetes/crates/discovery/Cargo.toml          ./rusternetes/crates/discovery/Cargo.toml
 COPY rusternetes/crates/dns/Cargo.toml                ./rusternetes/crates/dns/Cargo.toml
 COPY rusternetes/crates/kubectl/Cargo.toml            ./rusternetes/crates/kubectl/Cargo.toml
 COPY rusternetes/crates/kubelet/Cargo.toml            ./rusternetes/crates/kubelet/Cargo.toml
 COPY rusternetes/crates/kube-proxy/Cargo.toml         ./rusternetes/crates/kube-proxy/Cargo.toml
+COPY rusternetes/crates/middleware/Cargo.toml         ./rusternetes/crates/middleware/Cargo.toml
+COPY rusternetes/crates/netstack/Cargo.toml           ./rusternetes/crates/netstack/Cargo.toml
+COPY rusternetes/crates/protobuf/Cargo.toml           ./rusternetes/crates/protobuf/Cargo.toml
 COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/rusternetes/Cargo.toml
 COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
 COPY rusternetes/crates/storage/Cargo.toml            ./rusternetes/crates/storage/Cargo.toml
@@ -98,13 +104,14 @@ COPY rusternetes/crates/api-server/build.rs ./rusternetes/crates/api-server/buil
 COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
-#   - lib only:   common, storage, cloud-providers
+#   - lib only:   common, storage, cloud-providers, netstack, protobuf,
+#                 middleware, admission-webhook, discovery
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet,
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in common storage cloud-providers; do \
+    for c in common storage cloud-providers netstack protobuf middleware admission-webhook discovery; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -140,14 +147,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
     cargo build --profile release-fast --features ${CARGO_FEATURES} -p rusternetes \
  && cargo clean --profile release-fast \
+        -p rusternetes-admission-webhook \
         -p rusternetes-api-server \
         -p rusternetes-cloud-providers \
         -p rusternetes-common \
         -p rusternetes-controller-manager \
+        -p rusternetes-discovery \
         -p rusternetes-dns \
         -p rusternetes-kubectl \
         -p rusternetes-kubelet \
         -p rusternetes-kube-proxy \
+        -p rusternetes-middleware \
+        -p rusternetes-netstack \
+        -p rusternetes-protobuf \
         -p rusternetes \
         -p rusternetes-scheduler \
         -p rusternetes-storage \
@@ -156,6 +168,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ----- PASS 2: real source compile -----
 
 # CRATE-ENUMERATION (3/3): real source COPYs, per crate.
+COPY rusternetes/crates/admission-webhook/src    ./crates/admission-webhook/src
 COPY rusternetes/crates/api-server/src           ./crates/api-server/src
 COPY rusternetes/crates/api-server/tests         ./crates/api-server/tests
 COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
@@ -163,6 +176,7 @@ COPY rusternetes/crates/common/src               ./crates/common/src
 COPY rusternetes/crates/common/tests             ./crates/common/tests
 COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src
 COPY rusternetes/crates/controller-manager/tests ./crates/controller-manager/tests
+COPY rusternetes/crates/discovery/src            ./crates/discovery/src
 COPY rusternetes/crates/dns/src                  ./crates/dns/src
 COPY rusternetes/crates/kubectl/src              ./crates/kubectl/src
 COPY rusternetes/crates/kubectl/tests            ./crates/kubectl/tests
@@ -170,6 +184,9 @@ COPY rusternetes/crates/kubelet/src              ./crates/kubelet/src
 COPY rusternetes/crates/kubelet/tests            ./crates/kubelet/tests
 COPY rusternetes/crates/kube-proxy/src           ./crates/kube-proxy/src
 COPY rusternetes/crates/kube-proxy/tests         ./crates/kube-proxy/tests
+COPY rusternetes/crates/middleware/src           ./crates/middleware/src
+COPY rusternetes/crates/netstack/src             ./crates/netstack/src
+COPY rusternetes/crates/protobuf/src             ./crates/protobuf/src
 COPY rusternetes/crates/rusternetes/src          ./crates/rusternetes/src
 COPY rusternetes/crates/scheduler/src            ./crates/scheduler/src
 COPY rusternetes/crates/scheduler/tests          ./crates/scheduler/tests
