@@ -37,6 +37,18 @@ pub async fn create_apiservice(
         .to_string();
     info!("Creating APIService: {}", name);
 
+    // Reject create with neither name nor generateName (#1065). This handler is
+    // JSON-Value based, so it can't share `require_object_name`; emit the same
+    // upstream 422 inline.
+    if name.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(vec![
+            rusternetes_common::validation::field::Error::required(
+                &rusternetes_common::validation::field::Path::new("metadata").child("name"),
+                "name or generateName is required",
+            ),
+        ]));
+    }
+
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "apiservices")
         .with_api_group("apiregistration.k8s.io");
     match state.authorizer.authorize(&attrs).await? {

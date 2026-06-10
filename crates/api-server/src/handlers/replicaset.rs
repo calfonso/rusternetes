@@ -46,6 +46,9 @@ pub async fn create(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&replicaset.metadata)?;
+
     replicaset.metadata.namespace = Some(namespace.clone());
     replicaset.metadata.ensure_uid();
     replicaset.metadata.ensure_creation_timestamp();

@@ -60,6 +60,9 @@ pub async fn create(
         crate::handlers::validation::validate_strict_fields(&params, &body, &deployment)?;
     let response_headers = build_warning_headers(&warnings);
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&deployment.metadata)?;
+
     // Field validation (mirrors upstream ValidateDeployment).
     {
         let errs = rusternetes_common::validation::apps::validate_deployment(&deployment);

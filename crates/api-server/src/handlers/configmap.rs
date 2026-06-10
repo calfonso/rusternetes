@@ -29,6 +29,9 @@ pub async fn create(
         configmap.metadata.name, namespace
     );
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&configmap.metadata)?;
+
     // Validate resource name
     crate::handlers::validation::validate_resource_name(&configmap.metadata.name)?;
 

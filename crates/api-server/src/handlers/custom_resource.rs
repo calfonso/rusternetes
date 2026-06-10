@@ -146,6 +146,8 @@ pub async fn create_custom_resource(
         }
     }
     crate::handlers::validation::validate_strict_fields(&params, &body, &cr)?;
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&cr.metadata)?;
 
     // Use the CRD we already looked up for preserve-unknown-fields check
     let crd = crd_for_validation;

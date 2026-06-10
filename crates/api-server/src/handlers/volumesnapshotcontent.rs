@@ -23,6 +23,9 @@ pub async fn create_volumesnapshotcontent(
 ) -> Result<(StatusCode, Json<VolumeSnapshotContent>)> {
     info!("Creating VolumeSnapshotContent: {}", vsc.metadata.name);
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&vsc.metadata)?;
+
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumesnapshotcontents")
         .with_api_group("snapshot.storage.k8s.io");

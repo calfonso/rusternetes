@@ -40,6 +40,9 @@ pub async fn create(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&namespace.metadata)?;
+
     // Enrich metadata with system fields. `ensure_uid()` also resolves
     // `generateName` -> `metadata.name` (via `ensure_name()`).
     namespace.metadata.ensure_uid();

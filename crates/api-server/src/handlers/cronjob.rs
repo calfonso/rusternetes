@@ -39,6 +39,9 @@ pub async fn create(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&cronjob.metadata)?;
+
     cronjob.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields

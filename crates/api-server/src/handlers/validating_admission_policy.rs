@@ -29,6 +29,9 @@ pub async fn create_validating_admission_policy(
         policy.metadata.name
     );
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&policy.metadata)?;
+
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "validatingadmissionpolicies")
         .with_api_group("admissionregistration.k8s.io");
@@ -241,6 +244,9 @@ pub async fn create_validating_admission_policy_binding(
         "Creating ValidatingAdmissionPolicyBinding: {}",
         binding.metadata.name
     );
+
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&binding.metadata)?;
 
     // Check authorization
     let attrs =

@@ -120,6 +120,9 @@ pub async fn create(
 
     info!("Creating service: {}/{}", namespace, service.metadata.name);
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&service.metadata)?;
+
     // Default ServicePort.targetPort / protocol BEFORE validation.
     //
     // Upstream runs SetDefaults_Service before ValidateService, and treats a

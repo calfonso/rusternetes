@@ -29,6 +29,9 @@ pub async fn create(
         namespace, service_account.metadata.name
     );
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&service_account.metadata)?;
+
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 

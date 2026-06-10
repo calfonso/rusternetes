@@ -82,6 +82,8 @@ pub async fn create(
         secret.metadata.name, namespace
     );
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&secret.metadata)?;
     // Validate resource name
     crate::handlers::validation::validate_resource_name(&secret.metadata.name)?;
 

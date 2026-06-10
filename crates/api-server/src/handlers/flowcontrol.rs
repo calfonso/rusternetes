@@ -34,6 +34,9 @@ pub async fn create_priority_level_configuration(
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&plc.metadata)?;
+
     // Enrich metadata with system fields
     plc.metadata.ensure_uid();
     plc.metadata.ensure_creation_timestamp();
@@ -246,6 +249,9 @@ pub async fn create_flow_schema(
         Decision::Allow => {}
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
+
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&fs.metadata)?;
 
     // Enrich metadata with system fields
     fs.metadata.ensure_uid();

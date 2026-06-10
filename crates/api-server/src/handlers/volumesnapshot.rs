@@ -27,6 +27,9 @@ pub async fn create_volumesnapshot(
         namespace, vs.metadata.name
     );
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&vs.metadata)?;
+
     // Check authorization (namespace-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumesnapshots")
         .with_api_group("snapshot.storage.k8s.io")

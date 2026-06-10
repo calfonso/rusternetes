@@ -43,6 +43,9 @@ pub async fn create(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&hpa.metadata)?;
+
     hpa.metadata.namespace = Some(namespace.clone());
     hpa.metadata.ensure_uid();
     hpa.metadata.ensure_creation_timestamp();
