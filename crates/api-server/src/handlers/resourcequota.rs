@@ -144,6 +144,19 @@ pub async fn update(
 
     let key = build_key("resourcequotas", Some(&namespace), &name);
 
+    // Upstream resourcequotaStrategy.PrepareForUpdate copies the stored object's
+    // status onto the incoming object so status (used/hard) only mutates via the
+    // /status subresource. Without this, a spec-only PUT carries an empty status
+    // and wipes the controller-computed usage until the next reconcile.
+    let old_status = match state.storage.get::<ResourceQuota>(&key).await {
+        Ok(old) => Some(old.status),
+        Err(rusternetes_common::Error::NotFound(_)) => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(status) = old_status {
+        quota.status = status;
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
