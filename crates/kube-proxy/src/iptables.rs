@@ -1002,8 +1002,11 @@ impl IptablesManager {
 
     /// Flush all rules in a specific chain
     fn flush_chain(&self, table: &str, chain: &str) -> Result<()> {
+        // `-w 5`: wait for the xtables lock rather than failing under
+        // contention (see apply_nat_rules_atomic). This runs on the fallback
+        // rebuild path, so a lock failure here would widen the no-rules gap.
         let output = Command::new(&self.iptables_cmd)
-            .args(["-t", table, "-F", chain])
+            .args(["-w", "5", "-t", table, "-F", chain])
             .output()
             .context(format!("Failed to flush chain {}", chain))?;
 
@@ -2085,8 +2088,14 @@ impl IptablesManager {
         } else {
             "iptables-restore"
         };
+        // `-w 5`: wait up to 5s for the xtables lock instead of failing
+        // immediately. Under load (kubelet programming hostPorts, CNI, and this
+        // proxy all touch iptables) the lock is frequently held; without --wait,
+        // iptables-restore aborts, kube-proxy falls back to the non-atomic
+        // flush+rebuild path, and ClusterIP traffic gets "connection refused"
+        // during the rebuild gap. Upstream kube-proxy always passes --wait.
         let mut child = Command::new(restore_cmd)
-            .args(["--noflush"])
+            .args(["-w", "5", "--noflush"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
