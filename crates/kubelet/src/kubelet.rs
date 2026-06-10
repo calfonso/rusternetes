@@ -3545,8 +3545,35 @@ impl Kubelet {
                                 }
                                 None => true,
                             };
-                            let all_ready =
+                            let containers_ready =
                                 container_statuses.iter().all(|s| s.ready) && init_sidecars_ready;
+                            // Readiness gates: every condition named in
+                            // spec.readinessGates must be present in
+                            // status.conditions with status "True" for the pod to
+                            // be Ready (upstream GeneratePodReadyCondition). These
+                            // conditions are supplied via the status subresource.
+                            // ContainersReady ignores the gates; only Ready ANDs
+                            // them in.
+                            let readiness_gates_satisfied = pod
+                                .spec
+                                .as_ref()
+                                .and_then(|s| s.readiness_gates.as_ref())
+                                .map(|gates| {
+                                    gates.iter().all(|gate| {
+                                        pod.status
+                                            .as_ref()
+                                            .and_then(|st| st.conditions.as_ref())
+                                            .map(|conds| {
+                                                conds.iter().any(|c| {
+                                                    c.condition_type == gate.condition_type
+                                                        && c.status == "True"
+                                                })
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(true);
+                            let all_ready = containers_ready && readiness_gates_satisfied;
 
                             // Check if all containers have terminated (for Never/OnFailure restart policies)
                             let restart_policy = pod
@@ -3698,19 +3725,22 @@ impl Kubelet {
                                         pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
                                     status.pod_ip = pod_ip;
                                 }
-                                if all_ready {
-                                    status.message = Some("All containers ready".to_string());
-                                    status.conditions = Some(Self::merge_pod_conditions(
-                                        status.conditions.as_deref().unwrap_or(&[]),
-                                        Self::running_pod_conditions(),
-                                    ));
-                                } else {
-                                    status.message = Some("Some containers not ready".to_string());
-                                    status.conditions = Some(Self::merge_pod_conditions(
-                                        status.conditions.as_deref().unwrap_or(&[]),
-                                        Self::not_ready_pod_conditions(),
-                                    ));
-                                }
+                                status.message = Some(
+                                    if all_ready {
+                                        "All containers ready"
+                                    } else if containers_ready {
+                                        "Waiting on pod readiness gates"
+                                    } else {
+                                        "Some containers not ready"
+                                    }
+                                    .to_string(),
+                                );
+                                // ContainersReady reflects only the containers;
+                                // Ready additionally requires the readinessGates.
+                                status.conditions = Some(Self::merge_pod_conditions(
+                                    status.conditions.as_deref().unwrap_or(&[]),
+                                    Self::pod_readiness_conditions(containers_ready, all_ready),
+                                ));
                             }
 
                             // Skip update if status hasn't changed — avoids unnecessary
@@ -4095,12 +4125,85 @@ impl Kubelet {
                 new.last_transition_time = prev.last_transition_time;
             }
         }
+        // Preserve existing conditions this writer doesn't manage — notably the
+        // custom conditions a readinessGate refers to, supplied out-of-band via
+        // the pod status subresource. Without this the kubelet clobbers them on
+        // every status sync and the readinessGate can never be satisfied.
+        for prev in existing {
+            if !incoming
+                .iter()
+                .any(|c| c.condition_type == prev.condition_type)
+            {
+                incoming.push(prev.clone());
+            }
+        }
         incoming
+    }
+
+    /// Build the standard pod conditions with ContainersReady and Ready set
+    /// independently. ContainersReady reflects only container/sidecar readiness;
+    /// Ready additionally requires every spec.readinessGates condition to be True
+    /// (upstream GeneratePodReadyCondition). Initialized and PodScheduled are
+    /// always True here (the pod has been admitted and its containers created).
+    fn pod_readiness_conditions(containers_ready: bool, pod_ready: bool) -> Vec<PodCondition> {
+        let now = Some(chrono::Utc::now());
+        let bool_str = |b: bool| if b { "True" } else { "False" }.to_string();
+        let not_ready_reason = |b: bool| {
+            if b {
+                (None, None)
+            } else {
+                (
+                    Some("ContainersNotReady".to_string()),
+                    Some("containers or readiness gates not ready".to_string()),
+                )
+            }
+        };
+        let (cr_reason, cr_msg) = not_ready_reason(containers_ready);
+        let (rd_reason, rd_msg) = not_ready_reason(pod_ready);
+        vec![
+            PodCondition {
+                condition_type: "Initialized".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+            PodCondition {
+                condition_type: "PodScheduled".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+            PodCondition {
+                condition_type: "ContainersReady".to_string(),
+                status: bool_str(containers_ready),
+                reason: cr_reason,
+                message: cr_msg,
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+            PodCondition {
+                condition_type: "Ready".to_string(),
+                status: bool_str(pod_ready),
+                reason: rd_reason,
+                message: rd_msg,
+                last_probe_time: None,
+                last_transition_time: now,
+                observed_generation: None,
+            },
+        ]
     }
 
     /// Build the standard pod conditions for a Running pod.
     /// Real Kubernetes sets Initialized, PodScheduled, ContainersReady, and Ready=True
     /// when all containers are running. The e2e conformance suite checks these conditions.
+    #[allow(dead_code)]
     fn running_pod_conditions() -> Vec<PodCondition> {
         let now = Some(chrono::Utc::now());
         vec![
