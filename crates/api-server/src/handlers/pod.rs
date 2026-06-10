@@ -1806,6 +1806,11 @@ fn is_valid_sysctl_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 253 {
         return false;
     }
+    // Kubernetes treats `/` and `.` as equivalent sysctl separators and
+    // canonicalises slashes to dots before validating (upstream
+    // convertSysctlVariableToDotsSeparator). Validate on the dotted form so the
+    // slash variant of a name (e.g. `kernel/shm_rmid_forced`) is accepted.
+    let name = name.replace('/', ".");
     for segment in name.split('.') {
         if segment.is_empty() {
             return false;
@@ -2070,6 +2075,22 @@ mod tests {
                 || name.starts_with("net.ipv6.conf.");
             assert!(!is_safe, "Expected {} to be classified as unsafe", name);
         }
+    }
+
+    #[test]
+    fn test_sysctl_name_accepts_slash_separator() {
+        // Kubernetes treats `/` and `.` as equivalent sysctl separators
+        // (upstream convertSysctlVariableToDotsSeparator). The slash form of a
+        // safe sysctl must validate so the pod is accepted — NodeConformance
+        // "should support sysctls with slashes as separator" (#1068).
+        assert!(is_valid_sysctl_name("kernel/shm_rmid_forced"));
+        assert!(is_valid_sysctl_name("net/ipv4/tcp_syncookies"));
+        // Dotted form still valid.
+        assert!(is_valid_sysctl_name("kernel.shm_rmid_forced"));
+        // Genuinely invalid names still rejected (uppercase, empty segment).
+        assert!(!is_valid_sysctl_name("Kernel/Shm"));
+        assert!(!is_valid_sysctl_name("kernel//shm"));
+        assert!(!is_valid_sysctl_name("kernel/"));
     }
 
     #[test]
