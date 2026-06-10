@@ -33,7 +33,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         let metrics_client: Arc<dyn MetricsClient> = match HttpMetricsClient::new(cfg) {
             Ok(c) => Arc::new(c),
             Err(e) => {
-                warn!("HPA metrics client unavailable ({e}); metric fetches will fail");
+                warn!("HPA metrics client unavailable ({e:#}); metric fetches will fail");
                 Arc::new(FakeMetricsClient::new())
             }
         };

@@ -177,6 +177,15 @@ pub struct HttpMetricsClient {
 
 impl HttpMetricsClient {
     pub fn new(cfg: HttpMetricsConfig) -> Result<Self> {
+        // rustls 0.23 requires a process-default CryptoProvider before any
+        // ClientConfig is built. The controller-manager binary never constructs
+        // a TlsConfig (unlike the api-server), so nothing installs one and
+        // reqwest's `.build()` fails with a "builder error". Install the
+        // aws-lc-rs provider idempotently here (no-op if already set).
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
         let ca = std::fs::read(&cfg.ca_cert_path)
             .map_err(|e| anyhow::anyhow!("read CA {}: {e}", cfg.ca_cert_path))?;
         let mut identity_pem = std::fs::read(&cfg.client_cert_path)
