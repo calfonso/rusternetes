@@ -263,6 +263,13 @@ impl MetricsClient for HttpMetricsClient {
                         }
                     }
                 }
+                // PLACEHOLDER: real utilization = usage * 100 / pod-request, but
+                // metrics.k8s.io here only reports usage (and rusternetes
+                // synthesizes usage = request), so we cannot compute a true
+                // percentage without fetching each pod's resource requests.
+                // Hardcoded 100% until that is wired — tracked in
+                // indyjonesnl/rusternetes#1077. Resource-utilization HPAs are
+                // therefore not load-accurate on the live path yet.
                 info.insert(
                     name,
                     PodMetric {
