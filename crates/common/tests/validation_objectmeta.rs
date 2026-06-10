@@ -699,6 +699,33 @@ fn test_ensure_name_resolves_generate_name() {
     );
 }
 
+#[test]
+fn test_ensure_name_does_not_fabricate_without_generate_name() {
+    // With neither name nor generateName, ensure_name must leave the name
+    // empty (so name validation can reject the object) rather than inventing
+    // an `auto-<id>` name — which is non-conformant (#1063).
+    let mut meta = ObjectMeta {
+        name: String::new(),
+        generate_name: None,
+        ..ObjectMeta::default()
+    };
+    meta.ensure_name();
+    assert!(
+        meta.name.is_empty(),
+        "ensure_name must not fabricate a name without generateName, got {:?}",
+        meta.name
+    );
+
+    // An empty generateName is equivalent to none.
+    let mut meta = ObjectMeta {
+        name: String::new(),
+        generate_name: Some(String::new()),
+        ..ObjectMeta::default()
+    };
+    meta.ensure_name();
+    assert!(meta.name.is_empty(), "got {:?}", meta.name);
+}
+
 // ===========================================================================
 // Bonus pin: ObjectMeta::has_finalizers() — a tiny green pin that exercises
 // the finalizer accessor used as a precondition by several of the upstream

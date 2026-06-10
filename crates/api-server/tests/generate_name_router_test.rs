@@ -101,6 +101,30 @@ async fn pod_create_honors_generate_name() {
 }
 
 #[tokio::test]
+async fn secret_create_honors_generate_name() {
+    // Secret used to synthesise via a per-handler call; #1063 removed it in
+    // favour of the central middleware. Pin that Secret still works.
+    let state = make_state();
+    let body = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"generateName": "my-secret-"},
+        "type": "Opaque",
+    });
+    let (status, created) = post_json(&state, "/api/v1/namespaces/default/secrets", &body).await;
+
+    assert!(
+        status.is_success(),
+        "create with generateName must succeed, got {status}: {created}"
+    );
+    let name = created["metadata"]["name"].as_str().unwrap_or_default();
+    assert!(
+        name.starts_with("my-secret-") && name.len() > "my-secret-".len(),
+        "expected a synthesised name with prefix 'my-secret-', got {name:?}"
+    );
+}
+
+#[tokio::test]
 async fn explicit_name_still_wins_over_generate_name() {
     let state = make_state();
     let body = json!({
