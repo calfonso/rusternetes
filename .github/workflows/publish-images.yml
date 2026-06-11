@@ -1,0 +1,75 @@
+name: Publish images
+
+# Build the 7 conformance-stack images once per main push and publish them to
+# GHCR with two tags:
+#   * sha-<full-sha> — immutable, one per main commit. The historic record:
+#     any past main build is runnable without compilation (#1056).
+#   * main           — moving alias for the latest successful publish.
+#
+# Consumers:
+#   * conformance-canary.yml re-triggers off this workflow (workflow_run) and
+#     pulls the exact sha-tag — 1:1 commit↔result blame.
+#   * feature-conformance.yml + node-conformance.yml nightlies pull :main.
+#   * All consumers auto-fall back to a local compose build when the pull
+#     fails (ci/actions/bring-up-cluster / run-node-conformance.sh).
+#
+# Intentionally NO paths filter: every main sha must get an image so the
+# canary chain never has gaps and the registry history is complete. A push
+# that changes no Rust is a warm-cache rebuild (~3-5 min) and the pushed
+# layers dedupe server-side.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOCKER_HOST: unix:///var/run/docker.sock
+
+# One publish at a time, never cancelled: every main sha needs its tag.
+concurrency:
+  group: publish-images
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: build + push (sqlite stack images)
+    runs-on: arc-runner-set-conformance
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build images (tagged sha-${{ github.sha }})
+        env:
+          RUSTERNETES_IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml \
+            build --parallel
+
+      - name: Push sha tags
+        env:
+          RUSTERNETES_IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml \
+            push
+
+      - name: Retag + push :main
+        run: |
+          set -euo pipefail
+          for img in rhino api-server scheduler controller-manager kubelet kube-proxy dns; do
+            docker tag \
+              "ghcr.io/indyjonesnl/rusternetes/${img}:sha-${{ github.sha }}" \
+              "ghcr.io/indyjonesnl/rusternetes/${img}:main"
+            docker push "ghcr.io/indyjonesnl/rusternetes/${img}:main"
+          done
