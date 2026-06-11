@@ -32,3 +32,9 @@ chrono.workspace = true
 # Requires Docker (or Podman with the Docker-compat socket) on the host;
 # CI / dev environments already have Docker available.
 testcontainers = "0.23"
+criterion = "0.5"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "watch_latency"
+harness = false
