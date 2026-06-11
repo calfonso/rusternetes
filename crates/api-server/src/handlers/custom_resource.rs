@@ -442,6 +442,110 @@ pub async fn list_custom_resources(
     Ok(Json(list))
 }
 
+/// DELETE on a custom-resource collection (`deletecollection`).
+///
+/// The dynamic client's `DeleteCollection` (used by the
+/// `CustomResourceFieldSelectors` conformance test) issues
+/// `DELETE /apis/{group}/{version}/namespaces/{ns}/{plural}?fieldSelector=...`.
+/// Without this handler that path matched no route and returned a bare 404
+/// ("the server could not find the requested resource").
+///
+/// Mirrors [`list_custom_resources`]'s pipeline so a field selector targeting a
+/// non-storage version (e.g. `host=host1,port=80` on `v2` while the stored
+/// version is `v1`) selects against the *requested-version* field layout:
+/// validate selectable paths -> default -> convert -> apply label/field
+/// selectors -> delete each match by name (the storage key is
+/// version-independent). Honours finalizers per item like the built-in
+/// `deletecollection_*` handlers.
+pub async fn deletecollection_custom_resources(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    group: String,
+    version: String,
+    plural: String,
+    namespace: Option<String>,
+    params: HashMap<String, String>,
+) -> Result<StatusCode> {
+    info!(
+        "DeleteCollection custom resources {}/{}/{} (ns={:?}) params={:?}",
+        group, version, plural, namespace, params
+    );
+
+    // Find the CRD for this resource type
+    let crd_name = format!("{plural}.{group}");
+    let crd = get_crd_for_resource(&state, &crd_name).await?;
+
+    // Check authorization
+    let attrs = if let Some(ref ns) = namespace {
+        RequestAttributes::new(auth_ctx.user.clone(), "deletecollection", &plural)
+            .with_api_group(&group)
+            .with_namespace(ns)
+    } else {
+        RequestAttributes::new(auth_ctx.user.clone(), "deletecollection", &plural)
+            .with_api_group(&group)
+    };
+
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => {
+            return Err(rusternetes_common::Error::Forbidden(reason));
+        }
+    }
+
+    // Same selectable-path gate LIST applies.
+    if let Some(fs) = params.get("fieldSelector").filter(|s| !s.is_empty()) {
+        validate_field_selector_paths(&crd, &version, fs)?;
+    }
+
+    // Build storage prefix and load the collection.
+    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
+    let prefix = if let Some(ref ns) = namespace {
+        build_prefix(&resource_type, Some(ns))
+    } else {
+        build_prefix(&resource_type, None)
+    };
+    let mut crs: Vec<CustomResource> = state.storage.list(&prefix).await?;
+
+    // Default + convert to the requested version, then filter — mirrors LIST so
+    // the field selector matches the requested-version layout.
+    for cr in &mut crs {
+        apply_schema_defaults(&crd, &version, cr);
+    }
+    crs = crate::conversion::convert_custom_resources(&crd, crs, &version, &state.storage).await?;
+    crate::handlers::filtering::apply_selectors(&mut crs, &params)?;
+
+    // Dry-run: report success without deleting.
+    if crate::handlers::dryrun::is_dry_run(&params) {
+        info!(
+            "Dry-run: would delete {} custom resources matching selectors",
+            crs.len()
+        );
+        return Ok(StatusCode::OK);
+    }
+
+    // Delete each matching resource by name (storage key is version-independent).
+    let mut deleted_count = 0;
+    for cr in &crs {
+        let key = if let Some(ref ns) = namespace {
+            build_key(&resource_type, Some(ns), &cr.metadata.name)
+        } else {
+            build_key(&resource_type, None, &cr.metadata.name)
+        };
+        let has_finalizers =
+            crate::handlers::finalizers::handle_delete_with_finalizers(&*state.storage, &key, cr)
+                .await?;
+        if !has_finalizers {
+            deleted_count += 1;
+        }
+    }
+
+    info!(
+        "DeleteCollection completed: {} custom resources deleted",
+        deleted_count
+    );
+    Ok(StatusCode::OK)
+}
+
 /// Watch custom resources, converting every streamed object to the requested
 /// API `version` before field-selector filtering and emission — the watch-side
 /// counterpart to [`list_custom_resources`] (which converts at the
