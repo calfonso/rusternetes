@@ -5,7 +5,7 @@
 //! for N clients, which overwhelms etcd and exhausts HTTP/2 stream limits.
 
 use rusternetes_storage::StorageBackend;
-use rusternetes_storage::{Storage, WatchEvent, WatchStream};
+use rusternetes_storage::{WatchEvent, WatchStream};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -94,7 +94,7 @@ impl WatchCache {
                 prefix_owned
             );
             loop {
-                match storage.watch(&prefix_owned).await {
+                match storage.watch_backend(&prefix_owned).await {
                     Ok(mut stream) => {
                         use futures::StreamExt;
                         while let Some(event_result) = stream.next().await {
