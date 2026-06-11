@@ -400,3 +400,273 @@ async fn test_default_storage_class_beta_annotation() {
     // storageClassName should be set even with beta annotation
     assert_eq!(pvc.spec.storage_class_name, Some("default-sc".to_string()));
 }
+
+// ===========================================================================
+// LimitRange admission — e2e parity pins (relocated from the controller-manager
+// stub suite; issue #1031). Upstream enforces LimitRange in the LimitRanger
+// ADMISSION plugin (plugin/pkg/admission/limitranger), NOT a background
+// controller. These mirror test/e2e/apimachinery/limit_range.go (release-1.35).
+// ===========================================================================
+
+use rusternetes_api_server::admission::{apply_limit_range_to_pvc, apply_limit_range_with};
+use rusternetes_common::resources::volume::ResourceRequirements as PvcResourceRequirements;
+use rusternetes_common::types::ResourceRequirements as PodResourceRequirements;
+
+const LR_NS: &str = "limitrange-e2e";
+
+fn str_map(pairs: &[(&str, &str)]) -> Option<HashMap<String, String>> {
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+}
+
+fn container_item(
+    default: &[(&str, &str)],
+    default_request: &[(&str, &str)],
+    min: &[(&str, &str)],
+    max: &[(&str, &str)],
+    ratio: &[(&str, &str)],
+) -> LimitRangeItem {
+    LimitRangeItem {
+        item_type: "Container".to_string(),
+        default: str_map(default),
+        default_request: str_map(default_request),
+        min: str_map(min),
+        max: str_map(max),
+        max_limit_request_ratio: str_map(ratio),
+    }
+}
+
+fn limit_range(items: Vec<LimitRangeItem>) -> LimitRange {
+    LimitRange::new("lr", LR_NS, LimitRangeSpec { limits: items })
+}
+
+fn pod_one_container(name: &str, requests: &[(&str, &str)], limits: &[(&str, &str)]) -> Pod {
+    Pod {
+        type_meta: TypeMeta {
+            kind: "Pod".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: ObjectMeta::new(name).with_namespace(LR_NS),
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "c".to_string(),
+                image: "pause:latest".to_string(),
+                resources: Some(PodResourceRequirements {
+                    requests: str_map(requests),
+                    limits: str_map(limits),
+                    claims: None,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+async fn make_pvc(storage: &Arc<MemoryStorage>, name: &str, storage_req: &str) {
+    let mut requests = HashMap::new();
+    requests.insert("storage".to_string(), storage_req.to_string());
+    let pvc = PersistentVolumeClaim {
+        type_meta: TypeMeta {
+            kind: "PersistentVolumeClaim".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: ObjectMeta::new(name).with_namespace(LR_NS),
+        spec: PersistentVolumeClaimSpec {
+            access_modes: vec![],
+            resources: PvcResourceRequirements {
+                requests: Some(requests),
+                limits: None,
+            },
+            storage_class_name: None,
+            volume_name: None,
+            selector: None,
+            volume_mode: None,
+            data_source: None,
+            data_source_ref: None,
+            volume_attributes_class_name: None,
+        },
+        status: None,
+    };
+    let key = build_key("persistentvolumeclaims", Some(LR_NS), name);
+    storage.create(&key, &pvc).await.expect("create pvc");
+}
+
+/// 1. Container defaults: a pod declaring no resources inherits `default`
+/// (limits) and `defaultRequest` from a `type: Container` item.
+#[tokio::test]
+async fn limitrange_container_defaults_apply_to_unspecified_pods() {
+    let lr = limit_range(vec![container_item(
+        &[("cpu", "200m"), ("memory", "256Mi")],
+        &[("cpu", "100m"), ("memory", "128Mi")],
+        &[],
+        &[],
+        &[],
+    )]);
+    let mut pod = pod_one_container("noresources", &[], &[]);
+
+    let allowed = apply_limit_range_with(&mut pod, &vec![lr]).expect("apply");
+    assert!(allowed, "defaulting must not reject");
+
+    let c = &pod.spec.unwrap().containers[0];
+    let rr = c.resources.as_ref().unwrap();
+    let requests = rr.requests.as_ref().unwrap();
+    let limits = rr.limits.as_ref().unwrap();
+    assert_eq!(requests.get("cpu"), Some(&"100m".to_string()));
+    assert_eq!(requests.get("memory"), Some(&"128Mi".to_string()));
+    assert_eq!(limits.get("cpu"), Some(&"200m".to_string()));
+    assert_eq!(limits.get("memory"), Some(&"256Mi".to_string()));
+}
+
+/// 2. Min/max: a container outside `[min, max]` is rejected; in-range admitted.
+#[tokio::test]
+async fn limitrange_min_max_rejects_out_of_range_pods() {
+    let lr = limit_range(vec![container_item(
+        &[],
+        &[],
+        &[("cpu", "200m")],
+        &[("cpu", "2")],
+        &[],
+    )]);
+
+    let mut in_range = pod_one_container("in-range", &[("cpu", "500m")], &[("cpu", "1")]);
+    assert!(
+        apply_limit_range_with(&mut in_range, &vec![lr.clone()]).expect("apply"),
+        "in-range pod must be admitted",
+    );
+
+    let mut too_big = pod_one_container("too-big", &[("cpu", "1")], &[("cpu", "4")]);
+    assert!(
+        !apply_limit_range_with(&mut too_big, &vec![lr]).expect("apply"),
+        "cpu limit 4 above max 2 must be rejected",
+    );
+}
+
+/// 3. Ratio: `maxLimitRequestRatio` caps `limits/requests` per resource.
+#[tokio::test]
+async fn limitrange_ratio_rejects_high_ratio_pods() {
+    let lr = limit_range(vec![container_item(&[], &[], &[], &[], &[("cpu", "3")])]);
+
+    let mut low = pod_one_container("low-ratio", &[("cpu", "100m")], &[("cpu", "200m")]);
+    assert!(
+        apply_limit_range_with(&mut low, &vec![lr.clone()]).expect("apply"),
+        "ratio 2 must survive cap 3",
+    );
+
+    let mut high = pod_one_container("high-ratio", &[("cpu", "100m")], &[("cpu", "500m")]);
+    assert!(
+        !apply_limit_range_with(&mut high, &vec![lr]).expect("apply"),
+        "ratio 5 must be rejected by cap 3",
+    );
+}
+
+/// 4. PVC storage min/max: a `type: PersistentVolumeClaim` item bounds the
+/// PVC's `resources.requests.storage`.
+#[tokio::test]
+async fn limitrange_pvc_storage_min_max_enforced() {
+    let storage = Arc::new(MemoryStorage::new());
+    let lr = LimitRange::new(
+        "lr",
+        LR_NS,
+        LimitRangeSpec {
+            limits: vec![LimitRangeItem {
+                item_type: "PersistentVolumeClaim".to_string(),
+                default: None,
+                default_request: None,
+                min: str_map(&[("storage", "1Gi")]),
+                max: str_map(&[("storage", "10Gi")]),
+                max_limit_request_ratio: None,
+            }],
+        },
+    );
+    let lr_key = build_key("limitranges", Some(LR_NS), "lr");
+    storage.create(&lr_key, &lr).await.unwrap();
+
+    make_pvc(&storage, "too-small", "500Mi").await;
+    make_pvc(&storage, "ok", "5Gi").await;
+    make_pvc(&storage, "too-big", "100Gi").await;
+
+    let small_key = build_key("persistentvolumeclaims", Some(LR_NS), "too-small");
+    let mut too_small: PersistentVolumeClaim = storage.get(&small_key).await.unwrap();
+    assert!(
+        !apply_limit_range_to_pvc(&storage, LR_NS, &mut too_small)
+            .await
+            .expect("apply"),
+        "500Mi below min 1Gi must be rejected",
+    );
+
+    let ok_key = build_key("persistentvolumeclaims", Some(LR_NS), "ok");
+    let mut ok: PersistentVolumeClaim = storage.get(&ok_key).await.unwrap();
+    assert!(
+        apply_limit_range_to_pvc(&storage, LR_NS, &mut ok)
+            .await
+            .expect("apply"),
+        "5Gi within [1Gi,10Gi] must be admitted",
+    );
+
+    let big_key = build_key("persistentvolumeclaims", Some(LR_NS), "too-big");
+    let mut too_big: PersistentVolumeClaim = storage.get(&big_key).await.unwrap();
+    assert!(
+        !apply_limit_range_to_pvc(&storage, LR_NS, &mut too_big)
+            .await
+            .expect("apply"),
+        "100Gi above max 10Gi must be rejected",
+    );
+}
+
+/// 5. Pod-level aggregation: a `type: Pod` item's max applies to the SUM
+/// across all containers, not each container individually.
+#[tokio::test]
+async fn limitrange_pod_level_aggregates_across_containers() {
+    let lr = LimitRange::new(
+        "lr",
+        LR_NS,
+        LimitRangeSpec {
+            limits: vec![LimitRangeItem {
+                item_type: "Pod".to_string(),
+                default: None,
+                default_request: None,
+                min: None,
+                max: str_map(&[("cpu", "2")]),
+                max_limit_request_ratio: None,
+            }],
+        },
+    );
+
+    let container = |n: &str| Container {
+        name: n.to_string(),
+        image: "pause:latest".to_string(),
+        resources: Some(PodResourceRequirements {
+            requests: str_map(&[("cpu", "1500m")]),
+            limits: None,
+            claims: None,
+        }),
+        ..Default::default()
+    };
+    let mut pod = Pod {
+        type_meta: TypeMeta {
+            kind: "Pod".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: ObjectMeta::new("oversized-sum").with_namespace(LR_NS),
+        spec: Some(PodSpec {
+            containers: vec![container("a"), container("b")],
+            ..Default::default()
+        }),
+        status: None,
+    };
+
+    assert!(
+        !apply_limit_range_with(&mut pod, &vec![lr]).expect("apply"),
+        "two containers at 1500m (sum 3) must exceed type:Pod max.cpu=2",
+    );
+}
