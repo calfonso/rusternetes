@@ -1,0 +1,30 @@
+[
+  {
+    "name": "sysctls",
+    "sig": "sig-node",
+    "focus": "\\[(Feature|NodeFeature):Sysctls\\]",
+    "skip": "\\[Flaky\\]",
+    "gating": false
+  },
+  {
+    "name": "probe-termination-grace-period",
+    "sig": "sig-node",
+    "focus": "\\[Feature:ProbeTerminationGracePeriod\\]",
+    "skip": "\\[Flaky\\]",
+    "gating": false
+  },
+  {
+    "name": "downward-api",
+    "sig": "sig-node",
+    "focus": "\\[Feature:DownwardAPI\\]",
+    "skip": "\\[Flaky\\]",
+    "gating": false
+  },
+  {
+    "name": "configmap",
+    "sig": "sig-node",
+    "focus": "\\[sig-node\\].*ConfigMap|ConfigMap.*\\[sig-node\\]",
+    "skip": "\\[Flaky\\]|\\[Serial\\]",
+    "gating": false
+  }
+]
