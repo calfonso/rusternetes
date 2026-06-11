@@ -68,5 +68,38 @@ fn bench_memory_single(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_memory_single);
+fn bench_memory_fanout(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let (storage, key) = rt.block_on(seed_memory());
+
+    let mut group = c.benchmark_group("watch_latency/memory_fanout");
+    for n in [1usize, 10, 50] {
+        group.bench_with_input(criterion::BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    // N live watchers, all subscribed before the measured write.
+                    let mut streams = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        streams.push(storage.watch(PREFIX).await.expect("watch"));
+                    }
+                    let start = std::time::Instant::now();
+                    for i in 0..iters {
+                        storage
+                            .update::<serde_json::Value>(&key, &payload(i + 1))
+                            .await
+                            .expect("update");
+                        // Every watcher must observe this write's event.
+                        for s in streams.iter_mut() {
+                            let _ = s.next().await.expect("event").expect("ok event");
+                        }
+                    }
+                    start.elapsed()
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_memory_single, bench_memory_fanout);
 criterion_main!(benches);
