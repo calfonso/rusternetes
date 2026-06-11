@@ -1,0 +1,210 @@
+name: Bring up rusternetes cluster (sqlite/dind + Hydrophone)
+description: >
+  Confirm docker, install kubectl + Hydrophone, build images, bring up the
+  compose.sqlite.yml + compose.dind.yml stack, discover the bridge gateway,
+  wait for api-server health, and bootstrap. Shared by the conformance canary
+  and the per-feature matrix. node-conformance uses a different stack and does
+  NOT use this action.
+inputs:
+  hydrophone-version:
+    description: Hydrophone release tag
+    required: false
+    default: v0.7.0
+  kubectl-version:
+    description: kubectl release tag (match the conformance image)
+    required: false
+    default: v1.35.0
+outputs:
+  kubeconfig:
+    description: Path to the generated kubeconfig
+    value: ${{ steps.kubeconfig.outputs.path }}
+runs:
+  using: composite
+  steps:
+    - name: Confirm Docker daemon
+      shell: bash
+      run: |
+        docker version
+        docker info --format '{{ .ServerVersion }}'
+
+    - name: Check docker-compose v2 plugin
+      # The runner image (ci/arc-runner/Dockerfile) bakes in v2.30.3.
+      # Fail fast if the plugin is missing or older than the floor —
+      # rebuilding the runner image is the correct fix, not papering
+      # over it in this workflow.
+      shell: bash
+      env:
+        REQUIRED_COMPOSE_VERSION: v2.30.0
+      run: |
+        set -euo pipefail
+        if ! docker compose version --short >/dev/null 2>&1; then
+          echo "docker compose plugin missing — rebuild the ARC runner image (ci/arc-runner/Dockerfile)" >&2
+          exit 1
+        fi
+        ACTUAL="v$(docker compose version --short)"
+        if ! printf '%s\n%s\n' "$REQUIRED_COMPOSE_VERSION" "$ACTUAL" | sort -V -C; then
+          echo "docker compose $ACTUAL is older than required $REQUIRED_COMPOSE_VERSION — rebuild the ARC runner image (ci/arc-runner/Dockerfile)" >&2
+          exit 1
+        fi
+        echo "docker compose $ACTUAL (>= $REQUIRED_COMPOSE_VERSION)"
+
+    - name: Generate TLS certs
+      shell: bash
+      run: |
+        bash scripts/generate-certs.sh
+
+    - name: Set KUBELET_VOLUMES_PATH
+      shell: bash
+      run: |
+        echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
+        mkdir -p "$GITHUB_WORKSPACE/.rusternetes/volumes"
+
+    - name: Write kubeconfig
+      # The repo doesn't ship a kubeconfig — it's user-maintained
+      # locally at ~/.kube/rusternetes-config. Construct a minimal
+      # one for the runner. Inside the runner pod (which shares its
+      # network namespace with the dind sidecar), the api-server's
+      # published port 6443 is reachable on localhost. `--skip-auth`
+      # on the api-server (compose.sqlite.yml) means any bearer token is
+      # accepted, so the placeholder works.
+      id: kubeconfig
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.kube"
+        cat > "$HOME/.kube/rusternetes-config" <<'EOF'
+        apiVersion: v1
+        kind: Config
+        clusters:
+          - name: rusternetes
+            cluster:
+              insecure-skip-tls-verify: true
+              server: https://localhost:6443
+        contexts:
+          - name: rusternetes
+            context:
+              cluster: rusternetes
+              user: admin
+        current-context: rusternetes
+        users:
+          - name: admin
+            user:
+              token: anonymous
+        EOF
+        echo "KUBECONFIG=$HOME/.kube/rusternetes-config" >> "$GITHUB_ENV"
+        echo "path=$HOME/.kube/rusternetes-config" >> "$GITHUB_OUTPUT"
+
+    - name: Install kubectl
+      # The ARC runner image (ci/arc-runner/Dockerfile) bakes Rust + protoc
+      # + docker-compose but not kubectl, so `kubectl ... 2>/dev/null`
+      # silently 127's and any wait-loop spins forever (run 26127584434
+      # timed out for exactly this reason). Pin to match the conformance
+      # image so kubectl never lags the cluster API surface.
+      # Drop into the runner user's local bin and append to GITHUB_PATH
+      # — no sudo (the runner image's sudo config is not guaranteed).
+      shell: bash
+      run: |
+        set -euo pipefail
+        KUBECTL_VERSION="${{ inputs.kubectl-version }}"
+        mkdir -p "$HOME/.local/bin"
+        curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+          "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+          -o "$HOME/.local/bin/kubectl"
+        chmod +x "$HOME/.local/bin/kubectl"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/kubectl" version --client
+
+    - name: Build images
+      # Build before `up -d` so the up step is a fast container-start
+      # rather than a slow build. Parallel build keeps wall time
+      # reasonable on the 3-core conformance tier.
+      shell: bash
+      run: |
+        docker compose -f compose.sqlite.yml -f compose.dind.yml build --parallel
+
+    - name: Bring up cluster
+      shell: bash
+      run: |
+        # Initial up creates the bridge network (needed before we can
+        # discover the gateway.  KUBERNETES_SERVICE_HOST_OVERRIDE will
+        # be wrong until the restart step below.
+        docker compose -f compose.sqlite.yml -f compose.dind.yml up -d
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ps
+
+    - id: discover-gateway
+      name: Discover docker bridge gateway
+      shell: bash
+      run: |
+        GW=$(docker network inspect rusternetes-network -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "")
+        if [ -z "$GW" ]; then
+          GW=$(ip route show | grep "docker0" | grep -oP 'inet\K[0-9./]+' | head -1 | cut -d/ -f1 | rev | cut -d. -f2,3,4 | rev | sed 's/\.[0-9]*$/.1/')
+        fi
+        if [ -z "$GW" ]; then
+          echo "ERROR: Could not discover docker bridge gateway" >&2
+          exit 1
+        fi
+        echo "gateway=$GW" >> "$GITHUB_OUTPUT"
+        echo "DOCKER_GATEWAY=$GW" >> "$GITHUB_ENV"
+        echo "Docker bridge gateway: $GW"
+
+    - name: Restart cluster with discovered gateway
+      # Write .env so compose interpolates the real gateway on restart.
+      # The kubelet inside the container now sees the correct IP.
+      shell: bash
+      run: |
+        echo "DOCKER_GATEWAY=${{ steps.discover-gateway.outputs.gateway }}" > .env
+        echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> .env
+        docker compose -f compose.sqlite.yml -f compose.dind.yml up -d
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ps
+
+    - name: Wait for api-server health
+      # NOTE: composite-action steps do NOT support `timeout-minutes` at
+      # the step level (GitHub limitation). The 90×2s loop self-bounds to
+      # ~3 min, matching the canary's step-level timeout. The caller's job
+      # `timeout-minutes` is the real ceiling for runaway cases.
+      shell: bash
+      run: |
+        # Runner default `bash -e` makes `OUT=$(kubectl ... 2>&1)` exit
+        # silently on the first kubectl failure: bash propagates the
+        # non-zero status of the command substitution and dies before
+        # `RC=$?` runs. The whole step died in <100ms with no output
+        # (run 26359713718, 2026-05-24). The retry loop *expects*
+        # kubectl to fail until api-server is listening, so opt out of -e.
+        set +e
+        # Earlier loop piped kubectl through `grep -q ok`, which swallowed
+        # every stderr line (run 26147385703 — 3 min of "waiting" with no
+        # diagnostic). Surface the actual kubectl output each iteration so
+        # the failure mode (TLS, refused, no route) is visible in the log.
+        for i in $(seq 1 90); do
+          OUT=$(kubectl get --raw=/healthz 2>&1)
+          RC=$?
+          if [ "$RC" -eq 0 ] && echo "$OUT" | grep -q ok; then
+            echo "api-server healthy after ${i} attempts: $OUT"
+            kubectl get nodes
+            exit 0
+          fi
+          printf '[%02d] kubectl rc=%d: %s\n' "$i" "$RC" "$OUT"
+          sleep 2
+        done
+        echo "api-server never became healthy — dumping diagnostics:"
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ps || true
+        docker compose -f compose.sqlite.yml -f compose.dind.yml logs --tail=50 rusternetes || true
+        curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
+        curl -kv --max-time 5 https://localhost:6443/healthz || true
+        exit 1
+
+    - name: Bootstrap cluster (CoreDNS, services, SA tokens)
+      shell: bash
+      run: bash scripts/bootstrap-cluster.sh
+
+    - name: Install Hydrophone
+      # Pinned binary; callers expect it on PATH after this action runs.
+      shell: bash
+      run: |
+        set -e
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+          -o /tmp/hydrophone.tar.gz \
+          "https://github.com/kubernetes-sigs/hydrophone/releases/download/${{ inputs.hydrophone-version }}/hydrophone_Linux_x86_64.tar.gz"
+        tar -xzf /tmp/hydrophone.tar.gz -C "$HOME/.local/bin" hydrophone
+        chmod +x "$HOME/.local/bin/hydrophone"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        hydrophone --help | head -5

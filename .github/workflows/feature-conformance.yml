@@ -1,0 +1,150 @@
+name: Feature conformance
+
+# Per-[Feature:xxx] conformance matrix. Each feature gets its own cluster
+# bring-up and Hydrophone run, so one red matrix cell == one broken feature.
+# Graduated (gating:true) features go red on regression; the rest report only.
+#
+# Triggers:
+#   * pull_request (manifest/script/action/workflow paths) — cheap validate job
+#     only (JSON lint + shell unit tests). No cluster.
+#   * schedule nightly 05:00 UTC — full matrix (after node-conformance's 03:00
+#     so they don't contend for the conformance runner pool).
+#   * workflow_dispatch — optional feature/sig filter to run a subset on demand.
+
+on:
+  pull_request:
+    paths:
+      - 'ci/conformance/features.json'
+      - 'scripts/conformance-feature-run.sh'
+      - 'scripts/conformance-features-discover.sh'
+      - 'scripts/tests/test-conformance-feature-run.sh'
+      - 'scripts/tests/test-features-manifest.sh'
+      - 'scripts/tests/test-conformance-features-discover.sh'
+      - 'ci/actions/bring-up-cluster/action.yml'
+      - '.github/workflows/feature-conformance.yml'
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      feature:
+        description: 'Single feature name to run (exact match in features.json)'
+        required: false
+        default: ''
+      sig:
+        description: 'Run only features for this SIG (e.g. sig-node)'
+        required: false
+        default: ''
+
+env:
+  HYDROPHONE_VERSION: v0.7.0
+  DOCKER_HOST: unix:///var/run/docker.sock
+
+jobs:
+  validate:
+    name: validate manifest + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
+      - name: Manifest validity
+        run: bash scripts/tests/test-features-manifest.sh
+      - name: Runner unit tests
+        run: bash scripts/tests/test-conformance-feature-run.sh
+      - name: Discovery unit tests
+        run: bash scripts/tests/test-conformance-features-discover.sh
+
+  matrix-gen:
+    name: generate matrix
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
+      - id: gen
+        env:
+          FILTER_FEATURE: ${{ github.event.inputs.feature }}
+          FILTER_SIG: ${{ github.event.inputs.sig }}
+        run: |
+          set -euo pipefail
+          m=$(cat ci/conformance/features.json)
+          if [ -n "${FILTER_FEATURE:-}" ]; then
+            m=$(echo "$m" | jq --arg f "$FILTER_FEATURE" '[.[] | select(.name==$f)]')
+          fi
+          if [ -n "${FILTER_SIG:-}" ]; then
+            m=$(echo "$m" | jq --arg s "$FILTER_SIG" '[.[] | select(.sig==$s)]')
+          fi
+          n=$(echo "$m" | jq length)
+          if [ "$n" -eq 0 ]; then
+            echo "filter matched no features (feature='${FILTER_FEATURE:-}' sig='${FILTER_SIG:-}')" >&2
+            exit 1
+          fi
+          echo "selected $n feature(s)"
+          echo "matrix={\"include\":$(echo "$m" | jq -c .)}" >> "$GITHUB_OUTPUT"
+
+  feature:
+    name: ${{ matrix.name }}
+    needs: matrix-gen
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: arc-runner-set-conformance
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # max-parallel: 2 is safe because each ARC conformance runner pod gets its
+      # own DinD daemon — container/network/volume names are per-daemon, so two
+      # concurrent feature jobs don't collide. If the runner set is ever moved to
+      # bare-host (shared Docker daemon), add COMPOSE_PROJECT_NAME isolation first.
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.matrix-gen.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Bring up cluster
+        uses: ./ci/actions/bring-up-cluster
+        with:
+          hydrophone-version: ${{ env.HYDROPHONE_VERSION }}
+          kubectl-version: v1.35.0
+      - name: Run feature conformance
+        env:
+          FEATURE_NAME: ${{ matrix.name }}
+          FEATURE_FOCUS: ${{ matrix.focus }}
+          FEATURE_SKIP: ${{ matrix.skip }}
+          FEATURE_GATING: ${{ matrix.gating }}
+        run: |
+          bash scripts/conformance-feature-run.sh \
+            --name "$FEATURE_NAME" \
+            --focus "$FEATURE_FOCUS" \
+            --skip "$FEATURE_SKIP" \
+            --gating "$FEATURE_GATING" \
+            --output-dir "feature-out/$FEATURE_NAME"
+      - name: Update feature badge
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEATURE_NAME: ${{ matrix.name }}
+        run: |
+          j="feature-out/$FEATURE_NAME/junit_01.xml"
+          [ -f "$j" ] || { echo "no junit — skipping badge"; exit 0; }
+          p=$(grep -oE 'status="passed"' "$j" | wc -l | tr -d ' ')
+          f=$(grep -oE 'status="failed"' "$j" | wc -l | tr -d ' ')
+          bash scripts/update-badge.sh "feature-$FEATURE_NAME" "$FEATURE_NAME" "$p" "$((p + f))"
+      - name: Upload feature artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-${{ matrix.name }}
+          path: feature-out/${{ matrix.name }}/
+          retention-days: 14
+      - name: Tear down cluster
+        if: always()
+        run: |
+          docker compose -f compose.sqlite.yml -f compose.dind.yml logs --tail=100 || true
+          docker compose -f compose.sqlite.yml -f compose.dind.yml down -v || true
