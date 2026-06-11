@@ -15,6 +15,10 @@ on:
         description: "Upstream Kubernetes test tarball version"
         required: false
         default: "v1.35.0"
+      image_tag:
+        description: "GHCR image tag to pull (default main; empty = build locally)"
+        required: false
+        default: main
   schedule:
     # 03:00 UTC nightly. Self-hosted runner; respects the project's GH Actions
     # minute budget (see project memory `project_github_actions_minute_budget`).
@@ -76,6 +80,7 @@ jobs:
           KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
           FOCUS: ${{ github.event.inputs.focus || '\[NodeConformance\]' }}
           K8S_VERSION: ${{ github.event.inputs.k8s_version || 'v1.35.0' }}
+          RUSTERNETES_IMAGE_TAG: ${{ github.event_name == 'schedule' && 'main' || github.event.inputs.image_tag }}
         run: bash scripts/run-node-conformance.sh
 
       - name: Upload ginkgo log
