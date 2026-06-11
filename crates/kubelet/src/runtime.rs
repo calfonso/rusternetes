@@ -339,6 +339,34 @@ fn sysctl_name_to_dotted(name: &str) -> String {
     name.replace('/', ".")
 }
 
+/// Strip the leading `/` Docker prefixes to container names in the
+/// `ContainerSummary.names` list (e.g. `/test-container-pod_pause`).
+fn canonical_container_name(name: &str) -> &str {
+    name.strip_prefix('/').unwrap_or(name)
+}
+
+/// True iff `name` is exactly the pause container for `pod_name`.
+///
+/// Pod containers are named `{pod_name}_{container}` and the pause is
+/// `{pod_name}_pause` (see [`Runtime::start_pause_container`]). Docker's
+/// `list_containers` `name` filter is a *substring* match, so a query for
+/// `test-container-pod_pause` also returns `host-test-container-pod_pause`.
+/// That hostNetwork pause joins the node netns, so picking it makes
+/// `get_pod_ip` report the node IP as the pod IP. Match the canonical name
+/// exactly to avoid that collision.
+fn is_pause_container_name(name: &str, pod_name: &str) -> bool {
+    canonical_container_name(name) == format!("{pod_name}_pause")
+}
+
+/// True iff `name` is one of `pod_name`'s containers (`{pod_name}_*`).
+///
+/// Anchored on the canonical (de-`/`'d) name so `test-container-pod` does
+/// not match `host-test-container-pod_*`. Used by `get_pod_ip`'s fallback
+/// when no pause container is present.
+fn container_belongs_to_pod(name: &str, pod_name: &str) -> bool {
+    canonical_container_name(name).starts_with(&format!("{pod_name}_"))
+}
+
 /// The default set of "safe" sysctls — namespaced and isolated, so always
 /// permitted. Mirrors upstream `pkg/kubelet/sysctl/safe_sysctls.go::safeSysctls`
 /// (the kernel-version-gated `net.ipv4.*` entries are treated as safe here,
@@ -9209,10 +9237,25 @@ impl ContainerRuntime {
             ..Default::default()
         };
 
-        let mut containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.docker.list_containers(Some(options)).await?;
 
-        // If no pause container, try any container matching the pod name
-        if containers.is_empty() {
+        // Docker's `name` filter is a *substring* match, so this list can
+        // include e.g. `host-test-container-pod_pause` when we asked for
+        // `test-container-pod_pause`. That hostNetwork pause joins the node
+        // netns and would make us report the node IP as the pod IP, breaking
+        // intra-pod networking. Select the pause whose canonical name matches
+        // exactly. See `is_pause_container_name`.
+        let mut selected = containers.into_iter().find(|c| {
+            c.names
+                .iter()
+                .flatten()
+                .any(|n| is_pause_container_name(n, pod_name))
+        });
+
+        // No pause container — fall back to any container that truly belongs
+        // to this pod (anchored, so `test-container-pod` does not match
+        // `host-test-container-pod_*`).
+        if selected.is_none() {
             let mut filters2 = HashMap::new();
             filters2.insert("name".to_string(), vec![format!("{}_", pod_name)]);
             let options2 = ListContainersOptions {
@@ -9220,11 +9263,17 @@ impl ContainerRuntime {
                 filters: filters2,
                 ..Default::default()
             };
-            containers = self.docker.list_containers(Some(options2)).await?;
+            let containers2 = self.docker.list_containers(Some(options2)).await?;
+            selected = containers2.into_iter().find(|c| {
+                c.names
+                    .iter()
+                    .flatten()
+                    .any(|n| container_belongs_to_pod(n, pod_name))
+            });
         }
 
         // Get the IP from the pause container (or first matching)
-        if let Some(container) = containers.first() {
+        if let Some(container) = selected.as_ref() {
             if let Some(id) = &container.id {
                 let inspect = self
                     .docker
@@ -10127,9 +10176,44 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_quantity_bytes, pod_dir_key, split_image_reference, sysctl_name_to_dotted,
-        write_file_atomic,
+        container_belongs_to_pod, is_pause_container_name, parse_quantity_bytes, pod_dir_key,
+        split_image_reference, sysctl_name_to_dotted, write_file_atomic,
     };
+
+    #[test]
+    fn pod_ip_lookup_does_not_match_host_pod_by_substring() {
+        // Docker's `name` filter is a substring match, so a query for
+        // `test-container-pod`'s pause also returns the hostNetwork
+        // `host-test-container-pod_pause` running concurrently (parallel
+        // ginkgo). That pause joins the node netns, so get_pod_ip would
+        // wrongly report the node IP as the pod IP and intra-pod networking
+        // fails ("1 out of 1 connections failed"). Match the canonical name
+        // exactly instead. Regression for [sig-network] Networking Granular
+        // Checks: Pods intra-pod communication (node conformance).
+        assert!(is_pause_container_name(
+            "/test-container-pod_pause",
+            "test-container-pod"
+        ));
+        assert!(!is_pause_container_name(
+            "/host-test-container-pod_pause",
+            "test-container-pod"
+        ));
+        // The no-pause fallback (match any container of the pod) must be
+        // anchored the same way.
+        assert!(container_belongs_to_pod(
+            "/test-container-pod_webserver",
+            "test-container-pod"
+        ));
+        assert!(!container_belongs_to_pod(
+            "/host-test-container-pod_webserver",
+            "test-container-pod"
+        ));
+        // Names without the Docker `/` prefix still match.
+        assert!(is_pause_container_name(
+            "test-container-pod_pause",
+            "test-container-pod"
+        ));
+    }
 
     #[test]
     fn sysctl_name_to_dotted_converts_slashes() {
