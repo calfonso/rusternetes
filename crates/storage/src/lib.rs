@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 pub mod concurrency;
 pub mod etcd;
+mod event_bus;
 pub mod event_recorder;
 pub mod memory;
 pub mod metadata;
@@ -15,6 +16,9 @@ pub mod workqueue;
 
 // Re-export MemoryStorage for convenient testing
 pub use memory::MemoryStorage;
+
+// Re-export the in-process watch event bus (#1039)
+pub use event_bus::EventBus;
 
 // Re-export the unified event recorder
 pub use event_recorder::EventRecorder;
