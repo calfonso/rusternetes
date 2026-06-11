@@ -51,3 +51,37 @@ async fn watch_sees_create_update_delete_via_bus() {
         other => panic!("expected Deleted, got {other:?}"),
     }
 }
+
+/// A write that fails the CAS (stale resourceVersion -> Conflict) must publish
+/// nothing to the bus: the publish calls sit after each `if !succeeded` guard.
+#[tokio::test]
+async fn failed_write_publishes_nothing() {
+    let storage = bus_backend().await;
+    let key = "/registry/pods/default/p2";
+    let mut stream = storage.watch("/registry/pods/").await.expect("watch");
+
+    let obj = serde_json::json!({"metadata": {"name": "p2", "namespace": "default"}, "spec": {}});
+    let _: serde_json::Value = storage.create(key, &obj).await.expect("create");
+
+    // Consume the create's Added so the stream is drained to "now".
+    let added = stream.next().await.expect("event").expect("ok");
+    assert!(matches!(added, rusternetes_storage::WatchEvent::Added(ref k, _) if k == key));
+
+    // Update carrying a stale resourceVersion -> CAS fails -> Conflict.
+    let stale = serde_json::json!({
+        "metadata": {"name": "p2", "namespace": "default", "resourceVersion": "1"},
+        "spec": {"x": 1}
+    });
+    let err = storage
+        .update::<serde_json::Value>(key, &stale)
+        .await
+        .expect_err("stale update must Conflict");
+    assert!(
+        matches!(err, rusternetes_common::Error::Conflict(_)),
+        "expected Conflict, got {err:?}"
+    );
+
+    // No event should arrive on the bus for the failed write.
+    let next = tokio::time::timeout(std::time::Duration::from_millis(300), stream.next()).await;
+    assert!(next.is_err(), "failed write must not publish; got {next:?}");
+}

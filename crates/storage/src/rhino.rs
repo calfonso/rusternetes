@@ -328,6 +328,9 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         }
 
         debug!("Deleted resource at key: {}", key);
+        // Guarded so the prev-value reconstruction (utf8 + RV inject) is skipped
+        // entirely when no bus is attached — keep the guard, don't simplify to a
+        // bare `self.publish(...)` which would do that work unconditionally.
         if self.bus.is_some() {
             let prev_value = prev_kv
                 .as_ref()

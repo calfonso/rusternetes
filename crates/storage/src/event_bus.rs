@@ -2,6 +2,14 @@
 //! per-consumer backend watch round-trip in the all-in-one binary (#1039).
 //! Only correct when one process is the sole writer (all-in-one); multi-process
 //! deployments must keep using the native backend watch.
+//!
+//! Tradeoff: the bus has no resourceVersion-resume equivalent to
+//! `watch_from_revision`. On lag (or any stream error) a consumer must relist
+//! and re-subscribe, leaving a small gap window that level-driven controllers
+//! close on their next resync tick. This matches the pre-existing
+//! `MemoryStorage` broadcast semantics; external HTTP watch clients, which need
+//! RV-resumable replay, are served from the native feed via
+//! `StorageBackend::watch_backend` instead.
 
 use crate::{WatchEvent, WatchStream};
 use rusternetes_common::Error;
