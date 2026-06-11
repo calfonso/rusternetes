@@ -31,6 +31,10 @@ jq -e 'all(.[];
 dupes=$(jq -r '[.[].name] | group_by(.) | map(select(length>1)) | .[][0]' "$MANIFEST")
 [ -z "$dupes" ] || fail "duplicate feature names: $dupes"
 
+# Names must be path-safe (used as a directory + artifact name in CI).
+jq -e 'all(.[].name; test("^[a-z0-9][a-z0-9-]*$"))' "$MANIFEST" >/dev/null \
+    || fail "feature names must match ^[a-z0-9][a-z0-9-]*\$ (path-safe)"
+
 # focus/skip compile as EREs.
 while IFS=$'\t' read -r name focus skip; do
     printf '' | grep -E "$focus" >/dev/null 2>&1 || [ $? -le 1 ] \
