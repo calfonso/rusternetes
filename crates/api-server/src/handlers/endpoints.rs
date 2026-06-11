@@ -44,6 +44,9 @@ pub async fn create_endpoints(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&endpoints.metadata)?;
+
     endpoints.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields

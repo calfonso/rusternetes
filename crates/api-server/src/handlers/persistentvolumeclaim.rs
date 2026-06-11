@@ -42,6 +42,9 @@ pub async fn create_pvc(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&pvc.metadata)?;
+
     pvc.metadata.namespace = Some(namespace.clone());
 
     // Apply DefaultStorageClass admission (sets default storage class if not specified)

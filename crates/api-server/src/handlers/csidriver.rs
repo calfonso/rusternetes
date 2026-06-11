@@ -34,6 +34,9 @@ pub async fn create_csidriver(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&driver.metadata)?;
+
     driver.metadata.ensure_uid();
     driver.metadata.ensure_creation_timestamp();
 

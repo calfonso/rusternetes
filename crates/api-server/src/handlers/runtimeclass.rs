@@ -24,6 +24,9 @@ pub async fn create_runtimeclass(
 ) -> Result<(StatusCode, Json<RuntimeClass>)> {
     info!("Creating RuntimeClass: {}", runtime_class.metadata.name);
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&runtime_class.metadata)?;
+
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 

@@ -39,6 +39,9 @@ pub async fn create(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&lease.metadata)?;
+
     lease.metadata.namespace = Some(namespace.clone());
     lease.metadata.ensure_uid();
     lease.metadata.ensure_creation_timestamp();

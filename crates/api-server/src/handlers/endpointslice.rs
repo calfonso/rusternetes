@@ -41,6 +41,9 @@ pub async fn create_endpointslice(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&endpointslice.metadata)?;
+
     endpointslice.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields

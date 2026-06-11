@@ -35,6 +35,9 @@ pub async fn create_ipaddress(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&ipaddress.metadata)?;
+
     // Enrich metadata with system fields
     ipaddress.metadata.ensure_uid();
     ipaddress.metadata.ensure_creation_timestamp();

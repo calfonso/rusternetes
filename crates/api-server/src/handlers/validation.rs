@@ -756,9 +756,56 @@ pub fn validate_resource_name(name: &str) -> Result<(), Error> {
 // `rusternetes_middleware::generate_name_middleware` for every create request
 // (#1052), so per-handler helpers are no longer needed here.
 
+/// Reject a persisted create whose object carries neither `metadata.name` nor a
+/// resolved `metadata.generateName`.
+///
+/// By the time a create handler runs, `generate_name_middleware` has already
+/// turned any non-empty `generateName` into a concrete `name` (#1052), so an
+/// empty `name` here means the client supplied neither field. Upstream's
+/// `ValidateObjectMeta` rejects this with HTTP 422 and the message
+/// `name or generateName is required`, instead of persisting the object at a
+/// malformed `/registry/<type>/<ns>/` key. GitHub #1065.
+///
+/// Non-persisted POSTs (SubjectAccessReview/TokenReview/TokenRequest/
+/// SelfSubjectReview, pod binding/eviction) legitimately have no name and must
+/// NOT call this.
+pub fn require_object_name(meta: &rusternetes_common::types::ObjectMeta) -> Result<(), Error> {
+    if meta.name.is_empty() {
+        use rusternetes_common::validation::field::{Error as FieldError, Path};
+        return Err(Error::Invalid(vec![FieldError::required(
+            &Path::new("metadata").child("name"),
+            "name or generateName is required",
+        )]));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_object_name_rejects_empty_name() {
+        let meta = rusternetes_common::types::ObjectMeta::default();
+        let err = require_object_name(&meta).expect_err("empty name must be rejected");
+        match err {
+            Error::Invalid(errs) => {
+                assert_eq!(errs.len(), 1);
+                assert_eq!(errs[0].field, "metadata.name");
+                assert_eq!(errs[0].detail, "name or generateName is required");
+            }
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_object_name_accepts_named() {
+        let meta = rusternetes_common::types::ObjectMeta {
+            name: "foo".to_string(),
+            ..Default::default()
+        };
+        assert!(require_object_name(&meta).is_ok());
+    }
 
     /// A CRD whose validation schema sets standard JSON-Schema fields to their
     /// zero value (`exclusiveMaximum: false`, `nullable: false`,

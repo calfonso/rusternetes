@@ -27,6 +27,9 @@ pub async fn create_csinode(
     })?;
     info!("Creating CSINode: {}", node.metadata.name);
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&node.metadata)?;
+
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "csinodes")
         .with_api_group("storage.k8s.io");

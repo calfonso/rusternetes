@@ -347,6 +347,9 @@ pub async fn create_role(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&role.metadata)?;
+
     role.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields
@@ -625,6 +628,9 @@ pub async fn create_rolebinding(
         &rolebinding.metadata.name,
     )
     .await?;
+
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&rolebinding.metadata)?;
 
     rolebinding.metadata.namespace = Some(namespace.clone());
 
@@ -919,6 +925,9 @@ pub async fn create_clusterrole(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&clusterrole.metadata)?;
+
     // Enrich metadata with system fields
     clusterrole.metadata.ensure_uid();
     clusterrole.metadata.ensure_creation_timestamp();
@@ -1169,6 +1178,9 @@ pub async fn create_clusterrolebinding(
         &clusterrolebinding.metadata.name,
     )
     .await?;
+
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&clusterrolebinding.metadata)?;
 
     // Enrich metadata with system fields
     clusterrolebinding.metadata.ensure_uid();

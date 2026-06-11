@@ -39,6 +39,9 @@ pub async fn create_csistoragecapacity(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&csc.metadata)?;
+
     csc.metadata.namespace = Some(namespace.clone());
     csc.metadata.ensure_uid();
     csc.metadata.ensure_creation_timestamp();

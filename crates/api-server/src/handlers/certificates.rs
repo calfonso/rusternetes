@@ -32,6 +32,9 @@ pub async fn create_certificate_signing_request(
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&csr.metadata)?;
+
     // Enrich metadata with system fields
     csr.metadata.ensure_uid();
     csr.metadata.ensure_creation_timestamp();

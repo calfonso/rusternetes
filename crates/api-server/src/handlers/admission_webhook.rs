@@ -40,6 +40,9 @@ pub async fn create_validating_webhook(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&config.metadata)?;
+
     // Validate matchConditions CEL expressions with type-checking
     if let Some(webhooks) = &config.webhooks {
         for webhook in webhooks {
@@ -351,6 +354,9 @@ pub async fn create_mutating_webhook(
             return Err(rusternetes_common::Error::Forbidden(reason));
         }
     }
+
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&config.metadata)?;
 
     // Validate matchConditions CEL expressions with type-checking
     if let Some(webhooks) = &config.webhooks {

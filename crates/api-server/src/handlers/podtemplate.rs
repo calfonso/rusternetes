@@ -39,6 +39,9 @@ pub async fn create_podtemplate(
         }
     }
 
+    // Reject create with neither name nor generateName (#1065).
+    crate::handlers::validation::require_object_name(&podtemplate.metadata)?;
+
     // Ensure namespace is set from the URL path
     podtemplate.metadata.namespace = Some(namespace.clone());
 
