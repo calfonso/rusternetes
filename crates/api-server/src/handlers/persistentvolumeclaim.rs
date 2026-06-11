@@ -58,6 +58,27 @@ pub async fn create_pvc(
         // Continue anyway - don't fail PVC creation if default storage class can't be set
     }
 
+    // LimitRange admission — reject PVCs whose storage request falls outside
+    // the namespace's `type: PersistentVolumeClaim` min/max bounds.
+    match crate::admission::apply_limit_range_to_pvc(&state.storage, &namespace, &mut pvc).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "PVC {}/{} violates a LimitRange constraint",
+                namespace, pvc.metadata.name
+            )));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Error applying LimitRange admission for PVC {}/{}: {}",
+                namespace,
+                pvc.metadata.name,
+                e
+            );
+            // Continue on storage hiccup rather than blocking PVC creation.
+        }
+    }
+
     pvc.metadata.ensure_uid();
     pvc.metadata.ensure_creation_timestamp();
 

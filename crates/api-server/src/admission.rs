@@ -585,6 +585,147 @@ pub fn apply_limit_range_with(
         }
     }
 
+    // Pod-level aggregation: `type: Pod` items bound the SUM of a resource
+    // across ALL containers in the pod, not each container individually.
+    // Upstream: `PodValidateLimitFunc` in
+    // `plugin/pkg/admission/limitranger/admission.go` sums per-resource over
+    // containers and checks the total against min/max.
+    if let Some(spec) = &pod.spec {
+        // Sum a resource (in canonical units — cpu millicores, else bytes)
+        // across every container's `requests` (or `limits` when `use_limits`).
+        let sum_across = |use_limits: bool, resource: &str| -> anyhow::Result<i64> {
+            let mut total = 0i64;
+            for container in &spec.containers {
+                if let Some(rr) = &container.resources {
+                    let map = if use_limits { &rr.limits } else { &rr.requests };
+                    if let Some(m) = map {
+                        if let Some(v) = m.get(resource) {
+                            total += if resource == "cpu" {
+                                parse_cpu_to_millicores(v)?
+                            } else {
+                                parse_memory_to_bytes(v)?
+                            };
+                        }
+                    }
+                }
+            }
+            Ok(total)
+        };
+
+        for limit_range in limit_ranges {
+            for limit_item in &limit_range.spec.limits {
+                if limit_item.item_type != "Pod" {
+                    continue;
+                }
+
+                // max: summed requests AND summed limits must each be ≤ max.
+                if let Some(max) = &limit_item.max {
+                    for (resource, max_value) in max {
+                        for use_limits in [false, true] {
+                            let sum = sum_across(use_limits, resource)?;
+                            let exceeds = if resource == "cpu" {
+                                sum > parse_cpu_to_millicores(max_value)?
+                            } else {
+                                sum > parse_memory_to_bytes(max_value)?
+                            };
+                            if exceeds {
+                                warn!(
+                                    "Pod {} aggregate {} {} exceeds type:Pod maximum {}",
+                                    pod.metadata.name,
+                                    if use_limits { "limits" } else { "requests" },
+                                    resource,
+                                    max_value
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+
+                // min: summed requests must be ≥ min.
+                if let Some(min) = &limit_item.min {
+                    for (resource, min_value) in min {
+                        let sum = sum_across(false, resource)?;
+                        let below = if resource == "cpu" {
+                            sum < parse_cpu_to_millicores(min_value)?
+                        } else {
+                            sum < parse_memory_to_bytes(min_value)?
+                        };
+                        if below {
+                            warn!(
+                                "Pod {} aggregate requests {} below type:Pod minimum {}",
+                                pod.metadata.name, resource, min_value
+                            );
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+/// Apply LimitRange `type: PersistentVolumeClaim` constraints to a PVC.
+///
+/// Validates the PVC's `spec.resources.requests.storage` against the
+/// `min`/`max` of every `type: PersistentVolumeClaim` item in the namespace's
+/// LimitRanges. Returns `Ok(false)` when the request is out of range.
+///
+/// Upstream: `PersistentVolumeClaimValidateLimitFunc` in
+/// `plugin/pkg/admission/limitranger/admission.go`.
+pub async fn apply_limit_range_to_pvc<S: Storage>(
+    storage: &Arc<S>,
+    namespace: &str,
+    pvc: &mut rusternetes_common::resources::PersistentVolumeClaim,
+) -> anyhow::Result<bool> {
+    let limit_prefix = format!("/registry/limitranges/{}/", namespace);
+    let limit_ranges: Vec<LimitRange> = storage.list(&limit_prefix).await?;
+    if limit_ranges.is_empty() {
+        return Ok(true);
+    }
+
+    let requests = match &pvc.spec.resources.requests {
+        Some(r) => r,
+        None => return Ok(true),
+    };
+    let storage_req = match requests.get("storage") {
+        Some(s) => s,
+        None => return Ok(true),
+    };
+    let requested = parse_memory_to_bytes(storage_req)?;
+
+    for limit_range in &limit_ranges {
+        for limit_item in &limit_range.spec.limits {
+            if limit_item.item_type != "PersistentVolumeClaim" {
+                continue;
+            }
+            if let Some(min) = &limit_item.min {
+                if let Some(min_storage) = min.get("storage") {
+                    if requested < parse_memory_to_bytes(min_storage)? {
+                        warn!(
+                            "PVC {} storage request {} below LimitRange minimum {}",
+                            pvc.metadata.name, storage_req, min_storage
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            if let Some(max) = &limit_item.max {
+                if let Some(max_storage) = max.get("storage") {
+                    if requested > parse_memory_to_bytes(max_storage)? {
+                        warn!(
+                            "PVC {} storage request {} exceeds LimitRange maximum {}",
+                            pvc.metadata.name, storage_req, max_storage
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(true)
 }
 
