@@ -1492,6 +1492,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
+        // Propagate the SA's imagePullSecrets (#1084) — controllers bypass the
+        // api-server admission path that normally does this.
+        super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut pod_spec).await;
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
@@ -1596,6 +1600,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 }
             }
         }
+
+        // Propagate the SA's imagePullSecrets (#1084) — controllers bypass the
+        // api-server admission path that normally does this.
+        super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut pod_spec).await;
 
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
@@ -1910,6 +1918,45 @@ mod tests {
             Some("data-web-0"),
             "'data' volume must reference PVC data-web-0"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sts_pods_inherit_sa_image_pull_secrets() {
+        // #1084: SA imagePullSecrets must reach controller-created pods, which
+        // bypass the api-server admission path.
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+        let ns = "default";
+
+        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", ns);
+        sa.image_pull_secrets = Some(vec![
+            rusternetes_common::resources::service_account::LocalObjectReference {
+                name: "regcred".to_string(),
+            },
+        ]);
+        storage
+            .create("/registry/serviceaccounts/default/default", &sa)
+            .await
+            .unwrap();
+
+        let ss = make_statefulset("web", ns, 1, "nginx:1.19");
+        let key = format!("/registry/statefulsets/{}/web", ns);
+        storage.create(&key, &ss).await.unwrap();
+
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+
+        let pod: Pod = storage
+            .get(&format!("/registry/pods/{}/web-0", ns))
+            .await
+            .expect("pod web-0 created");
+        let spec = pod.spec.unwrap();
+        let secrets = spec
+            .image_pull_secrets
+            .as_ref()
+            .expect("pod must inherit the SA's imagePullSecrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "regcred");
     }
 
     /// Without a default StorageClass, an unset storageClassName stays unset

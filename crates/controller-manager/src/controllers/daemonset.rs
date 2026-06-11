@@ -1133,6 +1133,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // Inject service account token volume
         self.inject_service_account_token(&mut spec, namespace);
 
+        // Propagate the SA's imagePullSecrets (#1084) — controllers bypass the
+        // api-server admission path that normally does this.
+        super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut spec).await;
+
         // Debug: Check again after injection
         debug!("After injection - Checking environment variables:");
         for container in &spec.containers {
@@ -1792,6 +1796,51 @@ mod tests {
     }
 
     /// Helper to create a minimal DaemonSet for testing
+    #[tokio::test]
+    async fn test_ds_pods_inherit_sa_image_pull_secrets() {
+        // #1084: SA imagePullSecrets must reach controller-created pods, which
+        // bypass the api-server admission path.
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+
+        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", "default");
+        sa.image_pull_secrets = Some(vec![
+            rusternetes_common::resources::service_account::LocalObjectReference {
+                name: "regcred".to_string(),
+            },
+        ]);
+        storage
+            .create("/registry/serviceaccounts/default/default", &sa)
+            .await
+            .unwrap();
+
+        let node = make_test_node("test-node-1");
+        storage
+            .create("/registry/nodes/test-node-1", &node)
+            .await
+            .unwrap();
+
+        let mut ds = make_test_daemonset("pullsecrets-ds", "default");
+        storage
+            .create("/registry/daemonsets/default/pullsecrets-ds", &ds)
+            .await
+            .unwrap();
+
+        controller.reconcile(&mut ds).await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 1, "DS should create one pod on the node");
+        let secrets = pods[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .image_pull_secrets
+            .as_ref()
+            .expect("pod must inherit the SA's imagePullSecrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "regcred");
+    }
+
     fn make_test_daemonset(name: &str, namespace: &str) -> DaemonSet {
         let mut match_labels = HashMap::new();
         match_labels.insert("app".to_string(), name.to_string());
