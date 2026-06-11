@@ -3,7 +3,6 @@ name: Feature conformance
 # Per-[Feature:xxx] conformance matrix. Each feature gets its own cluster
 # bring-up and Hydrophone run, so one red matrix cell == one broken feature.
 # Graduated (gating:true) features go red on regression; the rest report only.
-# See docs/superpowers/specs/2026-06-11-per-feature-conformance-matrix-design.md
 #
 # Triggers:
 #   * pull_request (manifest/script/action/workflow paths) — cheap validate job

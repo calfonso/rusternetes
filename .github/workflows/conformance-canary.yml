@@ -57,6 +57,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/conformance-canary.yml'
+      - 'ci/actions/bring-up-cluster/action.yml'
       - 'scripts/conformance-tags-run.sh'
       - 'compose.sqlite.yml'
       - 'compose.dind.yml'
