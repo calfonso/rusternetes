@@ -87,7 +87,15 @@ jobs:
           if-no-files-found: warn
 
       - name: Update node-conformance badge
-        if: always()
+        # Only publish from a FULL [NodeConformance] sweep. A focus-narrowed
+        # manual dispatch (e.g. focus="should function for intra-pod
+        # communication" → 2 specs) must NOT clobber the nightly pass-rate.
+        # Scheduled runs leave inputs.focus empty (defaults to the full focus);
+        # manual runs must keep the default to qualify.
+        if: >-
+          always() &&
+          (github.event.inputs.focus == '' ||
+           github.event.inputs.focus == '\[NodeConformance\]')
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -99,7 +107,14 @@ jobs:
           passed=$(echo "$line" | grep -oE '^[0-9]+')
           failed=$(echo "$line" | sed -nE 's/.*\| ([0-9]+) Failed/\1/p')
           : "${passed:=0}"; : "${failed:=0}"
-          bash scripts/update-badge.sh node-conformance "node conformance" "$passed" "$((passed + failed))"
+          total=$((passed + failed))
+          # Defense-in-depth: the full sweep is ~190 specs. If far fewer ran the
+          # log is from a partial/aborted run — don't publish a bogus pass-rate.
+          if [ "$total" -lt 100 ]; then
+            echo "only $total specs counted (<100) — partial run, skipping badge"
+            exit 0
+          fi
+          bash scripts/update-badge.sh node-conformance "node conformance" "$passed" "$total"
 
       - name: Tear down stack
         if: always()
