@@ -458,6 +458,36 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                 };
                 Ok((replicas, status))
             }
+            "ContainerResource" => {
+                let cr = metric.container_resource.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("ContainerResource metric without containerResource field")
+                })?;
+                let target = cr.target.average_utilization.unwrap_or(80);
+                let info = self
+                    .metrics_client
+                    .get_container_resource_metric(&cr.name, &cr.container, namespace, &selector)
+                    .await?;
+                let (replicas, avg) = calc::get_resource_replicas(&info, current_replicas, target)?;
+                let status = MetricStatus {
+                    metric_type: "ContainerResource".into(),
+                    resource: None,
+                    pods: None,
+                    object: None,
+                    external: None,
+                    container_resource: Some(
+                        rusternetes_common::resources::ContainerResourceMetricStatus {
+                            name: cr.name.clone(),
+                            container: cr.container.clone(),
+                            current: MetricValueStatus {
+                                value: None,
+                                average_value: None,
+                                average_utilization: Some(avg),
+                            },
+                        },
+                    ),
+                };
+                Ok((replicas, status))
+            }
             "Pods" => {
                 let p = metric
                     .pods
@@ -498,6 +528,23 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .await?;
                 let (replicas, v) =
                     calc::get_object_metric_replicas(value, current_replicas, target)?;
+                // Report the field matching the target type: AverageValue
+                // targets report currentAverageValue = value / replicas; Value
+                // targets report the raw value. (k8s ObjectMetricStatus.)
+                let current = if o.target.target_type == "AverageValue" {
+                    let replicas = current_replicas.max(1) as i64;
+                    MetricValueStatus {
+                        value: None,
+                        average_value: Some((v / replicas).to_string()),
+                        average_utilization: None,
+                    }
+                } else {
+                    MetricValueStatus {
+                        value: Some(v.to_string()),
+                        average_value: None,
+                        average_utilization: None,
+                    }
+                };
                 let status = MetricStatus {
                     metric_type: "Object".into(),
                     resource: None,
@@ -505,11 +552,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     object: Some(rusternetes_common::resources::ObjectMetricStatus {
                         metric: o.metric.clone(),
                         described_object: o.described_object.clone(),
-                        current: MetricValueStatus {
-                            value: Some(v.to_string()),
-                            average_value: None,
-                            average_utilization: None,
-                        },
+                        current,
                     }),
                     external: None,
                     container_resource: None,
@@ -529,6 +572,10 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .get_external_metric(&e.metric.name, namespace, sel)
                     .await?;
                 let (replicas, sum) = calc::get_external_metric_replicas(&values, target)?;
+                // k8s reports currentAverageValue = sum / currentReplicas for an
+                // AverageValue target (the scaling math already used the per-pod
+                // target); the raw sum would mislabel the status field.
+                let avg = sum / (current_replicas.max(1) as i64);
                 let status = MetricStatus {
                     metric_type: "External".into(),
                     resource: None,
@@ -538,7 +585,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                         metric: e.metric.clone(),
                         current: MetricValueStatus {
                             value: None,
-                            average_value: Some(sum.to_string()),
+                            average_value: Some(avg.to_string()),
                             average_utilization: None,
                         },
                     }),
@@ -927,6 +974,147 @@ mod tests {
             "Desired replicas should be at most max_replicas (10), got {}",
             desired
         );
+    }
+
+    fn hpa_with_metric(metric: MetricSpec) -> HorizontalPodAutoscaler {
+        let spec = HorizontalPodAutoscalerSpec {
+            scale_target_ref: CrossVersionObjectReference {
+                kind: "Deployment".to_string(),
+                name: "web-app".to_string(),
+                api_version: Some("apps/v1".to_string()),
+            },
+            min_replicas: Some(1),
+            max_replicas: 100,
+            metrics: Some(vec![metric]),
+            behavior: None,
+        };
+        HorizontalPodAutoscaler::new("test-hpa", "default", spec)
+    }
+
+    #[tokio::test]
+    async fn container_resource_metric_scales_on_container_utilization() {
+        use rusternetes_common::resources::ContainerResourceMetricSource;
+        let storage = Arc::new(MemoryStorage::new());
+        let mut fake = FakeMetricsClient::new();
+        // Keyed "{resource}/{container}" — 100% util vs 50% target -> ratio 2.
+        fake.resource.insert(
+            "cpu/app".to_string(),
+            FakeMetricsClient::pods_info(&[("pod-a", 0, Some(100))]),
+        );
+        let controller =
+            HorizontalPodAutoscalerController::with_metrics_client(storage, Arc::new(fake));
+
+        let metric = MetricSpec {
+            metric_type: "ContainerResource".to_string(),
+            resource: None,
+            pods: None,
+            object: None,
+            external: None,
+            container_resource: Some(ContainerResourceMetricSource {
+                name: "cpu".to_string(),
+                container: "app".to_string(),
+                target: MetricTarget {
+                    target_type: "Utilization".to_string(),
+                    value: None,
+                    average_value: None,
+                    average_utilization: Some(50),
+                },
+            }),
+        };
+        let hpa = hpa_with_metric(metric.clone());
+        let (replicas, status) = controller
+            .calculate_replicas_for_metric(&metric, 2, "default", &hpa)
+            .await
+            .unwrap();
+        assert_eq!(replicas, 4, "100% vs 50% target on 2 replicas -> 4");
+        let cr = status
+            .container_resource
+            .expect("container_resource status");
+        assert_eq!(cr.container, "app");
+        assert_eq!(cr.current.average_utilization, Some(100));
+    }
+
+    #[tokio::test]
+    async fn external_status_reports_sum_over_replicas() {
+        use rusternetes_common::resources::{ExternalMetricSource, MetricIdentifier};
+        let storage = Arc::new(MemoryStorage::new());
+        let mut fake = FakeMetricsClient::new();
+        fake.external.insert("queue".to_string(), vec![90]);
+        let controller =
+            HorizontalPodAutoscalerController::with_metrics_client(storage, Arc::new(fake));
+
+        let metric = MetricSpec {
+            metric_type: "External".to_string(),
+            resource: None,
+            pods: None,
+            object: None,
+            external: Some(ExternalMetricSource {
+                metric: MetricIdentifier {
+                    name: "queue".to_string(),
+                    selector: None,
+                },
+                target: MetricTarget {
+                    target_type: "AverageValue".to_string(),
+                    value: None,
+                    average_value: Some("30".to_string()),
+                    average_utilization: None,
+                },
+            }),
+            container_resource: None,
+        };
+        let hpa = hpa_with_metric(metric.clone());
+        let (_replicas, status) = controller
+            .calculate_replicas_for_metric(&metric, 3, "default", &hpa)
+            .await
+            .unwrap();
+        let ext = status.external.expect("external status");
+        // sum 90 / 3 replicas = 30, not the raw sum 90.
+        assert_eq!(ext.current.average_value.as_deref(), Some("30"));
+    }
+
+    #[tokio::test]
+    async fn object_average_value_target_reports_average_value() {
+        use rusternetes_common::resources::{MetricIdentifier, ObjectMetricSource};
+        let storage = Arc::new(MemoryStorage::new());
+        let mut fake = FakeMetricsClient::new();
+        fake.object.insert("hits".to_string(), 200);
+        let controller =
+            HorizontalPodAutoscalerController::with_metrics_client(storage, Arc::new(fake));
+
+        let metric = MetricSpec {
+            metric_type: "Object".to_string(),
+            resource: None,
+            pods: None,
+            object: Some(ObjectMetricSource {
+                described_object: CrossVersionObjectReference {
+                    kind: "Service".to_string(),
+                    name: "web".to_string(),
+                    api_version: Some("v1".to_string()),
+                },
+                metric: MetricIdentifier {
+                    name: "hits".to_string(),
+                    selector: None,
+                },
+                target: MetricTarget {
+                    target_type: "AverageValue".to_string(),
+                    value: None,
+                    average_value: Some("100".to_string()),
+                    average_utilization: None,
+                },
+            }),
+            external: None,
+            container_resource: None,
+        };
+        let hpa = hpa_with_metric(metric.clone());
+        let (_replicas, status) = controller
+            .calculate_replicas_for_metric(&metric, 2, "default", &hpa)
+            .await
+            .unwrap();
+        let obj = status.object.expect("object status");
+        // AverageValue target -> averageValue = value/replicas = 200/2 = 100;
+        // the `value` field stays unset.
+        assert_eq!(obj.current.average_value.as_deref(), Some("100"));
+        assert!(obj.current.value.is_none());
     }
 
     #[tokio::test]

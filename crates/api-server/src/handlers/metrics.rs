@@ -16,6 +16,82 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
+/// Build per-container usage from a pod's resource requests/limits.
+///
+/// Fallback only: used when the kubelet has not yet published live
+/// `PodMetrics` to storage. Reports `requests` (then `limits`, then a small
+/// default) as a stand-in so `kubectl top` / HPA see a non-zero value during
+/// the startup window.
+fn fabricate_containers(pod: &rusternetes_common::resources::Pod) -> Vec<ContainerMetrics> {
+    let mut containers = Vec::new();
+    if let Some(spec) = &pod.spec {
+        for container in &spec.containers {
+            let mut usage = BTreeMap::new();
+            let cpu = container
+                .resources
+                .as_ref()
+                .and_then(|r| r.requests.as_ref())
+                .and_then(|req| req.get("cpu"))
+                .or_else(|| {
+                    container
+                        .resources
+                        .as_ref()
+                        .and_then(|r| r.limits.as_ref())
+                        .and_then(|lim| lim.get("cpu"))
+                })
+                .cloned()
+                .unwrap_or_else(|| "100m".to_string());
+            let memory = container
+                .resources
+                .as_ref()
+                .and_then(|r| r.requests.as_ref())
+                .and_then(|req| req.get("memory"))
+                .or_else(|| {
+                    container
+                        .resources
+                        .as_ref()
+                        .and_then(|r| r.limits.as_ref())
+                        .and_then(|lim| lim.get("memory"))
+                })
+                .cloned()
+                .unwrap_or_else(|| "128Mi".to_string());
+            usage.insert("cpu".to_string(), cpu);
+            usage.insert("memory".to_string(), memory);
+            containers.push(ContainerMetrics {
+                name: container.name.clone(),
+                usage,
+            });
+        }
+    }
+    containers
+}
+
+/// Return live `PodMetrics` published by the kubelet, or synthesize from the
+/// pod spec when none have been published yet.
+async fn pod_metrics_or_fallback<S: Storage>(
+    storage: &S,
+    namespace: &str,
+    pod: &rusternetes_common::resources::Pod,
+) -> PodMetrics {
+    let name = &pod.metadata.name;
+    let key = format!("/registry/metrics.k8s.io/pods/{}/{}", namespace, name);
+    if let Ok(metrics) = storage.get::<PodMetrics>(&key).await {
+        return metrics;
+    }
+    PodMetrics {
+        api_version: "metrics.k8s.io/v1beta1".to_string(),
+        kind: "PodMetrics".to_string(),
+        metadata: PodMetricsMetadata {
+            name: name.clone(),
+            namespace: namespace.to_string(),
+            creation_timestamp: Some(Utc::now()),
+        },
+        timestamp: Utc::now(),
+        window: "30s".to_string(),
+        containers: fabricate_containers(pod),
+    }
+}
+
 /// Get metrics for a specific node.
 /// Reads metrics published to storage by the kubelet.
 pub async fn get_node_metrics(
@@ -149,62 +225,7 @@ pub async fn get_pod_metrics(
     let pod_key = build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.as_ref().get(&pod_key).await?;
 
-    // Return metrics based on pod spec resource requests/limits
-    let mut containers = Vec::new();
-    if let Some(spec) = &pod.spec {
-        for container in &spec.containers {
-            let mut usage = BTreeMap::new();
-            let cpu = container
-                .resources
-                .as_ref()
-                .and_then(|r| r.requests.as_ref())
-                .and_then(|req| req.get("cpu"))
-                .or_else(|| {
-                    container
-                        .resources
-                        .as_ref()
-                        .and_then(|r| r.limits.as_ref())
-                        .and_then(|lim| lim.get("cpu"))
-                })
-                .cloned()
-                .unwrap_or_else(|| "100m".to_string());
-            let memory = container
-                .resources
-                .as_ref()
-                .and_then(|r| r.requests.as_ref())
-                .and_then(|req| req.get("memory"))
-                .or_else(|| {
-                    container
-                        .resources
-                        .as_ref()
-                        .and_then(|r| r.limits.as_ref())
-                        .and_then(|lim| lim.get("memory"))
-                })
-                .cloned()
-                .unwrap_or_else(|| "128Mi".to_string());
-            usage.insert("cpu".to_string(), cpu);
-            usage.insert("memory".to_string(), memory);
-
-            containers.push(ContainerMetrics {
-                name: container.name.clone(),
-                usage,
-            });
-        }
-    }
-
-    let metrics = PodMetrics {
-        api_version: "metrics.k8s.io/v1beta1".to_string(),
-        kind: "PodMetrics".to_string(),
-        metadata: PodMetricsMetadata {
-            name,
-            namespace,
-            creation_timestamp: Some(Utc::now()),
-        },
-        timestamp: Utc::now(),
-        window: "30s".to_string(),
-        containers,
-    };
-
+    let metrics = pod_metrics_or_fallback(state.storage.as_ref(), &namespace, &pod).await;
     Ok(Json(metrics))
 }
 
@@ -233,60 +254,7 @@ pub async fn list_pod_metrics(
     let mut metrics_list = Vec::new();
 
     for pod in pods {
-        let mut containers = Vec::new();
-        if let Some(spec) = &pod.spec {
-            for container in &spec.containers {
-                let mut usage = BTreeMap::new();
-                let cpu = container
-                    .resources
-                    .as_ref()
-                    .and_then(|r| r.requests.as_ref())
-                    .and_then(|req| req.get("cpu"))
-                    .or_else(|| {
-                        container
-                            .resources
-                            .as_ref()
-                            .and_then(|r| r.limits.as_ref())
-                            .and_then(|lim| lim.get("cpu"))
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| "100m".to_string());
-                let memory = container
-                    .resources
-                    .as_ref()
-                    .and_then(|r| r.requests.as_ref())
-                    .and_then(|req| req.get("memory"))
-                    .or_else(|| {
-                        container
-                            .resources
-                            .as_ref()
-                            .and_then(|r| r.limits.as_ref())
-                            .and_then(|lim| lim.get("memory"))
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| "128Mi".to_string());
-                usage.insert("cpu".to_string(), cpu);
-                usage.insert("memory".to_string(), memory);
-
-                containers.push(ContainerMetrics {
-                    name: container.name.clone(),
-                    usage,
-                });
-            }
-        }
-
-        let metrics = PodMetrics {
-            api_version: "metrics.k8s.io/v1beta1".to_string(),
-            kind: "PodMetrics".to_string(),
-            metadata: PodMetricsMetadata {
-                name: pod.metadata.name.clone(),
-                namespace: namespace.clone(),
-                creation_timestamp: Some(Utc::now()),
-            },
-            timestamp: Utc::now(),
-            window: "30s".to_string(),
-            containers,
-        };
+        let metrics = pod_metrics_or_fallback(state.storage.as_ref(), &namespace, &pod).await;
         metrics_list.push(metrics);
     }
 
@@ -325,60 +293,8 @@ pub async fn list_all_pod_metrics(
             state.storage.as_ref().list(&pods_prefix).await?;
 
         for pod in pods {
-            let mut containers = Vec::new();
-            if let Some(spec) = &pod.spec {
-                for container in &spec.containers {
-                    let mut usage = BTreeMap::new();
-                    let cpu = container
-                        .resources
-                        .as_ref()
-                        .and_then(|r| r.requests.as_ref())
-                        .and_then(|req| req.get("cpu"))
-                        .or_else(|| {
-                            container
-                                .resources
-                                .as_ref()
-                                .and_then(|r| r.limits.as_ref())
-                                .and_then(|lim| lim.get("cpu"))
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| "100m".to_string());
-                    let memory = container
-                        .resources
-                        .as_ref()
-                        .and_then(|r| r.requests.as_ref())
-                        .and_then(|req| req.get("memory"))
-                        .or_else(|| {
-                            container
-                                .resources
-                                .as_ref()
-                                .and_then(|r| r.limits.as_ref())
-                                .and_then(|lim| lim.get("memory"))
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| "128Mi".to_string());
-                    usage.insert("cpu".to_string(), cpu);
-                    usage.insert("memory".to_string(), memory);
-
-                    containers.push(ContainerMetrics {
-                        name: container.name.clone(),
-                        usage,
-                    });
-                }
-            }
-
-            let metrics = PodMetrics {
-                api_version: "metrics.k8s.io/v1beta1".to_string(),
-                kind: "PodMetrics".to_string(),
-                metadata: PodMetricsMetadata {
-                    name: pod.metadata.name.clone(),
-                    namespace: ns.metadata.name.clone(),
-                    creation_timestamp: Some(Utc::now()),
-                },
-                timestamp: Utc::now(),
-                window: "30s".to_string(),
-                containers,
-            };
+            let metrics =
+                pod_metrics_or_fallback(state.storage.as_ref(), &ns.metadata.name, &pod).await;
             metrics_list.push(metrics);
         }
     }

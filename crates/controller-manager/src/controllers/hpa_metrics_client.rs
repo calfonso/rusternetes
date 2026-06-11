@@ -41,6 +41,17 @@ pub trait MetricsClient: Send + Sync {
         selector: &LabelSelector,
     ) -> Result<PodMetricsInfo>;
 
+    /// Per-pod resource utilization for a single named container (cpu/memory),
+    /// for the ContainerResource HPA metric type. Usage and the request
+    /// denominator are both scoped to `container`.
+    async fn get_container_resource_metric(
+        &self,
+        resource: &str,
+        container: &str,
+        namespace: &str,
+        selector: &LabelSelector,
+    ) -> Result<PodMetricsInfo>;
+
     /// Per-pod custom ("Pods" type) metric.
     async fn get_raw_metric(
         &self,
@@ -111,6 +122,24 @@ impl MetricsClient for FakeMetricsClient {
             .get(resource)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no resource metric for {resource}"))
+    }
+
+    async fn get_container_resource_metric(
+        &self,
+        resource: &str,
+        container: &str,
+        _namespace: &str,
+        _selector: &LabelSelector,
+    ) -> Result<PodMetricsInfo> {
+        // Test double keys per-container readings as "{resource}/{container}",
+        // falling back to the plain resource map for convenience.
+        self.resource
+            .get(&format!("{resource}/{container}"))
+            .or_else(|| self.resource.get(resource))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("no container resource metric for {resource}/{container}")
+            })
     }
 
     async fn get_raw_metric(
@@ -219,15 +248,16 @@ impl HttpMetricsClient {
             http,
         })
     }
-}
 
-#[async_trait]
-impl MetricsClient for HttpMetricsClient {
-    async fn get_resource_metric(
+    /// Shared resource-utilization path for both whole-pod (`container == None`)
+    /// and single-container (`container == Some`) metrics. Reads usage from
+    /// `metrics.k8s.io`, divides by each pod's resource `requests` to produce a
+    /// true utilization percentage.
+    async fn resource_metric_impl(
         &self,
         resource: &str,
+        container: Option<&str>,
         namespace: &str,
-        _selector: &LabelSelector,
     ) -> Result<PodMetricsInfo> {
         let url = format!(
             "{}/apis/metrics.k8s.io/v1beta1/namespaces/{}/pods",
@@ -241,6 +271,12 @@ impl MetricsClient for HttpMetricsClient {
             .error_for_status()?
             .json()
             .await?;
+
+        // Per-pod request denominator (sum of the relevant containers' requests).
+        let requests = self
+            .fetch_pod_requests(resource, container, namespace)
+            .await;
+
         let mut info = PodMetricsInfo::new();
         let now = Utc::now();
         if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
@@ -254,6 +290,13 @@ impl MetricsClient for HttpMetricsClient {
                 let mut usage = 0i64;
                 if let Some(containers) = item.get("containers").and_then(|c| c.as_array()) {
                     for c in containers {
+                        // For ContainerResource, only the named container counts.
+                        if let Some(want) = container {
+                            let cname = c.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                            if cname != want {
+                                continue;
+                            }
+                        }
                         if let Some(q) = c
                             .get("usage")
                             .and_then(|u| u.get(resource))
@@ -263,18 +306,18 @@ impl MetricsClient for HttpMetricsClient {
                         }
                     }
                 }
-                // PLACEHOLDER: real utilization = usage * 100 / pod-request, but
-                // metrics.k8s.io here only reports usage (and rusternetes
-                // synthesizes usage = request), so we cannot compute a true
-                // percentage without fetching each pod's resource requests.
-                // Hardcoded 100% until that is wired — tracked in
-                // indyjonesnl/rusternetes#1077. Resource-utilization HPAs are
-                // therefore not load-accurate on the live path yet.
+                // True utilization = usage * 100 / request. If the request
+                // denominator is missing/zero we cannot express a percentage,
+                // so leave it None (the replica calculator skips such pods).
+                let utilization = requests
+                    .get(&name)
+                    .filter(|r| **r > 0)
+                    .map(|r| ((usage * 100) / *r) as i32);
                 info.insert(
                     name,
                     PodMetric {
                         value: usage,
-                        utilization: Some(100),
+                        utilization,
                         timestamp: now,
                     },
                 );
@@ -284,6 +327,94 @@ impl MetricsClient for HttpMetricsClient {
             anyhow::bail!("no pod metrics for namespace {namespace}");
         }
         Ok(info)
+    }
+
+    /// Fetch each pod's resource `requests` denominator for `resource`, summed
+    /// over either all containers (`container == None`) or just the named
+    /// container. Returns a pod-name -> request (millicores for cpu, bytes for
+    /// memory) map. Best-effort: a failed list yields an empty map (utilization
+    /// then reported as unknown rather than fabricated).
+    async fn fetch_pod_requests(
+        &self,
+        resource: &str,
+        container: Option<&str>,
+        namespace: &str,
+    ) -> HashMap<String, i64> {
+        let mut out = HashMap::new();
+        let url = format!("{}/api/v1/namespaces/{}/pods", self.base, namespace);
+        let body: serde_json::Value = match self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(b) => b,
+                Err(_) => return out,
+            },
+            Err(_) => return out,
+        };
+        if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                let name = item
+                    .get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let mut sum = 0i64;
+                if let Some(containers) = item
+                    .get("spec")
+                    .and_then(|s| s.get("containers"))
+                    .and_then(|c| c.as_array())
+                {
+                    for c in containers {
+                        if let Some(want) = container {
+                            let cname = c.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                            if cname != want {
+                                continue;
+                            }
+                        }
+                        if let Some(q) = c
+                            .get("resources")
+                            .and_then(|r| r.get("requests"))
+                            .and_then(|req| req.get(resource))
+                            .and_then(|v| v.as_str())
+                        {
+                            sum += parse_quantity_milli(q, resource);
+                        }
+                    }
+                }
+                if sum > 0 {
+                    out.insert(name, sum);
+                }
+            }
+        }
+        out
+    }
+}
+
+#[async_trait]
+impl MetricsClient for HttpMetricsClient {
+    async fn get_resource_metric(
+        &self,
+        resource: &str,
+        namespace: &str,
+        _selector: &LabelSelector,
+    ) -> Result<PodMetricsInfo> {
+        self.resource_metric_impl(resource, None, namespace).await
+    }
+
+    async fn get_container_resource_metric(
+        &self,
+        resource: &str,
+        container: &str,
+        namespace: &str,
+        _selector: &LabelSelector,
+    ) -> Result<PodMetricsInfo> {
+        self.resource_metric_impl(resource, Some(container), namespace)
+            .await
     }
 
     async fn get_raw_metric(
@@ -402,8 +533,10 @@ impl MetricsClient for HttpMetricsClient {
     }
 }
 
-/// Parse a k8s quantity to an integer. CPU is returned in millicores; everything
-/// else as a whole number (best-effort; strips known suffixes).
+/// Parse a k8s quantity to an integer in units consistent per resource so a
+/// usage/request ratio is meaningful: CPU in millicores, memory in bytes
+/// (binary `Ki/Mi/Gi/...` and SI `k/M/G/...` suffixes honoured), and any other
+/// metric as a best-effort whole number (leading digits).
 fn parse_quantity_milli(q: &str, resource: &str) -> i64 {
     let q = q.trim();
     if resource == "cpu" {
@@ -413,9 +546,50 @@ fn parse_quantity_milli(q: &str, resource: &str) -> i64 {
         if let Ok(cores) = q.parse::<f64>() {
             return (cores * 1000.0) as i64;
         }
+        return 0;
+    }
+    if resource == "memory" {
+        return parse_memory_bytes(q);
     }
     let digits: String = q.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse::<i64>().unwrap_or(0)
+}
+
+/// Parse a k8s memory quantity into bytes. Honours binary (Ki, Mi, Gi, Ti, Pi,
+/// Ei) and decimal SI (k, M, G, T, P, E) suffixes; a bare number is bytes.
+fn parse_memory_bytes(q: &str) -> i64 {
+    let q = q.trim();
+    let (num, mult): (&str, f64) = if let Some(n) = q.strip_suffix("Ki") {
+        (n, 1024.0)
+    } else if let Some(n) = q.strip_suffix("Mi") {
+        (n, 1024f64.powi(2))
+    } else if let Some(n) = q.strip_suffix("Gi") {
+        (n, 1024f64.powi(3))
+    } else if let Some(n) = q.strip_suffix("Ti") {
+        (n, 1024f64.powi(4))
+    } else if let Some(n) = q.strip_suffix("Pi") {
+        (n, 1024f64.powi(5))
+    } else if let Some(n) = q.strip_suffix("Ei") {
+        (n, 1024f64.powi(6))
+    } else if let Some(n) = q.strip_suffix('k') {
+        (n, 1e3)
+    } else if let Some(n) = q.strip_suffix('M') {
+        (n, 1e6)
+    } else if let Some(n) = q.strip_suffix('G') {
+        (n, 1e9)
+    } else if let Some(n) = q.strip_suffix('T') {
+        (n, 1e12)
+    } else if let Some(n) = q.strip_suffix('P') {
+        (n, 1e15)
+    } else if let Some(n) = q.strip_suffix('E') {
+        (n, 1e18)
+    } else {
+        (q, 1.0)
+    };
+    num.trim()
+        .parse::<f64>()
+        .map(|v| (v * mult) as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -436,6 +610,40 @@ mod tests {
             .unwrap();
         assert_eq!(info.len(), 2);
         assert_eq!(info["p1"].value, 200);
+    }
+
+    #[test]
+    fn parse_quantity_cpu_and_memory_units() {
+        // CPU -> millicores
+        assert_eq!(parse_quantity_milli("500m", "cpu"), 500);
+        assert_eq!(parse_quantity_milli("2", "cpu"), 2000);
+        // Memory -> bytes, binary + SI suffixes
+        assert_eq!(parse_quantity_milli("128Mi", "memory"), 128 * 1024 * 1024);
+        assert_eq!(parse_quantity_milli("1Gi", "memory"), 1024 * 1024 * 1024);
+        assert_eq!(parse_quantity_milli("1M", "memory"), 1_000_000);
+        assert_eq!(parse_quantity_milli("1048576", "memory"), 1_048_576);
+        // Other metrics -> leading digits, best-effort
+        assert_eq!(parse_quantity_milli("42", "requests-per-second"), 42);
+    }
+
+    #[tokio::test]
+    async fn fake_container_resource_metric_lookup() {
+        let mut fake = FakeMetricsClient::new();
+        fake.resource.insert(
+            "cpu/app".to_string(),
+            FakeMetricsClient::pods_info(&[("p1", 50, Some(75))]),
+        );
+        let sel = LabelSelector::default();
+        let info = fake
+            .get_container_resource_metric("cpu", "app", "default", &sel)
+            .await
+            .unwrap();
+        assert_eq!(info["p1"].utilization, Some(75));
+        // Missing container -> error.
+        assert!(fake
+            .get_container_resource_metric("cpu", "missing", "default", &sel)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

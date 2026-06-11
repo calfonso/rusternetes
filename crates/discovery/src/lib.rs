@@ -686,6 +686,18 @@ pub async fn get_api_groups(
                 version: "v1beta2".to_string(),
             },
         },
+        // external.metrics.k8s.io API group
+        APIGroup {
+            name: "external.metrics.k8s.io".to_string(),
+            versions: vec![GroupVersionForDiscovery {
+                group_version: "external.metrics.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            }],
+            preferred_version: GroupVersionForDiscovery {
+                group_version: "external.metrics.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            },
+        },
         // resource.k8s.io API group
         APIGroup {
             name: "resource.k8s.io".to_string(),
@@ -843,6 +855,7 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
         ("policy", "v1"),
         ("metrics.k8s.io", "v1beta1"),
         ("custom.metrics.k8s.io", "v1beta2"),
+        ("external.metrics.k8s.io", "v1beta1"),
         ("resource.k8s.io", "v1"),
         ("events.k8s.io", "v1"),
         ("apiregistration.k8s.io", "v1"),
@@ -1461,6 +1474,7 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
             res("pods", "pod", "PodMetrics", true, &["get", "list"], vec![]),
         ],
         "custom.metrics.k8s.io" => vec![],
+        "external.metrics.k8s.io" => vec![],
         "resource.k8s.io" => vec![
             res(
                 "resourceclaims",
@@ -3534,6 +3548,32 @@ pub async fn get_custom_metrics_v1beta2_resources() -> (StatusCode, Json<APIReso
     (StatusCode::OK, Json(resource_list))
 }
 
+/// GET /apis/external.metrics.k8s.io/v1beta1
+/// Returns the list of resources available in the external.metrics.k8s.io/v1beta1 API.
+/// External metric names are dynamic, so a single wildcard resource is advertised
+/// (matching the upstream external metrics adapter convention).
+pub async fn get_external_metrics_v1beta1_resources() -> (StatusCode, Json<APIResourceList>) {
+    let resources = vec![APIResource {
+        name: "*".to_string(),
+        singular_name: "".to_string(),
+        namespaced: true,
+        kind: "ExternalMetricValueList".to_string(),
+        verbs: ["get"].iter().map(|s| s.to_string()).collect(),
+        short_names: None,
+        categories: None,
+        storage_version_hash: None,
+    }];
+
+    let resource_list = APIResourceList {
+        kind: "APIResourceList".to_string(),
+        api_version: "v1beta1".to_string(),
+        group_version: "external.metrics.k8s.io/v1beta1".to_string(),
+        resources,
+    };
+
+    (StatusCode::OK, Json(resource_list))
+}
+
 /// GET /apis/resource.k8s.io/v1
 /// Returns the list of resources available in the resource.k8s.io/v1 API
 pub async fn get_resource_v1_resources() -> (StatusCode, Json<APIResourceList>) {
@@ -4155,7 +4195,7 @@ mod tests {
         // Verify every group in get_api_group_names returns non-empty (or at least valid) resources
         for (group, version) in get_api_group_names() {
             let resources = get_aggregated_resources_for_group(group, version);
-            if group != "custom.metrics.k8s.io" {
+            if group != "custom.metrics.k8s.io" && group != "external.metrics.k8s.io" {
                 assert!(
                     !resources.is_empty(),
                     "Group '{}' version '{}' should have resources",

@@ -16,6 +16,7 @@ pub mod dra;
 pub mod endpoints;
 pub mod endpointslice;
 pub mod event;
+pub mod external_metrics;
 pub mod flowcontrol;
 pub mod ingress;
 pub mod ingressclass;
@@ -132,6 +133,7 @@ pub use dra::{
 pub use endpoints::{EndpointAddress, EndpointPort, EndpointReference, EndpointSubset, Endpoints};
 pub use endpointslice::{Endpoint, EndpointConditions, EndpointHints, EndpointSlice, ForZone};
 pub use event::{Event, EventList, EventSeries, EventSource, EventType};
+pub use external_metrics::{ExternalMetricValue, ExternalMetricValueList};
 pub use flowcontrol::{
     ExemptPriorityLevelConfiguration, FlowDistinguisherMethod, FlowDistinguisherMethodType,
     FlowSchema, FlowSchemaCondition, FlowSchemaSpec, FlowSchemaStatus, FlowSchemaSubject,

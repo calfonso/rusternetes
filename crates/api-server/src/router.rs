@@ -868,6 +868,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::discovery::get_custom_metrics_v1beta2_resources),
         )
         .route(
+            "/apis/external.metrics.k8s.io/v1beta1",
+            get(handlers::discovery::get_external_metrics_v1beta1_resources),
+        )
+        .route(
             "/apis/resource.k8s.io/v1",
             get(handlers::discovery::get_resource_v1_resources),
         )
@@ -2345,6 +2349,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         .route(
             "/apis/custom.metrics.k8s.io/v1beta2/:resource/:name/:metric",
             get(handlers::custom_metrics::get_cluster_metric),
+        )
+        // External Metrics API - external.metrics.k8s.io/v1beta1
+        .route(
+            "/apis/external.metrics.k8s.io/v1beta1/namespaces/:namespace/:metric",
+            get(handlers::external_metrics::list_external_metrics),
         )
         // Watch routes for remaining resource types
         .route(

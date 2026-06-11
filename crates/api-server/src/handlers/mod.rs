@@ -19,6 +19,7 @@ pub mod daemonset;
 pub mod defaults;
 pub mod deployment;
 pub mod deviceclass;
+pub mod external_metrics;
 pub use rusternetes_discovery as discovery;
 pub mod dryrun;
 pub mod endpoints;
