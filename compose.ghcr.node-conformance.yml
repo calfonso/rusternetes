@@ -1,0 +1,16 @@
+# GHCR image-name overlay for the compose.node-conformance.yml single-node
+# stack. Same images as compose.ghcr.yml — both stacks build identical
+# Dockerfile.services targets. Consumed by scripts/run-node-conformance.sh
+# when RUSTERNETES_IMAGE_TAG is set (pull instead of build, with fallback).
+# Keep in sync with compose.node-conformance.yml —
+# scripts/tests/test-ghcr-overlays.sh enforces it.
+
+services:
+  rhino:
+    image: "ghcr.io/indyjonesnl/rusternetes/rhino:${RUSTERNETES_IMAGE_TAG:-main}"
+  api-server:
+    image: "ghcr.io/indyjonesnl/rusternetes/api-server:${RUSTERNETES_IMAGE_TAG:-main}"
+  kubelet:
+    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${RUSTERNETES_IMAGE_TAG:-main}"
+  scheduler:
+    image: "ghcr.io/indyjonesnl/rusternetes/scheduler:${RUSTERNETES_IMAGE_TAG:-main}"
