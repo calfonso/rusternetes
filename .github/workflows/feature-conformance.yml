@@ -22,6 +22,11 @@ on:
       - 'scripts/tests/test-conformance-features-discover.sh'
       - 'ci/actions/bring-up-cluster/action.yml'
       - '.github/workflows/feature-conformance.yml'
+      - 'compose.ghcr.yml'
+      - 'compose.ghcr.node-conformance.yml'
+      - 'compose.sqlite.yml'
+      - 'compose.node-conformance.yml'
+      - 'scripts/tests/test-ghcr-overlays.sh'
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
@@ -34,6 +39,11 @@ on:
         description: 'Run only features for this SIG (e.g. sig-node)'
         required: false
         default: ''
+      image-tag:
+        description: >-
+          GHCR image tag to pull (default main). Empty = build images locally.
+        required: false
+        default: main
 
 env:
   HYDROPHONE_VERSION: v0.7.0
@@ -53,6 +63,8 @@ jobs:
         run: bash scripts/tests/test-conformance-feature-run.sh
       - name: Discovery unit tests
         run: bash scripts/tests/test-conformance-features-discover.sh
+      - name: GHCR overlay sync test
+        run: bash scripts/tests/test-ghcr-overlays.sh
 
   matrix-gen:
     name: generate matrix
@@ -111,6 +123,8 @@ jobs:
         with:
           hydrophone-version: ${{ env.HYDROPHONE_VERSION }}
           kubectl-version: v1.35.0
+          # schedule → 'main' (inputs absent); dispatch → operator's choice.
+          image-tag: ${{ github.event_name == 'schedule' && 'main' || github.event.inputs.image-tag }}
       - name: Run feature conformance
         env:
           FEATURE_NAME: ${{ matrix.name }}
