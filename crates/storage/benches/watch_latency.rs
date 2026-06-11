@@ -145,11 +145,69 @@ fn bench_sqlite_single(c: &mut Criterion) {
 }
 
 #[cfg(feature = "sqlite")]
+fn bench_sqlite_delivery(c: &mut Criterion) {
+    use rusternetes_storage::{StorageBackend, StorageConfig};
+
+    let rt = Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("watch_delivery/sqlite");
+
+    // Delivery latency in isolation: the write is performed UNtimed; we time
+    // only how long until the watcher observes the resulting event. This is the
+    // intra-control-plane event-propagation latency #1039 targets. The bus
+    // publishes synchronously inside the write (event already buffered when the
+    // write returns -> ~channel-recv cost); the native rhino watch must run a
+    // poll + DB re-query after the write commits.
+    for (label, bus_on) in [("native", false), ("bus", true)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!("delivery-{label}.sqlite"));
+        let key = format!("{PREFIX}obj");
+        let storage = rt.block_on(async {
+            let mut backend = StorageBackend::new(StorageConfig::Sqlite {
+                path: db_path.to_string_lossy().into_owned(),
+            })
+            .await
+            .expect("sqlite backend");
+            if bus_on {
+                backend.enable_event_bus();
+            }
+            backend
+                .create::<serde_json::Value>(&key, &payload(0))
+                .await
+                .expect("seed create");
+            Arc::new(backend)
+        });
+
+        group.bench_function(label, |b| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut stream = storage.watch(PREFIX).await.expect("watch");
+                    let mut total = std::time::Duration::ZERO;
+                    for i in 0..iters {
+                        // Untimed: the backend write (shared cost, not what the bus changes).
+                        storage
+                            .update::<serde_json::Value>(&key, &payload(i + 1))
+                            .await
+                            .expect("update");
+                        // Timed: delivery latency only.
+                        let t = std::time::Instant::now();
+                        let _ = stream.next().await.expect("event").expect("ok event");
+                        total += t.elapsed();
+                    }
+                    total
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
+#[cfg(feature = "sqlite")]
 criterion_group!(
     benches,
     bench_memory_single,
     bench_memory_fanout,
-    bench_sqlite_single
+    bench_sqlite_single,
+    bench_sqlite_delivery
 );
 
 #[cfg(not(feature = "sqlite"))]
