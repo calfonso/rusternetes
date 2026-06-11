@@ -1,32 +1,32 @@
 //! Scoped mirror of the upstream Kubernetes v1.35 e2e file
-//! `test/e2e/scheduling/priorityclass.go` as a RED-state TDD pin.
+//! `test/e2e/scheduling/priorityclass.go`.
 //!
 //! Upstream permalink (release-1.35):
 //!   <https://github.com/kubernetes/kubernetes/blob/release-1.35/test/e2e/scheduling/priorityclass.go>
 //!
-//! The upstream e2e covers four behaviors that a real
-//! `PriorityClassController` must implement (today our controller is a no-op
-//! stub — see `crates/controller-manager/src/controllers/priorityclass.rs`):
+//! Covers the *defaulting* responsibilities of `PriorityClassController`
+//! (mirroring the upstream `Priority` admission plugin):
 //!
-//!   1. **Preemption** — when a high-priority pending pod cannot be scheduled
-//!      because the cluster is already running a lower-priority pod, the
-//!      lower-priority pod is evicted (`deletionTimestamp` set) so the
-//!      pending pod can run.
-//!   2. **Global default** — at most one `PriorityClass` may have
+//!   1. **Global default** — at most one `PriorityClass` may have
 //!      `globalDefault: true`. Pods that omit `priorityClassName` inherit
 //!      that class's numeric `value` into `pod.spec.priority`.
-//!   3. **Namespace default** — installations can opt into a per-namespace
+//!   2. **Namespace default** — installations can opt into a per-namespace
 //!      default priority (annotated on the namespace or selected by label);
 //!      pods in such a namespace that omit `priorityClassName` inherit the
 //!      namespace default rather than the cluster-wide default.
-//!   4. **Value ordering** — `PriorityClass.value` is a signed 32-bit integer
+//!   3. **Value ordering** — `PriorityClass.value` is a signed 32-bit integer
 //!      that strictly orders pods for scheduling and preemption; the
 //!      controller must surface this ordering on `pod.spec.priority` so the
 //!      scheduler can rank pods.
+//!   4. **preemptionPolicy propagation** — resolving a class also copies its
+//!      `preemptionPolicy` onto `pod.spec.preemptionPolicy` (never
+//!      overwriting an explicit value).
 //!
-//! Each `#[tokio::test]` is `#[ignore = "RED-state: PriorityClassController is
-//! a stub"]` so `cargo test` stays green while the controller is unfinished.
-//! Remove the `#[ignore]` once the corresponding behavior is implemented.
+//! **Preemption/eviction itself is the scheduler's job** — see
+//! `crates/scheduler/tests/scheduler_preemption_test.rs`
+//! (`*_via_schedule_loop`) for the end-to-end eviction and
+//! `preemptionPolicy: Never` pins that used to live here as `#[ignore]`d
+//! controller tests (issue #1033).
 
 use rusternetes_common::resources::{Container, Pod, PodSpec, PriorityClass};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
@@ -77,51 +77,7 @@ async fn reload_pod(storage: &Arc<MemoryStorage>, namespace: &str, name: &str) -
 }
 
 // ---------------------------------------------------------------------------
-// 1. Preemption: lower-priority pod is evicted to make room
-// ---------------------------------------------------------------------------
-
-/// Mirrors upstream `It("validates lower priority pod preemption ...")`:
-/// a pending high-priority pod that cannot fit triggers the
-/// `PriorityClassController` to mark the running low-priority pod for
-/// eviction (deletionTimestamp).
-#[tokio::test]
-#[ignore = "RED-state: PriorityClassController is a stub"]
-async fn priority_class_preemption_evicts_lower_priority_pod() {
-    let storage = Arc::new(MemoryStorage::new());
-    storage.clear();
-    let controller = PriorityClassController::new(storage.clone());
-
-    create_priority_class(&storage, PriorityClass::new("low", 100)).await;
-    create_priority_class(&storage, PriorityClass::new("high", 1_000_000)).await;
-
-    // Low-priority victim — already Running.
-    let victim = make_pod("victim", "default", Some("low"));
-    storage
-        .create(&build_key("pods", Some("default"), "victim"), &victim)
-        .await
-        .unwrap();
-
-    // High-priority pending pod that needs a slot the cluster cannot provide
-    // without evicting `victim`.
-    let preemptor = make_pod("preemptor", "default", Some("high"));
-    storage
-        .create(&build_key("pods", Some("default"), "preemptor"), &preemptor)
-        .await
-        .unwrap();
-
-    controller.reconcile_all().await.unwrap();
-
-    let victim_after = reload_pod(&storage, "default", "victim").await;
-    assert!(
-        victim_after.metadata.deletion_timestamp.is_some(),
-        "lower-priority pod 'victim' should be marked for eviction when a higher-priority pod \
-         is pending; got deletion_timestamp = {:?}",
-        victim_after.metadata.deletion_timestamp
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 2. Global default: pods without priorityClassName inherit cluster default
+// 1. Global default: pods without priorityClassName inherit cluster default
 // ---------------------------------------------------------------------------
 
 /// Mirrors upstream "globalDefault" behavior: exactly one PriorityClass with
@@ -158,7 +114,7 @@ async fn priority_class_global_default_applies_to_unset_pods() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Namespace default: per-namespace default priority wins over cluster default
+// 2. Namespace default: per-namespace default priority wins over cluster default
 // ---------------------------------------------------------------------------
 
 /// Some installations annotate namespaces with a default PriorityClass name
@@ -218,7 +174,7 @@ async fn priority_class_namespace_default_overrides_global_default() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Value ordering: higher PriorityClass.value => higher pod.spec.priority
+// 3. Value ordering: higher PriorityClass.value => higher pod.spec.priority
 // ---------------------------------------------------------------------------
 
 /// Each pod's resolved `spec.priority` must reflect the strict numeric
@@ -288,50 +244,7 @@ async fn priority_class_value_ordering_is_preserved_on_pods() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Preemption policy: `Never` must not evict victims
-// ---------------------------------------------------------------------------
-
-/// Mirrors upstream `preemptionPolicy: Never`: even when a higher-priority
-/// pod is pending, a `Never`-policy PriorityClass must NOT cause eviction of
-/// lower-priority pods.
-#[tokio::test]
-#[ignore = "RED-state: PriorityClassController is a stub"]
-async fn priority_class_preemption_policy_never_does_not_evict() {
-    let storage = Arc::new(MemoryStorage::new());
-    storage.clear();
-    let controller = PriorityClassController::new(storage.clone());
-
-    create_priority_class(&storage, PriorityClass::new("low", 100)).await;
-    create_priority_class(
-        &storage,
-        PriorityClass::new("high-but-polite", 1_000_000).with_preemption_policy("Never"),
-    )
-    .await;
-
-    let victim = make_pod("victim", "default", Some("low"));
-    storage
-        .create(&build_key("pods", Some("default"), "victim"), &victim)
-        .await
-        .unwrap();
-    let preemptor = make_pod("preemptor", "default", Some("high-but-polite"));
-    storage
-        .create(&build_key("pods", Some("default"), "preemptor"), &preemptor)
-        .await
-        .unwrap();
-
-    controller.reconcile_all().await.unwrap();
-
-    let victim_after = reload_pod(&storage, "default", "victim").await;
-    assert!(
-        victim_after.metadata.deletion_timestamp.is_none(),
-        "victim must NOT be evicted when the higher-priority pod's PriorityClass has \
-         preemptionPolicy: Never; got deletion_timestamp = {:?}",
-        victim_after.metadata.deletion_timestamp
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 6. At most one globalDefault: controller must not silently apply two defaults
+// 4. At most one globalDefault: controller must not silently apply two defaults
 // ---------------------------------------------------------------------------
 
 /// Upstream invariant: at most one PriorityClass may have
@@ -364,7 +277,7 @@ async fn priority_class_rejects_multiple_global_defaults() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. preemptionPolicy propagation: resolved class's policy lands on pod.spec
+// 5. preemptionPolicy propagation: resolved class's policy lands on pod.spec
 // ---------------------------------------------------------------------------
 
 /// Mirrors the upstream `Priority` admission plugin
