@@ -127,7 +127,9 @@ RUN set -eux; \
 # Path is rooted at /build/rusternetes because this Dockerfile's
 # workspace lives there (rhino sits next to it at /build/rhino).
 RUN mkdir -p /build/rusternetes/crates/common/benches \
- && echo "fn main(){}" > /build/rusternetes/crates/common/benches/regex_cache.rs
+ && echo "fn main(){}" > /build/rusternetes/crates/common/benches/regex_cache.rs \
+ && mkdir -p /build/rusternetes/crates/storage/benches \
+ && echo "fn main(){}" > /build/rusternetes/crates/storage/benches/watch_latency.rs
 
 ARG CARGO_FEATURES=sqlite
 WORKDIR /build/rusternetes

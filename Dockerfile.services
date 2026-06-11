@@ -211,7 +211,9 @@ RUN set -eux; \
 # without an explicit dummy here. Keep this list in sync with every
 # crate's [[bench]] declarations.
 RUN mkdir -p crates/common/benches \
- && echo "fn main(){}" > crates/common/benches/regex_cache.rs
+ && echo "fn main(){}" > crates/common/benches/regex_cache.rs \
+ && mkdir -p crates/storage/benches \
+ && echo "fn main(){}" > crates/storage/benches/watch_latency.rs
 
 ARG CARGO_FEATURES=""
 
