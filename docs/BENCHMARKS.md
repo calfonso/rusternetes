@@ -42,6 +42,34 @@ The embedded-sqlite round-trip is ~two orders of magnitude slower than the
 in-memory broadcast path — that gap is what the in-process event bus targets for
 internal consumers.
 
+### Post-bus result (#1039 event bus): delivery latency
+
+The bus's win is **event-propagation latency** — the time from a write
+committing to an internal consumer observing the event — not the write itself
+(the bus does not change backend write cost). `watch_delivery/sqlite` measures
+this in isolation (the write is performed untimed; only delivery is timed):
+
+| feed                         | delivery latency (median) |
+|------------------------------|---------------------------|
+| native rhino sqlite watch    | 124.07 µs |
+| in-process bus (#1039)       | 603.66 ns |
+
+The native backend watch delivers via a notify + SQLite re-query poll after each
+write; the bus publishes synchronously inside the write, so the event is already
+buffered when the write returns. That is a ~206x reduction in delivery
+latency, matching the in-memory broadcast reference (`watch_latency/memory/single_watcher`
+≈ 1.7 µs).
+
+**Honest caveat — end-to-end write-to-observe is write-bound.** A single
+write-then-observe round trip on embedded SQLite is dominated by the backend
+write (~0.8–1 ms); the bus removes the ~124.07 µs delivery overhead on top of
+that, so the single-writer end-to-end improvement is modest. The bus's larger
+wins are (1) removing this per-consumer poll+re-query delivery overhead for
+*every* internal watcher, and (2) eliminating ~35 redundant native watch
+poll-loops in the all-in-one binary (CPU/memory), replaced by one O(1) broadcast
+fan-out. External HTTP watch clients are unaffected — the watch_cache keeps the
+native, RV-ordered feed via `StorageBackend::watch_backend`.
+
 ### Idle resident memory
 
 The watch-cache ring buffers the bus would shrink live in the apiserver process;

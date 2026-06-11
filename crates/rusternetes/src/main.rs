@@ -27,6 +27,12 @@ struct Args {
     #[arg(long, default_value = "./data/rusternetes.db")]
     data_dir: String,
 
+    /// Enable the in-process watch event bus (all-in-one fast path, #1039).
+    /// On by default; pass `--in-process-bus false` to use native backend
+    /// watches (e.g. for A/B benchmarking).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    in_process_bus: bool,
+
     /// Etcd endpoints, comma-separated (only used when --storage-backend=etcd)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
@@ -210,7 +216,14 @@ async fn main() -> Result<()> {
             );
         }
     };
-    let storage = Arc::new(StorageBackend::new(storage_config).await?);
+    let mut storage = StorageBackend::new(storage_config).await?;
+    if args.in_process_bus {
+        storage.enable_event_bus();
+        info!("In-process watch event bus: ENABLED (internal consumers use the fast path)");
+    } else {
+        info!("In-process watch event bus: disabled (native backend watches)");
+    }
+    let storage = Arc::new(storage);
 
     info!("Storage initialized, starting components...");
 

@@ -5,14 +5,13 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast;
 
 /// In-memory storage implementation for testing
 #[derive(Clone)]
 pub struct MemoryStorage {
     data: Arc<RwLock<HashMap<String, String>>>,
-    // Broadcast channel for watch events
-    watch_tx: broadcast::Sender<WatchEvent>,
+    // In-process event bus for watch fan-out.
+    bus: crate::EventBus,
     /// Number of remaining update() calls that will return Error::Conflict
     /// before delegating to the real update. Used by tests to inject CAS conflicts.
     conflict_update_count: Arc<AtomicUsize>,
@@ -24,11 +23,9 @@ pub struct MemoryStorage {
 
 impl MemoryStorage {
     pub fn new() -> Self {
-        // Create a broadcast channel with capacity of 1000 events
-        let (watch_tx, _) = broadcast::channel(1000);
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
-            watch_tx,
+            bus: crate::EventBus::new(crate::event_bus::DEFAULT_CAPACITY),
             conflict_update_count: Arc::new(AtomicUsize::new(0)),
             compacted_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
@@ -119,9 +116,8 @@ impl Storage for MemoryStorage {
         drop(data); // Release lock before sending event
 
         // Emit watch event
-        let _ = self
-            .watch_tx
-            .send(WatchEvent::Added(key.to_string(), serialized.clone()));
+        self.bus
+            .publish(WatchEvent::Added(key.to_string(), serialized.clone()));
 
         Ok(serde_json::from_str(&serialized)?)
     }
@@ -169,9 +165,8 @@ impl Storage for MemoryStorage {
         drop(data); // Release lock before sending event
 
         // Emit watch event
-        let _ = self
-            .watch_tx
-            .send(WatchEvent::Modified(key.to_string(), serialized.clone()));
+        self.bus
+            .publish(WatchEvent::Modified(key.to_string(), serialized.clone()));
 
         Ok(serde_json::from_str(&serialized)?)
     }
@@ -188,9 +183,8 @@ impl Storage for MemoryStorage {
         drop(data); // Release lock before sending event
 
         // Emit watch event
-        let _ = self
-            .watch_tx
-            .send(WatchEvent::Modified(key.to_string(), serialized));
+        self.bus
+            .publish(WatchEvent::Modified(key.to_string(), serialized));
 
         Ok(())
     }
@@ -203,9 +197,8 @@ impl Storage for MemoryStorage {
         drop(data); // Release lock before sending event
 
         // Emit watch event with previous value
-        let _ = self
-            .watch_tx
-            .send(WatchEvent::Deleted(key.to_string(), previous_value));
+        self.bus
+            .publish(WatchEvent::Deleted(key.to_string(), previous_value));
 
         Ok(())
     }
@@ -241,25 +234,7 @@ impl Storage for MemoryStorage {
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
-        let mut rx = self.watch_tx.subscribe();
-        let prefix = prefix.to_string();
-
-        let stream = async_stream::stream! {
-            while let Ok(event) = rx.recv().await {
-                // Filter events by prefix
-                let matches = match &event {
-                    WatchEvent::Added(key, _) => key.starts_with(&prefix),
-                    WatchEvent::Modified(key, _) => key.starts_with(&prefix),
-                    WatchEvent::Deleted(key, _) => key.starts_with(&prefix),
-                };
-
-                if matches {
-                    yield Ok(event);
-                }
-            }
-        };
-
-        Ok(Box::pin(stream))
+        Ok(self.bus.subscribe(prefix))
     }
 
     async fn current_revision(&self) -> Result<i64> {

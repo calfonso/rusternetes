@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 pub mod concurrency;
 pub mod etcd;
+mod event_bus;
 pub mod event_recorder;
 pub mod memory;
 pub mod metadata;
@@ -15,6 +16,9 @@ pub mod workqueue;
 
 // Re-export MemoryStorage for convenient testing
 pub use memory::MemoryStorage;
+
+// Re-export the in-process watch event bus (#1039)
+pub use event_bus::EventBus;
 
 // Re-export the unified event recorder
 pub use event_recorder::EventRecorder;
@@ -402,6 +406,37 @@ impl StorageBackend {
     /// copy.
     pub fn new_memory() -> Self {
         StorageBackend::Memory(Arc::new(MemoryStorage::new()))
+    }
+
+    /// Attach an in-process event bus to the backend so internal `watch()`
+    /// consumers get the in-process fast path. Only valid in a single-writer
+    /// (all-in-one) process. No-op for etcd/memory: memory already has an
+    /// in-process bus, and etcd keeps its native watch.
+    pub fn enable_event_bus(&mut self) {
+        match self {
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => {
+                s.set_event_bus(EventBus::new(event_bus::DEFAULT_CAPACITY))
+            }
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => s.set_event_bus(EventBus::new(event_bus::DEFAULT_CAPACITY)),
+            _ => {}
+        }
+    }
+
+    /// Native backend watch, bypassing any attached event bus. The api-server
+    /// watch cache uses this so external HTTP watch clients keep the
+    /// globally-RV-ordered feed even when the bus is enabled for internal
+    /// consumers.
+    pub async fn watch_backend(&self, prefix: &str) -> Result<WatchStream> {
+        match self {
+            StorageBackend::Etcd(s) => Storage::watch(s, prefix).await,
+            #[cfg(feature = "sqlite")]
+            StorageBackend::Sqlite(s) => s.watch_native(prefix).await,
+            #[cfg(feature = "redis")]
+            StorageBackend::Redis(s) => s.watch_native(prefix).await,
+            StorageBackend::Memory(s) => Storage::watch(s.as_ref(), prefix).await,
+        }
     }
 }
 
