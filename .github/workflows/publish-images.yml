@@ -65,6 +65,10 @@ jobs:
             push
 
       - name: Retag + push :main
+        # Only the real main branch may move the :main alias — a
+        # workflow_dispatch from a feature branch still publishes its
+        # sha- tag above, but must not clobber :main.
+        if: github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
           for img in rhino api-server scheduler controller-manager kubelet kube-proxy dns; do
