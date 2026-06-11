@@ -9,6 +9,7 @@
 #   scripts/bench-idle-memory.sh                 # boot target/release/rusternetes, sample 30s
 #   scripts/bench-idle-memory.sh --pid 12345     # sample an already-running process
 #   scripts/bench-idle-memory.sh --seconds 60    # override sample window
+#   scripts/bench-idle-memory.sh --settle 10     # boot settle time before sampling
 set -euo pipefail
 
 SECONDS_TO_SAMPLE=30
@@ -65,6 +66,10 @@ for _ in $(seq "$SECONDS_TO_SAMPLE"); do
   sleep 1
 done
 
+if [[ "$count" -eq 0 ]]; then
+  echo "error: no samples collected (--seconds must be >= 1)" >&2
+  exit 1
+fi
 avg=$((sum / count))
 printf 'idle VmRSS over %ss (pid %s)%s:\n' "$SECONDS_TO_SAMPLE" "$PID" "${BOOTED:+ [booted]}"
 printf '  min %d MiB  avg %d MiB  max %d MiB\n' $((min / 1024)) $((avg / 1024)) $((max / 1024))

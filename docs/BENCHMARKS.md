@@ -28,7 +28,7 @@ cargo bench -p rusternetes-storage --bench watch_latency --features sqlite -- --
 cargo bench -p rusternetes-storage --bench watch_latency --features sqlite -- --baseline pre-bus
 ```
 
-Pre-bus baseline (captured 2026-06-11, local dev workstation, sqlite backend):
+Pre-bus baseline (captured 2026-06-11, local dev workstation; memory + embedded-sqlite backends):
 
 | case                              | median |
 |-----------------------------------|--------|
