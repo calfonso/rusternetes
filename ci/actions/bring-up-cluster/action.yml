@@ -14,6 +14,13 @@ inputs:
     description: kubectl release tag (match the conformance image)
     required: false
     default: v1.35.0
+  image-tag:
+    description: >-
+      GHCR image tag to pull (e.g. sha-<sha> or main) instead of building
+      locally. Empty = build locally (previous behavior). On pull failure the
+      action logs a warning and falls back to the local build.
+    required: false
+    default: ""
 outputs:
   kubeconfig:
     description: Path to the generated kubeconfig
@@ -113,12 +120,28 @@ runs:
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
         "$HOME/.local/bin/kubectl" version --client
 
-    - name: Build images
-      # Build before `up -d` so the up step is a fast container-start
-      # rather than a slow build. Parallel build keeps wall time
-      # reasonable on the 3-core conformance tier.
+    - name: Pull prebuilt images or build locally
+      # With inputs.image-tag set, try the GHCR-published images first
+      # (publish-images.yml pushes sha-<sha> + main tags on every main push).
+      # GHCR_OVERLAY + RUSTERNETES_IMAGE_TAG are exported to GITHUB_ENV so the
+      # up/restart steps below compose with the same image names. Pull failure
+      # (tag missing, registry down, publish still running) falls back to the
+      # local build — same path as image-tag="".
       shell: bash
+      env:
+        IMAGE_TAG: ${{ inputs.image-tag }}
       run: |
+        set -euo pipefail
+        if [ -n "$IMAGE_TAG" ]; then
+          export RUSTERNETES_IMAGE_TAG="$IMAGE_TAG"
+          if docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml pull; then
+            echo "GHCR_OVERLAY=-f compose.ghcr.yml" >> "$GITHUB_ENV"
+            echo "RUSTERNETES_IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+            echo "using prebuilt images: tag=$IMAGE_TAG"
+            exit 0
+          fi
+          echo "::warning::prebuilt images tag=$IMAGE_TAG not pullable — falling back to local build"
+        fi
         docker compose -f compose.sqlite.yml -f compose.dind.yml build --parallel
 
     - name: Bring up cluster
@@ -127,8 +150,11 @@ runs:
         # Initial up creates the bridge network (needed before we can
         # discover the gateway.  KUBERNETES_SERVICE_HOST_OVERRIDE will
         # be wrong until the restart step below.
-        docker compose -f compose.sqlite.yml -f compose.dind.yml up -d
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ps
+        # ${GHCR_OVERLAY:-} expands to "-f compose.ghcr.yml" when the pull
+        # step succeeded, "" otherwise. --no-build keeps a half-missing pull
+        # from silently recompiling.
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} up -d --no-build
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} ps
 
     - id: discover-gateway
       name: Discover docker bridge gateway
@@ -153,8 +179,11 @@ runs:
       run: |
         echo "DOCKER_GATEWAY=${{ steps.discover-gateway.outputs.gateway }}" > .env
         echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> .env
-        docker compose -f compose.sqlite.yml -f compose.dind.yml up -d
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ps
+        if [ -n "${RUSTERNETES_IMAGE_TAG:-}" ]; then
+          echo "RUSTERNETES_IMAGE_TAG=${RUSTERNETES_IMAGE_TAG}" >> .env
+        fi
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} up -d --no-build
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} ps
 
     - name: Wait for api-server health
       # NOTE: composite-action steps do NOT support `timeout-minutes` at
@@ -186,8 +215,8 @@ runs:
           sleep 2
         done
         echo "api-server never became healthy — dumping diagnostics:"
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ps || true
-        docker compose -f compose.sqlite.yml -f compose.dind.yml logs --tail=50 rusternetes || true
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} ps || true
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} logs --tail=50 rusternetes || true
         curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
         curl -kv --max-time 5 https://localhost:6443/healthz || true
         exit 1
