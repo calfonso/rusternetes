@@ -204,6 +204,34 @@ impl PrometheusClient {
         Ok(value)
     }
 
+    /// Query an external metric (external.metrics.k8s.io). External metrics are
+    /// not tied to a Kubernetes object; the result is summed across all series
+    /// matching the namespace and any additional label selectors.
+    pub async fn query_external_metric(
+        &self,
+        metric_name: &str,
+        namespace: &str,
+        labels: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        let mut label_selectors = vec![format!("namespace=\"{}\"", namespace)];
+        if let Some(labels_map) = labels {
+            for (key, value) in labels_map {
+                label_selectors.push(format!("{}=\"{}\"", key, value));
+            }
+        }
+        let query = format!("sum({}{{{}}})", metric_name, label_selectors.join(","));
+
+        debug!("Querying Prometheus for external metric: {}", query);
+
+        if let Some(cached_value) = self.get_cached(&query).await {
+            return Ok(cached_value);
+        }
+        let value = self.execute_instant_query(&query).await?;
+        self.cache_value(&query, &value, Duration::from_secs(60))
+            .await;
+        Ok(value)
+    }
+
     /// Build PromQL query for a specific object
     fn build_object_query(
         &self,
