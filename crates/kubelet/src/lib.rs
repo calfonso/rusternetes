@@ -6,6 +6,7 @@ pub mod events;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
+pub mod labels;
 pub mod lifecycle;
 pub mod runtime;
 pub mod server;

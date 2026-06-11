@@ -5,6 +5,7 @@ mod events;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;
+mod labels;
 mod lifecycle;
 mod runtime;
 mod server;
