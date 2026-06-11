@@ -362,3 +362,78 @@ async fn priority_class_rejects_multiple_global_defaults() {
          globalDefault: true; got Ok"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 7. preemptionPolicy propagation: resolved class's policy lands on pod.spec
+// ---------------------------------------------------------------------------
+
+/// Mirrors the upstream `Priority` admission plugin
+/// (`plugin/pkg/admission/priority/admission.go`): resolving a pod's
+/// `priorityClassName` must set BOTH `spec.priority` and
+/// `spec.preemptionPolicy` from the class.
+#[tokio::test]
+async fn priority_class_propagates_preemption_policy_to_pods() {
+    let storage = Arc::new(MemoryStorage::new());
+    storage.clear();
+    let controller = PriorityClassController::new(storage.clone());
+
+    create_priority_class(
+        &storage,
+        PriorityClass::new("high-but-polite", 1_000_000).with_preemption_policy("Never"),
+    )
+    .await;
+
+    let pod = make_pod("polite-pod", "default", Some("high-but-polite"));
+    storage
+        .create(&build_key("pods", Some("default"), "polite-pod"), &pod)
+        .await
+        .unwrap();
+
+    controller.reconcile_all().await.unwrap();
+
+    let after = reload_pod(&storage, "default", "polite-pod").await;
+    let spec = after.spec.expect("pod must retain its spec");
+    assert_eq!(
+        spec.priority,
+        Some(1_000_000),
+        "priority must resolve from the named class"
+    );
+    assert_eq!(
+        spec.preemption_policy.as_deref(),
+        Some("Never"),
+        "preemptionPolicy must propagate from the named class onto pod.spec"
+    );
+}
+
+/// An explicit `spec.preemptionPolicy` (set by the user or by api-server
+/// admission) must never be overwritten by the controller backstop.
+#[tokio::test]
+async fn priority_class_does_not_overwrite_explicit_preemption_policy() {
+    let storage = Arc::new(MemoryStorage::new());
+    storage.clear();
+    let controller = PriorityClassController::new(storage.clone());
+
+    create_priority_class(
+        &storage,
+        PriorityClass::new("high-but-polite", 1_000_000).with_preemption_policy("Never"),
+    )
+    .await;
+
+    let mut pod = make_pod("explicit-pod", "default", Some("high-but-polite"));
+    pod.spec.as_mut().unwrap().preemption_policy = Some("PreemptLowerPriority".to_string());
+    storage
+        .create(&build_key("pods", Some("default"), "explicit-pod"), &pod)
+        .await
+        .unwrap();
+
+    controller.reconcile_all().await.unwrap();
+
+    let after = reload_pod(&storage, "default", "explicit-pod").await;
+    let spec = after.spec.expect("pod must retain its spec");
+    assert_eq!(
+        spec.preemption_policy.as_deref(),
+        Some("PreemptLowerPriority"),
+        "controller must not overwrite an explicitly-set preemptionPolicy"
+    );
+    assert_eq!(spec.priority, Some(1_000_000));
+}
