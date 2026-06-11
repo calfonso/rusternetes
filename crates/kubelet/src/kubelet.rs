@@ -996,8 +996,9 @@ impl Kubelet {
             self.storage.update(&key, &node).await?;
         }
 
-        // Collect and publish node metrics to storage
+        // Collect and publish node + per-pod metrics to storage
         self.publish_node_metrics().await;
+        self.publish_pod_metrics().await;
 
         // If eviction is needed, trigger pod eviction
         if !active_signals.is_empty() {
@@ -1124,6 +1125,90 @@ impl Kubelet {
             Err(_) => {
                 if let Err(e) = self.storage.create(&metrics_key, &metrics).await {
                     debug!("Failed to create node metrics: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Collect per-pod container usage from the runtime and write `PodMetrics`
+    /// to storage. The api-server reads these to serve real
+    /// `metrics.k8s.io` pod metrics (replacing synthetic usage=requests), which
+    /// in turn lets the HPA controller compute true resource utilization.
+    async fn publish_pod_metrics(&self) {
+        use rusternetes_common::resources::{ContainerMetrics, PodMetrics, PodMetricsMetadata};
+        use std::collections::BTreeMap;
+
+        let all_pods: Vec<Pod> = self
+            .storage
+            .list(&build_prefix("pods", None))
+            .await
+            .unwrap_or_default();
+
+        // Pods assigned to this node, keyed by name -> namespace.
+        let node_pods: Vec<&Pod> = all_pods
+            .iter()
+            .filter(|p| {
+                p.spec
+                    .as_ref()
+                    .and_then(|s| s.node_name.as_deref())
+                    .map(|n| n == self.node_name)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if node_pods.is_empty() {
+            return;
+        }
+
+        let pod_names: Vec<String> = node_pods.iter().map(|p| p.metadata.name.clone()).collect();
+        let per_pod = self.runtime.collect_pod_metrics(&pod_names).await;
+
+        for pod in node_pods {
+            let name = &pod.metadata.name;
+            let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+            let readings = match per_pod.get(name) {
+                Some(r) if !r.is_empty() => r,
+                // No live stats (e.g. pod not yet running) — skip; the handler
+                // falls back to request-based estimates for absent metrics.
+                _ => continue,
+            };
+
+            let containers: Vec<ContainerMetrics> = readings
+                .iter()
+                .map(|(cname, cpu_milli, mem_bytes)| {
+                    let mut usage = BTreeMap::new();
+                    usage.insert("cpu".to_string(), format!("{cpu_milli}m"));
+                    usage.insert("memory".to_string(), format!("{mem_bytes}"));
+                    ContainerMetrics {
+                        name: cname.clone(),
+                        usage,
+                    }
+                })
+                .collect();
+
+            let metrics = PodMetrics {
+                api_version: "metrics.k8s.io/v1beta1".to_string(),
+                kind: "PodMetrics".to_string(),
+                metadata: PodMetricsMetadata {
+                    name: name.clone(),
+                    namespace: namespace.to_string(),
+                    creation_timestamp: Some(chrono::Utc::now()),
+                },
+                timestamp: chrono::Utc::now(),
+                window: "30s".to_string(),
+                containers,
+            };
+
+            let key = format!("/registry/metrics.k8s.io/pods/{namespace}/{name}");
+            match self.storage.get::<PodMetrics>(&key).await {
+                Ok(_) => {
+                    if let Err(e) = self.storage.update(&key, &metrics).await {
+                        debug!("Failed to update pod metrics for {name}: {e}");
+                    }
+                }
+                Err(_) => {
+                    if let Err(e) = self.storage.create(&key, &metrics).await {
+                        debug!("Failed to create pod metrics for {name}: {e}");
+                    }
                 }
             }
         }

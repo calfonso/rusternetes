@@ -9916,6 +9916,127 @@ impl ContainerRuntime {
 
         (cpu_millicores, total_memory_bytes)
     }
+
+    /// Collect per-container CPU/memory usage for the given pods.
+    ///
+    /// Returns a map of pod name -> list of `(container_name, cpu_millicores,
+    /// memory_bytes)`. Unlike `collect_node_metrics` (which aggregates to a
+    /// node total), this preserves per-pod / per-container granularity so the
+    /// api-server can serve real `metrics.k8s.io` `PodMetrics` instead of
+    /// fabricating usage from resource requests. Pause containers are skipped.
+    pub async fn collect_pod_metrics(
+        &self,
+        pod_names: &[String],
+    ) -> std::collections::HashMap<String, Vec<(String, u64, u64)>> {
+        use futures::StreamExt;
+        use std::collections::HashMap;
+
+        let mut out: HashMap<String, Vec<(String, u64, u64)>> = HashMap::new();
+        if pod_names.is_empty() {
+            return out;
+        }
+
+        let opts = ListContainersOptions::<String> {
+            all: false,
+            ..Default::default()
+        };
+        let containers = match self.docker.list_containers(Some(opts)).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to list containers for pod metrics: {}", e);
+                return out;
+            }
+        };
+
+        // Match each container to its (pod, container) by the `{pod}_{container}`
+        // naming convention, skipping pause infra containers.
+        let mut targets: Vec<(String, String, String)> = Vec::new(); // (id, pod, container)
+        for c in &containers {
+            let id = match &c.id {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+            let names = match &c.names {
+                Some(n) => n,
+                None => continue,
+            };
+            for name in names {
+                let clean = name.trim_start_matches('/');
+                if clean.ends_with("_pause") {
+                    continue;
+                }
+                for pod_name in pod_names {
+                    if let Some(rest) = clean.strip_prefix(&format!("{pod_name}_")) {
+                        targets.push((id.clone(), pod_name.clone(), rest.to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if targets.is_empty() {
+            return out;
+        }
+
+        // Sample stats for all matched containers in parallel.
+        let mut stat_futures = Vec::new();
+        for (id, pod, container) in &targets {
+            let id_clone = id.clone();
+            let pod = pod.clone();
+            let container = container.clone();
+            let docker_ref = &self.docker;
+            stat_futures.push(async move {
+                let stats_opts = bollard::container::StatsOptions {
+                    stream: true,
+                    one_shot: false,
+                };
+                let mut stream = docker_ref.stats(&id_clone, Some(stats_opts));
+                let _ = stream.next().await; // discard first (precpu zeros)
+                let second = stream.next().await;
+                drop(stream);
+                (pod, container, second)
+            });
+        }
+
+        let results = futures::future::join_all(stat_futures).await;
+        for (pod, container, result) in results {
+            if let Some(Ok(stats)) = result {
+                let mut mem_bytes = 0u64;
+                if let Some(usage) = stats.memory_stats.usage {
+                    let cache = stats
+                        .memory_stats
+                        .stats
+                        .as_ref()
+                        .map(|s| match s {
+                            bollard::container::MemoryStatsStats::V1(v1) => v1.cache,
+                            bollard::container::MemoryStatsStats::V2(v2) => v2.inactive_file,
+                        })
+                        .unwrap_or(0);
+                    mem_bytes = usage.saturating_sub(cache);
+                }
+
+                let mut cpu_pct = 0.0f64;
+                let total_usage = stats.cpu_stats.cpu_usage.total_usage;
+                if let Some(system_cpu) = stats.cpu_stats.system_cpu_usage {
+                    let prev_total = stats.precpu_stats.cpu_usage.total_usage;
+                    let prev_system = stats.precpu_stats.system_cpu_usage.unwrap_or(0);
+                    let cpu_delta = total_usage.saturating_sub(prev_total);
+                    let system_delta = system_cpu.saturating_sub(prev_system);
+                    if system_delta > 0 {
+                        let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1);
+                        cpu_pct =
+                            (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
+                    }
+                }
+                let cpu_milli = (cpu_pct * 10.0) as u64;
+                out.entry(pod)
+                    .or_default()
+                    .push((container, cpu_milli, mem_bytes));
+            }
+        }
+
+        out
+    }
 }
 
 /// Truncate a candidate hostname to Linux's 63-character limit (POSIX
