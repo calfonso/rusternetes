@@ -286,7 +286,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             if let Err(e) = self.bind_pod_to_node(pod, &node.metadata.name).await {
                 error!("Failed to bind pod {}/{} to node: {}", ns, name, e);
             }
-        } else if let Some((node_name, victims)) = self.try_preempt(&pod, &nodes, &all_pods).await {
+        } else if let Some((node_name, victims)) = self
+            .try_preempt(&pod, &nodes, &all_pods, &priority_classes)
+            .await
+        {
             // No node fits — preempt lower-priority pods. The production
             // watch/work-queue path (this method) previously never attempted
             // preemption; it only existed in the test-only schedule_pending_pods,
@@ -486,7 +489,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
             {
                 // No suitable node found, try preemption if pod has priority
-                if let Some(preemption_result) = self.try_preempt(&pod, &nodes, &all_pods).await {
+                if let Some(preemption_result) = self
+                    .try_preempt(&pod, &nodes, &all_pods, &priority_classes)
+                    .await
+                {
                     let (node_name, pods_to_evict) = preemption_result;
                     info!(
                         "Preempting {} pods on node {} for high-priority pod {}",
@@ -992,12 +998,24 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         pod: &Pod,
         nodes: &[Node],
         all_pods: &[Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
     ) -> Option<(String, Vec<String>)> {
-        // If the pod's preemptionPolicy is "Never", skip preemption entirely
+        // If the pod's preemptionPolicy is "Never", skip preemption entirely.
+        // Fall back to the PriorityClass's policy when the pod spec doesn't
+        // carry one (mirrors the spec.priority backstop in the schedule
+        // loops — admission normally copies the class policy onto the pod,
+        // but pods written directly to storage may miss it).
         let preemption_policy = pod
             .spec
             .as_ref()
             .and_then(|s| s.preemption_policy.as_deref())
+            .or_else(|| {
+                pod.spec
+                    .as_ref()
+                    .and_then(|s| s.priority_class_name.as_deref())
+                    .and_then(|name| priority_classes.get(name))
+                    .and_then(|pc| pc.preemption_policy.as_deref())
+            })
             .unwrap_or("PreemptLowerPriority");
         if preemption_policy == "Never" {
             debug!(
