@@ -911,6 +911,110 @@ async fn crd_selectable_fields_list_watch_informer() {
     );
 }
 
+/// Custom-resource `deletecollection` honours field/label selectors.
+///
+/// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_selectable_fields.go:271
+/// (`v2Client.Namespace(ns).DeleteCollection(..., FieldSelector: "host=host1,port=80")`).
+///
+/// Regression guard for the route gap that returned a bare 404
+/// ("the server could not find the requested resource"): the collection-path
+/// arms in `custom_resource_fallback` were guarded to GET||POST, so a DELETE on
+/// `/apis/{g}/{v}/namespaces/{ns}/{plural}?fieldSelector=...` matched no route.
+#[tokio::test]
+async fn crd_deletecollection_honours_field_and_label_selectors() {
+    let (_mem, _state, router) = spawn_router();
+
+    // CRD with two selectable fields.
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "widgets.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {
+                "plural": "widgets", "singular": "widget",
+                "kind": "Widget", "listKind": "WidgetList",
+            },
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "properties": {
+                    "spec": {"type": "object", "properties": {
+                        "color": {"type": "string"},
+                        "shape": {"type": "string"},
+                    }}
+                }}},
+                "selectableFields": [
+                    {"jsonPath": ".spec.color"},
+                    {"jsonPath": ".spec.shape"},
+                ],
+            }]
+        }
+    });
+    let (s, _) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert_eq!(s, 201);
+
+    // Three CRs: two red, one blue.
+    for (name, color, shape) in [
+        ("w-red-1", "red", "square"),
+        ("w-red-2", "red", "circle"),
+        ("w-blue-1", "blue", "circle"),
+    ] {
+        let body = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"color": color, "shape": shape},
+        });
+        let (s, b) = post_json(
+            &router,
+            "/apis/example.com/v1/namespaces/default/widgets",
+            &body,
+        )
+        .await;
+        assert_eq!(s, 201, "creating {name} must succeed, body={b}");
+    }
+
+    // DeleteCollection with a field selector removes only the two red widgets.
+    // Pre-fix this returned 404 (route gap), not 2xx.
+    let (s, b) = delete(
+        &router,
+        "/apis/example.com/v1/namespaces/default/widgets?fieldSelector=spec.color%3Dred",
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "CR deletecollection must succeed, got status={s} body={b}"
+    );
+
+    // Only the blue widget survives.
+    let (s, body) = get(&router, "/apis/example.com/v1/namespaces/default/widgets").await;
+    assert_eq!(s, 200);
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["metadata"]["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["w-blue-1"], "only non-matching CR survives");
+
+    // DeleteCollection with no selector clears the rest.
+    let (s, _) = delete(&router, "/apis/example.com/v1/namespaces/default/widgets").await;
+    assert!((200..300).contains(&s), "unselected deletecollection, got {s}");
+    let (s, body) = get(&router, "/apis/example.com/v1/namespaces/default/widgets").await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(0),
+        "all widgets deleted"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // x-kubernetes-validations (CEL) — crd_validation_rules.go
 // ---------------------------------------------------------------------------

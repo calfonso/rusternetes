@@ -298,9 +298,10 @@ async fn custom_resource_fallback(
 
     // Parse the path components
     let (group, version, plural, namespace, name, subresource) = match parts.as_slice() {
-        // Namespaced: /apis/{group}/{version}/namespaces/{namespace}/{plural}
+        // Namespaced collection: /apis/{group}/{version}/namespaces/{namespace}/{plural}
+        // GET = list, POST = create, DELETE = deletecollection.
         [group, version, "namespaces", namespace, plural]
-            if method == Method::GET || method == Method::POST =>
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
         {
             (*group, *version, *plural, Some(*namespace), None, None)
         }
@@ -322,8 +323,11 @@ async fn custom_resource_fallback(
             Some(*name),
             Some(*subresource),
         ),
-        // Cluster-scoped: /apis/{group}/{version}/{plural}
-        [group, version, plural] if method == Method::GET || method == Method::POST => {
+        // Cluster-scoped collection: /apis/{group}/{version}/{plural}
+        // GET = list, POST = create, DELETE = deletecollection.
+        [group, version, plural]
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
+        {
             (*group, *version, *plural, None, None, None)
         }
         // Cluster-scoped resource: /apis/{group}/{version}/{plural}/{name}
@@ -359,6 +363,35 @@ async fn custom_resource_fallback(
 
     // Route to the appropriate custom resource handler based on method and path
     let response = match (method.clone(), name, subresource) {
+        // DELETE to collection endpoint = deletecollection
+        (Method::DELETE, None, None) => {
+            let query_params: std::collections::HashMap<String, String> = uri
+                .query()
+                .map(|q| {
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            match handlers::custom_resource::deletecollection_custom_resources(
+                state.clone(),
+                auth_ctx.clone(),
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                namespace.map(|s| s.to_string()),
+                query_params,
+            )
+            .await
+            {
+                Ok(status) => status.into_response(),
+                Err(e) => {
+                    warn!("Error deleting custom resource collection: {}", e);
+                    e.into_response()
+                }
+            }
+        }
         // POST to list endpoint = create
         (Method::POST, None, None) => {
             let body = axum::body::to_bytes(req.into_body(), usize::MAX)
