@@ -1375,6 +1375,10 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
+        // Propagate the SA's imagePullSecrets (#1084) — controllers bypass the
+        // api-server admission path that normally does this.
+        super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut spec).await;
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
@@ -1778,6 +1782,45 @@ mod tests {
         assert_eq!(format_index_ranges(&[0, 1, 2]), "0-2");
         assert_eq!(format_index_ranges(&[0, 1, 2, 5]), "0-2,5");
         assert_eq!(format_index_ranges(&[0, 2, 3, 4, 7, 8]), "0,2-4,7-8");
+    }
+
+    #[tokio::test]
+    async fn test_job_pods_inherit_sa_image_pull_secrets() {
+        // #1084: SA imagePullSecrets must reach controller-created pods, which
+        // bypass the api-server admission path.
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = JobController::new(storage.clone());
+
+        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", "default");
+        sa.image_pull_secrets = Some(vec![
+            rusternetes_common::resources::service_account::LocalObjectReference {
+                name: "regcred".to_string(),
+            },
+        ]);
+        storage
+            .create("/registry/serviceaccounts/default/default", &sa)
+            .await
+            .unwrap();
+
+        let mut job = make_job("pullsecrets-job", "default", 1, 1);
+        storage
+            .create("/registry/jobs/default/pullsecrets-job", &job)
+            .await
+            .unwrap();
+
+        controller.reconcile(&mut job).await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 1, "Job should create one pod");
+        let secrets = pods[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .image_pull_secrets
+            .as_ref()
+            .expect("pod must inherit the SA's imagePullSecrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "regcred");
     }
 
     #[tokio::test]

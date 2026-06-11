@@ -1185,42 +1185,19 @@ pub async fn inject_service_account_token<S: Storage>(
         .as_ref()
         .and_then(|sa| sa.automount_service_account_token);
 
-    // Propagate the ServiceAccount's imagePullSecrets onto the pod.
-    //
-    // K8s ref: plugin/pkg/admission/serviceaccount/admission.go (release-1.35)
-    // `Plugin.Admit`: the SA's imagePullSecrets are copied onto the pod ONLY
-    // when the pod declares none of its own — there is no merge, a pod-level
-    // list wins outright. This runs regardless of automount (a pod can opt out
-    // of token mounting but still inherit pull secrets).
-    if let Some(sa) = service_account.as_ref() {
-        let pod_has_secrets = spec
-            .image_pull_secrets
+    // Propagate the ServiceAccount's imagePullSecrets onto the pod (semantics
+    // documented on the shared helper: pod list wins, regardless of automount).
+    let copied = rusternetes_common::serviceaccount::propagate_image_pull_secrets(
+        spec,
+        service_account
             .as_ref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        if !pod_has_secrets {
-            if let Some(sa_secrets) = sa.image_pull_secrets.as_ref() {
-                if !sa_secrets.is_empty() {
-                    spec.image_pull_secrets = Some(
-                        sa_secrets
-                            .iter()
-                            .map(
-                                |r| rusternetes_common::resources::pod::LocalObjectReference {
-                                    name: r.name.clone(),
-                                },
-                            )
-                            .collect(),
-                    );
-                    info!(
-                        "Propagated {} imagePullSecret(s) from SA {}/{} to pod {}",
-                        sa_secrets.len(),
-                        namespace,
-                        sa_name,
-                        pod.metadata.name
-                    );
-                }
-            }
-        }
+            .and_then(|sa| sa.image_pull_secrets.as_deref()),
+    );
+    if copied > 0 {
+        info!(
+            "Propagated {} imagePullSecret(s) from SA {}/{} to pod {}",
+            copied, namespace, sa_name, pod.metadata.name
+        );
     }
 
     // Determine whether to mount the SA token.

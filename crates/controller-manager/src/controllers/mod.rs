@@ -42,6 +42,32 @@ pub mod volume_expansion;
 pub mod volume_snapshot;
 pub mod vpa;
 
+/// Propagate the pod's ServiceAccount `imagePullSecrets` onto a
+/// controller-created pod spec (#1084). Controllers write pods straight to
+/// storage and bypass the api-server admission path, so without this the SA's
+/// pull secrets never reach DaemonSet/ReplicaSet/StatefulSet/Job pods.
+///
+/// Resolves the SA named by the spec (default `"default"`) and applies the
+/// same semantics as admission (PR #1083): copy only when the pod declares no
+/// secrets of its own, regardless of automount. A missing SA is a no-op.
+pub async fn propagate_sa_image_pull_secrets<S: rusternetes_storage::Storage>(
+    storage: &S,
+    namespace: &str,
+    spec: &mut rusternetes_common::resources::PodSpec,
+) {
+    let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
+    let sa_key = format!("/registry/serviceaccounts/{}/{}", namespace, sa_name);
+    if let Ok(sa) = storage
+        .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
+        .await
+    {
+        rusternetes_common::serviceaccount::propagate_image_pull_secrets(
+            spec,
+            sa.image_pull_secrets.as_deref(),
+        );
+    }
+}
+
 /// Check ResourceQuota before creating a pod in a namespace.
 /// Returns Ok(()) if quota allows, Err with quota exceeded message otherwise.
 pub async fn check_resource_quota<S: rusternetes_storage::Storage>(

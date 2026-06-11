@@ -865,7 +865,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         // /var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}.
         if let Some(spec) = pod.spec.as_mut() {
             let sa_name = rusternetes_common::serviceaccount::ensure_service_account_name(spec);
-            let sa_automount = self
+            let service_account = self
                 .storage
                 .get::<rusternetes_common::resources::ServiceAccount>(&build_key(
                     "serviceaccounts",
@@ -873,8 +873,19 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                     &sa_name,
                 ))
                 .await
-                .ok()
-                .and_then(|sa| sa.automount_service_account_token);
+                .ok();
+
+            // Propagate the SA's imagePullSecrets (#1084) — controllers bypass
+            // the api-server admission path that normally does this. Applies
+            // regardless of automount.
+            rusternetes_common::serviceaccount::propagate_image_pull_secrets(
+                spec,
+                service_account
+                    .as_ref()
+                    .and_then(|sa| sa.image_pull_secrets.as_deref()),
+            );
+
+            let sa_automount = service_account.and_then(|sa| sa.automount_service_account_token);
             let should_mount = match spec.automount_service_account_token {
                 Some(v) => v,
                 None => sa_automount.unwrap_or(true),
@@ -1121,6 +1132,47 @@ mod tests {
             2,
             "second reconcile must match existing pods, not create more"
         );
+    }
+
+    #[tokio::test]
+    async fn test_rs_pods_inherit_sa_image_pull_secrets() {
+        // #1084: SA imagePullSecrets must reach controller-created pods, which
+        // bypass the api-server admission path.
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+
+        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", "default");
+        sa.image_pull_secrets = Some(vec![
+            rusternetes_common::resources::service_account::LocalObjectReference {
+                name: "regcred".to_string(),
+            },
+        ]);
+        storage
+            .create("/registry/serviceaccounts/default/default", &sa)
+            .await
+            .unwrap();
+
+        let labels = make_labels(&[("app", "pullsecrets")]);
+        let rs = make_replicaset("pullsecrets-rs", labels, 1);
+        let rs_key = build_key("replicasets", Some("default"), "pullsecrets-rs");
+        storage.create(&rs_key, &rs).await.unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list(&build_prefix("pods", Some("default")))
+            .await
+            .unwrap();
+        assert_eq!(pods.len(), 1);
+        let secrets = pods[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .image_pull_secrets
+            .as_ref()
+            .expect("pod must inherit the SA's imagePullSecrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "regcred");
     }
 
     #[test]

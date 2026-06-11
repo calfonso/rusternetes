@@ -142,10 +142,104 @@ pub fn add_kube_api_access_volume(spec: &mut PodSpec) {
     }
 }
 
+/// Propagate a ServiceAccount's `imagePullSecrets` onto a pod spec.
+///
+/// K8s ref: `plugin/pkg/admission/serviceaccount/admission.go` (release-1.35)
+/// `Plugin.Admit`: the SA's imagePullSecrets are copied onto the pod ONLY when
+/// the pod declares none of its own — there is no merge, a pod-level list wins
+/// outright. This applies regardless of `automountServiceAccountToken` (a pod
+/// can opt out of token mounting but still inherit pull secrets).
+///
+/// Takes the resolved SA's secret list so it works for both the api-server
+/// admission path and controllers that create pods directly in storage.
+/// Returns the number of secrets copied (0 when the pod kept its own list or
+/// the SA has none).
+pub fn propagate_image_pull_secrets(
+    spec: &mut PodSpec,
+    sa_image_pull_secrets: Option<&[crate::resources::service_account::LocalObjectReference]>,
+) -> usize {
+    let pod_has_secrets = spec
+        .image_pull_secrets
+        .as_ref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if pod_has_secrets {
+        return 0;
+    }
+    let Some(sa_secrets) = sa_image_pull_secrets.filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    spec.image_pull_secrets = Some(
+        sa_secrets
+            .iter()
+            .map(|r| crate::resources::pod::LocalObjectReference {
+                name: r.name.clone(),
+            })
+            .collect(),
+    );
+    sa_secrets.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resources::Container;
+
+    fn sa_secrets(names: &[&str]) -> Vec<crate::resources::service_account::LocalObjectReference> {
+        names
+            .iter()
+            .map(
+                |n| crate::resources::service_account::LocalObjectReference {
+                    name: n.to_string(),
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn propagate_copies_sa_secrets_when_pod_has_none() {
+        let mut spec = spec_with_container();
+        let secrets = sa_secrets(&["regcred", "other"]);
+        let copied = propagate_image_pull_secrets(&mut spec, Some(&secrets));
+        assert_eq!(copied, 2);
+        let pod_secrets = spec.image_pull_secrets.as_ref().unwrap();
+        assert_eq!(pod_secrets.len(), 2);
+        assert_eq!(pod_secrets[0].name, "regcred");
+        assert_eq!(pod_secrets[1].name, "other");
+    }
+
+    #[test]
+    fn propagate_copies_sa_secrets_when_pod_list_empty() {
+        let mut spec = spec_with_container();
+        spec.image_pull_secrets = Some(vec![]);
+        let secrets = sa_secrets(&["regcred"]);
+        let copied = propagate_image_pull_secrets(&mut spec, Some(&secrets));
+        assert_eq!(copied, 1);
+        assert_eq!(spec.image_pull_secrets.as_ref().unwrap()[0].name, "regcred");
+    }
+
+    #[test]
+    fn propagate_pod_list_wins_no_merge() {
+        let mut spec = spec_with_container();
+        spec.image_pull_secrets = Some(vec![crate::resources::pod::LocalObjectReference {
+            name: "pod-own".to_string(),
+        }]);
+        let secrets = sa_secrets(&["regcred"]);
+        let copied = propagate_image_pull_secrets(&mut spec, Some(&secrets));
+        assert_eq!(copied, 0);
+        let pod_secrets = spec.image_pull_secrets.as_ref().unwrap();
+        assert_eq!(pod_secrets.len(), 1, "no merge: pod list wins outright");
+        assert_eq!(pod_secrets[0].name, "pod-own");
+    }
+
+    #[test]
+    fn propagate_noop_when_sa_has_none() {
+        let mut spec = spec_with_container();
+        assert_eq!(propagate_image_pull_secrets(&mut spec, None), 0);
+        assert!(spec.image_pull_secrets.is_none());
+        assert_eq!(propagate_image_pull_secrets(&mut spec, Some(&[])), 0);
+        assert!(spec.image_pull_secrets.is_none());
+    }
 
     fn spec_with_container() -> PodSpec {
         PodSpec {
