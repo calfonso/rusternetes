@@ -101,5 +101,58 @@ fn bench_memory_fanout(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "sqlite")]
+fn bench_sqlite_single(c: &mut Criterion) {
+    use rusternetes_storage::{StorageBackend, StorageConfig};
+
+    let rt = Runtime::new().expect("tokio runtime");
+    // tempfile keeps the db out of the repo and auto-cleans on drop.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("bench.sqlite");
+    let key = format!("{PREFIX}obj");
+
+    let storage = rt.block_on(async {
+        let backend = StorageBackend::new(StorageConfig::Sqlite {
+            path: db_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("sqlite backend");
+        backend
+            .create::<serde_json::Value>(&key, &payload(0))
+            .await
+            .expect("seed create");
+        Arc::new(backend)
+    });
+
+    let mut group = c.benchmark_group("watch_latency/sqlite");
+    group.bench_function("single_watcher", |b| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let mut stream = storage.watch(PREFIX).await.expect("watch");
+                let start = std::time::Instant::now();
+                for i in 0..iters {
+                    storage
+                        .update::<serde_json::Value>(&key, &payload(i + 1))
+                        .await
+                        .expect("update");
+                    let _ = stream.next().await.expect("event").expect("ok event");
+                }
+                start.elapsed()
+            })
+        });
+    });
+    group.finish();
+}
+
+#[cfg(feature = "sqlite")]
+criterion_group!(
+    benches,
+    bench_memory_single,
+    bench_memory_fanout,
+    bench_sqlite_single
+);
+
+#[cfg(not(feature = "sqlite"))]
 criterion_group!(benches, bench_memory_single, bench_memory_fanout);
+
 criterion_main!(benches);
