@@ -1,0 +1,6 @@
+[sig-node] Sysctls [NodeFeature:Sysctls] should support sysctls [MinimumKubeletVersion:1.21]
+[sig-node] [Feature:ProbeTerminationGracePeriod] Probe should override timeoutGracePeriodSeconds
+[sig-network] Networking [Feature:PerformanceDNS] should answer
+[sig-node] Downward API [Feature:DownwardAPI] should provide pod name
+[sig-apps] Deployment should run the lifecycle of a Deployment [Conformance]
+[sig-network] [Feature:SCTPConnectivity] should support SCTP traffic
