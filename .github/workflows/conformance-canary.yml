@@ -37,12 +37,13 @@ name: Conformance canary
 # delta via the printed counts and the uploaded junit, not a red/green job.
 #
 # Triggers:
-#   * workflow_dispatch — manual button on the Actions tab.
-#   * push to main — post-merge smoke test. PR-trigger removed because
-#     a full hydrophone run blocks PRs for 30–60 min on cold caches
-#     and the canary's value (post-merge conformance reporting) is
-#     preserved by the post-merge run plus operator-driven manual
-#     dispatches when warranted.
+#   * workflow_dispatch — manual button on the Actions tab. `image-tag`
+#     selects a published GHCR tag (default `main`); empty builds locally.
+#   * workflow_run after "Publish images" succeeds on main — the canary
+#     checks out and tests the EXACT sha the publish built, so every
+#     conformance result maps 1:1 to a main commit. Replaces the old
+#     push-paths trigger: publish-images runs on every main push, so the
+#     canary now covers every merge, not just CI-file edits (#1056).
 #
 # Open follow-ups (canary backlog):
 #   - [x] Replace etcd with the SQLite backend for the canary (done: now uses
@@ -53,16 +54,17 @@ name: Conformance canary
 
 on:
   workflow_dispatch:
-  push:
+    inputs:
+      image-tag:
+        description: >-
+          GHCR image tag to test (e.g. main or sha-<sha>). Empty = build
+          images locally from the checked-out ref.
+        required: false
+        default: main
+  workflow_run:
+    workflows: ["Publish images"]
+    types: [completed]
     branches: [main]
-    paths:
-      - '.github/workflows/conformance-canary.yml'
-      - 'ci/actions/bring-up-cluster/action.yml'
-      - 'scripts/conformance-tags-run.sh'
-      - 'compose.sqlite.yml'
-      - 'compose.dind.yml'
-      - 'Dockerfile.services'
-      - 'Dockerfile.rhino'
 
 env:
   # The dind sidecar exposes the daemon at this canonical path; the
@@ -77,6 +79,11 @@ env:
 jobs:
   hydrophone:
     name: hydrophone (conformance tags)
+    # workflow_run fires for failed publishes too — only run on success.
+    # workflow_dispatch has no workflow_run payload and always runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     # contents:write lets the "Update badge" step push the latest pass-rate
     # JSON to the orphan `badges` branch (best-effort; never fails the run).
     permissions:
@@ -99,6 +106,10 @@ jobs:
 
     steps:
       - name: Checkout
+        # For workflow_run events, github.sha is the DEFAULT-BRANCH HEAD at
+        # trigger time, which may have advanced past the publish — pin to the
+        # exact sha the images were built from. Dispatch falls through to the
+        # invoking ref (empty ref input = default behavior).
         # rhino is an in-tree submodule (./rhino, indyjonesnl/rhino). The
         # storage crate's Cargo.toml references `path = "../../rhino"` and the
         # compose files expose it as a named build context
@@ -107,12 +118,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event.workflow_run.head_sha || '' }}
+
+      - name: Resolve image tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "IMAGE_TAG=sha-${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_ENV"
+          else
+            echo "IMAGE_TAG=${{ github.event.inputs.image-tag }}" >> "$GITHUB_ENV"
+          fi
+          echo "image tag: '$(grep ^IMAGE_TAG "$GITHUB_ENV" | cut -d= -f2-)'"
 
       - name: Bring up cluster
         uses: ./ci/actions/bring-up-cluster
         with:
           hydrophone-version: ${{ env.HYDROPHONE_VERSION }}
           kubectl-version: v1.35.0
+          image-tag: ${{ env.IMAGE_TAG }}
 
       - name: Run conformance tag suite
         # `scripts/conformance-tags-run.sh` runs the canonical two-phase

@@ -1,0 +1,36 @@
+# GHCR image-name overlay for the compose.sqlite.yml stack.
+#
+# Layered AFTER compose.sqlite.yml, it assigns a registry name to every
+# buildable service so that:
+#   * `docker compose ... build` tags images as ghcr.io/... (publish path —
+#     .github/workflows/publish-images.yml), and
+#   * `docker compose ... pull` fetches prebuilt images instead of compiling
+#     (consume path — ci/actions/bring-up-cluster with image-tag set).
+#
+# Tag selection: RUSTERNETES_IMAGE_TAG (default `main`, the latest published
+# main build). Every main commit also gets an immutable `sha-<full-sha>` tag —
+# the historic record. Bisect example:
+#
+#   RUSTERNETES_IMAGE_TAG=sha-<commit> \
+#   docker compose -f compose.sqlite.yml -f compose.ghcr.yml -f compose.dind.yml up -d
+#
+# Keep the service list in sync with compose.sqlite.yml —
+# scripts/tests/test-ghcr-overlays.sh enforces it.
+
+services:
+  rhino:
+    image: "ghcr.io/indyjonesnl/rusternetes/rhino:${RUSTERNETES_IMAGE_TAG:-main}"
+  api-server:
+    image: "ghcr.io/indyjonesnl/rusternetes/api-server:${RUSTERNETES_IMAGE_TAG:-main}"
+  scheduler:
+    image: "ghcr.io/indyjonesnl/rusternetes/scheduler:${RUSTERNETES_IMAGE_TAG:-main}"
+  controller-manager:
+    image: "ghcr.io/indyjonesnl/rusternetes/controller-manager:${RUSTERNETES_IMAGE_TAG:-main}"
+  kubelet:
+    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${RUSTERNETES_IMAGE_TAG:-main}"
+  kubelet2:
+    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${RUSTERNETES_IMAGE_TAG:-main}"
+  kube-proxy:
+    image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
+  dns:
+    image: "ghcr.io/indyjonesnl/rusternetes/dns:${RUSTERNETES_IMAGE_TAG:-main}"

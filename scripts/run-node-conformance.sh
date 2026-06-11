@@ -53,6 +53,25 @@ COMPOSE_FILES="-f ${PROJECT_ROOT}/compose.node-conformance.yml"
 for extra in ${EXTRA_COMPOSE_FILES:-}; do
     COMPOSE_FILES="${COMPOSE_FILES} -f ${extra}"
 done
+
+# Prebuilt-image mode (#1056): RUSTERNETES_IMAGE_TAG selects a GHCR tag
+# published by .github/workflows/publish-images.yml (e.g. main, sha-<sha>).
+# Pull-or-fallback: a successful pull layers the ghcr overlay (image: names)
+# and skips the local build; a failed pull (tag missing, registry down)
+# logs loudly and keeps today's --build path.
+UP_BUILD_FLAG="--build"
+if [ -n "${RUSTERNETES_IMAGE_TAG:-}" ]; then
+    GHCR_OVERLAY="${PROJECT_ROOT}/compose.ghcr.node-conformance.yml"
+    # shellcheck disable=SC2086
+    if ${CONTAINER_RUNTIME} compose ${COMPOSE_FILES} -f "${GHCR_OVERLAY}" pull; then
+        COMPOSE_FILES="${COMPOSE_FILES} -f ${GHCR_OVERLAY}"
+        UP_BUILD_FLAG="--no-build"
+        echo "Using prebuilt images: tag=${RUSTERNETES_IMAGE_TAG}"
+    else
+        echo "WARNING: prebuilt images tag=${RUSTERNETES_IMAGE_TAG} not pullable — falling back to local build" >&2
+    fi
+fi
+
 # shellcheck disable=SC2086
 # SC2086: intentional word-splitting — COMPOSE holds runtime + subcommand + flag triple
 COMPOSE="${CONTAINER_RUNTIME} compose ${COMPOSE_FILES}"
@@ -66,7 +85,7 @@ ${COMPOSE} down -v --remove-orphans >/dev/null 2>&1 || true
 
 echo "[2/7] Bringing up single-node stack..."
 # shellcheck disable=SC2086
-${COMPOSE} up -d --build
+${COMPOSE} up -d ${UP_BUILD_FLAG}
 
 echo "[3/7] Waiting for kubelet to come up (max 60s)..."
 for i in $(seq 1 60); do
