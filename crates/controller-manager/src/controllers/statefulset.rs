@@ -1167,6 +1167,65 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         }
     }
 
+    /// Build the `persistentVolumeClaim` pod volumes for this StatefulSet's
+    /// `volumeClaimTemplates` at the given ordinal. Upstream's `updateStorage`
+    /// adds, for each template, a pod volume
+    /// `{name, persistentVolumeClaim:{claimName: <template>-<set>-<ordinal>}}`.
+    /// Without it the container's volumeMount has no backing volume in
+    /// `pod.spec.volumes`, so the kubelet mounts nothing and the mountPath
+    /// (e.g. /data) is absent in the container.
+    fn volume_claim_template_volumes(
+        statefulset: &StatefulSet,
+        ordinal: i32,
+    ) -> Vec<rusternetes_common::resources::Volume> {
+        let Some(templates) = statefulset.spec.volume_claim_templates.as_ref() else {
+            return Vec::new();
+        };
+        templates
+            .iter()
+            .filter_map(|t| {
+                let claim_name = format!(
+                    "{}-{}-{}",
+                    t.metadata.name, statefulset.metadata.name, ordinal
+                );
+                serde_json::from_value(serde_json::json!({
+                    "name": t.metadata.name,
+                    "persistentVolumeClaim": {"claimName": claim_name},
+                }))
+                .ok()
+            })
+            .collect()
+    }
+
+    /// Return the name of the cluster's default StorageClass (the one annotated
+    /// `storageclass.kubernetes.io/is-default-class=true`, or the beta variant),
+    /// if any. Used to default `volumeClaimTemplate` PVCs that don't set a
+    /// `storageClassName`, matching the api-server's DefaultStorageClass
+    /// admission. `namespace` is accepted only for log context.
+    async fn default_storage_class_name(&self, namespace: &str) -> Option<String> {
+        let storage_classes: Vec<rusternetes_common::resources::StorageClass> = self
+            .storage
+            .list("/registry/storageclasses/")
+            .await
+            .unwrap_or_default();
+        for sc in storage_classes {
+            if let Some(annotations) = &sc.metadata.annotations {
+                if annotations.get("storageclass.kubernetes.io/is-default-class")
+                    == Some(&"true".to_string())
+                    || annotations.get("storageclass.beta.kubernetes.io/is-default-class")
+                        == Some(&"true".to_string())
+                {
+                    info!(
+                        "Defaulting StatefulSet PVC in {} to storage class '{}'",
+                        namespace, sc.metadata.name
+                    );
+                    return Some(sc.metadata.name.clone());
+                }
+            }
+        }
+        None
+    }
+
     async fn ensure_pvcs_for_ordinal(
         &self,
         statefulset: &StatefulSet,
@@ -1213,13 +1272,28 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     block_owner_deletion: Some(true),
                 }]);
 
+                // Apply DefaultStorageClass defaulting. The api-server runs this
+                // admission on PVCs created via the REST handler, but the
+                // StatefulSet controller writes volumeClaimTemplate PVCs straight
+                // to storage — so without this the PVC keeps the template's unset
+                // storageClassName, the dynamic provisioner never claims it, the
+                // PVC never binds, and the pod starts with the volume unmounted
+                // (StatefulSet pods then never become Ready). Mirrors
+                // api-server `admission::set_default_storage_class`.
+                let mut pvc_spec = template.spec.clone();
+                if pvc_spec.storage_class_name.is_none() {
+                    if let Some(default_sc) = self.default_storage_class_name(namespace).await {
+                        pvc_spec.storage_class_name = Some(default_sc);
+                    }
+                }
+
                 let pvc = PersistentVolumeClaim {
                     type_meta: TypeMeta {
                         kind: "PersistentVolumeClaim".to_string(),
                         api_version: "v1".to_string(),
                     },
                     metadata: pvc_metadata,
-                    spec: template.spec.clone(),
+                    spec: pvc_spec,
                     status: None,
                 };
 
@@ -1406,6 +1480,18 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             pod_spec.hostname = Some(pod_name.clone());
         }
 
+        // Inject a persistentVolumeClaim pod volume per volumeClaimTemplate so the
+        // template's volumeMounts have a backing volume (mirrors updateStorage).
+        let pvc_volumes = Self::volume_claim_template_volumes(statefulset, ordinal);
+        if !pvc_volumes.is_empty() {
+            let vols = pod_spec.volumes.get_or_insert_with(Vec::new);
+            for v in pvc_volumes {
+                if !vols.iter().any(|existing| existing.name == v.name) {
+                    vols.push(v);
+                }
+            }
+        }
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
@@ -1497,6 +1583,18 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         if !statefulset.spec.service_name.is_empty() {
             pod_spec.subdomain = Some(statefulset.spec.service_name.clone());
             pod_spec.hostname = Some(pod_name.clone());
+        }
+
+        // Inject a persistentVolumeClaim pod volume per volumeClaimTemplate so the
+        // template's volumeMounts have a backing volume (mirrors updateStorage).
+        let pvc_volumes = Self::volume_claim_template_volumes(statefulset, ordinal);
+        if !pvc_volumes.is_empty() {
+            let vols = pod_spec.volumes.get_or_insert_with(Vec::new);
+            for v in pvc_volumes {
+                if !vols.iter().any(|existing| existing.name == v.name) {
+                    vols.push(v);
+                }
+            }
         }
 
         let pod = Pod {
@@ -1713,6 +1811,139 @@ mod tests {
             },
             status: None,
         }
+    }
+
+    /// A volumeClaimTemplate PVC without an explicit storageClassName must
+    /// inherit the cluster's default StorageClass; an explicit one is preserved.
+    /// Regression guard: the StatefulSet controller writes these PVCs straight
+    /// to storage, bypassing the api-server's DefaultStorageClass admission, so
+    /// without in-controller defaulting the PVC never binds and the pod mounts
+    /// nothing (pods never become Ready).
+    #[tokio::test]
+    async fn test_volumeclaimtemplate_pvc_inherits_default_storage_class() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+        let ns = "default";
+
+        // Default StorageClass present in the cluster.
+        let sc: rusternetes_common::resources::StorageClass =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "StorageClass",
+                "metadata": {
+                    "name": "standard",
+                    "annotations": {"storageclass.kubernetes.io/is-default-class": "true"}
+                },
+                "provisioner": "rusternetes.io/hostpath"
+            }))
+            .unwrap();
+        storage
+            .create("/registry/storageclasses/standard", &sc)
+            .await
+            .unwrap();
+
+        // Two templates: one without a storageClassName, one with an explicit class.
+        let mut ss = make_statefulset("web", ns, 1, "nginx:1.19");
+        let tmpl = |name: &str, sc: Option<&str>| -> PersistentVolumeClaim {
+            let mut spec = serde_json::json!({
+                "accessModes": ["ReadWriteOnce"],
+                "resources": {"requests": {"storage": "1Mi"}}
+            });
+            if let Some(s) = sc {
+                spec["storageClassName"] = serde_json::json!(s);
+            }
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name},
+                "spec": spec
+            }))
+            .unwrap()
+        };
+        ss.spec.volume_claim_templates = Some(vec![tmpl("data", None), tmpl("fast", Some("ssd"))]);
+        let key = format!("/registry/statefulsets/{}/web", ns);
+        storage.create(&key, &ss).await.unwrap();
+
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+
+        let data_pvc: PersistentVolumeClaim = storage
+            .get(&format!(
+                "/registry/persistentvolumeclaims/{}/data-web-0",
+                ns
+            ))
+            .await
+            .expect("PVC data-web-0 created");
+        assert_eq!(
+            data_pvc.spec.storage_class_name.as_deref(),
+            Some("standard"),
+            "unset storageClassName must inherit the default StorageClass"
+        );
+
+        let fast_pvc: PersistentVolumeClaim = storage
+            .get(&format!(
+                "/registry/persistentvolumeclaims/{}/fast-web-0",
+                ns
+            ))
+            .await
+            .expect("PVC fast-web-0 created");
+        assert_eq!(
+            fast_pvc.spec.storage_class_name.as_deref(),
+            Some("ssd"),
+            "explicit storageClassName must be preserved, not overwritten"
+        );
+
+        // The pod must carry a persistentVolumeClaim volume per template, else
+        // the container's volumeMount has no backing volume and nothing mounts.
+        let pod: Pod = storage
+            .get(&format!("/registry/pods/{}/web-0", ns))
+            .await
+            .expect("pod web-0 created");
+        let volumes = pod.spec.unwrap().volumes.unwrap_or_default();
+        let data_vol = volumes
+            .iter()
+            .find(|v| v.name == "data")
+            .expect("pod must have a 'data' volume for the volumeClaimTemplate");
+        assert_eq!(
+            data_vol
+                .persistent_volume_claim
+                .as_ref()
+                .map(|p| p.claim_name.as_str()),
+            Some("data-web-0"),
+            "'data' volume must reference PVC data-web-0"
+        );
+    }
+
+    /// Without a default StorageClass, an unset storageClassName stays unset
+    /// (matching upstream: no default class => no defaulting).
+    #[tokio::test]
+    async fn test_volumeclaimtemplate_pvc_no_default_class_stays_unset() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+        let ns = "default";
+
+        let mut ss = make_statefulset("web", ns, 1, "nginx:1.19");
+        let tmpl: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "data"},
+            "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Mi"}}}
+        }))
+        .unwrap();
+        ss.spec.volume_claim_templates = Some(vec![tmpl]);
+        let key = format!("/registry/statefulsets/{}/web", ns);
+        storage.create(&key, &ss).await.unwrap();
+
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+
+        let pvc: PersistentVolumeClaim = storage
+            .get(&format!(
+                "/registry/persistentvolumeclaims/{}/data-web-0",
+                ns
+            ))
+            .await
+            .expect("PVC data-web-0 created");
+        assert!(
+            pvc.spec.storage_class_name.is_none(),
+            "no default StorageClass => storageClassName stays unset"
+        );
     }
 
     /// Make a pod look like it's Running and Ready
