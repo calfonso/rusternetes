@@ -1005,7 +1005,10 @@ async fn crd_deletecollection_honours_field_and_label_selectors() {
 
     // DeleteCollection with no selector clears the rest.
     let (s, _) = delete(&router, "/apis/example.com/v1/namespaces/default/widgets").await;
-    assert!((200..300).contains(&s), "unselected deletecollection, got {s}");
+    assert!(
+        (200..300).contains(&s),
+        "unselected deletecollection, got {s}"
+    );
     let (s, body) = get(&router, "/apis/example.com/v1/namespaces/default/widgets").await;
     assert_eq!(s, 200);
     assert_eq!(
