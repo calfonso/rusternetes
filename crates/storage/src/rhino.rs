@@ -27,6 +27,9 @@ use tracing::{debug, error, info};
 /// No gRPC, no network — pure in-process Rust calls.
 pub struct RhinoStorage<B: Backend> {
     backend: Arc<B>,
+    /// Optional in-process event bus. `Some` only in the all-in-one binary,
+    /// where this process is the sole writer (#1039). `None` everywhere else.
+    bus: Option<crate::EventBus>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -55,6 +58,7 @@ impl RhinoStorage<SqliteBackend> {
 
         Ok(Self {
             backend: Arc::new(backend),
+            bus: None,
         })
     }
 }
@@ -82,6 +86,7 @@ impl RhinoStorage<RedisBackend> {
 
         Ok(Self {
             backend: Arc::new(backend),
+            bus: None,
         })
     }
 }
@@ -103,6 +108,31 @@ impl<B: Backend> RhinoStorage<B> {
         } else {
             json.to_string()
         }
+    }
+
+    /// Attach an in-process event bus. After this, writes publish and `watch()`
+    /// serves from the bus. Call only in single-writer (all-in-one) processes.
+    pub fn set_event_bus(&mut self, bus: crate::EventBus) {
+        self.bus = Some(bus);
+    }
+
+    /// Publish a watch event to the bus when one is attached; no-op otherwise.
+    fn publish(&self, event: WatchEvent) {
+        if let Some(bus) = &self.bus {
+            bus.publish(event);
+        }
+    }
+
+    /// The native backend watch (current revision onward), bypassing the bus.
+    /// Used by `StorageBackend::watch_backend` to keep external HTTP clients on
+    /// the globally-RV-ordered feed.
+    pub async fn watch_native(&self, prefix: &str) -> Result<WatchStream> {
+        let current_rev = self
+            .backend
+            .current_revision()
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))?;
+        self.watch_from_revision(prefix, current_rev + 1).await
     }
 }
 
@@ -137,6 +167,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         debug!("Created resource at key: {}", key);
 
         let json_with_rv = Self::inject_resource_version(&json, mod_revision);
+        self.publish(WatchEvent::Added(key.to_string(), json_with_rv.clone()));
         serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
     }
 
@@ -203,6 +234,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
             debug!("Updated resource at key: {}", key);
             let json_with_rv = Self::inject_resource_version(&json, rev);
+            self.publish(WatchEvent::Modified(key.to_string(), json_with_rv.clone()));
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         } else {
             // No resourceVersion provided — check key exists, then update
@@ -243,11 +275,13 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
                 }
 
                 let json_with_rv = Self::inject_resource_version(&json, new_rev);
+                self.publish(WatchEvent::Modified(key.to_string(), json_with_rv.clone()));
                 return serde_json::from_str(&json_with_rv).map_err(Error::Serialization);
             }
 
             debug!("Updated resource at key: {}", key);
             let json_with_rv = Self::inject_resource_version(&json, new_rev);
+            self.publish(WatchEvent::Modified(key.to_string(), json_with_rv.clone()));
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         }
     }
@@ -264,7 +298,7 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
         let existing_kv = existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
 
-        let (_new_rev, _prev_kv, succeeded) = self
+        let (new_rev, _prev_kv, succeeded) = self
             .backend
             .update(key, json.as_bytes(), existing_kv.mod_revision, 0)
             .await
@@ -277,11 +311,13 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         }
 
         debug!("Updated resource (raw) at key: {}", key);
+        let json_with_rv = Self::inject_resource_version(&json, new_rev);
+        self.publish(WatchEvent::Modified(key.to_string(), json_with_rv));
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let (_rev, _prev_kv, succeeded) = self
+        let (_rev, prev_kv, succeeded) = self
             .backend
             .delete(key, 0)
             .await
@@ -292,6 +328,16 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         }
 
         debug!("Deleted resource at key: {}", key);
+        if self.bus.is_some() {
+            let prev_value = prev_kv
+                .as_ref()
+                .map(|kv| {
+                    let raw = String::from_utf8_lossy(&kv.value).to_string();
+                    Self::inject_resource_version(&raw, kv.mod_revision)
+                })
+                .unwrap_or_default();
+            self.publish(WatchEvent::Deleted(key.to_string(), prev_value));
+        }
         Ok(())
     }
 
@@ -324,14 +370,12 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
-        // Watch from current revision (0 means "now")
-        let current_rev = self
-            .backend
-            .current_revision()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))?;
-
-        self.watch_from_revision(prefix, current_rev + 1).await
+        // With a bus attached (all-in-one), internal consumers get the in-process
+        // fast path. Without one, fall back to the native backend watch.
+        match &self.bus {
+            Some(bus) => Ok(bus.subscribe(prefix)),
+            None => self.watch_native(prefix).await,
+        }
     }
 
     async fn watch_from_revision(&self, prefix: &str, revision: i64) -> Result<WatchStream> {
