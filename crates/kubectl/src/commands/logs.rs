@@ -1,5 +1,5 @@
-use crate::client::ApiClient;
 use anyhow::Result;
+use rusternetes_client::http::ApiClient;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_enhanced(

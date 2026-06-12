@@ -1,6 +1,6 @@
-use crate::client::ApiClient;
 use crate::types::RolloutCommands;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 use serde_json::{json, Value};
 
 /// Execute rollout commands

@@ -1,6 +1,6 @@
-use crate::client::ApiClient;
 use crate::discovery::ResourceMapping;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 use serde_json::Value;
 
 /// Build the API path for a resource. When `name` is `None` the collection

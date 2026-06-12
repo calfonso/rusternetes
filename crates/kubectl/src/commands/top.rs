@@ -1,6 +1,6 @@
-use crate::client::ApiClient;
 use crate::types::TopCommands;
 use anyhow::Result;
+use rusternetes_client::http::ApiClient;
 use serde::Deserialize;
 
 #[derive(Deserialize)]

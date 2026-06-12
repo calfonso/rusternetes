@@ -4284,6 +4284,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
 name = "rusternetes-cloud-providers"
 version = "0.1.0"
 dependencies = [
@@ -4437,6 +4450,7 @@ dependencies = [
  "hyper 1.9.0",
  "hyper-util",
  "reqwest",
+ "rusternetes-client",
  "rusternetes-common",
  "serde",
  "serde_json",

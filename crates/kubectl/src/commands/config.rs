@@ -1,8 +1,8 @@
-use crate::kubeconfig::{
-    Cluster, ClusterEntry, Context, ContextEntry, KubeConfig, User, UserEntry,
-};
 use crate::types::ConfigCommands;
 use anyhow::Result;
+use rusternetes_client::kubeconfig::{
+    Cluster, ClusterEntry, Context, ContextEntry, KubeConfig, User, UserEntry,
+};
 use std::path::PathBuf;
 
 /// Execute config commands for kubeconfig management

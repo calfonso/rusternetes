@@ -1,7 +1,5 @@
-mod client;
 mod commands;
 mod discovery;
-mod kubeconfig;
 mod manifest;
 mod ops;
 mod types;
@@ -9,8 +7,8 @@ mod websocket;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use client::ApiClient;
-use kubeconfig::KubeConfig;
+use rusternetes_client::http::ApiClient;
+use rusternetes_client::kubeconfig::KubeConfig;
 use types::{
     ApplyCommands, AuthCommands, CertificateCommands, ConfigCommands, CreateCommands,
     KubercCommands, PluginCommands, RolloutCommands, SetCommands, TopCommands,

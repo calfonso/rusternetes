@@ -1,7 +1,7 @@
-use crate::client::{ApiClient, GetError};
 use crate::discovery::RestMapper;
 use crate::ops::build_path;
 use anyhow::{Context, Result};
+use rusternetes_client::http::{ApiClient, GetError};
 use serde_json::Value;
 
 /// Show diff between current and applied configuration

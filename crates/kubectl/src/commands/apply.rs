@@ -1,7 +1,7 @@
-use crate::client::ApiClient;
 use crate::discovery::RestMapper;
 use crate::types::ApplyCommands;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;

@@ -1,7 +1,7 @@
-use crate::client::ApiClient;
 use crate::discovery::ResourceMapping;
 use crate::types::SetCommands;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 use serde_json::{json, Value};
 
 /// Dispatch set subcommands.

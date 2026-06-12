@@ -1,5 +1,5 @@
-use crate::client::ApiClient;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 
 /// Cascade strategy for delete operations, matching Kubernetes propagation policies.
 #[derive(Debug, Clone, PartialEq)]

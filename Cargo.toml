@@ -13,6 +13,7 @@ members = [
     "crates/protobuf",
     "crates/admission-webhook",
     "crates/storage",
+    "crates/client",
     "crates/cloud-providers",
     "crates/dns",
     "crates/netstack",

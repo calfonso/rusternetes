@@ -1,6 +1,6 @@
-use crate::client::ApiClient;
 use crate::websocket;
 use anyhow::Result;
+use rusternetes_client::http::ApiClient;
 
 /// Attach to a running container in a pod.
 ///

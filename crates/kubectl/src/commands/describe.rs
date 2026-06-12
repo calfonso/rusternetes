@@ -1,6 +1,6 @@
-use crate::client::{ApiClient, GetError};
 use anyhow::Result;
 use chrono::Utc;
+use rusternetes_client::http::{ApiClient, GetError};
 use rusternetes_common::resources::{Deployment, Namespace, Node, Pod, Service};
 
 pub async fn execute_enhanced(
@@ -737,13 +737,13 @@ mod tests {
 
     #[test]
     fn test_map_get_error_not_found() {
-        let err = map_get_error(crate::client::GetError::NotFound);
+        let err = map_get_error(rusternetes_client::http::GetError::NotFound);
         assert_eq!(err.to_string(), "Resource not found");
     }
 
     #[test]
     fn test_map_get_error_other() {
-        let err = map_get_error(crate::client::GetError::Other(anyhow::anyhow!(
+        let err = map_get_error(rusternetes_client::http::GetError::Other(anyhow::anyhow!(
             "connection refused"
         )));
         assert_eq!(err.to_string(), "connection refused");

@@ -1,5 +1,5 @@
-use crate::client::ApiClient;
 use anyhow::Result;
+use rusternetes_client::http::ApiClient;
 
 /// Display cluster information
 pub async fn execute(client: &ApiClient, dump: bool) -> Result<()> {
