@@ -620,7 +620,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         let mut pod_spec = rc.spec.template.spec.clone();
         rusternetes_common::tolerations::add_default_tolerations(&mut pod_spec);
 
-        let pod = Pod {
+        let mut pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
@@ -647,6 +647,40 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 start_time: None,
             }),
         };
+
+        // Inject the ServiceAccount token volume and propagate the SA's
+        // imagePullSecrets exactly as the api-server's admission does for HTTP
+        // pod creates (#1118). Controllers write pods straight to storage and
+        // bypass that admission path; mirrors the ReplicaSet wiring — upstream
+        // Go's RC controller IS the ReplicaSet controller via adapters.
+        if let Some(spec) = pod.spec.as_mut() {
+            let sa_name = rusternetes_common::serviceaccount::ensure_service_account_name(spec);
+            let service_account = self
+                .storage
+                .get::<rusternetes_common::resources::ServiceAccount>(&build_key(
+                    "serviceaccounts",
+                    Some(namespace),
+                    &sa_name,
+                ))
+                .await
+                .ok();
+
+            rusternetes_common::serviceaccount::propagate_image_pull_secrets(
+                spec,
+                service_account
+                    .as_ref()
+                    .and_then(|sa| sa.image_pull_secrets.as_deref()),
+            );
+
+            let sa_automount = service_account.and_then(|sa| sa.automount_service_account_token);
+            let should_mount = match spec.automount_service_account_token {
+                Some(v) => v,
+                None => sa_automount.unwrap_or(true),
+            };
+            if should_mount {
+                rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
+            }
+        }
 
         // Check ResourceQuota before creating pod
         super::check_resource_quota(&*self.storage, namespace)
@@ -1078,6 +1112,56 @@ mod tests {
             assert_eq!(tol.effect.as_deref(), Some("NoExecute"));
             assert_eq!(tol.toleration_seconds, Some(300));
         }
+    }
+
+    #[tokio::test]
+    async fn test_rc_pods_inherit_sa_image_pull_secrets_and_token_volume() {
+        // #1118: SA imagePullSecrets and the SA token volume must reach
+        // RC-created pods, which bypass the api-server admission path —
+        // mirrors the ReplicaSet wiring (upstream Go's RC controller IS the
+        // ReplicaSet controller via adapters).
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", "default");
+        sa.image_pull_secrets = Some(vec![
+            rusternetes_common::resources::service_account::LocalObjectReference {
+                name: "regcred".to_string(),
+            },
+        ]);
+        storage
+            .create("/registry/serviceaccounts/default/default", &sa)
+            .await
+            .unwrap();
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "pullsecrets".to_string());
+        let rc = make_rc("pullsecrets-rc", "default", 1, selector, None);
+        storage
+            .create(
+                "/registry/replicationcontrollers/default/pullsecrets-rc",
+                &rc,
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 1);
+        let spec = pods[0].spec.as_ref().unwrap();
+        let secrets = spec
+            .image_pull_secrets
+            .as_ref()
+            .expect("pod must inherit the SA's imagePullSecrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "regcred");
+        assert!(
+            spec.volumes
+                .as_ref()
+                .is_some_and(|vols| vols.iter().any(|v| v.name.starts_with("kube-api-access"))),
+            "pod must get the SA token volume injected"
+        );
     }
 
     #[tokio::test]
