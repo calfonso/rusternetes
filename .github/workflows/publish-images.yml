@@ -25,6 +25,12 @@ on:
 
 env:
   DOCKER_HOST: unix:///var/run/docker.sock
+  # compose.sqlite.yml interpolates ${KUBELET_VOLUMES_PATH} into kubelet bind
+  # mounts; compose validates the volume spec even for `build`/`push`, so an
+  # unset value yields "invalid spec: ::rw,rshared" and exit 15. No container
+  # is ever started here — the path just has to be a non-empty absolute path
+  # (same value the conformance workflows use).
+  KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
 
 # One publish at a time, never cancelled: every main sha needs its tag.
 concurrency:
