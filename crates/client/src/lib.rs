@@ -4,3 +4,4 @@
 pub mod config;
 pub mod http;
 pub mod kubeconfig;
+pub mod watch;
