@@ -893,6 +893,10 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             if should_mount {
                 rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
             }
+
+            // DefaultTolerationSeconds admission (#442): controllers bypass the
+            // api-server admission path that adds these NoExecute tolerations.
+            rusternetes_common::tolerations::add_default_tolerations(spec);
         }
 
         // Check ResourceQuota before creating pod

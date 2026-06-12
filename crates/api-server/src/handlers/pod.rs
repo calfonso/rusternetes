@@ -268,6 +268,20 @@ pub async fn create(
                 spec.preemption_policy = Some(policy.clone());
             }
         }
+
+        // DefaultTolerationSeconds admission: append the NotReady/Unreachable
+        // NoExecute tolerations (tolerationSeconds: 300) unless the pod already
+        // tolerates them. Without this a transient node NotReady flap evicts —
+        // and the kubelet sweep ultimately deletes — every pod on the node
+        // instantly (#442). K8s ref:
+        // plugin/pkg/admission/defaulttolerationseconds/admission.go (Admit).
+        let added = rusternetes_common::tolerations::add_default_tolerations(spec);
+        if added > 0 {
+            info!(
+                "Added {} default NoExecute toleration(s) to pod {}",
+                added, pod.metadata.name
+            );
+        }
     }
 
     // Ensure namespace is set correctly
@@ -861,6 +875,17 @@ pub async fn update(
     // the only path that may mutate it. Upstream resets
     // `newPod.Status = oldPod.Status` before persisting.
     pod.status = old_pod.status.clone();
+
+    // DefaultTolerationSeconds admission runs on UPDATE too (the upstream
+    // plugin registers for admission.Create AND admission.Update — see
+    // plugin/pkg/admission/defaulttolerationseconds/admission.go:86
+    // NewHandler(Create, Update)). Re-add the default NoExecute tolerations the
+    // client may have omitted from the PUT body before the add-only toleration
+    // immutability check below, so a round-trip update that drops them does not
+    // trip `validateOnlyAddedTolerations`.
+    if let Some(ref mut spec) = pod.spec {
+        rusternetes_common::tolerations::add_default_tolerations(spec);
+    }
 
     // K8s ref: pkg/apis/core/validation/validation.go ValidatePodUpdate —
     // immutability fence. Only specific spec fields are mutable on a PUT

@@ -23,6 +23,7 @@ pub mod schema_validation;
 pub mod server_side_apply;
 pub mod serviceaccount;
 pub mod tls;
+pub mod tolerations;
 pub mod tracing;
 pub mod types;
 pub mod validation;

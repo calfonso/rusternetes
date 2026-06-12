@@ -615,13 +615,18 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             block_owner_deletion: Some(true),
         }]);
 
+        // DefaultTolerationSeconds admission (#442): controllers bypass the
+        // api-server admission path that adds these NoExecute tolerations.
+        let mut pod_spec = rc.spec.template.spec.clone();
+        rusternetes_common::tolerations::add_default_tolerations(&mut pod_spec);
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata,
-            spec: Some(rc.spec.template.spec.clone()),
+            spec: Some(pod_spec),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
                 message: None,
@@ -1033,6 +1038,46 @@ mod tests {
             Some(&"v1".to_string()),
             "Pod should use template labels when present"
         );
+    }
+
+    #[tokio::test]
+    async fn test_rc_created_pods_get_default_tolerations() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicationControllerController::new(storage.clone(), 5);
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "tol-test".to_string());
+
+        let rc = make_rc("tol-rc", "default", 1, selector, None);
+        storage
+            .create("/registry/replicationcontrollers/default/tol-rc", &rc)
+            .await
+            .unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert!(!pods.is_empty(), "RC should have created a pod");
+
+        // DefaultTolerationSeconds admission parity (#442): RC-created pods
+        // bypass the api-server, so the controller must add the defaults.
+        let tolerations = pods[0]
+            .spec
+            .as_ref()
+            .and_then(|s| s.tolerations.as_ref())
+            .expect("RC-created pod must carry default tolerations");
+        for key in [
+            "node.kubernetes.io/not-ready",
+            "node.kubernetes.io/unreachable",
+        ] {
+            let tol = tolerations
+                .iter()
+                .find(|t| t.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("missing default toleration for {key}"));
+            assert_eq!(tol.operator.as_deref(), Some("Exists"));
+            assert_eq!(tol.effect.as_deref(), Some("NoExecute"));
+            assert_eq!(tol.toleration_seconds, Some(300));
+        }
     }
 
     #[tokio::test]
