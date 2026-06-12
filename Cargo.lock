@@ -4288,6 +4288,7 @@ name = "rusternetes-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "futures",
  "reqwest",
@@ -4295,6 +4296,8 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
