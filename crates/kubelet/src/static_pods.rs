@@ -147,3 +147,67 @@ pub fn load_static_pods(dir: &Path, node_name: &str) -> Vec<Pod> {
     pods.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
     pods
 }
+
+use rusternetes_storage::{build_key, build_prefix, Storage};
+
+/// Project `desired` static pods into storage as mirror pods and delete
+/// stale mirrors for this node. Never touches non-mirror pods.
+/// Upstream: pkg/kubelet/pod/mirror_client.go CreateMirrorPod /
+/// DeleteMirrorPod (hash-compare via the config.mirror annotation).
+pub async fn reconcile_mirror_pods<S: Storage>(
+    storage: &S,
+    node_name: &str,
+    desired: &[Pod],
+) -> Result<()> {
+    for pod in desired {
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let key = build_key("pods", Some(ns), &pod.metadata.name);
+        let want_hash = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(CONFIG_HASH_ANNOTATION))
+            .cloned()
+            .unwrap_or_default();
+        match storage.get::<Pod>(&key).await {
+            Ok(existing) => {
+                let have = existing
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(CONFIG_MIRROR_ANNOTATION))
+                    .cloned()
+                    .unwrap_or_default();
+                if have != want_hash {
+                    // manifest changed: recreate the mirror (upstream behavior)
+                    let _ = storage.delete(&key).await;
+                    storage.create(&key, &make_mirror_pod(pod)).await?;
+                }
+            }
+            Err(_) => {
+                storage.create(&key, &make_mirror_pod(pod)).await?;
+            }
+        }
+    }
+
+    // Delete stale mirrors: mirror-annotated pods on this node whose name is
+    // no longer in the desired set.
+    let desired_names: std::collections::HashSet<&str> =
+        desired.iter().map(|p| p.metadata.name.as_str()).collect();
+    let all: Vec<Pod> = storage.list(&build_prefix("pods", None)).await?;
+    for pod in all {
+        let on_node = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .map(|n| n == node_name)
+            .unwrap_or(false);
+        if on_node && is_mirror_pod(&pod) && !desired_names.contains(pod.metadata.name.as_str()) {
+            let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+            let _ = storage
+                .delete(&build_key("pods", Some(ns), &pod.metadata.name))
+                .await;
+        }
+    }
+    Ok(())
+}

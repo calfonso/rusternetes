@@ -129,3 +129,110 @@ fn load_static_pods_reads_dir_skips_invalid_sorted() {
     let names: Vec<_> = pods.iter().map(|p| p.metadata.name.as_str()).collect();
     assert_eq!(names, vec!["aaa-node-1", "bbb-node-1"]);
 }
+
+use rusternetes_kubelet::static_pods::reconcile_mirror_pods;
+use rusternetes_storage::{build_key, MemoryStorage, Storage};
+
+fn static_pod(name: &str, image: &str) -> rusternetes_common::resources::Pod {
+    let yaml = YAML_POD
+        .replace("kube-scheduler", name)
+        .replace(":latest", image);
+    normalize_static_pod(parse_manifest(yaml.as_bytes(), "t.yaml").unwrap(), "node-1").unwrap()
+}
+
+#[tokio::test]
+async fn creates_missing_mirror() {
+    let storage = MemoryStorage::new();
+    let desired = vec![static_pod("sch", ":v1")];
+    reconcile_mirror_pods(&storage, "node-1", &desired)
+        .await
+        .unwrap();
+    let key = build_key("pods", Some("kube-system"), "sch-node-1");
+    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    assert!(is_mirror_pod(&mirror));
+}
+
+#[tokio::test]
+async fn recreates_mirror_on_hash_change() {
+    let storage = MemoryStorage::new();
+    let v1 = vec![static_pod("sch", ":v1")];
+    reconcile_mirror_pods(&storage, "node-1", &v1)
+        .await
+        .unwrap();
+    let v2 = vec![static_pod("sch", ":v2")];
+    reconcile_mirror_pods(&storage, "node-1", &v2)
+        .await
+        .unwrap();
+    let key = build_key("pods", Some("kube-system"), "sch-node-1");
+    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let ann = mirror.metadata.annotations.as_ref().unwrap();
+    assert_eq!(
+        ann.get(CONFIG_MIRROR_ANNOTATION),
+        v2[0]
+            .metadata
+            .annotations
+            .as_ref()
+            .unwrap()
+            .get(CONFIG_HASH_ANNOTATION)
+    );
+}
+
+#[tokio::test]
+async fn unchanged_manifest_does_not_clobber_mirror_status() {
+    use rusternetes_common::types::Phase;
+    let storage = MemoryStorage::new();
+    let desired = vec![static_pod("sch", ":v1")];
+    reconcile_mirror_pods(&storage, "node-1", &desired)
+        .await
+        .unwrap();
+    let key = build_key("pods", Some("kube-system"), "sch-node-1");
+    // simulate kubelet status sync writing phase=Running onto the mirror
+    let mut mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let mut status = mirror.status.clone().unwrap_or_default();
+    status.phase = Some(Phase::Running);
+    mirror.status = Some(status);
+    storage.update(&key, &mirror).await.unwrap();
+
+    reconcile_mirror_pods(&storage, "node-1", &desired)
+        .await
+        .unwrap();
+    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    assert_eq!(
+        mirror.status.as_ref().and_then(|s| s.phase.clone()),
+        Some(Phase::Running)
+    );
+}
+
+#[tokio::test]
+async fn deletes_stale_mirror_when_manifest_removed() {
+    let storage = MemoryStorage::new();
+    let desired = vec![static_pod("sch", ":v1")];
+    reconcile_mirror_pods(&storage, "node-1", &desired)
+        .await
+        .unwrap();
+    reconcile_mirror_pods(&storage, "node-1", &[])
+        .await
+        .unwrap();
+    let key = build_key("pods", Some("kube-system"), "sch-node-1");
+    let got: Result<rusternetes_common::resources::Pod, _> = storage.get(&key).await;
+    assert!(got.is_err());
+}
+
+#[tokio::test]
+async fn does_not_touch_other_nodes_or_regular_pods() {
+    let storage = MemoryStorage::new();
+    // a regular (non-mirror) pod on this node must never be deleted
+    let yaml = YAML_POD.replace("kube-scheduler", "regular");
+    let mut regular = parse_manifest(yaml.as_bytes(), "r.yaml").unwrap();
+    regular.spec.as_mut().unwrap().node_name = Some("node-1".to_string());
+    let rkey = build_key("pods", Some("kube-system"), "regular");
+    storage.create(&rkey, &regular).await.unwrap();
+
+    reconcile_mirror_pods(&storage, "node-1", &[])
+        .await
+        .unwrap();
+    assert!(storage
+        .get::<rusternetes_common::resources::Pod>(&rkey)
+        .await
+        .is_ok());
+}
