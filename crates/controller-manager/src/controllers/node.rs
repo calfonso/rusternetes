@@ -584,11 +584,16 @@ impl<S: Storage + 'static> NodeController<S> {
         let key = build_key("nodes", None, node_name);
         let mut updated_node: Node = self.storage.get(&key).await?;
 
+        // Stamp time_added when adding a NoExecute taint, mirroring upstream
+        // SwapNodeControllerTaint (pkg/controller/util/node/controller_utils.go:197-198,
+        // `taintToAdd.TimeAdded = &now`). The kubelet's NoExecute sweep measures
+        // a timed toleration's grace period from this timestamp (#442): without
+        // it, a pod's tolerationSeconds:300 grace can never start counting.
         let not_ready_taint = rusternetes_common::resources::node::Taint {
             key: "node.kubernetes.io/not-ready".to_string(),
             value: Some("".to_string()),
             effect: "NoExecute".to_string(),
-            time_added: None,
+            time_added: Some(chrono::Utc::now()),
         };
 
         let spec = updated_node

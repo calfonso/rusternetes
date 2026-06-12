@@ -1137,6 +1137,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // api-server admission path that normally does this.
         super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut spec).await;
 
+        // DefaultTolerationSeconds admission (#442): controllers write pods
+        // straight to storage and bypass the api-server admission path that adds
+        // these, so apply the same NotReady/Unreachable NoExecute tolerations.
+        rusternetes_common::tolerations::add_default_tolerations(&mut spec);
+
         // Debug: Check again after injection
         debug!("After injection - Checking environment variables:");
         for container in &spec.containers {

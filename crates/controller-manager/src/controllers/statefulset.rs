@@ -1496,6 +1496,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         // api-server admission path that normally does this.
         super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut pod_spec).await;
 
+        // DefaultTolerationSeconds admission (#442): controllers bypass the
+        // api-server admission path that adds these NoExecute tolerations.
+        rusternetes_common::tolerations::add_default_tolerations(&mut pod_spec);
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
@@ -1604,6 +1608,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         // Propagate the SA's imagePullSecrets (#1084) — controllers bypass the
         // api-server admission path that normally does this.
         super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut pod_spec).await;
+
+        // DefaultTolerationSeconds admission (#442): controllers bypass the
+        // api-server admission path that adds these NoExecute tolerations.
+        rusternetes_common::tolerations::add_default_tolerations(&mut pod_spec);
 
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {

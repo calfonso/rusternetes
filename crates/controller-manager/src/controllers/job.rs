@@ -1379,6 +1379,10 @@ impl<S: Storage + 'static> JobController<S> {
         // api-server admission path that normally does this.
         super::propagate_sa_image_pull_secrets(&*self.storage, namespace, &mut spec).await;
 
+        // DefaultTolerationSeconds admission (#442): controllers bypass the
+        // api-server admission path that adds these NoExecute tolerations.
+        rusternetes_common::tolerations::add_default_tolerations(&mut spec);
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
