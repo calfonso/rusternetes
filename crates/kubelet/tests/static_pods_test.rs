@@ -236,3 +236,34 @@ async fn does_not_touch_other_nodes_or_regular_pods() {
         .await
         .is_ok());
 }
+
+use rusternetes_kubelet::static_pods::merge_node_pods;
+
+#[test]
+fn merge_prefers_file_version_and_drops_mirror_duplicates() {
+    let file_pod = static_pod("sch", ":v1"); // name sch-node-1, node-1
+    let mirror = make_mirror_pod(&file_pod); // same name — storage copy
+    let yaml = YAML_POD.replace("kube-scheduler", "regular");
+    let mut regular = parse_manifest(yaml.as_bytes(), "r.yaml").unwrap();
+    regular.spec.as_mut().unwrap().node_name = Some("node-1".to_string());
+
+    let merged = merge_node_pods(vec![mirror, regular], vec![file_pod.clone()], "node-1");
+    let names: Vec<_> = merged.iter().map(|p| p.metadata.name.as_str()).collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"sch-node-1"));
+    assert!(names.contains(&"regular"));
+    // the sch-node-1 entry must be the file version (no mirror annotation)
+    let sch = merged
+        .iter()
+        .find(|p| p.metadata.name == "sch-node-1")
+        .unwrap();
+    assert!(!is_mirror_pod(sch));
+}
+
+#[test]
+fn merge_filters_other_nodes() {
+    let mut other = static_pod("sch", ":v1");
+    other.spec.as_mut().unwrap().node_name = Some("node-2".to_string());
+    let merged = merge_node_pods(vec![other], vec![], "node-1");
+    assert!(merged.is_empty());
+}

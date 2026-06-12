@@ -213,6 +213,12 @@ pub struct Kubelet {
     /// the advertised port drifting from the bind port (the conformance
     /// framework hardcodes `<node>:10250`, so deviating breaks node-proxy).
     metrics_port: u16,
+    /// Static pod manifest dir (upstream staticPodPath). None = disabled.
+    pod_manifest_path: Option<PathBuf>,
+    /// Current file-sourced static pods, keyed by (suffixed) pod name.
+    /// Workers consult this before storage so static pods survive
+    /// mirror-pod deletion.
+    static_pods: Arc<Mutex<HashMap<String, Pod>>>,
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -394,7 +400,15 @@ impl Kubelet {
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
             last_sync: AtomicU64::new(0),
             metrics_port,
+            pod_manifest_path: None,
+            static_pods: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Enable static pods from a manifest directory (kubeadm staticPodPath).
+    pub fn with_pod_manifest_path(mut self, path: Option<PathBuf>) -> Self {
+        self.pod_manifest_path = path;
+        self
     }
 
     /// Liveness probe — true iff `sync_loop` completed inside the
@@ -1350,17 +1364,30 @@ impl Kubelet {
         let all_pods_prefix = build_prefix("pods", None);
         let all_pods: Vec<Pod> = self.storage.list(&all_pods_prefix).await?;
 
-        let node_pods: Vec<Pod> = all_pods
-            .iter()
-            .filter(|p| {
-                p.spec
-                    .as_ref()
-                    .and_then(|s| s.node_name.as_ref())
-                    .map(|n| n == &self.node_name)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
+        // Static pods: rescan the manifest dir (file source resync) and
+        // project mirrors into storage before computing the node's pod set.
+        let static_pods: Vec<Pod> = if let Some(dir) = &self.pod_manifest_path {
+            let pods = crate::static_pods::load_static_pods(dir, &self.node_name);
+            if let Err(e) = crate::static_pods::reconcile_mirror_pods(
+                self.storage.as_ref(),
+                &self.node_name,
+                &pods,
+            )
+            .await
+            {
+                warn!("static pods: mirror reconcile failed: {}", e);
+            }
+            *self.static_pods.lock().unwrap() = pods
+                .iter()
+                .map(|p| (p.metadata.name.clone(), p.clone()))
+                .collect();
+            pods
+        } else {
+            Vec::new()
+        };
+
+        let node_pods: Vec<Pod> =
+            crate::static_pods::merge_node_pods(all_pods.clone(), static_pods, &self.node_name);
 
         debug!("Found {} pods assigned to this node", node_pods.len());
 
@@ -1793,19 +1820,27 @@ impl Kubelet {
                 // We need to find the namespace since it's not stored in the worker key.
                 // Search all namespaces for this pod name assigned to our node.
                 let pod = {
-                    let prefix = build_prefix("pods", None);
-                    match kubelet.storage.list::<Pod>(&prefix).await {
-                        Ok(pods) => pods.into_iter().find(|p| {
-                            p.metadata.name == name
-                                && p.spec
-                                    .as_ref()
-                                    .and_then(|s| s.node_name.as_ref())
-                                    .map(|n| n == &node_name)
-                                    .unwrap_or(false)
-                        }),
-                        Err(e) => {
-                            debug!("Pod worker {}: storage error: {}", name, e);
-                            continue;
+                    // File-sourced static pods are authoritative: consult the
+                    // cache first so a static pod keeps running even if its
+                    // mirror was deleted from storage.
+                    let cached = kubelet.static_pods.lock().unwrap().get(&name).cloned();
+                    if let Some(p) = cached {
+                        Some(p)
+                    } else {
+                        let prefix = build_prefix("pods", None);
+                        match kubelet.storage.list::<Pod>(&prefix).await {
+                            Ok(pods) => pods.into_iter().find(|p| {
+                                p.metadata.name == name
+                                    && p.spec
+                                        .as_ref()
+                                        .and_then(|s| s.node_name.as_ref())
+                                        .map(|n| n == &node_name)
+                                        .unwrap_or(false)
+                            }),
+                            Err(e) => {
+                                debug!("Pod worker {}: storage error: {}", name, e);
+                                continue;
+                            }
                         }
                     }
                 };

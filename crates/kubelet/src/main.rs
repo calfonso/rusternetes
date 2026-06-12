@@ -9,6 +9,7 @@ mod labels;
 mod lifecycle;
 mod runtime;
 mod server;
+mod static_pods;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -152,6 +153,11 @@ struct Args {
     /// Default `5m`, matching upstream.
     #[arg(long, default_value = None)]
     eviction_pressure_transition_period: Option<String>,
+
+    /// Directory of static pod manifests (upstream --pod-manifest-path /
+    /// staticPodPath). Disabled when unset.
+    #[arg(long, value_name = "DIR")]
+    pod_manifest_path: Option<std::path::PathBuf>,
 }
 
 /// Parse `<signal>=<duration>,...` into a map. Empty/None → empty map.
@@ -388,7 +394,8 @@ async fn main() -> Result<()> {
             runtime_config.metrics_bind_port,
             args.allowed_unsafe_sysctls.clone(),
         )
-        .await?,
+        .await?
+        .with_pod_manifest_path(args.pod_manifest_path.clone()),
     );
 
     let server_state = server::ServerState {
