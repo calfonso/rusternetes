@@ -10,6 +10,7 @@ pub mod labels;
 pub mod lifecycle;
 pub mod runtime;
 pub mod server;
+pub mod static_pods;
 
 pub use kubelet::PodWorkerState;
 

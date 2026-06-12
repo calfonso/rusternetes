@@ -1,0 +1,131 @@
+use rusternetes_kubelet::static_pods::{
+    is_mirror_pod, load_static_pods, make_mirror_pod, normalize_static_pod, parse_manifest,
+    pod_config_hash, CONFIG_HASH_ANNOTATION, CONFIG_MIRROR_ANNOTATION, CONFIG_SOURCE_ANNOTATION,
+};
+
+const YAML_POD: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-scheduler
+  namespace: kube-system
+spec:
+  containers:
+  - name: scheduler
+    image: ghcr.io/indyjonesnl/rusternetes-scheduler:latest
+"#;
+
+#[test]
+fn parses_yaml_pod_manifest() {
+    let pod = parse_manifest(YAML_POD.as_bytes(), "kube-scheduler.yaml").unwrap();
+    assert_eq!(pod.metadata.name, "kube-scheduler");
+}
+
+#[test]
+fn parses_json_pod_manifest() {
+    let json = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"p"},"spec":{"containers":[{"name":"c","image":"i"}]}}"#;
+    let pod = parse_manifest(json.as_bytes(), "p.json").unwrap();
+    assert_eq!(pod.metadata.name, "p");
+}
+
+#[test]
+fn rejects_non_pod_kind() {
+    let yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n";
+    assert!(parse_manifest(yaml.as_bytes(), "x.yaml").is_err());
+}
+
+#[test]
+fn rejects_missing_name() {
+    let yaml = "apiVersion: v1\nkind: Pod\nmetadata: {}\nspec:\n  containers: []\n";
+    assert!(parse_manifest(yaml.as_bytes(), "x.yaml").is_err());
+}
+
+#[test]
+fn normalize_applies_node_suffix_namespace_annotations_and_uid() {
+    let pod = parse_manifest(YAML_POD.as_bytes(), "kube-scheduler.yaml").unwrap();
+    let pod = normalize_static_pod(pod, "node-1").unwrap();
+    // upstream: pkg/kubelet/config/common.go generatePodName → "<name>-<node>"
+    assert_eq!(pod.metadata.name, "kube-scheduler-node-1");
+    assert_eq!(pod.metadata.namespace.as_deref(), Some("kube-system"));
+    assert_eq!(
+        pod.spec.as_ref().unwrap().node_name.as_deref(),
+        Some("node-1")
+    );
+    let ann = pod.metadata.annotations.as_ref().unwrap();
+    assert_eq!(
+        ann.get(CONFIG_SOURCE_ANNOTATION).map(String::as_str),
+        Some("file")
+    );
+    assert!(ann.contains_key(CONFIG_HASH_ANNOTATION));
+    assert!(!pod.metadata.uid.is_empty());
+}
+
+#[test]
+fn normalize_defaults_namespace_to_default() {
+    let yaml =
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\nspec:\n  containers:\n  - name: c\n    image: i\n";
+    let pod = parse_manifest(yaml.as_bytes(), "p.yaml").unwrap();
+    let pod = normalize_static_pod(pod, "node-1").unwrap();
+    assert_eq!(pod.metadata.namespace.as_deref(), Some("default"));
+}
+
+#[test]
+fn hash_is_deterministic_and_spec_sensitive() {
+    let a = normalize_static_pod(
+        parse_manifest(YAML_POD.as_bytes(), "a.yaml").unwrap(),
+        "node-1",
+    )
+    .unwrap();
+    let b = normalize_static_pod(
+        parse_manifest(YAML_POD.as_bytes(), "a.yaml").unwrap(),
+        "node-1",
+    )
+    .unwrap();
+    assert_eq!(pod_config_hash(&a), pod_config_hash(&b));
+    assert_eq!(a.metadata.uid, b.metadata.uid); // stable UID across restarts
+
+    let changed = YAML_POD.replace(":latest", ":v2");
+    let c = normalize_static_pod(
+        parse_manifest(changed.as_bytes(), "a.yaml").unwrap(),
+        "node-1",
+    )
+    .unwrap();
+    assert_ne!(pod_config_hash(&a), pod_config_hash(&c));
+}
+
+#[test]
+fn mirror_pod_carries_mirror_annotation_and_is_detected() {
+    let pod = normalize_static_pod(
+        parse_manifest(YAML_POD.as_bytes(), "a.yaml").unwrap(),
+        "node-1",
+    )
+    .unwrap();
+    let mirror = make_mirror_pod(&pod);
+    let ann = mirror.metadata.annotations.as_ref().unwrap();
+    assert_eq!(
+        ann.get(CONFIG_MIRROR_ANNOTATION),
+        ann.get(CONFIG_HASH_ANNOTATION)
+    );
+    assert!(is_mirror_pod(&mirror));
+    assert!(!is_mirror_pod(&pod));
+}
+
+#[test]
+fn load_static_pods_reads_dir_skips_invalid_sorted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("b.yaml"),
+        YAML_POD.replace("kube-scheduler", "bbb"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("a.yaml"),
+        YAML_POD.replace("kube-scheduler", "aaa"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.yaml"), "not: [valid").unwrap();
+    std::fs::write(dir.path().join("ignore.txt"), "x").unwrap();
+    let pods = load_static_pods(dir.path(), "node-1");
+    let names: Vec<_> = pods.iter().map(|p| p.metadata.name.as_str()).collect();
+    assert_eq!(names, vec!["aaa-node-1", "bbb-node-1"]);
+}
