@@ -3,6 +3,18 @@ use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// List-level metadata (`metadata` on a `*List` envelope).
+///
+/// `resourceVersion` is what a reflector resumes its watch from after the
+/// initial list.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMeta {
+    pub resource_version: Option<String>,
+    #[serde(rename = "continue")]
+    pub continue_token: Option<String>,
+}
+
 /// Generic Kubernetes List wrapper
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -12,6 +24,7 @@ pub struct KubernetesList<T> {
     pub api_version: String,
     #[allow(dead_code)]
     pub kind: String,
+    pub metadata: Option<ListMeta>,
     pub items: Vec<T>,
 }
 
