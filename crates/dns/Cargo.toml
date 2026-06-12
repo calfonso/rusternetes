@@ -21,6 +21,7 @@ redis = ["rusternetes-storage/redis"]
 [dependencies]
 rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage" }
+rusternetes-client = { path = "../client" }
 tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
