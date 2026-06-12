@@ -1,4 +1,5 @@
 use crate::eviction::{get_node_stats, get_pod_stats, EvictionManager, EvictionSignal};
+use crate::lifecycle::should_skip_phase_write;
 use crate::runtime::ContainerRuntime;
 use anyhow::Result;
 use rusternetes_common::{
@@ -1827,6 +1828,12 @@ impl Kubelet {
         let terminal_and_done = is_terminal_phase && restart_policy != "Always";
         let needs_terminating = (pod.metadata.deletion_timestamp.is_some() || terminal_and_done)
             && matches!(current_state, PodWorkerState::SyncPod);
+        // INVARIANT: a pod whose phase is terminal either transitions to
+        // TerminatingPod here or dispatches into the Succeeded|Failed match
+        // arm below — it never re-enters the start_pod/Pending paths, so the
+        // Pending status writes in those paths don't need the
+        // should_skip_phase_write guard; only write sites that re-read a
+        // possibly-terminal fresh pod from storage carry it.
 
         if needs_terminating {
             self.pod_states
@@ -2589,21 +2596,28 @@ impl Kubelet {
                                 _ => pod.clone(),
                             };
 
-                            // start_pod may have rejected the pod during admission
-                            // (e.g. an unsafe sysctl -> phase=Failed,
-                            // reason=SysctlForbidden) without creating any
-                            // containers. That status is terminal — don't overwrite
-                            // it with Running below (which would then let the
-                            // restartPolicy=Never reconcile flip it to Succeeded).
-                            let rejected = fresh_pod
-                                .status
-                                .as_ref()
-                                .map(|s| {
-                                    s.phase == Some(Phase::Failed)
-                                        && s.reason.as_deref() == Some("SysctlForbidden")
-                                })
-                                .unwrap_or(false);
-                            if rejected {
+                            // Terminal phases are sticky: if the pod already
+                            // reached Succeeded/Failed in storage, don't write
+                            // the Running status below. This subsumes the older
+                            // SysctlForbidden-specific guard (start_pod may have
+                            // rejected the pod during admission, e.g. an unsafe
+                            // sysctl -> phase=Failed, reason=SysctlForbidden,
+                            // without creating any containers) and also blocks a
+                            // genuine Succeeded->Running flap that would let the
+                            // job controller delete a completed pod (#1048).
+                            // Upstream parity: kubelet_pods.go:1934-1942
+                            // generateAPIPodStatus ("pods are not allowed to
+                            // transition out of terminal phases").
+                            if should_skip_phase_write(
+                                fresh_pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                                &Phase::Running,
+                            ) {
+                                debug!(
+                                    "Pod {}/{} already terminal in storage ({:?}); not overwriting with Running",
+                                    namespace,
+                                    pod_name,
+                                    fresh_pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                                );
                                 return Ok(());
                             }
 
@@ -2674,6 +2688,18 @@ impl Kubelet {
                                     || e.to_string().contains("mismatch")
                                 {
                                     if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
+                                        // Terminal phases are sticky — don't
+                                        // regress a Succeeded/Failed pod to
+                                        // Running on the conflict retry.
+                                        if should_skip_phase_write(
+                                            fresh_pod
+                                                .status
+                                                .as_ref()
+                                                .and_then(|s| s.phase.as_ref()),
+                                            &Phase::Running,
+                                        ) {
+                                            return Ok(());
+                                        }
                                         let mut retry_pod = fresh_pod;
                                         // Re-fetch ALL statuses for the retry — stale
                                         // init_container_statuses from an intermediate
@@ -3061,6 +3087,24 @@ impl Kubelet {
                         Ok(p) => p,
                         _ => pod.clone(),
                     };
+
+                    // Terminal phases are sticky — if a concurrent reconcile
+                    // already set Succeeded/Failed in storage, don't regress to
+                    // Running. Upstream parity: kubelet_pods.go:1934-1942
+                    // generateAPIPodStatus ("pods are not allowed to
+                    // transition out of terminal phases").
+                    if should_skip_phase_write(
+                        fresh_pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                        &Phase::Running,
+                    ) {
+                        debug!(
+                            "Pod {}/{} already terminal in storage ({:?}); not overwriting with Running",
+                            namespace,
+                            pod_name,
+                            fresh_pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                        );
+                        return Ok(());
+                    }
 
                     // Get container statuses
                     let container_statuses =
@@ -3660,6 +3704,17 @@ impl Kubelet {
                                         Ok(p) => p,
                                         _ => pod.clone(),
                                     };
+                                    // Terminal phases are sticky. A restartPolicy=
+                                    // Always pod is never terminal (the kubelet keeps
+                                    // it Running/CrashLoopBackOff), so this guard does
+                                    // NOT affect legitimate liveness-probe restarts —
+                                    // it only blocks a racing terminal->Running flap.
+                                    if should_skip_phase_write(
+                                        new_pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+                                        &Phase::Running,
+                                    ) {
+                                        return Ok(());
+                                    }
                                     if let Some(ref mut status) = new_pod.status {
                                         status.phase = Some(Phase::Running);
                                         status.message = Some("Liveness probe failed".to_string());
@@ -4787,6 +4842,30 @@ impl Kubelet {
             Ok(p) => p,
             Err(_) => pod.clone(),
         };
+
+        // Terminal pod phases are STICKY. If storage already reports the pod
+        // as Succeeded/Failed, refuse to regress it to a non-terminal phase
+        // (and never rewrite one terminal phase into the other). Without this
+        // a Succeeded pod could flap back to Running; the job controller then
+        // deletes that Running pod on job completion while its completion
+        // index stays counted, dropping the index from the pod listing — the
+        // Indexed Job conformance flake (#1048).
+        // Upstream parity: pkg/kubelet/kubelet_pods.go:1934-1942
+        // generateAPIPodStatus — "pods are not allowed to transition out of
+        // terminal phases" forces the computed phase back to the API
+        // server's terminal value ("Pod attempted illegal phase transition").
+        let current_phase = new_pod.status.as_ref().and_then(|s| s.phase.clone());
+        if should_skip_phase_write(current_phase.as_ref(), &phase) {
+            debug!(
+                "refusing to regress terminal phase of pod {}/{}: storage={:?} requested={:?} (upstream: generateAPIPodStatus illegal-phase-transition guard)",
+                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                pod.metadata.name,
+                current_phase,
+                phase,
+            );
+            return Ok(());
+        }
+
         let original = new_pod.clone();
 
         let mut status = new_pod.status.take().unwrap_or_default();

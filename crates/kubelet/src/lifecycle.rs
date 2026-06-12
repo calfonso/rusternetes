@@ -19,8 +19,55 @@
 //!     (unless the runtime supplied a specific `error` string).
 
 use rusternetes_common::resources::{ContainerState, Lifecycle, Pod};
+use rusternetes_common::types::Phase;
 use std::collections::HashMap;
 use std::time::Duration;
+
+/// True when `phase` is one of the two terminal pod phases (`Succeeded`,
+/// `Failed`).
+///
+/// Mirrors upstream `pkg/api/v1/pod/util.go:307 IsPodPhaseTerminal`, which
+/// returns true for exactly `PodSucceeded` and `PodFailed`. Terminal phases
+/// are an absorbing state: once a pod reaches one, the kubelet must never
+/// report it back to a non-terminal phase.
+#[inline]
+pub fn phase_is_terminal(phase: Option<&Phase>) -> bool {
+    matches!(phase, Some(Phase::Succeeded) | Some(Phase::Failed))
+}
+
+/// Decide whether a kubelet status write that would set the pod phase to
+/// `incoming` must be SKIPPED because the pod already reached a terminal
+/// phase in storage (`current`).
+///
+/// This is the rusternetes analogue of the terminal-phase stickiness guard
+/// in upstream `pkg/kubelet/kubelet_pods.go:1934-1942 generateAPIPodStatus`
+/// ("pods are not allowed to transition out of terminal phases"): when the
+/// API server already shows `Failed`/`Succeeded` and the freshly computed
+/// phase differs, the kubelet logs "Pod attempted illegal phase transition"
+/// and forces the phase back to the API server's terminal value, so a
+/// `Succeeded`/`Failed` pod is never regressed to `Running`/`Pending`.
+///
+/// Rules:
+///   - current terminal, incoming non-terminal → SKIP (regression — the bug).
+///   - current terminal, incoming the SAME terminal phase → ALLOW (reason /
+///     message updates for the same terminal phase, e.g. `Failed → Failed`
+///     for eviction or preemption, must still land).
+///   - current terminal, incoming a DIFFERENT terminal phase
+///     (`Succeeded → Failed` or vice-versa) → SKIP. The first terminal phase
+///     a pod reaches wins; upstream never rewrites one terminal phase into
+///     the other.
+///   - current non-terminal → ALLOW everything (the normal
+///     `Pending → Running → Succeeded` progression, including restartPolicy=
+///     Always pods that the kubelet keeps in `Running`/`CrashLoopBackOff`
+///     and therefore never have a terminal `current`).
+#[inline]
+pub fn should_skip_phase_write(current: Option<&Phase>, incoming: &Phase) -> bool {
+    if !phase_is_terminal(current) {
+        return false;
+    }
+    // current is terminal here; only an exact-same-phase write is allowed.
+    current != Some(incoming)
+}
 
 /// Minimum grace period after preStop has overrun, in seconds.
 ///
@@ -410,6 +457,78 @@ mod tests {
         assert_eq!(terminal_pod_phase(Some("OnFailure"), true), None);
         assert_eq!(terminal_pod_phase(Some("Always"), false), None);
         assert_eq!(terminal_pod_phase(Some("Always"), true), None);
+    }
+
+    #[test]
+    fn phase_is_terminal_only_for_succeeded_and_failed() {
+        assert!(phase_is_terminal(Some(&Phase::Succeeded)));
+        assert!(phase_is_terminal(Some(&Phase::Failed)));
+        assert!(!phase_is_terminal(Some(&Phase::Running)));
+        assert!(!phase_is_terminal(Some(&Phase::Pending)));
+        assert!(!phase_is_terminal(Some(&Phase::Unknown)));
+        assert!(!phase_is_terminal(None));
+    }
+
+    #[test]
+    fn skip_terminal_succeeded_regression_to_running() {
+        // The exact Indexed-Job flake: a Succeeded pod must not flap back to
+        // Running (which would let the job controller delete it and drop its
+        // completion index).
+        assert!(should_skip_phase_write(
+            Some(&Phase::Succeeded),
+            &Phase::Running
+        ));
+        assert!(should_skip_phase_write(
+            Some(&Phase::Succeeded),
+            &Phase::Pending
+        ));
+    }
+
+    #[test]
+    fn allow_same_terminal_phase_reason_update() {
+        // Failed -> Failed (new reason/message: eviction, preemption) must
+        // still be written.
+        assert!(!should_skip_phase_write(
+            Some(&Phase::Failed),
+            &Phase::Failed
+        ));
+        assert!(!should_skip_phase_write(
+            Some(&Phase::Succeeded),
+            &Phase::Succeeded
+        ));
+    }
+
+    #[test]
+    fn allow_nonterminal_progression_to_terminal() {
+        // Normal Running -> Succeeded / Pending -> Failed progression.
+        assert!(!should_skip_phase_write(
+            Some(&Phase::Running),
+            &Phase::Succeeded
+        ));
+        assert!(!should_skip_phase_write(
+            Some(&Phase::Running),
+            &Phase::Failed
+        ));
+        assert!(!should_skip_phase_write(
+            Some(&Phase::Pending),
+            &Phase::Running
+        ));
+        // No prior phase at all — never skip.
+        assert!(!should_skip_phase_write(None, &Phase::Running));
+    }
+
+    #[test]
+    fn skip_cross_terminal_rewrite() {
+        // The first terminal phase wins; never rewrite one terminal into the
+        // other.
+        assert!(should_skip_phase_write(
+            Some(&Phase::Succeeded),
+            &Phase::Failed
+        ));
+        assert!(should_skip_phase_write(
+            Some(&Phase::Failed),
+            &Phase::Succeeded
+        ));
     }
 
     #[test]
