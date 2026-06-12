@@ -30,6 +30,7 @@ use rusternetes_common::resources::{
 };
 use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
 use rusternetes_scheduler::advanced::{check_preemption, check_preemption_with_pdbs};
+use rusternetes_scheduler::scheduler::Scheduler;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 
 // ---------------------------------------------------------------------------
@@ -469,4 +470,135 @@ async fn scheduler_queue_sorting_orders_pending_pods_by_priority_desc() {
     assert_eq!(resolve_priority(&p_class_high, &classes), 1000);
     assert_eq!(resolve_priority(&p_class_med, &classes), 100);
     assert_eq!(resolve_priority(&p_explicit_low, &classes), 5);
+}
+
+/// End-to-end preemption through the scheduling loop (repointed from the
+/// retired controller-level pin; mirrors upstream
+/// `test/e2e/scheduling/preemption.go::"validates basic preemption works"`).
+///
+/// A node fully occupied by a running low-priority pod cannot fit a pending
+/// high-priority pod; `schedule_pending_pods` must evict the victim
+/// (deletionTimestamp + DisruptionTarget) rather than leave the preemptor
+/// pending forever.
+#[tokio::test]
+async fn preemption_evicts_lower_priority_pod_via_schedule_loop() {
+    let storage = setup_test().await;
+    let scheduler = Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+
+    storage
+        .create(
+            &build_key("priorityclasses", None, "high"),
+            &PriorityClass::new("high", 1_000_000),
+        )
+        .await
+        .unwrap();
+
+    let node = make_node("node-1", "1", "1Gi");
+    storage
+        .create(&build_key("nodes", None, "node-1"), &node)
+        .await
+        .unwrap();
+
+    // Running victim consumes the node's entire CPU allocatable.
+    let victim = make_scheduled_pod("victim", 100, "1", "512Mi", "node-1");
+    storage
+        .create(&build_key("pods", Some("default"), "victim"), &victim)
+        .await
+        .unwrap();
+
+    // Pending preemptor: priority resolved from the PriorityClass by the
+    // scheduler's backstop (spec.priority intentionally None).
+    let preemptor = make_pending_pod("preemptor", None, Some("high"));
+    storage
+        .create(&build_key("pods", Some("default"), "preemptor"), &preemptor)
+        .await
+        .unwrap();
+
+    scheduler.schedule_pending_pods().await.unwrap();
+
+    let victim_after: Pod = storage
+        .get(&build_key("pods", Some("default"), "victim"))
+        .await
+        .unwrap();
+    assert!(
+        victim_after.metadata.deletion_timestamp.is_some(),
+        "running lower-priority pod must be evicted (deletionTimestamp) when a \
+         higher-priority pod cannot otherwise fit; got {:?}",
+        victim_after.metadata.deletion_timestamp
+    );
+    let conditions = victim_after
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .expect("evicted victim must carry status conditions");
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c.condition_type == "DisruptionTarget" && c.status == "True"),
+        "evicted victim must carry a DisruptionTarget=True condition"
+    );
+}
+
+/// `preemptionPolicy: Never` end-to-end (repointed from the retired
+/// controller-level pin; mirrors upstream
+/// `test/e2e/scheduling/preemption.go` PreemptionExecutionPath / NonPreempting).
+///
+/// The preemptor's spec.preemptionPolicy is deliberately left None — the
+/// scheduler must fall back to the PriorityClass's policy (same backstop it
+/// already applies for spec.priority) and refuse to evict.
+#[tokio::test]
+async fn preemption_policy_never_does_not_evict_via_schedule_loop() {
+    let storage = setup_test().await;
+    let scheduler = Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+
+    storage
+        .create(
+            &build_key("priorityclasses", None, "high-but-polite"),
+            &PriorityClass::new("high-but-polite", 1_000_000).with_preemption_policy("Never"),
+        )
+        .await
+        .unwrap();
+
+    let node = make_node("node-1", "1", "1Gi");
+    storage
+        .create(&build_key("nodes", None, "node-1"), &node)
+        .await
+        .unwrap();
+
+    let victim = make_scheduled_pod("victim", 100, "1", "512Mi", "node-1");
+    storage
+        .create(&build_key("pods", Some("default"), "victim"), &victim)
+        .await
+        .unwrap();
+
+    let preemptor = make_pending_pod("preemptor", None, Some("high-but-polite"));
+    storage
+        .create(&build_key("pods", Some("default"), "preemptor"), &preemptor)
+        .await
+        .unwrap();
+
+    scheduler.schedule_pending_pods().await.unwrap();
+
+    let victim_after: Pod = storage
+        .get(&build_key("pods", Some("default"), "victim"))
+        .await
+        .unwrap();
+    assert!(
+        victim_after.metadata.deletion_timestamp.is_none(),
+        "victim must NOT be evicted when the preemptor's PriorityClass has \
+         preemptionPolicy: Never; got {:?}",
+        victim_after.metadata.deletion_timestamp
+    );
+    let preemptor_after: Pod = storage
+        .get(&build_key("pods", Some("default"), "preemptor"))
+        .await
+        .unwrap();
+    assert!(
+        preemptor_after
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .is_none_or(str::is_empty),
+        "Never-policy preemptor must stay unscheduled when the node is full"
+    );
 }

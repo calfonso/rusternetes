@@ -24,9 +24,12 @@ pub const NS_DEFAULT_PRIORITY_CLASS_ANNOTATION: &str = "scheduling.k8s.io/defaul
 ///   its value to pods that omit a `priorityClassName`.
 /// * Surfacing namespace-scoped default priority (e.g. via a default
 ///   PriorityClass per-namespace annotation) so newly created pods inherit it.
-/// * Triggering preemption of lower-priority pods when a higher-priority
-///   pending pod is unschedulable, by handing eviction candidates to the
-///   scheduler / kubelet.
+///
+/// Preemption and eviction are NOT this controller's job — that is the
+/// scheduler's (`crates/scheduler/src/scheduler.rs::try_preempt`). This
+/// controller only resolves `priorityClassName` -> `spec.priority` +
+/// `spec.preemptionPolicy` as a defaulting backstop mirroring the upstream
+/// `Priority` admission plugin.
 ///
 /// # Upstream note
 ///
@@ -86,6 +89,11 @@ impl<S: Storage + 'static> PriorityClassController<S> {
     /// 4. **Global default** — pods with no `priorityClassName` in namespaces
     ///    that carry no namespace-default annotation inherit the cluster-wide
     ///    `globalDefault` class's `value` (if one exists).
+    ///
+    /// 5. **preemptionPolicy propagation** — when a class resolves (named,
+    ///    namespace default, or globalDefault), its `preemptionPolicy` is also
+    ///    injected onto the pod, but only when the pod does not already carry an
+    ///    explicit `spec.preemptionPolicy` (which is never overwritten).
     pub async fn reconcile_all(&self) -> Result<()> {
         // -----------------------------------------------------------------
         // 1. Load all PriorityClasses into a name → value map.
@@ -99,10 +107,15 @@ impl<S: Storage + 'static> PriorityClassController<S> {
             .list(&build_prefix("priorityclasses", None))
             .await?;
 
-        // name → PriorityClass value (order-independent).
-        let pc_value_map: HashMap<String, i32> = all_pcs
+        // name → (value, preemptionPolicy) (order-independent).
+        let pc_map: HashMap<String, (i32, Option<String>)> = all_pcs
             .iter()
-            .map(|pc| (pc.metadata.name.clone(), pc.value))
+            .map(|pc| {
+                (
+                    pc.metadata.name.clone(),
+                    (pc.value, pc.preemption_policy.clone()),
+                )
+            })
             .collect();
 
         // -----------------------------------------------------------------
@@ -123,19 +136,20 @@ impl<S: Storage + 'static> PriorityClassController<S> {
             ));
         }
 
-        let global_default_value: Option<i32> = all_pcs
+        let global_default: Option<(i32, Option<String>)> = all_pcs
             .iter()
             .find(|pc| pc.global_default == Some(true))
-            .map(|pc| pc.value);
+            .map(|pc| (pc.value, pc.preemption_policy.clone()));
 
         // -----------------------------------------------------------------
         // 3. Load namespace annotations for per-namespace defaults.
         //
         //    Namespaces are stored as raw JSON values; we avoid a dependency
         //    on the concrete Namespace struct so this remains forward-compatible.
-        //    Key: namespace name → resolved default priority value.
+        //    Key: namespace name → resolved (priority value, preemptionPolicy)
+        //    pair of the namespace's default PriorityClass.
         // -----------------------------------------------------------------
-        let ns_default_map: HashMap<String, i32> = {
+        let ns_default_map: HashMap<String, (i32, Option<String>)> = {
             let namespaces: Vec<serde_json::Value> =
                 self.storage.list(&build_prefix("namespaces", None)).await?;
 
@@ -157,8 +171,8 @@ impl<S: Storage + 'static> PriorityClassController<S> {
                     );
                     let class_name = ns.pointer(&annotation_ptr).and_then(|v| v.as_str())?;
 
-                    let value = *pc_value_map.get(class_name)?;
-                    Some((ns_name, value))
+                    let resolved = pc_map.get(class_name)?.clone();
+                    Some((ns_name, resolved))
                 })
                 .collect()
         };
@@ -185,32 +199,49 @@ impl<S: Storage + 'static> PriorityClassController<S> {
                 continue;
             };
 
-            // Resolve the priority value to inject. This controller only ever
-            // *sets* a priority; it never clears one, so any case where no value
-            // applies leaves the pod untouched (`continue`).
-            let desired: i32 = match spec_ref.priority_class_name.as_deref() {
-                // Pod names a specific class — resolve to its value. If the class
-                // is absent (deleted, or a transient read gap), leave the pod's
-                // existing priority alone rather than zeroing it.
-                Some(class_name) => match pc_value_map.get(class_name) {
-                    Some(v) => *v,
-                    None => continue,
-                },
-                // Pod omits priorityClassName — apply the effective default:
-                // namespace annotation wins over cluster globalDefault. No
-                // default configured ⇒ leave the pod untouched.
-                None => match ns_default_map.get(&ns).copied().or(global_default_value) {
-                    Some(v) => v,
-                    None => continue,
-                },
+            // Resolve the (priority, preemptionPolicy) pair to inject. This
+            // controller only ever *sets* values; it never clears one, so any
+            // case where no class applies leaves the pod untouched (`continue`).
+            let (desired_value, desired_policy): (i32, Option<String>) =
+                match spec_ref.priority_class_name.as_deref() {
+                    // Pod names a specific class — resolve to its value. If the class
+                    // is absent (deleted, or a transient read gap), leave the pod's
+                    // existing priority alone rather than zeroing it.
+                    Some(class_name) => match pc_map.get(class_name) {
+                        Some(resolved) => resolved.clone(),
+                        None => continue,
+                    },
+                    // Pod omits priorityClassName — apply the effective default:
+                    // namespace annotation wins over cluster globalDefault. No
+                    // default configured ⇒ leave the pod untouched.
+                    None => match ns_default_map
+                        .get(&ns)
+                        .cloned()
+                        .or_else(|| global_default.clone())
+                    {
+                        Some(resolved) => resolved,
+                        None => continue,
+                    },
+                };
+
+            // Only inject the policy when the pod doesn't already carry one —
+            // an explicit spec.preemptionPolicy (user-set or api-server
+            // admission) must never be overwritten.
+            let policy_to_set = if spec_ref.preemption_policy.is_none() {
+                desired_policy
+            } else {
+                None
             };
 
-            // Idempotent: only write when the value actually changes.
-            if spec_ref.priority == Some(desired) {
+            // Idempotent: only write when something actually changes.
+            if spec_ref.priority == Some(desired_value) && policy_to_set.is_none() {
                 continue;
             }
             if let Some(spec) = pod.spec.as_mut() {
-                spec.priority = Some(desired);
+                spec.priority = Some(desired_value);
+                if let Some(policy) = policy_to_set {
+                    spec.preemption_policy = Some(policy);
+                }
             }
             let pod_key = build_key("pods", Some(&ns), &pod.metadata.name);
             if let Err(e) = self.storage.update(&pod_key, &pod).await {
