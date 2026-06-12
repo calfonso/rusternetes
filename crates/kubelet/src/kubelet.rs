@@ -85,9 +85,21 @@ pub struct Kubelet {
     /// per-UID and dispatch in the sync loop.
     /// K8s ref: pkg/kubelet/pod_workers.go
     pod_states: Mutex<HashMap<String, PodWorkerState>>,
-    /// Per-pod sync lock. Prevents concurrent sync_pod calls for the same pod.
-    /// K8s uses one goroutine per pod (podWorkerLoop). We use a lock set to
-    /// ensure only one sync_pod runs at a time for each pod UID.
+    /// Per-pod sync lock, keyed by `"{namespace}/{name}"` (NOT UID).
+    /// Prevents concurrent sync_pod calls for the same pod, and — because two
+    /// incarnations of a recreated pod (e.g. a StatefulSet replacement) share
+    /// the name but not the UID — also serializes the old incarnation's
+    /// teardown against the new incarnation's stale-incarnation sweep and
+    /// container creation (issue #1112).
+    ///
+    /// Upstream note: the Go kubelet has no single same-name barrier for
+    /// regular pods — it gets the equivalent from per-UID pod workers
+    /// (pkg/kubelet/pod_workers.go, UpdatePod/podWorkerLoop) whose
+    /// termination state machine lets the new UID's worker create containers
+    /// only after the old UID's worker has finished terminating; an explicit
+    /// same-fullname barrier exists only for static pods (allowStaticPodStart,
+    /// startedStaticPodsByFullname). Our name-keyed skip-and-retry is a
+    /// rusternetes-specific serialization achieving the same effect.
     pod_sync_locks: Mutex<HashSet<String>>,
     /// Per-container CrashLoopBackOff state, keyed by
     /// `"{namespace}/{pod}/{container}"`. Source of truth for restartCount +
@@ -1736,30 +1748,38 @@ impl Kubelet {
         // Per-pod sync lock: prevent concurrent sync_pod calls for the same pod.
         // K8s uses one goroutine per pod; without this, concurrent syncs create
         // Docker 409 "container name already in use" errors (1014 per run).
+        //
+        // Keyed by namespace/name, NOT UID: a recreated pod (same name, new
+        // UID — the StatefulSet replacement pattern) must not sweep/create
+        // containers while a queued sync of the OLD incarnation is still
+        // running, or the swept container can be resurrected mid-start
+        // (issue #1112). Same-name pods cannot legitimately coexist in
+        // storage, so name-keyed skip-and-retry loses no real concurrency.
+        let sync_lock_key = format!("{}/{}", namespace, pod_name);
         {
             let mut locks = self.pod_sync_locks.lock().unwrap();
-            if locks.contains(pod_uid) {
+            if locks.contains(&sync_lock_key) {
                 debug!(
-                    "Skipping sync for pod {}/{} — already syncing",
-                    namespace, pod_name
+                    "Skipping sync for pod {}/{} (uid {}) — already syncing",
+                    namespace, pod_name, pod_uid
                 );
                 return Ok(());
             }
-            locks.insert(pod_uid.clone());
+            locks.insert(sync_lock_key.clone());
         }
         // Release the lock when this function returns (on any path)
         struct SyncGuard<'a> {
             locks: &'a Mutex<HashSet<String>>,
-            uid: String,
+            key: String,
         }
         impl<'a> Drop for SyncGuard<'a> {
             fn drop(&mut self) {
-                self.locks.lock().unwrap().remove(&self.uid);
+                self.locks.lock().unwrap().remove(&self.key);
             }
         }
         let _sync_guard = SyncGuard {
             locks: &self.pod_sync_locks,
-            uid: pod_uid.clone(),
+            key: sync_lock_key,
         };
 
         debug!("Syncing pod: {}/{}", namespace, pod_name);
