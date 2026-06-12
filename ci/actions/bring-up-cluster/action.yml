@@ -132,9 +132,15 @@ runs:
         IMAGE_TAG: ${{ inputs.image-tag }}
       run: |
         set -euo pipefail
+        # --profile build includes the build-only dns image: it runs as an
+        # in-cluster Deployment (bootstrap-dns.yaml), not a compose container.
         if [ -n "$IMAGE_TAG" ]; then
           export RUSTERNETES_IMAGE_TAG="$IMAGE_TAG"
-          if docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml pull; then
+          if docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml --profile build pull; then
+            # bootstrap-dns.yaml references rusternetes-dns:latest with
+            # imagePullPolicy IfNotPresent — retag the pulled GHCR image so
+            # the kubelet's local-image lookup finds it.
+            docker tag "ghcr.io/indyjonesnl/rusternetes/dns:$IMAGE_TAG" rusternetes-dns:latest
             echo "GHCR_OVERLAY=-f compose.ghcr.yml" >> "$GITHUB_ENV"
             echo "RUSTERNETES_IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
             echo "using prebuilt images: tag=$IMAGE_TAG"
@@ -142,7 +148,7 @@ runs:
           fi
           echo "::warning::prebuilt images tag=$IMAGE_TAG not pullable — falling back to local build"
         fi
-        docker compose -f compose.sqlite.yml -f compose.dind.yml build --parallel
+        docker compose -f compose.sqlite.yml -f compose.dind.yml --profile build build --parallel
 
     - name: Bring up cluster
       shell: bash

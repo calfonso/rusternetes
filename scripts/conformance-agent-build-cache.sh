@@ -30,7 +30,10 @@ fi
 export COMPOSE_PROJECT_NAME=rusternetes
 
 echo "==> Building rusternetes service images (compose project: rusternetes)"
-docker compose -f compose.yml build --parallel
+# --profile build includes the build-only dns image (runs as an in-cluster
+# Deployment via bootstrap-dns.yaml, not a compose container — the kubelets
+# inside each agent dind need it loaded locally).
+docker compose -f compose.yml --profile build build --parallel
 
 # Image set matches compose.yml's services with a `build:` block. etcd
 # is upstream and pulled fresh inside each dind (cheap), no need to
@@ -42,6 +45,7 @@ IMAGES=(
   rusternetes-kubelet
   rusternetes-kubelet2
   rusternetes-kube-proxy
+  rusternetes-dns
 )
 
 echo "==> Verifying images exist before save"

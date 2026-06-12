@@ -234,7 +234,13 @@ services:
       - RUST_LOG=info
     command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
 
+  # DNS image, build-only. The dns binary runs as a kube-system Deployment
+  # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster
+  # state from the api-server — not as a compose container.
+  # Build with: docker compose --profile build build dns
   dns:
+    profiles: ["build"]
+    image: rusternetes-dns:latest
     build:
       context: .
       dockerfile: Dockerfile.services
@@ -242,28 +248,6 @@ services:
       additional_contexts:
         rhino: ./rhino
       args: *sccache-args
-    container_name: rusternetes-dns
-    restart: unless-stopped
-    depends_on:
-      rhino:
-        condition: service_healthy
-    networks:
-      rusternetes-net:
-        aliases:
-          - dns
-    cap_add:
-      - NET_BIND_SERVICE
-    environment:
-      - RUST_LOG=info
-    command:
-      - "--etcd-servers"
-      - "http://rhino:2379"
-      - "--cluster-zone"
-      - "cluster.local"
-      - "--udp-bind"
-      - "0.0.0.0:53"
-      - "--tcp-bind"
-      - "0.0.0.0:53"
 
 networks:
   rusternetes-net:

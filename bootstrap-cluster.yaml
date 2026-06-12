@@ -54,8 +54,10 @@ description: "Used for system critical pods that must run in the cluster but can
 #
 # The Service is ALWAYS created so its ClusterIP (10.96.0.10) stays stable —
 # every Pod's /etc/resolv.conf references it via kubelet's --cluster-dns flag.
-# The backend (rusternetes-dns container by default, or a CoreDNS Pod when
-# USE_RUSTERNETES_DNS=0) is wired in separately by bootstrap-cluster.sh.
+# The backend (by default the rusternetes-dns kube-system Deployment from
+# bootstrap-dns.yaml — or the all-in-one container's in-process DNS task,
+# or a CoreDNS Pod when USE_RUSTERNETES_DNS=0) is wired in separately by
+# bootstrap-cluster.sh.
 # The CoreDNS Pod + ConfigMap live in bootstrap-coredns.yaml, applied only
 # on the USE_RUSTERNETES_DNS=0 path.
 # Pin to 10.96.0.10 for stability (like real Kubernetes often does)

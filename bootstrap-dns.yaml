@@ -1,0 +1,97 @@
+# rusternetes-dns as an in-cluster kube-system Deployment (CoreDNS parity).
+#
+# Applied by bootstrap-cluster.sh on the default USE_RUSTERNETES_DNS=1 path
+# for multi-container stacks. The pod carries the `k8s-app: kube-dns` label,
+# so the endpoints controller populates the kube-dns Service (created in
+# bootstrap-cluster.yaml with a matching selector and ClusterIP 10.96.0.10)
+# from the pod IP — no manual EndpointSlice wiring.
+#
+# The container runs arg-free: with no storage or --api-server-url flags the
+# dns binary resolves the standard in-cluster client config (serviceaccount
+# token + ca.crt projection, KUBERNETES_SERVICE_HOST/PORT injected by the
+# kubelet) and reads cluster state from the api-server via list+watch.
+#
+# The image is built by the compose `dns` service (build-only, profile
+# "build"): `docker compose --profile build build dns` tags it
+# rusternetes-dns:latest. Kubelets share the host docker daemon, so the
+# locally-built tag is visible without a registry; imagePullPolicy
+# IfNotPresent keeps the kubelet from trying to pull it.
+#
+# The all-in-one stack does NOT use this manifest — there the DNS server is
+# an in-process task inside the `rusternetes` container, and
+# bootstrap-cluster.sh wires the kube-dns Service to that container's bridge
+# IP with a manual EndpointSlice.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rusternetes-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:rusternetes-dns
+  labels:
+    k8s-app: kube-dns
+rules:
+- apiGroups: [""]
+  resources: ["services", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:rusternetes-dns
+  labels:
+    k8s-app: kube-dns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:rusternetes-dns
+subjects:
+- kind: ServiceAccount
+  name: rusternetes-dns
+  namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rusternetes-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      serviceAccountName: rusternetes-dns
+      containers:
+      - name: dns
+        image: rusternetes-dns:latest
+        imagePullPolicy: IfNotPresent
+        # Arg-free: in-cluster api-server config; defaults already serve
+        # cluster.local on UDP+TCP 0.0.0.0:53.
+        ports:
+        - containerPort: 53
+          protocol: UDP
+          name: dns
+        - containerPort: 53
+          protocol: TCP
+          name: dns-tcp
+        securityContext:
+          capabilities:
+            add: ["NET_BIND_SERVICE"]
+        readinessProbe:
+          tcpSocket:
+            port: 53
