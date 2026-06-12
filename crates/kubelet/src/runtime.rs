@@ -1,3 +1,7 @@
+use crate::labels::{
+    is_stale_same_pod_incarnation, pod_container_labels, POD_NAMESPACE_LABEL, POD_NAME_LABEL,
+    POD_UID_LABEL,
+};
 use anyhow::{Context, Result};
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
@@ -1568,10 +1572,24 @@ impl ContainerRuntime {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
+        // Stale-incarnation sweep: a pod that shares this name but has a
+        // different UID may have left running/exited containers behind (the
+        // classic case is a StatefulSet pod that is evicted and recreated with
+        // the same name but a fresh UID). Those containers carry the old pod
+        // UID in their io.kubernetes.pod.uid label. Remove every one before the
+        // is_pod_running guard, otherwise the guard would see the OLD
+        // incarnation still running and skip starting the NEW pod entirely.
+        // K8s ref: kuberuntime_manager.go computePodActions kills containers of
+        // a different pod UID.
+        self.sweep_stale_incarnations(pod, namespace, pod_name)
+            .await;
+
         // Guard: if the pod's containers are already running, skip the start.
         // This prevents duplicate container creation when sync_pod is called
         // multiple times in rapid succession (e.g., watch feedback loops).
-        if self.is_pod_running(pod_name).await.unwrap_or(false) {
+        // UID-aware: containers of a stale incarnation (different pod UID) do
+        // not count as "this pod running" — they were just swept above.
+        if self.is_pod_running(pod).await.unwrap_or(false) {
             debug!(
                 "Pod {}/{} containers already running, skipping start",
                 namespace, pod_name
@@ -2714,9 +2732,16 @@ impl ContainerRuntime {
             .await
             .context("Failed to ensure busybox image for pause container")?;
 
+        // Pod-identity labels so the kubelet can tell which pod incarnation
+        // (by UID) this sandbox belongs to. Upstream names the infra container
+        // "POD" (types.PodInfraContainerName). K8s ref:
+        // pkg/kubelet/kuberuntime/labels.go newPodLabels.
+        let pause_labels = pod_container_labels(pod, "POD");
+
         let config = Config {
             image: Some("busybox:latest".to_string()),
             cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
+            labels: Some(pause_labels),
             // Docker rejects hostname / exposed-ports / dns when the sandbox
             // joins another container's netns (host_netns_ref) — those come
             // from the donor netns. Only set them in the normal bridge case.
@@ -4874,28 +4899,30 @@ impl ContainerRuntime {
             let is_running = state.and_then(|s| s.running).unwrap_or(false);
             let status = state.and_then(|s| s.status.as_ref());
 
-            // Skip if container is running or just created (about to start)
-            if is_running {
-                return Ok(());
-            }
-            if matches!(
-                status,
-                Some(bollard::secret::ContainerStateStatusEnum::CREATED)
+            // Stale incarnation: a container whose labels claim this exact
+            // namespaced pod but a DIFFERENT pod UID belongs to a previous
+            // incarnation (e.g. an evicted StatefulSet pod recreated with the
+            // same name). Force-remove it (kills it if running) and fall
+            // through to create the new incarnation, instead of silently
+            // adopting the old one. The strict name+namespace+uid predicate
+            // means label-less legacy containers are never removed here.
+            // K8s ref: kuberuntime_manager.go computePodActions — containers
+            // of a different pod UID are killed.
+            let existing_labels = inspect.config.as_ref().and_then(|c| c.labels.as_ref());
+            if is_stale_same_pod_incarnation(
+                existing_labels,
+                pod_name,
+                namespace,
+                &pod.metadata.uid,
             ) {
-                debug!(
-                    "Container {} is in created state, waiting for it to start",
-                    container_name
+                let old_uid = existing_labels
+                    .and_then(|l| l.get(POD_UID_LABEL))
+                    .map(|s| s.as_str())
+                    .unwrap_or("<none>");
+                info!(
+                    "Removing stale incarnation of container {} (old pod uid {}, new {})",
+                    container_name, old_uid, pod.metadata.uid
                 );
-                return Ok(());
-            }
-
-            // Only remove if container has actually exited
-            if matches!(
-                status,
-                Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                    | Some(bollard::secret::ContainerStateStatusEnum::DEAD)
-            ) {
-                debug!("Removing exited container: {}", container_name);
                 let remove_options = RemoveContainerOptions {
                     force: true,
                     ..Default::default()
@@ -4904,15 +4931,48 @@ impl ContainerRuntime {
                     .remove_container(&container_name, Some(remove_options))
                     .await?;
                 // Brief wait for Docker to release the container name.
-                // Docker typically releases names within 50ms after force removal.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             } else {
-                // Unknown state — don't remove, don't recreate
-                debug!(
-                    "Container {} in state {:?}, skipping",
-                    container_name, status
-                );
-                return Ok(());
+                // Skip if container is running or just created (about to start)
+                if is_running {
+                    return Ok(());
+                }
+                if matches!(
+                    status,
+                    Some(bollard::secret::ContainerStateStatusEnum::CREATED)
+                ) {
+                    debug!(
+                        "Container {} is in created state, waiting for it to start",
+                        container_name
+                    );
+                    return Ok(());
+                }
+
+                // Only remove if container has actually exited
+                if matches!(
+                    status,
+                    Some(bollard::secret::ContainerStateStatusEnum::EXITED)
+                        | Some(bollard::secret::ContainerStateStatusEnum::DEAD)
+                ) {
+                    debug!("Removing exited container: {}", container_name);
+                    let remove_options = RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    };
+                    self.docker
+                        .remove_container(&container_name, Some(remove_options))
+                        .await?;
+                    // Brief wait for Docker to release the container name.
+                    // Docker typically releases names within 50ms after force removal.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                } else {
+                    // Unknown state — don't remove, don't recreate
+                    debug!(
+                        "Container {} in state {:?}, skipping",
+                        container_name, status
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -5839,12 +5899,20 @@ impl ContainerRuntime {
             pod.spec.as_ref().and_then(|s| s.hostname.as_deref()),
         );
 
+        // Pod-identity labels: tie this container to the exact pod UID so a
+        // recreated pod (same name, new UID) is never confused with the old
+        // incarnation. K8s ref: pkg/kubelet/kuberuntime/labels.go newPodLabels.
+        // Covers app, init and ephemeral containers — all flow through
+        // start_container.
+        let container_labels = pod_container_labels(pod, &container.name);
+
         let mut config = Config {
             image: Some(container.image.clone()),
             env,
             working_dir: container.working_dir.clone(),
             user: run_as_user,
             hostname: pod_hostname,
+            labels: Some(container_labels),
             exposed_ports: if exposed_ports.is_empty() {
                 None
             } else {
@@ -6753,8 +6821,108 @@ impl ContainerRuntime {
         false
     }
 
-    /// Check if a pod's containers are running
-    pub async fn is_pod_running(&self, pod_name: &str) -> Result<bool> {
+    /// Force-remove every container whose identity labels claim this exact
+    /// namespaced pod but carry a different `io.kubernetes.pod.uid` — the
+    /// leftovers of a previous pod incarnation (e.g. an evicted StatefulSet
+    /// pod recreated with the same name but a fresh UID).
+    ///
+    /// Selection is by LABELS, not by container name: Docker's `name` filter
+    /// is a substring match (`web_` would match `myweb_x`) and container names
+    /// carry no namespace, so a name-based sweep could destroy containers of
+    /// unrelated or cross-namespace pods. The label filter is a server-side
+    /// exact match on `io.kubernetes.pod.name` + `io.kubernetes.pod.namespace`,
+    /// and label-less legacy containers can never match — they are never swept.
+    ///
+    /// Best-effort: list/remove errors are logged and swallowed so a transient
+    /// Docker hiccup never blocks the new pod from starting.
+    /// K8s ref: kuberuntime_manager.go computePodActions.
+    async fn sweep_stale_incarnations(&self, pod: &Pod, namespace: &str, pod_name: &str) {
+        let pod_uid = &pod.metadata.uid;
+        if pod_uid.is_empty() {
+            return;
+        }
+
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![
+                format!("{}={}", POD_NAME_LABEL, pod_name),
+                format!("{}={}", POD_NAMESPACE_LABEL, namespace),
+            ],
+        );
+        let options = ListContainersOptions {
+            all: true, // include exited containers from the old incarnation
+            filters,
+            ..Default::default()
+        };
+
+        let containers = match self.docker.list_containers(Some(options)).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "Stale-incarnation sweep for {}/{}: list_containers failed: {}",
+                    namespace, pod_name, e
+                );
+                return;
+            }
+        };
+
+        let mut removed_any = false;
+        for c in containers {
+            if !is_stale_same_pod_incarnation(c.labels.as_ref(), pod_name, namespace, pod_uid) {
+                continue;
+            }
+            let old_uid = c
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(POD_UID_LABEL))
+                .map(|s| s.as_str())
+                .unwrap_or("<none>");
+            // Prefer the container id; fall back to the first name.
+            let target = c.id.clone().or_else(|| {
+                c.names
+                    .as_ref()
+                    .and_then(|n| n.first().map(|s| s.trim_start_matches('/').to_string()))
+            });
+            let Some(target) = target else { continue };
+            info!(
+                "Removing stale incarnation {} for pod {}/{} (old uid {}, new {})",
+                target, namespace, pod_name, old_uid, pod_uid
+            );
+            let remove_options = RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            };
+            match self
+                .docker
+                .remove_container(&target, Some(remove_options))
+                .await
+            {
+                Ok(()) => removed_any = true,
+                Err(e) => {
+                    warn!(
+                        "Failed to remove stale incarnation {} for {}/{}: {}",
+                        target, namespace, pod_name, e
+                    );
+                }
+            }
+        }
+        if removed_any {
+            // Brief wait for Docker to release the removed container names so
+            // the new incarnation's creates don't hit 409 Conflict.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Check if a pod's containers are running.
+    ///
+    /// UID-aware: containers whose `io.kubernetes.pod.uid` label disagrees with
+    /// this pod's UID are stale incarnations of a same-named predecessor and do
+    /// NOT count as this pod running.
+    pub async fn is_pod_running(&self, pod: &Pod) -> Result<bool> {
+        let pod_name = &pod.metadata.name;
+        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let pod_uid = &pod.metadata.uid;
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
 
@@ -6770,6 +6938,10 @@ impl ContainerRuntime {
         // failed to start (e.g., CreateContainerConfigError from subpath validation).
         let pause_suffix = format!("{}_pause", pod_name);
         let has_app_container = containers.iter().any(|c| {
+            // Ignore stale incarnations of this exact pod (different pod UID).
+            if is_stale_same_pod_incarnation(c.labels.as_ref(), pod_name, pod_namespace, pod_uid) {
+                return false;
+            }
             c.names
                 .as_ref()
                 .map(|names| names.iter().any(|n| !n.contains(&pause_suffix)))
@@ -6783,6 +6955,8 @@ impl ContainerRuntime {
     /// If app containers exist, all init containers must have completed successfully.
     async fn has_any_app_container(&self, pod: &Pod) -> bool {
         let pod_name = &pod.metadata.name;
+        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let pod_uid = &pod.metadata.uid;
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
 
@@ -6810,6 +6984,10 @@ impl ContainerRuntime {
         let pause_name = format!("{}_pause", pod_name);
 
         containers.iter().any(|c| {
+            // Ignore stale incarnations of this exact pod (different pod UID).
+            if is_stale_same_pod_incarnation(c.labels.as_ref(), pod_name, pod_namespace, pod_uid) {
+                return false;
+            }
             c.names
                 .as_ref()
                 .map(|names| {

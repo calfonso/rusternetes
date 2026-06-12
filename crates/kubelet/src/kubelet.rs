@@ -1856,8 +1856,7 @@ impl Kubelet {
                     .deletion_timestamp
                     .map(|dt| (chrono::Utc::now() - dt).num_seconds() >= grace)
                     .unwrap_or(true);
-                let containers_running =
-                    self.runtime.is_pod_running(pod_name).await.unwrap_or(false);
+                let containers_running = self.runtime.is_pod_running(pod).await.unwrap_or(false);
                 if containers_running && !grace_elapsed {
                     debug!(
                         "Pod {}/{} terminating — keeping visible until containers stop ({}s grace)",
@@ -2092,7 +2091,7 @@ impl Kubelet {
                             }
                             let _ = self.storage.update(&key, &failed_pod).await;
                             // Stop the pod
-                            if self.runtime.is_pod_running(pod_name).await.unwrap_or(false) {
+                            if self.runtime.is_pod_running(pod).await.unwrap_or(false) {
                                 let _ = self.runtime.stop_pod_with_grace_period(pod_name, 0).await;
                             }
                             return Ok(());
@@ -2112,7 +2111,7 @@ impl Kubelet {
         );
         let is_running = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            self.runtime.is_pod_running(pod_name),
+            self.runtime.is_pod_running(pod),
         )
         .await
         {
