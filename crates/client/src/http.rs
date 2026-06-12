@@ -84,6 +84,18 @@ impl ApiClient {
         Self::with_tls(base_url, insecure_skip_tls_verify, None, token)
     }
 
+    /// Build a client from a resolved [`crate::config::ClientConfig`]
+    /// (kubeconfig- or in-cluster-sourced), reusing the [`Self::with_tls`]
+    /// CA/token path.
+    pub fn from_config(config: &crate::config::ClientConfig) -> Result<Self> {
+        Self::with_tls(
+            &config.base_url,
+            false,
+            config.ca_pem.as_ref().map(|pem| pem.as_bytes().to_vec()),
+            config.token.clone(),
+        )
+    }
+
     /// Build a client, optionally trusting a kubeconfig-supplied CA certificate.
     ///
     /// TLS precedence mirrors upstream kubectl:
