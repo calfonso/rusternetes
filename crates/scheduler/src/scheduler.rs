@@ -390,21 +390,24 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if nodes.is_empty() {
             return Ok(());
         }
+        let priority_classes = self.load_priority_classes().await?;
         let mut all_pods: Vec<Pod> = self.data.list_pods().await?;
+        // Stamp resolved priority onto every in-memory pod from its
+        // priorityClassName. Controller-created pods (ReplicaSet, etc.) never
+        // get spec.priority set — controllers write straight to storage,
+        // bypassing api-server priority admission — so without this the
+        // preemption victim selection and the nominated-pod space reservation
+        // (both read spec.priority directly) treat every such pod as priority 0
+        // and pick the wrong victims. Resolving here, in-memory, is what
+        // admission would have done. NOT persisted: the api-server rejects spec
+        // mutations on update.
+        self.stamp_priorities(&mut all_pods, &priority_classes);
         // Overlay in-memory preemption nominations so the space reservation in
         // select_node sees a just-nominated preemptor before its /status write
         // propagates back through the informer (prevents the live-lock).
         self.apply_nominations(&mut all_pods);
-        let priority_classes = self.load_priority_classes().await?;
 
-        // Resolve priority in-memory for this scheduling pass. We deliberately
-        // do NOT persist it back onto spec.priority: the api-server treats the
-        // pod spec as immutable on update and rejects the PUT, and persistence
-        // is unnecessary — every consumer resolves priority on the fly via
-        // get_pod_priority_sync (which prefers spec.priority, else the live
-        // PriorityClass map). Controller-created pods never get spec.priority
-        // stamped (controllers write straight to storage, bypassing api-server
-        // priority admission); the map fallback compensates.
+        // Same in-memory priority resolution for the candidate being scheduled.
         let mut pod = pod;
         if pod.spec.as_ref().and_then(|s| s.priority).is_none() {
             let resolved = self.get_pod_priority_sync(&pod, &priority_classes);
@@ -1345,6 +1348,29 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 val as i64
             } else {
                 0
+            }
+        }
+    }
+
+    /// Stamp `spec.priority` (in-memory) on every pod that lacks it, resolving
+    /// from `priorityClassName` via the PriorityClass map. Downstream preemption
+    /// and the nominated-pod space reservation read `spec.priority` directly, so
+    /// controller-created pods (which never get it stamped by admission) must be
+    /// resolved here or they all look like priority 0. Not persisted.
+    fn stamp_priorities(
+        &self,
+        pods: &mut [Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+    ) {
+        for pod in pods.iter_mut() {
+            if pod.spec.as_ref().and_then(|s| s.priority).is_some() {
+                continue;
+            }
+            let resolved = self.get_pod_priority_sync(pod, priority_classes);
+            if resolved != 0 {
+                if let Some(spec) = pod.spec.as_mut() {
+                    spec.priority = Some(resolved);
+                }
             }
         }
     }
