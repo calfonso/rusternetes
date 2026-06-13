@@ -326,7 +326,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let all_pods: Vec<Pod> = self.data.list_pods().await?;
         let priority_classes = self.load_priority_classes().await?;
 
-        // Resolve priority
+        // Resolve priority in-memory for this scheduling pass. We deliberately
+        // do NOT persist it back onto spec.priority: the api-server treats the
+        // pod spec as immutable on update and rejects the PUT, and persistence
+        // is unnecessary — every consumer resolves priority on the fly via
+        // get_pod_priority_sync (which prefers spec.priority, else the live
+        // PriorityClass map). Controller-created pods never get spec.priority
+        // stamped (controllers write straight to storage, bypassing api-server
+        // priority admission); the map fallback compensates.
         let mut pod = pod;
         if pod.spec.as_ref().and_then(|s| s.priority).is_none() {
             let resolved = self.get_pod_priority_sync(&pod, &priority_classes);
@@ -334,14 +341,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 if let Some(ref mut spec) = pod.spec {
                     spec.priority = Some(resolved);
                 }
-                self.update_pod_with_retry(&pod_key, |p| {
-                    if let Some(ref mut spec) = p.spec {
-                        if spec.priority.is_none() {
-                            spec.priority = Some(resolved);
-                        }
-                    }
-                })
-                .await;
             }
         }
 
@@ -492,28 +491,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // blocking all others. K8s processes pods concurrently in the
         // scheduling queue; we process sequentially but with a per-pod timeout.
         for mut pod in pending_pods {
-            // Resolve priority from PriorityClass if not explicitly set.
-            // K8s admission controller sets spec.priority from priorityClassName,
-            // but our admission doesn't always do this. Ensure it's set so
-            // preemption can check the priority correctly.
+            // Resolve priority in-memory if not explicitly set. Not persisted:
+            // the api-server rejects spec mutations on update, and on-the-fly
+            // resolution via get_pod_priority_sync (spec.priority, else the live
+            // PriorityClass map) is sufficient for every consumer. See the same
+            // note in try_schedule_pod.
             if pod.spec.as_ref().and_then(|s| s.priority).is_none() {
                 let resolved = self.get_pod_priority_sync(&pod, &priority_classes);
                 if resolved != 0 {
                     if let Some(ref mut spec) = pod.spec {
                         spec.priority = Some(resolved);
                     }
-                    // Also update in storage so preemption picks up the priority
-                    let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-                    let pod_key =
-                        rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
-                    self.update_pod_with_retry(&pod_key, |p| {
-                        if let Some(ref mut spec) = p.spec {
-                            if spec.priority.is_none() {
-                                spec.priority = Some(resolved);
-                            }
-                        }
-                    })
-                    .await;
                 }
             }
             // 5-second timeout per pod — if scheduling takes longer (e.g.,
@@ -1141,8 +1129,19 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         let conditions = status.conditions.get_or_insert_with(Vec::new);
                         conditions.push(disruption_condition);
                     }
-                    self.data.update_pod(&pod_ns, pod_name, &pod).await?;
-                    info!("Evicted pod {} for preemption (set deletionTimestamp + DisruptionTarget condition)", pod_name);
+                    // Storage mode persists the whole pod (kubelet sees the
+                    // deletionTimestamp); API mode stamps DisruptionTarget via
+                    // /status then issues a real DELETE (the api-server rejects
+                    // a PUT that sets deletionTimestamp). See
+                    // DataPlane::evict_pod_for_preemption.
+                    let grace = pod.metadata.deletion_grace_period_seconds.unwrap_or(30);
+                    self.data
+                        .evict_pod_for_preemption(&pod_ns, pod_name, &pod, grace)
+                        .await?;
+                    info!(
+                        "Evicted pod {} for preemption (DisruptionTarget + termination, grace={}s)",
+                        pod_name, grace
+                    );
                 }
                 return Ok(());
             }

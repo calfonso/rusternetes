@@ -235,6 +235,52 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
         }
     }
 
+    /// Evict a preemption victim.
+    ///
+    /// `mutated_pod` is the victim with the DisruptionTarget condition (and, in
+    /// storage mode, `deletionTimestamp` + Preempted status) already applied.
+    ///
+    /// Storage mode writes the whole pod in one shot — the kubelet observes the
+    /// `deletionTimestamp` and terminates it. API mode cannot: the api-server
+    /// owns `deletionTimestamp` and rejects a PUT that sets it (pod spec/meta is
+    /// immutable on update). So API mode stamps the DisruptionTarget condition
+    /// via the `/status` subresource (best-effort, for the conformance specs
+    /// that observe it) and then issues a real `DELETE` with the grace period —
+    /// the only way to actually terminate the victim and free its resources.
+    pub async fn evict_pod_for_preemption(
+        &self,
+        ns: &str,
+        name: &str,
+        mutated_pod: &Pod,
+        grace_period_seconds: i64,
+    ) -> Result<()> {
+        match self {
+            DataPlane::Storage(s) => {
+                s.update(&build_key("pods", Some(ns), name), mutated_pod)
+                    .await?;
+                Ok(())
+            }
+            DataPlane::Api(a) => {
+                // Best-effort DisruptionTarget condition via /status; the DELETE
+                // below is what actually frees resources, so a status hiccup
+                // must not abort the eviction.
+                let _: std::result::Result<Pod, _> = a
+                    .client
+                    .put(
+                        &format!("/api/v1/namespaces/{}/pods/{}/status", ns, name),
+                        mutated_pod,
+                    )
+                    .await;
+                let body = json!({ "gracePeriodSeconds": grace_period_seconds });
+                a.client
+                    .delete_with_options(&ApiBackend::pod_path(ns, name), &[], Some(&body))
+                    .await
+                    .map_err(|e| Error::Internal(format!("evict DELETE failed: {e}")))?;
+                Ok(())
+            }
+        }
+    }
+
     /// Bind a pod to a node.
     ///
     /// Storage mode preserves the old single-write behavior: the caller passes
