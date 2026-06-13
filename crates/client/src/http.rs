@@ -3,6 +3,18 @@ use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// List-level metadata (`metadata` on a `*List` envelope).
+///
+/// `resourceVersion` is what a reflector resumes its watch from after the
+/// initial list.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMeta {
+    pub resource_version: Option<String>,
+    #[serde(rename = "continue")]
+    pub continue_token: Option<String>,
+}
+
 /// Generic Kubernetes List wrapper
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -12,6 +24,7 @@ pub struct KubernetesList<T> {
     pub api_version: String,
     #[allow(dead_code)]
     pub kind: String,
+    pub metadata: Option<ListMeta>,
     pub items: Vec<T>,
 }
 
@@ -69,6 +82,18 @@ impl ApiClient {
         token: Option<String>,
     ) -> Result<Self> {
         Self::with_tls(base_url, insecure_skip_tls_verify, None, token)
+    }
+
+    /// Build a client from a resolved [`crate::config::ClientConfig`]
+    /// (kubeconfig- or in-cluster-sourced), reusing the [`Self::with_tls`]
+    /// CA/token path.
+    pub fn from_config(config: &crate::config::ClientConfig) -> Result<Self> {
+        Self::with_tls(
+            &config.base_url,
+            false,
+            config.ca_pem.as_ref().map(|pem| pem.as_bytes().to_vec()),
+            config.token.clone(),
+        )
     }
 
     /// Build a client, optionally trusting a kubeconfig-supplied CA certificate.

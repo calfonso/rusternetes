@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 rusternetes-common = { path = "../common" }
+rusternetes-client = { path = "../client" }
 tokio = { workspace = true, features = ["full", "io-util", "io-std"] }
 serde.workspace = true
 serde_json.workspace = true

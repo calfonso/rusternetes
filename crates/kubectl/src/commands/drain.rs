@@ -1,5 +1,5 @@
-use crate::client::ApiClient;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 use serde_json::{json, Value};
 
 /// Cordon a node (mark as unschedulable).
@@ -231,8 +231,8 @@ pub async fn execute_drain(
                     );
                 }
                 match client.get::<Value>(&pod_path).await {
-                    Err(crate::client::GetError::NotFound) => break,
-                    Err(crate::client::GetError::Other(e)) => {
+                    Err(rusternetes_client::http::GetError::NotFound) => break,
+                    Err(rusternetes_client::http::GetError::Other(e)) => {
                         return Err(e).context("Error checking pod status");
                     }
                     Ok(_) => {

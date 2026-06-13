@@ -1,5 +1,5 @@
-use crate::client::ApiClient;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 use serde_json::{json, Value};
 
 /// Create debugging sessions for troubleshooting workloads and nodes.

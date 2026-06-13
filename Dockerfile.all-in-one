@@ -85,6 +85,7 @@ COPY rusternetes/Cargo.toml rusternetes/Cargo.lock* ./rusternetes/
 COPY rusternetes/crates/admission-webhook/Cargo.toml  ./rusternetes/crates/admission-webhook/Cargo.toml
 COPY rusternetes/crates/api-server/Cargo.toml         ./rusternetes/crates/api-server/Cargo.toml
 COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud-providers/Cargo.toml
+COPY rusternetes/crates/client/Cargo.toml             ./rusternetes/crates/client/Cargo.toml
 COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
 COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
 COPY rusternetes/crates/discovery/Cargo.toml          ./rusternetes/crates/discovery/Cargo.toml
@@ -111,7 +112,7 @@ COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/prot
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in common storage cloud-providers netstack protobuf middleware admission-webhook discovery; do \
+    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -151,6 +152,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cargo clean --profile release-fast \
         -p rusternetes-admission-webhook \
         -p rusternetes-api-server \
+        -p rusternetes-client \
         -p rusternetes-cloud-providers \
         -p rusternetes-common \
         -p rusternetes-controller-manager \
@@ -174,6 +176,7 @@ COPY rusternetes/crates/admission-webhook/src    ./crates/admission-webhook/src
 COPY rusternetes/crates/api-server/src           ./crates/api-server/src
 COPY rusternetes/crates/api-server/tests         ./crates/api-server/tests
 COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
+COPY rusternetes/crates/client/src               ./crates/client/src
 COPY rusternetes/crates/common/src               ./crates/common/src
 COPY rusternetes/crates/common/tests             ./crates/common/tests
 COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src

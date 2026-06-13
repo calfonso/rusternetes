@@ -1,5 +1,5 @@
-use crate::client::ApiClient;
 use anyhow::{Context, Result};
+use rusternetes_client::http::ApiClient;
 use serde_json::Value;
 use std::fs;
 
