@@ -74,16 +74,26 @@ fn node_store_key(n: &Node) -> String {
     n.metadata.name.clone()
 }
 
+fn priority_class_store_key(pc: &PriorityClass) -> String {
+    pc.metadata.name.clone()
+}
+
 /// A reflector keyed by a plain function pointer (no captured state), shared
 /// behind an `Arc` so the run loops and the read paths reference the same store.
 type PodReflector = Arc<Reflector<Pod, fn(&Pod) -> String>>;
 type NodeReflector = Arc<Reflector<Node, fn(&Node) -> String>>;
+type PriorityClassReflector = Arc<Reflector<PriorityClass, fn(&PriorityClass) -> String>>;
 
 /// The api-server-backed data plane: client + informers + event recorder.
 pub struct ApiBackend {
     pub(crate) client: Arc<ApiClient>,
     pub(crate) pods: PodReflector,
     pub(crate) nodes: NodeReflector,
+    /// PriorityClasses are reflector-backed (not per-cycle GETs): under heavy
+    /// scheduling load a per-cycle live LIST occasionally came back incomplete,
+    /// collapsing pod priorities to 0 and breaking preemption ordering. A
+    /// local informer store is always complete and current.
+    pub(crate) priority_classes: PriorityClassReflector,
     pub(crate) recorder: ClientEventRecorder,
 }
 
@@ -94,17 +104,26 @@ impl ApiBackend {
         use rusternetes_client::reflector::ApiListWatch;
         let pods_lw = Arc::new(ApiListWatch::new(Arc::clone(&client), "/api/v1/pods"));
         let nodes_lw = Arc::new(ApiListWatch::new(Arc::clone(&client), "/api/v1/nodes"));
+        let pc_lw = Arc::new(ApiListWatch::new(
+            Arc::clone(&client),
+            "/apis/scheduling.k8s.io/v1/priorityclasses",
+        ));
         let pods: PodReflector =
             Arc::new(Reflector::new(pods_lw, pod_store_key as fn(&Pod) -> String));
         let nodes: NodeReflector = Arc::new(Reflector::new(
             nodes_lw,
             node_store_key as fn(&Node) -> String,
         ));
+        let priority_classes: PriorityClassReflector = Arc::new(Reflector::new(
+            pc_lw,
+            priority_class_store_key as fn(&PriorityClass) -> String,
+        ));
         let recorder = ClientEventRecorder::new(Arc::clone(&client), scheduler_name.to_string());
         Self {
             client,
             pods,
             nodes,
+            priority_classes,
             recorder,
         }
     }
@@ -154,14 +173,7 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                 s.list(&rusternetes_storage::build_prefix("priorityclasses", None))
                     .await
             }
-            DataPlane::Api(a) => {
-                let pcs: Vec<PriorityClass> = a
-                    .client
-                    .get_list("/apis/scheduling.k8s.io/v1/priorityclasses")
-                    .await
-                    .map_err(get_err_to_common)?;
-                Ok(pcs)
-            }
+            DataPlane::Api(a) => Ok(a.priority_classes.store().items()),
         }
     }
 

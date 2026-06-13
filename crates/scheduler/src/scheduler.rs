@@ -153,8 +153,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if let DataPlane::Api(api) = &self.data {
             let pods = Arc::clone(&api.pods);
             let nodes = Arc::clone(&api.nodes);
+            let priority_classes = Arc::clone(&api.priority_classes);
             tokio::spawn(async move { pods.run().await });
             tokio::spawn(async move { nodes.run().await });
+            tokio::spawn(async move { priority_classes.run().await });
 
             let mut sub = api.pods.subscribe();
             let mut resync = tokio::time::interval(self.interval);
