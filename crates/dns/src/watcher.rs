@@ -1,5 +1,13 @@
-//! Watches Services, EndpointSlices, and Pods from the rusternetes
-//! storage backend and rebuilds the in-memory DNS zone on every change.
+//! Watches Services, EndpointSlices, and Pods and rebuilds the in-memory
+//! DNS zone on every change.
+//!
+//! Two data sources share one debounce/rebuild loop ([`DnsSource`]):
+//!
+//! - **Storage** — direct reads from the rusternetes storage backend
+//!   (etcd/sqlite/redis). Used by the all-in-one binary and the legacy
+//!   compose container.
+//! - **Api** — list + watch against the api-server REST endpoints via
+//!   `rusternetes-client`. Used by the in-cluster Deployment.
 //!
 //! Pattern lifted from `crates/kube-proxy/src/lib.rs`: open one watch
 //! stream per resource type, multiplex them with `tokio::select!`, and
@@ -9,19 +17,73 @@
 //! consistent.
 //!
 //! Safety net: a fixed-period resync ticker (default 30s) re-lists from
-//! storage even when no watch events have arrived, so a missed event
+//! the source even when no watch events have arrived, so a missed event
 //! never leaves stale records in service forever.
 
 use crate::server::SharedZone;
 use crate::zone::Zone;
 use anyhow::Result;
 use futures::StreamExt;
+use rusternetes_client::http::ApiClient;
+use rusternetes_client::watch::watch_stream;
 use rusternetes_common::resources::{EndpointSlice, Pod, Service};
 use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// REST collection endpoints the API data source lists and watches.
+pub mod api_paths {
+    pub const SERVICES: &str = "/api/v1/services";
+    pub const ENDPOINTSLICES: &str = "/apis/discovery.k8s.io/v1/endpointslices";
+    pub const PODS: &str = "/api/v1/pods";
+}
+
+/// Everything the zone is built from, decoupled from where it was read.
+///
+/// `rebuild_zone(data)` is pure, so the storage path and the API path
+/// provably produce identical zones for identical inputs.
+pub struct DnsData {
+    pub services: Vec<Service>,
+    pub endpoint_slices: Vec<EndpointSlice>,
+    pub pods: Vec<Pod>,
+}
+
+/// Pure zone construction — shared by the storage and API data paths.
+pub fn rebuild_zone(data: &DnsData, cluster_zone: &str) -> Result<Zone> {
+    Ok(Zone::build(
+        cluster_zone,
+        &data.services,
+        &data.endpoint_slices,
+        &data.pods,
+    ))
+}
+
+/// Where the watcher reads cluster state from.
+#[derive(Clone)]
+pub enum DnsSource {
+    /// Direct storage backend reads (etcd/sqlite/redis).
+    Storage(Arc<StorageBackend>),
+    /// API-server client (list + watch over REST).
+    Api(Arc<ApiClient>),
+}
+
+impl DnsSource {
+    async fn rebuild(&self, cluster_zone: &str) -> Result<Zone> {
+        match self {
+            DnsSource::Storage(storage) => rebuild(storage, cluster_zone).await,
+            DnsSource::Api(client) => rebuild_from_api(client, cluster_zone).await,
+        }
+    }
+
+    async fn run_watches(&self, tx: mpsc::Sender<()>) -> Result<()> {
+        match self {
+            DnsSource::Storage(storage) => run_watches(storage, tx).await,
+            DnsSource::Api(client) => run_watches_api(client, tx).await,
+        }
+    }
+}
 
 pub struct WatcherConfig {
     pub cluster_zone: String,
@@ -37,10 +99,29 @@ impl Default for WatcherConfig {
     }
 }
 
-/// Run the watcher loop until cancelled (no graceful shutdown — the
-/// server's signal handler tears down the whole process).
+/// Run the watcher loop against the storage backend until cancelled
+/// (no graceful shutdown — the server's signal handler tears down the
+/// whole process).
 pub async fn run(
     storage: Arc<StorageBackend>,
+    zone: SharedZone,
+    config: WatcherConfig,
+) -> Result<()> {
+    run_with_source(DnsSource::Storage(storage), zone, config).await
+}
+
+/// Run the watcher loop against the api-server until cancelled.
+pub async fn run_api(
+    client: Arc<ApiClient>,
+    zone: SharedZone,
+    config: WatcherConfig,
+) -> Result<()> {
+    run_with_source(DnsSource::Api(client), zone, config).await
+}
+
+/// Shared debounce/rebuild loop for both data sources.
+pub async fn run_with_source(
+    source: DnsSource,
     zone: SharedZone,
     config: WatcherConfig,
 ) -> Result<()> {
@@ -50,18 +131,18 @@ pub async fn run(
     );
 
     // Single-slot mpsc — coalescing channel. Multiple rapid events
-    // collapse into one rebuild instead of stampeding storage.
+    // collapse into one rebuild instead of stampeding the source.
     let (tx, mut rx) = mpsc::channel::<()>(1);
 
     // Trigger the initial sync immediately.
     let _ = tx.try_send(());
 
     // Watch spawner — restarts watches when the underlying stream errors.
-    let watch_storage = Arc::clone(&storage);
+    let watch_source = source.clone();
     let watch_tx = tx.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_watches(&watch_storage, watch_tx.clone()).await {
+            if let Err(e) = watch_source.run_watches(watch_tx.clone()).await {
                 warn!("DNS watch loop errored, retrying in 5s: {e:?}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -90,7 +171,7 @@ pub async fn run(
         // Drain any extras that piled up during the rebuild.
         while rx.try_recv().is_ok() {}
 
-        match rebuild(&storage, &config.cluster_zone).await {
+        match source.rebuild(&config.cluster_zone).await {
             Ok(new_zone) => {
                 zone.store(new_zone).await;
                 debug!("DNS zone rebuilt");
@@ -124,12 +205,40 @@ async fn rebuild(storage: &Arc<StorageBackend>, cluster_zone: &str) -> Result<Zo
         Vec::new()
     });
 
-    Ok(Zone::build(
+    rebuild_zone(
+        &DnsData {
+            services,
+            endpoint_slices,
+            pods,
+        },
         cluster_zone,
-        &services,
-        &endpoint_slices,
-        &pods,
-    ))
+    )
+}
+
+/// Full re-list over the api-server REST endpoints. Unlike the storage
+/// path, a list error aborts the rebuild (the loop keeps serving the
+/// previous zone snapshot and retries on the next trigger).
+pub async fn rebuild_from_api(client: &ApiClient, cluster_zone: &str) -> Result<Zone> {
+    let services: Vec<Service> = client
+        .get_list(api_paths::SERVICES)
+        .await
+        .map_err(|e| anyhow::anyhow!("services list failed: {e}"))?;
+    let endpoint_slices: Vec<EndpointSlice> = client
+        .get_list(api_paths::ENDPOINTSLICES)
+        .await
+        .map_err(|e| anyhow::anyhow!("endpointslices list failed: {e}"))?;
+    let pods: Vec<Pod> = client
+        .get_list(api_paths::PODS)
+        .await
+        .map_err(|e| anyhow::anyhow!("pods list failed: {e}"))?;
+    rebuild_zone(
+        &DnsData {
+            services,
+            endpoint_slices,
+            pods,
+        },
+        cluster_zone,
+    )
 }
 
 /// Open three watch streams (services / endpointslices / pods) and
@@ -180,6 +289,66 @@ async fn run_watches(storage: &Arc<StorageBackend>, tx: mpsc::Sender<()>) -> Res
                     }
                     None => {
                         warn!("Pod watch stream ended");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// API-mode trigger loop: three `watch_stream`s, any event → debounce
+/// signal. Mirrors `run_watches` exactly: error/stream-end returns `Ok`
+/// so the caller's reconnect loop restarts all three together. Events
+/// are decoded as `serde_json::Value` and discarded — they are only
+/// rebuild triggers, same as the storage path.
+async fn run_watches_api(client: &ApiClient, tx: mpsc::Sender<()>) -> Result<()> {
+    let mut svc_watch =
+        Box::pin(watch_stream::<serde_json::Value>(client, api_paths::SERVICES, None).await?);
+    let mut es_watch =
+        Box::pin(watch_stream::<serde_json::Value>(client, api_paths::ENDPOINTSLICES, None).await?);
+    let mut pod_watch =
+        Box::pin(watch_stream::<serde_json::Value>(client, api_paths::PODS, None).await?);
+
+    info!("DNS API watches established (services, endpointslices, pods)");
+
+    loop {
+        tokio::select! {
+            event = svc_watch.next() => {
+                match event {
+                    Some(Ok(_)) => { let _ = tx.try_send(()); }
+                    Some(Err(e)) => {
+                        warn!("Service API watch error: {e:?}");
+                        return Ok(());
+                    }
+                    None => {
+                        warn!("Service API watch stream ended");
+                        return Ok(());
+                    }
+                }
+            }
+            event = es_watch.next() => {
+                match event {
+                    Some(Ok(_)) => { let _ = tx.try_send(()); }
+                    Some(Err(e)) => {
+                        warn!("EndpointSlice API watch error: {e:?}");
+                        return Ok(());
+                    }
+                    None => {
+                        warn!("EndpointSlice API watch stream ended");
+                        return Ok(());
+                    }
+                }
+            }
+            event = pod_watch.next() => {
+                match event {
+                    Some(Ok(_)) => { let _ = tx.try_send(()); }
+                    Some(Err(e)) => {
+                        warn!("Pod API watch error: {e:?}");
+                        return Ok(());
+                    }
+                    None => {
+                        warn!("Pod API watch stream ended");
                         return Ok(());
                     }
                 }

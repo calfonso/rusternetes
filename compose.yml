@@ -205,42 +205,22 @@ services:
       - RUST_LOG=info
     command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
 
-  # DNS - authoritative cluster.local DNS server. Drop-in replacement
-  # for the CoreDNS pod from bootstrap-cluster.yaml. bootstrap-cluster.sh
-  # creates the matching kube-dns Service + EndpointSlice pointing at
-  # the container IP on rusternetes-net (kube-proxy DNATs 10.96.0.10 to
-  # this IP via iptables).
+  # DNS - authoritative cluster.local DNS server, build-only. The dns
+  # binary no longer runs as a compose container: bootstrap-cluster.sh
+  # applies bootstrap-dns.yaml, which deploys this image as a kube-system
+  # Deployment (k8s-app=kube-dns) reading cluster state from the
+  # api-server. Kubelets share the host docker daemon, so the locally
+  # built tag is visible to pods without a registry.
+  # Build with: docker compose --profile build build dns
   dns:
+    profiles: ["build"]
+    image: rusternetes-dns:latest
     build:
       context: .
       dockerfile: Dockerfile.services
       target: dns
       additional_contexts:
         rhino: ./rhino
-    container_name: rusternetes-dns
-    depends_on:
-      etcd:
-        condition: service_healthy
-    networks:
-      rusternetes-net:
-        aliases:
-          - dns
-    cap_add:
-      # 53 is privileged; the binary runs as root in this image so this
-      # is technically redundant, but we declare it for the day someone
-      # adds a non-root USER directive to the image.
-      - NET_BIND_SERVICE
-    environment:
-      - RUST_LOG=info
-    command:
-      - "--etcd-servers"
-      - "http://etcd:2379"
-      - "--cluster-zone"
-      - "cluster.local"
-      - "--udp-bind"
-      - "0.0.0.0:53"
-      - "--tcp-bind"
-      - "0.0.0.0:53"
 
 networks:
   rusternetes-net:

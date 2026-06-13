@@ -213,15 +213,18 @@ fi
 
 # Step 5: Wire the kube-dns Service to a DNS backend.
 #
-# When USE_RUSTERNETES_DNS=1 (default), the script:
-#   1. Resolves the rusternetes-dns container's IP on the
-#      rusternetes-network bridge. (No CoreDNS Pod is ever created on this
-#      path — bootstrap-cluster.yaml only creates the kube-dns Service,
-#      whose ClusterIP 10.96.0.10 every Pod's /etc/resolv.conf references
-#      via kubelet's --cluster-dns flag, and which we keep stable.)
-#   2. Creates a hand-written EndpointSlice in kube-system that points
-#      `kube-dns` at that container IP, so kube-proxy DNATs cluster DNS
-#      queries (10.96.0.10:53) onto the standalone DNS server.
+# When USE_RUSTERNETES_DNS=1 (default), the backend depends on the stack:
+#   - All-in-one stack (`rusternetes` container on the bridge): the DNS
+#     server is an in-process task inside that container, so the script
+#     creates a hand-written EndpointSlice pointing `kube-dns` at the
+#     container's bridge IP (kube-proxy then DNATs 10.96.0.10:53 to it).
+#   - Multi-container stacks: the script applies bootstrap-dns.yaml, which
+#     runs rusternetes-dns as a kube-system Deployment (k8s-app=kube-dns).
+#     The endpoints controller populates the kube-dns Service from the pod
+#     via the Service selector — no manual EndpointSlice.
+# Either way bootstrap-cluster.yaml only creates the kube-dns Service,
+# whose ClusterIP 10.96.0.10 every Pod's /etc/resolv.conf references via
+# kubelet's --cluster-dns flag, and which we keep stable.
 #
 # To run with a CoreDNS Pod instead (e.g. for A/B comparison), set
 # USE_RUSTERNETES_DNS=0 in the environment; the script then applies
@@ -238,51 +241,31 @@ if [ "${SKIP_DNS_WIRING:-0}" = "1" ]; then
     print_step "Skipping DNS backend wiring (SKIP_DNS_WIRING=1)."
     echo "  This stack has no in-cluster DNS backend; node-scoped tests don't need cluster DNS."
 elif [ "$USE_RUSTERNETES_DNS" = "1" ]; then
-    print_step "Wiring kube-dns Service to rusternetes-dns container..."
-
     # No CoreDNS Pod/ConfigMap to tear down on this path — bootstrap-cluster.yaml
     # no longer creates them. The Step 3 cleanup above already removed any stale
     # CoreDNS Pod left over from a previous USE_RUSTERNETES_DNS=0 run. The
     # kube-dns Service stays (created in Step 4) so the ClusterIP is stable.
 
-    # Discover a container on the rusternetes bridge that serves DNS on
-    # :53. Two candidates depending on which stack is up:
-    #   - `rusternetes-dns`  — multi-container stack (compose.yml).
-    #   - `rusternetes`      — all-in-one stack (compose.all-in-one.yml),
-    #                          where the in-process DNS task binds 0.0.0.0:53.
-    # The compose files pin the network name to `rusternetes-network`
-    # (see the `networks:` block in both files).
-    DNS_CANDIDATES="rusternetes-dns rusternetes"
+    # All-in-one stack detection: the `rusternetes` container runs the DNS
+    # server as an in-process task binding 0.0.0.0:53 — there is no dns pod
+    # image on that stack, so kube-dns is wired manually to the container IP.
+    # The compose files pin the network name to `rusternetes-network`.
     DNS_NETWORK="rusternetes-network"
-    DNS_CONTAINER_NAME=""
-    DNS_IP=""
-    for i in $(seq 1 30); do
-        for candidate in $DNS_CANDIDATES; do
-            DNS_IP=$($CONTAINER_RT inspect "$candidate" \
-                --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
-                2>/dev/null || true)
-            if [ -n "$DNS_IP" ] && [ "$DNS_IP" != "<no value>" ]; then
-                DNS_CONTAINER_NAME="$candidate"
-                break 2
-            fi
-        done
-        echo "  Waiting for a DNS container ($DNS_CANDIDATES) on $DNS_NETWORK... ($i/30)"
-        sleep 1
-    done
+    AIO_DNS_IP=$($CONTAINER_RT inspect rusternetes \
+        --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
+        2>/dev/null || true)
 
-    if [ -z "$DNS_IP" ] || [ "$DNS_IP" = "<no value>" ]; then
-        print_warning "No DNS container found on $DNS_NETWORK (tried: $DNS_CANDIDATES)."
-        print_warning "Is the dns service running? Try: $CONTAINER_RT ps --filter name=rusternetes"
-        print_warning "Falling back: cluster DNS will NOT be functional until kube-dns has endpoints."
-    else
-        echo "  Found $DNS_CONTAINER_NAME at $DNS_IP"
+    if [ -n "$AIO_DNS_IP" ] && [ "$AIO_DNS_IP" != "<no value>" ]; then
+        print_step "Wiring kube-dns Service to the all-in-one rusternetes container..."
+        echo "  Found rusternetes at $AIO_DNS_IP"
 
         # Wire up the EndpointSlice that backs the kube-dns Service.
         # Without this kube-proxy has nothing to DNAT 10.96.0.10:53 to.
         # The slice carries the standard `kubernetes.io/service-name`
         # label so kube-proxy + the EndpointSlice controller treat it
-        # as belonging to kube-dns. `addressType: IPv4` matches the
-        # bridge IPs; dual-stack support is a follow-up.
+        # as belonging to kube-dns; the non-controller `managed-by` value
+        # keeps the endpointslice controller from pruning it. `addressType:
+        # IPv4` matches the bridge IPs; dual-stack support is a follow-up.
         cat <<EOF | $KUBECTL $KUBECTL_FLAGS apply -f -
 apiVersion: discovery.k8s.io/v1
 kind: EndpointSlice
@@ -302,13 +285,51 @@ ports:
     protocol: TCP
 endpoints:
   - addresses:
-      - "$DNS_IP"
+      - "$AIO_DNS_IP"
     conditions:
       ready: true
       serving: true
       terminating: false
 EOF
-        print_success "$DNS_CONTAINER_NAME wired up at $DNS_IP for kube-dns Service"
+        print_success "rusternetes wired up at $AIO_DNS_IP for kube-dns Service"
+    else
+        # Multi-container stack: rusternetes-dns runs as a kube-system
+        # Deployment reading cluster state from the api-server. The
+        # endpoints controller wires the kube-dns Service to the pod via
+        # the k8s-app=kube-dns selector.
+        print_step "Applying rusternetes-dns Deployment (bootstrap-dns.yaml)..."
+        if [ ! -f "$PROJECT_ROOT/bootstrap-dns.yaml" ]; then
+            print_error "bootstrap-dns.yaml not found"
+            exit 1
+        fi
+
+        # A previous bootstrap may have wired kube-dns manually to a (now
+        # stale) compose-container IP — drop that slice; the endpoints
+        # controller owns the Service's endpoints from here on.
+        $KUBECTL $KUBECTL_FLAGS delete endpointslice kube-dns-rusternetes -n kube-system 2>/dev/null \
+            && echo "  Deleted stale kube-dns-rusternetes EndpointSlice" || true
+
+        $KUBECTL $KUBECTL_FLAGS apply -f "$PROJECT_ROOT/bootstrap-dns.yaml"
+
+        print_step "Waiting for the rusternetes-dns Deployment to be ready..."
+        MAX_WAIT=60
+        for i in $(seq 1 $MAX_WAIT); do
+            DNS_READY=$($KUBECTL $KUBECTL_FLAGS get deployment rusternetes-dns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+
+            if [ "$DNS_READY" == "1" ]; then
+                print_success "rusternetes-dns Deployment is ready!"
+                break
+            fi
+
+            if [ $i -eq $MAX_WAIT ]; then
+                print_warning "rusternetes-dns not ready after ${MAX_WAIT} attempts (readyReplicas: ${DNS_READY:-none})"
+                print_warning "Check: $KUBECTL $KUBECTL_FLAGS get pods -n kube-system"
+                print_warning "Is the rusternetes-dns:latest image built? Try: docker compose --profile build build dns"
+            else
+                echo "  Waiting for rusternetes-dns... ($i/$MAX_WAIT)"
+                sleep 2
+            fi
+        done
     fi
 else
     # Fallback path (USE_RUSTERNETES_DNS=0): apply the CoreDNS Pod + ConfigMap

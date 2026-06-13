@@ -220,6 +220,20 @@ services:
     # Host network: rhino is accessible via the mapped port on localhost
     command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
 
+  # DNS image, build-only. The dns binary runs as a kube-system Deployment
+  # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster
+  # state from the api-server — not as a compose container.
+  # Build with: docker compose -f compose.redis.yml --profile build build dns
+  dns:
+    profiles: ["build"]
+    image: rusternetes-dns:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.services
+      target: dns
+      additional_contexts:
+        rhino: ./rhino
+
 networks:
   rusternetes-net:
     driver: bridge

@@ -480,4 +480,6 @@ EXPOSE 53/udp
 EXPOSE 53/tcp
 
 ENTRYPOINT ["/app/rusternetes-dns"]
-CMD ["--etcd-servers", "http://etcd:2379"]
+# No CMD: the in-cluster Deployment runs arg-free so the binary
+# autodetects ClientConfig::in_cluster(); a baked-in --etcd-servers
+# default would defeat that detection (clap sees an explicit flag).

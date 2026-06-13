@@ -13,8 +13,8 @@
 //!   100% unit-tested without any tokio sockets.
 //! - [`server`] — `hickory-server` integration that translates the
 //!   in-memory zone into DNS responses.
-//! - [`watcher`] — subscribes to storage list/watch events and rebuilds
-//!   the zone snapshot on every change.
+//! - [`watcher`] — subscribes to list/watch events (storage backend or
+//!   api-server REST) and rebuilds the zone snapshot on every change.
 //!
 //! ### Integration shapes
 //!
@@ -74,11 +74,27 @@ impl Default for DnsConfig {
     }
 }
 
-/// Run the DNS server until the process is signalled.
+/// Run the DNS server until the process is signalled, reading cluster
+/// state directly from the storage backend.
 ///
 /// Wires the storage watcher into the in-memory zone and serves DNS over
 /// both UDP and TCP on the configured bind addresses.
 pub async fn run(storage: Arc<StorageBackend>, config: DnsConfig) -> Result<()> {
+    run_with_source(watcher::DnsSource::Storage(storage), config).await
+}
+
+/// Run the DNS server until the process is signalled, reading cluster
+/// state from the api-server (list + watch over REST). This is the mode
+/// the in-cluster `rusternetes-dns` Deployment uses.
+pub async fn run_with_api(
+    client: Arc<rusternetes_client::http::ApiClient>,
+    config: DnsConfig,
+) -> Result<()> {
+    run_with_source(watcher::DnsSource::Api(client), config).await
+}
+
+/// Shared server wiring for both data sources.
+async fn run_with_source(source: watcher::DnsSource, config: DnsConfig) -> Result<()> {
     info!(
         "Starting rusternetes-dns serving zone {} on UDP {} / TCP {}",
         config.cluster_zone, config.udp_bind, config.tcp_bind
@@ -87,14 +103,13 @@ pub async fn run(storage: Arc<StorageBackend>, config: DnsConfig) -> Result<()> 
     let shared = server::SharedZone::new(zone::Zone::empty(&config.cluster_zone));
 
     // Start the watcher task that keeps the zone in sync.
-    let watcher_storage = Arc::clone(&storage);
     let watcher_zone = shared.clone();
     let watcher_cfg = watcher::WatcherConfig {
         cluster_zone: config.cluster_zone.clone(),
         resync_interval_secs: config.resync_interval,
     };
     tokio::spawn(async move {
-        if let Err(e) = watcher::run(watcher_storage, watcher_zone, watcher_cfg).await {
+        if let Err(e) = watcher::run_with_source(source, watcher_zone, watcher_cfg).await {
             tracing::error!("watcher exited with error: {e:?}");
         }
     });
