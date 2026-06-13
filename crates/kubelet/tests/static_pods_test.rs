@@ -60,6 +60,44 @@ fn normalize_applies_node_suffix_namespace_annotations_and_uid() {
     assert!(!pod.metadata.uid.is_empty());
 }
 
+/// The committed kube-scheduler static pod manifest must parse against the real
+/// `Pod` schema (args, tolerations, volumeMounts, hostPath) and normalize to the
+/// mirror name the metrics-grabber matches (`kube-scheduler-node-1`). The
+/// manifest carries an `@CERTS_PATH@` placeholder that bootstrap-cluster.sh
+/// templates; we substitute a dummy value here so the YAML is well-formed.
+#[test]
+fn committed_kube_scheduler_manifest_parses_and_suffixes_to_node_1() {
+    let manifest_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../manifests/control-plane/kube-scheduler.yaml"
+    );
+    let raw = std::fs::read_to_string(manifest_path)
+        .expect("committed kube-scheduler static pod manifest must exist");
+    let templated = raw.replace("@CERTS_PATH@", "/host/.rusternetes/certs");
+    let pod = parse_manifest(templated.as_bytes(), "kube-scheduler.yaml")
+        .expect("manifest must parse against the Pod schema");
+    let pod = normalize_static_pod(pod, "node-1").unwrap();
+    // metrics-grabber regex is kube-scheduler-.* — node-1 suffix produces it.
+    assert_eq!(pod.metadata.name, "kube-scheduler-node-1");
+    assert_eq!(pod.metadata.namespace.as_deref(), Some("kube-system"));
+    let spec = pod.spec.as_ref().unwrap();
+    // Tolerates the control-plane NoSchedule taint so it runs on tainted node-1.
+    let tol = spec.tolerations.as_ref().expect("tolerations present");
+    assert!(tol
+        .iter()
+        .any(|t| t.key.as_deref() == Some("node-role.kubernetes.io/control-plane")));
+    // The certs hostPath resolved from the placeholder.
+    let vol = spec.volumes.as_ref().unwrap();
+    let certs = vol
+        .iter()
+        .find(|v| v.name == "certs")
+        .expect("certs volume");
+    assert_eq!(
+        certs.host_path.as_ref().unwrap().path,
+        "/host/.rusternetes/certs"
+    );
+}
+
 #[test]
 fn normalize_defaults_namespace_to_default() {
     let yaml =

@@ -78,23 +78,20 @@ services:
       - "--log-level"
       - "info"
 
-  # Scheduler - assigns pods to nodes
+  # Scheduler — build-only. The scheduler runs as a static pod on node-1
+  # (manifests/control-plane/kube-scheduler.yaml), launched by the node-1
+  # kubelet — not as its own compose service. This service exists only so
+  # `compose --profile build build` produces rusternetes-scheduler:latest for
+  # the static pod. It never starts under `up` (gated by the `build` profile).
   scheduler:
+    profiles: ["build"]
     build:
       context: .
       dockerfile: Dockerfile.services
       target: scheduler
       additional_contexts:
         rhino: ./rhino
-    container_name: rusternetes-scheduler
-    depends_on:
-      - etcd
-      - api-server
-    networks:
-      - rusternetes-net
-    environment:
-      - RUST_LOG=info
-    command: ["--etcd-servers", "http://etcd:2379", "--interval", "1"]
+    image: rusternetes-scheduler:latest
 
   # Controller Manager - runs controllers
   controller-manager:
@@ -141,12 +138,17 @@ services:
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       # Mount TLS certificates so kubelet can inject CA cert into service account volumes
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+      # Templated control-plane static pod manifests (kube-scheduler) +
+      # host-absolute certs mount for the scheduler static pod's hostPath. See
+      # the matching block in compose.sqlite.yml for the full rationale.
+      - ./.rusternetes/manifests:/etc/rusternetes/manifests:ro
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
     environment:
       - RUST_LOG=info
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
       - RUSTERNETES_DUMP_PAYLOADS=${RUSTERNETES_DUMP_PAYLOADS:-}
-    command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
 
   # Kubelet 2 - second node agent for multi-node conformance tests
   kubelet2:
