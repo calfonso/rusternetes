@@ -225,12 +225,15 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
         }
     }
 
-    /// Persist a full pod object. Storage: `update`. API: PUT the pod (used for
-    /// the priority backstop, `nominatedNodeName`, the `Unschedulable`
-    /// condition, and preemption eviction — NOT for binding, which goes through
-    /// [`Self::bind`]). Propagates [`Error::Conflict`] on a 409 so callers keep
-    /// their existing re-GET-and-retry behavior.
-    pub async fn update_pod(&self, ns: &str, name: &str, pod: &Pod) -> Result<()> {
+    /// Persist a pod **status** change (e.g. `nominatedNodeName`).
+    ///
+    /// Storage mode writes the whole pod. API mode MUST route through the
+    /// `/status` subresource: a whole-pod PUT that changes status (or any
+    /// immutable spec/meta field) is rejected by the api-server. This is
+    /// critical for `nominatedNodeName` — without it the preemptor's node
+    /// reservation never sticks and preemption live-locks (preempt → victims
+    /// recreated → preempt again, forever).
+    pub async fn update_pod_status(&self, ns: &str, name: &str, pod: &Pod) -> Result<()> {
         match self {
             DataPlane::Storage(s) => {
                 s.update(&build_key("pods", Some(ns), name), pod).await?;
@@ -239,7 +242,10 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
             DataPlane::Api(a) => {
                 let _: Pod = a
                     .client
-                    .put(&ApiBackend::pod_path(ns, name), pod)
+                    .put(
+                        &format!("/api/v1/namespaces/{}/pods/{}/status", ns, name),
+                        pod,
+                    )
                     .await
                     .map_err(api_err_to_common)?;
                 Ok(())

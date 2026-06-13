@@ -29,6 +29,15 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// upstream's `recorder.Eventf` after bind. `None` in API mode, where events
     /// POST through the data plane's client recorder instead.
     recorder: Option<EventRecorder<S>>,
+    /// In-memory nominator: pod key (`ns/name`) → node reserved by preemption.
+    /// Set synchronously the instant the scheduler decides to preempt, BEFORE
+    /// the async `nominatedNodeName` `/status` write propagates back through the
+    /// pods informer. Overlaid onto the pod list each scheduling cycle so the
+    /// nominated-pod space reservation (advanced.rs) sees the reservation
+    /// immediately — without it, a lower-priority pod fills the space the
+    /// preemptor just freed before the informer catches up, and preemption
+    /// live-locks. Mirrors upstream's in-memory `SchedulingQueue` nominator.
+    nominations: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl Scheduler<StorageBackend> {
@@ -45,6 +54,7 @@ impl Scheduler<StorageBackend> {
             recorder: None,
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
+            nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -56,7 +66,58 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             data: DataPlane::Storage(storage),
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
+            nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Record a preemption nomination synchronously (in-memory) and persist it
+    /// to `status.nominatedNodeName` via the `/status` subresource.
+    async fn nominate(&self, pod_key: &str, node_name: &str) {
+        let (ns, name) = parse_pod_storage_key(pod_key);
+        self.nominations
+            .lock()
+            .unwrap()
+            .insert(format!("{ns}/{name}"), node_name.to_string());
+        let node = node_name.to_string();
+        self.update_pod_status_with_retry(pod_key, move |p| {
+            if let Some(ref mut status) = p.status {
+                status.nominated_node_name = Some(node.clone());
+            }
+        })
+        .await;
+    }
+
+    /// Overlay the in-memory nominations onto a freshly-read pod list so the
+    /// space reservation sees them before the informer propagates the `/status`
+    /// write. Prunes stale entries: a nomination is dropped once the pod is
+    /// bound (`spec.nodeName` set) or no longer present.
+    fn apply_nominations(&self, all_pods: &mut [Pod]) {
+        let mut noms = self.nominations.lock().unwrap();
+        if noms.is_empty() {
+            return;
+        }
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pod in all_pods.iter_mut() {
+            let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+            let key = format!("{}/{}", ns, pod.metadata.name);
+            let bound = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.as_ref())
+                .is_some();
+            if let Some(node) = noms.get(&key) {
+                if bound {
+                    continue; // pruned below — reservation no longer needed
+                }
+                live.insert(key.clone());
+                let status = pod.status.get_or_insert_with(Default::default);
+                if status.nominated_node_name.is_none() {
+                    status.nominated_node_name = Some(node.clone());
+                }
+            }
+        }
+        // Keep only nominations whose pod is still present and unbound.
+        noms.retain(|k, _| live.contains(k));
     }
 
     /// Emit a pod-scoped event through the unified recorder, sourced from this
@@ -101,11 +162,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
     }
 
-    /// Write a pod update with one-attempt retry on resource-version Conflict
-    /// and tracing for all other errors. Avoids silently dropping storage
-    /// failures from `let _ = storage.update(...)`. The mutator is re-applied
-    /// to the freshly-read pod on Conflict, so it must be idempotent.
-    async fn update_pod_with_retry<F>(&self, pod_key: &str, mutate: F)
+    /// Persist a pod **status** change with one-attempt retry on
+    /// resource-version Conflict, via the `/status` subresource (API mode) or a
+    /// whole-pod write (storage mode). Used for `nominatedNodeName` and the
+    /// `Unschedulable` PodScheduled condition: the api-server rejects status
+    /// changes on a whole-pod PUT, and without the persisted `nominatedNodeName`
+    /// reservation preemption live-locks (preempt → victims recreated → preempt
+    /// again). The mutator re-applies to the freshly-read pod on Conflict, so it
+    /// must be idempotent.
+    async fn update_pod_status_with_retry<F>(&self, pod_key: &str, mutate: F)
     where
         F: Fn(&mut Pod) + Send,
     {
@@ -120,11 +185,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
             };
             mutate(&mut pod);
-            match self.data.update_pod(ns, name, &pod).await {
+            match self.data.update_pod_status(ns, name, &pod).await {
                 Ok(_) => return,
                 Err(rusternetes_common::Error::Conflict(_)) if attempt == 0 => continue,
                 Err(e) => {
-                    error!(error = %e, pod = pod_key, "scheduler: failed to update pod");
+                    error!(error = %e, pod = pod_key, "scheduler: failed to update pod status");
                     return;
                 }
             }
@@ -325,7 +390,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if nodes.is_empty() {
             return Ok(());
         }
-        let all_pods: Vec<Pod> = self.data.list_pods().await?;
+        let mut all_pods: Vec<Pod> = self.data.list_pods().await?;
+        // Overlay in-memory preemption nominations so the space reservation in
+        // select_node sees a just-nominated preemptor before its /status write
+        // propagates back through the informer (prevents the live-lock).
+        self.apply_nominations(&mut all_pods);
         let priority_classes = self.load_priority_classes().await?;
 
         // Resolve priority in-memory for this scheduling pass. We deliberately
@@ -376,12 +445,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     error!("Failed to evict victim pod {}: {}", victim, e);
                 }
             }
-            self.update_pod_with_retry(&pod_key, |p| {
-                if let Some(ref mut status) = p.status {
-                    status.nominated_node_name = Some(node_name.clone());
-                }
-            })
-            .await;
+            self.nominate(&pod_key, &node_name).await;
         } else {
             // No node fits and preemption can't help — surface FailedScheduling.
             // The production path previously stayed silent here; the
@@ -593,7 +657,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                     error!("Failed to bind preemptor to nominated node: {}", e);
                                     // Fall back to setting nominatedNodeName
                                     let nn = node_name.clone();
-                                    self.update_pod_with_retry(&pod_key, |p| {
+                                    self.update_pod_status_with_retry(&pod_key, |p| {
                                         if let Some(ref mut status) = p.status {
                                             status.nominated_node_name = Some(nn.clone());
                                         }
@@ -608,7 +672,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             } else {
                                 // Resources not yet free (victims still running) — set nominatedNodeName
                                 let nn = node_name.clone();
-                                self.update_pod_with_retry(&pod_key, |p| {
+                                self.update_pod_status_with_retry(&pod_key, |p| {
                                     if let Some(ref mut status) = p.status {
                                         status.nominated_node_name = Some(nn.clone());
                                     }
@@ -622,7 +686,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         } else {
                             // Node not found — set nominatedNodeName anyway
                             let nn = node_name.clone();
-                            self.update_pod_with_retry(&pod_key, |p| {
+                            self.update_pod_status_with_retry(&pod_key, |p| {
                                 if let Some(ref mut status) = p.status {
                                     status.nominated_node_name = Some(nn.clone());
                                 }
@@ -647,7 +711,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     let pod_key =
                         rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
                     let msg = sched_message.clone();
-                    self.update_pod_with_retry(&pod_key, |p| {
+                    self.update_pod_status_with_retry(&pod_key, |p| {
                         let condition = rusternetes_common::resources::PodCondition {
                             condition_type: "PodScheduled".to_string(),
                             status: "False".to_string(),
