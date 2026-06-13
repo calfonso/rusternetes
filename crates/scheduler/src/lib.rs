@@ -1,4 +1,5 @@
 pub mod advanced;
+pub mod data_plane;
 #[allow(dead_code)]
 pub mod framework;
 #[allow(dead_code)]
