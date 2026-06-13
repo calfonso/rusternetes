@@ -402,19 +402,23 @@ else
     done
 fi
 
-# Step 6: Label + taint node-1 as the control-plane node.
+# Step 6: Label node-1 as the control-plane node.
 #
-# node-1 runs the kube-scheduler static pod. Tainting it NoSchedule keeps
-# workload pods off node-1 (they land on node-2) so the 2-node capacity isn't
-# squeezed by the control-plane pod; the scheduler static pod itself tolerates
-# the taint (see manifests/control-plane/kube-scheduler.yaml). Best-effort: a
-# fresh node object may not exist yet on the very first bootstrap, so failures
-# are non-fatal and the next bootstrap re-applies (--overwrite is idempotent).
-print_step "Labeling + tainting node-1 as control-plane..."
+# node-1 runs the kube-scheduler static pod (its manifest is mounted into
+# node-1's kubelet via --pod-manifest-path; placement does NOT depend on a
+# taint). We label it control-plane for identification but DELIBERATELY do NOT
+# taint it: this is a 2-node stack, and the [sig-architecture] conformance test
+# "should have at least two untainted nodes" requires both nodes schedulable.
+# Tainting node-1 NoSchedule left only one untainted node and regressed that
+# test plus several scheduling-pressure-sensitive specs (DaemonSet rollback,
+# SchedulerPreemption execution path, StatefulSet recreate). The scheduler pod
+# coexists with workloads on node-1 instead. (A dedicated tainted control-plane
+# node would need a 3rd node — tracked for the lightweight-distro story.)
+# Best-effort: a fresh node object may not exist yet on the very first
+# bootstrap, so failure is non-fatal and the next bootstrap re-applies.
+print_step "Labeling node-1 as control-plane (no taint — 2-node stack)..."
 $KUBECTL $KUBECTL_FLAGS label node node-1 node-role.kubernetes.io/control-plane= --overwrite 2>/dev/null \
     && echo "  Labeled node-1 control-plane" || print_warning "Could not label node-1 (not registered yet?)"
-$KUBECTL $KUBECTL_FLAGS taint node node-1 node-role.kubernetes.io/control-plane=:NoSchedule --overwrite 2>/dev/null \
-    && echo "  Tainted node-1 NoSchedule" || print_warning "Could not taint node-1 (not registered yet?)"
 
 echo ""
 print_success "Cluster bootstrap complete!"
