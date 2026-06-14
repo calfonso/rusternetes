@@ -165,6 +165,63 @@ KUBECONFIG
     fi
 }
 
+# kubelet kubeconfig for the in-cluster kubelets (node-1, node-2). On the
+# compose network they reach the api-server by its DNS alias. One shared
+# CA-only kubeconfig serves both nodes (sufficient under --skip-auth; a real
+# per-node CN=system:node:<name> cert is needed only once authn is enabled,
+# #1129).
+generate_kubelet_kubeconfig() {
+    local kl_key="${CERT_DIR}/kubelet.key"
+    local kl_crt="${CERT_DIR}/kubelet.crt"
+    local kl_conf="${CERT_DIR}/kubelet.conf"
+    local ca_crt="${CERT_DIR}/ca.crt"
+
+    if [ ! -f "$ca_crt" ]; then
+        return 0
+    fi
+
+    if [ ! -f "$kl_crt" ] || [ ! -f "$kl_conf" ]; then
+        echo "Generating kubelet client cert + kubeconfig..."
+        openssl ecparam -name prime256v1 -genkey -noout -out "$kl_key"
+        openssl req -new -key "$kl_key" -out "${CERT_DIR}/kubelet.csr" \
+            -subj "/CN=system:node:rusternetes/O=system:nodes"
+        openssl x509 -req -in "${CERT_DIR}/kubelet.csr" \
+            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -out "$kl_crt" -days 3650 \
+            -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
+        rm -f "${CERT_DIR}/kubelet.csr"
+
+        local ca_b64 cert_b64 key_b64
+        ca_b64=$(base64 -w0 < "$ca_crt")
+        cert_b64=$(base64 -w0 < "$kl_crt")
+        key_b64=$(base64 -w0 < "$kl_key")
+
+        cat > "$kl_conf" <<KUBECONFIG
+apiVersion: v1
+kind: Config
+current-context: kubelet@rusternetes
+clusters:
+- name: rusternetes
+  cluster:
+    server: https://api-server:6443
+    certificate-authority-data: ${ca_b64}
+users:
+- name: kubelet
+  user:
+    client-certificate-data: ${cert_b64}
+    client-key-data: ${key_b64}
+contexts:
+- name: kubelet@rusternetes
+  context:
+    cluster: rusternetes
+    user: kubelet
+    namespace: default
+KUBECONFIG
+        echo "  Kubelet cert:       $kl_crt (CN=system:node:rusternetes)"
+        echo "  Kubelet kubeconfig: $kl_conf"
+    fi
+}
+
 # kube-proxy kubeconfig for the in-cluster compose service. kube-proxy runs
 # host-network, so its kubeconfig points at the host-published api-server port
 # (https://localhost:6443; cert SANs include localhost/127.0.0.1). CA-only
@@ -233,6 +290,7 @@ if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     generate_scheduler_kubeconfig
     generate_controller_manager_kubeconfig
     generate_kube_proxy_kubeconfig
+    generate_kubelet_kubeconfig
     echo ""
     echo "To regenerate certificates, delete them first:"
     echo "  rm $CERT_FILE $KEY_FILE"
@@ -340,6 +398,7 @@ cp "$CERT_FILE" "${CERT_DIR}/ca.crt"
 generate_scheduler_kubeconfig
 generate_controller_manager_kubeconfig
 generate_kube_proxy_kubeconfig
+generate_kubelet_kubeconfig
 
 echo ""
 echo "Certificates generated successfully:"

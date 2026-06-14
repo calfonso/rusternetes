@@ -4,7 +4,7 @@ pub mod proxy;
 use futures::StreamExt;
 use proxy::KubeProxy;
 use rusternetes_client::http::ApiClient;
-use rusternetes_controller_manager::api_storage::ApiStorage;
+use rusternetes_storage::api_storage::ApiStorage;
 use rusternetes_storage::{Storage, StorageBackend, WorkQueue, RECONCILE_ALL_SENTINEL};
 use std::sync::Arc;
 use tracing::{info, warn};

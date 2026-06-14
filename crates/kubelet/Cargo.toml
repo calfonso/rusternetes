@@ -20,7 +20,10 @@ redis = ["rusternetes-storage/redis"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
-rusternetes-storage = { path = "../storage" }
+# api-client: StorageBackend::Api lets the in-cluster kubelet read/write via
+# the api-server while keeping its Arc<StorageBackend> handle unchanged.
+rusternetes-storage = { path = "../storage", features = ["api-client"] }
+rusternetes-client = { path = "../client" }
 rusternetes-netstack = { path = "../netstack" }
 tokio.workspace = true
 serde.workspace = true

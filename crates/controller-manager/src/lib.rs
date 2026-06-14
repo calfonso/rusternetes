@@ -1,9 +1,7 @@
 // Library interface for controller-manager
-pub mod api_storage;
 pub mod controllers;
 pub use controllers::*;
 
-use api_storage::ApiStorage;
 use controllers::{
     apiservice::APIServiceAvailabilityController,
     certificate_signing_request::CertificateSigningRequestController,
@@ -40,6 +38,7 @@ use controllers::{
     vpa::VerticalPodAutoscalerController,
 };
 use rusternetes_client::http::ApiClient;
+use rusternetes_storage::api_storage::ApiStorage;
 use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::{error, info};

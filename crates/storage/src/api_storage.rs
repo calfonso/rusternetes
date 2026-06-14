@@ -36,12 +36,12 @@
 //!   no controller in this crate calls them, and `list_paginated` is a handler
 //!   concern, not a controller one.
 
+use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
 use futures::StreamExt;
 use rusternetes_client::http::{ApiClient, GetError, KubernetesList};
 use rusternetes_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
 use rusternetes_common::{Error, Result};
-use rusternetes_storage::{Storage, WatchEvent, WatchStream};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
