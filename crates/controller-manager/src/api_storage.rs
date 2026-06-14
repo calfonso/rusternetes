@@ -14,7 +14,9 @@
 //! - `update_status` → PUT to the `/status` subresource (grafted onto a fresh
 //!   GET so a stale caller cannot clobber spec, mirroring the storage impl);
 //! - `watch` → the api-server's `?watch=true` JSON-lines stream, re-keyed to
-//!   the `/registry/...` form [`rusternetes_storage::extract_key`] expects.
+//!   the `/registry/...` form [`rusternetes_storage::extract_key`] expects, and
+//!   **shared**: all controllers watching the same resource type fan out from a
+//!   single upstream connection via a broadcast (#1138).
 //!
 //! ## Known gaps (tracked follow-ups, not adapter bugs)
 //!
@@ -35,7 +37,6 @@
 //!   concern, not a controller one.
 
 use async_trait::async_trait;
-use futures::channel::mpsc;
 use futures::StreamExt;
 use rusternetes_client::http::{ApiClient, GetError, KubernetesList};
 use rusternetes_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
@@ -45,7 +46,14 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, Mutex, RwLock};
+
+/// Per-resource-type buffer for the shared watch broadcast. A subscriber that
+/// falls more than this many events behind is told to relist (see `watch`).
+const SHARED_WATCH_BUFFER: usize = 1024;
+
+/// Registry of live shared upstream watches, keyed by resolved collection path.
+type SharedWatches = Arc<Mutex<HashMap<String, broadcast::Sender<Arc<WatchEvent>>>>>;
 
 /// A [`Storage`] implementation that proxies to the api-server over REST.
 pub struct ApiStorage {
@@ -55,6 +63,11 @@ pub struct ApiStorage {
     /// the arbitrary types the garbage collector traverses). `None` until the
     /// first miss triggers a one-shot discovery load; `Some` thereafter.
     dynamic: RwLock<Option<HashMap<String, (String, bool)>>>,
+    /// One shared upstream `?watch=true` stream per resolved collection path,
+    /// fanned out to every controller watching that type via a broadcast — so
+    /// the ~50 controller watch() calls collapse to ~one HTTP connection per
+    /// resource type (idle-RAM, #1138).
+    shared_watches: SharedWatches,
 }
 
 impl ApiStorage {
@@ -62,6 +75,7 @@ impl ApiStorage {
         Self {
             client,
             dynamic: RwLock::new(None),
+            shared_watches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -480,10 +494,15 @@ impl Storage for ApiStorage {
 }
 
 impl ApiStorage {
-    /// Establish a `?watch=true` stream and re-key its events into the
-    /// `/registry/...` form. A background task owns the `Arc<ApiClient>` and the
-    /// underlying byte stream so the returned `WatchStream` is `'static`.
-    async fn watch_inner(&self, prefix: &str, rv: Option<String>) -> Result<WatchStream> {
+    /// Subscribe to a shared upstream `?watch=true` stream for `prefix`'s
+    /// collection. The first subscriber for a path spawns one upstream task
+    /// (re-keying events into `/registry/...` form and broadcasting them);
+    /// later subscribers join its broadcast. So the ~50 controller watch()
+    /// calls collapse to one HTTP connection per resource type (#1138).
+    ///
+    /// `rv` is intentionally ignored: a shared stream cannot honor a
+    /// per-subscriber resourceVersion, and controllers relist on (re)connect.
+    async fn watch_inner(&self, prefix: &str, _rv: Option<String>) -> Result<WatchStream> {
         let (rt, rest) = parse_key(prefix)?;
         let Some((root, namespaced)) = self.try_resolve(&rt).await else {
             // Type not served — a stream that never yields, mirroring a watch on
@@ -492,45 +511,111 @@ impl ApiStorage {
             return Ok(futures::stream::pending().boxed());
         };
         let path = build_collection_for_prefix(&root, namespaced, &rt, &rest)?;
-        let client = self.client.clone();
 
-        let (tx, rx) = mpsc::unbounded::<Result<WatchEvent>>();
-        tokio::spawn(async move {
-            let raw = match watch_stream::<Value>(&client, &path, rv.as_deref()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.unbounded_send(Err(Error::Network(e.to_string())));
-                    return;
+        // Get-or-create the shared upstream for this collection path.
+        let rx = {
+            let mut guard = self.shared_watches.lock().await;
+            match guard.get(&path) {
+                Some(tx) => tx.subscribe(),
+                None => {
+                    let (tx, rx) = broadcast::channel::<Arc<WatchEvent>>(SHARED_WATCH_BUFFER);
+                    guard.insert(path.clone(), tx.clone());
+                    tokio::spawn(shared_upstream(
+                        self.client.clone(),
+                        path,
+                        rt,
+                        namespaced,
+                        tx,
+                        self.shared_watches.clone(),
+                    ));
+                    rx
                 }
-            };
-            futures::pin_mut!(raw);
-            while let Some(ev) = raw.next().await {
-                let mapped: Option<Result<WatchEvent>> = match ev {
-                    Ok(ClientWatchEvent::Added(o)) => Some(
-                        storage_key_for(&rt, namespaced, &o)
-                            .map(|k| WatchEvent::Added(k, o.to_string())),
-                    ),
-                    Ok(ClientWatchEvent::Modified(o)) => Some(
-                        storage_key_for(&rt, namespaced, &o)
-                            .map(|k| WatchEvent::Modified(k, o.to_string())),
-                    ),
-                    Ok(ClientWatchEvent::Deleted(o)) => Some(
-                        storage_key_for(&rt, namespaced, &o)
-                            .map(|k| WatchEvent::Deleted(k, o.to_string())),
-                    ),
-                    // Bookmarks are watch-progress markers, not resource deltas.
-                    Ok(ClientWatchEvent::Bookmark(_)) => None,
-                    Err(e) => Some(Err(Error::Network(e.to_string()))),
-                };
-                if let Some(item) = mapped {
-                    if tx.unbounded_send(item).is_err() {
-                        break; // consumer dropped the stream
-                    }
-                }
+            }
+        };
+
+        // Adapt the broadcast receiver to a storage `WatchStream`. A lagged
+        // subscriber (fell behind the buffer) yields an error so its controller
+        // relists+reconnects; a closed channel (upstream ended) ends the stream
+        // so the controller reconnects, recreating the upstream.
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            match rx.recv().await {
+                Ok(ev) => Some((Ok((*ev).clone()), rx)),
+                Err(broadcast::error::RecvError::Lagged(n)) => Some((
+                    Err(Error::Network(format!(
+                        "shared watch lagged {n} events; relist"
+                    ))),
+                    rx,
+                )),
+                Err(broadcast::error::RecvError::Closed) => None,
             }
         });
 
-        Ok(rx.boxed())
+        Ok(stream.boxed())
+    }
+}
+
+/// The single upstream task behind a shared watch: read the api-server's
+/// `?watch=true` stream for `path`, re-key each event into `/registry/...`
+/// form, and broadcast it to all subscribers. Exits (and deregisters itself)
+/// when the upstream closes/errors or when no subscribers remain — at which
+/// point any surviving/late subscriber sees the channel close and reconnects,
+/// recreating a fresh upstream.
+async fn shared_upstream(
+    client: Arc<ApiClient>,
+    path: String,
+    rt: String,
+    namespaced: bool,
+    tx: broadcast::Sender<Arc<WatchEvent>>,
+    registry: SharedWatches,
+) {
+    let raw = match watch_stream::<Value>(&client, &path, None).await {
+        Ok(s) => s,
+        Err(_) => {
+            // Connect failed; drop the registration so the next watch() retries.
+            remove_shared(&registry, &path, &tx).await;
+            return;
+        }
+    };
+    futures::pin_mut!(raw);
+    while let Some(ev) = raw.next().await {
+        let mapped: Option<WatchEvent> = match ev {
+            Ok(ClientWatchEvent::Added(o)) => storage_key_for(&rt, namespaced, &o)
+                .ok()
+                .map(|k| WatchEvent::Added(k, o.to_string())),
+            Ok(ClientWatchEvent::Modified(o)) => storage_key_for(&rt, namespaced, &o)
+                .ok()
+                .map(|k| WatchEvent::Modified(k, o.to_string())),
+            Ok(ClientWatchEvent::Deleted(o)) => storage_key_for(&rt, namespaced, &o)
+                .ok()
+                .map(|k| WatchEvent::Deleted(k, o.to_string())),
+            // Bookmarks are watch-progress markers, not resource deltas.
+            Ok(ClientWatchEvent::Bookmark(_)) => None,
+            // Upstream error → end; subscribers see close and reconnect.
+            Err(_) => break,
+        };
+        if let Some(ev) = mapped {
+            // `send` errors only when there are zero receivers — every
+            // controller has dropped this watch, so stop holding the connection.
+            if tx.send(Arc::new(ev)).is_err() {
+                break;
+            }
+        }
+    }
+    remove_shared(&registry, &path, &tx).await;
+}
+
+/// Deregister a shared upstream, but only if the registry still points at *this*
+/// sender — a concurrent `watch()` may have already replaced it with a fresh one.
+async fn remove_shared(
+    registry: &SharedWatches,
+    path: &str,
+    tx: &broadcast::Sender<Arc<WatchEvent>>,
+) {
+    let mut guard = registry.lock().await;
+    if let Some(current) = guard.get(path) {
+        if current.same_channel(tx) {
+            guard.remove(path);
+        }
     }
 }
 
