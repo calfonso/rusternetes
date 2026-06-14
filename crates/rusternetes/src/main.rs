@@ -250,27 +250,41 @@ async fn main() -> Result<()> {
     // Give API server a moment to bind before starting clients
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    // --- Scheduler ---
-    let sched_storage = storage.clone();
-    let sched_config = rusternetes_scheduler::SchedulerConfig {
-        interval: args.scheduler_interval,
-    };
-    tokio::spawn(async move {
-        if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
-            error!("Scheduler error: {}", e);
-        }
-    });
-
-    // --- Controller Manager ---
-    let cm_storage = storage.clone();
-    // The HPA metrics client talks to the in-process api-server over loopback.
-    // Derive the port from the api-server bind address; fall back to 6443.
+    // Embedded clients (scheduler, DNS) reach the api-server over loopback,
+    // matching the trust boundary the compose path enforces: only the
+    // api-server touches storage (#1128). The self-signed loopback cert is
+    // skipped when TLS is on; skip_auth is the all-in-one default, so no
+    // bearer token is needed (real authn tracked in #1129). The port is
+    // derived from the api-server bind address; fall back to 6443.
     let api_port = args
         .bind_address
         .rsplit(':')
         .next()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
+    let loopback_scheme = if args.tls { "https" } else { "http" };
+    let loopback_url = format!("{loopback_scheme}://127.0.0.1:{api_port}");
+
+    // --- Scheduler ---
+    let sched_config = rusternetes_scheduler::SchedulerConfig {
+        interval: args.scheduler_interval,
+    };
+    let sched_client = Arc::new(rusternetes_client::http::ApiClient::new(
+        &loopback_url,
+        args.tls,
+        None,
+    )?);
+    info!("Scheduler reading cluster state from embedded api-server at {loopback_url}");
+    tokio::spawn(async move {
+        if let Err(e) = rusternetes_scheduler::run_with_api(sched_client, sched_config).await {
+            error!("Scheduler error: {}", e);
+        }
+    });
+
+    // --- Controller Manager ---
+    let cm_storage = storage.clone();
+    // The HPA metrics client talks to the in-process api-server over loopback
+    // using client-cert mTLS (only when cert+key are configured).
     let metrics_config = args
         .tls_cert_file
         .as_ref()
@@ -428,20 +442,14 @@ async fn main() -> Result<()> {
             ..rusternetes_dns::DnsConfig::default()
         };
         // DNS reaches cluster state through the embedded api-server over
-        // loopback rather than the StorageBackend directly, matching the
-        // trust boundary the compose path enforces (only the api-server
-        // touches storage). #1128. `api_port` is derived above for the HPA
-        // metrics client. The self-signed loopback cert is skipped when TLS
-        // is on; skip_auth is the all-in-one default, so no bearer token is
-        // needed (real authn tracked in #1129).
-        let dns_scheme = if args.tls { "https" } else { "http" };
-        let dns_api_url = format!("{dns_scheme}://127.0.0.1:{api_port}");
+        // loopback rather than the StorageBackend directly (see the loopback
+        // client note above the scheduler block, #1128).
         let dns_client = Arc::new(rusternetes_client::http::ApiClient::new(
-            &dns_api_url,
+            &loopback_url,
             args.tls,
             None,
         )?);
-        info!("DNS reading cluster state from embedded api-server at {dns_api_url}");
+        info!("DNS reading cluster state from embedded api-server at {loopback_url}");
         tokio::spawn(async move {
             if let Err(e) = rusternetes_dns::run_with_api(dns_client, dns_config).await {
                 error!("DNS server error: {}", e);

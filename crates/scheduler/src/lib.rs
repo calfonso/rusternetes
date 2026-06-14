@@ -27,3 +27,29 @@ pub async fn run(storage: Arc<StorageBackend>, config: SchedulerConfig) -> anyho
 
     Ok(())
 }
+
+/// Run the scheduler as an api-server client, reading pod/node/priorityclass
+/// state from informers and writing through the binding/status subresources
+/// and events — no direct storage handle.
+///
+/// This is the in-process counterpart of the binary's `--api-server-url`
+/// mode: the all-in-one binary calls this with an [`rusternetes_client::http::ApiClient`]
+/// pointed at its embedded api-server over loopback, so DNS/scheduler all share
+/// the same trust boundary (only the api-server touches storage).
+pub async fn run_with_api(
+    client: Arc<rusternetes_client::http::ApiClient>,
+    config: SchedulerConfig,
+) -> anyhow::Result<()> {
+    info!("Starting Rusternetes Scheduler (API mode)");
+
+    let scheduler_name = "default-scheduler".to_string();
+    let backend = data_plane::ApiBackend::new(client, &scheduler_name);
+    let scheduler = Arc::new(scheduler::Scheduler::new_api(
+        backend,
+        config.interval,
+        scheduler_name,
+    ));
+    scheduler.run().await?;
+
+    Ok(())
+}
