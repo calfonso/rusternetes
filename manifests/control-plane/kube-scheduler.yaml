@@ -1,0 +1,55 @@
+# kube-scheduler static pod.
+#
+# The kubelet on node-1 runs this from its --pod-manifest-path. The static-pod
+# name suffixing (crates/kubelet/src/static_pods.rs::normalize_static_pod)
+# turns `name: kube-scheduler` into the mirror pod `kube-scheduler-node-1`,
+# which Hydrophone's metrics-grabber matches via `kube-scheduler-.*`.
+#
+# CERTS HOSTPATH (container-in-container): the kubelet runs inside a compose
+# container, so a `hostPath` volume is resolved by the Docker daemon on the
+# HOST (DinD socket), not inside the kubelet container. Worse, the kubelet
+# ALSO `fs::metadata`-checks the hostPath inside its own container
+# (crates/kubelet/src/runtime.rs::create_volume -> check_host_path_type). The
+# path must therefore exist identically on the host AND inside the kubelet
+# container. `@CERTS_PATH@` is a placeholder that bootstrap-cluster.sh rewrites
+# (sed) to the host-absolute path of `.rusternetes/certs`; compose mounts that
+# same host path at the same path inside the kubelet (see compose.*.yml's
+# node-1 kubelet `@CERTS_PATH@:@CERTS_PATH@:ro` mount). The committed manifest
+# keeps the placeholder so it is not machine-specific.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-scheduler
+  namespace: kube-system
+  labels:
+    component: kube-scheduler
+    tier: control-plane
+spec:
+  hostNetwork: false
+  tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
+  containers:
+  - name: kube-scheduler
+    image: rusternetes-scheduler:latest
+    imagePullPolicy: IfNotPresent
+    # The api-server runs with --skip-auth, so the kubeconfig only needs the CA
+    # to validate the server's TLS cert (see scripts/generate-certs.sh). The
+    # static pod joins rusternetes-network, where `api-server` resolves to the
+    # api-server container (cert SANs include `api-server`).
+    args:
+    - "--api-server-url"
+    - "https://api-server:6443"
+    - "--kubeconfig"
+    - "@CERTS_PATH@/scheduler.conf"
+    - "--interval"
+    - "1"
+    volumeMounts:
+    - name: certs
+      mountPath: "@CERTS_PATH@"
+      readOnly: true
+  volumes:
+  - name: certs
+    hostPath:
+      path: "@CERTS_PATH@"
+      type: Directory

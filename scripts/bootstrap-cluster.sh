@@ -127,6 +127,41 @@ echo "Using kubectl: $KUBECTL"
 echo "Kubectl flags: $KUBECTL_FLAGS"
 echo ""
 
+# Step 0: Template control-plane static pod manifests.
+#
+# The kube-scheduler static pod (manifests/control-plane/kube-scheduler.yaml)
+# hostPath-mounts the certs dir. Because the kubelet runs inside a compose
+# container, that hostPath must be the HOST-absolute path of .rusternetes/certs
+# (Docker resolves pod hostPaths on the host AND the kubelet stat()s it inside
+# its own container — so it has to exist at the same path on both sides; compose
+# mounts CERTS_PATH:CERTS_PATH on the node-1 kubelet). We rewrite the committed
+# @CERTS_PATH@ placeholder into the templated copy under .rusternetes/manifests,
+# which is what the node-1 kubelet's --pod-manifest-path actually mounts.
+#
+# No RBAC is created for the scheduler: the api-server runs with --skip-auth
+# (admin for every request), so the authorizer is bypassed and a
+# system:kube-scheduler ClusterRoleBinding would be inert. See
+# scripts/generate-certs.sh for the full authn investigation.
+CERTS_PATH="$PROJECT_ROOT/.rusternetes/certs"
+export CERTS_PATH
+if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
+    print_step "Templating control-plane static pod manifests (CERTS_PATH=$CERTS_PATH)..."
+    mkdir -p "$PROJECT_ROOT/.rusternetes/manifests"
+    for src in "$PROJECT_ROOT/manifests/control-plane/"*.yaml; do
+        [ -e "$src" ] || continue
+        dst="$PROJECT_ROOT/.rusternetes/manifests/$(basename "$src")"
+        sed "s|@CERTS_PATH@|${CERTS_PATH}|g" "$src" > "$dst"
+        echo "  $(basename "$src") -> $dst"
+    done
+    # Persist CERTS_PATH so a compose restart picks up the same mount path.
+    if [ -f "$PROJECT_ROOT/.env" ] && grep -q '^CERTS_PATH=' "$PROJECT_ROOT/.env" 2>/dev/null; then
+        sed -i "s|^CERTS_PATH=.*|CERTS_PATH=${CERTS_PATH}|" "$PROJECT_ROOT/.env"
+    else
+        echo "CERTS_PATH=${CERTS_PATH}" >> "$PROJECT_ROOT/.env"
+    fi
+    print_success "Static pod manifests templated"
+fi
+
 # Step 1: Generate ServiceAccount tokens
 print_step "Generating ServiceAccount tokens..."
 if [ -f "$SCRIPT_DIR/generate-default-serviceaccounts.sh" ]; then
@@ -366,6 +401,24 @@ else
         fi
     done
 fi
+
+# Step 6: Label node-1 as the control-plane node.
+#
+# node-1 runs the kube-scheduler static pod (its manifest is mounted into
+# node-1's kubelet via --pod-manifest-path; placement does NOT depend on a
+# taint). We label it control-plane for identification but DELIBERATELY do NOT
+# taint it: this is a 2-node stack, and the [sig-architecture] conformance test
+# "should have at least two untainted nodes" requires both nodes schedulable.
+# Tainting node-1 NoSchedule left only one untainted node and regressed that
+# test plus several scheduling-pressure-sensitive specs (DaemonSet rollback,
+# SchedulerPreemption execution path, StatefulSet recreate). The scheduler pod
+# coexists with workloads on node-1 instead. (A dedicated tainted control-plane
+# node would need a 3rd node — tracked for the lightweight-distro story.)
+# Best-effort: a fresh node object may not exist yet on the very first
+# bootstrap, so failure is non-fatal and the next bootstrap re-applies.
+print_step "Labeling node-1 as control-plane (no taint — 2-node stack)..."
+$KUBECTL $KUBECTL_FLAGS label node node-1 node-role.kubernetes.io/control-plane= --overwrite 2>/dev/null \
+    && echo "  Labeled node-1 control-plane" || print_warning "Could not label node-1 (not registered yet?)"
 
 echo ""
 print_success "Cluster bootstrap complete!"

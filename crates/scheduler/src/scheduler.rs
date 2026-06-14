@@ -13,33 +13,111 @@ use crate::advanced::{
     check_host_port_conflicts, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
     check_preemption, check_taints_tolerations, check_topology_spread_constraints, NodeScore,
 };
+use crate::data_plane::{ApiBackend, DataPlane};
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
-    storage: Arc<S>,
+    /// All reads/writes flow through the data plane — either storage directly
+    /// (all-in-one) or the api-server over HTTP (in-cluster static pod). See
+    /// `data_plane.rs` for the classification of the original 22 storage sites.
+    data: DataPlane<S>,
     interval: Duration,
     /// Name of this scheduler (default "default-scheduler")
     scheduler_name: String,
-    /// Unified event recorder — the scheduler is the source of truth for the
-    /// `Scheduled` / `FailedScheduling` events, routed through the shared
-    /// `EventCorrelator` (dedup/count/series + spam-filter) like upstream's
-    /// `recorder.Eventf` after bind. Mirrors the kubelet's wiring.
-    recorder: EventRecorder<S>,
+    /// Unified event recorder for STORAGE mode — the scheduler is the source of
+    /// truth for the `Scheduled` / `FailedScheduling` events, routed through the
+    /// shared `EventCorrelator` (dedup/count/series + spam-filter) like
+    /// upstream's `recorder.Eventf` after bind. `None` in API mode, where events
+    /// POST through the data plane's client recorder instead.
+    recorder: Option<EventRecorder<S>>,
+    /// In-memory nominator: pod key (`ns/name`) → node reserved by preemption.
+    /// Set synchronously the instant the scheduler decides to preempt, BEFORE
+    /// the async `nominatedNodeName` `/status` write propagates back through the
+    /// pods informer. Overlaid onto the pod list each scheduling cycle so the
+    /// nominated-pod space reservation (advanced.rs) sees the reservation
+    /// immediately — without it, a lower-priority pod fills the space the
+    /// preemptor just freed before the informer catches up, and preemption
+    /// live-locks. Mirrors upstream's in-memory `SchedulingQueue` nominator.
+    nominations: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl Scheduler<StorageBackend> {
     pub fn new(storage: Arc<StorageBackend>, interval_secs: u64) -> Self {
         Self::new_with_name(storage, interval_secs, "default-scheduler".to_string())
     }
+
+    /// Construct an api-server-backed scheduler (in-cluster static pod mode).
+    /// Reads come from the pods/nodes informers; writes go through the binding
+    /// subresource + status PUT; events POST to `/api/v1/.../events`.
+    pub fn new_api(api: ApiBackend, interval_secs: u64, scheduler_name: String) -> Self {
+        Self {
+            data: DataPlane::Api(api),
+            recorder: None,
+            interval: Duration::from_secs(interval_secs),
+            scheduler_name,
+            nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     pub fn new_with_name(storage: Arc<S>, interval_secs: u64, scheduler_name: String) -> Self {
         Self {
-            recorder: EventRecorder::new(Arc::clone(&storage)),
-            storage,
+            recorder: Some(EventRecorder::new(Arc::clone(&storage))),
+            data: DataPlane::Storage(storage),
             interval: Duration::from_secs(interval_secs),
             scheduler_name,
+            nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Record a preemption nomination synchronously (in-memory) and persist it
+    /// to `status.nominatedNodeName` via the `/status` subresource.
+    async fn nominate(&self, pod_key: &str, node_name: &str) {
+        let (ns, name) = parse_pod_storage_key(pod_key);
+        self.nominations
+            .lock()
+            .unwrap()
+            .insert(format!("{ns}/{name}"), node_name.to_string());
+        let node = node_name.to_string();
+        self.update_pod_status_with_retry(pod_key, move |p| {
+            if let Some(ref mut status) = p.status {
+                status.nominated_node_name = Some(node.clone());
+            }
+        })
+        .await;
+    }
+
+    /// Overlay the in-memory nominations onto a freshly-read pod list so the
+    /// space reservation sees them before the informer propagates the `/status`
+    /// write. Prunes stale entries: a nomination is dropped once the pod is
+    /// bound (`spec.nodeName` set) or no longer present.
+    fn apply_nominations(&self, all_pods: &mut [Pod]) {
+        let mut noms = self.nominations.lock().unwrap();
+        if noms.is_empty() {
+            return;
+        }
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pod in all_pods.iter_mut() {
+            let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+            let key = format!("{}/{}", ns, pod.metadata.name);
+            let bound = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.as_ref())
+                .is_some();
+            if let Some(node) = noms.get(&key) {
+                if bound {
+                    continue; // pruned below — reservation no longer needed
+                }
+                live.insert(key.clone());
+                let status = pod.status.get_or_insert_with(Default::default);
+                if status.nominated_node_name.is_none() {
+                    status.nominated_node_name = Some(node.clone());
+                }
+            }
+        }
+        // Keep only nominations whose pod is still present and unbound.
+        noms.retain(|k, _| live.contains(k));
     }
 
     /// Emit a pod-scoped event through the unified recorder, sourced from this
@@ -47,41 +125,58 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// propagated — a failed event must not abort a bind/scheduling decision.
     async fn emit_pod_event(&self, pod: &Pod, event_type: EventType, reason: &str, message: &str) {
         let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-        let involved = ObjectReference {
-            kind: Some("Pod".to_string()),
-            namespace: Some(ns.to_string()),
-            name: Some(pod.metadata.name.clone()),
-            uid: Some(pod.metadata.uid.clone()),
-            api_version: Some("v1".to_string()),
-            resource_version: pod.metadata.resource_version.clone(),
-            field_path: None,
-        };
-        let source = EventSource {
-            component: self.scheduler_name.clone(),
-            host: None,
-        };
-        if let Err(e) = self
-            .recorder
-            .event(&involved, &source, event_type, reason, message)
-            .await
-        {
-            warn!(
-                "Failed to record {} event for pod {}/{}: {}",
-                reason, ns, pod.metadata.name, e
-            );
+        // API mode: POST through the data plane's client recorder.
+        if let Some(recorder) = self.recorder.as_ref() {
+            let involved = ObjectReference {
+                kind: Some("Pod".to_string()),
+                namespace: Some(ns.to_string()),
+                name: Some(pod.metadata.name.clone()),
+                uid: Some(pod.metadata.uid.clone()),
+                api_version: Some("v1".to_string()),
+                resource_version: pod.metadata.resource_version.clone(),
+                field_path: None,
+            };
+            let source = EventSource {
+                component: self.scheduler_name.clone(),
+                host: None,
+            };
+            if let Err(e) = recorder
+                .event(&involved, &source, event_type, reason, message)
+                .await
+            {
+                warn!(
+                    "Failed to record {} event for pod {}/{}: {}",
+                    reason, ns, pod.metadata.name, e
+                );
+            }
+        } else {
+            self.data
+                .emit_event_api(
+                    ns,
+                    reason,
+                    message,
+                    event_type,
+                    ("Pod", ns, &pod.metadata.name, &pod.metadata.uid),
+                )
+                .await;
         }
     }
 
-    /// Write a pod update with one-attempt retry on resource-version Conflict
-    /// and tracing for all other errors. Avoids silently dropping storage
-    /// failures from `let _ = storage.update(...)`. The mutator is re-applied
-    /// to the freshly-read pod on Conflict, so it must be idempotent.
-    async fn update_pod_with_retry<F>(&self, pod_key: &str, mutate: F)
+    /// Persist a pod **status** change with one-attempt retry on
+    /// resource-version Conflict, via the `/status` subresource (API mode) or a
+    /// whole-pod write (storage mode). Used for `nominatedNodeName` and the
+    /// `Unschedulable` PodScheduled condition: the api-server rejects status
+    /// changes on a whole-pod PUT, and without the persisted `nominatedNodeName`
+    /// reservation preemption live-locks (preempt → victims recreated → preempt
+    /// again). The mutator re-applies to the freshly-read pod on Conflict, so it
+    /// must be idempotent.
+    async fn update_pod_status_with_retry<F>(&self, pod_key: &str, mutate: F)
     where
         F: Fn(&mut Pod) + Send,
     {
+        let (ns, name) = parse_pod_storage_key(pod_key);
         for attempt in 0..2 {
-            let mut pod: Pod = match self.storage.get(pod_key).await {
+            let mut pod: Pod = match self.data.get_pod(ns, name).await {
                 Ok(p) => p,
                 Err(rusternetes_common::Error::NotFound(_)) => return,
                 Err(e) => {
@@ -90,11 +185,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
             };
             mutate(&mut pod);
-            match self.storage.update(pod_key, &pod).await {
+            match self.data.update_pod_status(ns, name, &pod).await {
                 Ok(_) => return,
                 Err(rusternetes_common::Error::Conflict(_)) if attempt == 0 => continue,
                 Err(e) => {
-                    error!(error = %e, pod = pod_key, "scheduler: failed to update pod");
+                    error!(error = %e, pod = pod_key, "scheduler: failed to update pod status");
                     return;
                 }
             }
@@ -117,12 +212,52 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             worker_self.worker(worker_queue).await;
         });
 
+        // API mode: drive the work queue from the pods/nodes reflectors instead
+        // of a storage watch. Spawn both reflector run loops, then subscribe to
+        // the pods store and enqueue the work-queue key for every mutation.
+        if let DataPlane::Api(api) = &self.data {
+            let pods = Arc::clone(&api.pods);
+            let nodes = Arc::clone(&api.nodes);
+            let priority_classes = Arc::clone(&api.priority_classes);
+            tokio::spawn(async move { pods.run().await });
+            tokio::spawn(async move { nodes.run().await });
+            tokio::spawn(async move { priority_classes.run().await });
+
+            let mut sub = api.pods.subscribe();
+            let mut resync = tokio::time::interval(self.interval);
+            resync.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    ev = sub.recv() => {
+                        use rusternetes_client::reflector::StoreEvent;
+                        match ev {
+                            Ok(StoreEvent::Added(p) | StoreEvent::Modified(p)) => {
+                                let ns = p.metadata.namespace.as_deref().unwrap_or("default");
+                                queue.add(format!("pods/{}/{}", ns, p.metadata.name)).await;
+                            }
+                            Ok(StoreEvent::Deleted(_)) => {}
+                            // Lagged/closed: fall back to a full resync below.
+                            Err(_) => { self.enqueue_all(&queue).await; }
+                        }
+                    }
+                    _ = resync.tick() => {
+                        self.enqueue_all(&queue).await;
+                    }
+                }
+            }
+        }
+
+        // Storage mode (all-in-one): watch /registry/pods directly.
+        let storage = match &self.data {
+            DataPlane::Storage(s) => Arc::clone(s),
+            DataPlane::Api(_) => unreachable!("API mode handled above"),
+        };
         loop {
             self.enqueue_all(&queue).await;
 
             // Watch for pod changes (new pods, status changes)
             let prefix = build_prefix("pods", None);
-            let watch_result = self.storage.watch(&prefix).await;
+            let watch_result = storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
@@ -181,8 +316,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Enqueue all pending pods for scheduling.
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        let prefix = build_prefix("pods", None);
-        match self.storage.list::<Pod>(&prefix).await {
+        match self.data.list_pods().await {
             Ok(pods) => {
                 for pod in &pods {
                     // Only enqueue pods that need scheduling
@@ -220,7 +354,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
 
         let pod_key = build_key("pods", Some(ns), name);
-        let pod: Pod = match self.storage.get(&pod_key).await {
+        let pod: Pod = match self.data.get_pod(ns, name).await {
             Ok(p) => p,
             Err(_) => return Ok(()), // pod deleted
         };
@@ -252,14 +386,28 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Get nodes and all pods for scheduling context
-        let nodes: Vec<Node> = self.storage.list(&build_prefix("nodes", None)).await?;
+        let nodes: Vec<Node> = self.data.list_nodes().await?;
         if nodes.is_empty() {
             return Ok(());
         }
-        let all_pods: Vec<Pod> = self.storage.list(&build_prefix("pods", None)).await?;
         let priority_classes = self.load_priority_classes().await?;
+        let mut all_pods: Vec<Pod> = self.data.list_pods().await?;
+        // Stamp resolved priority onto every in-memory pod from its
+        // priorityClassName. Controller-created pods (ReplicaSet, etc.) never
+        // get spec.priority set — controllers write straight to storage,
+        // bypassing api-server priority admission — so without this the
+        // preemption victim selection and the nominated-pod space reservation
+        // (both read spec.priority directly) treat every such pod as priority 0
+        // and pick the wrong victims. Resolving here, in-memory, is what
+        // admission would have done. NOT persisted: the api-server rejects spec
+        // mutations on update.
+        self.stamp_priorities(&mut all_pods, &priority_classes);
+        // Overlay in-memory preemption nominations so the space reservation in
+        // select_node sees a just-nominated preemptor before its /status write
+        // propagates back through the informer (prevents the live-lock).
+        self.apply_nominations(&mut all_pods);
 
-        // Resolve priority
+        // Same in-memory priority resolution for the candidate being scheduled.
         let mut pod = pod;
         if pod.spec.as_ref().and_then(|s| s.priority).is_none() {
             let resolved = self.get_pod_priority_sync(&pod, &priority_classes);
@@ -267,14 +415,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 if let Some(ref mut spec) = pod.spec {
                     spec.priority = Some(resolved);
                 }
-                self.update_pod_with_retry(&pod_key, |p| {
-                    if let Some(ref mut spec) = p.spec {
-                        if spec.priority.is_none() {
-                            spec.priority = Some(resolved);
-                        }
-                    }
-                })
-                .await;
             }
         }
 
@@ -308,12 +448,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     error!("Failed to evict victim pod {}: {}", victim, e);
                 }
             }
-            self.update_pod_with_retry(&pod_key, |p| {
-                if let Some(ref mut status) = p.status {
-                    status.nominated_node_name = Some(node_name.clone());
-                }
-            })
-            .await;
+            self.nominate(&pod_key, &node_name).await;
         } else {
             // No node fits and preemption can't help — surface FailedScheduling.
             // The production path previously stayed silent here; the
@@ -345,8 +480,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         debug!("Looking for pending pods to schedule");
 
         // Get all pods
-        let prefix = build_prefix("pods", None);
-        let all_pods: Vec<Pod> = self.storage.list(&prefix).await?;
+        let all_pods: Vec<Pod> = self.data.list_pods().await?;
 
         // Filter pending pods without a node assignment that are assigned to this scheduler
         let pending_pods: Vec<Pod> = all_pods
@@ -395,8 +529,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         debug!("Found {} pending pods to schedule", pending_pods.len());
 
         // Get all nodes
-        let nodes_prefix = build_prefix("nodes", None);
-        let nodes: Vec<Node> = self.storage.list(&nodes_prefix).await?;
+        let nodes: Vec<Node> = self.data.list_nodes().await?;
 
         if nodes.is_empty() {
             warn!("No nodes available for scheduling");
@@ -427,28 +560,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // blocking all others. K8s processes pods concurrently in the
         // scheduling queue; we process sequentially but with a per-pod timeout.
         for mut pod in pending_pods {
-            // Resolve priority from PriorityClass if not explicitly set.
-            // K8s admission controller sets spec.priority from priorityClassName,
-            // but our admission doesn't always do this. Ensure it's set so
-            // preemption can check the priority correctly.
+            // Resolve priority in-memory if not explicitly set. Not persisted:
+            // the api-server rejects spec mutations on update, and on-the-fly
+            // resolution via get_pod_priority_sync (spec.priority, else the live
+            // PriorityClass map) is sufficient for every consumer. See the same
+            // note in try_schedule_pod.
             if pod.spec.as_ref().and_then(|s| s.priority).is_none() {
                 let resolved = self.get_pod_priority_sync(&pod, &priority_classes);
                 if resolved != 0 {
                     if let Some(ref mut spec) = pod.spec {
                         spec.priority = Some(resolved);
                     }
-                    // Also update in storage so preemption picks up the priority
-                    let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-                    let pod_key =
-                        rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
-                    self.update_pod_with_retry(&pod_key, |p| {
-                        if let Some(ref mut spec) = p.spec {
-                            if spec.priority.is_none() {
-                                spec.priority = Some(resolved);
-                            }
-                        }
-                    })
-                    .await;
                 }
             }
             // 5-second timeout per pod — if scheduling takes longer (e.g.,
@@ -473,7 +595,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             match schedule_result {
                 Ok(true) => {
                     // Pod bound — re-read all_pods so next pod sees updated state
-                    all_pods = self.storage.list(&prefix).await.unwrap_or_default();
+                    all_pods = self.data.list_pods().await.unwrap_or_default();
                     continue;
                 }
                 Ok(false) => {} // No node found, try preemption below
@@ -513,15 +635,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     // our architecture the RS controller may create replacement pods
                     // that steal the freed resources before the next scheduling cycle.
                     // To avoid this race, re-read cluster state and attempt binding now.
-                    all_pods = self.storage.list(&prefix).await.unwrap_or_default();
-                    let fresh_nodes: Vec<Node> =
-                        self.storage.list(&nodes_prefix).await.unwrap_or_default();
+                    all_pods = self.data.list_pods().await.unwrap_or_default();
+                    let fresh_nodes: Vec<Node> = self.data.list_nodes().await.unwrap_or_default();
 
                     // Re-read the pod for fresh state
                     let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
                     let pod_key =
                         rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
-                    let fresh_pod = self.storage.get::<Pod>(&pod_key).await.ok();
+                    let fresh_pod = self.data.get_pod(pod_ns, &pod.metadata.name).await.ok();
 
                     if let Some(fresh_pod) = fresh_pod {
                         // Try to schedule directly to the nominated node first
@@ -539,7 +660,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                     error!("Failed to bind preemptor to nominated node: {}", e);
                                     // Fall back to setting nominatedNodeName
                                     let nn = node_name.clone();
-                                    self.update_pod_with_retry(&pod_key, |p| {
+                                    self.update_pod_status_with_retry(&pod_key, |p| {
                                         if let Some(ref mut status) = p.status {
                                             status.nominated_node_name = Some(nn.clone());
                                         }
@@ -554,7 +675,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             } else {
                                 // Resources not yet free (victims still running) — set nominatedNodeName
                                 let nn = node_name.clone();
-                                self.update_pod_with_retry(&pod_key, |p| {
+                                self.update_pod_status_with_retry(&pod_key, |p| {
                                     if let Some(ref mut status) = p.status {
                                         status.nominated_node_name = Some(nn.clone());
                                     }
@@ -568,7 +689,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         } else {
                             // Node not found — set nominatedNodeName anyway
                             let nn = node_name.clone();
-                            self.update_pod_with_retry(&pod_key, |p| {
+                            self.update_pod_status_with_retry(&pod_key, |p| {
                                 if let Some(ref mut status) = p.status {
                                     status.nominated_node_name = Some(nn.clone());
                                 }
@@ -578,7 +699,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     }
 
                     // Re-read all_pods after potential binding so next pod sees updated state
-                    all_pods = self.storage.list(&prefix).await.unwrap_or_default();
+                    all_pods = self.data.list_pods().await.unwrap_or_default();
                 } else {
                     warn!(
                         "No suitable node found for pod {} (even with preemption)",
@@ -593,7 +714,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     let pod_key =
                         rusternetes_storage::build_key("pods", Some(pod_ns), &pod.metadata.name);
                     let msg = sched_message.clone();
-                    self.update_pod_with_retry(&pod_key, |p| {
+                    self.update_pod_status_with_retry(&pod_key, |p| {
                         let condition = rusternetes_common::resources::PodCondition {
                             condition_type: "PodScheduled".to_string(),
                             status: "False".to_string(),
@@ -929,51 +1050,21 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             });
         }
 
-        // Update pod in storage with retry on conflict
-        let key = rusternetes_storage::build_key(
-            "pods",
-            pod.metadata.namespace.as_deref(),
-            &pod.metadata.name,
-        );
-
-        let bound_pod = match self.storage.update(&key, &pod).await {
-            Ok(_) => {
-                info!("Successfully bound pod to node {}", node_name);
-                pod
-            }
-            Err(rusternetes_common::Error::Conflict(_)) => {
-                // ResourceVersion conflict — re-read and retry once
-                debug!("Bind conflict for pod {}, retrying", pod.metadata.name);
-                let mut fresh_pod: Pod = self.storage.get(&key).await?;
-                if let Some(ref mut spec) = fresh_pod.spec {
-                    spec.node_name = Some(node_name.to_string());
-                }
-                let condition = rusternetes_common::resources::PodCondition {
-                    condition_type: "PodScheduled".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: None,
-                    last_transition_time: Some(chrono::Utc::now()),
-                    reason: Some("Scheduled".to_string()),
-                    message: Some(format!("Successfully assigned to {}", node_name)),
-                    observed_generation: None,
-                };
-                if let Some(ref mut status) = fresh_pod.status {
-                    let conditions = status.conditions.get_or_insert_with(Vec::new);
-                    if let Some(existing) = conditions
-                        .iter_mut()
-                        .find(|c| c.condition_type == "PodScheduled")
-                    {
-                        *existing = condition;
-                    } else {
-                        conditions.push(condition);
-                    }
-                }
-                self.storage.update(&key, &fresh_pod).await?;
-                info!("Successfully bound pod to node {} (retry)", node_name);
-                fresh_pod
-            }
+        // Bind: storage mode writes the fully-mutated pod (spec.nodeName +
+        // PodScheduled condition) in one update with a re-GET-on-conflict retry;
+        // API mode POSTs the binding subresource (the only way to set the
+        // immutable spec.nodeName) and PUTs the PodScheduled condition via the
+        // status subresource. See `DataPlane::bind`.
+        let ns = pod
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        match self.data.bind(&ns, &pod, node_name).await {
+            Ok(()) => info!("Successfully bound pod to node {}", node_name),
             Err(e) => return Err(e),
-        };
+        }
+        let bound_pod = pod;
 
         // Emit the Scheduled event once on successful bind via the unified
         // recorder, regardless of which attempt succeeded — upstream's
@@ -1068,16 +1159,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// The kubelet will detect the deletionTimestamp and handle graceful shutdown.
     async fn evict_pod(&self, pod_name: &str) -> rusternetes_common::Result<()> {
         // Find the pod in all namespaces
-        let prefix = build_prefix("pods", None);
-        let all_pods: Vec<Pod> = self.storage.list(&prefix).await?;
+        let all_pods: Vec<Pod> = self.data.list_pods().await?;
 
         for mut pod in all_pods {
             if pod.metadata.name == pod_name {
-                let key = rusternetes_storage::build_key(
-                    "pods",
-                    pod.metadata.namespace.as_deref(),
-                    pod_name,
-                );
+                let pod_ns = pod
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
 
                 // Set deletionTimestamp and add DisruptionTarget condition
                 if pod.metadata.deletion_timestamp.is_none() {
@@ -1108,8 +1198,19 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         let conditions = status.conditions.get_or_insert_with(Vec::new);
                         conditions.push(disruption_condition);
                     }
-                    self.storage.update(&key, &pod).await?;
-                    info!("Evicted pod {} for preemption (set deletionTimestamp + DisruptionTarget condition)", pod_name);
+                    // Storage mode persists the whole pod (kubelet sees the
+                    // deletionTimestamp); API mode stamps DisruptionTarget via
+                    // /status then issues a real DELETE (the api-server rejects
+                    // a PUT that sets deletionTimestamp). See
+                    // DataPlane::evict_pod_for_preemption.
+                    let grace = pod.metadata.deletion_grace_period_seconds.unwrap_or(30);
+                    self.data
+                        .evict_pod_for_preemption(&pod_ns, pod_name, &pod, grace)
+                        .await?;
+                    info!(
+                        "Evicted pod {} for preemption (DisruptionTarget + termination, grace={}s)",
+                        pod_name, grace
+                    );
                 }
                 return Ok(());
             }
@@ -1123,8 +1224,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     async fn load_priority_classes(
         &self,
     ) -> rusternetes_common::Result<HashMap<String, PriorityClass>> {
-        let prefix = build_prefix("priorityclasses", None);
-        let priority_classes: Vec<PriorityClass> = self.storage.list(&prefix).await?;
+        let priority_classes: Vec<PriorityClass> = self.data.list_priority_classes().await?;
 
         let mut map = HashMap::new();
         for pc in priority_classes {
@@ -1252,6 +1352,29 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
     }
 
+    /// Stamp `spec.priority` (in-memory) on every pod that lacks it, resolving
+    /// from `priorityClassName` via the PriorityClass map. Downstream preemption
+    /// and the nominated-pod space reservation read `spec.priority` directly, so
+    /// controller-created pods (which never get it stamped by admission) must be
+    /// resolved here or they all look like priority 0. Not persisted.
+    fn stamp_priorities(
+        &self,
+        pods: &mut [Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+    ) {
+        for pod in pods.iter_mut() {
+            if pod.spec.as_ref().and_then(|s| s.priority).is_some() {
+                continue;
+            }
+            let resolved = self.get_pod_priority_sync(pod, priority_classes);
+            if resolved != 0 {
+                if let Some(spec) = pod.spec.as_mut() {
+                    spec.priority = Some(resolved);
+                }
+            }
+        }
+    }
+
     /// Get the priority value for a pod (synchronous version using pre-loaded PriorityClasses)
     /// If pod.spec.priority is set, use it directly
     /// Otherwise, look up the PriorityClass specified by pod.spec.priorityClassName
@@ -1334,11 +1457,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 return false;
             };
 
-            // Get the ResourceClaim from storage
-            let claim_key =
-                rusternetes_storage::build_key("resourceclaims", Some(pod_namespace), claim_name);
-
-            let claim: ResourceClaim = match self.storage.get(&claim_key).await {
+            // Get the ResourceClaim from the data plane.
+            let claim: ResourceClaim = match self
+                .data
+                .get_resource_claim(pod_namespace, claim_name)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
@@ -1439,8 +1563,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // Check each allocated device to ensure it's on this node
             for device_result in &allocation.devices.results {
                 // Get ResourceSlices to find which node has this device
-                let slices_prefix = build_prefix("resourceslices", None);
-                let slices: Vec<ResourceSlice> = match self.storage.list(&slices_prefix).await {
+                let slices: Vec<ResourceSlice> = match self.data.list_resource_slices().await {
                     Ok(s) => s,
                     Err(e) => {
                         warn!("Failed to list ResourceSlices: {}", e);
@@ -1498,6 +1621,20 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // All resource claims are satisfied on this node
         true
+    }
+}
+
+/// Split a `/registry/pods/{ns}/{name}` storage key into `(ns, name)`. Tolerates
+/// a missing namespace segment (defaults to `default`). The scheduler builds
+/// these keys via `build_key("pods", Some(ns), name)`, so the format is stable.
+fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
+    let rest = pod_key
+        .strip_prefix("/registry/pods/")
+        .unwrap_or(pod_key)
+        .trim_end_matches('/');
+    match rest.split_once('/') {
+        Some((ns, name)) => (ns, name),
+        None => ("default", rest),
     }
 }
 

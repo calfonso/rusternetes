@@ -22,11 +22,101 @@ if [ ! -f "$SA_KEY" ]; then
     echo "  SA public key:  $SA_PUB"
 fi
 
+# Generate the kube-scheduler client cert + kubeconfig for the in-cluster
+# static pod (Task 3 of the scheduler-in-cluster plan). Runs whether or not the
+# api-server TLS cert already exists, so it is idempotently produced on reruns.
+#
+# AUTHN INVESTIGATION (crates/api-server + crates/middleware): the api-server's
+# auth middleware (crates/middleware/src/lib.rs `auth_middleware`) authenticates
+# ONLY via the `Authorization: Bearer <token>` header (SA JWT or bootstrap
+# token); there is NO client-certificate → user/group mapping. `--client-ca-file`
+# wires an mTLS *verifier* at the rustls layer (crates/common/src/tls.rs
+# `into_mtls_server_config`), but the request handler uses
+# `app.into_make_service()` (not `_with_connect_info`), so the peer cert never
+# reaches a handler and CN/O are never turned into a user. Separately, compose
+# runs the api-server with `--skip-auth`, which injects an admin AuthContext
+# (`system:masters`) for EVERY request and bypasses the authorizer entirely.
+#
+# Consequences for the scheduler static pod:
+#   * It does NOT need client credentials — with --skip-auth every request is
+#     already admin, so authz passes. The kubeconfig only needs the CA so the
+#     scheduler can VALIDATE the api-server's self-signed serving cert.
+#   * No RBAC objects (ClusterRole/ClusterRoleBinding for system:kube-scheduler)
+#     are required, because the authorizer is not consulted under --skip-auth.
+#     bootstrap-cluster.sh therefore creates none (revisit if --skip-auth is
+#     ever dropped: then add a Bearer-token kubeconfig + RBAC, since cert authn
+#     is unimplemented — tracked as a follow-up).
+#
+# We still emit a CN=system:kube-scheduler client cert (kubeadm parity) and
+# embed it in scheduler.conf so the kubeconfig is forward-compatible the day
+# client-cert authn lands; it is simply unused by today's authenticator.
+generate_scheduler_kubeconfig() {
+    local sched_key="${CERT_DIR}/kube-scheduler.key"
+    local sched_crt="${CERT_DIR}/kube-scheduler.crt"
+    local sched_conf="${CERT_DIR}/scheduler.conf"
+    local ca_crt="${CERT_DIR}/ca.crt"
+
+    # The CA is the api-server's self-signed serving cert (CA:TRUE in cert.conf).
+    # If it does not exist yet (first run), this function is re-invoked after the
+    # api-server cert is generated below.
+    if [ ! -f "$ca_crt" ]; then
+        return 0
+    fi
+
+    if [ ! -f "$sched_crt" ] || [ ! -f "$sched_conf" ]; then
+        echo "Generating kube-scheduler client cert + kubeconfig..."
+        openssl ecparam -name prime256v1 -genkey -noout -out "$sched_key"
+        # CSR with CN=system:kube-scheduler, O=system:kube-scheduler (kubeadm
+        # parity: CN → user, O → group).
+        openssl req -new -key "$sched_key" -out "${CERT_DIR}/kube-scheduler.csr" \
+            -subj "/CN=system:kube-scheduler/O=system:kube-scheduler"
+        # Sign with the api-server CA (clientAuth EKU).
+        openssl x509 -req -in "${CERT_DIR}/kube-scheduler.csr" \
+            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -out "$sched_crt" -days 3650 \
+            -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
+        rm -f "${CERT_DIR}/kube-scheduler.csr"
+
+        local ca_b64 cert_b64 key_b64
+        ca_b64=$(base64 -w0 < "$ca_crt")
+        cert_b64=$(base64 -w0 < "$sched_crt")
+        key_b64=$(base64 -w0 < "$sched_key")
+
+        # kubeconfig pointing at the in-cluster api-server compose DNS name.
+        cat > "$sched_conf" <<KUBECONFIG
+apiVersion: v1
+kind: Config
+current-context: kube-scheduler@rusternetes
+clusters:
+- name: rusternetes
+  cluster:
+    server: https://api-server:6443
+    certificate-authority-data: ${ca_b64}
+users:
+- name: system:kube-scheduler
+  user:
+    client-certificate-data: ${cert_b64}
+    client-key-data: ${key_b64}
+contexts:
+- name: kube-scheduler@rusternetes
+  context:
+    cluster: rusternetes
+    user: system:kube-scheduler
+    namespace: kube-system
+KUBECONFIG
+        echo "  Scheduler cert:       $sched_crt (CN=system:kube-scheduler)"
+        echo "  Scheduler kubeconfig: $sched_conf"
+    fi
+}
+
 # Check if TLS certificates already exist
 if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     echo "Certificates already exist at:"
     echo "  Cert: $CERT_FILE"
     echo "  Key:  $KEY_FILE"
+    # Still (re)generate the scheduler kubeconfig — it depends on the existing
+    # CA, not on regenerating the api-server cert.
+    generate_scheduler_kubeconfig
     echo ""
     echo "To regenerate certificates, delete them first:"
     echo "  rm $CERT_FILE $KEY_FILE"
@@ -127,6 +217,10 @@ echo "Copied certificate to CoreDNS volume: ${COREDNS_CA_DIR}/ca.crt"
 
 # Also create ca.crt in certs directory for consistency
 cp "$CERT_FILE" "${CERT_DIR}/ca.crt"
+
+# Now that the api-server cert + CA exist, emit the kube-scheduler client cert
+# and kubeconfig for the in-cluster static pod.
+generate_scheduler_kubeconfig
 
 echo ""
 echo "Certificates generated successfully:"

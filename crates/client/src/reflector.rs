@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
@@ -19,15 +20,25 @@ use tokio::sync::broadcast;
 use crate::http::{ApiClient, KubernetesList};
 use crate::watch::{watch_stream, WatchEvent};
 
-/// List+watch source. `list` returns `(items, listResourceVersion)`; `watch`
-/// runs one watch session from `rv` and returns the events it produced before
-/// the stream ended, plus the final resourceVersion observed (None if the
-/// session saw no versioned event). The production impl streams; the trait
-/// batches so the reflector loop and tests share one shape.
+/// One watch event paired with the resourceVersion observed on its object
+/// (`None` for an event whose object carries no `metadata.resourceVersion`).
+pub type WatchItem<T> = Result<(WatchEvent<T>, Option<String>)>;
+
+/// List+watch source. `list` returns `(items, listResourceVersion)`.
+///
+/// `watch` opens a session from `rv` and returns a **stream** that yields
+/// events as they arrive, each paired with the object's resourceVersion. A
+/// Kubernetes watch is long-lived — it does not deliver a finite batch and
+/// then return — so the reflector MUST consume events incrementally off this
+/// stream. (The previous batch-returning shape blocked forever against a real
+/// api-server: it accumulated events and only returned once the never-ending
+/// stream closed, so the store was never updated past the initial list.)
+/// The stream ends when the server closes the watch (timeout / disconnect);
+/// the reflector's `run` loop then reconnects from the last held rv.
 #[async_trait::async_trait]
 pub trait ListWatch<T>: Send + Sync {
     async fn list(&self) -> Result<(Vec<T>, String)>;
-    async fn watch(&self, rv: Option<String>) -> Result<(Vec<WatchEvent<T>>, Option<String>)>;
+    async fn watch<'a>(&'a self, rv: Option<String>) -> Result<BoxStream<'a, WatchItem<T>>>;
 }
 
 /// Store mutation emitted to subscribers (bookmarks are not emitted).
@@ -101,7 +112,10 @@ where
     }
 
     /// One list (only when no resourceVersion is held yet) + one watch
-    /// session, applying every event to the store.
+    /// session, applying every event to the store **as it streams in**. Returns
+    /// when the watch stream ends (server timeout / disconnect); the caller's
+    /// `run` loop reconnects. An error mid-stream (e.g. the api-server's
+    /// `Expired` envelope) propagates so `run` can decide to re-list.
     pub async fn sync_once(&self) -> Result<()> {
         if self.last_rv.read().unwrap().is_none() {
             let (items, rv) = self.lw.list().await.context("reflector list")?;
@@ -115,8 +129,9 @@ where
         }
 
         let rv = self.last_rv.read().unwrap().clone();
-        let (events, final_rv) = self.lw.watch(rv).await.context("reflector watch")?;
-        for event in events {
+        let mut stream = self.lw.watch(rv).await.context("reflector watch")?;
+        while let Some(item) = stream.next().await {
+            let (event, obj_rv) = item.context("reflector watch event")?;
             match event {
                 WatchEvent::Added(obj) => {
                     self.store
@@ -139,9 +154,11 @@ where
                 // Bookmark: rv progress only — no store change, no emit.
                 WatchEvent::Bookmark(_) => {}
             }
-        }
-        if final_rv.is_some() {
-            *self.last_rv.write().unwrap() = final_rv;
+            // Advance the held rv after every event so a reconnect resumes
+            // from the last thing we actually applied.
+            if obj_rv.is_some() {
+                *self.last_rv.write().unwrap() = obj_rv;
+            }
         }
         Ok(())
     }
@@ -207,40 +224,49 @@ impl<T: DeserializeOwned + Send + Sync + 'static> ListWatch<T> for ApiListWatch 
         Ok((list.items, rv))
     }
 
-    async fn watch(&self, rv: Option<String>) -> Result<(Vec<WatchEvent<T>>, Option<String>)> {
-        // Stream as raw JSON values so each event's metadata.resourceVersion
-        // can be tracked, then decode into T.
-        let mut stream = Box::pin(
-            watch_stream::<serde_json::Value>(&self.client, &self.path, rv.as_deref()).await?,
-        );
-        let mut events = Vec::new();
-        let mut final_rv: Option<String> = None;
-        while let Some(item) = stream.next().await {
-            let event = item?;
-            let (value, is_bookmark) = match &event {
-                WatchEvent::Added(v) | WatchEvent::Modified(v) | WatchEvent::Deleted(v) => {
-                    (v.clone(), false)
-                }
-                WatchEvent::Bookmark(v) => (v.clone(), true),
+    async fn watch<'a>(&'a self, rv: Option<String>) -> Result<BoxStream<'a, WatchItem<T>>> {
+        // Stream raw JSON values so each event's metadata.resourceVersion can
+        // be extracted, then decode the object into T. Events are mapped
+        // lazily and yielded one at a time — the reflector applies each to its
+        // store as it arrives, so a never-ending watch never blocks.
+        //
+        // Bookmark frames are dropped (their payload is not a full object, only
+        // an rv marker). The reflector still advances its rv on every real
+        // Added/Modified/Deleted event, so dropping bookmarks only forgoes rv
+        // progress during fully-idle windows — acceptable here.
+        let raw =
+            watch_stream::<serde_json::Value>(&self.client, &self.path, rv.as_deref()).await?;
+        let mapped = raw.filter_map(|item| async move {
+            let event = match item {
+                Ok(e) => e,
+                Err(e) => return Some(Err(e)),
             };
-            if let Some(obj_rv) = value
+            let value = match &event {
+                WatchEvent::Added(v)
+                | WatchEvent::Modified(v)
+                | WatchEvent::Deleted(v)
+                | WatchEvent::Bookmark(v) => v.clone(),
+            };
+            if matches!(event, WatchEvent::Bookmark(_)) {
+                return None; // rv-only marker, nothing to apply
+            }
+            let obj_rv = value
                 .get("metadata")
                 .and_then(|m| m.get("resourceVersion"))
                 .and_then(|v| v.as_str())
-            {
-                final_rv = Some(obj_rv.to_string());
-            }
-            if is_bookmark {
-                continue;
-            }
-            let typed: T = serde_json::from_value(value).context("decoding watch object")?;
-            events.push(match event {
+                .map(str::to_string);
+            let typed: T = match serde_json::from_value(value).context("decoding watch object") {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            let out = match event {
                 WatchEvent::Added(_) => WatchEvent::Added(typed),
                 WatchEvent::Modified(_) => WatchEvent::Modified(typed),
                 WatchEvent::Deleted(_) => WatchEvent::Deleted(typed),
-                WatchEvent::Bookmark(_) => unreachable!("bookmarks skipped above"),
-            });
-        }
-        Ok((events, final_rv))
+                WatchEvent::Bookmark(_) => unreachable!("handled above"),
+            };
+            Some(Ok((out, obj_rv)))
+        });
+        Ok(Box::pin(mapped))
     }
 }
