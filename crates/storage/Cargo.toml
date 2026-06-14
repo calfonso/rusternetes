@@ -9,9 +9,16 @@ license.workspace = true
 default = []
 sqlite = ["dep:rhino"]
 redis = ["dep:rhino"]
+# Enables the StorageBackend::Api variant + ApiStorage adapter (Storage trait
+# over the api-server REST client). Opt-in so the default storage build (and
+# leaf consumers like the api-server) stay lean. Components running as
+# api-server clients (kubelet/controller-manager/kube-proxy, the all-in-one)
+# enable it via `rusternetes-storage/api-client`.
+api-client = ["dep:rusternetes-client"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
+rusternetes-client = { path = "../client", optional = true }
 rhino = { path = "../../rhino", optional = true }
 tokio.workspace = true
 serde.workspace = true

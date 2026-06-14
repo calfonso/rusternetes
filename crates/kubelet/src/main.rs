@@ -131,6 +131,22 @@ struct Args {
     #[arg(long, default_value = "./data/rusternetes.db")]
     data_dir: String,
 
+    /// API server URL for API mode (e.g. https://api-server:6443). When
+    /// --kubeconfig is set, the kubelet reads/writes cluster state through the
+    /// api-server (StorageBackend::Api) instead of a storage backend.
+    #[arg(long, default_value = "https://api-server:6443")]
+    api_server_url: String,
+
+    /// Path to a kubeconfig for API mode (CA + server). Presence selects API
+    /// mode (in-cluster kubelet); absent = storage mode (all-in-one / legacy).
+    #[arg(long)]
+    kubeconfig: Option<String>,
+
+    /// Skip TLS verification for the api-server connection in API mode (the
+    /// kubeconfig CA normally validates the self-signed cert).
+    #[arg(long)]
+    insecure_skip_tls_verify: bool,
+
     /// Hard eviction thresholds, upstream `<signal><op><value>` syntax.
     /// Empty string disables eviction. See module docs for details.
     #[arg(long, default_value = None)]
@@ -281,23 +297,50 @@ async fn main() -> Result<()> {
     info!("Starting Rusternetes Kubelet");
     info!("{}", runtime_config.display());
 
-    // Initialize storage
-    let storage_config = match args.storage_backend.as_str() {
-        #[cfg(feature = "sqlite")]
-        "sqlite" => {
-            info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite {
-                path: args.data_dir.clone(),
+    // Initialize storage. In API mode (--kubeconfig) the kubelet reads/writes
+    // cluster state through the api-server via StorageBackend::Api; the rest of
+    // the kubelet keeps its ordinary Arc<StorageBackend> handle unchanged.
+    let storage = if let Some(kubeconfig) = args.kubeconfig.as_deref() {
+        use rusternetes_client::http::ApiClient;
+        use rusternetes_client::kubeconfig::KubeConfig;
+
+        let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(kubeconfig))?;
+        let ca_pem = cfg.get_ca_cert_pem().ok().flatten();
+        let insecure =
+            args.insecure_skip_tls_verify || cfg.should_skip_tls_verify().unwrap_or(false);
+        info!(
+            "Kubelet API mode: api-server={}, ca={}, insecure={}",
+            args.api_server_url,
+            ca_pem.is_some(),
+            insecure
+        );
+        // --skip-auth on the api-server: the CA only validates TLS, no client
+        // credentials needed (authn tracked in #1129).
+        let client = Arc::new(ApiClient::with_tls(
+            &args.api_server_url,
+            insecure,
+            ca_pem,
+            None,
+        )?);
+        Arc::new(StorageBackend::new_api(client))
+    } else {
+        let storage_config = match args.storage_backend.as_str() {
+            #[cfg(feature = "sqlite")]
+            "sqlite" => {
+                info!("Using SQLite storage backend at: {}", args.data_dir);
+                StorageConfig::Sqlite {
+                    path: args.data_dir.clone(),
+                }
             }
-        }
-        _ => {
-            info!("Connecting to etcd: {:?}", runtime_config.etcd_endpoints);
-            StorageConfig::Etcd {
-                endpoints: runtime_config.etcd_endpoints.clone(),
+            _ => {
+                info!("Connecting to etcd: {:?}", runtime_config.etcd_endpoints);
+                StorageConfig::Etcd {
+                    endpoints: runtime_config.etcd_endpoints.clone(),
+                }
             }
-        }
+        };
+        Arc::new(StorageBackend::new(storage_config).await?)
     };
-    let storage = Arc::new(StorageBackend::new(storage_config).await?);
 
     // Discover cluster DNS IP if not provided
     let cluster_dns = match args.cluster_dns {

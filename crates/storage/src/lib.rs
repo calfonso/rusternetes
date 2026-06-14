@@ -4,6 +4,8 @@ use rusternetes_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 
+#[cfg(feature = "api-client")]
+pub mod api_storage;
 pub mod concurrency;
 pub mod etcd;
 mod event_bus;
@@ -389,6 +391,12 @@ pub enum StorageBackend {
     /// In-memory backend backed by `MemoryStorage`. Intended for unit/integration
     /// tests that need a full `ApiServerState` without an external store.
     Memory(Arc<MemoryStorage>),
+    /// API-client backend: every `Storage` call is proxied to the api-server
+    /// over REST via [`api_storage::ApiStorage`]. Lets a component run as an
+    /// api-server client (in-cluster kubelet/controller-manager/kube-proxy)
+    /// while keeping its `Arc<StorageBackend>` handle unchanged.
+    #[cfg(feature = "api-client")]
+    Api(api_storage::ApiStorage),
 }
 
 impl StorageBackend {
@@ -420,6 +428,14 @@ impl StorageBackend {
         StorageBackend::Memory(Arc::new(MemoryStorage::new()))
     }
 
+    /// Construct an API-client backend that proxies all `Storage` calls to the
+    /// api-server over REST. The component keeps an ordinary
+    /// `Arc<StorageBackend>` and never touches a real store directly.
+    #[cfg(feature = "api-client")]
+    pub fn new_api(client: Arc<rusternetes_client::http::ApiClient>) -> Self {
+        StorageBackend::Api(api_storage::ApiStorage::new(client))
+    }
+
     /// Attach an in-process event bus to the backend so internal `watch()`
     /// consumers get the in-process fast path. Only valid in a single-writer
     /// (all-in-one) process. No-op for etcd/memory: memory already has an
@@ -448,6 +464,8 @@ impl StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => s.watch_native(prefix).await,
             StorageBackend::Memory(s) => Storage::watch(s.as_ref(), prefix).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::watch(s, prefix).await,
         }
     }
 }
@@ -465,6 +483,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::create(s, key, value).await,
             StorageBackend::Memory(s) => Storage::create(s.as_ref(), key, value).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::create(s, key, value).await,
         }
     }
 
@@ -479,6 +499,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::get(s, key).await,
             StorageBackend::Memory(s) => Storage::get(s.as_ref(), key).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::get(s, key).await,
         }
     }
 
@@ -493,6 +515,54 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::update(s, key, value).await,
             StorageBackend::Memory(s) => Storage::update(s.as_ref(), key, value).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::update(s, key, value).await,
+        }
+    }
+
+    /// Status writes must reach the inner backend's `update_status` — for the
+    /// `Api` variant that routes to the `/status` subresource, which a plain
+    /// `update` (full PUT) would otherwise strip. Other backends keep the
+    /// default get+graft+update behavior.
+    async fn update_status<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::update_status(s, key, value).await,
+            // Non-API backends: replicate the trait default (graft only the
+            // incoming status onto the freshly-read object, CAS-retry on
+            // conflict) — they don't separate status, so update() persists it.
+            _ => {
+                let incoming = serde_json::to_value(value).map_err(Error::Serialization)?;
+                let new_status = incoming.get("status").cloned();
+                const MAX_ATTEMPTS: usize = 8;
+                for attempt in 0..MAX_ATTEMPTS {
+                    let mut current: serde_json::Value = Storage::get(self, key).await?;
+                    if let Some(obj) = current.as_object_mut() {
+                        match &new_status {
+                            Some(status) => {
+                                obj.insert("status".to_string(), status.clone());
+                            }
+                            None => {
+                                obj.remove("status");
+                            }
+                        }
+                    }
+                    match Storage::update::<serde_json::Value>(self, key, &current).await {
+                        Ok(updated) => {
+                            return serde_json::from_value(updated).map_err(Error::Serialization)
+                        }
+                        Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(Error::Conflict(format!(
+                    "update_status: exhausted {} CAS retries for {}",
+                    MAX_ATTEMPTS, key
+                )))
+            }
         }
     }
 
@@ -504,6 +574,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::update_raw(s, key, value).await,
             StorageBackend::Memory(s) => Storage::update_raw(s.as_ref(), key, value).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::update_raw(s, key, value).await,
         }
     }
 
@@ -515,6 +587,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::delete(s, key).await,
             StorageBackend::Memory(s) => Storage::delete(s.as_ref(), key).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::delete(s, key).await,
         }
     }
 
@@ -529,6 +603,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::list(s, prefix).await,
             StorageBackend::Memory(s) => Storage::list(s.as_ref(), prefix).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::list(s, prefix).await,
         }
     }
 
@@ -556,6 +632,10 @@ impl Storage for StorageBackend {
             StorageBackend::Memory(s) => {
                 Storage::list_paginated(s.as_ref(), prefix, limit, continue_token).await
             }
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => {
+                Storage::list_paginated(s, prefix, limit, continue_token).await
+            }
         }
     }
 
@@ -567,6 +647,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::watch(s, prefix).await,
             StorageBackend::Memory(s) => Storage::watch(s.as_ref(), prefix).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::watch(s, prefix).await,
         }
     }
 
@@ -580,6 +662,8 @@ impl Storage for StorageBackend {
             StorageBackend::Memory(s) => {
                 Storage::watch_from_revision(s.as_ref(), prefix, revision).await
             }
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::watch_from_revision(s, prefix, revision).await,
         }
     }
 
@@ -591,6 +675,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::current_revision(s).await,
             StorageBackend::Memory(s) => Storage::current_revision(s.as_ref()).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::current_revision(s).await,
         }
     }
 
@@ -602,6 +688,8 @@ impl Storage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::is_revision_compacted(s, revision).await,
             StorageBackend::Memory(s) => Storage::is_revision_compacted(s.as_ref(), revision).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => Storage::is_revision_compacted(s, revision).await,
         }
     }
 }
@@ -620,6 +708,13 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => AuthzStorage::get(s, key, namespace).await,
             StorageBackend::Memory(s) => AuthzStorage::get(s.as_ref(), key, namespace).await,
+            // The API-client backend is used by node/controller components that
+            // never run the authorizer (only the api-server does, with a real
+            // backend), so AuthzStorage is unreachable here.
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(_) => Err(Error::Internal(
+                "AuthzStorage is not supported on the API-client backend".into(),
+            )),
         }
     }
 
@@ -634,6 +729,10 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => AuthzStorage::list(s, namespace).await,
             StorageBackend::Memory(s) => AuthzStorage::list(s.as_ref(), namespace).await,
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(_) => Err(Error::Internal(
+                "AuthzStorage is not supported on the API-client backend".into(),
+            )),
         }
     }
 }

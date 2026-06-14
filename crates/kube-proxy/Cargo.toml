@@ -20,12 +20,10 @@ redis = ["rusternetes-storage/redis"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
-rusternetes-storage = { path = "../storage" }
+# api-client: StorageBackend::Api + the shared ApiStorage adapter (now lives in
+# the storage crate; resolves the old controller-manager dependency, #1146).
+rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
-# For the shared ApiStorage adapter (Storage-trait-over-REST), reused by the
-# in-cluster API-client mode. TODO(#follow-up): extract ApiStorage into a small
-# shared crate so kube-proxy doesn't depend on the whole control-plane crate.
-rusternetes-controller-manager = { path = "../controller-manager" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -34,3 +32,9 @@ clap.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies]
+# Integration tests drive the Endpoints/EndpointSlice controllers to populate
+# state kube-proxy then programs. (The lib no longer depends on it — ApiStorage
+# now lives in the storage crate.)
+rusternetes-controller-manager = { path = "../controller-manager" }

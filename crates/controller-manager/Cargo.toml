@@ -15,7 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 rusternetes-common = { path = "../common" }
-rusternetes-storage = { path = "../storage" }
+# api-client: StorageBackend::Api + the ApiStorage adapter used by run_with_api.
+rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
 rusternetes-cloud-providers = { path = "../cloud-providers", optional = true }
 tokio.workspace = true

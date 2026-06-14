@@ -171,7 +171,7 @@ services:
       - RUST_MIN_STACK=8388608
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
 
   # Kubelet 2
   kubelet2:
@@ -204,7 +204,7 @@ services:
       - RUST_MIN_STACK=8388608
       - DOCKER_HOST=unix:///run/podman/podman.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-    command: ["--node-name", "node-2", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   # Kube-proxy (host network mode for iptables)
   kube-proxy:
