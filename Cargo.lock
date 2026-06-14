@@ -4378,6 +4378,7 @@ dependencies = [
  "rand 0.9.4",
  "rcgen",
  "reqwest",
+ "rusternetes-client",
  "rusternetes-cloud-providers",
  "rusternetes-common",
  "rusternetes-storage",

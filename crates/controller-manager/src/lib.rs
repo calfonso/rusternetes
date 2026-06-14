@@ -1,7 +1,9 @@
 // Library interface for controller-manager
+pub mod api_storage;
 pub mod controllers;
 pub use controllers::*;
 
+use api_storage::ApiStorage;
 use controllers::{
     apiservice::APIServiceAvailabilityController,
     certificate_signing_request::CertificateSigningRequestController,
@@ -37,7 +39,8 @@ use controllers::{
     volume_snapshot::VolumeSnapshotController,
     vpa::VerticalPodAutoscalerController,
 };
-use rusternetes_storage::StorageBackend;
+use rusternetes_client::http::ApiClient;
+use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -49,11 +52,34 @@ pub struct ControllerManagerConfig {
     pub metrics_config: Option<HttpMetricsConfig>,
 }
 
-/// Run the controller-manager component.
-///
-/// Spawns all controllers as tokio tasks and waits for ctrl-c.
+/// Run the controller-manager against a storage backend directly (all-in-one
+/// binary's storage mode, and the standalone binary).
 pub async fn run(
     storage: Arc<StorageBackend>,
+    config: ControllerManagerConfig,
+) -> anyhow::Result<()> {
+    run_controllers(storage, config).await
+}
+
+/// Run the controller-manager as an api-server client: every controller's
+/// `Storage` calls are proxied to the api-server over REST via [`ApiStorage`],
+/// with no direct storage handle. This is the in-process counterpart of an
+/// in-cluster controller-manager — the all-in-one binary calls this with an
+/// [`ApiClient`] pointed at its embedded api-server over loopback, so
+/// dns/scheduler/controller-manager all share the same trust boundary (only
+/// the api-server touches storage).
+pub async fn run_with_api(
+    client: Arc<ApiClient>,
+    config: ControllerManagerConfig,
+) -> anyhow::Result<()> {
+    run_controllers(Arc::new(ApiStorage::new(client)), config).await
+}
+
+/// Spawn all controllers as tokio tasks and wait for ctrl-c. Generic over the
+/// storage seam so the SAME controllers run against either a real
+/// `StorageBackend` or [`ApiStorage`].
+async fn run_controllers<S: Storage + Send + Sync + 'static>(
+    storage: Arc<S>,
     config: ControllerManagerConfig,
 ) -> anyhow::Result<()> {
     info!("Starting Rusternetes Controller Manager");
