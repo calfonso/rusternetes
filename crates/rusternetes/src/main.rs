@@ -174,8 +174,24 @@ struct Args {
     client_ca_file: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The all-in-one packs the api-server, scheduler, controller-manager,
+    // kubelet, and kube-proxy into one tokio runtime. The api-server's request
+    // path (routing → admission → mutating/validating webhooks → watch fan-out)
+    // produces deep async call chains, and creating pods overflows tokio's
+    // default 2 MiB worker-thread stack (`fatal runtime error: stack overflow`).
+    // Multi-container compose runs each component as its own process and isn't
+    // affected; only the single-runtime all-in-one is. Give workers an 8 MiB
+    // stack — virtual reservation only (Linux commits stack pages lazily), so
+    // no idle-RAM cost. See #1135.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args = Args::parse();
 
     rusternetes_common::tracing::init_basic_tracing("rusternetes", &args.log_level)?;
