@@ -50,7 +50,12 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// Per-resource-type buffer for the shared watch broadcast. A subscriber that
 /// falls more than this many events behind is told to relist (see `watch`).
-const SHARED_WATCH_BUFFER: usize = 1024;
+///
+/// tokio's broadcast eagerly allocates all `N` slots up front, so this is a
+/// fixed per-watch cost (× ~one channel per resource type). 256 is ample lag
+/// tolerance for promptly-draining controllers while keeping the idle-RAM
+/// footprint small (#1138); a lagged subscriber just relists.
+const SHARED_WATCH_BUFFER: usize = 256;
 
 /// Registry of live shared upstream watches, keyed by resolved collection path.
 type SharedWatches = Arc<Mutex<HashMap<String, broadcast::Sender<Arc<WatchEvent>>>>>;
