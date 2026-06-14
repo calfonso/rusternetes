@@ -129,19 +129,21 @@ echo ""
 
 # Step 0: Template control-plane static pod manifests.
 #
-# The kube-scheduler static pod (manifests/control-plane/kube-scheduler.yaml)
-# hostPath-mounts the certs dir. Because the kubelet runs inside a compose
-# container, that hostPath must be the HOST-absolute path of .rusternetes/certs
-# (Docker resolves pod hostPaths on the host AND the kubelet stat()s it inside
-# its own container — so it has to exist at the same path on both sides; compose
-# mounts CERTS_PATH:CERTS_PATH on the node-1 kubelet). We rewrite the committed
-# @CERTS_PATH@ placeholder into the templated copy under .rusternetes/manifests,
-# which is what the node-1 kubelet's --pod-manifest-path actually mounts.
+# The kube-scheduler and kube-controller-manager static pods
+# (manifests/control-plane/*.yaml) hostPath-mount the certs dir. Because the
+# kubelet runs inside a compose container, that hostPath must be the
+# HOST-absolute path of .rusternetes/certs (Docker resolves pod hostPaths on the
+# host AND the kubelet stat()s it inside its own container — so it has to exist
+# at the same path on both sides; compose mounts CERTS_PATH:CERTS_PATH on the
+# node-1 kubelet). We rewrite the committed @CERTS_PATH@ placeholder into the
+# templated copies under .rusternetes/manifests, which is what the node-1
+# kubelet's --pod-manifest-path actually mounts. The loop below globs every
+# manifest, so new control-plane pods are picked up automatically.
 #
-# No RBAC is created for the scheduler: the api-server runs with --skip-auth
-# (admin for every request), so the authorizer is bypassed and a
-# system:kube-scheduler ClusterRoleBinding would be inert. See
-# scripts/generate-certs.sh for the full authn investigation.
+# No RBAC is created for these static pods: the api-server runs with --skip-auth
+# (admin for every request), so the authorizer is bypassed and
+# system:kube-scheduler / system:kube-controller-manager ClusterRoleBindings
+# would be inert. See scripts/generate-certs.sh for the full authn investigation.
 CERTS_PATH="$PROJECT_ROOT/.rusternetes/certs"
 export CERTS_PATH
 if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then

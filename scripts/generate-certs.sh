@@ -109,14 +109,71 @@ KUBECONFIG
     fi
 }
 
+# kube-controller-manager kubeconfig for the in-cluster static pod. Identical
+# rationale to the scheduler one above (CA-only is sufficient under
+# --skip-auth; a CN=system:kube-controller-manager client cert is emitted for
+# kubeadm parity / forward-compat but unused by today's authenticator).
+generate_controller_manager_kubeconfig() {
+    local cm_key="${CERT_DIR}/kube-controller-manager.key"
+    local cm_crt="${CERT_DIR}/kube-controller-manager.crt"
+    local cm_conf="${CERT_DIR}/controller-manager.conf"
+    local ca_crt="${CERT_DIR}/ca.crt"
+
+    if [ ! -f "$ca_crt" ]; then
+        return 0
+    fi
+
+    if [ ! -f "$cm_crt" ] || [ ! -f "$cm_conf" ]; then
+        echo "Generating kube-controller-manager client cert + kubeconfig..."
+        openssl ecparam -name prime256v1 -genkey -noout -out "$cm_key"
+        openssl req -new -key "$cm_key" -out "${CERT_DIR}/kube-controller-manager.csr" \
+            -subj "/CN=system:kube-controller-manager/O=system:kube-controller-manager"
+        openssl x509 -req -in "${CERT_DIR}/kube-controller-manager.csr" \
+            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -out "$cm_crt" -days 3650 \
+            -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
+        rm -f "${CERT_DIR}/kube-controller-manager.csr"
+
+        local ca_b64 cert_b64 key_b64
+        ca_b64=$(base64 -w0 < "$ca_crt")
+        cert_b64=$(base64 -w0 < "$cm_crt")
+        key_b64=$(base64 -w0 < "$cm_key")
+
+        cat > "$cm_conf" <<KUBECONFIG
+apiVersion: v1
+kind: Config
+current-context: kube-controller-manager@rusternetes
+clusters:
+- name: rusternetes
+  cluster:
+    server: https://api-server:6443
+    certificate-authority-data: ${ca_b64}
+users:
+- name: system:kube-controller-manager
+  user:
+    client-certificate-data: ${cert_b64}
+    client-key-data: ${key_b64}
+contexts:
+- name: kube-controller-manager@rusternetes
+  context:
+    cluster: rusternetes
+    user: system:kube-controller-manager
+    namespace: kube-system
+KUBECONFIG
+        echo "  Controller-manager cert:       $cm_crt (CN=system:kube-controller-manager)"
+        echo "  Controller-manager kubeconfig: $cm_conf"
+    fi
+}
+
 # Check if TLS certificates already exist
 if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     echo "Certificates already exist at:"
     echo "  Cert: $CERT_FILE"
     echo "  Key:  $KEY_FILE"
-    # Still (re)generate the scheduler kubeconfig — it depends on the existing
-    # CA, not on regenerating the api-server cert.
+    # Still (re)generate the scheduler + controller-manager kubeconfigs — they
+    # depend on the existing CA, not on regenerating the api-server cert.
     generate_scheduler_kubeconfig
+    generate_controller_manager_kubeconfig
     echo ""
     echo "To regenerate certificates, delete them first:"
     echo "  rm $CERT_FILE $KEY_FILE"
@@ -218,9 +275,11 @@ echo "Copied certificate to CoreDNS volume: ${COREDNS_CA_DIR}/ca.crt"
 # Also create ca.crt in certs directory for consistency
 cp "$CERT_FILE" "${CERT_DIR}/ca.crt"
 
-# Now that the api-server cert + CA exist, emit the kube-scheduler client cert
-# and kubeconfig for the in-cluster static pod.
+# Now that the api-server cert + CA exist, emit the kube-scheduler and
+# kube-controller-manager client certs + kubeconfigs for the in-cluster static
+# pods.
 generate_scheduler_kubeconfig
+generate_controller_manager_kubeconfig
 
 echo ""
 echo "Certificates generated successfully:"

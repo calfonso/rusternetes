@@ -107,6 +107,60 @@ struct Args {
     /// true because the cluster ships a self-signed api-server cert.
     #[arg(long, default_value_t = true)]
     metrics_insecure_skip_tls_verify: bool,
+
+    /// Path to a kubeconfig for API mode (CA + server URL). When set, the
+    /// controller-manager runs as an api-server client (every controller's
+    /// `Storage` calls proxy to the api-server via `ApiStorage`) with no direct
+    /// storage handle — the in-cluster static-pod path. When unset, the storage
+    /// backend is used (all-in-one / legacy compose path).
+    #[arg(long)]
+    kubeconfig: Option<String>,
+
+    /// Skip TLS verification for the api-server data-plane connection in API
+    /// mode (the kubeconfig CA normally validates the self-signed cert).
+    #[arg(long)]
+    insecure_skip_tls_verify: bool,
+}
+
+/// Run the controller-manager as an api-server client (in-cluster static pod).
+/// Resolves the api-server CA from `--kubeconfig` and the URL from
+/// `--api-server-url`, builds an [`ApiClient`], and delegates to the library's
+/// `run_with_api`, which drives every controller through `ApiStorage`.
+async fn run_api_mode(args: Args) -> Result<()> {
+    use rusternetes_client::http::ApiClient;
+    use rusternetes_client::kubeconfig::KubeConfig;
+
+    let (ca_pem, kube_insecure) = if let Some(path) = args.kubeconfig.as_deref() {
+        let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(path))?;
+        let ca = cfg.get_ca_cert_pem().ok().flatten();
+        let insecure = cfg.should_skip_tls_verify().unwrap_or(false);
+        (ca, insecure)
+    } else {
+        (None, false)
+    };
+    let insecure = args.insecure_skip_tls_verify || kube_insecure;
+    info!(
+        "Controller-manager API mode: api-server={}, ca={}, insecure={}",
+        args.api_server_url,
+        ca_pem.is_some(),
+        insecure
+    );
+
+    // The api-server runs with --skip-auth in compose, so the CA only validates
+    // the server's TLS cert; no client credentials are needed (authn is #1129).
+    let client = Arc::new(ApiClient::with_tls(
+        &args.api_server_url,
+        insecure,
+        ca_pem,
+        None,
+    )?);
+    let config = rusternetes_controller_manager::ControllerManagerConfig {
+        sync_interval: args.sync_interval,
+        // HPA metric fetches over the api-server in API mode are a follow-up
+        // (need a client-cert/token path under the static pod).
+        metrics_config: None,
+    };
+    rusternetes_controller_manager::run_with_api(client, config).await
 }
 
 #[tokio::main]
@@ -114,6 +168,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     rusternetes_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
+
+    // In-cluster static-pod path: run as an api-server client, no storage handle.
+    if args.kubeconfig.is_some() {
+        info!("Starting Rusternetes Controller Manager (API mode)");
+        return run_api_mode(args).await;
+    }
 
     info!("Starting Rusternetes Controller Manager");
 
