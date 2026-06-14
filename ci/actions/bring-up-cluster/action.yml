@@ -65,6 +65,14 @@ runs:
       run: |
         echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
         mkdir -p "$GITHUB_WORKSPACE/.rusternetes/volumes"
+        # Pre-create every host dir that compose bind-mounts, so the Docker
+        # daemon does not create it as root on `up` (the runner then can't
+        # write into it). .rusternetes/manifests holds the templated
+        # control-plane static pod YAML written by bootstrap-cluster.sh AFTER
+        # `compose up` — without this, that step dies with "Permission denied"
+        # (conformance canary red since the static-pod control-plane landed,
+        # 2026-06-12). Mirrors the volumes mkdir above.
+        mkdir -p "$GITHUB_WORKSPACE/.rusternetes/manifests"
 
     - name: Write kubeconfig
       # The repo doesn't ship a kubeconfig — it's user-maintained
