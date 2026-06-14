@@ -906,7 +906,11 @@ impl Kubelet {
             .unwrap_or_else(|_| "failed to serialize".to_string());
         debug!("Registering node with spec: {}", node_json);
 
-        // Try to create, if it exists, update it
+        // Try to create, if it exists, update it. `create`/`update` carry the
+        // node spec + labels; the node STATUS (addresses, capacity, Ready
+        // condition) is written separately via update_status because a full
+        // create/PUT strips `.status` through the api-server (storage mode is
+        // unaffected — its update_status grafts the same status).
         match self.storage.create(&key, &node).await {
             Ok(_) => info!("Node registered successfully"),
             Err(rusternetes_common::Error::AlreadyExists(_)) => {
@@ -915,6 +919,7 @@ impl Kubelet {
             }
             Err(e) => return Err(e.into()),
         }
+        self.storage.update_status(&key, &node).await?;
 
         Ok(())
     }
@@ -1105,7 +1110,9 @@ impl Kubelet {
         }
 
         if needs_write {
-            self.storage.update(&key, &node).await?;
+            // Node heartbeat is a pure status write (Ready condition, heartbeat
+            // time) — route through the /status subresource.
+            self.storage.update_status(&key, &node).await?;
         }
 
         // Collect and publish node + per-pod metrics to storage
@@ -2097,7 +2104,7 @@ impl Kubelet {
                         }
                     }
                     if !pod_status_equal(&original, &p) {
-                        let _ = self.storage.update(&key, &p).await;
+                        let _ = self.storage.update_status(&key, &p).await;
                     }
                 }
                 // Now that containers are stopped and the terminal status is
@@ -2139,7 +2146,7 @@ impl Kubelet {
                         }
                     }
                     if !pod_status_equal(&original, &p) {
-                        let _ = self.storage.update(&key, &p).await;
+                        let _ = self.storage.update_status(&key, &p).await;
                     }
                 }
             }
@@ -2189,7 +2196,7 @@ impl Kubelet {
                         }
                     }
                     if !pod_status_equal(&original, &p) {
-                        let _ = self.storage.update(&key, &p).await;
+                        let _ = self.storage.update_status(&key, &p).await;
                     }
                 }
             }
@@ -2234,7 +2241,7 @@ impl Kubelet {
                     }
                 }
                 if !pod_status_equal(&original, &p) {
-                    let _ = self.storage.update(&key, &p).await;
+                    let _ = self.storage.update_status(&key, &p).await;
                 }
             }
             debug!(
@@ -2267,7 +2274,7 @@ impl Kubelet {
                                     deadline
                                 ));
                             }
-                            let _ = self.storage.update(&key, &failed_pod).await;
+                            let _ = self.storage.update_status(&key, &failed_pod).await;
                             // Stop the pod
                             if self.runtime.is_pod_running(pod).await.unwrap_or(false) {
                                 let _ = self.runtime.stop_pod_with_grace_period(pod_name, 0).await;
@@ -2340,7 +2347,7 @@ impl Kubelet {
                                     .to_string(),
                             );
                         }
-                        let _ = self.storage.update(&key, &p).await;
+                        let _ = self.storage.update_status(&key, &p).await;
                     }
                     return Ok(());
                 }
@@ -2444,7 +2451,10 @@ impl Kubelet {
                                                                 port
                                                             ));
                                                         }
-                                                        let _ = self.storage.update(&key, &p).await;
+                                                        let _ = self
+                                                            .storage
+                                                            .update_status(&key, &p)
+                                                            .await;
                                                     }
                                                     return Ok(());
                                                 }
@@ -2631,7 +2641,7 @@ impl Kubelet {
                                         s.container_statuses = app_container_statuses;
                                         s.conditions = Some(failed_conditions);
                                     }
-                                    let _ = self.storage.update(&key, &p).await;
+                                    let _ = self.storage.update_status(&key, &p).await;
                                 }
                                 return Ok(());
                             } else {
@@ -2694,7 +2704,7 @@ impl Kubelet {
                                         s.init_container_statuses = init_statuses;
                                         s.reason = Some("PodInitializing".to_string());
                                     }
-                                    let _ = self.storage.update(&key, &p).await;
+                                    let _ = self.storage.update_status(&key, &p).await;
                                 }
                                 return Ok(());
                             }
@@ -2833,7 +2843,7 @@ impl Kubelet {
                                 start_time: Some(chrono::Utc::now()),
                             });
 
-                            if let Err(e) = self.storage.update(&key, &new_pod).await {
+                            if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                 // Retry with fresh read on conflict (K8s pattern)
                                 if e.to_string().contains("Conflict")
                                     || e.to_string().contains("mismatch")
@@ -2870,7 +2880,8 @@ impl Kubelet {
                                                 status.container_statuses = Some(cs);
                                             }
                                         }
-                                        if let Err(e2) = self.storage.update(&key, &retry_pod).await
+                                        if let Err(e2) =
+                                            self.storage.update_status(&key, &retry_pod).await
                                         {
                                             warn!("Failed to update pod {}/{} status to Running after retry: {}", namespace, pod_name, e2);
                                         }
@@ -2939,7 +2950,7 @@ impl Kubelet {
                                         status.container_statuses = Some(container_statuses);
                                         status.conditions = Some(Self::not_ready_pod_conditions());
                                     }
-                                    let _ = self.storage.update(&key, &p).await;
+                                    let _ = self.storage.update_status(&key, &p).await;
                                 }
                                 return Ok(());
                             }
@@ -3027,7 +3038,7 @@ impl Kubelet {
                                     start_time: Some(chrono::Utc::now()),
                                 });
 
-                                if let Err(e) = self.storage.update(&key, &new_pod).await {
+                                if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                     warn!(
                                     "Failed to update pod {}/{} status to container error: {}, retrying",
                                     namespace, pod_name, e
@@ -3035,7 +3046,7 @@ impl Kubelet {
                                     // CAS retry — re-read and apply status
                                     if let Ok(mut retry_pod) = self.storage.get::<Pod>(&key).await {
                                         retry_pod.status = new_pod.status.clone();
-                                        let _ = self.storage.update(&key, &retry_pod).await;
+                                        let _ = self.storage.update_status(&key, &retry_pod).await;
                                     }
                                 }
                             } else {
@@ -3184,7 +3195,7 @@ impl Kubelet {
                                     start_time: Some(chrono::Utc::now()),
                                 });
 
-                                if let Err(e) = self.storage.update(&key, &new_pod).await {
+                                if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                     warn!(
                                         "Failed to update pod {}/{} status after init failure: {}",
                                         namespace, pod_name, e
@@ -3319,7 +3330,7 @@ impl Kubelet {
                     // the next sync will retry via the Pending+is_running path.
                     // Do NOT propagate the error — that causes update_pod_status_error to
                     // set the pod to Failed, which is unrecoverable.
-                    if let Err(e) = self.storage.update(&key, &new_pod).await {
+                    if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                         warn!(
                             "Failed to update pod {}/{} to Running (will retry): {}",
                             namespace, pod_name, e
@@ -3366,7 +3377,7 @@ impl Kubelet {
                             if let Some(ref mut status) = rpod.status {
                                 status.resize = Some("InProgress".to_string());
                             }
-                            let _ = self.storage.update(&rkey, &rpod).await;
+                            let _ = self.storage.update_status(&rkey, &rpod).await;
                         }
                     }
 
@@ -3475,7 +3486,7 @@ impl Kubelet {
                                     }
                                 }
                             }
-                            let _ = self.storage.update(&rkey, &rpod).await;
+                            let _ = self.storage.update_status(&rkey, &rpod).await;
                         }
                     }
                 }
@@ -3588,7 +3599,7 @@ impl Kubelet {
                                     }
                                 }
                                 if !pod_status_equal(&original, &new_pod) {
-                                    let _ = self.storage.update(&key, &new_pod).await;
+                                    let _ = self.storage.update_status(&key, &new_pod).await;
                                 }
                                 return Ok(());
                             }
@@ -3620,7 +3631,7 @@ impl Kubelet {
                                         status.conditions = Some(Self::succeeded_pod_conditions());
                                     }
                                     if !pod_status_equal(&original, &new_pod) {
-                                        let _ = self.storage.update(&key, &new_pod).await;
+                                        let _ = self.storage.update_status(&key, &new_pod).await;
                                     }
                                     return Ok(());
                                 }
@@ -3726,7 +3737,7 @@ impl Kubelet {
                                     if let Some(ref mut status) = p.status {
                                         status.ephemeral_container_statuses = ec_statuses;
                                     }
-                                    let _ = self.storage.update(&key, &p).await;
+                                    let _ = self.storage.update_status(&key, &p).await;
                                 }
                             }
                         }
@@ -3897,7 +3908,7 @@ impl Kubelet {
                                         });
                                     }
 
-                                    let _ = self.storage.update(&key, &new_pod).await;
+                                    let _ = self.storage.update_status(&key, &new_pod).await;
 
                                     // Start again
                                     if let Err(e) = self.runtime.start_pod(&new_pod).await {
@@ -4040,7 +4051,7 @@ impl Kubelet {
                                     }
                                 }
                                 if !pod_status_equal(&original, &new_pod) {
-                                    let _ = self.storage.update(&key, &new_pod).await;
+                                    let _ = self.storage.update_status(&key, &new_pod).await;
                                 }
                                 return Ok(());
                             }
@@ -4094,7 +4105,7 @@ impl Kubelet {
                                         }
                                         status.conditions = Some(Self::succeeded_pod_conditions());
                                     }
-                                    let _ = self.storage.update(&key, &new_pod).await;
+                                    let _ = self.storage.update_status(&key, &new_pod).await;
                                     return Ok(());
                                 }
                             }
@@ -4166,7 +4177,7 @@ impl Kubelet {
                                 return Ok(());
                             }
 
-                            if let Err(e) = self.storage.update(&key, &new_pod).await {
+                            if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                 // CAS conflict — re-read and retry once
                                 debug!("Pod status update CAS conflict, retrying: {}", e);
                                 if let Ok(mut fresh_pod) = self.storage.get::<Pod>(&key).await {
@@ -4188,7 +4199,9 @@ impl Kubelet {
                                             }
                                         }
                                     }
-                                    if let Err(e2) = self.storage.update(&key, &fresh_pod).await {
+                                    if let Err(e2) =
+                                        self.storage.update_status(&key, &fresh_pod).await
+                                    {
                                         warn!("Failed to update pod status after retry: {}", e2);
                                     }
                                 }
@@ -4257,7 +4270,7 @@ impl Kubelet {
                                 status.conditions = Some(Self::succeeded_pod_conditions());
                             }
                             let key = build_key("pods", Some(namespace), pod_name);
-                            let _ = self.storage.update(&key, &new_pod).await;
+                            let _ = self.storage.update_status(&key, &new_pod).await;
                         }
                     }
                     "Never" => {
@@ -4304,7 +4317,7 @@ impl Kubelet {
                             });
                         }
                         let key = build_key("pods", Some(namespace), pod_name);
-                        let _ = self.storage.update(&key, &new_pod).await;
+                        let _ = self.storage.update_status(&key, &new_pod).await;
                     }
                     _ => {}
                 }
@@ -4509,7 +4522,7 @@ impl Kubelet {
                         s.init_container_statuses = init_statuses;
                     }
                 }
-                let _ = self.storage.update(&key, &fresh_pod).await;
+                let _ = self.storage.update_status(&key, &fresh_pod).await;
             }
         }
     }
@@ -5027,7 +5040,7 @@ impl Kubelet {
 
         // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
         if !pod_status_equal(&original, &new_pod) {
-            self.storage.update(&key, &new_pod).await?;
+            self.storage.update_status(&key, &new_pod).await?;
         }
 
         Ok(())

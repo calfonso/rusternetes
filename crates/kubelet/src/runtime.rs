@@ -1621,7 +1621,7 @@ impl ContainerRuntime {
                         status.phase = Some(rusternetes_common::types::Phase::Failed);
                         status.reason = Some("SysctlForbidden".to_string());
                         status.message = Some(message);
-                        let _ = storage.update(&pod_key, &status_pod).await;
+                        let _ = storage.update_status(&pod_key, &status_pod).await;
                     }
                 }
                 return Ok(());
@@ -1974,7 +1974,7 @@ impl ContainerRuntime {
                                 status.init_container_statuses = init_statuses;
                                 status.container_statuses = Some(container_statuses);
                             }
-                            let _ = storage.update(&pod_key, &status_pod).await;
+                            let _ = storage.update_status(&pod_key, &status_pod).await;
                         }
                     }
 
@@ -2261,7 +2261,7 @@ impl ContainerRuntime {
                                     ]);
                                 }
                             }
-                            let _ = storage.update(&pod_key, &p).await;
+                            let _ = storage.update_status(&pod_key, &p).await;
                             info!(
                                 "Pod {}/{} all containers terminated, set phase={:?}",
                                 namespace,
@@ -3035,7 +3035,7 @@ impl ContainerRuntime {
                 s.conditions = Some(Self::init_progress_conditions(&incomplete_inits));
             }
         }
-        let _ = storage.update(&pod_key, &status_pod).await;
+        let _ = storage.update_status(&pod_key, &status_pod).await;
     }
 
     /// Pod conditions for a pod whose init containers are still incomplete:
