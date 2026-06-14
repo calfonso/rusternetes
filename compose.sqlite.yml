@@ -235,9 +235,14 @@ services:
       # (ClusterIP still works — it is L3-routed through the host).
       # See crates/kube-proxy/src/iptables.rs (modprobe + sysctl on startup).
       - /lib/modules:/lib/modules:ro
+      # kube-proxy.conf (CA-only kubeconfig) for API mode — see generate-certs.sh.
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
-    command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
+    # API mode: read Services/Endpoints/EndpointSlices from the api-server via
+    # ApiStorage (no storage handle). Host-network, so the api-server is reached
+    # at its host-published port (localhost:6443), not the compose DNS name.
+    command: ["--node-name", "node-1", "--api-server-url", "https://localhost:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
 
   # DNS image, build-only. The dns binary runs as a kube-system Deployment
   # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster

@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
 use rusternetes_common::resources::{EndpointSlice, Endpoints, Pod, Service, ServiceType};
-use rusternetes_storage::{Storage, StorageBackend};
+use rusternetes_storage::Storage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::iptables::IptablesManager;
 
-/// KubeProxy manages service networking through iptables rules
-pub struct KubeProxy {
-    storage: Arc<StorageBackend>,
+/// KubeProxy manages service networking through iptables rules.
+///
+/// Generic over the storage seam so the SAME proxy runs against either a real
+/// `StorageBackend` (all-in-one) or `ApiStorage` (in-cluster compose service,
+/// reading Services/Endpoints/EndpointSlices from the api-server).
+pub struct KubeProxy<S: Storage> {
+    storage: Arc<S>,
     iptables: IptablesManager,
     /// Name of the node we're running on. Used to filter pods so we only
     /// install KUBE-HOSTPORTS DNAT rules for locally-scheduled pods.
@@ -20,9 +24,9 @@ pub struct KubeProxy {
     last_sync_hash: u64,
 }
 
-impl KubeProxy {
+impl<S: Storage> KubeProxy<S> {
     pub fn new(
-        storage: Arc<StorageBackend>,
+        storage: Arc<S>,
         cluster_cidr: String,
         nodeport_range: String,
         node_name: String,
@@ -463,7 +467,7 @@ impl KubeProxy {
     }
 }
 
-impl Drop for KubeProxy {
+impl<S: Storage> Drop for KubeProxy<S> {
     fn drop(&mut self) {
         info!("Shutting down kube-proxy");
     }

@@ -4521,6 +4521,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
+ "rusternetes-client",
  "rusternetes-common",
  "rusternetes-controller-manager",
  "rusternetes-storage",

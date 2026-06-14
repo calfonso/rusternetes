@@ -3,6 +3,8 @@ pub mod proxy;
 
 use futures::StreamExt;
 use proxy::KubeProxy;
+use rusternetes_client::http::ApiClient;
+use rusternetes_controller_manager::api_storage::ApiStorage;
 use rusternetes_storage::{Storage, StorageBackend, WorkQueue, RECONCILE_ALL_SENTINEL};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -32,11 +34,24 @@ impl Default for KubeProxyConfig {
     }
 }
 
-/// Run the kube-proxy component.
-///
-/// This is the main entry point for embedding kube-proxy in the all-in-one binary.
-/// It runs the iptables sync loop until cancelled.
+/// Run kube-proxy against a storage backend directly (all-in-one binary).
 pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyhow::Result<()> {
+    run_proxy(storage, config).await
+}
+
+/// Run kube-proxy as an api-server client: Services/Endpoints/EndpointSlices are
+/// read through [`ApiStorage`] over REST, with no direct storage handle. Used by
+/// the in-cluster compose service (host network → published api-server port).
+pub async fn run_with_api(client: Arc<ApiClient>, config: KubeProxyConfig) -> anyhow::Result<()> {
+    run_proxy(Arc::new(ApiStorage::new(client)), config).await
+}
+
+/// The kube-proxy sync loop, generic over the storage seam so the same iptables
+/// logic runs against either a real `StorageBackend` or [`ApiStorage`].
+async fn run_proxy<S: Storage + Send + Sync + 'static>(
+    storage: Arc<S>,
+    config: KubeProxyConfig,
+) -> anyhow::Result<()> {
     info!(
         "Starting Rusternetes Kube-proxy for node: {}",
         config.node_name

@@ -165,6 +165,64 @@ KUBECONFIG
     fi
 }
 
+# kube-proxy kubeconfig for the in-cluster compose service. kube-proxy runs
+# host-network, so its kubeconfig points at the host-published api-server port
+# (https://localhost:6443; cert SANs include localhost/127.0.0.1). CA-only
+# suffices under --skip-auth; a CN=system:kube-proxy client cert is emitted for
+# kubeadm parity (unused by today's authenticator).
+generate_kube_proxy_kubeconfig() {
+    local kp_key="${CERT_DIR}/kube-proxy.key"
+    local kp_crt="${CERT_DIR}/kube-proxy.crt"
+    local kp_conf="${CERT_DIR}/kube-proxy.conf"
+    local ca_crt="${CERT_DIR}/ca.crt"
+
+    if [ ! -f "$ca_crt" ]; then
+        return 0
+    fi
+
+    if [ ! -f "$kp_crt" ] || [ ! -f "$kp_conf" ]; then
+        echo "Generating kube-proxy client cert + kubeconfig..."
+        openssl ecparam -name prime256v1 -genkey -noout -out "$kp_key"
+        openssl req -new -key "$kp_key" -out "${CERT_DIR}/kube-proxy.csr" \
+            -subj "/CN=system:kube-proxy/O=system:node-proxier"
+        openssl x509 -req -in "${CERT_DIR}/kube-proxy.csr" \
+            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -out "$kp_crt" -days 3650 \
+            -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
+        rm -f "${CERT_DIR}/kube-proxy.csr"
+
+        local ca_b64 cert_b64 key_b64
+        ca_b64=$(base64 -w0 < "$ca_crt")
+        cert_b64=$(base64 -w0 < "$kp_crt")
+        key_b64=$(base64 -w0 < "$kp_key")
+
+        # Host-network kube-proxy reaches the api-server at the published port.
+        cat > "$kp_conf" <<KUBECONFIG
+apiVersion: v1
+kind: Config
+current-context: kube-proxy@rusternetes
+clusters:
+- name: rusternetes
+  cluster:
+    server: https://localhost:6443
+    certificate-authority-data: ${ca_b64}
+users:
+- name: system:kube-proxy
+  user:
+    client-certificate-data: ${cert_b64}
+    client-key-data: ${key_b64}
+contexts:
+- name: kube-proxy@rusternetes
+  context:
+    cluster: rusternetes
+    user: system:kube-proxy
+    namespace: kube-system
+KUBECONFIG
+        echo "  Kube-proxy cert:       $kp_crt (CN=system:kube-proxy)"
+        echo "  Kube-proxy kubeconfig: $kp_conf"
+    fi
+}
+
 # Check if TLS certificates already exist
 if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     echo "Certificates already exist at:"
@@ -174,6 +232,7 @@ if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     # depend on the existing CA, not on regenerating the api-server cert.
     generate_scheduler_kubeconfig
     generate_controller_manager_kubeconfig
+    generate_kube_proxy_kubeconfig
     echo ""
     echo "To regenerate certificates, delete them first:"
     echo "  rm $CERT_FILE $KEY_FILE"
@@ -275,11 +334,12 @@ echo "Copied certificate to CoreDNS volume: ${COREDNS_CA_DIR}/ca.crt"
 # Also create ca.crt in certs directory for consistency
 cp "$CERT_FILE" "${CERT_DIR}/ca.crt"
 
-# Now that the api-server cert + CA exist, emit the kube-scheduler and
-# kube-controller-manager client certs + kubeconfigs for the in-cluster static
-# pods.
+# Now that the api-server cert + CA exist, emit the kube-scheduler,
+# kube-controller-manager (static pods) and kube-proxy (host-network compose
+# service) client certs + kubeconfigs for the in-cluster components.
 generate_scheduler_kubeconfig
 generate_controller_manager_kubeconfig
+generate_kube_proxy_kubeconfig
 
 echo ""
 echo "Certificates generated successfully:"

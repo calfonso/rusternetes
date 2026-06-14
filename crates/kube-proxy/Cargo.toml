@@ -21,6 +21,11 @@ redis = ["rusternetes-storage/redis"]
 [dependencies]
 rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage" }
+rusternetes-client = { path = "../client" }
+# For the shared ApiStorage adapter (Storage-trait-over-REST), reused by the
+# in-cluster API-client mode. TODO(#follow-up): extract ApiStorage into a small
+# shared crate so kube-proxy doesn't depend on the whole control-plane crate.
+rusternetes-controller-manager = { path = "../controller-manager" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -29,6 +34,3 @@ clap.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
-
-[dev-dependencies]
-rusternetes-controller-manager = { path = "../controller-manager" }
