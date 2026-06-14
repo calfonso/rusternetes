@@ -14,6 +14,13 @@ use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{error, info};
 
+// Heap-profiling allocator (off by default; `--features dhat-heap`). Attributes
+// the all-in-one's idle RAM by backtrace for #1138. Dumps `dhat-heap.json` when
+// the profiler guard in `main` drops on a clean (SIGINT) shutdown.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes")]
 #[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]
@@ -175,6 +182,11 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Hold the dhat profiler for the whole process; it writes dhat-heap.json
+    // when dropped (after block_on returns on a SIGINT shutdown).
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     // The all-in-one packs the api-server, scheduler, controller-manager,
     // kubelet, and kube-proxy into one tokio runtime. The api-server's request
     // path (routing → admission → mutating/validating webhooks → watch fan-out)

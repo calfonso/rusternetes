@@ -30,6 +30,11 @@ redis = [
     "rusternetes-kube-proxy/redis",
     "rusternetes-dns/redis",
 ]
+# Heap profiling via dhat (off by default). Build with
+# `--features dhat-heap` to swap in dhat's allocator; on a clean shutdown
+# (SIGINT) it writes `dhat-heap.json` with per-backtrace allocation sizes,
+# used to attribute the all-in-one's idle RAM (#1138). Pure Rust — no jeprof.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }
@@ -47,3 +52,4 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+dhat = { version = "0.3", optional = true }
