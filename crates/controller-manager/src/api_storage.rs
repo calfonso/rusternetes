@@ -9,7 +9,7 @@
 //!
 //! - storage keys `/registry/{plural}/{ns}/{name}` ↔ REST paths
 //!   (`/api/v1/...` or `/apis/{group}/{version}/...`), resolved through a
-//!   built-in GVR table ([`resource_info`]);
+//!   built-in GVR table ([`static_resource_info`]) with a discovery fallback;
 //! - `get`/`list` → GET, `create` → POST, `update` → PUT, `delete` → DELETE;
 //! - `update_status` → PUT to the `/status` subresource (grafted onto a fresh
 //!   GET so a stale caller cannot clobber spec, mirroring the storage impl);
@@ -24,9 +24,12 @@
 //!   [`Storage::update_status`] will not see it stick in API mode. That is
 //!   faithful Kubernetes behavior; the fix is per-controller (use the status
 //!   subresource), not here.
-//! - **Unmapped types.** CRDs the built-in table doesn't know (VPA, volume
-//!   snapshots) return [`Error::Internal`]; wiring those (likely via discovery)
-//!   is a follow-up.
+//! - **GVR resolution.** Built-in types resolve through a static table
+//!   ([`static_resource_info`]) with no network. Types not in the table (CRDs,
+//!   aggregated APIs, and the arbitrary types the garbage collector traverses)
+//!   are resolved by loading the api-server's discovery once and caching it. A
+//!   plural that is neither built-in nor present in discovery (e.g. a CRD whose
+//!   controller runs but whose CRD is not registered) errors via [`unmapped`].
 //! - **`current_revision`/`is_revision_compacted`** are best-effort (0 / false):
 //!   no controller in this crate calls them, and `list_paginated` is a handler
 //!   concern, not a controller one.
@@ -40,25 +43,121 @@ use rusternetes_common::{Error, Result};
 use rusternetes_storage::{Storage, WatchEvent, WatchStream};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// A [`Storage`] implementation that proxies to the api-server over REST.
 pub struct ApiStorage {
     client: Arc<ApiClient>,
+    /// Discovery-resolved `plural -> (api_root, namespaced)` for types not in
+    /// the built-in [`static_resource_info`] table (CRDs, aggregated APIs, and
+    /// the arbitrary types the garbage collector traverses). `None` until the
+    /// first miss triggers a one-shot discovery load; `Some` thereafter.
+    dynamic: RwLock<Option<HashMap<String, (String, bool)>>>,
 }
 
 impl ApiStorage {
     pub fn new(client: Arc<ApiClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            dynamic: RwLock::new(None),
+        }
+    }
+
+    /// Resolve a plural to `(api_root, namespaced)`. Built-in types hit the
+    /// static table with no network; on a miss, the api-server's discovery is
+    /// loaded once and cached, then retried, so CRD/aggregated types map too.
+    async fn resolve(&self, rt: &str) -> Result<(String, bool)> {
+        if let Some((root, namespaced)) = static_resource_info(rt) {
+            return Ok((root.to_string(), namespaced));
+        }
+        // Fast path: already-loaded discovery cache.
+        if let Some(map) = self.dynamic.read().await.as_ref() {
+            return map.get(rt).cloned().ok_or_else(|| unmapped(rt));
+        }
+        // Slow path: load discovery once, cache it, then look up. A concurrent
+        // miss may load too — idempotent, last write wins.
+        let map = self.load_discovery().await;
+        let found = map.get(rt).cloned();
+        *self.dynamic.write().await = Some(map);
+        found.ok_or_else(|| unmapped(rt))
+    }
+
+    /// Like [`Self::resolve`] but yields `None` for a type the api-server does
+    /// not serve, so `list`/`watch` can mirror storage mode's "empty
+    /// collection" semantics instead of erroring (and log-spamming) on, e.g., a
+    /// CRD whose controller runs but whose CRD is not registered.
+    async fn try_resolve(&self, rt: &str) -> Option<(String, bool)> {
+        self.resolve(rt).await.ok()
+    }
+
+    /// Build `plural -> (api_root, namespaced)` from the api-server's discovery
+    /// documents: core `/api/v1`, then every group's preferred version. Best
+    /// effort — discovery failures yield an empty map (callers then error with
+    /// `unmapped`), never a panic.
+    async fn load_discovery(&self) -> HashMap<String, (String, bool)> {
+        let mut map = HashMap::new();
+        // Core group.
+        if let Ok(list) = self.client.get::<Value>("/api/v1").await {
+            ingest_resource_list(&mut map, "/api/v1", &list);
+        }
+        // Named groups: /apis -> APIGroupList, then each preferred groupVersion.
+        if let Ok(groups) = self.client.get::<Value>("/apis").await {
+            if let Some(arr) = groups.get("groups").and_then(|g| g.as_array()) {
+                for g in arr {
+                    let gv = g
+                        .get("preferredVersion")
+                        .and_then(|pv| pv.get("groupVersion"))
+                        .and_then(|v| v.as_str());
+                    if let Some(gv) = gv {
+                        let root = format!("/apis/{gv}");
+                        if let Ok(list) = self.client.get::<Value>(&root).await {
+                            ingest_resource_list(&mut map, &root, &list);
+                        }
+                    }
+                }
+            }
+        }
+        map
     }
 }
 
-/// Resolve a resource-type plural to its REST API root and namespacing.
+/// `Error` for a plural that is neither built-in nor present in discovery.
+fn unmapped(rt: &str) -> Error {
+    Error::Internal(format!(
+        "ApiStorage: resource type '{rt}' not served by the api-server (not built-in, absent from discovery)"
+    ))
+}
+
+/// Fold an `APIResourceList` (`{resources: [{name, namespaced}, ...]}`) into the
+/// dynamic map under `root`, skipping subresources (names containing `/`).
+fn ingest_resource_list(map: &mut HashMap<String, (String, bool)>, root: &str, list: &Value) {
+    let Some(resources) = list.get("resources").and_then(|r| r.as_array()) else {
+        return;
+    };
+    for r in resources {
+        let Some(name) = r.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if name.contains('/') {
+            continue; // subresource (e.g. "deployments/status")
+        }
+        let namespaced = r
+            .get("namespaced")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        map.entry(name.to_string())
+            .or_insert((root.to_string(), namespaced));
+    }
+}
+
+/// Resolve a built-in resource-type plural to its REST API root and namespacing.
 ///
-/// Mirrors the group/versions the api-server router actually serves (built-in
-/// types only). Returns `(api_root, namespaced)` where `api_root` is e.g.
-/// `/api/v1` (core) or `/apis/apps/v1`.
-fn resource_info(rt: &str) -> Result<(&'static str, bool)> {
+/// Covers the group/versions the api-server router serves natively. Returns
+/// `(api_root, namespaced)` where `api_root` is e.g. `/api/v1` (core) or
+/// `/apis/apps/v1`; `None` for non-built-in types (resolved via discovery).
+fn static_resource_info(rt: &str) -> Option<(&'static str, bool)> {
     let info = match rt {
         // core /api/v1 — namespaced
         "pods"
@@ -112,13 +211,9 @@ fn resource_info(rt: &str) -> Result<(&'static str, bool)> {
         // resource.k8s.io/v1 (DRA)
         "resourceclaims" | "resourceclaimtemplates" => ("/apis/resource.k8s.io/v1", true),
         "deviceclasses" | "resourceslices" => ("/apis/resource.k8s.io/v1", false),
-        _ => {
-            return Err(Error::Internal(format!(
-                "ApiStorage: no REST mapping for resource type '{rt}'"
-            )))
-        }
+        _ => return None,
     };
-    Ok(info)
+    Some(info)
 }
 
 /// Split a `/registry/{plural}/...` key into `(plural, remaining_segments)`.
@@ -138,36 +233,38 @@ fn parse_key(key: &str) -> Result<(String, Vec<String>)> {
     Ok((rt, parts[1..].to_vec()))
 }
 
-/// REST path for a single object key (`get`/`update`/`delete`).
-fn object_path(key: &str) -> Result<String> {
-    let (rt, rest) = parse_key(key)?;
-    let (root, namespaced) = resource_info(&rt)?;
+/// Build the REST path for a single object key (`get`/`update`/`delete`) from
+/// already-resolved `(root, namespaced)`.
+fn build_object_path(root: &str, namespaced: bool, rt: &str, rest: &[String]) -> Result<String> {
     if namespaced {
-        match rest.as_slice() {
+        match rest {
             [ns, name] => Ok(format!("{root}/namespaces/{ns}/{rt}/{name}")),
             _ => Err(Error::Internal(format!(
-                "ApiStorage: expected namespaced object key /registry/{rt}/<ns>/<name>, got {key}"
+                "ApiStorage: expected namespaced object key /registry/{rt}/<ns>/<name>"
             ))),
         }
     } else {
-        match rest.as_slice() {
+        match rest {
             [name] => Ok(format!("{root}/{rt}/{name}")),
             _ => Err(Error::Internal(format!(
-                "ApiStorage: expected cluster object key /registry/{rt}/<name>, got {key}"
+                "ApiStorage: expected cluster object key /registry/{rt}/<name>"
             ))),
         }
     }
 }
 
-/// REST collection path for an object key (drops the name) — used by `create`.
-fn collection_for_object(key: &str) -> Result<String> {
-    let (rt, rest) = parse_key(key)?;
-    let (root, namespaced) = resource_info(&rt)?;
+/// Build the REST collection path for an object key (drops the name) — `create`.
+fn build_collection_for_object(
+    root: &str,
+    namespaced: bool,
+    rt: &str,
+    rest: &[String],
+) -> Result<String> {
     if namespaced {
-        match rest.as_slice() {
+        match rest {
             [ns, _name] => Ok(format!("{root}/namespaces/{ns}/{rt}")),
             _ => Err(Error::Internal(format!(
-                "ApiStorage: expected namespaced object key for create, got {key}"
+                "ApiStorage: expected namespaced object key for create of {rt}"
             ))),
         }
     } else {
@@ -175,20 +272,39 @@ fn collection_for_object(key: &str) -> Result<String> {
     }
 }
 
-/// REST collection path for a list/watch prefix.
-fn collection_for_prefix(prefix: &str) -> Result<String> {
-    let (rt, rest) = parse_key(prefix)?;
-    let (root, namespaced) = resource_info(&rt)?;
+/// Build the REST collection path for a list/watch prefix.
+fn build_collection_for_prefix(
+    root: &str,
+    namespaced: bool,
+    rt: &str,
+    rest: &[String],
+) -> Result<String> {
     if namespaced {
-        match rest.as_slice() {
+        match rest {
             [] => Ok(format!("{root}/{rt}")),
             [ns] => Ok(format!("{root}/namespaces/{ns}/{rt}")),
             _ => Err(Error::Internal(format!(
-                "ApiStorage: unexpected list prefix {prefix}"
+                "ApiStorage: unexpected list prefix for {rt}"
             ))),
         }
     } else {
         Ok(format!("{root}/{rt}"))
+    }
+}
+
+impl ApiStorage {
+    /// Async REST path for a single object key (resolves the GVR first).
+    async fn object_path(&self, key: &str) -> Result<String> {
+        let (rt, rest) = parse_key(key)?;
+        let (root, namespaced) = self.resolve(&rt).await?;
+        build_object_path(&root, namespaced, &rt, &rest)
+    }
+
+    /// Async REST collection path for an object key (`create`).
+    async fn collection_for_object(&self, key: &str) -> Result<String> {
+        let (rt, rest) = parse_key(key)?;
+        let (root, namespaced) = self.resolve(&rt).await?;
+        build_collection_for_object(&root, namespaced, &rt, &rest)
     }
 }
 
@@ -243,7 +359,7 @@ impl Storage for ApiStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let path = collection_for_object(key)?;
+        let path = self.collection_for_object(key).await?;
         let body = serde_json::to_value(value).map_err(Error::Serialization)?;
         let created: Value = self
             .client
@@ -257,7 +373,7 @@ impl Storage for ApiStorage {
     where
         T: DeserializeOwned + Send + Sync,
     {
-        let path = object_path(key)?;
+        let path = self.object_path(key).await?;
         let v: Value = self.client.get(&path).await.map_err(map_get_err)?;
         serde_json::from_value(v).map_err(Error::Serialization)
     }
@@ -266,7 +382,7 @@ impl Storage for ApiStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let path = object_path(key)?;
+        let path = self.object_path(key).await?;
         let body = serde_json::to_value(value).map_err(Error::Serialization)?;
         let updated: Value = self.client.put(&path, &body).await.map_err(map_write_err)?;
         serde_json::from_value(updated).map_err(Error::Serialization)
@@ -281,7 +397,7 @@ impl Storage for ApiStorage {
         let incoming = serde_json::to_value(value).map_err(Error::Serialization)?;
         let new_status = incoming.get("status").cloned();
 
-        let path = object_path(key)?;
+        let path = self.object_path(key).await?;
         let mut current: Value = self.client.get(&path).await.map_err(map_get_err)?;
         if let Some(obj) = current.as_object_mut() {
             match new_status {
@@ -303,13 +419,13 @@ impl Storage for ApiStorage {
     }
 
     async fn update_raw(&self, key: &str, value: &Value) -> Result<()> {
-        let path = object_path(key)?;
+        let path = self.object_path(key).await?;
         let _: Value = self.client.put(&path, value).await.map_err(map_write_err)?;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let path = object_path(key)?;
+        let path = self.object_path(key).await?;
         let status = self
             .client
             .delete_with_options(&path, &[], None)
@@ -330,7 +446,13 @@ impl Storage for ApiStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let path = collection_for_prefix(prefix)?;
+        let (rt, rest) = parse_key(prefix)?;
+        let Some((root, namespaced)) = self.try_resolve(&rt).await else {
+            // Type not served by the api-server — mirror storage mode, where an
+            // unknown prefix simply lists empty (no error, no log spam).
+            return Ok(Vec::new());
+        };
+        let path = build_collection_for_prefix(&root, namespaced, &rt, &rest)?;
         let list: KubernetesList<Value> = self.client.get(&path).await.map_err(map_get_err)?;
         let mut out = Vec::with_capacity(list.items.len());
         for item in list.items {
@@ -362,9 +484,14 @@ impl ApiStorage {
     /// `/registry/...` form. A background task owns the `Arc<ApiClient>` and the
     /// underlying byte stream so the returned `WatchStream` is `'static`.
     async fn watch_inner(&self, prefix: &str, rv: Option<String>) -> Result<WatchStream> {
-        let (rt, _rest) = parse_key(prefix)?;
-        let (_root, namespaced) = resource_info(&rt)?;
-        let path = collection_for_prefix(prefix)?;
+        let (rt, rest) = parse_key(prefix)?;
+        let Some((root, namespaced)) = self.try_resolve(&rt).await else {
+            // Type not served — a stream that never yields, mirroring a watch on
+            // an empty storage prefix (the controller idles; any periodic
+            // relist also returns empty).
+            return Ok(futures::stream::pending().boxed());
+        };
+        let path = build_collection_for_prefix(&root, namespaced, &rt, &rest)?;
         let client = self.client.clone();
 
         let (tx, rx) = mpsc::unbounded::<Result<WatchEvent>>();
@@ -411,22 +538,36 @@ impl ApiStorage {
 mod tests {
     use super::*;
 
+    /// Resolve a built-in object key through the static table + pure builder,
+    /// mirroring the old free-fn `object_path` for test purposes.
+    fn static_object_path(key: &str) -> Result<String> {
+        let (rt, rest) = parse_key(key)?;
+        let (root, namespaced) = static_resource_info(&rt).ok_or_else(|| unmapped(&rt))?;
+        build_object_path(root, namespaced, &rt, &rest)
+    }
+
+    fn static_collection_prefix(prefix: &str) -> Result<String> {
+        let (rt, rest) = parse_key(prefix)?;
+        let (root, namespaced) = static_resource_info(&rt).ok_or_else(|| unmapped(&rt))?;
+        build_collection_for_prefix(root, namespaced, &rt, &rest)
+    }
+
     #[test]
     fn object_path_namespaced_and_cluster() {
         assert_eq!(
-            object_path("/registry/pods/default/nginx").unwrap(),
+            static_object_path("/registry/pods/default/nginx").unwrap(),
             "/api/v1/namespaces/default/pods/nginx"
         );
         assert_eq!(
-            object_path("/registry/deployments/kube-system/coredns").unwrap(),
+            static_object_path("/registry/deployments/kube-system/coredns").unwrap(),
             "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
         );
         assert_eq!(
-            object_path("/registry/nodes/node-1").unwrap(),
+            static_object_path("/registry/nodes/node-1").unwrap(),
             "/api/v1/nodes/node-1"
         );
         assert_eq!(
-            object_path("/registry/priorityclasses/high").unwrap(),
+            static_object_path("/registry/priorityclasses/high").unwrap(),
             "/apis/scheduling.k8s.io/v1/priorityclasses/high"
         );
     }
@@ -434,26 +575,54 @@ mod tests {
     #[test]
     fn collection_paths() {
         assert_eq!(
-            collection_for_prefix("/registry/replicasets/").unwrap(),
+            static_collection_prefix("/registry/replicasets/").unwrap(),
             "/apis/apps/v1/replicasets"
         );
         assert_eq!(
-            collection_for_prefix("/registry/pods/default/").unwrap(),
+            static_collection_prefix("/registry/pods/default/").unwrap(),
             "/api/v1/namespaces/default/pods"
         );
         assert_eq!(
-            collection_for_prefix("/registry/nodes/").unwrap(),
+            static_collection_prefix("/registry/nodes/").unwrap(),
             "/api/v1/nodes"
         );
+        let (rt, rest) = parse_key("/registry/pods/default/nginx").unwrap();
+        let (root, ns) = static_resource_info(&rt).unwrap();
         assert_eq!(
-            collection_for_object("/registry/pods/default/nginx").unwrap(),
+            build_collection_for_object(root, ns, &rt, &rest).unwrap(),
             "/api/v1/namespaces/default/pods"
         );
     }
 
     #[test]
-    fn unmapped_type_errors() {
-        assert!(object_path("/registry/verticalpodautoscalers/ns/v").is_err());
+    fn non_builtin_type_is_not_static() {
+        // CRD types fall through the static table (resolved via discovery at
+        // runtime); they are not hard-coded.
+        assert!(static_resource_info("verticalpodautoscalers").is_none());
+        assert!(static_object_path("/registry/verticalpodautoscalers/ns/v").is_err());
+    }
+
+    #[test]
+    fn discovery_ingest_maps_plurals_and_skips_subresources() {
+        let mut map = HashMap::new();
+        let list = serde_json::json!({
+            "resources": [
+                {"name": "volumesnapshots", "namespaced": true},
+                {"name": "volumesnapshots/status", "namespaced": true},
+                {"name": "volumesnapshotcontents", "namespaced": false},
+            ]
+        });
+        ingest_resource_list(&mut map, "/apis/snapshot.storage.k8s.io/v1", &list);
+        assert_eq!(
+            map.get("volumesnapshots"),
+            Some(&("/apis/snapshot.storage.k8s.io/v1".to_string(), true))
+        );
+        assert_eq!(
+            map.get("volumesnapshotcontents"),
+            Some(&("/apis/snapshot.storage.k8s.io/v1".to_string(), false))
+        );
+        // Subresource entry must not become its own mapping.
+        assert!(!map.contains_key("volumesnapshots/status"));
     }
 
     #[test]
