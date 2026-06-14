@@ -250,12 +250,12 @@ async fn main() -> Result<()> {
     // Give API server a moment to bind before starting clients
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    // Embedded clients (scheduler, DNS) reach the api-server over loopback,
-    // matching the trust boundary the compose path enforces: only the
-    // api-server touches storage (#1128). The self-signed loopback cert is
-    // skipped when TLS is on; skip_auth is the all-in-one default, so no
-    // bearer token is needed (real authn tracked in #1129). The port is
-    // derived from the api-server bind address; fall back to 6443.
+    // Embedded clients (scheduler, controller-manager, DNS) reach the
+    // api-server over loopback, matching the trust boundary the compose path
+    // enforces: only the api-server touches storage (#1128). The self-signed
+    // loopback cert is skipped when TLS is on; skip_auth is the all-in-one
+    // default, so no bearer token is needed (real authn tracked in #1129). The
+    // port is derived from the api-server bind address; fall back to 6443.
     let api_port = args
         .bind_address
         .rsplit(':')
@@ -282,7 +282,6 @@ async fn main() -> Result<()> {
     });
 
     // --- Controller Manager ---
-    let cm_storage = storage.clone();
     // The HPA metrics client talks to the in-process api-server over loopback
     // using client-cert mTLS (only when cert+key are configured).
     let metrics_config = args
@@ -302,8 +301,17 @@ async fn main() -> Result<()> {
         sync_interval: args.sync_interval,
         metrics_config,
     };
+    // The controller-manager reaches cluster state through the embedded
+    // api-server over the same loopback client as scheduler/DNS (#1128),
+    // rather than the StorageBackend directly.
+    let cm_client = Arc::new(rusternetes_client::http::ApiClient::new(
+        &loopback_url,
+        args.tls,
+        None,
+    )?);
+    info!("Controller manager reading cluster state from embedded api-server at {loopback_url}");
     tokio::spawn(async move {
-        if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {
+        if let Err(e) = rusternetes_controller_manager::run_with_api(cm_client, cm_config).await {
             error!("Controller manager error: {}", e);
         }
     });
