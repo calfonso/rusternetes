@@ -93,26 +93,20 @@ services:
         rhino: ./rhino
     image: rusternetes-scheduler:latest
 
-  # Controller Manager - runs controllers
+  # Controller Manager — build-only. Runs in-cluster as a static pod on node-1
+  # (manifests/control-plane/kube-controller-manager.yaml, API mode via
+  # ApiStorage); `compose --profile build build` produces
+  # rusternetes-controller-manager:latest for the static pod. It never starts
+  # under `up` (gated by the `build` profile).
   controller-manager:
+    profiles: ["build"]
     build:
       context: .
       dockerfile: Dockerfile.services
       target: controller-manager
       additional_contexts:
         rhino: ./rhino
-    container_name: rusternetes-controller-manager
-    depends_on:
-      - etcd
-      - api-server
-    networks:
-      - rusternetes-net
-    volumes:
-      # Mount CA certificate so the namespace controller can create kube-root-ca.crt ConfigMaps
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-    environment:
-      - RUST_LOG=info
-    command: ["--etcd-servers", "http://etcd:2379", "--sync-interval", "3", "--api-server-url", "https://api-server:6443"]
+    image: rusternetes-controller-manager:latest
 
   # Kubelet - node agent that manages containers
   kubelet:

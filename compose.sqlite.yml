@@ -110,8 +110,13 @@ services:
       target: scheduler
     image: rusternetes-scheduler:latest
 
-  # Controller Manager
+  # Controller Manager — build-only. Like the scheduler, it now runs in-cluster
+  # as a static pod on node-1 (manifests/control-plane/kube-controller-manager.yaml,
+  # API mode against the api-server via ApiStorage). This service exists only to
+  # build the rusternetes-controller-manager:latest image the static pod
+  # references; it never starts under `up` (gated behind the `build` profile).
   controller-manager:
+    profiles: ["build"]
     build:
       context: .
       dockerfile: Dockerfile.services
@@ -119,18 +124,7 @@ services:
         rhino: ./rhino
       args: *sccache-args
       target: controller-manager
-    container_name: rusternetes-controller-manager
-    restart: unless-stopped
-    depends_on:
-      - rhino
-      - api-server
-    networks:
-      - rusternetes-net
-    volumes:
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-    environment:
-      - RUST_LOG=info
-    command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "5", "--api-server-url", "https://api-server:6443"]
+    image: rusternetes-controller-manager:latest
 
   # Kubelet
   kubelet:
