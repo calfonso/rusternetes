@@ -869,7 +869,9 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         if daemonset.status != new_status {
             daemonset.status = new_status;
             let key = format!("/registry/daemonsets/{}/{}", namespace, name);
-            self.storage.update(&key, daemonset).await?;
+            // Status subresource: a full-object PUT strips `.status` through the
+            // api-server, so write status via update_status.
+            self.storage.update_status(&key, daemonset).await?;
         }
 
         Ok(())

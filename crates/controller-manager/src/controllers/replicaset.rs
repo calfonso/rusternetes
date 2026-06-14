@@ -760,26 +760,12 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         if updated_rs.status != new_status {
             updated_rs.status = new_status;
 
-            if let Err(e) = self.storage.update(&key, &updated_rs).await {
-                // CAS conflict — re-read and retry once
-                debug!("RS status update CAS conflict, retrying: {}", e);
-                if let Ok(mut fresh_rs) = self.storage.get::<ReplicaSet>(&key).await {
-                    let fresh_conditions =
-                        fresh_rs.status.as_ref().and_then(|s| s.conditions.clone());
-                    let retry_status = Some(ReplicaSetStatus {
-                        replicas,
-                        ready_replicas,
-                        available_replicas,
-                        fully_labeled_replicas: Some(replicas),
-                        observed_generation: fresh_rs.metadata.generation,
-                        conditions: fresh_conditions,
-                        terminating_replicas: None,
-                    });
-                    if fresh_rs.status != retry_status {
-                        fresh_rs.status = retry_status;
-                        let _ = self.storage.update(&key, &fresh_rs).await;
-                    }
-                }
+            // Status subresource write: through the api-server a full-object PUT
+            // strips `.status`, so status must go via update_status — which also
+            // does its own CAS read-modify-write, making the old manual
+            // re-read-and-retry redundant.
+            if let Err(e) = self.storage.update_status(&key, &updated_rs).await {
+                debug!("RS status update failed: {}", e);
             }
         }
 

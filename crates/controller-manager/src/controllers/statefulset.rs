@@ -937,7 +937,9 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         if statefulset.status != new_status {
             statefulset.status = new_status;
             let key = format!("/registry/statefulsets/{}/{}", namespace, name);
-            self.storage.update(&key, statefulset).await?;
+            // Status subresource: a full-object PUT strips `.status` through the
+            // api-server, so write status via update_status.
+            self.storage.update_status(&key, statefulset).await?;
         }
 
         // Ensure a ControllerRevision exists for the current template revision
