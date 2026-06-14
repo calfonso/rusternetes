@@ -418,7 +418,6 @@ async fn main() -> Result<()> {
 
     // --- DNS ---
     if !args.disable_dns {
-        let dns_storage = storage.clone();
         let dns_bind: std::net::SocketAddr = args
             .dns_bind
             .parse()
@@ -428,8 +427,23 @@ async fn main() -> Result<()> {
             tcp_bind: dns_bind,
             ..rusternetes_dns::DnsConfig::default()
         };
+        // DNS reaches cluster state through the embedded api-server over
+        // loopback rather than the StorageBackend directly, matching the
+        // trust boundary the compose path enforces (only the api-server
+        // touches storage). #1128. `api_port` is derived above for the HPA
+        // metrics client. The self-signed loopback cert is skipped when TLS
+        // is on; skip_auth is the all-in-one default, so no bearer token is
+        // needed (real authn tracked in #1129).
+        let dns_scheme = if args.tls { "https" } else { "http" };
+        let dns_api_url = format!("{dns_scheme}://127.0.0.1:{api_port}");
+        let dns_client = Arc::new(rusternetes_client::http::ApiClient::new(
+            &dns_api_url,
+            args.tls,
+            None,
+        )?);
+        info!("DNS reading cluster state from embedded api-server at {dns_api_url}");
         tokio::spawn(async move {
-            if let Err(e) = rusternetes_dns::run(dns_storage, dns_config).await {
+            if let Err(e) = rusternetes_dns::run_with_api(dns_client, dns_config).await {
                 error!("DNS server error: {}", e);
             }
         });
