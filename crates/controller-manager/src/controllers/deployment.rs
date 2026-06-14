@@ -1849,7 +1849,18 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     );
             }
 
-            self.storage.update(&key, &updated_deployment).await?;
+            // The revision annotation is metadata (a normal PUT); the replica
+            // counts/conditions are status (the /status subresource — a full PUT
+            // strips `.status` through the api-server). Write each to its own
+            // path so both persist in API mode.
+            if revision_changed {
+                self.storage.update(&key, &updated_deployment).await?;
+            }
+            if status_changed {
+                self.storage
+                    .update_status(&key, &updated_deployment)
+                    .await?;
+            }
         }
 
         debug!(

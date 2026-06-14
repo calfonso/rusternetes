@@ -298,6 +298,18 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         (**self).update(key, value).await
     }
 
+    // Must forward (not inherit the trait default), or the inner type's
+    // `update_status` override is bypassed. Notably `ApiStorage` routes status
+    // to the api-server's `/status` subresource — without this, an
+    // `Arc<ApiStorage>` would fall back to get+update (a full PUT), which the
+    // api-server strips of `.status`, silently dropping every status write.
+    async fn update_status<T>(&self, key: &str, value: &T) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        (**self).update_status(key, value).await
+    }
+
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         (**self).update_raw(key, value).await
     }
