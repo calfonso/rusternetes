@@ -149,6 +149,17 @@ fn unmapped(rt: &str) -> Error {
     ))
 }
 
+/// Query params that force an immediate (hard) delete on the api-server.
+///
+/// `Storage::delete` is unconditional removal in every backend. The api-server
+/// only removes a pod immediately when `gracePeriodSeconds=0`; otherwise it
+/// does a graceful (soft) delete that just stamps `deletionTimestamp`. Sending
+/// grace=0 keeps the Api backend's `delete` consistent with the others — see
+/// the call site in `ApiStorage::delete` for the full regression context.
+fn force_delete_query() -> Vec<(String, String)> {
+    vec![("gracePeriodSeconds".to_string(), "0".to_string())]
+}
+
 /// Fold an `APIResourceList` (`{resources: [{name, namespaced}, ...]}`) into the
 /// dynamic map under `root`, skipping subresources (names containing `/`).
 fn ingest_resource_list(map: &mut HashMap<String, (String, bool)>, root: &str, list: &Value) {
@@ -445,9 +456,22 @@ impl Storage for ApiStorage {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.object_path(key).await?;
+        // `Storage::delete` is a HARD delete in every backend (memory / rhino /
+        // etcd remove the key outright). The api-server's pod DELETE, however,
+        // defaults to GRACEFUL deletion: it merely stamps deletionTimestamp and
+        // keeps the object until a force delete arrives — it only removes the
+        // object when gracePeriodSeconds=0 (see api-server handlers/pod.rs).
+        // The kubelet runs as an api-server client (StorageBackend::Api) and
+        // calls this in `finalize_terminated_pod_storage` to complete deletion
+        // of an already-terminated, already-deletionTimestamp'd pod. Without
+        // gracePeriodSeconds=0 that final delete is a no-op: the pod lingers,
+        // the kubelet worker re-terminates it every reconcile forever, and the
+        // object is never removed (conformance "wait for pod to disappear"
+        // 300s timeouts; pod-deletion regression from #1150). Force grace=0 so
+        // the Api backend honours the same hard-delete contract as the others.
         let status = self
             .client
-            .delete_with_options(&path, &[], None)
+            .delete_with_options(&path, &force_delete_query(), None)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
         if status.is_success() {
@@ -640,6 +664,20 @@ mod tests {
         let (rt, rest) = parse_key(prefix)?;
         let (root, namespaced) = static_resource_info(&rt).ok_or_else(|| unmapped(&rt))?;
         build_collection_for_prefix(root, namespaced, &rt, &rest)
+    }
+
+    /// Regression: the Api backend's `delete` must force an immediate (hard)
+    /// delete. Without `gracePeriodSeconds=0` the api-server only soft-deletes
+    /// a pod (stamps deletionTimestamp), so the kubelet's finalize never
+    /// removes an already-terminated pod and loops forever (#1150 pod-deletion
+    /// regression — conformance "wait for pod to disappear" 300s timeouts).
+    #[test]
+    fn delete_forces_zero_grace_period() {
+        let q = force_delete_query();
+        assert!(
+            q.iter().any(|(k, v)| k == "gracePeriodSeconds" && v == "0"),
+            "ApiStorage::delete must send gracePeriodSeconds=0 for a hard delete, got {q:?}"
+        );
     }
 
     #[test]
