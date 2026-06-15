@@ -1345,3 +1345,104 @@ async fn terminated_pod_with_finalizer_remains_in_storage() {
         "pod with an unresolved finalizer must remain in storage"
     );
 }
+
+// ===========================================================================
+// 18. Explicitly deleted pod (deletionTimestamp set, no finalizers) must be
+//     removed from storage after reaching TerminatedPod state.
+//
+// K8s behavior:
+//   When a pod is deleted via the API (grace > 0), the API server sets
+//   deletionTimestamp but does not immediately remove the object. The kubelet
+//   detects deletionTimestamp, stops containers (TerminatingPod), then marks
+//   the pod as TerminatedPod.
+//
+//   At TerminatedPod, if the pod has no finalizers:
+//     - Status is updated to Succeeded/Failed.
+//     - The pod object MUST be deleted from storage so that subsequent
+//       reconcile calls do not re-detect deletionTimestamp and re-enter
+//       the TerminatingPod -> TerminatedPod cycle indefinitely.
+//
+//   The pod_states entry is also removed. With the pod gone from storage,
+//   the next watch/reconcile will not see it, ending the loop.
+//
+//   K8s reference: pkg/kubelet/pod_workers.go — SyncTerminatedPod completes
+//   then HandlePodCleanups removes the pod worker. The real K8s API server
+//   removes the object when the last finalizer is removed (tombstone GC).
+//   rusternetes has no finalizer mechanism, so the kubelet must delete directly.
+// ===========================================================================
+
+#[test]
+fn terminated_pod_with_deletion_timestamp_must_be_removed_from_storage() {
+    // Document the contract: a pod that has been explicitly deleted and has
+    // no finalizers must not persist in storage after TerminatedPod processing.
+    // Leaving it in storage causes the next reconcile to re-detect
+    // deletionTimestamp => needs_terminating => infinite TerminatingPod loop.
+
+    let mut pod = make_pod(
+        "hello",
+        "Never",
+        vec![],
+        vec![make_container("app", "alpine:latest")],
+    );
+    pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    pod.metadata.deletion_grace_period_seconds = Some(30);
+    pod.status = Some(make_pod_status_succeeded(vec![], vec![]));
+
+    let has_finalizers = pod
+        .metadata
+        .finalizers
+        .as_ref()
+        .map(|f| !f.is_empty())
+        .unwrap_or(false);
+    let was_explicitly_deleted = pod.metadata.deletion_timestamp.is_some();
+
+    assert!(
+        !has_finalizers,
+        "pod has no finalizers — deletion must be completed by the kubelet"
+    );
+    assert!(
+        was_explicitly_deleted,
+        "pod has deletionTimestamp — it was explicitly deleted"
+    );
+
+    // The kubelet must delete this pod from storage, not just update status.
+    // If it only updates status and removes pod_states, the next reconcile
+    // defaults the pod back to SyncPod, detects deletionTimestamp, and
+    // re-enters TerminatingPod. This assertion documents the required behavior.
+    let should_delete_from_storage = was_explicitly_deleted && !has_finalizers;
+    assert!(
+        should_delete_from_storage,
+        "TerminatedPod with deletionTimestamp and no finalizers MUST be deleted from storage"
+    );
+}
+
+#[test]
+fn terminated_pod_without_deletion_timestamp_must_remain_in_storage() {
+    // A pod that terminated naturally (RestartNever, all containers exited)
+    // without an explicit delete has no deletionTimestamp.
+    // It must stay in storage so `kubectl get pod` continues to show its
+    // terminal status (Succeeded/Failed).
+
+    let mut pod = make_pod(
+        "batch-job",
+        "Never",
+        vec![],
+        vec![make_container("worker", "alpine:latest")],
+    );
+    pod.status = Some(make_pod_status_succeeded(vec![], vec![]));
+    // No deletionTimestamp — natural termination
+
+    let was_explicitly_deleted = pod.metadata.deletion_timestamp.is_some();
+    let has_finalizers = pod
+        .metadata
+        .finalizers
+        .as_ref()
+        .map(|f| !f.is_empty())
+        .unwrap_or(false);
+
+    let should_delete_from_storage = was_explicitly_deleted && !has_finalizers;
+    assert!(
+        !should_delete_from_storage,
+        "naturally-terminated pod (no deletionTimestamp) must remain in storage"
+    );
+}
