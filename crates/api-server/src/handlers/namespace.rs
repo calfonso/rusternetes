@@ -338,6 +338,33 @@ pub async fn update(
         Err(e) => return Err(e),
     };
 
+    // Namespace finalization removal — mirrors upstream
+    // `ShouldDeleteNamespaceDuringUpdate`
+    // (pkg/registry/core/namespace/storage/storage.go, release-1.35):
+    //   len(ns.Spec.Finalizers) == 0 && ShouldDeleteDuringUpdate(...)
+    // i.e. once the finalizer list drains AND the namespace is already
+    // Terminating (deletionTimestamp set), the object is removed from storage.
+    // This route also serves the `/api/v1/namespaces/:name/finalize`
+    // subresource, which is exactly how the namespace controller completes
+    // deletion. Without this, every namespace leaked `Terminating` forever and
+    // the controller spun re-deleting them on false `Ok` (#1161). rusternetes
+    // keeps the lifecycle finalizer in `metadata.finalizers`, so check there.
+    let terminating = result.metadata.deletion_timestamp.is_some();
+    let no_finalizers = result
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_none_or(|f| f.is_empty());
+    if terminating && no_finalizers {
+        match state.storage.delete(&key).await {
+            Ok(_) => info!(
+                "Namespace {} finalized (finalizers drained) — removed from storage",
+                name
+            ),
+            Err(e) => warn!("Failed to remove finalized namespace {}: {}", name, e),
+        }
+    }
+
     Ok(Json(result))
 }
 
