@@ -151,7 +151,7 @@ async fn run_api_mode(args: Args) -> Result<()> {
     let client = Arc::new(ApiClient::with_tls(
         &args.api_server_url,
         insecure,
-        ca_pem,
+        ca_pem.clone(),
         None,
     )?);
     let config = rusternetes_controller_manager::ControllerManagerConfig {
@@ -159,6 +159,10 @@ async fn run_api_mode(args: Args) -> Result<()> {
         // HPA metric fetches over the api-server in API mode are a follow-up
         // (need a client-cert/token path under the static pod).
         metrics_config: None,
+        // The namespace controller can't read the CA from the api-server's
+        // cert paths in its own container — hand it the kubeconfig-resolved CA
+        // so it can (re)create kube-root-ca.crt in every namespace.
+        ca_cert_pem: ca_pem.and_then(|b| String::from_utf8(b).ok()),
     };
     rusternetes_controller_manager::run_with_api(client, config).await
 }
@@ -645,8 +649,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start Namespace controller (watch-based)
-    let namespace_controller = Arc::new(NamespaceController::new(storage.clone()));
+    // Start Namespace controller (watch-based). Hand it the CA cert so it can
+    // (re)create kube-root-ca.crt in every namespace (read from pki_dir, the
+    // same dir the metrics/cert paths use above).
+    let ns_ca = std::fs::read_to_string(format!("{}/ca.crt", args.pki_dir)).ok();
+    let namespace_controller =
+        Arc::new(NamespaceController::new(storage.clone()).with_ca_cert(ns_ca));
     spawn_controller!("Namespace controller", leader_elector, {
         let controller = namespace_controller.clone();
         async move {

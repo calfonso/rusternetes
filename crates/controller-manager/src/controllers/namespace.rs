@@ -85,11 +85,29 @@ struct GvrDeletionMetadata {
 /// 4. Allows the namespace to be deleted
 pub struct NamespaceController<S: Storage> {
     storage: Arc<S>,
+    /// Cluster CA cert PEM, used to (re)create the `kube-root-ca.crt` ConfigMap
+    /// in every namespace (upstream `rootcacertpublisher`). The controller-
+    /// manager container does not have the CA at the api-server's hardcoded
+    /// paths, so it is threaded in from the resolved kubeconfig CA. `None`
+    /// falls back to the legacy file-path reads (used by unit tests).
+    ca_cert: Option<String>,
 }
 
 impl<S: Storage + 'static> NamespaceController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            ca_cert: None,
+        }
+    }
+
+    /// Provide the cluster CA cert PEM so the controller can (re)create
+    /// `kube-root-ca.crt`. Without it the controller cannot read the CA (its
+    /// container lacks the api-server's cert paths) and recreation-on-delete
+    /// silently no-ops (#1161-adjacent: kube-root-ca conformance test).
+    pub fn with_ca_cert(mut self, ca_cert: Option<String>) -> Self {
+        self.ca_cert = ca_cert.filter(|s| !s.is_empty());
+        self
     }
 
     /// Work-queue-based run loop. Watch events enqueue resource keys;
@@ -230,9 +248,14 @@ impl<S: Storage + 'static> NamespaceController<S> {
         // K8s rootcacertpublisher checks if the data matches and updates if not.
         // See: pkg/controller/certificates/rootcacertpublisher/publisher.go:syncNamespace()
         let cm_key = build_key("configmaps", Some(name), "kube-root-ca.crt");
-        let ca_cert = std::fs::read_to_string("/etc/kubernetes/pki/ca.crt")
-            .or_else(|_| std::fs::read_to_string("/root/.rusternetes/certs/ca.crt"))
-            .unwrap_or_else(|_| "".to_string());
+        // Prefer the CA threaded in from the resolved kubeconfig; fall back to
+        // the api-server's hardcoded cert paths (present only when the
+        // controller shares the api-server's filesystem, e.g. some tests).
+        let ca_cert = self.ca_cert.clone().unwrap_or_else(|| {
+            std::fs::read_to_string("/etc/kubernetes/pki/ca.crt")
+                .or_else(|_| std::fs::read_to_string("/root/.rusternetes/certs/ca.crt"))
+                .unwrap_or_default()
+        });
         if !ca_cert.is_empty() {
             let expected_data = serde_json::json!({ "ca.crt": ca_cert });
             match self.storage.get::<serde_json::Value>(&cm_key).await {
@@ -992,6 +1015,70 @@ mod tests {
         let resource_types = ["pods", "services", "configmaps", "secrets", "deployments"];
         assert!(resource_types.contains(&"pods"));
         assert!(resource_types.contains(&"services"));
+    }
+
+    /// kube-root-ca.crt must be created in an active namespace and RECREATED
+    /// after deletion, given the controller has the CA threaded in. Regression
+    /// for the `[sig-auth] ServiceAccounts should guarantee kube-root-ca.crt
+    /// exist in any namespace [Conformance]` failure: the controller-manager
+    /// container lacks the api-server's cert paths, so without the threaded CA
+    /// it silently skipped (re)creation.
+    #[tokio::test]
+    async fn test_reconcile_creates_and_recreates_kube_root_ca() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller =
+            NamespaceController::new(storage.clone()).with_ca_cert(Some("CA-PEM-DATA".to_string()));
+
+        let ns = Namespace::new("active-ns");
+        let ns_key = build_key("namespaces", None, "active-ns");
+        storage.create(&ns_key, &ns).await.unwrap();
+
+        let cm_key = build_key("configmaps", Some("active-ns"), "kube-root-ca.crt");
+
+        // First reconcile: configmap created with the CA data.
+        controller.reconcile_namespace(&ns).await.unwrap();
+        let cm: serde_json::Value = storage
+            .get(&cm_key)
+            .await
+            .expect("kube-root-ca.crt must be created in an active namespace");
+        assert_eq!(
+            cm.pointer("/data/ca.crt").and_then(|v| v.as_str()),
+            Some("CA-PEM-DATA")
+        );
+
+        // Delete it, then reconcile again: it must be RECREATED.
+        storage.delete(&cm_key).await.unwrap();
+        assert!(storage.get::<serde_json::Value>(&cm_key).await.is_err());
+        controller.reconcile_namespace(&ns).await.unwrap();
+        let cm2: serde_json::Value = storage
+            .get(&cm_key)
+            .await
+            .expect("kube-root-ca.crt must be RECREATED after deletion");
+        assert_eq!(
+            cm2.pointer("/data/ca.crt").and_then(|v| v.as_str()),
+            Some("CA-PEM-DATA")
+        );
+    }
+
+    /// Without a threaded CA (and no cert files), the controller cannot publish
+    /// kube-root-ca.crt — it must skip silently rather than create an empty/
+    /// invalid ConfigMap.
+    #[tokio::test]
+    async fn test_reconcile_skips_kube_root_ca_without_ca() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = NamespaceController::new(storage.clone());
+
+        let ns = Namespace::new("no-ca-ns");
+        let ns_key = build_key("namespaces", None, "no-ca-ns");
+        storage.create(&ns_key, &ns).await.unwrap();
+
+        controller.reconcile_namespace(&ns).await.unwrap();
+        // No CA available (paths absent in test env) → no configmap written.
+        let cm_key = build_key("configmaps", Some("no-ca-ns"), "kube-root-ca.crt");
+        assert!(
+            storage.get::<serde_json::Value>(&cm_key).await.is_err(),
+            "must not publish kube-root-ca.crt without a CA"
+        );
     }
 
     #[test]

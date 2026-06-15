@@ -325,9 +325,17 @@ async fn async_main() -> Result<()> {
                 insecure_skip_tls_verify: true,
             }
         });
+    // CA cert PEM for the namespace controller's kube-root-ca.crt publisher.
+    // Read from the configured CA file (falling back to the serving cert).
+    let cm_ca_pem = args
+        .client_ca_file
+        .as_ref()
+        .or(args.tls_cert_file.as_ref())
+        .and_then(|p| std::fs::read_to_string(p).ok());
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
         metrics_config,
+        ca_cert_pem: cm_ca_pem,
     };
     // The controller-manager reaches cluster state through the embedded
     // api-server over the same loopback client as scheduler/DNS (#1128),

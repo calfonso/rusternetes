@@ -49,6 +49,10 @@ pub struct ControllerManagerConfig {
     /// Metrics client config for the HPA controller. When `None`,
     /// `HttpMetricsConfig::default()` is used (api-server:6443 + /etc/kubernetes/pki).
     pub metrics_config: Option<HttpMetricsConfig>,
+    /// Cluster CA cert PEM, threaded to the namespace controller so it can
+    /// (re)create `kube-root-ca.crt` in every namespace. `None` falls back to
+    /// the legacy cert-file paths.
+    pub ca_cert_pem: Option<String>,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -312,8 +316,9 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
     });
 
     let s = storage.clone();
+    let ns_ca = config.ca_cert_pem.clone();
     tokio::spawn(async move {
-        let c = Arc::new(NamespaceController::new(s));
+        let c = Arc::new(NamespaceController::new(s).with_ca_cert(ns_ca));
         if let Err(e) = c.run().await {
             error!("Namespace controller error: {}", e);
         }
