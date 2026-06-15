@@ -60,7 +60,7 @@ runs:
       run: |
         bash scripts/generate-certs.sh
 
-    - name: Set KUBELET_VOLUMES_PATH
+    - name: Set KUBELET_VOLUMES_PATH and CERTS_PATH
       shell: bash
       run: |
         echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
@@ -73,6 +73,20 @@ runs:
         # (conformance canary red since the static-pod control-plane landed,
         # 2026-06-12). Mirrors the volumes mkdir above.
         mkdir -p "$GITHUB_WORKSPACE/.rusternetes/manifests"
+        # CERTS_PATH MUST be set before the first `compose up`. The kubelet
+        # bind-mounts certs at ${CERTS_PATH}:${CERTS_PATH} (compose.sqlite.yml)
+        # so the kube-scheduler / kube-controller-manager static pods can
+        # hostPath-mount the certs dir at an absolute path that resolves
+        # identically inside the kubelet container and on the Docker host.
+        # bootstrap-cluster.sh templates that same host-absolute path into the
+        # static-pod manifests. If CERTS_PATH is unset at `up` time the kubelet
+        # falls back to mounting certs at /etc/rusternetes/certs, the manifest
+        # hostPath ($GITHUB_WORKSPACE/.rusternetes/certs) then fails the
+        # kubelet's existence check, and both control-plane static pods hang in
+        # Pending forever — no scheduler, no controller-manager, broken cluster
+        # under conformance (#1153). Export it here so every `up` in this action
+        # (initial + gateway restart) mounts certs at the host-absolute path.
+        echo "CERTS_PATH=$GITHUB_WORKSPACE/.rusternetes/certs" >> "$GITHUB_ENV"
 
     - name: Write kubeconfig
       # The repo doesn't ship a kubeconfig — it's user-maintained
@@ -193,6 +207,10 @@ runs:
       run: |
         echo "DOCKER_GATEWAY=${{ steps.discover-gateway.outputs.gateway }}" > .env
         echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> .env
+        # Persist CERTS_PATH (set in GITHUB_ENV before the first `up`) into .env
+        # too, so compose interpolation and any manual re-up keep mounting certs
+        # at the host-absolute path the static-pod manifests reference (#1153).
+        echo "CERTS_PATH=${CERTS_PATH}" >> .env
         if [ -n "${RUSTERNETES_IMAGE_TAG:-}" ]; then
           echo "RUSTERNETES_IMAGE_TAG=${RUSTERNETES_IMAGE_TAG}" >> .env
         fi
@@ -238,6 +256,35 @@ runs:
     - name: Bootstrap cluster (CoreDNS, services, SA tokens)
       shell: bash
       run: bash scripts/bootstrap-cluster.sh
+
+    - name: Verify control-plane static pods are Running
+      # The kube-scheduler / kube-controller-manager static pods must reach
+      # Running before handing off to hydrophone. If they hang Pending (e.g.
+      # the CERTS_PATH hostPath regression #1153), nothing schedules and
+      # Deployments never expand — conformance then runs against a broken
+      # control plane and reports meaningless junk. Fail fast here instead.
+      shell: bash
+      run: |
+        set +e
+        pods="kube-controller-manager-node-1 kube-scheduler-node-1"
+        for i in $(seq 1 60); do
+          ok=1
+          for p in $pods; do
+            phase=$(kubectl get pod "$p" -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null)
+            [ "$phase" = "Running" ] || ok=0
+          done
+          if [ "$ok" -eq 1 ]; then
+            echo "control-plane static pods Running after ${i} attempts"
+            kubectl get pods -n kube-system -o wide
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "control-plane static pods did not reach Running — dumping diagnostics:"
+        kubectl get pods -n kube-system -o wide || true
+        for p in $pods; do kubectl describe pod "$p" -n kube-system || true; done
+        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} logs --tail=80 kubelet || true
+        exit 1
 
     - name: Install Hydrophone
       # Pinned binary; callers expect it on PATH after this action runs.
