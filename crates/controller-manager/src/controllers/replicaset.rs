@@ -408,6 +408,9 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         // pod watch event or 5s resync) would `list` before the prior create
         // was visible, see current<desired again, and create a duplicate.
         let exp_key = Self::expectation_key(replicaset);
+        // Captures a pod-creation error (e.g. quota exceeded) so it can be
+        // surfaced as the ReplicaFailure status condition instead of aborting.
+        let mut create_failure: Option<String> = None;
         if !self.expectations_satisfied(&exp_key) {
             debug!(
                 "ReplicaSet {}/{}: expectations unmet, deferring create/delete this sync",
@@ -428,7 +431,16 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                     // The create never landed — don't wait forever to observe
                     // a pod that won't appear.
                     self.observe_creation(&exp_key);
-                    return Err(e);
+                    // Don't abort: surface the failure as a ReplicaFailure
+                    // condition (e.g. quota exceeded), mirroring the RC
+                    // controller and upstream `pkg/controller/replicaset`
+                    // (`manageReplicas` records the create error into the
+                    // ReplicaFailure condition rather than failing the sync).
+                    error!(
+                        "Failed to create pod for replicaset {}/{}: {}",
+                        namespace, replicaset.metadata.name, e
+                    );
+                    create_failure = Some(e.to_string());
                 }
             }
         } else if current_replicas > desired_replicas {
@@ -486,6 +498,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             final_current_replicas,
             final_ready_count,
             final_available_count,
+            create_failure.as_deref(),
         )
         .await?;
 
@@ -724,6 +737,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         replicas: i32,
         ready_replicas: i32,
         available_replicas: i32,
+        failure_message: Option<&str>,
     ) -> rusternetes_common::Result<()> {
         let namespace = replicaset
             .metadata
@@ -739,11 +753,34 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             Err(_) => replicaset.clone(),
         };
 
-        // Preserve existing conditions (user/test-set) instead of wiping them
-        let existing_conditions = updated_rs
+        // Manage the `ReplicaFailure` condition: keep any conditions of other
+        // types (user/test-set), drop our previous ReplicaFailure, and re-add
+        // it only while a pod-creation failure persists. Mirrors the RC
+        // controller and upstream `pkg/controller/replicaset` (sets
+        // ReplicaFailure=True/FailedCreate when manageReplicas hits a create
+        // error such as exceeded quota, clears it once creates succeed).
+        let mut conditions: Vec<rusternetes_common::resources::ReplicaSetCondition> = updated_rs
             .status
             .as_ref()
-            .and_then(|s| s.conditions.clone());
+            .and_then(|s| s.conditions.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.condition_type != "ReplicaFailure")
+            .collect();
+        if let Some(msg) = failure_message {
+            conditions.push(rusternetes_common::resources::ReplicaSetCondition {
+                condition_type: "ReplicaFailure".to_string(),
+                status: "True".to_string(),
+                last_transition_time: Some(chrono::Utc::now()),
+                reason: Some("FailedCreate".to_string()),
+                message: Some(msg.to_string()),
+            });
+        }
+        let conditions = if conditions.is_empty() {
+            None
+        } else {
+            Some(conditions)
+        };
 
         let new_status = Some(ReplicaSetStatus {
             replicas,
@@ -751,7 +788,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             available_replicas,
             fully_labeled_replicas: Some(replicas),
             observed_generation: updated_rs.metadata.generation,
-            conditions: existing_conditions,
+            conditions,
             terminating_replicas: None,
         });
 
@@ -979,6 +1016,54 @@ mod tests {
 
         let pod_with_labels = make_pod("test-pod", labels);
         assert_eq!(pod_with_labels.metadata.name, "test-pod");
+    }
+
+    /// Regression for `[sig-apps] ReplicaSet should surface a failure condition
+    /// on a common issue like exceeded quota`: a pod-creation failure must be
+    /// surfaced as a `ReplicaFailure`/`FailedCreate` status condition, and
+    /// cleared once creates succeed. (MemoryStorage can't deny on quota, so we
+    /// exercise the status path directly.)
+    #[tokio::test]
+    async fn test_update_status_sets_and_clears_replica_failure() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 10);
+        let labels = make_labels(&[("app", "rf")]);
+        let rs = make_replicaset("rf-rs", labels, 1);
+        let rs_key = build_key("replicasets", Some("default"), "rf-rs");
+        storage.create(&rs_key, &rs).await.unwrap();
+
+        // Failure present → ReplicaFailure=True / FailedCreate.
+        controller
+            .update_status(
+                &rs,
+                0,
+                0,
+                0,
+                Some("pods \"x\" is forbidden: exceeded quota"),
+            )
+            .await
+            .unwrap();
+        let after: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        let cond = after
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|cs| cs.iter().find(|c| c.condition_type == "ReplicaFailure"))
+            .expect("ReplicaFailure condition must be set on a pod-create failure");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("FailedCreate"));
+        assert!(cond.message.as_deref().unwrap_or("").contains("quota"));
+
+        // Failure resolved → ReplicaFailure cleared.
+        controller.update_status(&rs, 1, 1, 1, None).await.unwrap();
+        let after2: ReplicaSet = storage.get(&rs_key).await.unwrap();
+        let has_rf = after2
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .map(|cs| cs.iter().any(|c| c.condition_type == "ReplicaFailure"))
+            .unwrap_or(false);
+        assert!(!has_rf, "ReplicaFailure must clear once creates succeed");
     }
 
     #[tokio::test]
