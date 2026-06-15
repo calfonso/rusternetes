@@ -163,6 +163,18 @@ runs:
             # imagePullPolicy IfNotPresent — retag the pulled GHCR image so
             # the kubelet's local-image lookup finds it.
             docker tag "ghcr.io/indyjonesnl/rusternetes/dns:$IMAGE_TAG" rusternetes-dns:latest
+            # Same problem for the control-plane STATIC PODS (landed 2026-06-12):
+            # manifests/control-plane/{kube-controller-manager,kube-scheduler}.yaml
+            # hardcode `image: rusternetes-{controller-manager,scheduler}:latest`
+            # with imagePullPolicy IfNotPresent. Under the GHCR overlay those
+            # local `:latest` names don't exist (images arrive as ghcr.io/.../*
+            # :$IMAGE_TAG), so the kubelet falls back to docker.io and 404s, the
+            # static pods never start, and the "Verify control-plane static pods
+            # are Running" step fails the whole bring-up (every workflow_run-
+            # triggered canary red since the static-pod control-plane landed).
+            # Retag both so IfNotPresent resolves locally, exactly like dns.
+            docker tag "ghcr.io/indyjonesnl/rusternetes/controller-manager:$IMAGE_TAG" rusternetes-controller-manager:latest
+            docker tag "ghcr.io/indyjonesnl/rusternetes/scheduler:$IMAGE_TAG" rusternetes-scheduler:latest
             echo "GHCR_OVERLAY=-f compose.ghcr.yml" >> "$GITHUB_ENV"
             echo "RUSTERNETES_IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
             echo "using prebuilt images: tag=$IMAGE_TAG"
