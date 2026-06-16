@@ -715,7 +715,7 @@ pub async fn list(
 ) -> Result<Response> {
     // Check if this is a watch request
     if params.watch.unwrap_or(false) {
-        info!("Watch request for services in namespace: {}", namespace);
+        debug!("Watch request for services in namespace: {}", namespace);
         return crate::handlers::watch::watch_services(
             State(state),
             Extension(auth_ctx),
@@ -783,11 +783,11 @@ pub async fn list_all_services(
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
     // Debug log the params
-    info!("list_all_services called with watch={:?}", params.watch);
+    debug!("list_all_services called with watch={:?}", params.watch);
 
     // Check if this is a watch request
     if params.watch.unwrap_or(false) {
-        info!("Watch request for all services");
+        debug!("Watch request for all services");
         return crate::handlers::watch::watch_cluster_scoped::<Service>(
             state, auth_ctx, "services", "", params,
         )

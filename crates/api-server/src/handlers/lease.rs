@@ -94,7 +94,7 @@ pub async fn update(
     Query(params): Query<HashMap<String, String>>,
     DumpingJson(mut lease): DumpingJson<Lease>,
 ) -> Result<Json<Lease>> {
-    info!("Updating lease: {}/{}", namespace, name);
+    debug!("Updating lease: {}/{}", namespace, name);
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);

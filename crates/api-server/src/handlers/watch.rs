@@ -531,7 +531,7 @@ where
                     event_opt = watch_stream.next() => {
                         match event_opt {
                             Some(Ok(WatchEvent::Added(key, value))) => {
-                                info!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
+                                debug!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
                                 if let Some(object) =
                                     deserialize_converted::<T>(&value, &converter).await
                                 {
@@ -571,7 +571,7 @@ where
                                 }
                             }
                             Some(Ok(WatchEvent::Modified(key, value))) => {
-                                info!("Watch MODIFIED event for key={}", key);
+                                debug!("Watch MODIFIED event for key={}", key);
                                 if let Some(object) =
                                     deserialize_converted::<T>(&value, &converter).await
                                 {
@@ -1112,7 +1112,7 @@ where
                     event_opt = watch_stream.next() => {
                         match event_opt {
                             Some(Ok(WatchEvent::Added(key, value))) => {
-                                info!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
+                                debug!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
                                 if let Some(object) =
                                     deserialize_converted::<T>(&value, &converter).await
                                 {
@@ -1145,7 +1145,7 @@ where
                                 }
                             }
                             Some(Ok(WatchEvent::Modified(key, value))) => {
-                                info!("Watch MODIFIED event for key={}", key);
+                                debug!("Watch MODIFIED event for key={}", key);
                                 if let Some(object) =
                                     deserialize_converted::<T>(&value, &converter).await
                                 {

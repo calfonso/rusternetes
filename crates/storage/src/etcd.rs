@@ -438,7 +438,7 @@ impl Storage for EtcdStorage {
                                 // This is more reliable than prev_kv() which may be absent
                                 // after etcd compaction.
                                 let kv_version = event.kv().map(|kv| kv.version()).unwrap_or(0);
-                                info!("etcd watch_from_rev event: key={} mod_rev={} version={} type={}",
+                                debug!("etcd watch_from_rev event: key={} mod_rev={} version={} type={}",
                                     key, mod_revision, kv_version,
                                     if kv_version == 1 { "ADDED" } else { "MODIFIED" });
                                 if kv_version == 1 {

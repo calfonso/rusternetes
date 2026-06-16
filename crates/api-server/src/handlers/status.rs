@@ -618,7 +618,7 @@ pub async fn update_cluster_status(
             .or_insert_with(|| Value::String(api_version));
     }
 
-    info!("Successfully updated status for {}/{}", resource_type, name);
+    debug!("Successfully updated status for {}/{}", resource_type, name);
 
     Ok(Json(saved))
 }
