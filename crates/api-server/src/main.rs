@@ -3,6 +3,8 @@ pub use rusternetes_admission_webhook as admission_webhook;
 mod bootstrap;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 mod conversion;
+#[allow(dead_code)]
+mod cri_exec;
 mod dynamic_routes;
 #[allow(dead_code)]
 mod flow_control;

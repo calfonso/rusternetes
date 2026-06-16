@@ -1,8 +1,7 @@
 //! SPDY handlers for pod exec, attach, and port-forward
 //!
-//! The API server proxies exec/attach requests to the kubelet,
-//! which handles them via the container runtime (bollard/Docker).
-//! This keeps the API server runtime-agnostic.
+//! Exec runs the command one-shot against the container runtime over CRI
+//! (`ExecSync`); port-forward proxies a TCP connection to the pod IP.
 
 use crate::spdy::{SpdyChannel, SpdyConnection};
 use rusternetes_common::resources::Pod;
@@ -45,91 +44,58 @@ pub async fn handle_spdy_exec(
         pod.metadata.name, container_name, command, stdin, stdout, stderr, tty
     );
 
-    let container_id = format!("{}_{}", pod.metadata.name, container_name);
+    debug!(
+        "CRI exec for pod {} container {}",
+        pod.metadata.name, container_name
+    );
 
-    debug!("Direct Docker exec for container: {}", container_id);
-
-    // Execute directly via Docker (API server has Docker socket mounted)
-    use bollard::exec::{CreateExecOptions, StartExecResults};
-    use bollard::Docker;
-    use futures::StreamExt;
-
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(d) => d,
+    // Run the command one-shot via CRI ExecSync. The SPDY exec path already
+    // collected output one-shot (with no live stdin forwarding), so ExecSync
+    // preserves the external behavior.
+    //
+    // TODO(cri): true interactive exec (live stdin → process, incremental
+    // output, tty resize) is not implemented; that would require the CRI
+    // streaming `Exec` RPC and a proxy to the returned URL.
+    let mut cri = match crate::cri_exec::connect().await {
+        Ok(c) => c,
         Err(e) => {
-            error!("Failed to connect to Docker: {}", e);
+            error!("Failed to connect to CRI runtime: {}", e);
             let _ = spdy
-                .write_error(&format!("Failed to connect to Docker: {}", e))
+                .write_error(&format!("Failed to connect to CRI runtime: {}", e))
                 .await;
             return;
         }
     };
 
-    let exec_config = CreateExecOptions {
-        cmd: Some(command.iter().map(|s| s.as_str()).collect()),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        attach_stdin: Some(false),
-        tty: Some(tty),
-        ..Default::default()
-    };
-
-    let exec = match docker.create_exec(&container_id, exec_config).await {
-        Ok(e) => e,
-        Err(e) => {
-            error!("Failed to create exec: {}", e);
-            let _ = spdy.write_error(&format!("Exec failed: {}", e)).await;
-            return;
-        }
-    };
-
-    let output = match docker
-        .start_exec(
-            &exec.id,
-            Some(bollard::exec::StartExecOptions {
-                detach: false,
-                ..Default::default()
-            }),
-        )
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            error!("Failed to start exec: {}", e);
-            let _ = spdy.write_error(&format!("Exec failed: {}", e)).await;
-            return;
-        }
-    };
-
-    // Collect output with timeout
-    let mut stdout_data = Vec::new();
-    let mut stderr_data = Vec::new();
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = output
-    {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
-                Ok(Some(Ok(msg))) => match msg {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout_data.extend_from_slice(&message)
-                    }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr_data.extend_from_slice(&message)
-                    }
-                    _ => {}
-                },
-                Ok(Some(Err(_))) | Ok(None) => break,
-                Err(_) => {
-                    // Timeout — check if exec finished
-                    match docker.inspect_exec(&exec.id).await {
-                        Ok(info) if !info.running.unwrap_or(false) => break,
-                        _ => continue,
-                    }
-                }
+    let container_id =
+        match crate::cri_exec::resolve_container_id(&mut cri, &pod, &container_name).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                error!(
+                    "No running container {} for pod {}",
+                    container_name, pod.metadata.name
+                );
+                let _ = spdy
+                    .write_error(&format!("container {} not found", container_name))
+                    .await;
+                return;
             }
-        }
-    }
+            Err(e) => {
+                error!("Failed to resolve container: {}", e);
+                let _ = spdy.write_error(&format!("Exec failed: {}", e)).await;
+                return;
+            }
+        };
+
+    let (stdout_data, stderr_data, _exit_code) =
+        match crate::cri_exec::exec_sync(&mut cri, &container_id, &command, 60).await {
+            Ok(out) => out,
+            Err(e) => {
+                error!("Failed to exec: {}", e);
+                let _ = spdy.write_error(&format!("Exec failed: {}", e)).await;
+                return;
+            }
+        };
 
     // Send results back via SPDY
     if stdout && !stdout_data.is_empty() {

@@ -264,123 +264,76 @@ pub async fn get_logs(
     }
 }
 
-/// Get real logs from the container runtime
-async fn get_container_logs(
-    pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
-) -> anyhow::Result<String> {
-    use bollard::container::LogsOptions;
-    use bollard::Docker;
-    use futures::StreamExt;
-
-    // Connect to Docker/Podman
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| anyhow::anyhow!("Failed to connect to container runtime: {}", e))?;
-
-    // Container name format: {pod_name}_{container_name}
-    let full_container_name = format!("{}_{}", pod.metadata.name, container_name);
-
-    // Build log options based on query parameters
-    let mut options = LogsOptions::<String> {
-        stdout: true,
-        stderr: true,
+/// Convert a [`LogsQuery`] into the [`LogReadOptions`](crate::cri_exec::LogReadOptions)
+/// the CRI log reader uses, resolving `sinceSeconds`/`sinceTime` to an absolute
+/// Unix-epoch bound.
+fn log_read_options(query: &LogsQuery) -> crate::cri_exec::LogReadOptions {
+    let mut opts = crate::cri_exec::LogReadOptions {
         timestamps: query.timestamps,
-        tail: query
-            .tail_lines
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "all".to_string()),
-        ..Default::default()
+        tail_lines: query.tail_lines,
+        limit_bytes: query.limit_bytes,
+        since_unix: None,
     };
 
-    // Handle since_seconds parameter.
-    // K8s sinceSeconds is a relative duration (seconds ago from now).
-    // Bollard's `since` field expects an absolute Unix epoch timestamp.
+    // K8s sinceSeconds is a relative duration (seconds ago from now); resolve
+    // it to an absolute Unix-epoch bound. sinceTime is already absolute.
     if let Some(since_seconds) = query.since_seconds {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        options.since = now - since_seconds;
+        opts.since_unix = Some(now - since_seconds);
     }
-
-    // Handle sinceTime parameter (RFC3339 timestamp)
     if let Some(ref since_time) = query.since_time {
         if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(since_time) {
-            options.since = parsed.timestamp();
+            opts.since_unix = Some(parsed.timestamp());
         }
     }
+    opts
+}
 
-    // Try to get logs - first by exact name, then search all containers
-    // (the container might have a slightly different name or be stopped)
-    let container_exists = docker
-        .inspect_container(
-            &full_container_name,
-            None::<bollard::container::InspectContainerOptions>,
-        )
-        .await
-        .is_ok();
+/// Get real logs from the container runtime via CRI.
+///
+/// Resolves the named container to its CRI container id, reads the runtime's
+/// container log file ([`resolve_log_path`](crate::cri_exec::resolve_log_path)),
+/// and parses the CRI log line format into the raw bytes the API returns —
+/// honoring `timestamps`, `tailLines`, `limitBytes`, `sinceSeconds`/`sinceTime`.
+async fn get_container_logs(
+    pod: &rusternetes_common::resources::Pod,
+    container_name: &str,
+    query: &LogsQuery,
+) -> anyhow::Result<String> {
+    let mut cri = crate::cri_exec::connect().await?;
 
-    let effective_name = if container_exists {
-        full_container_name.clone()
-    } else {
-        // Search for the container by listing all (including exited)
-        let mut filters = std::collections::HashMap::new();
-        filters.insert("name".to_string(), vec![full_container_name.clone()]);
-        let list_opts = bollard::container::ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-        if let Ok(containers) = docker.list_containers(Some(list_opts)).await {
-            containers
-                .first()
-                .and_then(|c| c.id.clone())
-                .unwrap_or(full_container_name.clone())
-        } else {
-            full_container_name.clone()
-        }
+    let container_id = crate::cri_exec::resolve_container_id(&mut cri, pod, container_name)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no container {} found for pod {}",
+                container_name,
+                pod.metadata.name
+            )
+        })?;
+
+    let Some(log_path) = crate::cri_exec::resolve_log_path(&mut cri, pod, &container_id).await?
+    else {
+        tracing::debug!(
+            "CRI reported no log_path for container {} of pod {}",
+            container_name,
+            pod.metadata.name
+        );
+        return Ok(String::new());
     };
 
-    let mut log_stream = docker.logs(&effective_name, Some(options));
-
-    let mut log_output = String::new();
-    let mut total_bytes = 0usize;
-    let limit_bytes = query.limit_bytes.map(|l| l as usize);
-
-    // Collect logs from stream
-    while let Some(log_result) = log_stream.next().await {
-        match log_result {
-            Ok(log_output_chunk) => {
-                let chunk = log_output_chunk.to_string();
-                let chunk_len = chunk.len();
-
-                // Check if we've hit the byte limit
-                if let Some(limit) = limit_bytes {
-                    if total_bytes + chunk_len > limit {
-                        let remaining = limit - total_bytes;
-                        log_output.push_str(&chunk[..remaining]);
-                        break;
-                    }
-                }
-
-                log_output.push_str(&chunk);
-                total_bytes += chunk_len;
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("Error reading logs: {}", e));
-            }
-        }
-    }
-
-    Ok(log_output)
+    let opts = log_read_options(query);
+    let bytes = crate::cri_exec::read_log_file(&log_path, &opts)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Streaming variant of [`get_container_logs`] used when the client requests
-/// `follow=true`. Returns a byte stream that lives as long as the bollard
-/// log stream is open (i.e. until the container exits), so the HTTP
-/// response stays open and incremental output reaches the client without
-/// the EOF-then-reconnect loop hydrophone fell into.
+/// `follow=true`. Returns a byte stream that stays open and tails the CRI
+/// container log file, polling for appended output, so incremental log lines
+/// reach the client without the EOF-then-reconnect loop hydrophone fell into.
 ///
 /// `limit_bytes` is not enforced on this path — the upstream conformance
 /// tests that exercise follow don't set it, and the cost of tracking a
@@ -391,72 +344,108 @@ async fn stream_container_logs(
     query: &LogsQuery,
 ) -> anyhow::Result<impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>>
 {
-    use bollard::container::LogsOptions;
-    use bollard::Docker;
-    use futures::StreamExt;
+    use std::io::{Read, Seek, SeekFrom};
 
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| anyhow::anyhow!("Failed to connect to container runtime: {}", e))?;
+    let mut cri = crate::cri_exec::connect().await?;
+    let container_id = crate::cri_exec::resolve_container_id(&mut cri, pod, container_name)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no container {} found for pod {}",
+                container_name,
+                pod.metadata.name
+            )
+        })?;
+    let log_path = crate::cri_exec::resolve_log_path(&mut cri, pod, &container_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CRI reported no log_path for container {} of pod {}",
+                container_name,
+                pod.metadata.name
+            )
+        })?;
 
-    let full_container_name = format!("{}_{}", pod.metadata.name, container_name);
+    let opts = log_read_options(query);
+    let timestamps = opts.timestamps;
+    let since_unix = opts.since_unix;
 
-    let mut options = LogsOptions::<String> {
-        stdout: true,
-        stderr: true,
-        follow: true,
-        timestamps: query.timestamps,
-        tail: query
-            .tail_lines
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "all".to_string()),
-        ..Default::default()
-    };
-
-    if let Some(since_seconds) = query.since_seconds {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        options.since = now - since_seconds;
-    }
-    if let Some(ref since_time) = query.since_time {
-        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(since_time) {
-            options.since = parsed.timestamp();
+    // First emit the existing contents (honoring tail/since), then tail the
+    // file for new lines. `async_stream` lets us poll the file from inside the
+    // stream so the HTTP response body stays open until the container exits.
+    let stream = async_stream::stream! {
+        // Initial backlog read (tail/since honored by read_log_file).
+        match crate::cri_exec::read_log_file(&log_path, &opts) {
+            Ok(bytes) if !bytes.is_empty() => {
+                yield Ok(bytes::Bytes::from(bytes));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                yield Err(std::io::Error::other(e.to_string()));
+                return;
+            }
         }
-    }
 
-    // Resolve the container by exact name first, then by filtered list
-    // (mirrors the buffered path so a slightly-renamed or exited container
-    // still streams).
-    let effective_name = if docker
-        .inspect_container(
-            &full_container_name,
-            None::<bollard::container::InspectContainerOptions>,
-        )
-        .await
-        .is_ok()
-    {
-        full_container_name.clone()
-    } else {
-        let mut filters = std::collections::HashMap::new();
-        filters.insert("name".to_string(), vec![full_container_name.clone()]);
-        let list_opts = bollard::container::ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-        docker
-            .list_containers(Some(list_opts))
-            .await
-            .ok()
-            .and_then(|cs| cs.first().and_then(|c| c.id.clone()))
-            .unwrap_or(full_container_name.clone())
+        // Seek to end of file and tail. Re-open on each tick so a rotated /
+        // recreated log file is picked up.
+        let mut offset: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        let mut carry: Vec<u8> = Vec::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let len = match std::fs::metadata(&log_path) {
+                Ok(m) => m.len(),
+                Err(_) => break, // file gone — container/log removed; end stream
+            };
+            if len < offset {
+                // File truncated/rotated — restart from the beginning.
+                offset = 0;
+                carry.clear();
+            }
+            if len == offset {
+                continue;
+            }
+            let mut f = match std::fs::File::open(&log_path) {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            if f.seek(SeekFrom::Start(offset)).is_err() {
+                break;
+            }
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_err() {
+                break;
+            }
+            offset = len;
+            carry.extend_from_slice(&buf);
+
+            // Only parse up to the last complete line; keep any partial tail.
+            let last_nl = carry.iter().rposition(|&b| b == b'\n');
+            let Some(idx) = last_nl else { continue };
+            let complete: Vec<u8> = carry.drain(..=idx).collect();
+
+            let mut out = Vec::new();
+            for line in complete.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let parsed = crate::cri_exec::parse_cri_log_line(line);
+                if let Some(since) = since_unix {
+                    if let Some(ts) = parsed.timestamp_unix {
+                        if ts < since {
+                            continue;
+                        }
+                    }
+                }
+                if timestamps && !parsed.timestamp_prefix.is_empty() {
+                    out.extend_from_slice(parsed.timestamp_prefix.as_bytes());
+                }
+                out.extend_from_slice(&parsed.message);
+            }
+            if !out.is_empty() {
+                yield Ok(bytes::Bytes::from(out));
+            }
+        }
     };
-
-    let stream = docker.logs(&effective_name, Some(options)).map(|item| {
-        item.map(|chunk| bytes::Bytes::from(chunk.to_string()))
-            .map_err(|e| std::io::Error::other(format!("bollard log stream error: {}", e)))
-    });
 
     Ok(stream)
 }
@@ -668,77 +657,27 @@ pub async fn exec(
         namespace, name, query.command
     );
 
-    use bollard::exec::{CreateExecOptions, StartExecResults};
-    use bollard::Docker;
-    use futures::StreamExt;
-
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| Error::Internal(format!("Docker: {}", e)))?;
-
-    let container_id = format!("{}_{}", pod.metadata.name, container_name);
-    let exec_config = CreateExecOptions {
-        cmd: Some(query.command.iter().map(|s| s.as_str()).collect()),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        attach_stdin: Some(false),
-        tty: Some(query.tty),
-        ..Default::default()
-    };
-
-    let exec = docker
-        .create_exec(&container_id, exec_config)
+    // Run the command one-shot via CRI ExecSync and collect stdout/stderr +
+    // exit code. (The SPDY/plain-HTTP path was never interactive — it always
+    // collected output one-shot — so ExecSync is a faithful replacement.)
+    let mut cri = crate::cri_exec::connect()
         .await
-        .map_err(|e| Error::Internal(format!("Create exec: {}", e)))?;
+        .map_err(|e| Error::Internal(format!("CRI connect: {e}")))?;
 
-    let output = docker
-        .start_exec(
-            &exec.id,
-            Some(bollard::exec::StartExecOptions {
-                detach: false,
-                ..Default::default()
-            }),
-        )
+    let container_id = crate::cri_exec::resolve_container_id(&mut cri, &pod, &container_name)
         .await
-        .map_err(|e| Error::Internal(format!("Start exec: {}", e)))?;
+        .map_err(|e| Error::Internal(format!("CRI resolve container: {e}")))?
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "no running container {} found for pod {}/{}",
+                container_name, namespace, name
+            ))
+        })?;
 
-    let mut stdout_data = Vec::new();
-    let mut stderr_data = Vec::new();
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = output
-    {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
-                Ok(Some(Ok(msg))) => match msg {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout_data.extend_from_slice(&message)
-                    }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr_data.extend_from_slice(&message)
-                    }
-                    _ => {}
-                },
-                Ok(Some(Err(_))) | Ok(None) => break,
-                Err(_) => {
-                    if let Ok(info) = docker.inspect_exec(&exec.id).await {
-                        if !info.running.unwrap_or(false) {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Get exit code
-    let exit_code = docker
-        .inspect_exec(&exec.id)
-        .await
-        .ok()
-        .and_then(|info| info.exit_code)
-        .unwrap_or(0);
+    let (stdout_data, stderr_data, exit_code) =
+        crate::cri_exec::exec_sync(&mut cri, &container_id, &query.command, 60)
+            .await
+            .map_err(|e| Error::Internal(format!("CRI exec: {e}")))?;
 
     // Return as Kubernetes-compatible exec response
     // For SPDY clients: return 101 Switching Protocols with the output
