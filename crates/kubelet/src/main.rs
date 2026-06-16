@@ -10,6 +10,7 @@ mod lifecycle;
 mod runtime;
 mod server;
 mod static_pods;
+mod volumes;
 
 use anyhow::{Context, Result};
 use axum::{
