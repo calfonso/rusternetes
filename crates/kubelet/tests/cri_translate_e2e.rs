@@ -185,17 +185,34 @@ async fn cri_container_runtime_lifecycle() {
         "expected Running state, got {:?}",
         st.state
     );
-    eprintln!("CriContainerRuntime start_pod + introspection OK");
+    // Introspection helpers used by the kubelet reconcile loop.
+    assert!(
+        runtime
+            .is_container_running("sleeper")
+            .await
+            .expect("is_container_running"),
+        "is_container_running(sleeper) should be true"
+    );
+    assert!(
+        runtime
+            .list_all_pods()
+            .await
+            .expect("list_all_pods")
+            .contains(&pod_name),
+        "pod missing from list_all_pods"
+    );
+    // Host-network pod: IP may be the node IP or empty depending on runtime;
+    // just assert the call succeeds and log what it returns.
+    let ip = runtime.get_pod_ip(&pod_name).await.expect("get_pod_ip");
+    eprintln!("CriContainerRuntime introspection OK (pod_ip={ip:?})");
 
-    runtime
-        .stop_and_remove_pod(&pod_name)
-        .await
-        .expect("stop_and_remove_pod");
+    // Graceful teardown path.
+    runtime.stop_pod_for(&pod, 5).await.expect("stop_pod_for");
 
     // Sandbox gone -> no longer running.
     assert!(
         !runtime.is_pod_running(&pod).await.expect("is_pod_running"),
-        "pod still running after stop_and_remove_pod"
+        "pod still running after stop_pod_for"
     );
     eprintln!("CriContainerRuntime teardown OK");
 }

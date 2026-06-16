@@ -230,6 +230,71 @@ impl CriContainerRuntime {
         Ok(out)
     }
 
+    /// Names of all pods that have a sandbox on this runtime, regardless of
+    /// state (ready or not).
+    pub async fn list_all_pods(&self) -> Result<Vec<String>> {
+        let mut cri = self.cri.clone();
+        let sandboxes = cri.list_pod_sandbox(None).await?;
+        Ok(sandboxes
+            .into_iter()
+            .filter_map(|s| s.metadata.map(|m| m.name))
+            .collect())
+    }
+
+    /// The pod's primary IP, read from its sandbox network status. `None` if the
+    /// pod has no sandbox or no IP yet (e.g. CNI not done). Host-network pods
+    /// report the node IP.
+    pub async fn get_pod_ip(&self, pod_name: &str) -> Result<Option<String>> {
+        let Some(sandbox_id) = self.sandbox_id_for(pod_name).await? else {
+            return Ok(None);
+        };
+        let mut cri = self.cri.clone();
+        let status = cri.pod_sandbox_status(&sandbox_id, false).await?;
+        Ok(status
+            .status
+            .and_then(|s| s.network)
+            .map(|n| n.ip)
+            .filter(|ip| !ip.is_empty()))
+    }
+
+    /// Whether any container named `container_name` is currently RUNNING. CRI
+    /// container names are per-pod, so this matches across all pods by label.
+    pub async fn is_container_running(&self, container_name: &str) -> Result<bool> {
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::CONTAINER_NAME.to_string(),
+                container_name.to_string(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let containers = cri.list_containers(Some(filter)).await?;
+        let running = v1::ContainerState::ContainerRunning as i32;
+        Ok(containers.iter().any(|c| c.state == running))
+    }
+
+    /// Gracefully stop a pod: stop each of its containers with `grace_period_seconds`,
+    /// then stop and remove the sandbox. No-op if the pod has no sandbox.
+    pub async fn stop_pod_for(&self, pod: &Pod, grace_period_seconds: i64) -> Result<()> {
+        let Some(sandbox_id) = self.sandbox_id_for(&pod.metadata.name).await? else {
+            return Ok(());
+        };
+        let mut cri = self.cri.clone();
+
+        let filter = v1::ContainerFilter {
+            pod_sandbox_id: sandbox_id.clone(),
+            ..Default::default()
+        };
+        for c in cri.list_containers(Some(filter)).await? {
+            // Best-effort: keep tearing down even if one container stop fails.
+            let _ = cri.stop_container(&c.id, grace_period_seconds).await;
+        }
+
+        cri.stop_pod_sandbox(&sandbox_id).await?;
+        cri.remove_pod_sandbox(&sandbox_id).await?;
+        Ok(())
+    }
+
     /// Stop and remove a pod's sandbox; removing the sandbox tears down its
     /// containers. No-op if the pod has no sandbox.
     pub async fn stop_and_remove_pod(&self, pod_name: &str) -> Result<()> {
