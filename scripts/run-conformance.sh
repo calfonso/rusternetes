@@ -54,11 +54,9 @@ curl -sk -X PATCH https://localhost:6443/api/v1/nodes/node-2 \
     -d '{"metadata":{"labels":{"kubernetes.io/os":"linux","kubernetes.io/arch":"amd64","kubernetes.io/hostname":"node-2"}}}' >/dev/null 2>&1 || echo "Warning: Could not label node-2"
 
 # Step 4: Ensure cluster DNS has a ready backend.
-# Backend-agnostic: the default path runs rusternetes-dns (no CoreDNS Pod),
-# the A/B path (USE_RUSTERNETES_DNS=0) runs a CoreDNS Pod. Both back the
-# kube-dns Service via EndpointSlices, so check for a ready kube-dns endpoint
-# rather than a CoreDNS Pod (which no longer exists on the default path —
-# probing it would re-bootstrap on every run).
+# rusternetes-dns backs the kube-dns Service via EndpointSlices (CoreDNS has
+# been removed), so check for a ready kube-dns endpoint rather than a specific
+# DNS Pod.
 echo "[4/5] Checking cluster DNS (kube-dns endpoints) status..."
 DNS_READY=$(curl -sk "https://localhost:6443/apis/discovery.k8s.io/v1/namespaces/kube-system/endpointslices?labelSelector=kubernetes.io/service-name%3Dkube-dns" 2>/dev/null | grep -o '"ready":true' | head -n1 || echo "")
 

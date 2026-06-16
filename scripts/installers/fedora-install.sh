@@ -423,21 +423,44 @@ start_cluster() {
 
 # Bootstrap cluster
 bootstrap_cluster() {
-    log_step "Bootstrapping cluster with CoreDNS..."
+    log_step "Bootstrapping cluster (rusternetes-dns)..."
 
     cd "$INSTALL_DIR"
 
     export KUBELET_VOLUMES_PATH="$INSTALL_DIR/.rusternetes/volumes"
 
-    # Expand environment variables. This compose stack (docker-compose.yml)
-    # has no rusternetes-dns service, so CoreDNS is the DNS backend here —
-    # apply both the core resources and the CoreDNS Pod/ConfigMap (the latter
-    # now lives in bootstrap-coredns.yaml, split out of bootstrap-cluster.yaml).
+    # Apply the core resources (namespaces, kube-dns Service, priority classes).
     envsubst < bootstrap-cluster.yaml > /tmp/bootstrap-expanded.yaml
-    envsubst < bootstrap-coredns.yaml >> /tmp/bootstrap-expanded.yaml
-
-    # Apply bootstrap resources
     KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify apply -f /tmp/bootstrap-expanded.yaml
+
+    # CoreDNS has been removed. The all-in-one rusternetes container serves DNS
+    # in-process, so wire the kube-dns Service to it via a hand-written
+    # EndpointSlice (kube-proxy then DNATs 10.96.0.10:53 to the container).
+    # Mirrors the all-in-one path in scripts/bootstrap-cluster.sh Step 5.
+    local aio_dns_ip
+    aio_dns_ip=$(docker inspect rusternetes \
+        --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || true)
+    if [[ -n "$aio_dns_ip" ]]; then
+        cat <<EOF | KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify apply -f -
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: kube-dns-rusternetes
+  namespace: kube-system
+  labels:
+    kubernetes.io/service-name: kube-dns
+    endpointslice.kubernetes.io/managed-by: fedora-install.sh
+addressType: IPv4
+ports:
+  - {name: dns, port: 53, protocol: UDP}
+  - {name: dns-tcp, port: 53, protocol: TCP}
+endpoints:
+  - addresses: ["$aio_dns_ip"]
+    conditions: {ready: true, serving: true, terminating: false}
+EOF
+    else
+        log_warn "Could not find the rusternetes container to wire kube-dns; DNS may be unavailable"
+    fi
 
     log_info "Bootstrap completed successfully"
 }
@@ -455,8 +478,8 @@ verify_installation() {
         podman-compose ps
     fi
 
-    # Wait for CoreDNS
-    log_info "Waiting for CoreDNS to be ready..."
+    # Wait for cluster DNS
+    log_info "Waiting for cluster DNS (rusternetes-dns) to be ready..."
     sleep 10
 
     # Check pods

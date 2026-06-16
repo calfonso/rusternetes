@@ -143,8 +143,8 @@ if [ -f "bootstrap-cluster.yaml" ]; then
     max_attempts=30
     attempt=0
     while [ $attempt -lt $max_attempts ]; do
-        if $KCTL get pod -n kube-system coredns 2>/dev/null | grep -q "Running"; then
-            echo -e "${GREEN}✓ CoreDNS is ready${NC}\n"
+        if $KCTL get pods -n kube-system -l k8s-app=kube-dns 2>/dev/null | grep -q "Running"; then
+            echo -e "${GREEN}✓ cluster DNS (rusternetes-dns) is ready${NC}\n"
             break
         fi
         attempt=$((attempt + 1))

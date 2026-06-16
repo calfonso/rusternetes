@@ -702,7 +702,7 @@ display_completion() {
     echo "     export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes"
     echo "     docker-compose build"
     echo "     docker-compose up -d"
-    echo "     cat bootstrap-cluster.yaml bootstrap-coredns.yaml | envsubst > /tmp/bootstrap-expanded.yaml"
+    echo "     envsubst < bootstrap-cluster.yaml > /tmp/bootstrap-expanded.yaml"
     echo "     KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify apply -f /tmp/bootstrap-expanded.yaml"
     echo
     echo "Resources created:"

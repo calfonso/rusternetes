@@ -4,7 +4,7 @@
 # This script handles the complete cluster bootstrap process:
 # 1. Generate ServiceAccount tokens
 # 2. Apply ServiceAccounts and Secrets
-# 3. Apply bootstrap resources (namespaces, CoreDNS, etc.)
+# 3. Apply bootstrap resources (namespaces, services, priority classes)
 
 set -e
 
@@ -59,7 +59,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Discover the Docker bridge gateway (always [subnet].1) so we can
-# bootstrap CoreDNS and other resources without hardcoding an IP.
+# bootstrap rusternetes-dns and other resources without hardcoding an IP.
 # Uses the discover-bridge-gateway helper; callers can override via
 # RUSTERNETES_BRIDGE_GATEWAY env var if discovery fails.
 #
@@ -187,8 +187,11 @@ else
     print_warning "Continuing with bootstrap, but pods may not have valid tokens"
 fi
 
-# Step 3: Delete existing CoreDNS resources to ensure fresh creation with proper service account token
-print_step "Cleaning up existing CoreDNS resources (if any)..."
+# Step 3: Remove any legacy CoreDNS leftovers. CoreDNS has been removed in
+# favour of rusternetes-dns, but a pod/container named `coredns` may survive
+# from an older cluster on the shared host; drop it so the kube-dns Service
+# binds only to the rusternetes-dns backend.
+print_step "Cleaning up any legacy CoreDNS resources (if present)..."
 # Remove CoreDNS container
 $CONTAINER_RT rm -f $($CONTAINER_RT ps -a --filter "name=coredns" --format "{{.ID}}") 2>/dev/null && echo "  Deleted CoreDNS container" || echo "  No CoreDNS container to delete"
 # Remove CoreDNS pod from the api-server. kubectl works across every
@@ -205,16 +208,14 @@ $KUBECTL $KUBECTL_FLAGS delete pod coredns -n kube-system --grace-period=0 --for
 
 # Step 4: Apply bootstrap cluster resources
 # bootstrap-cluster.yaml carries namespaces, the kubernetes + kube-dns
-# Services, and PriorityClasses — but NOT the CoreDNS Pod/ConfigMap. Those
-# live in bootstrap-coredns.yaml and are applied only on the
-# USE_RUSTERNETES_DNS=0 path (Step 5). The default rusternetes-dns path
-# never creates a CoreDNS Pod.
+# Services, and PriorityClasses. The rusternetes-dns backend behind the
+# kube-dns Service is applied separately in Step 5 (bootstrap-dns.yaml).
 #
-# The gateway is still injected so the USE_RUSTERNETES_DNS=0 path can reuse
-# the discovered value, and to fail fast early if discovery broke (#787).
+# The gateway is injected so rusternetes-dns can reach the api-server, and to
+# fail fast early if discovery broke (#787).
 print_step "Applying bootstrap resources (namespaces, services, priority classes)..."
 if [ -f "$PROJECT_ROOT/bootstrap-cluster.yaml" ]; then
-    # Fail fast if discovery didn't give us a gateway — CoreDNS won't
+    # Fail fast if discovery didn't give us a gateway — rusternetes-dns won't
     # be able to reach the API server without it after #787.
     if [ -z "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
         print_error "Bridge gateway discovery failed. Set RUSTERNETES_BRIDGE_GATEWAY or fix discover-bridge-gateway.sh"
@@ -248,9 +249,10 @@ if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/nu
     echo "  .env file written: $PROJECT_ROOT/.env"
 fi
 
-# Step 5: Wire the kube-dns Service to a DNS backend.
+# Step 5: Wire the kube-dns Service to the rusternetes-dns backend.
 #
-# When USE_RUSTERNETES_DNS=1 (default), the backend depends on the stack:
+# rusternetes-dns is the only cluster-DNS backend (CoreDNS has been removed).
+# The backend depends on the stack:
 #   - All-in-one stack (`rusternetes` container on the bridge): the DNS
 #     server is an in-process task inside that container, so the script
 #     creates a hand-written EndpointSlice pointing `kube-dns` at the
@@ -262,11 +264,6 @@ fi
 # Either way bootstrap-cluster.yaml only creates the kube-dns Service,
 # whose ClusterIP 10.96.0.10 every Pod's /etc/resolv.conf references via
 # kubelet's --cluster-dns flag, and which we keep stable.
-#
-# To run with a CoreDNS Pod instead (e.g. for A/B comparison), set
-# USE_RUSTERNETES_DNS=0 in the environment; the script then applies
-# bootstrap-coredns.yaml and waits for the CoreDNS Pod to come up.
-USE_RUSTERNETES_DNS="${USE_RUSTERNETES_DNS:-1}"
 
 # Some single-node stacks intentionally ship no in-cluster DNS backend (e.g.
 # compose.node-conformance.yml — the [NodeConformance] suite has no
@@ -277,11 +274,9 @@ USE_RUSTERNETES_DNS="${USE_RUSTERNETES_DNS:-1}"
 if [ "${SKIP_DNS_WIRING:-0}" = "1" ]; then
     print_step "Skipping DNS backend wiring (SKIP_DNS_WIRING=1)."
     echo "  This stack has no in-cluster DNS backend; node-scoped tests don't need cluster DNS."
-elif [ "$USE_RUSTERNETES_DNS" = "1" ]; then
-    # No CoreDNS Pod/ConfigMap to tear down on this path — bootstrap-cluster.yaml
-    # no longer creates them. The Step 3 cleanup above already removed any stale
-    # CoreDNS Pod left over from a previous USE_RUSTERNETES_DNS=0 run. The
-    # kube-dns Service stays (created in Step 4) so the ClusterIP is stable.
+else
+    # rusternetes-dns is the only cluster-DNS backend (CoreDNS fully removed).
+    # The kube-dns Service stays (created in Step 4) so the ClusterIP is stable.
 
     # All-in-one stack detection: the `rusternetes` container runs the DNS
     # server as an in-process task binding 0.0.0.0:53 — there is no dns pod
@@ -368,40 +363,6 @@ EOF
             fi
         done
     fi
-else
-    # Fallback path (USE_RUSTERNETES_DNS=0): apply the CoreDNS Pod + ConfigMap
-    # from bootstrap-coredns.yaml (with the discovered gateway injected so
-    # CoreDNS can reach the api-server, #787), then wait for the Pod.
-    print_step "Applying CoreDNS Pod + ConfigMap (USE_RUSTERNETES_DNS=0)..."
-    if [ -f "$PROJECT_ROOT/bootstrap-coredns.yaml" ]; then
-        TEMP_COREDNS="$(mktemp)"
-        trap "rm -f '$TEMP_COREDNS'" EXIT
-        sed "s|\\\${DOCKER_GATEWAY}|${RUSTERNETES_BRIDGE_GATEWAY}|g" \
-            "$PROJECT_ROOT/bootstrap-coredns.yaml" > "$TEMP_COREDNS"
-        $KUBECTL $KUBECTL_FLAGS apply -f "$TEMP_COREDNS"
-    else
-        print_error "bootstrap-coredns.yaml not found (required for USE_RUSTERNETES_DNS=0)"
-        exit 1
-    fi
-
-    print_step "Waiting for CoreDNS to be ready (USE_RUSTERNETES_DNS=0)..."
-    MAX_WAIT=30
-    for i in $(seq 1 $MAX_WAIT); do
-        COREDNS_STATUS=$($KUBECTL $KUBECTL_FLAGS get pod coredns -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
-
-        if [ "$COREDNS_STATUS" == "Running" ]; then
-            print_success "CoreDNS is running!"
-            break
-        fi
-
-        if [ $i -eq $MAX_WAIT ]; then
-            print_warning "CoreDNS not running after ${MAX_WAIT} seconds (status: $COREDNS_STATUS)"
-            print_warning "You may need to check the logs: $KUBECTL $KUBECTL_FLAGS logs -n kube-system coredns"
-        else
-            echo "  Waiting for CoreDNS... ($i/$MAX_WAIT) Status: $COREDNS_STATUS"
-            sleep 2
-        fi
-    done
 fi
 
 # Step 6: Label node-1 as the control-plane node.

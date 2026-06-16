@@ -40,7 +40,7 @@ globalDefault: false
 preemptionPolicy: PreemptLowerPriority
 description: "Used for system critical pods that must not be moved from their current node."
 ---
-# system-cluster-critical: high priority, for cluster-level system pods (CoreDNS, etc.)
+# system-cluster-critical: high priority, for cluster-level system pods (DNS, etc.)
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
@@ -50,16 +50,14 @@ globalDefault: false
 preemptionPolicy: PreemptLowerPriority
 description: "Used for system critical pods that must run in the cluster but can be moved to another node if necessary."
 ---
-# CoreDNS Service (kube-dns)
+# kube-dns Service (backed by rusternetes-dns)
 #
 # The Service is ALWAYS created so its ClusterIP (10.96.0.10) stays stable —
 # every Pod's /etc/resolv.conf references it via kubelet's --cluster-dns flag.
-# The backend (by default the rusternetes-dns kube-system Deployment from
-# bootstrap-dns.yaml — or the all-in-one container's in-process DNS task,
-# or a CoreDNS Pod when USE_RUSTERNETES_DNS=0) is wired in separately by
-# bootstrap-cluster.sh.
-# The CoreDNS Pod + ConfigMap live in bootstrap-coredns.yaml, applied only
-# on the USE_RUSTERNETES_DNS=0 path.
+# The backend — the rusternetes-dns kube-system Deployment from
+# bootstrap-dns.yaml, or the all-in-one container's in-process DNS task — is
+# wired in separately by bootstrap-cluster.sh (Step 5). CoreDNS has been
+# removed; rusternetes-dns is the only backend.
 # Pin to 10.96.0.10 for stability (like real Kubernetes often does)
 # This ensures kubelet always discovers the same DNS IP
 apiVersion: v1
@@ -70,7 +68,7 @@ metadata:
   labels:
     k8s-app: kube-dns
     kubernetes.io/cluster-service: "true"
-    kubernetes.io/name: CoreDNS
+    kubernetes.io/name: rusternetes-dns
 spec:
   selector:
     k8s-app: kube-dns
