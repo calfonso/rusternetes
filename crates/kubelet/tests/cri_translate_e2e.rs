@@ -229,6 +229,28 @@ async fn cri_container_runtime_lifecycle() {
         .expect("update_container_resources");
     eprintln!("CriContainerRuntime metrics + resource update OK");
 
+    // Existence / termination / age introspection.
+    assert!(
+        runtime.container_exists("sleeper").await,
+        "container_exists(sleeper) should be true"
+    );
+    assert!(
+        !runtime.has_terminated_containers(&pod).await,
+        "running pod should have no terminated containers"
+    );
+    let (node_cpu, node_mem) = runtime
+        .collect_node_metrics(std::slice::from_ref(&pod_name))
+        .await;
+    eprintln!("node metrics: cpu={node_cpu} mem={node_mem}");
+    let age = runtime.get_container_age(&pod_name).await.expect("age");
+    assert!(age > std::time::Duration::ZERO, "sandbox age should be > 0");
+    eprintln!("CriContainerRuntime existence/age introspection OK");
+
+    // garbage_collect_containers is intentionally NOT exercised here: it removes
+    // every sandbox not in the keep-set, which would race with the sibling
+    // parallel tests' sandboxes. It reuses the already-verified list_pod_sandbox
+    // + remove_pod_sandbox primitives.
+
     // Graceful teardown path.
     runtime.stop_pod_for(&pod, 5).await.expect("stop_pod_for");
 

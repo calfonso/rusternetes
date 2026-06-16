@@ -472,6 +472,95 @@ impl CriContainerRuntime {
         out
     }
 
+    /// Whether any container named `container_name` exists on the runtime,
+    /// regardless of state.
+    pub async fn container_exists(&self, container_name: &str) -> bool {
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::CONTAINER_NAME.to_string(),
+                container_name.to_string(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        cri.list_containers(Some(filter))
+            .await
+            .map(|c| !c.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Whether any of the pod's containers have exited.
+    pub async fn has_terminated_containers(&self, pod: &Pod) -> bool {
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::POD_UID.to_string(),
+                pod.metadata.uid.clone(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let exited = v1::ContainerState::ContainerExited as i32;
+        cri.list_containers(Some(filter))
+            .await
+            .map(|cs| cs.iter().any(|c| c.state == exited))
+            .unwrap_or(false)
+    }
+
+    /// Total CPU (nano-cores) and memory (working-set bytes) across the given
+    /// pods — the node-level rollup the kubelet reports.
+    pub async fn collect_node_metrics(&self, pod_names: &[String]) -> (u64, u64) {
+        let per_pod = self.collect_pod_metrics(pod_names).await;
+        let mut cpu = 0u64;
+        let mut mem = 0u64;
+        for containers in per_pod.values() {
+            for (_, c, m) in containers {
+                cpu += *c;
+                mem += *m;
+            }
+        }
+        (cpu, mem)
+    }
+
+    /// Remove sandboxes (and their containers) for pods that are no longer
+    /// desired — any sandbox whose pod name is not in `existing_pods`. Returns
+    /// the number of sandboxes removed.
+    pub async fn garbage_collect_containers(
+        &self,
+        existing_pods: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let mut cri = self.cri.clone();
+        let sandboxes = cri.list_pod_sandbox(None).await?;
+        let mut removed = 0;
+        for sb in sandboxes {
+            let name = sb.metadata.as_ref().map(|m| m.name.as_str()).unwrap_or("");
+            if name.is_empty() || existing_pods.contains(name) {
+                continue;
+            }
+            let _ = cri.stop_pod_sandbox(&sb.id).await;
+            if cri.remove_pod_sandbox(&sb.id).await.is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Age of a pod's sandbox (time since it was created). Zero if the pod has
+    /// no sandbox or the runtime reports no creation time.
+    pub async fn get_container_age(&self, pod_name: &str) -> Result<std::time::Duration> {
+        let Some(sandbox_id) = self.sandbox_id_for(pod_name).await? else {
+            return Ok(std::time::Duration::ZERO);
+        };
+        let mut cri = self.cri.clone();
+        let status = cri.pod_sandbox_status(&sandbox_id, false).await?;
+        let created_at = status.status.map(|s| s.created_at).unwrap_or(0);
+        if created_at <= 0 {
+            return Ok(std::time::Duration::ZERO);
+        }
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let age_nanos = (now - created_at).max(0) as u64;
+        Ok(std::time::Duration::from_nanos(age_nanos))
+    }
+
     /// Gracefully stop a pod: stop each of its containers with `grace_period_seconds`,
     /// then stop and remove the sandbox. No-op if the pod has no sandbox.
     pub async fn stop_pod_for(&self, pod: &Pod, grace_period_seconds: i64) -> Result<()> {
@@ -494,15 +583,22 @@ impl CriContainerRuntime {
         Ok(())
     }
 
-    /// Stop and remove a pod's sandbox; removing the sandbox tears down its
-    /// containers. No-op if the pod has no sandbox.
+    /// Stop and remove every sandbox for a pod name; removing a sandbox tears
+    /// down its containers. Removes all matches (a pod can have a stale sandbox
+    /// alongside a new one), so it is also a no-op when none exist.
     pub async fn stop_and_remove_pod(&self, pod_name: &str) -> Result<()> {
-        let Some(sandbox_id) = self.sandbox_id_for(pod_name).await? else {
-            return Ok(());
+        let filter = v1::PodSandboxFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::POD_NAME.to_string(),
+                pod_name.to_string(),
+            )]),
+            ..Default::default()
         };
         let mut cri = self.cri.clone();
-        cri.stop_pod_sandbox(&sandbox_id).await?;
-        cri.remove_pod_sandbox(&sandbox_id).await?;
+        for sb in cri.list_pod_sandbox(Some(filter)).await? {
+            let _ = cri.stop_pod_sandbox(&sb.id).await;
+            cri.remove_pod_sandbox(&sb.id).await?;
+        }
         Ok(())
     }
 }
