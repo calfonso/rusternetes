@@ -8,18 +8,33 @@
 //!
 //! Covered: pod bring-up with init containers and host-side volume provisioning
 //! (`start_pod` + an attached [`VolumeManager`](crate::volumes::VolumeManager)),
-//! container/init status, status/introspection, metrics, gc, in-place resize,
-//! single-attempt probes (`probe_container`), and teardown. Remaining: wiring
-//! this type into `kubelet.rs` in place of the bollard runtime, the probe
-//! threshold/period state machine, and networking — tracked in the migration
-//! issue.
+//! container/init/ephemeral status, status/introspection, metrics, gc, in-place
+//! resize, single-attempt probes plus the full liveness/startup threshold state
+//! machine (`check_liveness`), init-action decisions, and teardown. The surface
+//! now matches the bollard `ContainerRuntime` contract the kubelet calls.
+//! Remaining: the `kubelet.rs` field swap and networking — tracked in the
+//! migration issue.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use rusternetes_common::resources::pod::{ContainerState, ContainerStatus, Pod};
+use chrono::Utc;
+use rusternetes_common::resources::pod::{Container, ContainerState, ContainerStatus, Pod, Probe};
 use rusternetes_cri::{v1, CriClient, CriError};
+use tracing::{debug, warn};
 
 use super::{probe, status, translate};
+
+/// Per-probe threshold-tracking state for the liveness/startup probe state
+/// machine. Mirrors the bollard runtime's `ProbeState`.
+#[derive(Default)]
+struct ProbeState {
+    consecutive_failures: i32,
+    consecutive_successes: i32,
+    /// Last time this probe was evaluated; honors `periodSeconds` so counters
+    /// advance at most once per period regardless of reconcile-loop frequency.
+    last_eval: Option<chrono::DateTime<Utc>>,
+}
 
 /// Errors from the CRI-backed runtime.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +100,9 @@ pub struct CriContainerRuntime {
     /// Provisions host-side pod volumes. `None` keeps `start_pod` volume-less
     /// (used by socket-only smoke tests); the kubelet always wires one in.
     volumes: Option<crate::volumes::VolumeManager>,
+    /// Threshold-tracking state for liveness/startup probes, keyed
+    /// `<pod>/<container>/<liveness|startup>`. `Arc` so clones share it.
+    probe_states: Arc<Mutex<std::collections::HashMap<String, ProbeState>>>,
 }
 
 impl CriContainerRuntime {
@@ -101,6 +119,7 @@ impl CriContainerRuntime {
             runtime_handler: runtime_handler.into(),
             log_root: log_root.into(),
             volumes: None,
+            probe_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -587,6 +606,238 @@ impl CriContainerRuntime {
 
         // No probe action configured.
         Ok(true)
+    }
+
+    /// Seconds since the named container started, from CRI `started_at`. `None`
+    /// if it is not found or has no start time yet.
+    async fn container_age_secs(&self, pod: &Pod, container_name: &str) -> Option<i64> {
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([
+                (
+                    translate::labels::POD_UID.to_string(),
+                    pod.metadata.uid.clone(),
+                ),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let c = cri
+            .list_containers(Some(filter))
+            .await
+            .ok()?
+            .into_iter()
+            .next()?;
+        let started = cri
+            .container_status(&c.id, false)
+            .await
+            .ok()?
+            .status?
+            .started_at;
+        if started <= 0 {
+            return None;
+        }
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        Some((now - started).max(0) / 1_000_000_000)
+    }
+
+    /// Clear all probe threshold state for a pod (on pod deletion/restart) so a
+    /// recreated pod's probes start fresh.
+    pub fn clear_probe_states_for_pod(&self, pod_name: &str) {
+        let prefix = format!("{pod_name}/");
+        let mut states = self.probe_states.lock().unwrap();
+        states.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    /// Evaluate liveness across a pod, returning `Some(grace_seconds)` if a
+    /// regular container's startup/liveness probe has failed enough consecutive
+    /// times to warrant restarting the whole pod. Restartable init containers
+    /// (sidecars) are restarted individually instead. Liveness is disabled while
+    /// the pod is terminating.
+    pub async fn check_liveness(&self, pod: &Pod) -> Result<Option<i64>> {
+        if pod.metadata.deletion_timestamp.is_some() {
+            return Ok(None);
+        }
+        let Some(spec) = pod.spec.as_ref() else {
+            return Ok(None);
+        };
+
+        for container in &spec.containers {
+            if let Some(grace) = self.evaluate_container_liveness(pod, container).await {
+                return Ok(Some(grace));
+            }
+        }
+
+        // Restartable init containers (restartPolicy=Always sidecars) are
+        // restarted individually, not by restarting the whole pod.
+        let restartable = spec
+            .init_containers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
+        for container in restartable {
+            if self
+                .evaluate_container_liveness(pod, container)
+                .await
+                .is_some()
+            {
+                warn!(
+                    "restarting sidecar {} after failed liveness probe",
+                    container.name
+                );
+                let filter = v1::ContainerFilter {
+                    label_selector: std::collections::HashMap::from([
+                        (
+                            translate::labels::POD_UID.to_string(),
+                            pod.metadata.uid.clone(),
+                        ),
+                        (
+                            translate::labels::CONTAINER_NAME.to_string(),
+                            container.name.clone(),
+                        ),
+                    ]),
+                    ..Default::default()
+                };
+                let mut cri = self.cri.clone();
+                if let Ok(cs) = cri.list_containers(Some(filter)).await {
+                    for c in cs {
+                        let _ = cri.stop_container(&c.id, 0).await;
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Evaluate one container's startup+liveness probes with threshold tracking.
+    /// `Some(grace)` means restart is warranted (grace = the probe's
+    /// terminationGracePeriodSeconds, else the pod's, else 30).
+    async fn evaluate_container_liveness(&self, pod: &Pod, container: &Container) -> Option<i64> {
+        let pod_name = &pod.metadata.name;
+        let pod_grace = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.termination_grace_period_seconds);
+        let grace_of = |probe: &Probe| {
+            probe
+                .termination_grace_period_seconds
+                .or(pod_grace)
+                .unwrap_or(30)
+        };
+
+        // Startup probe gates the liveness probe until it passes.
+        if let Some(startup) = &container.startup_probe {
+            let key = format!("{pod_name}/{}/startup", container.name);
+            let period = startup.period_seconds.unwrap_or(10).max(1) as i64;
+            let due = {
+                let mut states = self.probe_states.lock().unwrap();
+                let st = states.entry(key.clone()).or_default();
+                let now = Utc::now();
+                let due = st
+                    .last_eval
+                    .map(|t| (now - t).num_seconds() >= period)
+                    .unwrap_or(true);
+                if due {
+                    st.last_eval = Some(now);
+                }
+                due
+            };
+            if !due {
+                return None;
+            }
+            let ok = self
+                .probe_container(pod, container, startup)
+                .await
+                .unwrap_or(false);
+            let failure_threshold = startup.failure_threshold.unwrap_or(3);
+            let success_threshold = startup.success_threshold.unwrap_or(1);
+            enum Outcome {
+                Passed,
+                Pending,
+                Failed,
+            }
+            let outcome = {
+                let mut states = self.probe_states.lock().unwrap();
+                let st = states.entry(key).or_default();
+                if ok {
+                    st.consecutive_successes += 1;
+                    st.consecutive_failures = 0;
+                    if st.consecutive_successes >= success_threshold {
+                        Outcome::Passed
+                    } else {
+                        Outcome::Pending
+                    }
+                } else {
+                    st.consecutive_failures += 1;
+                    st.consecutive_successes = 0;
+                    if st.consecutive_failures >= failure_threshold {
+                        st.consecutive_failures = 0;
+                        Outcome::Failed
+                    } else {
+                        Outcome::Pending
+                    }
+                }
+            };
+            match outcome {
+                Outcome::Passed => {}
+                Outcome::Pending => return None,
+                Outcome::Failed => {
+                    warn!(
+                        "startup probe exceeded failure threshold for {} — restarting",
+                        container.name
+                    );
+                    return Some(grace_of(startup));
+                }
+            }
+        }
+
+        let probe = container.liveness_probe.as_ref()?;
+
+        // Honor initialDelaySeconds from the container's start time.
+        let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
+        if initial_delay > 0 {
+            if let Some(age) = self.container_age_secs(pod, &container.name).await {
+                if age < initial_delay as i64 {
+                    return None;
+                }
+            }
+        }
+
+        // A probe error (vs a clean failure) is transient — skip without counting.
+        let healthy = match self.probe_container(pod, container, probe).await {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        let failure_threshold = probe.failure_threshold.unwrap_or(3);
+        let key = format!("{pod_name}/{}/liveness", container.name);
+        let mut states = self.probe_states.lock().unwrap();
+        let st = states.entry(key).or_default();
+        if healthy {
+            st.consecutive_successes += 1;
+            st.consecutive_failures = 0;
+            None
+        } else {
+            st.consecutive_failures += 1;
+            st.consecutive_successes = 0;
+            if st.consecutive_failures >= failure_threshold {
+                warn!(
+                    "liveness probe failed {} times (threshold {}) for {}",
+                    st.consecutive_failures, failure_threshold, container.name
+                );
+                st.consecutive_failures = 0;
+                Some(grace_of(probe))
+            } else {
+                debug!(
+                    "liveness probe failed for {} ({}/{})",
+                    container.name, st.consecutive_failures, failure_threshold
+                );
+                None
+            }
+        }
     }
 
     /// Exit code of the (most recent) container named `container_name`, or 0 if

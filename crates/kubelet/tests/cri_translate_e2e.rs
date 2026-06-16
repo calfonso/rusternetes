@@ -413,6 +413,92 @@ async fn emptydir_volume_provisioned_and_mounted() {
         .expect("teardown");
 }
 
+/// A failing liveness probe (failureThreshold=1) makes check_liveness ask for a
+/// restart; a passing one does not.
+#[tokio::test]
+async fn liveness_probe_drives_check_liveness() {
+    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
+        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping liveness e2e");
+        return;
+    };
+    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
+    let log_root = std::env::temp_dir().join("rusternetes-cri-live");
+    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+        .await
+        .expect("connect");
+
+    let liveness = |cmd: &str| rusternetes_common::resources::pod::Probe {
+        http_get: None,
+        tcp_socket: None,
+        exec: Some(rusternetes_common::resources::pod::ExecAction {
+            command: vec![cmd.to_string()],
+        }),
+        initial_delay_seconds: None,
+        timeout_seconds: Some(2),
+        period_seconds: None,
+        success_threshold: None,
+        failure_threshold: Some(1), // single failure trips a restart
+        grpc: None,
+        termination_grace_period_seconds: Some(7),
+    };
+
+    let mut app = Container {
+        name: "sleeper".to_string(),
+        image: IMAGE.to_string(),
+        command: Some(vec!["/bin/sh".to_string()]),
+        args: Some(vec!["-c".to_string(), "sleep 3600".to_string()]),
+        ..Default::default()
+    };
+    app.liveness_probe = Some(liveness("/bin/false"));
+
+    let mut pod = Pod::new(
+        "live-e2e",
+        PodSpec {
+            containers: vec![app],
+            host_network: Some(true),
+            ..Default::default()
+        },
+    );
+    pod.metadata.namespace = Some("default".to_string());
+    pod.metadata.uid = "live-e2e-uid".to_string();
+    let pod_name = pod.metadata.name.clone();
+
+    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    runtime.start_pod(&pod).await.expect("start_pod");
+    for _ in 0..50 {
+        if runtime.is_pod_running(&pod).await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Failing liveness probe -> restart requested with the probe's grace (7).
+    let grace = runtime.check_liveness(&pod).await.expect("check_liveness");
+    assert_eq!(
+        grace,
+        Some(7),
+        "failing liveness should request restart w/ grace 7"
+    );
+
+    // Swap to a passing probe -> no restart. Clear prior threshold state first.
+    runtime.clear_probe_states_for_pod(&pod_name);
+    pod.spec.as_mut().unwrap().containers[0].liveness_probe = Some(liveness("/bin/true"));
+    let grace_ok = runtime
+        .check_liveness(&pod)
+        .await
+        .expect("check_liveness ok");
+    assert_eq!(
+        grace_ok, None,
+        "passing liveness should not request restart"
+    );
+    eprintln!("check_liveness OK (fail->Some(7), pass->None)");
+
+    runtime
+        .stop_and_remove_pod(&pod_name)
+        .await
+        .expect("teardown");
+}
+
 /// Init container runs to completion before the app container starts.
 #[tokio::test]
 async fn init_container_runs_before_app() {
