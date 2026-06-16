@@ -4483,6 +4483,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-cri"
+version = "0.1.0"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tower 0.4.13",
+ "tracing",
+]
+
+[[package]]
 name = "rusternetes-discovery"
 version = "0.1.0"
 dependencies = [
