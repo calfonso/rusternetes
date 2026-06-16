@@ -7,6 +7,7 @@
 //! `ContainerRuntime`-equivalent lifecycle methods build on it in later steps.
 
 pub mod runtime;
+pub mod status;
 pub mod translate;
 
 pub use runtime::{CriContainerRuntime, CriRuntimeError};

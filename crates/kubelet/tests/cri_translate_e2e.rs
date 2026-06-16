@@ -168,6 +168,23 @@ async fn cri_container_runtime_lifecycle() {
         pods.contains(&pod_name),
         "started pod missing from list_running_pods: {pods:?}"
     );
+    // Container status maps to Running/ready for the live container.
+    let statuses = runtime
+        .get_container_statuses(&pod)
+        .await
+        .expect("get_container_statuses");
+    assert_eq!(statuses.len(), 1, "expected one container status");
+    let st = &statuses[0];
+    assert_eq!(st.name, "sleeper");
+    assert!(st.ready, "container not ready");
+    assert!(
+        matches!(
+            st.state,
+            Some(rusternetes_common::resources::pod::ContainerState::Running { .. })
+        ),
+        "expected Running state, got {:?}",
+        st.state
+    );
     eprintln!("CriContainerRuntime start_pod + introspection OK");
 
     runtime

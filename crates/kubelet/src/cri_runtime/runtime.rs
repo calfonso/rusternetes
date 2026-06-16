@@ -13,10 +13,10 @@
 
 use std::path::Path;
 
-use rusternetes_common::resources::pod::Pod;
+use rusternetes_common::resources::pod::{ContainerState, ContainerStatus, Pod};
 use rusternetes_cri::{v1, CriClient, CriError};
 
-use super::translate;
+use super::{status, translate};
 
 /// Errors from the CRI-backed runtime.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +33,30 @@ pub enum CriRuntimeError {
 }
 
 type Result<T> = std::result::Result<T, CriRuntimeError>;
+
+/// Status for a spec container the runtime has not created yet.
+fn waiting_status(name: &str) -> ContainerStatus {
+    ContainerStatus {
+        name: name.to_string(),
+        ready: false,
+        restart_count: 0,
+        state: Some(ContainerState::Waiting {
+            reason: Some("ContainerCreating".to_string()),
+            message: None,
+        }),
+        last_state: None,
+        image: None,
+        image_id: None,
+        container_id: None,
+        started: Some(false),
+        allocated_resources: None,
+        allocated_resources_status: None,
+        resources: None,
+        user: None,
+        volume_mounts: None,
+        stop_signal: None,
+    }
+}
 
 /// Drives a CRI v1 runtime (containerd → Youki) for the kubelet.
 #[derive(Clone)]
@@ -153,6 +177,57 @@ impl CriContainerRuntime {
             .into_iter()
             .filter_map(|s| s.metadata.map(|m| m.name))
             .collect())
+    }
+
+    /// Statuses for every container in `pod.spec.containers`, in spec order.
+    ///
+    /// Containers the runtime has not created yet are reported as `Waiting /
+    /// ContainerCreating` so the result always has one entry per spec container
+    /// (what the kubelet's pod-status machinery expects).
+    pub async fn get_container_statuses(&self, pod: &Pod) -> Result<Vec<ContainerStatus>> {
+        let Some(spec) = pod.spec.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::POD_UID.to_string(),
+                pod.metadata.uid.clone(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let containers = cri.list_containers(Some(filter)).await?;
+
+        // Index runtime containers by their kubernetes container name.
+        let mut by_name: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for c in &containers {
+            if let Some(name) = c
+                .labels
+                .get(translate::labels::CONTAINER_NAME)
+                .or_else(|| c.metadata.as_ref().map(|m| &m.name))
+            {
+                by_name.insert(name.clone(), c.id.clone());
+            }
+        }
+
+        let mut out = Vec::with_capacity(spec.containers.len());
+        for spec_container in &spec.containers {
+            match by_name.get(&spec_container.name) {
+                Some(id) => {
+                    let full = cri.container_status(id, false).await?;
+                    let mapped = full
+                        .status
+                        .as_ref()
+                        .map(status::map_container_status)
+                        .unwrap_or_else(|| waiting_status(&spec_container.name));
+                    out.push(mapped);
+                }
+                None => out.push(waiting_status(&spec_container.name)),
+            }
+        }
+        Ok(out)
     }
 
     /// Stop and remove a pod's sandbox; removing the sandbox tears down its
