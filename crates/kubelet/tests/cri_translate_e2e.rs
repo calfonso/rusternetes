@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use rusternetes_common::resources::pod::{Container, Pod, PodSpec};
 use rusternetes_cri::CriClient;
 use rusternetes_kubelet::cri_runtime::{translate, CriContainerRuntime};
+use rusternetes_kubelet::volumes::VolumeManager;
 
 const IMAGE: &str = "docker.io/library/busybox:latest";
 
@@ -90,6 +91,24 @@ async fn translated_pod_runs_on_containerd() {
 
     let mut cri = CriClient::connect(&socket).await.expect("connect CRI");
     cri.pull_image(IMAGE, None, None).await.expect("PullImage");
+
+    // Remove any leftover sandbox for this pod from an interrupted prior run so
+    // the runtime's sandbox-name reservation doesn't block RunPodSandbox.
+    if let Ok(existing) = cri
+        .list_pod_sandbox(Some(rusternetes_cri::v1::PodSandboxFilter {
+            label_selector: std::collections::HashMap::from([(
+                "io.kubernetes.pod.uid".to_string(),
+                "translate-e2e-uid".to_string(),
+            )]),
+            ..Default::default()
+        }))
+        .await
+    {
+        for sb in existing {
+            let _ = cri.stop_pod_sandbox(&sb.id).await;
+            let _ = cri.remove_pod_sandbox(&sb.id).await;
+        }
+    }
 
     let sandbox_id = cri
         .run_pod_sandbox(sandbox_cfg.clone(), &handler)
@@ -298,6 +317,206 @@ async fn cri_container_runtime_lifecycle() {
     eprintln!("CriContainerRuntime teardown OK");
 }
 
+/// An emptyDir volume is provisioned on the host and mounted into the
+/// container: writing then reading a file under the mount path works.
+#[tokio::test]
+async fn emptydir_volume_provisioned_and_mounted() {
+    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
+        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping volume e2e");
+        return;
+    };
+    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
+
+    let vol_base = std::env::temp_dir().join("rusternetes-cri-volbase");
+    std::fs::create_dir_all(&vol_base).expect("vol base");
+    let vm = VolumeManager::new(
+        vol_base.to_string_lossy().to_string(),
+        None, // emptyDir needs no storage
+        rusternetes_common::auth::TokenManager::new(b"test-secret"),
+    );
+
+    let log_root = std::env::temp_dir().join("rusternetes-cri-vol");
+    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+        .await
+        .expect("connect")
+        .with_volumes(vm);
+
+    // Container that mounts an emptyDir at /scratch.
+    let mut app = Container {
+        name: "sleeper".to_string(),
+        image: IMAGE.to_string(),
+        command: Some(vec!["/bin/sh".to_string()]),
+        args: Some(vec!["-c".to_string(), "sleep 3600".to_string()]),
+        ..Default::default()
+    };
+    app.volume_mounts = Some(vec![serde_json::from_value(
+        serde_json::json!({"name": "scratch", "mountPath": "/scratch"}),
+    )
+    .unwrap()]);
+
+    let mut pod = Pod::new(
+        "vol-e2e",
+        PodSpec {
+            containers: vec![app],
+            volumes: Some(vec![serde_json::from_value(
+                serde_json::json!({"name": "scratch", "emptyDir": {}}),
+            )
+            .unwrap()]),
+            host_network: Some(true),
+            ..Default::default()
+        },
+    );
+    pod.metadata.namespace = Some("default".to_string());
+    pod.metadata.uid = "vol-e2e-uid".to_string();
+    let pod_name = pod.metadata.name.clone();
+
+    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    runtime
+        .start_pod(&pod)
+        .await
+        .expect("start_pod with volume");
+
+    // Wait until running, then write+read a file in the mounted emptyDir.
+    for _ in 0..50 {
+        if runtime.is_pod_running(&pod).await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let container = &pod.spec.as_ref().unwrap().containers[0];
+    let probe = exec_probe("/bin/true");
+    // (probe just confirms exec path; the real check is the write/read below.)
+    let _ = runtime.probe_container(&pod, container, &probe).await;
+
+    let mut cri = CriClient::connect(&socket).await.expect("cri");
+    let filter = rusternetes_cri::v1::ContainerFilter {
+        label_selector: std::collections::HashMap::from([(
+            "io.kubernetes.pod.uid".to_string(),
+            "vol-e2e-uid".to_string(),
+        )]),
+        ..Default::default()
+    };
+    let cid = cri
+        .list_containers(Some(filter))
+        .await
+        .expect("list")
+        .into_iter()
+        .next()
+        .expect("container exists")
+        .id;
+    let out = cri
+        .exec_sync(
+            &cid,
+            &[
+                "/bin/sh",
+                "-c",
+                "echo persisted > /scratch/f && cat /scratch/f",
+            ],
+            5,
+        )
+        .await
+        .expect("exec in volume");
+    assert_eq!(
+        out.exit_code,
+        0,
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "persisted");
+    eprintln!("emptyDir volume mount OK");
+
+    runtime
+        .stop_and_remove_pod(&pod_name)
+        .await
+        .expect("teardown");
+}
+
+/// A failing liveness probe (failureThreshold=1) makes check_liveness ask for a
+/// restart; a passing one does not.
+#[tokio::test]
+async fn liveness_probe_drives_check_liveness() {
+    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
+        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping liveness e2e");
+        return;
+    };
+    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
+    let log_root = std::env::temp_dir().join("rusternetes-cri-live");
+    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+        .await
+        .expect("connect");
+
+    let liveness = |cmd: &str| rusternetes_common::resources::pod::Probe {
+        http_get: None,
+        tcp_socket: None,
+        exec: Some(rusternetes_common::resources::pod::ExecAction {
+            command: vec![cmd.to_string()],
+        }),
+        initial_delay_seconds: None,
+        timeout_seconds: Some(2),
+        period_seconds: None,
+        success_threshold: None,
+        failure_threshold: Some(1), // single failure trips a restart
+        grpc: None,
+        termination_grace_period_seconds: Some(7),
+    };
+
+    let mut app = Container {
+        name: "sleeper".to_string(),
+        image: IMAGE.to_string(),
+        command: Some(vec!["/bin/sh".to_string()]),
+        args: Some(vec!["-c".to_string(), "sleep 3600".to_string()]),
+        ..Default::default()
+    };
+    app.liveness_probe = Some(liveness("/bin/false"));
+
+    let mut pod = Pod::new(
+        "live-e2e",
+        PodSpec {
+            containers: vec![app],
+            host_network: Some(true),
+            ..Default::default()
+        },
+    );
+    pod.metadata.namespace = Some("default".to_string());
+    pod.metadata.uid = "live-e2e-uid".to_string();
+    let pod_name = pod.metadata.name.clone();
+
+    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    runtime.start_pod(&pod).await.expect("start_pod");
+    for _ in 0..50 {
+        if runtime.is_pod_running(&pod).await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Failing liveness probe -> restart requested with the probe's grace (7).
+    let grace = runtime.check_liveness(&pod).await.expect("check_liveness");
+    assert_eq!(
+        grace,
+        Some(7),
+        "failing liveness should request restart w/ grace 7"
+    );
+
+    // Swap to a passing probe -> no restart. Clear prior threshold state first.
+    runtime.clear_probe_states_for_pod(&pod_name);
+    pod.spec.as_mut().unwrap().containers[0].liveness_probe = Some(liveness("/bin/true"));
+    let grace_ok = runtime
+        .check_liveness(&pod)
+        .await
+        .expect("check_liveness ok");
+    assert_eq!(
+        grace_ok, None,
+        "passing liveness should not request restart"
+    );
+    eprintln!("check_liveness OK (fail->Some(7), pass->None)");
+
+    runtime
+        .stop_and_remove_pod(&pod_name)
+        .await
+        .expect("teardown");
+}
+
 /// Init container runs to completion before the app container starts.
 #[tokio::test]
 async fn init_container_runs_before_app() {
@@ -347,7 +566,6 @@ async fn init_container_runs_before_app() {
     let init_statuses = runtime
         .get_init_container_statuses(&pod)
         .await
-        .expect("get_init_container_statuses")
         .expect("pod has init containers");
     assert_eq!(init_statuses.len(), 1);
     match &init_statuses[0].state {
@@ -364,7 +582,17 @@ async fn init_container_runs_before_app() {
         runtime.is_pod_running(&pod).await.expect("is_pod_running"),
         "app container should be running after init completed"
     );
-    eprintln!("init-container ordering OK");
+
+    // compute_init_container_actions reports init complete (no next index).
+    let (all_done, next, _retry) = runtime.compute_init_container_actions(&pod).await;
+    assert!(all_done, "init should be reported done");
+    assert!(next.is_none(), "no further init container to start");
+    // No ephemeral containers on this pod.
+    assert!(runtime
+        .get_ephemeral_container_statuses(&pod)
+        .await
+        .is_none());
+    eprintln!("init-container ordering + actions OK");
 
     runtime
         .stop_and_remove_pod(&pod_name)

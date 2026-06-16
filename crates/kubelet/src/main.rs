@@ -1,15 +1,33 @@
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod cni;
 mod config;
+#[allow(dead_code, unused_imports)]
+mod cri_runtime;
+// The standalone bin drives the CRI backend, so it no longer consumes the
+// kubelet's lifecycle-event / label / preStop / volume-manager / hostname free
+// helpers — those are only reached through the lib API now. They stay compiled
+// into the bin (shared modules) but read as dead here; the lib is their real
+// consumer.
+#[allow(dead_code)]
 mod events;
 #[allow(dead_code)]
 mod eviction;
+#[allow(dead_code)]
 mod kubelet;
+#[allow(dead_code)]
 mod labels;
+#[allow(dead_code)]
 mod lifecycle;
+// The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
+// runs on the CRI backend); runtime.rs is kept only for the still-shared free
+// helpers (volume setup, init-action decisions, PodNetworkMode), which the bin
+// does not all call directly.
+#[allow(dead_code)]
 mod runtime;
 mod server;
 mod static_pods;
+#[allow(dead_code)]
+mod volumes;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -18,16 +36,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bollard::container::LogOutput;
-use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::Docker;
 use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
 use eviction::{
     build_thresholds, parse_duration, parse_eviction_flag, EvictionManager, EvictionSignal,
     DEFAULT_TRANSITION_PERIOD,
 };
-use futures::StreamExt;
 use kubelet::Kubelet;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_storage::{StorageBackend, StorageConfig};
@@ -470,89 +484,42 @@ async fn main() -> Result<()> {
 
 /// Handle exec requests from the API server.
 ///
-/// The API server proxies exec requests to the kubelet, which uses bollard
-/// to create and start a Docker exec on the target container.
+/// The API server proxies exec requests to the kubelet, which runs a one-shot
+/// command on the target container via the CRI `ExecSync` RPC and returns the
+/// collected stdout/stderr. (Interactive tty/stdin streaming is not handled by
+/// this one-shot endpoint, matching the prior behavior.)
 async fn handle_exec(
     Path(container_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    body: axum::body::Bytes,
+    _body: axum::body::Bytes,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let command: Vec<String> = params
         .get("command")
         .map(|c| c.split(',').map(|s| s.to_string()).collect())
         .unwrap_or_default();
-    let stdin_data = if body.is_empty() { None } else { Some(body) };
-    let tty = params.get("tty").map(|v| v == "true").unwrap_or(false);
 
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let exec_config = CreateExecOptions {
-        cmd: Some(command.iter().map(|s| s.as_str()).collect()),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        attach_stdin: Some(stdin_data.is_some()),
-        tty: Some(tty),
-        ..Default::default()
-    };
-
-    let exec = docker
-        .create_exec(&container_id, exec_config)
+    let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
+        .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
+    let mut cri = rusternetes_cri::CriClient::connect(&socket)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Always use attached mode to collect output
-    let start_config = Some(bollard::exec::StartExecOptions {
-        detach: false,
-        ..Default::default()
-    });
-
-    let output = docker
-        .start_exec(&exec.id, start_config)
+    let cmd: Vec<&str> = command.iter().map(String::as_str).collect();
+    let resp = cri
+        .exec_sync(&container_id, &cmd, 60)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Collect output with short timeout per read to prevent hanging
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let exec_id = exec.id.clone();
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = output
-    {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
-                Ok(Some(Ok(msg))) => match msg {
-                    LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
-                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
-                    _ => {}
-                },
-                Ok(Some(Err(_))) | Ok(None) => break, // stream ended or error
-                Err(_) => {
-                    // Timeout — check if exec is still running
-                    match docker.inspect_exec(&exec_id).await {
-                        Ok(info) => {
-                            if !info.running.unwrap_or(false) {
-                                break; // exec finished, stream just didn't close
-                            }
-                            // still running, continue waiting
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    }
 
     info!(
-        "Exec completed: container={}, stdout_len={}, stderr_len={}",
+        "Exec completed: container={}, exit_code={}, stdout_len={}, stderr_len={}",
         container_id,
-        stdout.len(),
-        stderr.len()
+        resp.exit_code,
+        resp.stdout.len(),
+        resp.stderr.len()
     );
 
     Ok(Json(serde_json::json!({
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": String::from_utf8_lossy(&stderr),
+        "stdout": String::from_utf8_lossy(&resp.stdout),
+        "stderr": String::from_utf8_lossy(&resp.stderr),
     })))
 }

@@ -1010,14 +1010,14 @@ pub async fn get_pod_stats(pods: &[Pod]) -> HashMap<String, PodStats> {
 }
 
 async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
-    use bollard::Docker;
-
     let mut stats_map = HashMap::new();
 
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(d) => d,
+    let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
+        .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
+    let mut cri = match rusternetes_cri::CriClient::connect(&socket).await {
+        Ok(c) => c,
         Err(e) => {
-            warn!("Failed to connect to container runtime: {}", e);
+            warn!("Failed to connect to CRI runtime for pod stats: {}", e);
             return stats_map;
         }
     };
@@ -1025,30 +1025,33 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
     for pod in pods {
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let pod_name = &pod.metadata.name;
-        let key = format!("{}/{}", namespace, pod_name);
-
+        let key = format!("{namespace}/{pod_name}");
         let qos_class = get_qos_class(pod);
 
-        let mut total_memory_bytes = 0u64;
-        let mut total_disk_bytes = 0u64;
-
-        if let Some(spec) = &pod.spec {
-            for container in &spec.containers {
-                let container_name = format!("k8s_{}_{}_", container.name, pod_name);
-
-                match get_container_stats(&docker, &container_name).await {
-                    Ok((memory, disk)) => {
-                        total_memory_bytes += memory;
-                        total_disk_bytes += disk;
-                    }
-                    Err(e) => {
-                        debug!(
-                            "Failed to get stats for container {}: {}",
-                            container_name, e
-                        );
-                    }
+        // Sum CRI per-container stats for this pod (matched by the pod-uid
+        // label): working-set memory + writable-layer disk usage.
+        let filter = rusternetes_cri::v1::ContainerStatsFilter {
+            label_selector: HashMap::from([(
+                "io.kubernetes.pod.uid".to_string(),
+                pod.metadata.uid.clone(),
+            )]),
+            ..Default::default()
+        };
+        let (mut total_memory_bytes, mut total_disk_bytes) = (0u64, 0u64);
+        match cri.list_container_stats(Some(filter)).await {
+            Ok(stats) => {
+                for s in stats {
+                    total_memory_bytes += s
+                        .memory
+                        .and_then(|m| m.working_set_bytes.map(|v| v.value))
+                        .unwrap_or(0);
+                    total_disk_bytes += s
+                        .writable_layer
+                        .and_then(|w| w.used_bytes.map(|v| v.value))
+                        .unwrap_or(0);
                 }
             }
+            Err(e) => debug!("Failed to get CRI stats for pod {}: {}", key, e),
         }
 
         if total_memory_bytes > 0 || total_disk_bytes > 0 {
@@ -1066,58 +1069,6 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
     }
 
     stats_map
-}
-
-async fn get_container_stats(
-    docker: &bollard::Docker,
-    container_name_prefix: &str,
-) -> Result<(u64, u64)> {
-    use bollard::container::ListContainersOptions;
-    use std::collections::HashMap as BollardHashMap;
-
-    let mut filters = BollardHashMap::new();
-    filters.insert("name".to_string(), vec![container_name_prefix.to_string()]);
-
-    let options = Some(ListContainersOptions {
-        filters,
-        ..Default::default()
-    });
-
-    let containers = docker.list_containers(options).await?;
-
-    if containers.is_empty() {
-        return Ok((0, 0));
-    }
-
-    let container_id = &containers[0]
-        .id
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Container has no ID"))?;
-
-    let stats_options = bollard::container::StatsOptions {
-        stream: false,
-        one_shot: true,
-    };
-
-    use futures::stream::StreamExt;
-    let mut stats_stream = docker.stats(container_id, Some(stats_options));
-
-    if let Some(stats_result) = stats_stream.next().await {
-        let stats = stats_result?;
-
-        let memory_bytes = stats.memory_stats.usage.unwrap_or(0);
-
-        let mut disk_bytes = 0u64;
-        if let Some(io_service_bytes_recursive) = &stats.blkio_stats.io_service_bytes_recursive {
-            for entry in io_service_bytes_recursive {
-                disk_bytes += entry.value;
-            }
-        }
-
-        Ok((memory_bytes, disk_bytes))
-    } else {
-        Ok((0, 0))
-    }
 }
 
 #[cfg(test)]

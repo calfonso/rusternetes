@@ -4,6 +4,8 @@ pub mod bootstrap;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
 pub mod conversion;
+#[allow(dead_code)]
+pub mod cri_exec;
 pub mod dynamic_routes;
 #[allow(dead_code)]
 pub mod flow_control;

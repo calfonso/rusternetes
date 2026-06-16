@@ -85,19 +85,17 @@ impl CriClient {
         // ignores its authority and always dials the fixed socket path.
         let endpoint = Endpoint::try_from("http://[::]:50051").map_err(CriError::Endpoint)?;
 
-        let channel = endpoint
-            .connect_with_connector(service_fn(move |_: Uri| {
-                let path = socket_for_conn.clone();
-                async move {
-                    let stream = tokio::net::UnixStream::connect(path).await?;
-                    Ok::<_, std::io::Error>(TokioIo::new(stream))
-                }
-            }))
-            .await
-            .map_err(|source| CriError::Connect {
-                socket: socket.display().to_string(),
-                source,
-            })?;
+        // Lazy connection: like bollard's `Docker` handle, the socket is dialed
+        // on the first RPC, not here — so the kubelet can construct the runtime
+        // at startup even if the CRI runtime is momentarily unavailable, and
+        // recovers without a restart.
+        let channel = endpoint.connect_with_connector_lazy(service_fn(move |_: Uri| {
+            let path = socket_for_conn.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }));
 
         Ok(Self {
             runtime: RuntimeServiceClient::new(channel.clone()),

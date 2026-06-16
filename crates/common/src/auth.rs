@@ -107,6 +107,7 @@ impl ServiceAccountClaims {
 }
 
 /// TokenManager handles JWT token generation and validation
+#[derive(Clone)]
 pub struct TokenManager {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
