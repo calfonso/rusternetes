@@ -143,6 +143,231 @@ impl CriClient {
             })?;
         Ok(response.into_inner())
     }
+
+    // ---- Image lifecycle (ImageService) ------------------------------------
+
+    /// Pull an image, returning the runtime's canonical image reference.
+    ///
+    /// `runtime_handler` selects a runtime class (e.g. the Youki handler) for
+    /// runtime-handler-scoped image stores; pass `None` for the default. The
+    /// optional `sandbox_config` lets the runtime resolve registry settings from
+    /// the owning sandbox — supplied when pulling on behalf of a specific pod.
+    pub async fn pull_image(
+        &mut self,
+        image: &str,
+        runtime_handler: Option<&str>,
+        sandbox_config: Option<v1::PodSandboxConfig>,
+    ) -> Result<String> {
+        let request = v1::PullImageRequest {
+            image: Some(v1::ImageSpec {
+                image: image.to_string(),
+                runtime_handler: runtime_handler.unwrap_or_default().to_string(),
+                ..Default::default()
+            }),
+            auth: None,
+            sandbox_config,
+        };
+        let resp = self
+            .image
+            .pull_image(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "PullImage",
+                source,
+            })?;
+        Ok(resp.into_inner().image_ref)
+    }
+
+    /// Look up an image's status; `None` if the runtime does not have it.
+    pub async fn image_status(&mut self, image: &str, verbose: bool) -> Result<Option<v1::Image>> {
+        let request = v1::ImageStatusRequest {
+            image: Some(v1::ImageSpec {
+                image: image.to_string(),
+                ..Default::default()
+            }),
+            verbose,
+        };
+        let resp = self
+            .image
+            .image_status(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ImageStatus",
+                source,
+            })?;
+        Ok(resp.into_inner().image)
+    }
+
+    // ---- Pod sandbox lifecycle (RuntimeService) ----------------------------
+
+    /// Create and start a pod sandbox, returning its sandbox id.
+    ///
+    /// `runtime_handler` names the runtime class (e.g. the containerd handler
+    /// wired to Youki); empty string selects the runtime default.
+    pub async fn run_pod_sandbox(
+        &mut self,
+        config: v1::PodSandboxConfig,
+        runtime_handler: &str,
+    ) -> Result<String> {
+        let request = v1::RunPodSandboxRequest {
+            config: Some(config),
+            runtime_handler: runtime_handler.to_string(),
+        };
+        let resp = self
+            .runtime
+            .run_pod_sandbox(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "RunPodSandbox",
+                source,
+            })?;
+        Ok(resp.into_inner().pod_sandbox_id)
+    }
+
+    /// Stop a running pod sandbox (idempotent on the runtime side).
+    pub async fn stop_pod_sandbox(&mut self, pod_sandbox_id: &str) -> Result<()> {
+        let request = v1::StopPodSandboxRequest {
+            pod_sandbox_id: pod_sandbox_id.to_string(),
+        };
+        self.runtime
+            .stop_pod_sandbox(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "StopPodSandbox",
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Remove a (stopped) pod sandbox and any remaining containers in it.
+    pub async fn remove_pod_sandbox(&mut self, pod_sandbox_id: &str) -> Result<()> {
+        let request = v1::RemovePodSandboxRequest {
+            pod_sandbox_id: pod_sandbox_id.to_string(),
+        };
+        self.runtime
+            .remove_pod_sandbox(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "RemovePodSandbox",
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Fetch a pod sandbox's status.
+    pub async fn pod_sandbox_status(
+        &mut self,
+        pod_sandbox_id: &str,
+        verbose: bool,
+    ) -> Result<v1::PodSandboxStatusResponse> {
+        let request = v1::PodSandboxStatusRequest {
+            pod_sandbox_id: pod_sandbox_id.to_string(),
+            verbose,
+        };
+        let resp = self
+            .runtime
+            .pod_sandbox_status(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "PodSandboxStatus",
+                source,
+            })?;
+        Ok(resp.into_inner())
+    }
+
+    // ---- Container lifecycle (RuntimeService) ------------------------------
+
+    /// Create a container in a sandbox, returning its container id. The
+    /// container is created but not started — call [`Self::start_container`].
+    pub async fn create_container(
+        &mut self,
+        pod_sandbox_id: &str,
+        config: v1::ContainerConfig,
+        sandbox_config: v1::PodSandboxConfig,
+    ) -> Result<String> {
+        let request = v1::CreateContainerRequest {
+            pod_sandbox_id: pod_sandbox_id.to_string(),
+            config: Some(config),
+            sandbox_config: Some(sandbox_config),
+        };
+        let resp = self
+            .runtime
+            .create_container(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "CreateContainer",
+                source,
+            })?;
+        Ok(resp.into_inner().container_id)
+    }
+
+    /// Start a previously-created container.
+    pub async fn start_container(&mut self, container_id: &str) -> Result<()> {
+        let request = v1::StartContainerRequest {
+            container_id: container_id.to_string(),
+        };
+        self.runtime
+            .start_container(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "StartContainer",
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Stop a running container, giving it `timeout` seconds to exit before the
+    /// runtime forcibly kills it.
+    pub async fn stop_container(&mut self, container_id: &str, timeout: i64) -> Result<()> {
+        let request = v1::StopContainerRequest {
+            container_id: container_id.to_string(),
+            timeout,
+        };
+        self.runtime
+            .stop_container(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "StopContainer",
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Remove a (stopped) container.
+    pub async fn remove_container(&mut self, container_id: &str) -> Result<()> {
+        let request = v1::RemoveContainerRequest {
+            container_id: container_id.to_string(),
+        };
+        self.runtime
+            .remove_container(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "RemoveContainer",
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Fetch a container's status.
+    pub async fn container_status(
+        &mut self,
+        container_id: &str,
+        verbose: bool,
+    ) -> Result<v1::ContainerStatusResponse> {
+        let request = v1::ContainerStatusRequest {
+            container_id: container_id.to_string(),
+            verbose,
+        };
+        let resp = self
+            .runtime
+            .container_status(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ContainerStatus",
+                source,
+            })?;
+        Ok(resp.into_inner())
+    }
 }
 
 /// Strip a `unix://` (or `unix:`) scheme from a socket path, leaving a bare
