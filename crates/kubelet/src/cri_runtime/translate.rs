@@ -383,4 +383,138 @@ mod tests {
         assert_eq!(res.memory_limit_in_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.labels.get(labels::CONTAINER_NAME).unwrap(), "app");
     }
+
+    #[test]
+    fn volume_mounts_resolve_from_host_paths() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.volume_mounts = Some(vec![
+            VolumeMount {
+                name: "data".to_string(),
+                mount_path: "/data".to_string(),
+                read_only: Some(true),
+                sub_path: None,
+                sub_path_expr: None,
+                mount_propagation: None,
+                recursive_read_only: None,
+            },
+            VolumeMount {
+                name: "missing".to_string(),
+                mount_path: "/nope".to_string(),
+                read_only: None,
+                sub_path: None,
+                sub_path_expr: None,
+                mount_propagation: None,
+                recursive_read_only: None,
+            },
+        ]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        let host_paths = HashMap::from([("data".to_string(), "/host/data".to_string())]);
+        let cfg = container_config(&pod, &c, "img", &host_paths);
+        // Only the resolvable mount is emitted; the unmapped one is skipped.
+        assert_eq!(cfg.mounts.len(), 1);
+        assert_eq!(cfg.mounts[0].container_path, "/data");
+        assert_eq!(cfg.mounts[0].host_path, "/host/data");
+        assert!(cfg.mounts[0].readonly);
+    }
+
+    #[test]
+    fn ports_map_with_protocol() {
+        use rusternetes_common::resources::pod::ContainerPort;
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.ports = Some(vec![
+            ContainerPort {
+                container_port: 53,
+                name: Some("dns".to_string()),
+                protocol: Some("UDP".to_string()),
+                host_port: Some(5353),
+                host_ip: None,
+            },
+            ContainerPort {
+                container_port: 80,
+                name: None,
+                protocol: None, // defaults to TCP
+                host_port: None,
+                host_ip: None,
+            },
+        ]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c],
+            ..Default::default()
+        });
+        let cfg = sandbox_config(&pod, "/log");
+        assert_eq!(cfg.port_mappings.len(), 2);
+        assert_eq!(cfg.port_mappings[0].protocol, v1::Protocol::Udp as i32);
+        assert_eq!(cfg.port_mappings[0].container_port, 53);
+        assert_eq!(cfg.port_mappings[0].host_port, 5353);
+        assert_eq!(cfg.port_mappings[1].protocol, v1::Protocol::Tcp as i32);
+    }
+
+    #[test]
+    fn host_pid_and_ipc_map_to_node_namespace() {
+        let pod = pod_with(PodSpec {
+            host_pid: Some(true),
+            host_ipc: Some(true),
+            host_network: Some(false),
+            ..Default::default()
+        });
+        let ns = sandbox_config(&pod, "/log")
+            .linux
+            .unwrap()
+            .security_context
+            .unwrap()
+            .namespace_options
+            .unwrap();
+        assert_eq!(ns.pid, v1::NamespaceMode::Node as i32);
+        assert_eq!(ns.ipc, v1::NamespaceMode::Node as i32);
+        assert_eq!(ns.network, v1::NamespaceMode::Pod as i32);
+    }
+
+    #[test]
+    fn security_context_maps_privileged_and_user() {
+        use rusternetes_common::resources::pod::SecurityContext;
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.security_context = Some(SecurityContext {
+            privileged: Some(true),
+            run_as_user: Some(1000),
+            run_as_group: Some(2000),
+            run_as_non_root: None,
+            read_only_root_filesystem: Some(true),
+            allow_privilege_escalation: None,
+            proc_mount: None,
+            capabilities: None,
+            seccomp_profile: None,
+            se_linux_options: None,
+            app_armor_profile: None,
+            windows_options: None,
+        });
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        let sc = container_config(&pod, &c, "img", &HashMap::new())
+            .linux
+            .unwrap()
+            .security_context
+            .unwrap();
+        assert!(sc.privileged);
+        assert!(sc.readonly_rootfs);
+        assert_eq!(sc.run_as_user.unwrap().value, 1000);
+        assert_eq!(sc.run_as_group.unwrap().value, 2000);
+    }
 }
