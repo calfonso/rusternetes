@@ -19,7 +19,7 @@ use std::path::Path;
 use rusternetes_common::resources::pod::{ContainerState, ContainerStatus, Pod};
 use rusternetes_cri::{v1, CriClient, CriError};
 
-use super::{status, translate};
+use super::{probe, status, translate};
 
 /// Errors from the CRI-backed runtime.
 #[derive(Debug, thiserror::Error)]
@@ -356,6 +356,128 @@ impl CriContainerRuntime {
         let containers = cri.list_containers(Some(filter)).await?;
         let running = v1::ContainerState::ContainerRunning as i32;
         Ok(containers.iter().any(|c| c.state == running))
+    }
+
+    /// Execute a single probe attempt against a container, returning whether it
+    /// succeeded. The kubelet drives the surrounding state machine (delay,
+    /// period, thresholds); this performs one attempt:
+    ///
+    /// - `exec`: run the command via CRI `ExecSync`; success = exit 0.
+    /// - `tcpSocket`: TCP connect to the (host or pod IP):port from the node.
+    /// - `httpGet`: HTTP(S) GET to the (host or pod IP):port/path; success =
+    ///   status < 400 (k8s treats 2xx/3xx as healthy).
+    /// - `grpc`: not yet supported — returns `false`.
+    ///
+    /// A probe with no action configured is treated as success (nothing to check).
+    pub async fn probe_container(
+        &self,
+        pod: &Pod,
+        container: &rusternetes_common::resources::pod::Container,
+        probe: &rusternetes_common::resources::pod::Probe,
+    ) -> Result<bool> {
+        let timeout =
+            std::time::Duration::from_secs(probe.timeout_seconds.unwrap_or(1).max(1) as u64);
+
+        if let Some(exec) = probe.exec.as_ref() {
+            if exec.command.is_empty() {
+                return Ok(true);
+            }
+            // Scope by pod uid + container name so a sibling pod with the same
+            // container name is never probed by mistake.
+            let filter = v1::ContainerFilter {
+                label_selector: std::collections::HashMap::from([
+                    (
+                        translate::labels::POD_UID.to_string(),
+                        pod.metadata.uid.clone(),
+                    ),
+                    (
+                        translate::labels::CONTAINER_NAME.to_string(),
+                        container.name.clone(),
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let mut cri = self.cri.clone();
+            let Some(c) = cri.list_containers(Some(filter)).await?.into_iter().next() else {
+                return Ok(false);
+            };
+            let cmd: Vec<&str> = exec.command.iter().map(String::as_str).collect();
+            let resp = cri
+                .exec_sync(
+                    &c.id,
+                    &cmd,
+                    probe.timeout_seconds.unwrap_or(1).max(1) as i64,
+                )
+                .await?;
+            return Ok(resp.exit_code == 0);
+        }
+
+        if let Some(tcp) = probe.tcp_socket.as_ref() {
+            let Some(port) = probe::resolve_port(container, &tcp.port) else {
+                return Ok(false);
+            };
+            let host = match tcp.host.clone() {
+                Some(h) => h,
+                None => match self.get_pod_ip(&pod.metadata.name).await? {
+                    Some(ip) => ip,
+                    None => return Ok(false),
+                },
+            };
+            let addr = format!("{host}:{port}");
+            let ok = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            return Ok(ok);
+        }
+
+        if let Some(http) = probe.http_get.as_ref() {
+            let Some(port) = probe::resolve_port(container, &http.port) else {
+                return Ok(false);
+            };
+            let host = match http.host.clone() {
+                Some(h) => h,
+                None => match self.get_pod_ip(&pod.metadata.name).await? {
+                    Some(ip) => ip,
+                    None => return Ok(false),
+                },
+            };
+            let scheme = if http
+                .scheme
+                .as_deref()
+                .unwrap_or("HTTP")
+                .eq_ignore_ascii_case("HTTPS")
+            {
+                "https"
+            } else {
+                "http"
+            };
+            let path = http.path.as_deref().unwrap_or("/");
+            let url = format!("{scheme}://{host}:{port}{path}");
+
+            let client = match reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(timeout)
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return Ok(false),
+            };
+            let mut req = client.get(&url);
+            if let Some(headers) = http.http_headers.as_ref() {
+                for h in headers {
+                    req = req.header(&h.name, &h.value);
+                }
+            }
+            let ok = match req.send().await {
+                Ok(resp) => resp.status().as_u16() < 400,
+                Err(_) => false,
+            };
+            return Ok(ok);
+        }
+
+        // No probe action configured.
+        Ok(true)
     }
 
     /// Exit code of the (most recent) container named `container_name`, or 0 if

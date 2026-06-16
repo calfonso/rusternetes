@@ -20,6 +20,24 @@ use rusternetes_kubelet::cri_runtime::{translate, CriContainerRuntime};
 
 const IMAGE: &str = "docker.io/library/busybox:latest";
 
+/// An exec liveness probe running a single command (Probe has no Default).
+fn exec_probe(cmd: &str) -> rusternetes_common::resources::pod::Probe {
+    rusternetes_common::resources::pod::Probe {
+        http_get: None,
+        tcp_socket: None,
+        exec: Some(rusternetes_common::resources::pod::ExecAction {
+            command: vec![cmd.to_string()],
+        }),
+        initial_delay_seconds: None,
+        timeout_seconds: Some(2),
+        period_seconds: None,
+        success_threshold: None,
+        failure_threshold: None,
+        grpc: None,
+        termination_grace_period_seconds: None,
+    }
+}
+
 /// Build a single-container test pod. `name` is distinct per test so the two
 /// (parallel) e2e tests don't collide on the runtime's sandbox-name reservation.
 fn test_pod(name: &str) -> Pod {
@@ -245,6 +263,24 @@ async fn cri_container_runtime_lifecycle() {
     let age = runtime.get_container_age(&pod_name).await.expect("age");
     assert!(age > std::time::Duration::ZERO, "sandbox age should be > 0");
     eprintln!("CriContainerRuntime existence/age introspection OK");
+
+    // Exec probe: `true` succeeds, `false` fails — run via CRI ExecSync.
+    let app_container = &pod.spec.as_ref().unwrap().containers[0];
+    assert!(
+        runtime
+            .probe_container(&pod, app_container, &exec_probe("/bin/true"))
+            .await
+            .expect("probe ok"),
+        "exec /bin/true probe should succeed"
+    );
+    assert!(
+        !runtime
+            .probe_container(&pod, app_container, &exec_probe("/bin/false"))
+            .await
+            .expect("probe fail"),
+        "exec /bin/false probe should fail"
+    );
+    eprintln!("CriContainerRuntime exec probe OK");
 
     // garbage_collect_containers is intentionally NOT exercised here: it removes
     // every sandbox not in the keep-set, which would race with the sibling

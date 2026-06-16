@@ -6,6 +6,7 @@
 //! [`translate`] (Pod → CRI config mapping) is the foundation; the
 //! `ContainerRuntime`-equivalent lifecycle methods build on it in later steps.
 
+pub mod probe;
 pub mod runtime;
 pub mod status;
 pub mod translate;
