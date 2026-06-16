@@ -92,6 +92,24 @@ async fn translated_pod_runs_on_containerd() {
     let mut cri = CriClient::connect(&socket).await.expect("connect CRI");
     cri.pull_image(IMAGE, None, None).await.expect("PullImage");
 
+    // Remove any leftover sandbox for this pod from an interrupted prior run so
+    // the runtime's sandbox-name reservation doesn't block RunPodSandbox.
+    if let Ok(existing) = cri
+        .list_pod_sandbox(Some(rusternetes_cri::v1::PodSandboxFilter {
+            label_selector: std::collections::HashMap::from([(
+                "io.kubernetes.pod.uid".to_string(),
+                "translate-e2e-uid".to_string(),
+            )]),
+            ..Default::default()
+        }))
+        .await
+    {
+        for sb in existing {
+            let _ = cri.stop_pod_sandbox(&sb.id).await;
+            let _ = cri.remove_pod_sandbox(&sb.id).await;
+        }
+    }
+
     let sandbox_id = cri
         .run_pod_sandbox(sandbox_cfg.clone(), &handler)
         .await
