@@ -83,6 +83,7 @@ async fn projected_secret_explicit_default_mode_round_trips() {
                 service_account_token: None,
                 downward_api: None,
                 cluster_trust_bundle: None,
+                ..Default::default()
             }]),
         }),
         image: None,
@@ -159,6 +160,7 @@ async fn projected_omitted_default_mode_defaults_to_0644() {
                 service_account_token: None,
                 downward_api: None,
                 cluster_trust_bundle: None,
+                ..Default::default()
             }]),
         }),
         image: None,

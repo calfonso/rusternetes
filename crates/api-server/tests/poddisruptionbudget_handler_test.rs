@@ -309,6 +309,7 @@ async fn test_pdb_with_conditions() {
             last_transition_time: Some("2026-03-15T10:00:00Z".to_string()),
             reason: Some("SufficientPods".to_string()),
             message: Some("Sufficient pods available for disruption".to_string()),
+            ..Default::default()
         }]),
         disrupted_pods: None,
     });

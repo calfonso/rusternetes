@@ -106,6 +106,7 @@ fn pod_listening_on(namespace: &str, name: &str, port: u16) -> Pod {
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         }),
     }
 }

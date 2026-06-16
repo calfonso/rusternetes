@@ -57,6 +57,7 @@ fn sa_token_volume() -> Volume {
                     secret: None,
                     downward_api: None,
                     cluster_trust_bundle: None,
+                    ..Default::default()
                 },
                 VolumeProjection {
                     service_account_token: None,
@@ -72,6 +73,7 @@ fn sa_token_volume() -> Volume {
                     secret: None,
                     downward_api: None,
                     cluster_trust_bundle: None,
+                    ..Default::default()
                 },
                 VolumeProjection {
                     service_account_token: None,
@@ -89,6 +91,7 @@ fn sa_token_volume() -> Volume {
                         }]),
                     }),
                     cluster_trust_bundle: None,
+                    ..Default::default()
                 },
             ]),
             default_mode: Some(0o644),

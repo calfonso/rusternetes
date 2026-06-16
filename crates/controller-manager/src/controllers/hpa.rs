@@ -890,6 +890,7 @@ mod tests {
                         os: None,
                         scheduling_gates: None,
                         resources: None,
+                        ..Default::default()
                     },
                 },
                 strategy: None,
@@ -1178,6 +1179,7 @@ mod tests {
                         os: None,
                         scheduling_gates: None,
                         resources: None,
+                        ..Default::default()
                     },
                 },
                 strategy: None,

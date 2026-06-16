@@ -280,6 +280,7 @@ async fn test_ephemeral_container_add_via_subresource_accepted() {
         resources: None,
         termination_message_path: None,
         termination_message_policy: None,
+        ..Default::default()
     }]);
     let (status, body) = put_ephemeralcontainers(state, &new_pod).await;
     assert_eq!(
@@ -614,6 +615,7 @@ async fn test_ephemeral_container_remove_via_subresource_rejected() {
         resources: None,
         termination_message_path: None,
         termination_message_policy: None,
+        ..Default::default()
     }]);
     seed(&state, &pod).await;
 
@@ -654,6 +656,7 @@ async fn test_ephemeral_container_on_main_path_rejected() {
         resources: None,
         termination_message_path: None,
         termination_message_policy: None,
+        ..Default::default()
     }]);
     let (status, body) = put_pod(state, &new_pod).await;
     assert_rejected(

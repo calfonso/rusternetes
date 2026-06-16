@@ -213,6 +213,7 @@ fn container_strategy() -> impl Strategy<Value = Container> {
             stdin: None,
             stdin_once: None,
             tty: None,
+            ..Default::default()
         })
 }
 

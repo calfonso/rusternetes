@@ -349,6 +349,7 @@ fn test_validate_pod_error_ephemeral_containers_on_create() {
             resources: None,
             termination_message_path: None,
             termination_message_policy: None,
+            ..Default::default()
         }]),
         ..PodSpec::default()
     });

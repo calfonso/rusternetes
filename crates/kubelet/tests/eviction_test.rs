@@ -98,6 +98,7 @@ fn create_pod_with_qos(name: &str, namespace: &str, qos: QoSClass) -> Pod {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             ephemeral_containers: None,
@@ -138,6 +139,7 @@ fn create_pod_with_qos(name: &str, namespace: &str, qos: QoSClass) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

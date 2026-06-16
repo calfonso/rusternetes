@@ -645,6 +645,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
+                ..Default::default()
             }),
         };
 
@@ -859,6 +860,7 @@ mod tests {
                             tty: None,
                             resize_policy: None,
                             restart_policy: None,
+                            ..Default::default()
                         }],
                         init_containers: None,
                         ephemeral_containers: None,
@@ -899,6 +901,7 @@ mod tests {
                         resource_claims: None,
                         host_users: None,
                         resources: None,
+                        ..Default::default()
                     },
                 },
                 min_ready_seconds: None,
@@ -945,6 +948,7 @@ mod tests {
                     tty: None,
                     resize_policy: None,
                     restart_policy: None,
+                    ..Default::default()
                 }],
                 init_containers: None,
                 ephemeral_containers: None,
@@ -985,6 +989,7 @@ mod tests {
                 resource_claims: None,
                 host_users: None,
                 resources: None,
+                ..Default::default()
             }),
             status: Some(PodStatus {
                 phase: Some(Phase::Running),
@@ -1004,6 +1009,7 @@ mod tests {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
+                ..Default::default()
             }),
         }
     }

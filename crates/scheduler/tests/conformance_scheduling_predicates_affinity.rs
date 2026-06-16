@@ -97,6 +97,7 @@ fn container_with_cpu(cpu_request: Option<&str>) -> Container {
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 
@@ -256,6 +257,7 @@ fn required_pod_affinity(topology_key: &str, match_labels: &[(&str, &str)]) -> A
                 },
                 namespaces: None,
                 topology_key: topology_key.to_string(),
+                ..Default::default()
             }]),
             preferred_during_scheduling_ignored_during_execution: None,
         }),
@@ -286,6 +288,7 @@ fn preferred_pod_affinity(
                         },
                         namespaces: None,
                         topology_key: topology_key.to_string(),
+                        ..Default::default()
                     },
                 },
             ]),
@@ -310,6 +313,7 @@ fn required_pod_anti_affinity(topology_key: &str, match_labels: &[(&str, &str)])
                 },
                 namespaces: None,
                 topology_key: topology_key.to_string(),
+                ..Default::default()
             }]),
             preferred_during_scheduling_ignored_during_execution: None,
         }),

@@ -62,6 +62,7 @@ fn create_test_pod(name: &str, namespace: &str, owner_uid: Option<&str>) -> Pod 
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             restart_policy: Some("Always".to_string()),
@@ -102,6 +103,7 @@ fn create_test_pod(name: &str, namespace: &str, owner_uid: Option<&str>) -> Pod 
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Running),
@@ -121,6 +123,7 @@ fn create_test_pod(name: &str, namespace: &str, owner_uid: Option<&str>) -> Pod 
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         }),
     }
 }

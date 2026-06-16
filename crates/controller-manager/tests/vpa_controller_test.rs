@@ -69,6 +69,7 @@ fn create_test_deployment_with_pods(
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     ephemeral_containers: None,
@@ -109,6 +110,7 @@ fn create_test_deployment_with_pods(
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             strategy: None,
@@ -152,6 +154,7 @@ fn create_test_deployment_with_pods(
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         };
         pods.push(pod);

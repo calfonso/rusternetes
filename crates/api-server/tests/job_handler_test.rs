@@ -66,6 +66,7 @@ fn create_test_job(name: &str, namespace: &str) -> Job {
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     restart_policy: Some("OnFailure".to_string()),
@@ -106,6 +107,7 @@ fn create_test_job(name: &str, namespace: &str) -> Job {
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             active_deadline_seconds: None,

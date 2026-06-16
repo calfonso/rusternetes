@@ -86,6 +86,7 @@ fn make_container(name: &str, cpu: &str, memory: &str) -> Container {
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 

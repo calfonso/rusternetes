@@ -282,6 +282,7 @@ mod tests {
                 requires_republish: Some(false),
                 se_linux_mount: Some(false),
                 node_allocatable_update_period_seconds: None,
+                ..Default::default()
             },
         }
     }

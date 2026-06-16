@@ -54,6 +54,7 @@ fn base_pod_spec() -> PodSpec {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }],
         init_containers: None,
         restart_policy: Some("Never".to_string()),
@@ -94,6 +95,7 @@ fn base_pod_spec() -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     }
 }
 

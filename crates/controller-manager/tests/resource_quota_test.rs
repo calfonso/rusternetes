@@ -53,6 +53,7 @@ fn create_test_pod(name: &str, cpu_request: &str, memory_request: &str) -> Pod {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             volumes: None,
@@ -93,6 +94,7 @@ fn create_test_pod(name: &str, cpu_request: &str, memory_request: &str) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

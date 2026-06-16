@@ -43,6 +43,7 @@ fn create_pod_with_sidecar(
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         });
     }
 
@@ -73,6 +74,7 @@ fn create_pod_with_sidecar(
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         });
     }
 
@@ -103,6 +105,7 @@ fn create_pod_with_sidecar(
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         });
     }
 
@@ -153,6 +156,7 @@ fn create_pod_with_sidecar(
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }
@@ -280,6 +284,7 @@ fn test_sidecar_runs_alongside_main_containers() {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     });
 
     let status = pod.status.as_ref().unwrap();
@@ -467,6 +472,7 @@ fn test_sidecar_failure_should_not_block_pod() {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     });
 
     let status = pod.status.as_ref().unwrap();

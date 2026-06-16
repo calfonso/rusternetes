@@ -62,6 +62,7 @@ fn create_test_replicaset(name: &str, namespace: &str, replicas: i32) -> Replica
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     ephemeral_containers: None,
@@ -102,6 +103,7 @@ fn create_test_replicaset(name: &str, namespace: &str, replicas: i32) -> Replica
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
         },
@@ -293,6 +295,7 @@ async fn test_replicaset_selector_matching() {
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     ephemeral_containers: None,
@@ -333,6 +336,7 @@ async fn test_replicaset_selector_matching() {
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
         },
@@ -381,6 +385,7 @@ async fn test_replicaset_selector_matching() {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         }),
     };
 

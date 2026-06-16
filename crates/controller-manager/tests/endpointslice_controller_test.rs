@@ -24,6 +24,7 @@ fn create_test_endpoints(
                 namespace: Some(namespace.to_string()),
                 name: Some(format!("pod-{}", idx)),
                 uid: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
             }),
         })
         .collect();

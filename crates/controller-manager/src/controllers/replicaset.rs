@@ -877,6 +877,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
+                ..Default::default()
             }),
         };
 

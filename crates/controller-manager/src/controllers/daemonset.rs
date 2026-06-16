@@ -1211,6 +1211,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         };
 
@@ -1630,6 +1631,7 @@ mod tests {
                         os: None,
                         scheduling_gates: None,
                         resources: None,
+                        ..Default::default()
                     },
                 },
                 update_strategy: None,
@@ -1913,6 +1915,7 @@ mod tests {
                             tty: None,
                             resize_policy: None,
                             restart_policy: None,
+                            ..Default::default()
                         }],
                         node_name: None,
                         node_selector: None,
@@ -1952,6 +1955,7 @@ mod tests {
                         os: None,
                         scheduling_gates: None,
                         resources: None,
+                        ..Default::default()
                     },
                 },
                 update_strategy: None,

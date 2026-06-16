@@ -77,6 +77,7 @@ fn make_container_with_prestop_exec(name: &str, command: Vec<&str>) -> Container
         tty: None,
         env_from: None,
         volume_devices: None,
+        ..Default::default()
     }
 }
 

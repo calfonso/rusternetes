@@ -885,6 +885,7 @@ impl<S: Storage + 'static> NodeController<S> {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             });
         }
 

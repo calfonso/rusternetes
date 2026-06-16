@@ -110,6 +110,7 @@ fn create_test_pod(name: &str, namespace: &str, labels: HashMap<String, String>)
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             restart_policy: Some("Always".to_string()),
@@ -150,6 +151,7 @@ fn create_test_pod(name: &str, namespace: &str, labels: HashMap<String, String>)
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Running),
@@ -177,6 +179,7 @@ fn create_test_pod(name: &str, namespace: &str, labels: HashMap<String, String>)
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         }),
     };
     // Mirror the upstream guarantee that the pod is observed Running+Ready.

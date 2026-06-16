@@ -45,6 +45,7 @@ fn container_with_resize_policy(name: &str, rp: Vec<ContainerResizePolicy>) -> C
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 
@@ -96,6 +97,7 @@ fn pod_with_resize_status(status: Option<&str>) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: None,
@@ -115,6 +117,7 @@ fn pod_with_resize_status(status: Option<&str>) -> Pod {
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         }),
     }
 }

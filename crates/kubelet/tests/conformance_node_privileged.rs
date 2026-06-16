@@ -59,6 +59,7 @@ fn container_with_sec_ctx(name: &str, sc: Option<SecurityContext>) -> Container 
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 

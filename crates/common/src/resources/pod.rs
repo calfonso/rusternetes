@@ -205,8 +205,16 @@ pub struct PodSpec {
     pub host_users: Option<bool>,
 
     /// SetHostnameAsFQDN determines if the pod's hostname will be configured as the pod's FQDN
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "setHostnameAsFQDN", skip_serializing_if = "Option::is_none")]
     pub set_hostname_as_fqdn: Option<bool>,
+
+    /// HostnameOverride specifies an explicit override for the pod's hostname (k8s 1.35)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname_override: Option<String>,
+
+    /// WorkloadRef is a reference to the workload this pod belongs to (k8s 1.35, alpha)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload_ref: Option<WorkloadReference>,
 
     /// TerminationGracePeriodSeconds is the grace period before forcible pod termination
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -377,8 +385,82 @@ pub struct PodReadinessGate {
     pub condition_type: String,
 }
 
+/// WorkloadReference references the workload a pod belongs to (k8s 1.35, alpha)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadReference {
+    pub name: String,
+    pub pod_group: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_group_replica_key: Option<String>,
+}
+
+/// ContainerRestartRule describes how a container exit maps to a restart
+/// decision (k8s 1.35).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerRestartRule {
+    /// Action taken when the rule matches. Currently only "Restart".
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_codes: Option<ContainerRestartRuleOnExitCodes>,
+}
+
+/// ContainerRestartRuleOnExitCodes matches a container exit by exit code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerRestartRuleOnExitCodes {
+    /// Operator relating the container exit code(s) to `values` (In / NotIn).
+    pub operator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<i32>>,
+}
+
+/// PodExtendedResourceClaimStatus is the status of the ResourceClaim generated
+/// for a pod's extended resource requests (k8s 1.35).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodExtendedResourceClaimStatus {
+    /// RequestMappings map each container extended-resource request to a
+    /// DeviceRequest in the generated ResourceClaim.
+    pub request_mappings: Vec<ContainerExtendedResourceRequest>,
+    /// ResourceClaimName is the name of the generated ResourceClaim.
+    pub resource_claim_name: String,
+}
+
+/// ContainerExtendedResourceRequest maps a container's extended-resource
+/// request to a generated DeviceRequest (k8s 1.35).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerExtendedResourceRequest {
+    pub container_name: String,
+    pub request_name: String,
+    pub resource_name: String,
+}
+
+/// PodCertificateProjection projects a short-lived X.509 certificate issued for
+/// the pod into the volume (k8s 1.35).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodCertificateProjection {
+    /// SignerName is the name of the signer that signs the certificate.
+    pub signer_name: String,
+    /// KeyType is the type of keypair the kubelet generates (e.g. RSA3072, ED25519).
+    pub key_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_expiration_seconds: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_bundle_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_chain_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_annotations: Option<std::collections::HashMap<String, String>>,
+}
+
 /// EphemeralContainer is a temporary container added to a running pod for debugging
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralContainer {
     pub name: String,
@@ -440,6 +522,38 @@ pub struct EphemeralContainer {
     /// TerminationMessagePolicy indicates how the termination message should be populated
     #[serde(skip_serializing_if = "Option::is_none")]
     pub termination_message_policy: Option<String>,
+
+    /// Ports exposed by the ephemeral container (rarely used; kept for parity)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<ContainerPort>>,
+
+    /// EnvFrom sources to populate environment variables
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_from: Option<Vec<EnvFromSource>>,
+
+    /// VolumeDevices is the list of block devices to be used by the container
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_devices: Option<Vec<VolumeDevice>>,
+
+    /// Lifecycle is not allowed for ephemeral containers, but present for parity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Lifecycle>,
+
+    /// LivenessProbe is not allowed for ephemeral containers, but present for parity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness_probe: Option<Probe>,
+
+    /// ReadinessProbe is not allowed for ephemeral containers, but present for parity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<Probe>,
+
+    /// StartupProbe is not allowed for ephemeral containers, but present for parity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_probe: Option<Probe>,
+
+    /// RestartPolicyRules are evaluated in order to determine restart behaviour (k8s 1.35)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_policy_rules: Option<Vec<ContainerRestartRule>>,
 }
 
 /// TopologySpreadConstraint specifies how to spread pods across topology domains
@@ -530,6 +644,10 @@ pub struct Container {
     /// Possible values: Always (sidecar container that runs alongside main containers)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<String>,
+
+    /// RestartPolicyRules are evaluated in order to determine restart behaviour (k8s 1.35)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_policy_rules: Option<Vec<ContainerRestartRule>>,
 
     /// ResizePolicy is the list of container resource resize policies
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -823,18 +941,26 @@ pub struct VolumeDevice {
     pub device_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigMapKeySelector {
     pub name: String,
     pub key: String,
+
+    /// Specify whether the ConfigMap or its key must be defined
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretKeySelector {
     pub name: String,
     pub key: String,
+
+    /// Specify whether the Secret or its key must be defined
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -923,7 +1049,7 @@ pub struct ProjectedVolumeSource {
 }
 
 /// VolumeProjection is a single volume source for a projected volume
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeProjection {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -940,6 +1066,9 @@ pub struct VolumeProjection {
     pub downward_api: Option<DownwardAPIProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_trust_bundle: Option<ClusterTrustBundleProjection>,
+    /// PodCertificate projects a freshly-issued X.509 certificate (k8s 1.35)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_certificate: Option<PodCertificateProjection>,
 }
 
 /// SecretProjection adapts a Secret into a projected volume
@@ -1282,6 +1411,14 @@ pub struct PodStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resize: Option<String>,
 
+    /// Total compute resources actually allocated to the pod (pod-level resize)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_resources: Option<HashMap<String, String>>,
+
+    /// Compute resources the kubelet enforces for the pod (pod-level resize)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::types::ResourceRequirements>,
+
     /// Status of resource claims
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_claim_statuses: Option<Vec<PodResourceClaimStatus>>,
@@ -1289,6 +1426,11 @@ pub struct PodStatus {
     /// ObservedGeneration represents the .metadata.generation that the status was set based upon
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+
+    /// ExtendedResourceClaimStatus is the status of the extended resource claim
+    /// generated for this pod (k8s 1.35, DRA)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended_resource_claim_status: Option<PodExtendedResourceClaimStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1522,7 +1664,7 @@ pub struct PodAntiAffinity {
 }
 
 /// Defines a set of pods that should be co-located
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodAffinityTerm {
     /// A label selector over a set of resources
@@ -1534,6 +1676,20 @@ pub struct PodAffinityTerm {
 
     /// Topology key for pod placement
     pub topology_key: String,
+
+    /// A label query over the set of namespaces that the term applies to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace_selector: Option<crate::types::LabelSelector>,
+
+    /// Keys of pod labels merged into the labelSelector to select against
+    /// pods that have the same values for these keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_label_keys: Option<Vec<String>>,
+
+    /// Keys of pod labels merged into the labelSelector to select against
+    /// pods that have different values for these keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mismatch_label_keys: Option<Vec<String>>,
 }
 
 /// The weights of all the matched WeightedPodAffinityTerm fields are added per-node to find the most preferred node(s)
@@ -1898,6 +2054,7 @@ mod tests {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 },
                 Container {
                     name: "init-mydb".to_string(),
@@ -1928,6 +2085,7 @@ mod tests {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 },
             ]),
             containers: vec![Container {
@@ -1961,6 +2119,7 @@ mod tests {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             ephemeral_containers: None,
             volumes: None,
@@ -2000,6 +2159,7 @@ mod tests {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         };
 
         let pod = Pod::new("myapp-pod", spec);
@@ -2175,6 +2335,7 @@ mod tests {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         };
 
         assert_eq!(status.phase, Some(Phase::Running));
@@ -2301,6 +2462,7 @@ mod tests {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             ephemeral_containers: None,
@@ -2341,6 +2503,7 @@ mod tests {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         };
 
         // Clone it (like DaemonSet controller does)
@@ -2596,6 +2759,7 @@ mod tests {
                     env: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 }],
                 init_containers: None,
                 ephemeral_containers: None,
@@ -2636,6 +2800,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: Some(PodStatus {
                 phase: Some(Phase::Running),
@@ -2681,6 +2846,7 @@ mod tests {
                 resize: Some("InProgress".to_string()),
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         };
 
@@ -2771,6 +2937,7 @@ mod tests {
                     env: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 }],
                 init_containers: None,
                 ephemeral_containers: None,
@@ -2811,6 +2978,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: Some(PodStatus {
                 phase: Some(Phase::Running),
@@ -2830,6 +2998,7 @@ mod tests {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         };
 

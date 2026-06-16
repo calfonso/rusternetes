@@ -131,6 +131,7 @@ fn create_test_pod(
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             ephemeral_containers: None,
@@ -171,6 +172,7 @@ fn create_test_pod(
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Pending),
@@ -190,6 +192,7 @@ fn create_test_pod(
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         }),
     }
 }
@@ -783,6 +786,7 @@ async fn test_pod_affinity_required() {
                 },
                 namespaces: None,
                 topology_key: "topology.kubernetes.io/zone".to_string(),
+                ..Default::default()
             }]),
             preferred_during_scheduling_ignored_during_execution: None,
         }),
@@ -844,6 +848,7 @@ async fn test_pod_affinity_preferred() {
                         },
                         namespaces: None,
                         topology_key: "topology.kubernetes.io/zone".to_string(),
+                        ..Default::default()
                     },
                 },
             ]),
@@ -921,6 +926,7 @@ async fn test_pod_anti_affinity_required() {
                 },
                 namespaces: None,
                 topology_key: "kubernetes.io/hostname".to_string(),
+                ..Default::default()
             }]),
             preferred_during_scheduling_ignored_during_execution: None,
         }),
@@ -984,6 +990,7 @@ async fn test_pod_anti_affinity_preferred() {
                         },
                         namespaces: None,
                         topology_key: "kubernetes.io/hostname".to_string(),
+                        ..Default::default()
                     },
                 },
             ]),
@@ -1080,6 +1087,7 @@ async fn test_topology_spread_with_affinity() {
                             },
                             namespaces: None,
                             topology_key: "topology.kubernetes.io/zone".to_string(),
+                            ..Default::default()
                         },
                     },
                 ]),

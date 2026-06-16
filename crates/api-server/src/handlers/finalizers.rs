@@ -807,6 +807,7 @@ mod tests {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         };
         let mut pod = Pod::new(name, spec);
         pod.metadata.namespace = Some("default".to_string());

@@ -57,6 +57,7 @@ fn make_container(name: &str) -> Container {
         tty: None,
         env_from: None,
         volume_devices: None,
+        ..Default::default()
     }
 }
 
@@ -184,6 +185,7 @@ fn make_pod(
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }
@@ -339,6 +341,7 @@ fn guaranteed_unaffected_by_ephemeral_containers() {
         }),
         termination_message_path: None,
         termination_message_policy: None,
+        ..Default::default()
     };
     let pod = make_pod("pod", app, None, Some(vec![eph]));
     assert_eq!(

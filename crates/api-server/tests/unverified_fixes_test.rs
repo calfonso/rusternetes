@@ -821,6 +821,7 @@ fn create_test_pod(name: &str, namespace: &str) -> Pod {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             ephemeral_containers: None,
@@ -861,6 +862,7 @@ fn create_test_pod(name: &str, namespace: &str) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }
@@ -942,6 +944,7 @@ fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Deploym
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     ephemeral_containers: None,
@@ -982,6 +985,7 @@ fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Deploym
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             strategy: None,

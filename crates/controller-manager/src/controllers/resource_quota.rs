@@ -866,6 +866,7 @@ mod tests {
             tty: None,
             resize_policy: None,
             restart_policy: None,
+            ..Default::default()
         }
     }
 

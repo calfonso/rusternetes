@@ -79,6 +79,7 @@ fn empty_container() -> Container {
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 
@@ -130,6 +131,7 @@ fn pod_with_affinity(name: &str, affinity: Affinity) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

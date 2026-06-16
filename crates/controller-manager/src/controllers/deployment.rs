@@ -2059,6 +2059,7 @@ mod tests {
             stdin: None,
             stdin_once: None,
             tty: None,
+            ..Default::default()
         }
     }
 

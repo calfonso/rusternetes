@@ -62,6 +62,7 @@ fn create_minimal_pod_spec() -> PodSpec {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }],
         init_containers: None,
         ephemeral_containers: None,
@@ -102,6 +103,7 @@ fn create_minimal_pod_spec() -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     }
 }
 
@@ -125,6 +127,7 @@ fn create_minimal_pod_status() -> PodStatus {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     }
 }
 

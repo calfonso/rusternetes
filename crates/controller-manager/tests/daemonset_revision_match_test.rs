@@ -97,6 +97,7 @@ fn make_daemonset(name: &str, ns: &str) -> DaemonSet {
                         tty: None,
                         resize_policy: None,
                         restart_policy: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     node_name: None,
@@ -137,6 +138,7 @@ fn make_daemonset(name: &str, ns: &str) -> DaemonSet {
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             update_strategy: None,

@@ -44,6 +44,7 @@ fn base_container() -> Container {
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 
@@ -95,6 +96,7 @@ fn base_pod() -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

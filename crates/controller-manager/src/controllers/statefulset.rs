@@ -1527,6 +1527,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
+                ..Default::default()
             }),
         };
 
@@ -1640,6 +1641,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
+                ..Default::default()
             }),
         };
 
@@ -1792,6 +1794,7 @@ mod tests {
             stdin: None,
             stdin_once: None,
             tty: None,
+            ..Default::default()
         }
     }
 

@@ -643,6 +643,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
                     namespace: pod.metadata.namespace.clone(),
                     name: Some(pod.metadata.name.clone()),
                     uid: Some(pod.metadata.uid.clone()),
+                    ..Default::default()
                 }),
             };
 
@@ -712,6 +713,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
                         namespace: pod.metadata.namespace.clone(),
                         name: Some(pod.metadata.name.clone()),
                         uid: Some(pod.metadata.uid.clone()),
+                        ..Default::default()
                     }),
                 };
 
@@ -898,6 +900,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         };
@@ -989,6 +992,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         };
@@ -1014,6 +1018,7 @@ mod tests {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
             ..pod_no_status.clone()
         };
@@ -1063,6 +1068,7 @@ mod tests {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
             ..pod_no_status.clone()
         };
@@ -1112,6 +1118,7 @@ mod tests {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
             ..pod_no_status
         };

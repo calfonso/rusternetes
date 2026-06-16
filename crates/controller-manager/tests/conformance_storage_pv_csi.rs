@@ -631,6 +631,7 @@ fn csidriver_lifecycle_serde_round_trip() {
             requires_republish: None,
             se_linux_mount: None,
             node_allocatable_update_period_seconds: None,
+            ..Default::default()
         },
     };
 

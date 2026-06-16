@@ -72,6 +72,7 @@ fn empty_pod(name: &str) -> Pod {
                 stdin: None,
                 stdin_once: None,
                 tty: None,
+                ..Default::default()
             }],
             ..Default::default()
         },

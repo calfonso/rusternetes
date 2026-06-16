@@ -38,6 +38,7 @@ fn ec(name: &str, target: Option<&str>) -> EphemeralContainer {
         resources: None,
         termination_message_path: None,
         termination_message_policy: None,
+        ..Default::default()
     }
 }
 

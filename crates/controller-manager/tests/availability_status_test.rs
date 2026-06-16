@@ -51,6 +51,7 @@ fn make_container() -> Container {
         tty: None,
         env_from: None,
         volume_devices: None,
+        ..Default::default()
     }
 }
 
@@ -96,6 +97,7 @@ fn make_pod_spec(_labels: HashMap<String, String>) -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     }
 }
 

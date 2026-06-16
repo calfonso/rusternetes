@@ -27,6 +27,7 @@ fn make_container(name: &str) -> Container {
         tty: None,
         env_from: None,
         volume_devices: None,
+        ..Default::default()
     }
 }
 
@@ -78,6 +79,7 @@ fn make_pod(name: &str, namespace: &str, hostname: Option<&str>, subdomain: Opti
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

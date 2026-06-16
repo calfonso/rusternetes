@@ -84,6 +84,7 @@ async fn test_complete_pod_lifecycle() {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             restart_policy: Some("Always".to_string()),
@@ -124,6 +125,7 @@ async fn test_complete_pod_lifecycle() {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Pending),
@@ -143,6 +145,7 @@ async fn test_complete_pod_lifecycle() {
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         }),
     };
 
@@ -189,6 +192,7 @@ async fn test_complete_pod_lifecycle() {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     });
     storage.update(&pod_key, &running_pod).await.unwrap();
 
@@ -263,6 +267,7 @@ async fn test_deployment_workflow() {
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     restart_policy: Some("Always".to_string()),
@@ -303,6 +308,7 @@ async fn test_deployment_workflow() {
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             strategy: None,
@@ -369,6 +375,7 @@ async fn test_deployment_workflow() {
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         });
         storage.update(&pod_key, &updated_pod).await.unwrap();
     }

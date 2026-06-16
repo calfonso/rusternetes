@@ -1365,6 +1365,7 @@ mod tests {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 }],
                 init_containers: None,
                 ephemeral_containers: None,
@@ -1405,6 +1406,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         };

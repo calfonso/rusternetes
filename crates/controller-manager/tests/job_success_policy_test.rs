@@ -69,6 +69,7 @@ fn make_indexed_job(name: &str, namespace: &str, completions: i32, parallelism: 
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     restart_policy: Some("Never".to_string()),
                     ..Default::default()
@@ -160,6 +161,7 @@ fn make_indexed_pod(name: &str, namespace: &str, phase: Phase, job_name: &str, i
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             restart_policy: Some("Never".to_string()),
             ..Default::default()

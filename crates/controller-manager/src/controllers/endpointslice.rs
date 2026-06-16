@@ -766,6 +766,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     uid: Some(pod.metadata.uid.clone()),
                     resource_version: None,
                     field_path: None,
+                    ..Default::default()
                 }),
                 node_name: pod.spec.as_ref().and_then(|s| s.node_name.clone()),
                 zone: None,

@@ -62,6 +62,7 @@ fn container(name: &str, resources: Option<ResourceRequirements>) -> Container {
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 
@@ -113,6 +114,7 @@ fn pod_with_containers(name: &str, containers: Vec<Container>) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

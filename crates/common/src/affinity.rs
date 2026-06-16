@@ -403,6 +403,7 @@ mod tests {
             },
             namespaces: None,
             topology_key: topology_key.to_string(),
+            ..Default::default()
         };
         let spec = PodSpec {
             affinity: Some(Affinity {
