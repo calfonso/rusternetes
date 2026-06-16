@@ -43,7 +43,7 @@ The Topology view is an animated visual map of your entire cluster showing nodes
 
 **Nodes** — Shown as containers with:
 - Node name and pod count
-- CPU and Memory utilization bars with percentages (from real Docker/Podman container stats, updated every 5 seconds)
+- CPU and Memory utilization bars with percentages (from real container stats via CRI, updated every 5 seconds)
 - Green dot = Ready, pulsing red dot = NotReady
 
 **Pods** — Colored squares inside their node:
@@ -158,7 +158,7 @@ The Networking page shows your cluster's network configuration and all network r
 Four cards always visible at the top, even with zero services:
 
 - **Service CIDR** — the IP range for ClusterIP allocation (e.g., `10.96.0.0/12`). All ClusterIP addresses are allocated from this range.
-- **Pod CIDRs** — per-node pod CIDR assignments. Shows `auto` when pods use Docker bridge networking.
+- **Pod CIDRs** — per-node pod CIDR assignments. Shows `auto` when pods use the container runtime's default bridge networking.
 - **Cluster DNS** — the kube-dns service at `10.96.0.10` with ports 53/UDP, 53/TCP (DNS), and 9153/TCP (metrics). All pods use this for service discovery.
 - **Kube-Proxy** — mode (`iptables`), runs in host network mode, supports ClusterIP, NodePort, and LoadBalancer service types.
 
@@ -207,7 +207,7 @@ Rusternetes implements the standard CNI specification. On Linux with network nam
 - **Cilium** — eBPF-based high-performance networking
 - **Flannel** — simple overlay networking
 
-Drop the plugin binaries in `/opt/cni/bin/` and configuration in `/etc/cni/net.d/`. On macOS (Docker Desktop), the kubelet automatically falls back to Docker bridge networking since CNI requires Linux network namespaces.
+Drop the plugin binaries in `/opt/cni/bin/` and configuration in `/etc/cni/net.d/`. CNI requires Linux network namespaces, so it is only active on Linux nodes; on macOS the kubelet falls back to the container runtime's default bridge networking.
 
 ---
 
@@ -305,7 +305,7 @@ The Nodes page shows every node in the cluster with real-time resource utilizati
 - **OS/Architecture** — e.g., linux/amd64
 - **Pod count** — number of pods scheduled to this node
 - **Age** — how long the node has been registered
-- **CPU gauge** — real utilization from Docker/Podman container stats, shown as millicores used / total cores with percentage (e.g., `2m / 4.0 cores (0.1%)`)
+- **CPU gauge** — real utilization from container stats via CRI (containerd), shown as millicores used / total cores with percentage (e.g., `2m / 4.0 cores (0.1%)`)
 - **Memory gauge** — real utilization shown as used / total with percentage (e.g., `37Mi / 8.0Gi (0.5%)`)
 - **Taint badges** — shows each taint as `key=value:effect` (e.g., `node.kubernetes.io/not-ready:NoSchedule`)
 
@@ -315,7 +315,7 @@ Click the **ban icon** to cordon a node (marks it unschedulable — no new pods 
 
 ### Node Metrics
 
-CPU and memory values come from the metrics API (`/apis/metrics.k8s.io/v1beta1/nodes`), which queries real Docker/Podman container stats using the bollard API. The metrics are:
+CPU and memory values come from the metrics API (`/apis/metrics.k8s.io/v1beta1/nodes`), which queries real container stats via CRI (containerd, `ListContainerStats`). The metrics are:
 - Per-node (each node shows only its own pods' usage)
 - Updated every 5 seconds
 - Derived from actual container CPU nanocores and memory working set bytes
@@ -562,7 +562,7 @@ To create a CRD, use **Create > From JSON** and define a CustomResourceDefinitio
 
 The console collects metrics from two sources:
 
-1. **K8s Metrics API** — `/apis/metrics.k8s.io/v1beta1/nodes` and `/pods`. The API server queries Docker/Podman container stats via the bollard library, aggregates CPU nanocores and memory working set bytes per node based on pod-to-node assignments. Updated every 5 seconds on both Nodes and Topology pages.
+1. **K8s Metrics API** — `/apis/metrics.k8s.io/v1beta1/nodes` and `/pods`. The kubelet queries container stats via CRI (containerd, `ListContainerStats`), aggregates CPU nanocores and memory working set bytes per node based on pod-to-node assignments. Updated every 5 seconds on both Nodes and Topology pages.
 
 2. **In-browser collection** — the Overview page polls `/api/v1/pods`, `/api/v1/nodes`, `/apis/apps/v1/deployments`, and `/api/v1/events` every 30 seconds, storing time-series data points for sparkline charts. Up to 30 minutes of history (60 data points).
 
@@ -582,7 +582,7 @@ The console collects metrics from two sources:
 
 ### Node Metrics Detail
 
-CPU is shown as millicores used vs total cores. For example, `2m / 4.0 cores (0.1%)` means 2 millicores (0.002 cores) out of 4 available cores. These are real values from Docker container stats, not estimates.
+CPU is shown as millicores used vs total cores. For example, `2m / 4.0 cores (0.1%)` means 2 millicores (0.002 cores) out of 4 available cores. These are real values from CRI container stats, not estimates.
 
 Memory is shown as megabytes or gigabytes used vs total allocatable. For example, `37Mi / 8.0Gi (0.5%)`.
 
@@ -645,9 +645,9 @@ The dropdown is populated live from the cluster's namespace list. Namespace filt
 - The resource may have been created successfully but is in a non-Running state — check the Events page
 
 ### Metrics show 0% on everything
-- CPU/memory metrics come from Docker/Podman container stats via the bollard API
+- CPU/memory metrics come from container stats via CRI (containerd, `ListContainerStats`)
 - Very low utilization (< 1%) shows as "0.1%" with a tiny visible bar
-- If metrics are stuck at exactly 0, check that the API server container has the Docker socket mounted (`/var/run/docker.sock`)
+- If metrics are stuck at exactly 0, check that the kubelet can reach the CRI endpoint (`CONTAINER_RUNTIME_ENDPOINT`, default `unix:///run/containerd/containerd.sock`)
 - Run `curl -sk https://localhost:6443/apis/metrics.k8s.io/v1beta1/nodes` to verify the metrics API returns data
 
 ### Console accessible but API calls fail

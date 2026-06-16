@@ -58,7 +58,7 @@ native Rust binaries:
 | **API server** | `api-server` | Axum HTTPS server: the full REST + Watch API, RBAC, admission webhooks, CRDs, Server-Side Apply, and the embedded web console |
 | **Scheduler** | `scheduler` | Filter/score plugin scheduling: affinity, taints/tolerations, priority/preemption, topology spread |
 | **Controller manager** | `controller-manager` | 31 reconciliation control loops (Deployment, ReplicaSet, Job, Endpoints, PV binding, HPA, GC, …) |
-| **Kubelet** | `kubelet` | Pod lifecycle via the Docker API (bollard): probes, volumes, init/sidecar containers, exec/attach |
+| **Kubelet** | `kubelet` | Pod lifecycle via CRI (CRI v1 gRPC → containerd → Youki): probes, volumes, init/sidecar containers, exec/attach |
 | **Kube-proxy** | `kube-proxy` | iptables service routing (ClusterIP / NodePort / LoadBalancer) in host-network mode |
 | **DNS** | `dns` | Cluster DNS for Services and Pods |
 | **kubectl** | `kubectl` | A from-scratch `kubectl` CLI |
@@ -117,7 +117,7 @@ the proving ground; the small-board cluster is the destination.
 │                                                               │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌────────────┐  │
 │  │  Kubelet         │  │  Kube-Proxy      │  │  DNS       │  │
-│  │  bollard (Docker)│  │  iptables routing│  │  Services  │  │
+│  │  CRI → containerd│  │  iptables routing│  │  Services  │  │
 │  │  Probes+Volumes  │  │  ClusterIP/NP/LB │  │  + Pods    │  │
 │  └──────────────────┘  └──────────────────┘  └────────────┘  │
 └───────────────────────────────────────────────────────────────┘
@@ -377,8 +377,9 @@ binary).
 ### Prerequisites
 
 - **Rust** (stable toolchain — see `rust-toolchain.toml`) to build from source.
-- **Docker or Podman** on every node that runs a kubelet — the kubelet drives
-  the container runtime over its socket.
+- **A CRI runtime (containerd)** on every node that runs a kubelet — the kubelet
+  drives it over CRI v1 gRPC at `CONTAINER_RUNTIME_ENDPOINT`. Docker or Podman is
+  still used to run the compose stack of node containers.
 - **The Rhino submodule**, required for SQLite/Redis builds:
   ```bash
   git clone --recurse-submodules https://github.com/calfonso/rusternetes.git
@@ -478,15 +479,15 @@ kubelet + kube-proxy on each worker, all pointed at the same storage endpoint
 ./target/release/rusternetes-dns     --etcd-servers http://STORE:2379
 
 # each worker (kube-proxy needs root or CAP_NET_ADMIN)
-export DOCKER_HOST=unix:///var/run/docker.sock
+export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
 ./target/release/kubelet --node-name worker-1 --etcd-servers http://STORE:2379
 sudo ./target/release/kube-proxy --node-name worker-1 --etcd-servers http://STORE:2379
 ```
 
 Node requirements:
 
-- **Container runtime socket** reachable by the kubelet
-  (`DOCKER_HOST=unix:///var/run/docker.sock` for Docker, or the Podman socket).
+- **CRI runtime socket** reachable by the kubelet
+  (`CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock` for containerd).
 - **Kube-proxy** needs `CAP_NET_ADMIN` + `CAP_NET_RAW`, host networking, and the
   `iptables`/`iproute2` tools. Run it as root, or grant caps:
   `sudo setcap cap_net_admin,cap_net_raw=ep ./kube-proxy`.
@@ -538,7 +539,7 @@ streaming, full resource management) served at `/console/` when started with
 Rusternetes is continuously tested against the **official Kubernetes v1.35
 conformance suite** (via Sonobuoy/Hydrophone), plus a kubelet-scoped
 `[NodeConformance]` job. Current pass rates and the per-test breakdown are
-tracked in [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
+tracked in the repository's GitHub Projects (Node Conformance and Conformance).
 
 ```bash
 bash scripts/run-conformance.sh        # full conformance lifecycle
@@ -581,10 +582,9 @@ Unit tests use the in-memory storage backend; `#[tokio::test]` for async. See
 
 - [README.md](README.md) — project intro and screenshots
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — internal design
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — deployment deep dive
-- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) — first-cluster walkthrough
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) — first-cluster walkthrough and deployment
 - [docs/storage/STORAGE_BACKENDS.md](docs/storage/STORAGE_BACKENDS.md) — storage modes
-- [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md), [docs/HIGH_AVAILABILITY.md](docs/HIGH_AVAILABILITY.md), [docs/CONSOLE_USER_GUIDE.md](docs/CONSOLE_USER_GUIDE.md), [docs/CONFORMANCE.md](docs/CONFORMANCE.md)
+- [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md), [docs/HIGH_AVAILABILITY.md](docs/HIGH_AVAILABILITY.md), [docs/CONSOLE_USER_GUIDE.md](docs/CONSOLE_USER_GUIDE.md)
 
 ## License
 

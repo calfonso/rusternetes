@@ -151,7 +151,7 @@ The e2e log is written to `/tmp/sonobuoy/results/e2e.log` inside the e2e contain
 | `api-server` | Axum-based REST API with per-resource handler files |
 | `storage` | Pluggable storage: etcd, SQLite/Redis (rhino), and in-memory backends |
 | `controller-manager` | 31 controllers following the reconciliation loop pattern |
-| `kubelet` | Container runtime via bollard, pod lifecycle, volumes, probes |
+| `kubelet` | Container runtime via CRI (containerd + Youki), pod lifecycle, volumes, probes |
 | `kube-proxy` | iptables-based service routing |
 | `scheduler` | Pod scheduling with affinity, taints, tolerations, preemption |
 | `kubectl` | CLI tool |

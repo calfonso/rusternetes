@@ -761,7 +761,7 @@ Before going to production:
 ## Related Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture
-- [DEPLOYMENT.md](DEPLOYMENT.md) - Cluster deployment guide
+- [QUICKSTART.md](QUICKSTART.md) - Cluster deployment guide
 - [AUTHENTICATION.md](AUTHENTICATION.md) - Authentication, RBAC, and authorization
 - [TLS_GUIDE.md](TLS_GUIDE.md) - TLS configuration
 

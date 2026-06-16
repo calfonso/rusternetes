@@ -259,7 +259,7 @@ services:
       - "--volume-dir=/volumes"
       - "--log-level=debug"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock
       - ./volumes:/volumes
 ```
 
@@ -274,7 +274,7 @@ services:
       - "--etcd-servers=http://etcd:2379"
       - "--config=/etc/kubernetes/kubelet-config.yaml"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock
       - ./volumes:/volumes
       - ./kubelet-config.yaml:/etc/kubernetes/kubelet-config.yaml:ro
 ```
@@ -411,6 +411,6 @@ Key differences:
 
 ## See Also
 
-- [Volume Management](VOLUME_SNAPSHOTS.md)
+- [Storage Backends](storage/STORAGE_BACKENDS.md)
 - [Development Guide](DEVELOPMENT.md)
-- [Deployment Guide](../DEPLOYMENT.md)
+- [Quick Start](QUICKSTART.md)

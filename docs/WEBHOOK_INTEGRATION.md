@@ -1,7 +1,7 @@
 # Webhook Integration - Implementation Complete
 
 
-> **Tip:** You can manage related resources through the [web console](../CONSOLE_USER_GUIDE.md).
+> **Tip:** You can manage related resources through the [web console](CONSOLE_USER_GUIDE.md).
 ## Summary
 
 The admission webhook infrastructure has been successfully integrated into the Rusternetes API server request pipeline. Webhooks are now called during resource creation and update operations.

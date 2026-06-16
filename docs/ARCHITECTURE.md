@@ -50,7 +50,7 @@ Built-in web console with real-time topology visualization and live metrics.
 | Kubelet (node-1)  |          | Kube-Proxy        |
 | Kubelet (node-2)  |          |   iptables NAT    |
 |                   |          |   host network     |
-|  Docker/bollard   |          +-------------------+
+|  CRI → containerd |          +-------------------+
 |  pause container  |
 |  probes + volumes |          +-------------------+
 |  CAS status sync  |          | CoreDNS           |
@@ -77,7 +77,7 @@ rusternetes/
     storage/               # Storage trait, etcd/SQLite/Redis (rhino) + in-memory backends
     controller-manager/    # 31 controllers in src/controllers/
     scheduler/             # Filter/Score plugin architecture
-    kubelet/               # Node agent, Docker runtime via bollard, CNI framework
+    kubelet/               # Node agent, CRI runtime (containerd + Youki), CNI framework
     kube-proxy/            # iptables service routing, host network mode
     kubectl/               # CLI tool (get, create, apply, delete, logs, exec, ...)
     cloud-providers/       # AWS/GCP/Azure integrations
@@ -237,7 +237,7 @@ pub struct FooController<S: Storage> {
 
 ### kubelet
 
-Node agent managing the full pod lifecycle via Docker (bollard crate).
+Node agent managing the full pod lifecycle via the Container Runtime Interface (CRI v1, gRPC) to containerd, which runs containers with Youki (a Rust OCI runtime). The CRI endpoint comes from `CONTAINER_RUNTIME_ENDPOINT` (default `unix:///run/containerd/containerd.sock`).
 
 **Container model:** Each pod starts a pause container first. Application
 containers join the pause container's network namespace via `container:pause`
@@ -385,7 +385,7 @@ bridge IPs (172.18.0.2-5). The cluster is bootstrapped by
 5. The **Scheduler** watches for unscheduled Pods, filters nodes, scores
    candidates, and binds each Pod to a node by setting `spec.nodeName`.
 6. The **Kubelet** on the assigned node detects the binding, creates a pause
-   container, then starts application containers via Docker.
+   container, then starts application containers via CRI (containerd).
 7. The kubelet writes Pod status back to the API server (phase, conditions,
    container statuses, pod IP) using CAS updates.
 8. The **Endpoints** and **EndpointSlice controllers** detect the ready Pod
@@ -426,7 +426,7 @@ All components use Tokio for async I/O:
   `tokio::spawn` task with its own reconciliation interval.
 - **Scheduler:** Periodic async loop reading unscheduled pods and writing
   binding decisions.
-- **Kubelet:** Async sync loop interleaving Docker API calls (via bollard) and
+- **Kubelet:** Async sync loop interleaving CRI gRPC calls (to containerd) and
   status updates to the API server.
 - **Storage:** All etcd operations are async. CAS prevents concurrent write
   conflicts without locks.
@@ -446,7 +446,8 @@ cargo test test_name -- --nocapture            # Single test with stdout
 ```
 
 Conformance testing runs the official Kubernetes e2e suite via Sonobuoy against
-the Docker Compose cluster. See [CONFORMANCE.md](CONFORMANCE.md) for results.
+the Docker Compose cluster. Results are tracked in the repository's GitHub
+Projects (Node Conformance and Conformance).
 
 ---
 
@@ -458,7 +459,7 @@ the Docker Compose cluster. See [CONFORMANCE.md](CONFORMANCE.md) for results.
 | axum / axum-server | HTTP framework and TLS server |
 | serde / serde_json | JSON serialization for API and storage |
 | etcd-client | etcd v3 gRPC client |
-| bollard | Docker Engine API client for the kubelet |
+| tonic / prost | CRI v1 gRPC client (to containerd) for the kubelet |
 | rustls / tokio-rustls | TLS implementation (no OpenSSL dependency) |
 | rcgen | Self-signed certificate generation |
 | jsonwebtoken | JWT generation and validation for service account tokens |

@@ -34,7 +34,7 @@ Rūsternetes includes a built-in web console with real-time cluster topology vis
 | [![Overview](docs/screenshots/thumbs/console-overview.png)](docs/screenshots/console-overview.png) | [![Topology](docs/screenshots/thumbs/console-topology.png)](docs/screenshots/console-topology.png) | [![Workloads](docs/screenshots/thumbs/console-workloads.png)](docs/screenshots/console-workloads.png) |
 | **Overview** — Health rings, sparkline charts, deployment rollout progress, event feed | **Topology** — Animated node/pod/service map with traffic particles, CPU heatmap, protocol badges | **Workloads** — Pod phase chart, deployment cards with scale/restart, restart heatmap |
 | [![Networking](docs/screenshots/thumbs/console-networking.png)](docs/screenshots/console-networking.png) | [![Storage](docs/screenshots/thumbs/console-storage.png)](docs/screenshots/console-storage.png) | [![Nodes](docs/screenshots/thumbs/console-nodes.png)](docs/screenshots/console-nodes.png) |
-| **Networking** — Service CIDR, DNS, kube-proxy config, service routing diagrams | **Storage** — Capabilities, StorageClass provisioning, PVC/PV management | **Nodes** — CPU/memory gauges from real Docker stats, cordon/uncordon |
+| **Networking** — Service CIDR, DNS, kube-proxy config, service routing diagrams | **Storage** — Capabilities, StorageClass provisioning, PVC/PV management | **Nodes** — CPU/memory gauges from real CRI container stats, cordon/uncordon |
 | [![Config](docs/screenshots/thumbs/console-config.png)](docs/screenshots/console-config.png) | [![Events](docs/screenshots/thumbs/console-events.png)](docs/screenshots/console-events.png) | [![RBAC](docs/screenshots/thumbs/console-rbac.png)](docs/screenshots/console-rbac.png) |
 | **Config** — ConfigMaps with key badges, Secrets, Service Accounts | **Events** — Frequency histogram, type/reason filtering, auto-refresh | **RBAC** — Subject-role mapping, binding visualization, rule badges |
 
@@ -63,7 +63,7 @@ See the [Console User Guide](docs/CONSOLE_USER_GUIDE.md) for full documentation.
 │                                                               │
 │  ┌──────────────────┐  ┌──────────────────────────────────┐   │
 │  │  Kubelet         │  │  Kube-Proxy                      │   │
-│  │  bollard (Docker)│  │  iptables routing                │   │
+│  │  CRI → containerd│  │  iptables routing                │   │
 │  │  Probes+Volumes  │  │  ClusterIP/NodePort/LB           │   │
 │  └──────────────────┘  └──────────────────────────────────┘   │
 └───────────────────────────────────────────────────────────────┘
@@ -156,7 +156,7 @@ cargo build -p rusternetes --features redis
 ./target/release/rusternetes --storage-backend redis --redis-url redis://localhost:6379
 ```
 
-**Prerequisites:** Podman or Docker for the kubelet to manage containers. On Linux with Podman, rootful mode is required for kube-proxy iptables access. See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed setup.
+**Prerequisites:** a CRI runtime (containerd) reachable by the kubelet to manage containers, plus Podman or Docker to run the compose stack. On Linux with Podman, rootful mode is required for kube-proxy iptables access. See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed setup.
 
 ## What's Implemented
 
@@ -221,7 +221,7 @@ Filter/score plugin architecture with:
 | Events | Event recording and TTL cleanup |
 
 ### Kubelet
-Container runtime integration via [bollard](https://github.com/fussybeaver/bollard) (Docker API):
+Container runtime integration via the Container Runtime Interface (CRI v1, gRPC) to containerd, which runs containers with [Youki](https://github.com/containers/youki) (a Rust OCI runtime):
 - Pod lifecycle: create, start, stop, restart with grace periods
 - Pause container network namespace sharing
 - Liveness, readiness, and startup probes (HTTP, TCP, exec)
@@ -318,7 +318,7 @@ See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full guide and [CONTRIBUTING.m
 | All-in-One Binary | [All-in-One](docs/guide/all-in-one.html) |
 | Configuration | [API Server](docs/guide/api-server-config.html) / [Kubelet](docs/guide/kubelet-config.html) / [Storage](docs/guide/storage-config.html) |
 | Features | [Workloads](docs/guide/workloads.html) / [Networking](docs/guide/networking.html) / [Security](docs/guide/security.html) / [CRDs](docs/guide/crds.html) |
-| Web Console | [Console](docs/guide/console.html) / [CONSOLE.md](docs/CONSOLE.md) |
+| Web Console | [Console](docs/guide/console.html) / [CONSOLE_USER_GUIDE.md](docs/CONSOLE_USER_GUIDE.md) |
 | Authentication | [Authentication](docs/guide/authentication.html) / [AUTHENTICATION.md](docs/AUTHENTICATION.md) |
 | kubectl | [kubectl Reference](docs/guide/kubectl.html) |
 | API Reference | [API Reference](docs/guide/api-reference.html) |

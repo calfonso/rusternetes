@@ -4,7 +4,7 @@ Get a Rust-based Kubernetes cluster running locally with a built-in web console.
 
 ## Prerequisites
 
-- **Container runtime** — Podman or Docker
+- **Container engine** — Podman or Docker to run the compose stack (the in-cluster runtime is containerd inside the node containers)
 - **kubectl** (optional) — standard `kubectl` works against the cluster
 
 ### macOS — Podman
@@ -105,7 +105,7 @@ Standard `kubectl` works because rusternetes implements the same REST API as ups
 | API Server | Port 6443, HTTPS, REST API + Watch + RBAC + Webhooks + **Web Console** |
 | Scheduler | Affinity, taints/tolerations, priority, preemption |
 | Controller Manager | 31 controllers (Deployment, StatefulSet, Job, DaemonSet, HPA, etc.) |
-| Kubelet (node-1, node-2) | Container runtime via Docker/bollard, probes, volumes |
+| Kubelet (node-1, node-2) | Container runtime via CRI (containerd + Youki), probes, volumes |
 | Kube-Proxy | iptables ClusterIP/NodePort/LoadBalancer routing |
 | CoreDNS | Kubernetes service discovery |
 | Storage | etcd (default), SQLite, or Redis via [Rhino](https://github.com/calfonso/rhino) |
@@ -159,7 +159,7 @@ cargo build -p rusternetes --features redis --release
 
 Open `https://localhost:6443/console/` for the web console.
 
-**Note:** The all-in-one binary still needs Podman or Docker running on the host for the kubelet to create containers.
+**Note:** The all-in-one binary still needs a CRI runtime (containerd) reachable at `CONTAINER_RUNTIME_ENDPOINT` (default `unix:///run/containerd/containerd.sock`) for the kubelet to create containers.
 
 ## Common Operations
 
@@ -229,7 +229,7 @@ Rusternetes is a ground-up reimplementation — not a fork. Every component is w
 
 - 216,000+ lines of Rust across 10 crates
 - 90% conformance pass rate (398/441 tests) across 149 rounds of testing
-- Uses Podman or Docker as the container runtime via the bollard library
+- Uses CRI (CRI v1 gRPC → containerd → Youki) as the container runtime
 - Standard `kubectl` works against it (same REST API)
 - Built-in web console with topology visualization, live metrics, and pod log streaming
 - Supports CNI plugins (Calico, Cilium, Flannel) on Linux
@@ -238,6 +238,7 @@ Rusternetes is a ground-up reimplementation — not a fork. Every component is w
 
 - **[Console User Guide](CONSOLE_USER_GUIDE.md)** — topology, metrics, resource management, live logs
 - **[Authentication Guide](AUTHENTICATION.md)** — secure the cluster with JWT tokens and RBAC
-- **[CNI Networking Guide](CNI_GUIDE.md)** — configure third-party CNI plugins
-- **[Deployment Guide](DEPLOYMENT.md)** — production deployment options
+- **[CNI Networking Guide](CNI_INTEGRATION.md)** — configure third-party CNI plugins
+- **[AWS Deployment](AWS_DEPLOYMENT.md)** — production deployment on AWS
+- **[High Availability](HIGH_AVAILABILITY.md)** — multi-replica control plane
 - **[Full Documentation Site](guide/index.html)** — 30 themed pages covering every feature

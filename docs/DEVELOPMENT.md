@@ -5,7 +5,7 @@ How to build, test, and run Rusternetes locally.
 ## Prerequisites
 
 - **Rust** (latest stable, via [rustup](https://rustup.rs))
-- **Container runtime** — Docker or Podman (see [Container Runtime Setup](#container-runtime-setup) below)
+- **Container engine** — Docker or Podman to run the compose stack; the in-cluster runtime is containerd inside the node containers (see [Container Runtime Setup](#container-runtime-setup) below)
 - **Compose tool** — `docker-compose` and/or `podman-compose` for orchestrating the cluster
 
 On macOS, install everything with:
@@ -26,7 +26,7 @@ Rusternetes is a Cargo workspace with 10 crates (216,000+ lines of Rust, 3,100+ 
 | `crates/api-server` | Axum-based REST API with 75+ handler files and router.rs |
 | `crates/storage` | Pluggable storage: etcd, SQLite/Redis (rhino), and in-memory backends |
 | `crates/controller-manager` | 31 reconciliation controllers |
-| `crates/kubelet` | Node agent, Docker container runtime via bollard |
+| `crates/kubelet` | Node agent, CRI container runtime (containerd + Youki) |
 | `crates/kube-proxy` | iptables-based service routing (host network mode) |
 | `crates/scheduler` | Pod scheduling with affinity, taints, priority/preemption plugins |
 | `crates/kubectl` | CLI tool |

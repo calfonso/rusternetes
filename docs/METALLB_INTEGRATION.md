@@ -1,7 +1,7 @@
 # MetalLB Integration with Rusternetes
 
 
-> **Tip:** You can manage related resources through the [web console](../CONSOLE_USER_GUIDE.md).
+> **Tip:** You can manage related resources through the [web console](CONSOLE_USER_GUIDE.md).
 This guide explains how to use MetalLB with Rusternetes to provide LoadBalancer services without requiring a cloud provider. MetalLB is a production-ready, battle-tested load balancer implementation for bare-metal and on-premises Kubernetes clusters.
 
 ## Overview
@@ -494,7 +494,6 @@ spec:
 
 - [MetalLB Official Documentation](https://metallb.universe.tf/)
 - [MetalLB GitHub](https://github.com/metallb/metallb)
-- [Rusternetes LoadBalancer Documentation](LOADBALANCER.md)
 - [Kubernetes Service Types](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer)
 
 ## Next Steps
@@ -503,4 +502,3 @@ spec:
 2. Configure IP address pool for your network
 3. Test with the example LoadBalancer service
 4. Explore advanced features like IP sharing and BGP mode
-5. For production cloud deployments, see [LOADBALANCER.md](LOADBALANCER.md) for cloud provider integration
