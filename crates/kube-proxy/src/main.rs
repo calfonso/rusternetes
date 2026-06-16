@@ -72,6 +72,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     rusternetes_common::tracing::init_basic_tracing("kube-proxy", &args.log_level)?;
+    info!(
+        "Starting Rusternetes kube-proxy {}",
+        rusternetes_common::build_info::version_line()
+    );
 
     let config = KubeProxyConfig {
         node_name: args.node_name.clone(),

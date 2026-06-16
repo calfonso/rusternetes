@@ -210,7 +210,10 @@ async fn async_main() -> Result<()> {
 
     rusternetes_common::dump::install_panic_hook("rusternetes");
 
-    info!("Starting Rusternetes (all-in-one)");
+    info!(
+        "Starting Rusternetes (all-in-one) {}",
+        rusternetes_common::build_info::version_line()
+    );
 
     // Initialize storage — all components share one instance
     let storage_config = match args.storage_backend.as_str() {

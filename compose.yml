@@ -34,6 +34,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: api-server
       additional_contexts:
         # crates/storage/Cargo.toml declares rhino as `path = "../../rhino"`,
@@ -88,6 +90,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: scheduler
       additional_contexts:
         rhino: ./rhino
@@ -103,6 +107,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: controller-manager
       additional_contexts:
         rhino: ./rhino
@@ -113,6 +119,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kubelet
       additional_contexts:
         rhino: ./rhino
@@ -149,6 +157,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kubelet
       additional_contexts:
         rhino: ./rhino
@@ -175,6 +185,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kube-proxy
       additional_contexts:
         rhino: ./rhino
@@ -218,6 +230,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: dns
       additional_contexts:
         rhino: ./rhino

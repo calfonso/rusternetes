@@ -22,6 +22,10 @@
 # way with `USE_SCCACHE=1 docker compose ... build`.
 x-sccache-args: &sccache-args
   USE_SCCACHE: "${USE_SCCACHE-${GITHUB_ACTIONS:+1}}"
+  # Git commit the binaries are built from, logged at startup so you can tell
+  # which build a running cluster is on. Empty -> build.rs falls back to
+  # "unknown" (.git is dockerignored). The bring-up exports it from git.
+  RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
 
 services:
   # Rhino - etcd-compatible gRPC server backed by SQLite

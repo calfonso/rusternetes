@@ -294,7 +294,10 @@ async fn main() -> Result<()> {
     rusternetes_common::tracing::init_basic_tracing("kubelet", &runtime_config.log_level)?;
     rusternetes_common::dump::install_panic_hook("kubelet");
 
-    info!("Starting Rusternetes Kubelet");
+    info!(
+        "Starting Rusternetes Kubelet {}",
+        rusternetes_common::build_info::version_line()
+    );
     info!("{}", runtime_config.display());
 
     // Initialize storage. In API mode (--kubeconfig) the kubelet reads/writes
