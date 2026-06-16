@@ -42,7 +42,14 @@ fn sandbox_config(log_dir: &str) -> v1::PodSandboxConfig {
         log_directory: log_dir.to_string(),
         linux: Some(v1::LinuxPodSandboxConfig {
             security_context: Some(v1::LinuxSandboxSecurityContext {
-                namespace_options: Some(v1::NamespaceOption::default()),
+                // Host network namespace: pod-network (POD) would require the
+                // runtime to invoke CNI, which is a separate concern handled in
+                // the networking sub-project. NODE skips CNI so this slice
+                // exercises only the pull/sandbox/container path.
+                namespace_options: Some(v1::NamespaceOption {
+                    network: v1::NamespaceMode::Node as i32,
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
