@@ -4607,6 +4607,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tonic",
  "tower 0.4.13",

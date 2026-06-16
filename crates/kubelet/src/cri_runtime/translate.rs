@@ -19,7 +19,7 @@ use rusternetes_cri::v1;
 
 /// Well-known CRI metadata label keys the runtime indexes sandboxes/containers
 /// by. They mirror the keys the upstream kubelet sets so `crictl`/tools work.
-mod labels {
+pub(crate) mod labels {
     pub const POD_NAME: &str = "io.kubernetes.pod.name";
     pub const POD_NAMESPACE: &str = "io.kubernetes.pod.namespace";
     pub const POD_UID: &str = "io.kubernetes.pod.uid";

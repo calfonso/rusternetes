@@ -16,11 +16,13 @@ use std::collections::HashMap;
 
 use rusternetes_common::resources::pod::{Container, Pod, PodSpec};
 use rusternetes_cri::CriClient;
-use rusternetes_kubelet::cri_runtime::translate;
+use rusternetes_kubelet::cri_runtime::{translate, CriContainerRuntime};
 
 const IMAGE: &str = "docker.io/library/busybox:latest";
 
-fn test_pod() -> Pod {
+/// Build a single-container test pod. `name` is distinct per test so the two
+/// (parallel) e2e tests don't collide on the runtime's sandbox-name reservation.
+fn test_pod(name: &str) -> Pod {
     let container = Container {
         name: "sleeper".to_string(),
         image: IMAGE.to_string(),
@@ -34,7 +36,7 @@ fn test_pod() -> Pod {
         ..Default::default()
     };
     let mut pod = Pod::new(
-        "translate-e2e",
+        name,
         PodSpec {
             containers: vec![container],
             // Host network so the runtime skips CNI (not configured in the test rig).
@@ -43,7 +45,7 @@ fn test_pod() -> Pod {
         },
     );
     pod.metadata.namespace = Some("default".to_string());
-    pod.metadata.uid = "translate-e2e-uid".to_string();
+    pod.metadata.uid = format!("{name}-uid");
     pod
 }
 
@@ -59,7 +61,7 @@ async fn translated_pod_runs_on_containerd() {
     std::fs::create_dir_all(&log_dir).expect("log dir");
     let log_dir = log_dir.to_string_lossy().to_string();
 
-    let pod = test_pod();
+    let pod = test_pod("translate-e2e");
     let container = &pod.spec.as_ref().unwrap().containers[0];
 
     // The whole point: configs come from the translation layer, not hand-built.
@@ -123,4 +125,60 @@ async fn translated_pod_runs_on_containerd() {
     let _ = cri.remove_pod_sandbox(&sandbox_id).await;
 
     let () = result;
+}
+
+/// Drive the full `CriContainerRuntime` lifecycle type (not the raw client):
+/// start_pod -> is_pod_running -> list_running_pods -> stop_and_remove_pod.
+#[tokio::test]
+async fn cri_container_runtime_lifecycle() {
+    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
+        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping runtime lifecycle e2e");
+        return;
+    };
+    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
+
+    let log_root = std::env::temp_dir().join("rusternetes-cri-runtime");
+    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+        .await
+        .expect("connect runtime");
+
+    let pod = test_pod("runtime-e2e");
+    let pod_name = pod.metadata.name.clone();
+
+    // Clean any leftover from a previous run, then bring the pod up.
+    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    runtime.start_pod(&pod).await.expect("start_pod");
+
+    // Poll until the runtime reports the pod running.
+    let mut running = false;
+    for _ in 0..50 {
+        if runtime.is_pod_running(&pod).await.expect("is_pod_running") {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(running, "CriContainerRuntime did not report pod running");
+
+    let pods = runtime
+        .list_running_pods()
+        .await
+        .expect("list_running_pods");
+    assert!(
+        pods.contains(&pod_name),
+        "started pod missing from list_running_pods: {pods:?}"
+    );
+    eprintln!("CriContainerRuntime start_pod + introspection OK");
+
+    runtime
+        .stop_and_remove_pod(&pod_name)
+        .await
+        .expect("stop_and_remove_pod");
+
+    // Sandbox gone -> no longer running.
+    assert!(
+        !runtime.is_pod_running(&pod).await.expect("is_pod_running"),
+        "pod still running after stop_and_remove_pod"
+    );
+    eprintln!("CriContainerRuntime teardown OK");
 }
