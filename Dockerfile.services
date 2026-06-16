@@ -181,7 +181,9 @@ COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
 
 # build.rs scripts + proto/ files belong with the manifests because
 # they participate in dependency resolution / codegen during the
-# Pass-1 build. Only api-server has these in the current workspace.
+# Pass-1 build. common/build.rs stamps the version/SHA; api-server/build.rs
+# compiles protos.
+COPY crates/common/build.rs     crates/common/build.rs
 COPY crates/api-server/build.rs crates/api-server/build.rs
 COPY crates/api-server/proto    crates/api-server/proto
 
@@ -306,6 +308,13 @@ COPY crates/storage/src              crates/storage/src
 # so the runtime stages can pick them up (cache-mount contents are
 # discarded after the RUN finishes — they only persist across builds,
 # not into the image layer).
+#
+# Inject the git SHA here (Pass 2 only) so common's build.rs bakes the real
+# commit into every binary — `.git` is dockerignored, so without this the
+# version banner would read "unknown". Scoped to Pass 2 to keep the Pass-1
+# dependency cache from busting on every commit.
+ARG RUSTERNETES_GIT_SHA=""
+ENV RUSTERNETES_GIT_SHA=${RUSTERNETES_GIT_SHA}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \

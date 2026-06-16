@@ -61,6 +61,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       additional_contexts:
         rhino: ./rhino
       target: api-server
@@ -107,6 +109,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       additional_contexts:
         rhino: ./rhino
       target: scheduler
@@ -117,6 +121,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       additional_contexts:
         rhino: ./rhino
       target: controller-manager
@@ -137,6 +143,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       additional_contexts:
         rhino: ./rhino
       target: kubelet
@@ -168,6 +176,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       additional_contexts:
         rhino: ./rhino
       target: kubelet
@@ -194,6 +204,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       additional_contexts:
         rhino: ./rhino
       target: kube-proxy
@@ -231,6 +243,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.services
+      args:
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: dns
       additional_contexts:
         rhino: ./rhino

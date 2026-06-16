@@ -154,6 +154,11 @@ runs:
         IMAGE_TAG: ${{ inputs.image-tag }}
       run: |
         set -euo pipefail
+        # Stamp the git SHA into the binaries (logged at startup) so a running
+        # cluster reports exactly which commit it is built from. Only matters on
+        # the local-build fallback below — GHCR images carry the SHA from their
+        # own publish build.
+        export RUSTERNETES_GIT_SHA="${RUSTERNETES_GIT_SHA:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
         # --profile build includes the build-only dns image: it runs as an
         # in-cluster Deployment (bootstrap-dns.yaml), not a compose container.
         if [ -n "$IMAGE_TAG" ]; then

@@ -108,6 +108,10 @@ fn resolve_api_config(args: &Args) -> Result<Option<ClientConfig>> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     rusternetes_common::tracing::init_basic_tracing("dns", &args.log_level)?;
+    tracing::info!(
+        "Starting Rusternetes DNS {}",
+        rusternetes_common::build_info::version_line()
+    );
 
     let udp_bind: SocketAddr = args.udp_bind.parse()?;
     let tcp_bind: SocketAddr = args.tcp_bind.parse()?;

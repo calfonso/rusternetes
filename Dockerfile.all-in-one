@@ -100,9 +100,11 @@ COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/ruste
 COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
 COPY rusternetes/crates/storage/Cargo.toml            ./rusternetes/crates/storage/Cargo.toml
 
-# build.rs + proto/ (only api-server has these today).
+# build.rs + proto/. api-server has both; common has a build.rs that stamps
+# the git SHA / build time into the version banner (see build_info.rs).
 COPY rusternetes/crates/api-server/build.rs ./rusternetes/crates/api-server/build.rs
 COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/proto
+COPY rusternetes/crates/common/build.rs     ./rusternetes/crates/common/build.rs
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
 #   - lib only:   common, storage, cloud-providers, netstack, protobuf,
@@ -196,6 +198,13 @@ COPY rusternetes/crates/rusternetes/src          ./crates/rusternetes/src
 COPY rusternetes/crates/scheduler/src            ./crates/scheduler/src
 COPY rusternetes/crates/scheduler/tests          ./crates/scheduler/tests
 COPY rusternetes/crates/storage/src              ./crates/storage/src
+
+# Git SHA for the version banner. `.git` is excluded from the build context,
+# so the SHA is injected as a build-arg (compose passes ${RUSTERNETES_GIT_SHA});
+# common/build.rs picks it up and bakes it into the binary. Empty default =>
+# build.rs falls back to "unknown".
+ARG RUSTERNETES_GIT_SHA=""
+ENV RUSTERNETES_GIT_SHA=${RUSTERNETES_GIT_SHA}
 
 # Pass 2: rebuild with real sources. No `touch` hack needed — Pass 1
 # already removed the dummy workspace artefacts, so cargo compiles

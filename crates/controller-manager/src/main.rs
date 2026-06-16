@@ -175,11 +175,17 @@ async fn main() -> Result<()> {
 
     // In-cluster static-pod path: run as an api-server client, no storage handle.
     if args.kubeconfig.is_some() {
-        info!("Starting Rusternetes Controller Manager (API mode)");
+        info!(
+            "Starting Rusternetes Controller Manager (API mode) {}",
+            rusternetes_common::build_info::version_line()
+        );
         return run_api_mode(args).await;
     }
 
-    info!("Starting Rusternetes Controller Manager");
+    info!(
+        "Starting Rusternetes Controller Manager {}",
+        rusternetes_common::build_info::version_line()
+    );
 
     // Initialize storage
     let storage_config = match args.storage_backend.as_str() {

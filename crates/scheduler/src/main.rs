@@ -87,7 +87,10 @@ async fn main() -> Result<()> {
 
     rusternetes_common::tracing::init_basic_tracing("scheduler", &args.log_level)?;
 
-    info!("Starting Rusternetes Scheduler");
+    info!(
+        "Starting Rusternetes Scheduler {}",
+        rusternetes_common::build_info::version_line()
+    );
 
     // API mode (in-cluster static pod): no storage backend, no leader election
     // (single instance by design). Reads come from informers; writes go through

@@ -36,6 +36,7 @@ services:
       dockerfile: rusternetes/Dockerfile.all-in-one
       args:
         CARGO_FEATURES: redis
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
     container_name: rusternetes
     privileged: true
     ports:

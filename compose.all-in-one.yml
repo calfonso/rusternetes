@@ -19,6 +19,7 @@ services:
       dockerfile: rusternetes/Dockerfile.all-in-one
       args:
         CARGO_FEATURES: sqlite
+        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
     container_name: rusternetes
     # `privileged: true` covers NET_ADMIN / NET_RAW (kube-proxy iptables)
     # plus the kubelet's mount / cgroup manipulation, so one knob.

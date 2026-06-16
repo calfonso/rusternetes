@@ -113,7 +113,10 @@ async fn main() -> Result<()> {
     rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
     rusternetes_common::dump::install_panic_hook("api-server");
 
-    info!("Starting Rusternetes API Server");
+    info!(
+        "Starting Rusternetes API Server {}",
+        rusternetes_common::build_info::version_line()
+    );
 
     // Initialize storage
     let storage_config = match args.storage_backend.as_str() {
