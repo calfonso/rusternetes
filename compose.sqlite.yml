@@ -77,10 +77,12 @@ services:
           - api-server
     volumes:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw
+      # CRI socket from the containerd service: the api-server reads container
+      # stats (metrics) and runs exec/logs over CRI, not the Docker socket.
+      - containerd-run:/run/containerd
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
@@ -130,6 +132,26 @@ services:
       target: controller-manager
     image: rusternetes-controller-manager:latest
 
+  # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelets talk to
+  # this over CRI v1 instead of a Docker/Podman socket; pods run as containers
+  # inside this service. The CRI socket is shared with the kubelets via the
+  # `containerd-run` volume, and KUBELET_VOLUMES_PATH is bind-mounted at the same
+  # host path so the pod volumes the kubelet provisions resolve here too.
+  containerd:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.containerd
+    container_name: rusternetes-containerd
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - rusternetes-net
+    volumes:
+      - containerd-run:/run/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+
   # Kubelet
   kubelet:
     build:
@@ -145,10 +167,11 @@ services:
     depends_on:
       - rhino
       - api-server
+      - containerd
     networks:
       - rusternetes-net
     volumes:
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw
+      - containerd-run:/run/containerd
       # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
       # volumes propagate back to the host mount namespace, where the Docker
       # daemon resolves the app-container bind mounts. Without shared
@@ -173,7 +196,7 @@ services:
     environment:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
 
@@ -192,10 +215,11 @@ services:
     depends_on:
       - rhino
       - api-server
+      - containerd
     networks:
       - rusternetes-net
     volumes:
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw
+      - containerd-run:/run/containerd
       # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
       # volumes propagate back to the host mount namespace, where the Docker
       # daemon resolves the app-container bind mounts. Without shared
@@ -206,7 +230,7 @@ services:
     environment:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
@@ -271,3 +295,6 @@ networks:
 volumes:
   rhino-data:
     name: rusternetes-rhino-data
+  # CRI socket shared from the containerd service to the kubelets.
+  containerd-run:
+    name: rusternetes-containerd-run
