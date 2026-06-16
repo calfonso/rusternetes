@@ -6,10 +6,13 @@
 //! `io.kubernetes.*` labels [`translate`] stamps on them, so it reconciles
 //! correctly across restarts without an in-memory index.
 //!
-//! This is incremental — the methods here (`start_pod`, `is_pod_running`,
-//! `list_running_pods`, `stop_and_remove_pod`) cover pod bring-up, liveness and
-//! teardown. The remaining `ContainerRuntime` surface (full status mapping,
-//! probes, gc, metrics) lands on top of this. Tracked in the migration issue.
+//! This is incremental. Covered so far: pod bring-up with init containers
+//! (`start_pod`), container/init status (`get_container_statuses`,
+//! `get_init_container_statuses`), liveness/introspection (`is_pod_running`,
+//! `is_container_running`, `list_running_pods`, `list_all_pods`, `get_pod_ip`),
+//! and teardown (`stop_pod_for`, `stop_and_remove_pod`). Remaining
+//! `ContainerRuntime` surface (probes, gc, metrics, resource updates) lands on
+//! top of this — tracked in the migration issue.
 
 use std::path::Path;
 
@@ -30,6 +33,12 @@ pub enum CriRuntimeError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("init container {name} failed with exit code {exit_code}")]
+    InitContainerFailed { name: String, exit_code: i32 },
+
+    #[error("timed out waiting for init container {name} to complete")]
+    InitContainerTimeout { name: String },
 }
 
 type Result<T> = std::result::Result<T, CriRuntimeError>;
@@ -93,11 +102,65 @@ impl CriContainerRuntime {
         )
     }
 
-    /// Bring a pod up: pull each container image, run the sandbox, then create
-    /// and start every container from its translated config.
+    /// Create and start one container from its translated config, returning its
+    /// id. Pulls the image on behalf of the sandbox first.
+    async fn create_and_start_container(
+        &self,
+        cri: &mut CriClient,
+        pod: &Pod,
+        container: &rusternetes_common::resources::pod::Container,
+        sandbox_id: &str,
+        sandbox_cfg: &v1::PodSandboxConfig,
+    ) -> Result<String> {
+        let image_ref = cri
+            .pull_image(
+                &container.image,
+                Some(&self.runtime_handler),
+                Some(sandbox_cfg.clone()),
+            )
+            .await?;
+        let cfg = translate::container_config(
+            pod,
+            container,
+            &image_ref,
+            &std::collections::HashMap::new(),
+        );
+        let container_id = cri
+            .create_container(sandbox_id, cfg, sandbox_cfg.clone())
+            .await?;
+        cri.start_container(&container_id).await?;
+        Ok(container_id)
+    }
+
+    /// Poll a container until it exits, returning its exit code. Errors with
+    /// `InitContainerTimeout` if it does not finish within ~30s.
+    async fn wait_for_exit(
+        &self,
+        cri: &mut CriClient,
+        container_id: &str,
+        name: &str,
+    ) -> Result<i32> {
+        let exited = v1::ContainerState::ContainerExited as i32;
+        for _ in 0..300 {
+            let status = cri.container_status(container_id, false).await?;
+            if let Some(s) = status.status {
+                if s.state == exited {
+                    return Ok(s.exit_code);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Err(CriRuntimeError::InitContainerTimeout {
+            name: name.to_string(),
+        })
+    }
+
+    /// Bring a pod up: run the sandbox, run init containers to completion in
+    /// order (failing the start on a non-zero exit), then create and start the
+    /// app containers.
     ///
-    /// Init containers, probes and volume provisioning are handled by the
-    /// kubelet around this call; here we run `pod.spec.containers` in order.
+    /// Probes and volume provisioning are handled by the kubelet around this
+    /// call.
     pub async fn start_pod(&self, pod: &Pod) -> Result<()> {
         let Some(spec) = pod.spec.as_ref() else {
             return Ok(());
@@ -115,21 +178,25 @@ impl CriContainerRuntime {
         let mut cri = self.cri.clone();
         let sandbox_id = cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await?;
 
+        // Init containers run sequentially to completion before app containers.
+        if let Some(init_containers) = spec.init_containers.as_ref() {
+            for container in init_containers {
+                let id = self
+                    .create_and_start_container(&mut cri, pod, container, &sandbox_id, &sandbox_cfg)
+                    .await?;
+                let exit_code = self.wait_for_exit(&mut cri, &id, &container.name).await?;
+                if exit_code != 0 {
+                    return Err(CriRuntimeError::InitContainerFailed {
+                        name: container.name.clone(),
+                        exit_code,
+                    });
+                }
+            }
+        }
+
         for container in &spec.containers {
-            // Pull on behalf of this sandbox so registry config resolves.
-            let image_ref = cri
-                .pull_image(&container.image, Some(&handler), Some(sandbox_cfg.clone()))
+            self.create_and_start_container(&mut cri, pod, container, &sandbox_id, &sandbox_cfg)
                 .await?;
-            let cfg = translate::container_config(
-                pod,
-                container,
-                &image_ref,
-                &std::collections::HashMap::new(),
-            );
-            let container_id = cri
-                .create_container(&sandbox_id, cfg, sandbox_cfg.clone())
-                .await?;
-            cri.start_container(&container_id).await?;
         }
         Ok(())
     }
@@ -179,16 +246,14 @@ impl CriContainerRuntime {
             .collect())
     }
 
-    /// Statuses for every container in `pod.spec.containers`, in spec order.
-    ///
-    /// Containers the runtime has not created yet are reported as `Waiting /
-    /// ContainerCreating` so the result always has one entry per spec container
-    /// (what the kubelet's pod-status machinery expects).
-    pub async fn get_container_statuses(&self, pod: &Pod) -> Result<Vec<ContainerStatus>> {
-        let Some(spec) = pod.spec.as_ref() else {
-            return Ok(Vec::new());
-        };
-
+    /// Statuses for a given set of spec containers, in order. Containers the
+    /// runtime has not created yet are reported as `Waiting / ContainerCreating`
+    /// so the result always has one entry per spec container.
+    async fn statuses_for(
+        &self,
+        pod: &Pod,
+        spec_containers: &[rusternetes_common::resources::pod::Container],
+    ) -> Result<Vec<ContainerStatus>> {
         let filter = v1::ContainerFilter {
             label_selector: std::collections::HashMap::from([(
                 translate::labels::POD_UID.to_string(),
@@ -212,8 +277,8 @@ impl CriContainerRuntime {
             }
         }
 
-        let mut out = Vec::with_capacity(spec.containers.len());
-        for spec_container in &spec.containers {
+        let mut out = Vec::with_capacity(spec_containers.len());
+        for spec_container in spec_containers {
             match by_name.get(&spec_container.name) {
                 Some(id) => {
                     let full = cri.container_status(id, false).await?;
@@ -228,6 +293,26 @@ impl CriContainerRuntime {
             }
         }
         Ok(out)
+    }
+
+    /// Statuses for every container in `pod.spec.containers`, in spec order.
+    pub async fn get_container_statuses(&self, pod: &Pod) -> Result<Vec<ContainerStatus>> {
+        let Some(spec) = pod.spec.as_ref() else {
+            return Ok(Vec::new());
+        };
+        self.statuses_for(pod, &spec.containers).await
+    }
+
+    /// Statuses for the pod's init containers, in spec order. `None` if the pod
+    /// has no init containers.
+    pub async fn get_init_container_statuses(
+        &self,
+        pod: &Pod,
+    ) -> Result<Option<Vec<ContainerStatus>>> {
+        let Some(init) = pod.spec.as_ref().and_then(|s| s.init_containers.as_ref()) else {
+            return Ok(None);
+        };
+        Ok(Some(self.statuses_for(pod, init).await?))
     }
 
     /// Names of all pods that have a sandbox on this runtime, regardless of

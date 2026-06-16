@@ -216,3 +216,77 @@ async fn cri_container_runtime_lifecycle() {
     );
     eprintln!("CriContainerRuntime teardown OK");
 }
+
+/// Init container runs to completion before the app container starts.
+#[tokio::test]
+async fn init_container_runs_before_app() {
+    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
+        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping init-container e2e");
+        return;
+    };
+    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
+
+    let log_root = std::env::temp_dir().join("rusternetes-cri-init");
+    let runtime = CriContainerRuntime::connect(&socket, handler, log_root.to_string_lossy())
+        .await
+        .expect("connect runtime");
+
+    let init = Container {
+        name: "setup".to_string(),
+        image: IMAGE.to_string(),
+        command: Some(vec!["/bin/sh".to_string()]),
+        args: Some(vec!["-c".to_string(), "true".to_string()]),
+        ..Default::default()
+    };
+    let app = Container {
+        name: "sleeper".to_string(),
+        image: IMAGE.to_string(),
+        command: Some(vec!["/bin/sh".to_string()]),
+        args: Some(vec!["-c".to_string(), "sleep 3600".to_string()]),
+        ..Default::default()
+    };
+    let mut pod = Pod::new(
+        "init-e2e",
+        PodSpec {
+            containers: vec![app],
+            init_containers: Some(vec![init]),
+            host_network: Some(true),
+            ..Default::default()
+        },
+    );
+    pod.metadata.namespace = Some("default".to_string());
+    pod.metadata.uid = "init-e2e-uid".to_string();
+    let pod_name = pod.metadata.name.clone();
+
+    let _ = runtime.stop_and_remove_pod(&pod_name).await;
+    // start_pod blocks on the init container completing successfully.
+    runtime.start_pod(&pod).await.expect("start_pod with init");
+
+    // Init container terminated with exit 0.
+    let init_statuses = runtime
+        .get_init_container_statuses(&pod)
+        .await
+        .expect("get_init_container_statuses")
+        .expect("pod has init containers");
+    assert_eq!(init_statuses.len(), 1);
+    match &init_statuses[0].state {
+        Some(rusternetes_common::resources::pod::ContainerState::Terminated {
+            exit_code, ..
+        }) => {
+            assert_eq!(*exit_code, 0, "init container should exit 0");
+        }
+        other => panic!("expected init Terminated, got {other:?}"),
+    }
+
+    // App container is running.
+    assert!(
+        runtime.is_pod_running(&pod).await.expect("is_pod_running"),
+        "app container should be running after init completed"
+    );
+    eprintln!("init-container ordering OK");
+
+    runtime
+        .stop_and_remove_pod(&pod_name)
+        .await
+        .expect("teardown");
+}
