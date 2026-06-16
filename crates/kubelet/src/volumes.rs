@@ -27,6 +27,7 @@ use crate::runtime::{
 
 /// Provisions and maintains pod volumes on the host filesystem, independent of
 /// any container runtime. See the module docs.
+#[derive(Clone)]
 pub struct VolumeManager {
     pub volumes_base_path: String,
     pub storage: Option<Arc<rusternetes_storage::StorageBackend>>,

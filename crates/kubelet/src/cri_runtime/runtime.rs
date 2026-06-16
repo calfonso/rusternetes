@@ -6,13 +6,13 @@
 //! `io.kubernetes.*` labels [`translate`] stamps on them, so it reconciles
 //! correctly across restarts without an in-memory index.
 //!
-//! This is incremental. Covered so far: pod bring-up with init containers
-//! (`start_pod`), container/init status (`get_container_statuses`,
-//! `get_init_container_statuses`), liveness/introspection (`is_pod_running`,
-//! `is_container_running`, `list_running_pods`, `list_all_pods`, `get_pod_ip`),
-//! and teardown (`stop_pod_for`, `stop_and_remove_pod`). Remaining
-//! `ContainerRuntime` surface (probes, gc, metrics, resource updates) lands on
-//! top of this — tracked in the migration issue.
+//! Covered: pod bring-up with init containers and host-side volume provisioning
+//! (`start_pod` + an attached [`VolumeManager`](crate::volumes::VolumeManager)),
+//! container/init status, status/introspection, metrics, gc, in-place resize,
+//! single-attempt probes (`probe_container`), and teardown. Remaining: wiring
+//! this type into `kubelet.rs` in place of the bollard runtime, the probe
+//! threshold/period state machine, and networking — tracked in the migration
+//! issue.
 
 use std::path::Path;
 
@@ -39,6 +39,13 @@ pub enum CriRuntimeError {
 
     #[error("timed out waiting for init container {name} to complete")]
     InitContainerTimeout { name: String },
+
+    #[error("provisioning volumes for pod {pod}: {source}")]
+    Volumes {
+        pod: String,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 type Result<T> = std::result::Result<T, CriRuntimeError>;
@@ -75,6 +82,9 @@ pub struct CriContainerRuntime {
     runtime_handler: String,
     /// Root under which per-pod log directories are created.
     log_root: String,
+    /// Provisions host-side pod volumes. `None` keeps `start_pod` volume-less
+    /// (used by socket-only smoke tests); the kubelet always wires one in.
+    volumes: Option<crate::volumes::VolumeManager>,
 }
 
 impl CriContainerRuntime {
@@ -90,7 +100,16 @@ impl CriContainerRuntime {
             cri,
             runtime_handler: runtime_handler.into(),
             log_root: log_root.into(),
+            volumes: None,
         })
+    }
+
+    /// Attach a [`VolumeManager`](crate::volumes::VolumeManager) so `start_pod`
+    /// provisions host-side pod volumes and mounts them into containers.
+    #[must_use]
+    pub fn with_volumes(mut self, volumes: crate::volumes::VolumeManager) -> Self {
+        self.volumes = Some(volumes);
+        self
     }
 
     /// Per-pod log directory: `<log_root>/<namespace>_<name>_<uid>`.
@@ -111,6 +130,7 @@ impl CriContainerRuntime {
         container: &rusternetes_common::resources::pod::Container,
         sandbox_id: &str,
         sandbox_cfg: &v1::PodSandboxConfig,
+        host_paths: &std::collections::HashMap<String, String>,
     ) -> Result<String> {
         let image_ref = cri
             .pull_image(
@@ -119,12 +139,7 @@ impl CriContainerRuntime {
                 Some(sandbox_cfg.clone()),
             )
             .await?;
-        let cfg = translate::container_config(
-            pod,
-            container,
-            &image_ref,
-            &std::collections::HashMap::new(),
-        );
+        let cfg = translate::container_config(pod, container, &image_ref, host_paths);
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
@@ -172,6 +187,21 @@ impl CriContainerRuntime {
             source,
         })?;
 
+        // Provision host-side volumes once for the pod (emptyDir/hostPath/
+        // configMap/secret/projected/downwardAPI), yielding the volume-name →
+        // host-path map the container translation mounts.
+        let host_paths = match self.volumes.as_ref() {
+            Some(vm) => {
+                vm.create_pod_volumes(pod)
+                    .await
+                    .map_err(|source| CriRuntimeError::Volumes {
+                        pod: pod.metadata.name.clone(),
+                        source,
+                    })?
+            }
+            None => std::collections::HashMap::new(),
+        };
+
         let sandbox_cfg = translate::sandbox_config(pod, &log_dir);
         let handler = self.runtime_handler.clone();
 
@@ -182,7 +212,14 @@ impl CriContainerRuntime {
         if let Some(init_containers) = spec.init_containers.as_ref() {
             for container in init_containers {
                 let id = self
-                    .create_and_start_container(&mut cri, pod, container, &sandbox_id, &sandbox_cfg)
+                    .create_and_start_container(
+                        &mut cri,
+                        pod,
+                        container,
+                        &sandbox_id,
+                        &sandbox_cfg,
+                        &host_paths,
+                    )
                     .await?;
                 let exit_code = self.wait_for_exit(&mut cri, &id, &container.name).await?;
                 if exit_code != 0 {
@@ -195,8 +232,15 @@ impl CriContainerRuntime {
         }
 
         for container in &spec.containers {
-            self.create_and_start_container(&mut cri, pod, container, &sandbox_id, &sandbox_cfg)
-                .await?;
+            self.create_and_start_container(
+                &mut cri,
+                pod,
+                container,
+                &sandbox_id,
+                &sandbox_cfg,
+                &host_paths,
+            )
+            .await?;
         }
         Ok(())
     }
