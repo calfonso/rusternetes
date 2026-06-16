@@ -290,14 +290,10 @@ impl CriContainerRuntime {
             .collect())
     }
 
-    /// Statuses for a given set of spec containers, in order. Containers the
-    /// runtime has not created yet are reported as `Waiting / ContainerCreating`
-    /// so the result always has one entry per spec container.
-    async fn statuses_for(
-        &self,
-        pod: &Pod,
-        spec_containers: &[rusternetes_common::resources::pod::Container],
-    ) -> Result<Vec<ContainerStatus>> {
+    /// Statuses for a given set of container names, in order. Names the runtime
+    /// has not created yet are reported as `Waiting / ContainerCreating` so the
+    /// result always has one entry per name.
+    async fn statuses_for(&self, pod: &Pod, names: &[String]) -> Result<Vec<ContainerStatus>> {
         let filter = v1::ContainerFilter {
             label_selector: std::collections::HashMap::from([(
                 translate::labels::POD_UID.to_string(),
@@ -321,19 +317,19 @@ impl CriContainerRuntime {
             }
         }
 
-        let mut out = Vec::with_capacity(spec_containers.len());
-        for spec_container in spec_containers {
-            match by_name.get(&spec_container.name) {
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            match by_name.get(name) {
                 Some(id) => {
                     let full = cri.container_status(id, false).await?;
                     let mapped = full
                         .status
                         .as_ref()
                         .map(status::map_container_status)
-                        .unwrap_or_else(|| waiting_status(&spec_container.name));
+                        .unwrap_or_else(|| waiting_status(name));
                     out.push(mapped);
                 }
-                None => out.push(waiting_status(&spec_container.name)),
+                None => out.push(waiting_status(name)),
             }
         }
         Ok(out)
@@ -344,19 +340,88 @@ impl CriContainerRuntime {
         let Some(spec) = pod.spec.as_ref() else {
             return Ok(Vec::new());
         };
-        self.statuses_for(pod, &spec.containers).await
+        let names: Vec<String> = spec.containers.iter().map(|c| c.name.clone()).collect();
+        self.statuses_for(pod, &names).await
     }
 
     /// Statuses for the pod's init containers, in spec order. `None` if the pod
-    /// has no init containers.
-    pub async fn get_init_container_statuses(
+    /// has no init containers. Errors are swallowed to `None` to match the
+    /// bollard runtime's contract.
+    pub async fn get_init_container_statuses(&self, pod: &Pod) -> Option<Vec<ContainerStatus>> {
+        let init = pod.spec.as_ref()?.init_containers.as_ref()?;
+        if init.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = init.iter().map(|c| c.name.clone()).collect();
+        self.statuses_for(pod, &names).await.ok()
+    }
+
+    /// Statuses for the pod's ephemeral containers, in spec order. `None` if the
+    /// pod has none.
+    pub async fn get_ephemeral_container_statuses(
         &self,
         pod: &Pod,
-    ) -> Result<Option<Vec<ContainerStatus>>> {
-        let Some(init) = pod.spec.as_ref().and_then(|s| s.init_containers.as_ref()) else {
-            return Ok(None);
+    ) -> Option<Vec<ContainerStatus>> {
+        let ecs = pod.spec.as_ref()?.ephemeral_containers.as_ref()?;
+        if ecs.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = ecs.iter().map(|c| c.name.clone()).collect();
+        self.statuses_for(pod, &names).await.ok()
+    }
+
+    /// Decide init-container progress: `(all_init_done, next_index_to_start,
+    /// should_retry)`. Mirrors the bollard runtime — observes each init
+    /// container's runtime state and defers to the shared
+    /// [`decide_next_init_action`](crate::runtime::decide_next_init_action).
+    pub async fn compute_init_container_actions(&self, pod: &Pod) -> (bool, Option<usize>, bool) {
+        let init_containers = match pod.spec.as_ref().and_then(|s| s.init_containers.as_ref()) {
+            Some(ics) if !ics.is_empty() => ics,
+            _ => return (true, None, false), // no init containers = all done
         };
-        Ok(Some(self.statuses_for(pod, init).await?))
+
+        // Index runtime containers for this pod by kubernetes container name.
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::POD_UID.to_string(),
+                pod.metadata.uid.clone(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let containers = cri.list_containers(Some(filter)).await.unwrap_or_default();
+        let running = v1::ContainerState::ContainerRunning as i32;
+        let exited = v1::ContainerState::ContainerExited as i32;
+
+        let mut observed = Vec::with_capacity(init_containers.len());
+        for ic in init_containers {
+            let id = containers.iter().find(|c| {
+                c.labels
+                    .get(translate::labels::CONTAINER_NAME)
+                    .map(|n| n == &ic.name)
+                    .unwrap_or(false)
+            });
+            let obs = match id {
+                None => crate::runtime::InitContainerObserved::NotStarted,
+                Some(c) if c.state == running => crate::runtime::InitContainerObserved::Running,
+                Some(c) if c.state == exited => {
+                    // Fetch the exit code from full status.
+                    let code = cri
+                        .container_status(&c.id, false)
+                        .await
+                        .ok()
+                        .and_then(|s| s.status)
+                        .map(|s| s.exit_code)
+                        .unwrap_or(-1);
+                    crate::runtime::InitContainerObserved::Exited(code)
+                }
+                Some(_) => crate::runtime::InitContainerObserved::NotStarted,
+            };
+            observed.push(obs);
+        }
+
+        let action = crate::runtime::decide_next_init_action(pod, &observed);
+        (action.all_init_done, action.next_index, action.should_retry)
     }
 
     /// Names of all pods that have a sandbox on this runtime, regardless of
@@ -746,6 +811,72 @@ impl CriContainerRuntime {
 
         cri.stop_pod_sandbox(&sandbox_id).await?;
         cri.remove_pod_sandbox(&sandbox_id).await?;
+        Ok(())
+    }
+
+    /// Gracefully stop a pod by name: stop its containers with the grace period,
+    /// then stop and remove the sandbox. No-op if the pod has no sandbox.
+    pub async fn stop_pod_with_grace_period(
+        &self,
+        pod_name: &str,
+        grace_period_seconds: i64,
+    ) -> Result<()> {
+        let Some(sandbox_id) = self.sandbox_id_for(pod_name).await? else {
+            return Ok(());
+        };
+        let mut cri = self.cri.clone();
+        let filter = v1::ContainerFilter {
+            pod_sandbox_id: sandbox_id.clone(),
+            ..Default::default()
+        };
+        for c in cri.list_containers(Some(filter)).await? {
+            let _ = cri.stop_container(&c.id, grace_period_seconds).await;
+        }
+        cri.stop_pod_sandbox(&sandbox_id).await?;
+        cri.remove_pod_sandbox(&sandbox_id).await?;
+        Ok(())
+    }
+
+    // ---- Volume management (delegates to the attached VolumeManager) -------
+
+    /// Base directory under which pod volume trees are created. Empty when no
+    /// [`VolumeManager`](crate::volumes::VolumeManager) is attached.
+    pub fn volumes_base_path(&self) -> &str {
+        self.volumes
+            .as_ref()
+            .map(|v| v.volumes_base_path.as_str())
+            .unwrap_or("")
+    }
+
+    /// Refresh a pod's volumes (re-render configMap/secret/projected content).
+    /// No-op when no VolumeManager is attached.
+    pub async fn refresh_volumes(&self, pod: &Pod) -> Result<()> {
+        if let Some(vm) = self.volumes.as_ref() {
+            vm.refresh_volumes(pod)
+                .await
+                .map_err(|source| CriRuntimeError::Volumes {
+                    pod: pod.metadata.name.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Re-provision a pod's volumes from storage (e.g. after a kubelet restart).
+    /// No-op when no VolumeManager is attached.
+    pub async fn resync_volumes<S: rusternetes_storage::Storage>(
+        &self,
+        pod: &Pod,
+        storage: &S,
+    ) -> Result<()> {
+        if let Some(vm) = self.volumes.as_ref() {
+            vm.resync_volumes(pod, storage)
+                .await
+                .map_err(|source| CriRuntimeError::Volumes {
+                    pod: pod.metadata.name.clone(),
+                    source,
+                })?;
+        }
         Ok(())
     }
 

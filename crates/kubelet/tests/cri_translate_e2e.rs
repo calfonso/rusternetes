@@ -462,7 +462,6 @@ async fn init_container_runs_before_app() {
     let init_statuses = runtime
         .get_init_container_statuses(&pod)
         .await
-        .expect("get_init_container_statuses")
         .expect("pod has init containers");
     assert_eq!(init_statuses.len(), 1);
     match &init_statuses[0].state {
@@ -479,7 +478,17 @@ async fn init_container_runs_before_app() {
         runtime.is_pod_running(&pod).await.expect("is_pod_running"),
         "app container should be running after init completed"
     );
-    eprintln!("init-container ordering OK");
+
+    // compute_init_container_actions reports init complete (no next index).
+    let (all_done, next, _retry) = runtime.compute_init_container_actions(&pod).await;
+    assert!(all_done, "init should be reported done");
+    assert!(next.is_none(), "no further init container to start");
+    // No ephemeral containers on this pod.
+    assert!(runtime
+        .get_ephemeral_container_statuses(&pod)
+        .await
+        .is_none());
+    eprintln!("init-container ordering + actions OK");
 
     runtime
         .stop_and_remove_pod(&pod_name)
