@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 pub mod cni;
 pub mod config;
+pub mod cri_runtime;
 pub mod downward_api;
 pub mod events;
 #[allow(dead_code)]

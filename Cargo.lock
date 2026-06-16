@@ -4483,6 +4483,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-cri"
+version = "0.1.0"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tower 0.4.13",
+ "tracing",
+]
+
+[[package]]
 name = "rusternetes-discovery"
 version = "0.1.0"
 dependencies = [
@@ -4581,6 +4596,7 @@ dependencies = [
  "reqwest",
  "rusternetes-client",
  "rusternetes-common",
+ "rusternetes-cri",
  "rusternetes-netstack",
  "rusternetes-storage",
  "rustix 0.38.44",
@@ -4591,6 +4607,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tonic",
  "tower 0.4.13",
