@@ -142,6 +142,56 @@ async fn pod_runs_via_cri() {
         );
         eprintln!("container RUNNING — vertical slice OK");
 
+        // Sub-project 3 surface, verified against the same live container.
+
+        // Node-level runtime status: the runtime should report itself ready.
+        let status = cri.runtime_status(false).await.expect("Status");
+        let ready = status
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.r#type == "RuntimeReady"))
+            .map(|c| c.status)
+            .unwrap_or(false);
+        assert!(ready, "runtime not RuntimeReady: {status:?}");
+
+        // ListContainers should include our sleeper.
+        let containers = cri.list_containers(None).await.expect("ListContainers");
+        assert!(
+            containers.iter().any(|c| c.id == container_id),
+            "started container missing from ListContainers"
+        );
+
+        // ExecSync — the exec-probe workhorse.
+        let exec = cri
+            .exec_sync(&container_id, &["/bin/sh", "-c", "echo hello-cri"], 5)
+            .await
+            .expect("ExecSync");
+        assert_eq!(exec.exit_code, 0, "exec stderr: {:?}", exec.stderr);
+        assert_eq!(String::from_utf8_lossy(&exec.stdout).trim(), "hello-cri");
+        eprintln!("exec_sync OK");
+
+        // Streaming exec returns a proxy URL.
+        let url = cri
+            .exec(v1::ExecRequest {
+                container_id: container_id.clone(),
+                cmd: vec!["/bin/sh".to_string()],
+                tty: true,
+                stdin: true,
+                stdout: true,
+                stderr: false,
+            })
+            .await
+            .expect("Exec");
+        assert!(!url.is_empty(), "exec streaming url empty");
+
+        // Per-container stats for the eviction path.
+        let stats = cri
+            .container_stats(&container_id)
+            .await
+            .expect("ContainerStats");
+        assert!(stats.is_some(), "no stats for running container");
+        eprintln!("status/list/exec/stats all OK");
+
         let _ = cri.stop_container(&container_id, 5).await;
         let _ = cri.remove_container(&container_id).await;
     }

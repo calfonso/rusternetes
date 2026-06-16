@@ -368,6 +368,167 @@ impl CriClient {
             })?;
         Ok(resp.into_inner())
     }
+
+    // ---- Listing / reconciliation ------------------------------------------
+
+    /// List containers, optionally filtered (by id, sandbox, state, labels).
+    pub async fn list_containers(
+        &mut self,
+        filter: Option<v1::ContainerFilter>,
+    ) -> Result<Vec<v1::Container>> {
+        let request = v1::ListContainersRequest { filter };
+        let resp = self
+            .runtime
+            .list_containers(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ListContainers",
+                source,
+            })?;
+        Ok(resp.into_inner().containers)
+    }
+
+    /// List pod sandboxes, optionally filtered.
+    pub async fn list_pod_sandbox(
+        &mut self,
+        filter: Option<v1::PodSandboxFilter>,
+    ) -> Result<Vec<v1::PodSandbox>> {
+        let request = v1::ListPodSandboxRequest { filter };
+        let resp = self
+            .runtime
+            .list_pod_sandbox(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ListPodSandbox",
+                source,
+            })?;
+        Ok(resp.into_inner().items)
+    }
+
+    /// Node-level runtime status (readiness conditions, handlers, features).
+    /// The kubelet uses this to report the node's container-runtime health.
+    pub async fn runtime_status(&mut self, verbose: bool) -> Result<v1::StatusResponse> {
+        let request = v1::StatusRequest { verbose };
+        let resp = self
+            .runtime
+            .status(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "Status",
+                source,
+            })?;
+        Ok(resp.into_inner())
+    }
+
+    // ---- Stats (eviction / metrics) ----------------------------------------
+
+    /// Per-container resource stats; `None` if the container is gone.
+    pub async fn container_stats(
+        &mut self,
+        container_id: &str,
+    ) -> Result<Option<v1::ContainerStats>> {
+        let request = v1::ContainerStatsRequest {
+            container_id: container_id.to_string(),
+        };
+        let resp = self
+            .runtime
+            .container_stats(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ContainerStats",
+                source,
+            })?;
+        Ok(resp.into_inner().stats)
+    }
+
+    /// Stats for all matching containers; the kubelet's eviction manager polls
+    /// this to compare usage against thresholds.
+    pub async fn list_container_stats(
+        &mut self,
+        filter: Option<v1::ContainerStatsFilter>,
+    ) -> Result<Vec<v1::ContainerStats>> {
+        let request = v1::ListContainerStatsRequest { filter };
+        let resp = self
+            .runtime
+            .list_container_stats(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ListContainerStats",
+                source,
+            })?;
+        Ok(resp.into_inner().stats)
+    }
+
+    // ---- Exec / attach / port-forward / logs -------------------------------
+
+    /// Run a command in a container and wait for it to finish, returning its
+    /// stdout, stderr and exit code. This is the workhorse for `exec` liveness
+    /// and readiness probes. `timeout` is in seconds (0 = no timeout).
+    pub async fn exec_sync(
+        &mut self,
+        container_id: &str,
+        cmd: &[&str],
+        timeout: i64,
+    ) -> Result<v1::ExecSyncResponse> {
+        let request = v1::ExecSyncRequest {
+            container_id: container_id.to_string(),
+            cmd: cmd.iter().map(|s| (*s).to_string()).collect(),
+            timeout,
+        };
+        let resp = self
+            .runtime
+            .exec_sync(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ExecSync",
+                source,
+            })?;
+        Ok(resp.into_inner())
+    }
+
+    /// Prepare a streaming `exec` session, returning the URL the kubelet's
+    /// streaming proxy connects to for an interactive `kubectl exec`.
+    pub async fn exec(&mut self, request: v1::ExecRequest) -> Result<String> {
+        let resp = self
+            .runtime
+            .exec(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "Exec",
+                source,
+            })?;
+        Ok(resp.into_inner().url)
+    }
+
+    /// Prepare a streaming `attach` session, returning its URL.
+    pub async fn attach(&mut self, request: v1::AttachRequest) -> Result<String> {
+        let resp = self
+            .runtime
+            .attach(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "Attach",
+                source,
+            })?;
+        Ok(resp.into_inner().url)
+    }
+
+    /// Prepare a `port-forward` session to a sandbox, returning its URL.
+    pub async fn port_forward(&mut self, pod_sandbox_id: &str, ports: &[i32]) -> Result<String> {
+        let request = v1::PortForwardRequest {
+            pod_sandbox_id: pod_sandbox_id.to_string(),
+            port: ports.to_vec(),
+        };
+        let resp = self
+            .runtime
+            .port_forward(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "PortForward",
+                source,
+            })?;
+        Ok(resp.into_inner().url)
+    }
 }
 
 /// Strip a `unix://` (or `unix:`) scheme from a socket path, leaving a bare
