@@ -10,10 +10,11 @@
 //! (`start_pod` + an attached [`VolumeManager`](crate::volumes::VolumeManager)),
 //! container/init/ephemeral status, status/introspection, metrics, gc, in-place
 //! resize, single-attempt probes plus the full liveness/startup threshold state
-//! machine (`check_liveness`), init-action decisions, and teardown. The surface
-//! now matches the bollard `ContainerRuntime` contract the kubelet calls.
-//! Remaining: the `kubelet.rs` field swap and networking — tracked in the
-//! migration issue.
+//! machine (`check_liveness`), init-action decisions, image pulls with policy,
+//! per-container start, lifecycle events, and teardown. This is now the
+//! kubelet's runtime backend (the bollard `ContainerRuntime` handle was
+//! replaced). Remaining: pod DNS config, unsafe-sysctl plumbing, and moving pod
+//! networking fully to containerd-CNI — tracked in the migration issue.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -41,13 +42,6 @@ struct ProbeState {
 pub enum CriRuntimeError {
     #[error(transparent)]
     Cri(#[from] CriError),
-
-    #[error("preparing pod log directory {dir}: {source}")]
-    LogDir {
-        dir: String,
-        #[source]
-        source: std::io::Error,
-    },
 
     #[error("init container {name} failed with exit code {exit_code}")]
     InitContainerFailed { name: String, exit_code: i32 },
@@ -103,6 +97,8 @@ pub struct CriContainerRuntime {
     /// Threshold-tracking state for liveness/startup probes, keyed
     /// `<pod>/<container>/<liveness|startup>`. `Arc` so clones share it.
     probe_states: Arc<Mutex<std::collections::HashMap<String, ProbeState>>>,
+    /// Records Kubernetes lifecycle events. `None` disables event emission.
+    event_recorder: Option<rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>>,
 }
 
 impl CriContainerRuntime {
@@ -120,6 +116,7 @@ impl CriContainerRuntime {
             log_root: log_root.into(),
             volumes: None,
             probe_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_recorder: None,
         })
     }
 
@@ -129,6 +126,120 @@ impl CriContainerRuntime {
     pub fn with_volumes(mut self, volumes: crate::volumes::VolumeManager) -> Self {
         self.volumes = Some(volumes);
         self
+    }
+
+    /// Emit Kubernetes lifecycle events through `storage`.
+    #[must_use]
+    pub fn with_event_recorder(
+        mut self,
+        storage: Arc<rusternetes_storage::StorageBackend>,
+    ) -> Self {
+        self.event_recorder = Some(rusternetes_storage::EventRecorder::new(storage));
+        self
+    }
+
+    /// Emit a pod/container lifecycle event. No-op without an event recorder.
+    pub async fn emit_event(
+        &self,
+        pod: &Pod,
+        container_name: Option<&str>,
+        reason: &str,
+        event_type: rusternetes_common::resources::EventType,
+        message: &str,
+    ) {
+        let Some(recorder) = &self.event_recorder else {
+            return;
+        };
+        let _ = crate::events::emit_lifecycle_event(
+            recorder,
+            pod,
+            container_name,
+            reason,
+            event_type,
+            message,
+        )
+        .await;
+    }
+
+    /// Provision a pod's host-side volumes, returning the volume-name →
+    /// host-path map. Empty when no VolumeManager is attached.
+    pub async fn create_pod_volumes(
+        &self,
+        pod: &Pod,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        match self.volumes.as_ref() {
+            Some(vm) => {
+                vm.create_pod_volumes(pod)
+                    .await
+                    .map_err(|source| CriRuntimeError::Volumes {
+                        pod: pod.metadata.name.clone(),
+                        source,
+                    })
+            }
+            None => Ok(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Ensure an image is present, honoring the pull policy. `Never` requires it
+    /// to already exist; `Always` always pulls; `IfNotPresent` (default) pulls
+    /// only when absent.
+    pub async fn ensure_image(
+        &self,
+        image: &str,
+        pull_policy: Option<&str>,
+        _event_ctx: Option<(&Pod, &str)>,
+    ) -> anyhow::Result<()> {
+        let policy = pull_policy.unwrap_or("IfNotPresent");
+        let mut cri = self.cri.clone();
+
+        if policy != "Always" {
+            let present = cri.image_status(image, false).await?.is_some();
+            if present {
+                return Ok(());
+            }
+            if policy == "Never" {
+                // Absent and pulling disallowed. The typed error lets the
+                // kubelet report `ErrImageNeverPull` via reason_from_anyhow.
+                return Err(anyhow::Error::new(crate::lifecycle::ImageNeverPullError {
+                    image: image.to_string(),
+                }));
+            }
+        }
+        cri.pull_image(image, Some(&self.runtime_handler), None)
+            .await?;
+        Ok(())
+    }
+
+    /// Create and start a single container in the pod's existing sandbox. Used
+    /// by the kubelet for init-container sequencing, restarts, and ephemeral
+    /// containers. `netns_path`/`hosts_file_path`/`pod_ip` are bollard-era
+    /// networking hints that containerd-CNI handles itself — ignored here.
+    pub async fn start_container(
+        &self,
+        pod: &Pod,
+        container: &Container,
+        volume_paths: &std::collections::HashMap<String, String>,
+        _netns_path: Option<&str>,
+        _hosts_file_path: Option<&str>,
+        _pod_ip: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let sandbox_id = self
+            .sandbox_id_for(&pod.metadata.name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no sandbox for pod {}", pod.metadata.name))?;
+        let log_dir = self.log_dir_for(pod);
+        let sandbox_cfg = translate::sandbox_config(pod, &log_dir);
+        let mut cri = self.cri.clone();
+        self.create_and_start_container(
+            &mut cri,
+            pod,
+            container,
+            &sandbox_id,
+            &sandbox_cfg,
+            volume_paths,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Per-pod log directory: `<log_root>/<namespace>_<name>_<uid>`.
@@ -150,15 +261,15 @@ impl CriContainerRuntime {
         sandbox_id: &str,
         sandbox_cfg: &v1::PodSandboxConfig,
         host_paths: &std::collections::HashMap<String, String>,
-    ) -> Result<String> {
-        let image_ref = cri
-            .pull_image(
-                &container.image,
-                Some(&self.runtime_handler),
-                Some(sandbox_cfg.clone()),
-            )
-            .await?;
-        let cfg = translate::container_config(pod, container, &image_ref, host_paths);
+    ) -> anyhow::Result<String> {
+        // Honor the image pull policy (also surfaces ErrImageNeverPull).
+        self.ensure_image(
+            &container.image,
+            container.image_pull_policy.as_deref(),
+            Some((pod, &container.name)),
+        )
+        .await?;
+        let cfg = translate::container_config(pod, container, &container.image, host_paths);
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
@@ -195,31 +306,18 @@ impl CriContainerRuntime {
     ///
     /// Probes and volume provisioning are handled by the kubelet around this
     /// call.
-    pub async fn start_pod(&self, pod: &Pod) -> Result<()> {
+    pub async fn start_pod(&self, pod: &Pod) -> anyhow::Result<()> {
         let Some(spec) = pod.spec.as_ref() else {
             return Ok(());
         };
 
         let log_dir = self.log_dir_for(pod);
-        std::fs::create_dir_all(&log_dir).map_err(|source| CriRuntimeError::LogDir {
-            dir: log_dir.clone(),
-            source,
-        })?;
+        std::fs::create_dir_all(&log_dir)?;
 
         // Provision host-side volumes once for the pod (emptyDir/hostPath/
         // configMap/secret/projected/downwardAPI), yielding the volume-name →
         // host-path map the container translation mounts.
-        let host_paths = match self.volumes.as_ref() {
-            Some(vm) => {
-                vm.create_pod_volumes(pod)
-                    .await
-                    .map_err(|source| CriRuntimeError::Volumes {
-                        pod: pod.metadata.name.clone(),
-                        source,
-                    })?
-            }
-            None => std::collections::HashMap::new(),
-        };
+        let host_paths = self.create_pod_volumes(pod).await?;
 
         let sandbox_cfg = translate::sandbox_config(pod, &log_dir);
         let handler = self.runtime_handler.clone();
@@ -245,7 +343,8 @@ impl CriContainerRuntime {
                     return Err(CriRuntimeError::InitContainerFailed {
                         name: container.name.clone(),
                         exit_code,
-                    });
+                    }
+                    .into());
                 }
             }
         }

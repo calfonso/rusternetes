@@ -1,12 +1,19 @@
 #[allow(dead_code)]
 mod cni;
 mod config;
+#[allow(dead_code, unused_imports)]
+mod cri_runtime;
 mod events;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;
 mod labels;
 mod lifecycle;
+// The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
+// runs on the CRI backend); runtime.rs is kept only for the still-shared free
+// helpers (volume setup, init-action decisions, PodNetworkMode). Its bollard
+// surface is dead here until that code is removed in the migration cleanup.
+#[allow(dead_code)]
 mod runtime;
 mod server;
 mod static_pods;

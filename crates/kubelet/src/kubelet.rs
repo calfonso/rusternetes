@@ -1,6 +1,6 @@
+use crate::cri_runtime::CriContainerRuntime;
 use crate::eviction::{get_node_stats, get_pod_stats, EvictionManager, EvictionSignal};
 use crate::lifecycle::should_skip_phase_write;
-use crate::runtime::ContainerRuntime;
 use anyhow::Result;
 use rusternetes_common::{
     resources::{
@@ -161,7 +161,7 @@ struct RestartBackoff {
 pub struct Kubelet {
     node_name: String,
     storage: Arc<StorageBackend>,
-    runtime: Arc<ContainerRuntime>,
+    runtime: Arc<CriContainerRuntime>,
     sync_interval: Duration,
     /// Filesystem path used for `statvfs` when computing nodefs eviction stats.
     /// Defaults to `/var/lib/kubelet` when not provided.
@@ -366,20 +366,41 @@ impl Kubelet {
         metrics_port: u16,
         allowed_unsafe_sysctls: Vec<String>,
     ) -> Result<Self> {
-        let mut runtime = ContainerRuntime::new(
-            volume_dir,
-            cluster_dns,
-            cluster_domain,
-            network,
-            kubernetes_service_host,
-        )
-        .await?
-        .with_storage(storage.clone())
-        .with_pod_network_mode(pod_network_mode)
-        .with_allowed_unsafe_sysctls(allowed_unsafe_sysctls);
-        if let Some(ns) = netstack {
-            runtime = runtime.with_netstack(ns);
-        }
+        // CRI runtime backend (containerd + Youki). The endpoint and runtime
+        // handler come from the standard kubelet env vars; pod networking is
+        // owned by containerd's CNI plugin, so the netstack/pod-network-mode and
+        // unsafe-sysctl knobs from the bollard path are not applied here yet
+        // (tracked for the CRI migration follow-ups).
+        let _ = (
+            &cluster_dns,
+            &cluster_domain,
+            &network,
+            &kubernetes_service_host,
+            pod_network_mode,
+            &netstack,
+            &allowed_unsafe_sysctls,
+        );
+        let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
+            .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
+        let runtime_handler = std::env::var("CONTAINER_RUNTIME_HANDLER").unwrap_or_default();
+        let log_root = format!("{volume_dir}/pod-logs");
+
+        // VolumeManager shares the kubelet's storage + the api-server JWT secret
+        // (for projected service-account tokens), mirroring the bollard runtime.
+        let jwt_secret = std::env::var("JWT_SECRET")
+            .unwrap_or_else(|_| "rusternetes-secret-change-in-production".to_string());
+        let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
+        let volumes = crate::volumes::VolumeManager::new(
+            volume_dir.clone(),
+            Some(storage.clone()),
+            token_manager,
+        );
+
+        let runtime = CriContainerRuntime::connect(&socket, runtime_handler, log_root)
+            .await
+            .map_err(|e| anyhow::anyhow!("connecting to CRI runtime at {socket}: {e}"))?
+            .with_volumes(volumes)
+            .with_event_recorder(storage.clone());
 
         // Log the resolved statvfs path once so operators can see which
         // mount we're measuring for eviction. Upstream cadvisor logs this
