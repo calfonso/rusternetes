@@ -3,9 +3,8 @@
 //! [`VolumeManager`] owns the logic that materialises pod volumes on the host
 //! filesystem (configMap / secret / projected / downwardAPI / emptyDir /
 //! hostPath) plus the periodic resync/refresh of mutable sources. It is
-//! deliberately free of any container-runtime coupling so that BOTH the bollard
-//! [`crate::runtime::ContainerRuntime`] and the CRI runtime can reuse it. The
-//! bollard runtime keeps a `VolumeManager` and delegates to it; behavior is
+//! deliberately free of any container-runtime coupling so that the CRI runtime
+//! ([`crate::cri_runtime::CriContainerRuntime`]) can reuse it; behavior is
 //! identical to when this code lived inline in `runtime.rs`.
 
 use anyhow::{Context, Result};
@@ -517,7 +516,7 @@ impl VolumeManager {
         // see also tests/conformance_storage_emptydir_hostpath.rs.
         if let Some(host_path) = &volume.host_path {
             // Expand environment variables in the path
-            let path = crate::runtime::ContainerRuntime::expand_env_vars(&host_path.path);
+            let path = crate::runtime::expand_env_vars(&host_path.path);
             match check_host_path_type(&path, host_path.type_.as_deref()) {
                 HostPathCheck::Ok => {}
                 HostPathCheck::Missing => {

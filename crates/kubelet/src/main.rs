@@ -1,22 +1,32 @@
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod cni;
 mod config;
 #[allow(dead_code, unused_imports)]
 mod cri_runtime;
+// The standalone bin drives the CRI backend, so it no longer consumes the
+// kubelet's lifecycle-event / label / preStop / volume-manager / hostname free
+// helpers — those are only reached through the lib API now. They stay compiled
+// into the bin (shared modules) but read as dead here; the lib is their real
+// consumer.
+#[allow(dead_code)]
 mod events;
 #[allow(dead_code)]
 mod eviction;
+#[allow(dead_code)]
 mod kubelet;
+#[allow(dead_code)]
 mod labels;
+#[allow(dead_code)]
 mod lifecycle;
 // The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
 // runs on the CRI backend); runtime.rs is kept only for the still-shared free
-// helpers (volume setup, init-action decisions, PodNetworkMode). Its bollard
-// surface is dead here until that code is removed in the migration cleanup.
+// helpers (volume setup, init-action decisions, PodNetworkMode), which the bin
+// does not all call directly.
 #[allow(dead_code)]
 mod runtime;
 mod server;
 mod static_pods;
+#[allow(dead_code)]
 mod volumes;
 
 use anyhow::{Context, Result};

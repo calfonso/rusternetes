@@ -1,5 +1,5 @@
 //! CRI-backed container runtime — the lifecycle type that replaces the bollard
-//! [`crate::runtime::ContainerRuntime`].
+//! runtime.
 //!
 //! It is stateless about pod→id mappings: like the upstream kubelet, it
 //! discovers sandboxes and containers by querying the runtime with the

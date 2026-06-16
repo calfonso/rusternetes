@@ -263,7 +263,7 @@ impl std::fmt::Display for ImageNeverPullError {
 impl std::error::Error for ImageNeverPullError {}
 
 /// Recover the kubelet `containerStatus.waiting.reason` string from an
-/// [`anyhow::Error`] returned by [`crate::runtime::ContainerRuntime::start_pod`].
+/// [`anyhow::Error`] returned by the runtime's `start_pod`.
 ///
 /// Prefers a typed downcast to [`ImageNeverPullError`] so the reason does
 /// not depend on the user-facing Display string. Falls back to the legacy
@@ -284,9 +284,8 @@ pub fn reason_from_anyhow(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Map a low-level `start_pod` error message back to the upstream
 /// `containerStatus.waiting.reason` string. The kubelet's sync loop uses
-/// this to translate a `Result<_, anyhow::Error>` from
-/// [`crate::runtime::ContainerRuntime::start_pod`] into the reason field
-/// of `ContainerState::Waiting`.
+/// this to translate a `Result<_, anyhow::Error>` from the runtime's
+/// `start_pod` into the reason field of `ContainerState::Waiting`.
 ///
 /// Order matters: `ErrImageNeverPull` is checked before `ErrImagePull`
 /// because the former does not contain the latter as a substring (the

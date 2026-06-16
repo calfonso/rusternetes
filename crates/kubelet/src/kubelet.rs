@@ -222,7 +222,7 @@ pub struct Kubelet {
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
-// All fields are Send+Sync: Arc<StorageBackend>, Arc<ContainerRuntime>, Mutex<EvictionManager>
+// All fields are Send+Sync: Arc<StorageBackend>, Arc<CriContainerRuntime>, Mutex<EvictionManager>
 
 /// Return true iff `a.status` and `b.status` are semantically equal.
 ///
