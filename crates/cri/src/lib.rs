@@ -348,6 +348,28 @@ impl CriClient {
         Ok(())
     }
 
+    /// Update a running container's linux resource limits in place (in-place
+    /// pod resize). `resources` carries the new cgroup values.
+    pub async fn update_container_resources(
+        &mut self,
+        container_id: &str,
+        resources: v1::LinuxContainerResources,
+    ) -> Result<()> {
+        let request = v1::UpdateContainerResourcesRequest {
+            container_id: container_id.to_string(),
+            linux: Some(resources),
+            ..Default::default()
+        };
+        self.runtime
+            .update_container_resources(request)
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "UpdateContainerResources",
+                source,
+            })?;
+        Ok(())
+    }
+
     /// Fetch a container's status.
     pub async fn container_status(
         &mut self,

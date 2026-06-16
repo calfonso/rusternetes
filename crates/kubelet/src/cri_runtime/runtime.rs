@@ -358,6 +358,120 @@ impl CriContainerRuntime {
         Ok(containers.iter().any(|c| c.state == running))
     }
 
+    /// Exit code of the (most recent) container named `container_name`, or 0 if
+    /// no such container is known to the runtime.
+    pub async fn get_container_exit_code(&self, container_name: &str) -> Result<i64> {
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::CONTAINER_NAME.to_string(),
+                container_name.to_string(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let Some(container) = cri.list_containers(Some(filter)).await?.into_iter().next() else {
+            return Ok(0);
+        };
+        let status = cri.container_status(&container.id, false).await?;
+        Ok(status.status.map(|s| i64::from(s.exit_code)).unwrap_or(0))
+    }
+
+    /// Remove every exited container named `container_name` so a restart can
+    /// recreate it. Running containers are left alone.
+    pub async fn remove_terminated_container(&self, container_name: &str) -> Result<()> {
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::CONTAINER_NAME.to_string(),
+                container_name.to_string(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let exited = v1::ContainerState::ContainerExited as i32;
+        for c in cri.list_containers(Some(filter)).await? {
+            if c.state == exited {
+                cri.remove_container(&c.id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Update a container's cgroup limits in place (in-place pod resize). Matches
+    /// the container by name; no-op if it is not found.
+    pub async fn update_container_resources(
+        &self,
+        container_name: &str,
+        cpu_period: Option<i64>,
+        cpu_quota: Option<i64>,
+        cpu_shares: Option<i64>,
+        memory: Option<i64>,
+    ) -> Result<()> {
+        let filter = v1::ContainerFilter {
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::CONTAINER_NAME.to_string(),
+                container_name.to_string(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        let Some(container) = cri.list_containers(Some(filter)).await?.into_iter().next() else {
+            return Ok(());
+        };
+        let resources = v1::LinuxContainerResources {
+            cpu_period: cpu_period.unwrap_or(0),
+            cpu_quota: cpu_quota.unwrap_or(0),
+            cpu_shares: cpu_shares.unwrap_or(0),
+            memory_limit_in_bytes: memory.unwrap_or(0),
+            ..Default::default()
+        };
+        cri.update_container_resources(&container.id, resources)
+            .await?;
+        Ok(())
+    }
+
+    /// Per-container CPU/memory usage for the given pods, keyed by pod name.
+    /// Each entry is `(container_name, cpu_nano_cores, working_set_bytes)`.
+    pub async fn collect_pod_metrics(
+        &self,
+        pod_names: &[String],
+    ) -> std::collections::HashMap<String, Vec<(String, u64, u64)>> {
+        let mut out: std::collections::HashMap<String, Vec<(String, u64, u64)>> =
+            std::collections::HashMap::new();
+        let mut cri = self.cri.clone();
+
+        for pod_name in pod_names {
+            let Ok(Some(sandbox_id)) = self.sandbox_id_for(pod_name).await else {
+                continue;
+            };
+            let filter = v1::ContainerStatsFilter {
+                pod_sandbox_id: sandbox_id,
+                ..Default::default()
+            };
+            let Ok(stats) = cri.list_container_stats(Some(filter)).await else {
+                continue;
+            };
+            let mut per_pod = Vec::new();
+            for s in stats {
+                let name = s
+                    .attributes
+                    .as_ref()
+                    .and_then(|a| a.metadata.as_ref().map(|m| m.name.clone()))
+                    .unwrap_or_default();
+                let cpu = s
+                    .cpu
+                    .and_then(|c| c.usage_nano_cores.map(|v| v.value))
+                    .unwrap_or(0);
+                let mem = s
+                    .memory
+                    .and_then(|m| m.working_set_bytes.map(|v| v.value))
+                    .unwrap_or(0);
+                per_pod.push((name, cpu, mem));
+            }
+            out.insert(pod_name.clone(), per_pod);
+        }
+        out
+    }
+
     /// Gracefully stop a pod: stop each of its containers with `grace_period_seconds`,
     /// then stop and remove the sandbox. No-op if the pod has no sandbox.
     pub async fn stop_pod_for(&self, pod: &Pod, grace_period_seconds: i64) -> Result<()> {

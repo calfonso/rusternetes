@@ -206,6 +206,29 @@ async fn cri_container_runtime_lifecycle() {
     let ip = runtime.get_pod_ip(&pod_name).await.expect("get_pod_ip");
     eprintln!("CriContainerRuntime introspection OK (pod_ip={ip:?})");
 
+    // Per-pod metrics include the running container.
+    let metrics = runtime
+        .collect_pod_metrics(std::slice::from_ref(&pod_name))
+        .await;
+    let pod_metrics = metrics.get(&pod_name).expect("metrics for pod");
+    assert!(
+        pod_metrics.iter().any(|(name, _, _)| name == "sleeper"),
+        "sleeper missing from pod metrics: {pod_metrics:?}"
+    );
+
+    // In-place resource update is accepted by the runtime.
+    runtime
+        .update_container_resources(
+            "sleeper",
+            Some(100_000),
+            Some(50_000),
+            None,
+            Some(128 * 1024 * 1024),
+        )
+        .await
+        .expect("update_container_resources");
+    eprintln!("CriContainerRuntime metrics + resource update OK");
+
     // Graceful teardown path.
     runtime.stop_pod_for(&pod, 5).await.expect("stop_pod_for");
 
