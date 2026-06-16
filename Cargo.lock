@@ -4596,6 +4596,7 @@ dependencies = [
  "reqwest",
  "rusternetes-client",
  "rusternetes-common",
+ "rusternetes-cri",
  "rusternetes-netstack",
  "rusternetes-storage",
  "rustix 0.38.44",

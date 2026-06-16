@@ -25,6 +25,7 @@ rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
 rusternetes-netstack = { path = "../netstack" }
+rusternetes-cri = { path = "../cri" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
