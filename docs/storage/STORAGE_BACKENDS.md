@@ -1,7 +1,7 @@
 # Storage Backends
 
 
-> **Tip:** Storage configuration, classes, and PVCs are manageable through the [web console](CONSOLE_USER_GUIDE.md) Storage page.
+> **Tip:** Storage configuration, classes, and PVCs are manageable through the [web console](../CONSOLE_USER_GUIDE.md) Storage page.
 Rusternetes supports three deployment modes with different storage backends.
 The same component binaries work in all modes — the only difference is
 configuration flags and which compose file you use.
@@ -545,4 +545,3 @@ variant.
 
 - [Rhino](https://github.com/calfonso/rhino) — the SQLite/Redis/SQL-backed etcd shim
 - [kine](https://github.com/k3s-io/kine) — the Go project rhino is inspired by
-- [CSI Integration](csi-integration.md) — volume plugin storage (separate concern)

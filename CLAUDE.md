@@ -89,7 +89,7 @@ Rust reimplementation of Kubernetes. Workspace with 10 crates:
 - **`api-server`** - Axum-based REST API. Routes in `src/router.rs` (~9400 lines). One handler file per resource type in `src/handlers/`. State in `src/state.rs` holds storage, auth, IP allocator, webhook manager, watch cache.
 - **`storage`** - `Storage` trait in `src/lib.rs` with etcd backend (`src/etcd.rs`), SQLite backend via rhino (`src/rhino.rs`, behind `sqlite` feature), Redis backend via rhino (`src/rhino.rs`, behind `redis` feature), and memory backend (`src/memory.rs`). `StorageBackend` enum dispatches to the selected backend. Keys follow `/registry/{resource_type}/{namespace}/{name}`. Resource versions map to backend revision numbers. The rhino dependency uses an in-tree submodule path (`../../rhino` from `crates/storage`, i.e. the `./rhino` submodule).
 - **`controller-manager`** - 31 controllers in `src/controllers/`. Each has a struct with `storage: Arc<S>` + `interval: Duration`, an infinite `run()` loop, and `reconcile_one()` per resource.
-- **`kubelet`** - Container runtime via bollard (Docker API). Manages pod lifecycle, volumes, probes, networking.
+- **`kubelet`** - Container runtime via CRI (CRI v1 gRPC to containerd, which runs containers with Youki). Manages pod lifecycle, volumes, probes, networking. The CRI endpoint comes from `CONTAINER_RUNTIME_ENDPOINT` (default `unix:///run/containerd/containerd.sock`).
 - **`kube-proxy`** - iptables-based service routing. Runs in host network mode. Reads both Endpoints and EndpointSlices.
 - **`scheduler`** - Pod scheduling with affinity, taints/tolerations, priority/preemption. Plugins in `src/plugins/`.
 - **`kubectl`** - CLI tool. Commands in `src/commands/`.
