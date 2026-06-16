@@ -26,6 +26,18 @@ metadata:
     tier: control-plane
 spec:
   hostNetwork: false
+  # Resolve the `api-server` Docker name directly. ndots:0 makes the resolver
+  # try the bare name first instead of appending the cluster search domains
+  # (`*.svc.cluster.local`), which are slow to fail when cluster DNS
+  # (10.96.0.10) isn't reachable from the pod netns yet — Docker's resolver
+  # forwards them to the host upstream and each lookup can take >8s, so the
+  # first connect exceeds the client connect-timeout and the control plane
+  # never comes up. The control plane only needs `api-server`, so skipping the
+  # search domains here is safe.
+  dnsConfig:
+    options:
+    - name: ndots
+      value: "0"
   tolerations:
   - key: node-role.kubernetes.io/control-plane
     effect: NoSchedule

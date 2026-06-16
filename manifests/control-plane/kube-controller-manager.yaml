@@ -25,6 +25,14 @@ metadata:
     tier: control-plane
 spec:
   hostNetwork: false
+  # ndots:0 — resolve the `api-server` Docker name directly instead of trying
+  # the cluster search domains first, which are slow to fail before cluster DNS
+  # (10.96.0.10) is reachable and can push the first connect past the client
+  # connect-timeout. See kube-scheduler.yaml for the full rationale.
+  dnsConfig:
+    options:
+    - name: ndots
+      value: "0"
   tolerations:
   - key: node-role.kubernetes.io/control-plane
     effect: NoSchedule

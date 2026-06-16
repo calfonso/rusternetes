@@ -30,7 +30,15 @@ pub struct KubernetesList<T> {
 
 pub struct ApiClient {
     base_url: String,
+    /// Client for normal CRUD requests. Has a total-request timeout so a
+    /// stalled connection can't hang a caller forever (#1165: a controller's
+    /// single worker would block on a hung GET/LIST/UPDATE and stop reconciling
+    /// until process restart).
     client: Client,
+    /// Client for long-lived watch streams (`get_stream`). No total timeout —
+    /// a watch is meant to stay open indefinitely — but still bounded by
+    /// connect-timeout + TCP keepalive so a dead connection is detected.
+    stream_client: Client,
     token: Option<String>,
 }
 
@@ -109,25 +117,35 @@ impl ApiClient {
         ca_pem: Option<Vec<u8>>,
         token: Option<String>,
     ) -> Result<Self> {
-        let client = if insecure_skip_tls_verify {
-            Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .context("Failed to build HTTP client")?
-        } else if let Some(ca) = ca_pem {
-            let cert = reqwest::Certificate::from_pem(&ca)
-                .context("parsing kubeconfig CA certificate (certificate-authority-data)")?;
-            Client::builder()
-                .add_root_certificate(cert)
-                .build()
-                .context("Failed to build HTTP client with kubeconfig CA")?
-        } else {
-            Client::new()
+        // Build a reqwest client with the shared TLS config. `total_timeout`
+        // is applied only to the CRUD client — the stream client must stay open
+        // for long-lived watches. Both get a connect-timeout and TCP keepalive
+        // so a dead connection surfaces as an error instead of hanging forever
+        // (#1165).
+        let build_client = |total_timeout: Option<std::time::Duration>| -> Result<Client> {
+            let mut builder = Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .tcp_keepalive(std::time::Duration::from_secs(60));
+            if insecure_skip_tls_verify {
+                builder = builder.danger_accept_invalid_certs(true);
+            } else if let Some(ref ca) = ca_pem {
+                let cert = reqwest::Certificate::from_pem(ca)
+                    .context("parsing kubeconfig CA certificate (certificate-authority-data)")?;
+                builder = builder.add_root_certificate(cert);
+            }
+            if let Some(t) = total_timeout {
+                builder = builder.timeout(t);
+            }
+            builder.build().context("Failed to build HTTP client")
         };
+
+        let client = build_client(Some(std::time::Duration::from_secs(60)))?;
+        let stream_client = build_client(None)?;
 
         Ok(Self {
             base_url: base_url.to_string(),
             client,
+            stream_client,
             token,
         })
     }
@@ -172,7 +190,9 @@ impl ApiClient {
     /// Get a streaming response for watch mode
     pub async fn get_stream(&self, path: &str) -> Result<reqwest::Response, GetError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.get(&url);
+        // Use the stream client (no total-request timeout) — a watch is a
+        // long-lived stream and must not be killed by the CRUD timeout (#1165).
+        let mut request = self.stream_client.get(&url);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
