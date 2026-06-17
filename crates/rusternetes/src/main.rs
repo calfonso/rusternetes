@@ -322,9 +322,11 @@ async fn async_main() -> Result<()> {
         .map(|(cert, key)| {
             rusternetes_controller_manager::controllers::hpa_metrics_client::HttpMetricsConfig {
                 api_server_url: format!("https://127.0.0.1:{api_port}"),
-                ca_cert_path: args.client_ca_file.clone().unwrap_or_else(|| cert.clone()),
-                client_cert_path: cert.clone(),
-                client_key_path: key.clone(),
+                ca_pem: None,
+                ca_cert_path: Some(args.client_ca_file.clone().unwrap_or_else(|| cert.clone())),
+                client_cert_path: Some(cert.clone()),
+                client_key_path: Some(key.clone()),
+                token: None,
                 insecure_skip_tls_verify: true,
             }
         });
