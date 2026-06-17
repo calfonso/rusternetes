@@ -32,6 +32,7 @@ uuid.workspace = true
 chrono.workspace = true
 chrono-tz = "0.10"
 cron = "0.12"
+ipnet = "2"
 sha2 = "0.10"
 rand = "0.9"
 jsonwebtoken.workspace = true

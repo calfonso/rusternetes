@@ -53,6 +53,9 @@ pub struct ControllerManagerConfig {
     /// (re)create `kube-root-ca.crt` in every namespace. `None` falls back to
     /// the legacy cert-file paths.
     pub ca_cert_pem: Option<String>,
+    /// Node-IPAM config (pod-CIDR allocation). `None` disables it, matching
+    /// upstream `--allocate-node-cidrs=false`.
+    pub node_ipam: Option<crate::controllers::node_ipam::NodeIpamConfig>,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -349,8 +352,13 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
     });
 
     let s = storage.clone();
+    let node_ipam = config.node_ipam.clone();
     tokio::spawn(async move {
-        let c = Arc::new(NodeController::new(s));
+        let mut nc = NodeController::new(s);
+        if let Some(ipam) = node_ipam {
+            nc = nc.with_node_ipam(ipam);
+        }
+        let c = Arc::new(nc);
         if let Err(e) = c.run().await {
             error!("Node controller error: {}", e);
         }

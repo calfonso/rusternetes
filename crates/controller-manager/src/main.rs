@@ -22,6 +22,7 @@ use controllers::{
     namespace::NamespaceController,
     network_policy::NetworkPolicyController,
     node::NodeController,
+    node_ipam::NodeIpamConfig,
     pod_disruption_budget::{PodDisruptionBudgetController, StalePodDisruptionController},
     priorityclass::PriorityClassController,
     pv_binder::PVBinderController,
@@ -120,6 +121,34 @@ struct Args {
     /// mode (the kubeconfig CA normally validates the self-signed cert).
     #[arg(long)]
     insecure_skip_tls_verify: bool,
+
+    /// Allocate `node.spec.podCIDR` from `--cluster-cidr` (node IPAM). Off by
+    /// default, matching upstream kube-controller-manager. Requires
+    /// `--cluster-cidr` when enabled.
+    #[arg(long)]
+    allocate_node_cidrs: bool,
+
+    /// Cluster pod-network CIDR carved into per-node subnets (e.g.
+    /// `10.244.0.0/16`). Only used when `--allocate-node-cidrs` is set.
+    #[arg(long)]
+    cluster_cidr: Option<String>,
+
+    /// Per-node pod-CIDR subnet mask size (IPv4). Default 24 (matches upstream).
+    #[arg(long, default_value = "24")]
+    node_cidr_mask_size: u8,
+}
+
+/// Resolve node-IPAM flags into `(cluster_cidr, node_mask)`, or `None` when
+/// `--allocate-node-cidrs` is off. Errors if the flag is set without
+/// `--cluster-cidr` (mirrors upstream `node_ipam_controller.go`).
+fn node_ipam_params(args: &Args) -> Result<Option<(String, u8)>> {
+    if !args.allocate_node_cidrs {
+        return Ok(None);
+    }
+    let cidr = args.cluster_cidr.clone().ok_or_else(|| {
+        anyhow::anyhow!("--cluster-cidr is required when --allocate-node-cidrs is set")
+    })?;
+    Ok(Some((cidr, args.node_cidr_mask_size)))
 }
 
 /// Run the controller-manager as an api-server client (in-cluster static pod).
@@ -182,6 +211,17 @@ async fn run_api_mode(args: Args) -> Result<()> {
         // cert paths in its own container — hand it the kubeconfig-resolved CA
         // so it can (re)create kube-root-ca.crt in every namespace.
         ca_cert_pem: ca_pem.and_then(|b| String::from_utf8(b).ok()),
+        // Lib-qualified NodeIpamConfig (distinct from the bin's `mod controllers`
+        // copy), so it matches the type ControllerManagerConfig expects.
+        node_ipam: match node_ipam_params(&args)? {
+            Some((cidr, mask)) => Some(
+                rusternetes_controller_manager::controllers::node_ipam::NodeIpamConfig::new(
+                    &cidr, mask,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?,
+            ),
+            None => None,
+        },
     };
     rusternetes_controller_manager::run_with_api(client, config).await
 }
@@ -205,6 +245,9 @@ async fn main() -> Result<()> {
         "Starting Rusternetes Controller Manager {}",
         rusternetes_common::build_info::version_line()
     );
+
+    // Resolve node-IPAM params before `args` is partially moved below.
+    let ipam_params = node_ipam_params(&args)?;
 
     // Initialize storage
     let storage_config = match args.storage_backend.as_str() {
@@ -726,7 +769,15 @@ async fn main() -> Result<()> {
     });
 
     // Start Node controller (watch-based)
-    let node_controller = Arc::new(NodeController::new(storage.clone()));
+    let node_controller = {
+        let mut nc = NodeController::new(storage.clone());
+        if let Some((cidr, mask)) = ipam_params.clone() {
+            nc = nc
+                .with_node_ipam(NodeIpamConfig::new(&cidr, mask).map_err(|e| anyhow::anyhow!(e))?);
+            info!("Node IPAM enabled: cluster-cidr={cidr}, node-mask=/{mask}");
+        }
+        Arc::new(nc)
+    };
     spawn_controller!("Node controller", leader_elector, {
         let controller = node_controller.clone();
         async move {
