@@ -153,10 +153,28 @@ export CERTS_PATH
 if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     print_step "Templating control-plane static pod manifests (CERTS_PATH=$CERTS_PATH)..."
     mkdir -p "$PROJECT_ROOT/.rusternetes/manifests"
+    # Node IPAM is opt-in (issue #1187). When ALLOCATE_NODE_CIDRS is set (the
+    # flannel stack sets it — see compose.flannel.yml), expand the
+    # @NODE_IPAM_ARGS@ placeholder in the controller-manager manifest into the
+    # allocator flags; otherwise strip the placeholder line so the other stacks
+    # (conformance/sqlite/etcd/redis) keep node IPAM off and unchanged.
+    if [ -n "${ALLOCATE_NODE_CIDRS:-}" ]; then
+        CLUSTER_CIDR="${CLUSTER_CIDR:-10.244.0.0/16}"
+        NODE_CIDR_MASK_SIZE="${NODE_CIDR_MASK_SIZE:-24}"
+        node_ipam_args='    - "--allocate-node-cidrs"\n    - "--cluster-cidr"\n    - "'"${CLUSTER_CIDR}"'"\n    - "--node-cidr-mask-size"\n    - "'"${NODE_CIDR_MASK_SIZE}"'"'
+        print_step "Node IPAM enabled: cluster-cidr=${CLUSTER_CIDR}, node-mask=/${NODE_CIDR_MASK_SIZE}"
+    else
+        node_ipam_args=''
+    fi
     for src in "$PROJECT_ROOT/manifests/control-plane/"*.yaml; do
         [ -e "$src" ] || continue
         dst="$PROJECT_ROOT/.rusternetes/manifests/$(basename "$src")"
         sed "s|@CERTS_PATH@|${CERTS_PATH}|g" "$src" > "$dst"
+        if [ -n "$node_ipam_args" ]; then
+            sed -i "s|@NODE_IPAM_ARGS@|${node_ipam_args}|" "$dst"
+        else
+            sed -i '/@NODE_IPAM_ARGS@/d' "$dst"
+        fi
         echo "  $(basename "$src") -> $dst"
     done
     # Persist CERTS_PATH so a compose restart picks up the same mount path.
