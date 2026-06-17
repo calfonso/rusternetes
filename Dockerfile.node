@@ -1,0 +1,29 @@
+# A rusternetes node, kind-style: containerd (CRI + Youki + CNI) AND the kubelet
+# in one container, so the kubelet and the runtime share a filesystem (required
+# for flannel's hostPath CNI install and for pod hostPath volumes to resolve).
+#
+# Reuses two already-built images:
+#   - the containerd runtime base (Dockerfile.containerd) for containerd/youki/CNI
+#   - the kubelet image for the kubelet binary
+# Both image refs are ARGs so the build can point at whatever tags exist (the
+# compose build tags them per project).
+ARG KUBELET_IMAGE=isolated-work-kubelet:latest
+ARG CONTAINERD_IMAGE=rusternetes-containerd:latest
+
+FROM ${KUBELET_IMAGE} AS kubeletbin
+
+FROM ${CONTAINERD_IMAGE}
+
+COPY --from=kubeletbin /app/kubelet /usr/local/bin/kubelet
+
+# Pod networking comes from flannel-rs (installed by its DaemonSet into
+# /etc/cni/net.d + /opt/cni/bin at runtime), so drop the standalone bridge conf
+# the containerd image ships — otherwise both configs would race.
+RUN rm -f /etc/cni/net.d/10-rusternetes.conflist
+
+COPY deploy/node/entrypoint.sh /usr/local/bin/node-entrypoint.sh
+RUN chmod +x /usr/local/bin/node-entrypoint.sh
+
+ENV CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+
+ENTRYPOINT ["/usr/local/bin/node-entrypoint.sh"]
