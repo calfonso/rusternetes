@@ -85,7 +85,14 @@ async fn translated_pod_runs_on_containerd() {
 
     // The whole point: configs come from the translation layer, not hand-built.
     let sandbox_cfg = translate::sandbox_config(&pod, &log_dir);
-    let container_cfg = translate::container_config(&pod, container, IMAGE, &HashMap::new());
+    let container_cfg = translate::container_config(
+        &pod,
+        container,
+        IMAGE,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert_eq!(sandbox_cfg.metadata.as_ref().unwrap().name, "translate-e2e");
 

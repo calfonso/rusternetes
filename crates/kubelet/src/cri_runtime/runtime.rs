@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusternetes_common::resources::pod::{Container, ContainerState, ContainerStatus, Pod, Probe};
+use rusternetes_common::resources::{ConfigMap, Secret};
 use rusternetes_cri::{v1, CriClient, CriError};
+use rusternetes_storage::Storage;
 use tracing::{debug, warn};
 
 use super::{probe, status, translate};
@@ -285,7 +287,20 @@ impl CriContainerRuntime {
             Some((pod, &container.name)),
         )
         .await?;
-        let mut cfg = translate::container_config(pod, container, &container.image, host_paths);
+        let (config_maps, secrets) = self.resolve_env_sources(pod, container).await;
+        // Fail container creation if a non-optional configMap/secret keyRef is
+        // unresolvable, mirroring upstream's CreateContainerConfigError rather
+        // than silently launching the container with the var missing.
+        translate::validate_env_key_refs(pod, container, &config_maps, &secrets)
+            .map_err(|msg| anyhow::anyhow!("env for container {}: {msg}", container.name))?;
+        let mut cfg = translate::container_config(
+            pod,
+            container,
+            &container.image,
+            host_paths,
+            &config_maps,
+            &secrets,
+        );
         self.inject_service_env(&mut cfg);
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
@@ -294,30 +309,63 @@ impl CriContainerRuntime {
         Ok(container_id)
     }
 
+    /// Fetch the ConfigMap/Secret objects a container's `configMapKeyRef` /
+    /// `secretKeyRef` env vars reference, keyed by name, so [`translate`] can
+    /// resolve them without storage access. Mirrors the upstream kubelet's
+    /// configMap/secret managers feeding `makeEnvironmentVariables`. Missing or
+    /// un-fetchable sources are simply absent from the maps (translate then
+    /// omits the var); storage-less smoke runs return empty maps.
+    async fn resolve_env_sources(
+        &self,
+        pod: &Pod,
+        container: &Container,
+    ) -> (
+        std::collections::HashMap<String, ConfigMap>,
+        std::collections::HashMap<String, Secret>,
+    ) {
+        let mut config_maps = std::collections::HashMap::new();
+        let mut secrets = std::collections::HashMap::new();
+        let Some(storage) = self.volumes.as_ref().and_then(|v| v.storage.as_ref()) else {
+            return (config_maps, secrets);
+        };
+        let Some(env) = container.env.as_ref() else {
+            return (config_maps, secrets);
+        };
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        for e in env {
+            let Some(src) = e.value_from.as_ref() else {
+                continue;
+            };
+            if let Some(cmr) = src.config_map_key_ref.as_ref() {
+                if !config_maps.contains_key(&cmr.name) {
+                    let key = rusternetes_storage::build_key("configmaps", Some(ns), &cmr.name);
+                    if let Ok(cm) = storage.get::<ConfigMap>(&key).await {
+                        config_maps.insert(cmr.name.clone(), cm);
+                    }
+                }
+            }
+            if let Some(skr) = src.secret_key_ref.as_ref() {
+                if !secrets.contains_key(&skr.name) {
+                    let key = rusternetes_storage::build_key("secrets", Some(ns), &skr.name);
+                    if let Ok(s) = storage.get::<Secret>(&key).await {
+                        secrets.insert(skr.name.clone(), s);
+                    }
+                }
+            }
+        }
+        (config_maps, secrets)
+    }
+
     /// Inject the standard `kubernetes` Service env vars (KUBERNETES_SERVICE_HOST
-    /// /PORT and the legacy KUBERNETES_PORT_* forms) so in-cluster clients can
-    /// reach the api-server. Existing same-named vars in the container spec win.
+    /// /PORT and the docker-link KUBERNETES_PORT_* forms) so in-cluster clients
+    /// can reach the api-server. Existing same-named vars in the container spec
+    /// win.
     fn inject_service_env(&self, cfg: &mut v1::ContainerConfig) {
-        let (host, port) = (&self.service_host, &self.service_port);
-        let tcp = format!("tcp://{host}:{port}");
-        let vars = [
-            ("KUBERNETES_SERVICE_HOST", host.clone()),
-            ("KUBERNETES_SERVICE_PORT", port.clone()),
-            ("KUBERNETES_SERVICE_PORT_HTTPS", port.clone()),
-            ("KUBERNETES_PORT", tcp.clone()),
-            ("KUBERNETES_PORT_443_TCP", tcp),
-            ("KUBERNETES_PORT_443_TCP_PROTO", "tcp".to_string()),
-            ("KUBERNETES_PORT_443_TCP_PORT", port.clone()),
-            ("KUBERNETES_PORT_443_TCP_ADDR", host.clone()),
-        ];
-        for (key, value) in vars {
+        for (key, value) in service_env_vars(&self.service_host, &self.service_port) {
             if cfg.envs.iter().any(|e| e.key == key) {
                 continue; // explicit pod env overrides the injected default
             }
-            cfg.envs.push(v1::KeyValue {
-                key: key.to_string(),
-                value,
-            });
+            cfg.envs.push(v1::KeyValue { key, value });
         }
     }
 
@@ -1336,5 +1384,61 @@ impl CriContainerRuntime {
             cri.remove_pod_sandbox(&sb.id).await?;
         }
         Ok(())
+    }
+}
+
+/// The standard `kubernetes` master-Service env vars, in upstream order
+/// (`pkg/kubelet/envvars/envvars.go` `FromServices` + `makeLinkVariables`).
+///
+/// The default Service is a single TCP port named `https`, so upstream emits
+/// the `KUBERNETES_SERVICE_PORT_HTTPS` alias for it. The docker-link var names
+/// embed the *actual* Service port and protocol (`KUBERNETES_PORT_<port>_TCP`),
+/// never a hardcoded value, so a non-443 api-server gets correct names.
+fn service_env_vars(host: &str, port: &str) -> Vec<(String, String)> {
+    let tcp = format!("tcp://{host}:{port}");
+    // Docker-link prefix mirrors makeLinkVariables' "%s_PORT_%d_%s": the actual
+    // port and (TCP) protocol, so a non-443 api-server gets the right names.
+    let pp = format!("KUBERNETES_PORT_{port}_TCP");
+    vec![
+        ("KUBERNETES_SERVICE_HOST".to_string(), host.to_string()),
+        ("KUBERNETES_SERVICE_PORT".to_string(), port.to_string()),
+        (
+            "KUBERNETES_SERVICE_PORT_HTTPS".to_string(),
+            port.to_string(),
+        ),
+        ("KUBERNETES_PORT".to_string(), tcp.clone()),
+        (pp.clone(), tcp),
+        (format!("{pp}_PROTO"), "tcp".to_string()),
+        (format!("{pp}_PORT"), port.to_string()),
+        (format!("{pp}_ADDR"), host.to_string()),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn service_env_derives_port_from_actual_service_port() {
+        let map: HashMap<String, String> =
+            service_env_vars("10.96.0.1", "8080").into_iter().collect();
+        let get = |k: &str| map.get(k).map(String::as_str);
+
+        // Link-var names embed the actual port, never a hardcoded 443.
+        assert!(!map.keys().any(|k| k.contains("443")));
+        assert_eq!(
+            get("KUBERNETES_PORT_8080_TCP"),
+            Some("tcp://10.96.0.1:8080")
+        );
+        assert_eq!(get("KUBERNETES_PORT_8080_TCP_PROTO"), Some("tcp"));
+        assert_eq!(get("KUBERNETES_PORT_8080_TCP_PORT"), Some("8080"));
+        assert_eq!(get("KUBERNETES_PORT_8080_TCP_ADDR"), Some("10.96.0.1"));
+        assert_eq!(get("KUBERNETES_PORT"), Some("tcp://10.96.0.1:8080"));
+
+        // Core + named-port alias (the Service port is named "https").
+        assert_eq!(get("KUBERNETES_SERVICE_HOST"), Some("10.96.0.1"));
+        assert_eq!(get("KUBERNETES_SERVICE_PORT"), Some("8080"));
+        assert_eq!(get("KUBERNETES_SERVICE_PORT_HTTPS"), Some("8080"));
     }
 }
