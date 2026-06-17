@@ -288,6 +288,11 @@ impl CriContainerRuntime {
         )
         .await?;
         let (config_maps, secrets) = self.resolve_env_sources(pod, container).await;
+        // Fail container creation if a non-optional configMap/secret keyRef is
+        // unresolvable, mirroring upstream's CreateContainerConfigError rather
+        // than silently launching the container with the var missing.
+        translate::validate_env_key_refs(pod, container, &config_maps, &secrets)
+            .map_err(|msg| anyhow::anyhow!("env for container {}: {msg}", container.name))?;
         let mut cfg = translate::container_config(
             pod,
             container,

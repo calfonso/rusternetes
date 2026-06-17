@@ -283,6 +283,62 @@ fn container_resource_value(container: &Container, resource: &str) -> Option<Str
     }
 }
 
+/// Verify every *non-optional* `configMapKeyRef`/`secretKeyRef` env var in the
+/// container resolves against the pre-fetched `config_maps`/`secrets`. Returns
+/// the upstream error wording (`makeEnvironmentVariables`) on the first
+/// unresolved ref; the caller fails container creation, matching upstream's
+/// `CreateContainerConfigError` rather than silently dropping the var. Optional
+/// refs are skipped (and may be legitimately absent).
+pub fn validate_env_key_refs(
+    pod: &Pod,
+    container: &Container,
+    config_maps: &HashMap<String, ConfigMap>,
+    secrets: &HashMap<String, Secret>,
+) -> Result<(), String> {
+    let Some(env) = container.env.as_ref() else {
+        return Ok(());
+    };
+    let ns = namespace(pod);
+    for e in env {
+        let Some(src) = e.value_from.as_ref() else {
+            continue;
+        };
+        if let Some(cmr) = src.config_map_key_ref.as_ref() {
+            if cmr.optional.unwrap_or(false) {
+                continue;
+            }
+            match config_maps.get(&cmr.name) {
+                None => return Err(format!("couldn't get ConfigMap {ns}/{}", cmr.name)),
+                Some(cm) => {
+                    if !cm.data.as_ref().is_some_and(|d| d.contains_key(&cmr.key)) {
+                        return Err(format!(
+                            "couldn't find key {} in ConfigMap {ns}/{}",
+                            cmr.key, cmr.name
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(skr) = src.secret_key_ref.as_ref() {
+            if skr.optional.unwrap_or(false) {
+                continue;
+            }
+            match secrets.get(&skr.name) {
+                None => return Err(format!("couldn't get Secret {ns}/{}", skr.name)),
+                Some(s) => {
+                    if !s.data.as_ref().is_some_and(|d| d.contains_key(&skr.key)) {
+                        return Err(format!(
+                            "couldn't find key {} in Secret {ns}/{}",
+                            skr.key, skr.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Translate volume mounts into CRI mounts using a resolved volume-name →
 /// host-path map (volume provisioning is runtime-agnostic and done earlier).
 /// Mounts whose volume is absent from the map are skipped.
@@ -902,5 +958,94 @@ mod tests {
             &HashMap::new(),
         );
         assert!(cfg.envs.iter().all(|e| e.key != "MISSING"));
+    }
+
+    fn pod_with_env(env: Vec<rusternetes_common::resources::pod::EnvVar>) -> (Pod, Container) {
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.env = Some(env);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        (pod, c)
+    }
+
+    #[test]
+    fn validate_rejects_nonoptional_missing_key() {
+        use rusternetes_common::resources::pod::ConfigMapKeySelector;
+        let (pod, c) = pod_with_env(vec![env_from(
+            "NEED",
+            rusternetes_common::resources::pod::EnvVarSource {
+                config_map_key_ref: Some(ConfigMapKeySelector {
+                    name: "cfg".to_string(),
+                    key: "absent".to_string(),
+                    optional: None,
+                }),
+                ..empty_source()
+            },
+        )]);
+        // ConfigMap exists but lacks the key.
+        let mut cm = ConfigMap::new("cfg", "prod");
+        cm.data = Some(HashMap::from([("present".to_string(), "x".to_string())]));
+        let config_maps = HashMap::from([("cfg".to_string(), cm)]);
+        let err = validate_env_key_refs(&pod, &c, &config_maps, &HashMap::new()).unwrap_err();
+        assert_eq!(err, "couldn't find key absent in ConfigMap prod/cfg");
+    }
+
+    #[test]
+    fn validate_rejects_nonoptional_missing_object() {
+        use rusternetes_common::resources::pod::SecretKeySelector;
+        let (pod, c) = pod_with_env(vec![env_from(
+            "NEED",
+            rusternetes_common::resources::pod::EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: "creds".to_string(),
+                    key: "password".to_string(),
+                    optional: None,
+                }),
+                ..empty_source()
+            },
+        )]);
+        let err = validate_env_key_refs(&pod, &c, &HashMap::new(), &HashMap::new()).unwrap_err();
+        assert_eq!(err, "couldn't get Secret prod/creds");
+    }
+
+    #[test]
+    fn validate_allows_optional_missing_and_resolved_refs() {
+        use rusternetes_common::resources::pod::{ConfigMapKeySelector, SecretKeySelector};
+        let (pod, c) = pod_with_env(vec![
+            // optional + missing -> ok
+            env_from(
+                "OPT",
+                rusternetes_common::resources::pod::EnvVarSource {
+                    config_map_key_ref: Some(ConfigMapKeySelector {
+                        name: "gone".to_string(),
+                        key: "k".to_string(),
+                        optional: Some(true),
+                    }),
+                    ..empty_source()
+                },
+            ),
+            // non-optional + present -> ok
+            env_from(
+                "OK",
+                rusternetes_common::resources::pod::EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: "creds".to_string(),
+                        key: "password".to_string(),
+                        optional: None,
+                    }),
+                    ..empty_source()
+                },
+            ),
+        ]);
+        let mut s = Secret::new("creds", "prod");
+        s.data = Some(HashMap::from([("password".to_string(), b"x".to_vec())]));
+        let secrets = HashMap::from([("creds".to_string(), s)]);
+        assert!(validate_env_key_refs(&pod, &c, &HashMap::new(), &secrets).is_ok());
     }
 }
