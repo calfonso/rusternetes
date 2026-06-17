@@ -25,7 +25,7 @@ metadata:
     component: kube-scheduler
     tier: control-plane
 spec:
-  hostNetwork: false
+  hostNetwork: true
   # Resolve the `api-server` Docker name directly. ndots:0 makes the resolver
   # try the bare name first instead of appending the cluster search domains
   # (`*.svc.cluster.local`), which are slow to fail when cluster DNS
