@@ -135,6 +135,13 @@ jobs:
           hydrophone-version: ${{ env.HYDROPHONE_VERSION }}
           kubectl-version: v1.35.0
           image-tag: ${{ env.IMAGE_TAG }}
+          # workflow_run fires right after "Publish images" succeeded for this
+          # exact sha, so sha-<head_sha> MUST be pullable — a miss means the
+          # GHCR packages are still private (forgotten visibility flip), which
+          # the soft fallback would hide behind a green local build forever
+          # (#1108). Hard-fail there; keep the soft fallback for dispatch (where
+          # an arbitrary / not-yet-published tag is a legitimate input).
+          require-prebuilt: ${{ github.event_name == 'workflow_run' }}
 
       - name: Run conformance tag suite
         # `scripts/conformance-tags-run.sh` runs the canonical two-phase

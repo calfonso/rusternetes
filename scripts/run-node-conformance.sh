@@ -59,6 +59,11 @@ done
 # Pull-or-fallback: a successful pull layers the ghcr overlay (image: names)
 # and skips the local build; a failed pull (tag missing, registry down)
 # logs loudly and keeps today's --build path.
+#
+# REQUIRE_PREBUILT=true (set by the nightly schedule, where the `main` tag must
+# exist once the GHCR packages are public) turns a failed pull into a HARD
+# ERROR instead of a silent local-build fallback — otherwise a forgotten GHCR
+# visibility flip leaves the nightly green-but-always-compiling forever (#1108).
 UP_BUILD_FLAG="--build"
 if [ -n "${RUSTERNETES_IMAGE_TAG:-}" ]; then
     GHCR_OVERLAY="${PROJECT_ROOT}/compose.ghcr.node-conformance.yml"
@@ -67,8 +72,27 @@ if [ -n "${RUSTERNETES_IMAGE_TAG:-}" ]; then
         COMPOSE_FILES="${COMPOSE_FILES} -f ${GHCR_OVERLAY}"
         UP_BUILD_FLAG="--no-build"
         echo "Using prebuilt images: tag=${RUSTERNETES_IMAGE_TAG}"
+    elif [ "${REQUIRE_PREBUILT:-false}" = "true" ]; then
+        echo "ERROR: prebuilt images tag=${RUSTERNETES_IMAGE_TAG} not pullable on a require-prebuilt run — the ghcr.io/indyjonesnl/rusternetes/* packages are likely still private (flip them to public, see PR #1106 checklist). Refusing to fall back to a local build." >&2
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+                echo "### ❌ Prebuilt-image pull failed (hard error)"
+                echo
+                echo "Tag \`${RUSTERNETES_IMAGE_TAG}\` was not pullable and \`REQUIRE_PREBUILT\` is set."
+                echo "Most likely the \`ghcr.io/indyjonesnl/rusternetes/*\` packages are still **private** (PR #1106 post-merge checklist)."
+            } >> "${GITHUB_STEP_SUMMARY}"
+        fi
+        exit 1
     else
         echo "WARNING: prebuilt images tag=${RUSTERNETES_IMAGE_TAG} not pullable — falling back to local build" >&2
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+                echo "### ⚠️ Prebuilt-image fallback: built locally"
+                echo
+                echo "Tag \`${RUSTERNETES_IMAGE_TAG}\` was not pullable, so images were **compiled locally**."
+                echo "If this persists, the \`ghcr.io/indyjonesnl/rusternetes/*\` packages may still be private (PR #1106 post-merge checklist)."
+            } >> "${GITHUB_STEP_SUMMARY}"
+        fi
     fi
 fi
 
