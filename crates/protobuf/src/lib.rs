@@ -753,6 +753,7 @@ impl ProtoRegistry {
                             FieldType::Message("LifecycleHandler".into()),
                         ),
                     ),
+                    (3, ("stopSignal".into(), FieldType::String)),
                 ]),
             },
         );
@@ -1123,6 +1124,7 @@ impl ProtoRegistry {
                     (3, ("port".into(), FieldType::Int)),
                     (4, ("targetPort".into(), FieldType::IntOrString)),
                     (5, ("nodePort".into(), FieldType::Int)),
+                    (6, ("appProtocol".into(), FieldType::String)),
                 ]),
             },
         );
@@ -1379,6 +1381,21 @@ impl ProtoRegistry {
                         ),
                     ),
                     (17, ("observedGeneration".into(), FieldType::Int)),
+                    (
+                        18,
+                        (
+                            "extendedResourceClaimStatus".into(),
+                            FieldType::Message("PodExtendedResourceClaimStatus".into()),
+                        ),
+                    ),
+                    (19, ("allocatedResources".into(), FieldType::QuantityMap)),
+                    (
+                        20,
+                        (
+                            "resources".into(),
+                            FieldType::Message("ResourceRequirements".into()),
+                        ),
+                    ),
                 ]),
             },
         );
@@ -1651,6 +1668,13 @@ impl ProtoRegistry {
                     (
                         8,
                         ("currentVolumeAttributesClassName".into(), FieldType::String),
+                    ),
+                    (
+                        9,
+                        (
+                            "modifyVolumeStatus".into(),
+                            FieldType::Message("ModifyVolumeStatus".into()),
+                        ),
                     ),
                 ]),
             },
@@ -1944,6 +1968,13 @@ impl ProtoRegistry {
                     (
                         13,
                         ("features".into(), FieldType::Message("NodeFeatures".into())),
+                    ),
+                    (
+                        14,
+                        (
+                            "declaredFeatures".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
                     ),
                 ]),
             },
@@ -2658,6 +2689,20 @@ impl ProtoRegistry {
                             FieldType::Message("ServiceAccountTokenProjection".into()),
                         ),
                     ),
+                    (
+                        5,
+                        (
+                            "clusterTrustBundle".into(),
+                            FieldType::Message("ClusterTrustBundleProjection".into()),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "podCertificate".into(),
+                            FieldType::Message("PodCertificateProjection".into()),
+                        ),
+                    ),
                 ]),
             },
         );
@@ -2824,8 +2869,7 @@ impl ProtoRegistry {
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("medium".into(), FieldType::String)),
-                    // field 2 = sizeLimit (Quantity) — no FieldType variant
-                    // for Quantity strings; skip until callers need it.
+                    (2, ("sizeLimit".into(), FieldType::Quantity)),
                 ]),
             },
         );
@@ -6358,8 +6402,6 @@ impl ProtoRegistry {
                 ]),
             },
         );
-        // PersistentVolumeSpec.capacity is map<string, Quantity> — skipped.
-        //
         // persistentVolumeSource (field 2) references PersistentVolumeSource,
         // which is registered separately (see `register_core_v1_remaining_nested`).
         // Upstream Go marks the embed `json:",inline"`, so individual
@@ -6371,6 +6413,7 @@ impl ProtoRegistry {
             "PersistentVolumeSpec".into(),
             MessageSchema {
                 fields: HashMap::from([
+                    (1, ("capacity".into(), FieldType::QuantityMap)),
                     (
                         2,
                         (
@@ -7114,6 +7157,13 @@ impl ProtoRegistry {
                 (8, ("runAsGroup".into(), FieldType::Int)),
                 (9, ("procMount".into(), FieldType::String)),
                 (
+                    10,
+                    (
+                        "windowsOptions".into(),
+                        FieldType::Message("WindowsSecurityContextOptions".into()),
+                    ),
+                ),
+                (
                     11,
                     (
                         "seccompProfile".into(),
@@ -7229,6 +7279,35 @@ impl ProtoRegistry {
                         FieldType::Message("ProjectedVolumeSource".into()),
                     ),
                 ),
+                (
+                    7,
+                    ("nfs".into(), FieldType::Message("NFSVolumeSource".into())),
+                ),
+                (
+                    8,
+                    (
+                        "iscsi".into(),
+                        FieldType::Message("ISCSIVolumeSource".into()),
+                    ),
+                ),
+                (
+                    28,
+                    ("csi".into(), FieldType::Message("CSIVolumeSource".into())),
+                ),
+                (
+                    29,
+                    (
+                        "ephemeral".into(),
+                        FieldType::Message("EphemeralVolumeSource".into()),
+                    ),
+                ),
+                (
+                    30,
+                    (
+                        "image".into(),
+                        FieldType::Message("ImageVolumeSource".into()),
+                    ),
+                ),
             ]),
         }
     }
@@ -7292,6 +7371,13 @@ impl ProtoRegistry {
                     (
                         "secretKeyRef".into(),
                         FieldType::Message("SecretKeySelector".into()),
+                    ),
+                ),
+                (
+                    5,
+                    (
+                        "fileKeyRef".into(),
+                        FieldType::Message("FileKeySelector".into()),
                     ),
                 ),
             ]),
@@ -7370,6 +7456,13 @@ impl ProtoRegistry {
                     (
                         "sysctls".into(),
                         FieldType::Repeated(Box::new(FieldType::Message("Sysctl".into()))),
+                    ),
+                ),
+                (
+                    8,
+                    (
+                        "windowsOptions".into(),
+                        FieldType::Message("WindowsSecurityContextOptions".into()),
                     ),
                 ),
                 (9, ("fsGroupChangePolicy".into(), FieldType::String)),

@@ -691,6 +691,101 @@ fn registry_parity_with_upstream() {
     }
 }
 
+/// Fields a registered message intentionally does NOT carry on the wire,
+/// even though the upstream `.proto` declares them at that number. Keep this
+/// list tiny and well-justified — each entry is a place where protobuf
+/// round-trip is knowingly lossy.
+fn completeness_skip(msg: &str, field_number: u32) -> bool {
+    match (msg, field_number) {
+        // selfLink: deprecated in k8s 1.16, removed from server responses;
+        // our ObjectMeta intentionally omits it (mirrors the JSON parity
+        // test's KNOWN_GAPS). Not modelled on either codec.
+        ("ObjectMeta", 4) => true,
+
+        // Legacy / removed in-tree volume plugins. Our Volume struct does not
+        // implement these provider-specific sources (same KNOWN_GAPS set the
+        // JSON parity test allowlists), so the registry has no field for them.
+        //   3 gcePersistentDisk, 4 awsElasticBlockStore, 5 gitRepo,
+        //   9 glusterfs, 11 rbd, 12 flexVolume, 13 cinder, 14 cephfs,
+        //   15 flocker, 17 fc, 18 azureFile, 20 vsphereVolume, 21 quobyte,
+        //   22 azureDisk, 23 photonPersistentDisk, 24 portworxVolume,
+        //   25 scaleIO, 27 storageos.
+        ("VolumeSource", 3 | 4 | 5 | 9 | 11 | 12 | 13 | 14 | 15 | 17 | 18) => true,
+        ("VolumeSource", 20 | 21 | 22 | 23 | 24 | 25 | 27) => true,
+
+        _ => false,
+    }
+}
+
+/// Field-level completeness gate (the inverse of [`registry_parity_with_upstream`]).
+///
+/// `registry_parity_with_upstream` walks the *registry* and checks every
+/// registered field against upstream — so a message that is registered but
+/// *missing* some upstream fields slips through silently. That is the exact
+/// bug class that drops data on the native-protobuf wire: the field is absent
+/// from the schema, so the decoder never reads it (PR #690 was the message-
+/// level version; this is the field-level version).
+///
+/// For every message present in BOTH the registry and the bundled upstream
+/// snapshot, assert the registry carries an entry for every upstream field
+/// number (modulo [`intentional_field_skip`] name-divergence cases and the
+/// explicit [`completeness_skip`] allowlist).
+#[test]
+fn registry_covers_every_upstream_field() {
+    let files = parse_all_files();
+    let (upstream, _map_entries) = build_upstream_index(&files);
+    let qualified_upstream = build_qualified_index(&files);
+    let registry = ProtoRegistry::new();
+
+    let mut missing: Vec<String> = Vec::new();
+
+    for (msg_name, schema) in registry.iter_schemas() {
+        if REGISTRY_SKIP.contains(&msg_name) {
+            continue;
+        }
+        let upstream_fields = if msg_name.contains('/') && msg_name.contains('.') {
+            qualified_upstream.get(msg_name)
+        } else {
+            upstream.get(msg_name)
+        };
+        // Registry messages with no upstream counterpart are reported by
+        // registry_parity_with_upstream; nothing to complete here.
+        let Some(upstream_fields) = upstream_fields else {
+            continue;
+        };
+        for (field_number, up) in upstream_fields {
+            if intentional_field_skip(msg_name, *field_number)
+                || completeness_skip(msg_name, *field_number)
+            {
+                continue;
+            }
+            if !schema.fields.contains_key(field_number) {
+                missing.push(format!(
+                    "{}#{} '{}' ({:?}) present upstream but MISSING from registry",
+                    msg_name, field_number, up.name, up.logical
+                ));
+            }
+        }
+    }
+
+    missing.sort();
+    eprintln!(
+        "registry completeness: {} upstream field(s) unmodelled",
+        missing.len()
+    );
+    if !missing.is_empty() {
+        panic!(
+            "{} upstream field(s) missing from the registry (native-protobuf would drop them):\n{}",
+            missing.len(),
+            missing
+                .iter()
+                .map(|s| format!("  - {}", s))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
 /// Coverage check: every upstream message in our bundled snapshots has a
 /// counterpart in the registry. Originally a `#[ignore]`d dashboard that
 /// listed the missing entries; now enforced as a hard parity gate.
