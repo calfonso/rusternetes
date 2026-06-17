@@ -1144,10 +1144,7 @@ impl CriContainerRuntime {
     pub async fn container_exists(&self, pod_uid: &str, container_name: &str) -> bool {
         let filter = v1::ContainerFilter {
             label_selector: std::collections::HashMap::from([
-                (
-                    translate::labels::POD_UID.to_string(),
-                    pod_uid.to_string(),
-                ),
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
                 (
                     translate::labels::CONTAINER_NAME.to_string(),
                     container_name.to_string(),
