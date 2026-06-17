@@ -374,15 +374,24 @@ async fn stream_container_logs(
     // file for new lines. `async_stream` lets us poll the file from inside the
     // stream so the HTTP response body stays open until the container exits.
     let stream = async_stream::stream! {
-        // Initial backlog read (tail/since honored by read_log_file).
+        // Initial backlog read (tail/since honored by read_log_file). A read
+        // error here is NOT fatal: the container may have only just started and
+        // containerd may not have created the log file yet. Yielding an Err
+        // would make hyper reset the HTTP/2 stream (RST_STREAM, INTERNAL_ERROR),
+        // which clients like hydrophone treat as a hard failure rather than a
+        // retryable empty read. Instead, emit nothing and fall through to the
+        // tail loop, which waits for the file to appear.
         match crate::cri_exec::read_log_file(&log_path, &opts) {
             Ok(bytes) if !bytes.is_empty() => {
                 yield Ok(bytes::Bytes::from(bytes));
             }
             Ok(_) => {}
             Err(e) => {
-                yield Err(std::io::Error::other(e.to_string()));
-                return;
+                tracing::debug!(
+                    "follow log backlog read failed for {} (container may not have written yet): {}",
+                    log_path.display(),
+                    e
+                );
             }
         }
 
@@ -390,11 +399,26 @@ async fn stream_container_logs(
         // recreated log file is picked up.
         let mut offset: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
         let mut carry: Vec<u8> = Vec::new();
+        // Whether the log file has ever existed. Before it appears, a missing
+        // file means "container hasn't logged yet" (keep waiting); after it has
+        // appeared, a missing file means the container/log was removed (stop).
+        let mut seen_file = std::fs::metadata(&log_path).is_ok();
+        // Bound the pre-first-appearance wait so a container that exits without
+        // ever producing a log file ends the stream cleanly (EOF) instead of
+        // tailing a path that will never exist.
+        let mut waited_ticks: u32 = 0;
+        const MAX_PRE_FILE_TICKS: u32 = 240; // 240 * 500ms = 120s
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let len = match std::fs::metadata(&log_path) {
-                Ok(m) => m.len(),
-                Err(_) => break, // file gone — container/log removed; end stream
+                Ok(m) => { seen_file = true; m.len() }
+                Err(_) if !seen_file => {
+                    // Log file not created yet — keep waiting, up to the bound.
+                    waited_ticks += 1;
+                    if waited_ticks >= MAX_PRE_FILE_TICKS { break; }
+                    continue;
+                }
+                Err(_) => break, // file existed then vanished — container removed; end stream
             };
             if len < offset {
                 // File truncated/rotated — restart from the beginning.
