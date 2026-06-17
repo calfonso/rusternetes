@@ -7,14 +7,18 @@
 //! single place where rusternetes' resource model meets the CRI wire model.
 //!
 //! Scope: the fields needed to launch a pod — metadata, labels, namespaces,
-//! command/args/env (literal values), ports, resources, mounts, and the linux
-//! security context. Deferred (tracked separately): `valueFrom` env resolution
-//! (secrets/configMaps), `envFrom`, probes (driven kubelet-side via ExecSync),
+//! command/args/env, ports, resources, mounts, and the linux security context.
+//! `valueFrom` env is resolved here from inputs the kubelet fetches first:
+//! `fieldRef`/`resourceFieldRef` from the pod itself, `configMapKeyRef`/
+//! `secretKeyRef` from caller-supplied ConfigMap/Secret maps (the runtime reads
+//! these from storage before translation — see `container_config`). Deferred
+//! (tracked separately): `envFrom`, probes (driven kubelet-side via ExecSync),
 //! and windows configs.
 
 use std::collections::HashMap;
 
 use rusternetes_common::resources::pod::{Container, Pod};
+use rusternetes_common::resources::{ConfigMap, Secret};
 use rusternetes_cri::v1;
 
 /// Well-known CRI metadata label keys the runtime indexes sandboxes/containers
@@ -134,17 +138,23 @@ pub fn sandbox_config(pod: &Pod, log_directory: &str) -> v1::PodSandboxConfig {
     }
 }
 
-/// Translate literal env vars; `valueFrom` (secret/configMap/field refs) is
-/// resolved kubelet-side before translation and is not handled here.
-fn env_vars(pod: &Pod, container: &Container) -> Vec<v1::KeyValue> {
+/// Translate env vars, resolving each `valueFrom` source in declared order.
+/// Literal values pass through; `fieldRef`/`resourceFieldRef` resolve from the
+/// pod; `configMapKeyRef`/`secretKeyRef` resolve from `config_maps`/`secrets`
+/// (fetched from storage by the caller). A ref whose source/key is absent
+/// yields no var (matching the optional case); the caller is responsible for
+/// pre-validating non-optional refs.
+fn env_vars(
+    pod: &Pod,
+    container: &Container,
+    config_maps: &HashMap<String, ConfigMap>,
+    secrets: &HashMap<String, Secret>,
+) -> Vec<v1::KeyValue> {
     let Some(env) = container.env.as_ref() else {
         return Vec::new();
     };
     env.iter()
         .filter_map(|e| {
-            // Literal value wins; otherwise resolve a downward-API fieldRef /
-            // resourceFieldRef. configMap/secret keyRefs are resolved by the
-            // kubelet before translation (not handled here) and are skipped.
             let value = if let Some(v) = e.value.as_ref() {
                 Some(v.clone())
             } else if let Some(src) = e.value_from.as_ref() {
@@ -152,6 +162,19 @@ fn env_vars(pod: &Pod, container: &Container) -> Vec<v1::KeyValue> {
                     pod_field_value(pod, &fr.field_path)
                 } else if let Some(rfr) = src.resource_field_ref.as_ref() {
                     container_resource_value(container, &rfr.resource)
+                } else if let Some(cmr) = src.config_map_key_ref.as_ref() {
+                    config_maps
+                        .get(&cmr.name)
+                        .and_then(|cm| cm.data.as_ref())
+                        .and_then(|d| d.get(&cmr.key).cloned())
+                } else if let Some(skr) = src.secret_key_ref.as_ref() {
+                    // Secret data is the already-decoded bytes; env values are
+                    // the UTF-8 interpretation (upstream casts []byte→string).
+                    secrets
+                        .get(&skr.name)
+                        .and_then(|s| s.data.as_ref())
+                        .and_then(|d| d.get(&skr.key))
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 } else {
                     None
                 }
@@ -201,8 +224,42 @@ fn pod_field_value(pod: &Pod, field_path: &str) -> Option<String> {
                     .join(",")
             })
         }),
-        _ => None,
+        "spec.restartPolicy" => pod.spec.as_ref().and_then(|s| s.restart_policy.clone()),
+        "spec.schedulerName" => pod.spec.as_ref().and_then(|s| s.scheduler_name.clone()),
+        "status.phase" => pod
+            .status
+            .as_ref()
+            .and_then(|st| st.phase.as_ref())
+            .map(phase_str),
+        // Subscript forms `metadata.labels['key']` / `metadata.annotations['key']`.
+        _ => field_path
+            .strip_prefix("metadata.labels[")
+            .map(|k| (pod.metadata.labels.as_ref(), k))
+            .or_else(|| {
+                field_path
+                    .strip_prefix("metadata.annotations[")
+                    .map(|k| (pod.metadata.annotations.as_ref(), k))
+            })
+            .and_then(|(map, rest)| {
+                let key = rest.strip_suffix(']')?.trim_matches(['\'', '"']);
+                map?.get(key).cloned()
+            }),
     }
+}
+
+/// Render a [`Phase`] to its Kubernetes string form (`status.phase` fieldRef).
+fn phase_str(phase: &rusternetes_common::types::Phase) -> String {
+    use rusternetes_common::types::Phase;
+    match phase {
+        Phase::Pending => "Pending",
+        Phase::Running => "Running",
+        Phase::Succeeded => "Succeeded",
+        Phase::Failed => "Failed",
+        Phase::Unknown => "Unknown",
+        Phase::Active => "Active",
+        Phase::Terminating => "Terminating",
+    }
+    .to_string()
 }
 
 /// Resolve a `resourceFieldRef` (`limits.cpu` / `requests.memory`, etc.) to its
@@ -218,7 +275,10 @@ fn container_resource_value(container: &Container, resource: &str) -> Option<Str
     let raw = map.get(name)?;
     match name {
         "cpu" => parse_cpu_millicores(raw).map(|m| m.to_string()),
-        "memory" => parse_memory_bytes(raw).map(|b| b.to_string()),
+        // memory, ephemeral-storage and hugepages-<size> are all byte quantities
+        // upstream normalizes to an integer byte count (resource/helpers.go).
+        "memory" | "ephemeral-storage" => parse_memory_bytes(raw).map(|b| b.to_string()),
+        n if n.starts_with("hugepages-") => parse_memory_bytes(raw).map(|b| b.to_string()),
         _ => Some(raw.clone()),
     }
 }
@@ -332,11 +392,16 @@ fn linux_security_context(container: &Container) -> Option<v1::LinuxContainerSec
 ///
 /// `image_ref` is the canonical reference returned by `PullImage`. `host_paths`
 /// maps volume names to their resolved host paths for mount translation.
+/// `config_maps`/`secrets` are the ConfigMap/Secret objects (by name) the
+/// kubelet pre-fetched from storage so `configMapKeyRef`/`secretKeyRef` env can
+/// be resolved here without storage access.
 pub fn container_config(
     pod: &Pod,
     container: &Container,
     image_ref: &str,
     host_paths: &HashMap<String, String>,
+    config_maps: &HashMap<String, ConfigMap>,
+    secrets: &HashMap<String, Secret>,
 ) -> v1::ContainerConfig {
     let mut labels = pod_labels(pod);
     labels.insert(labels::CONTAINER_NAME.to_string(), container.name.clone());
@@ -366,7 +431,7 @@ pub fn container_config(
         command: container.command.clone().unwrap_or_default(),
         args: container.args.clone().unwrap_or_default(),
         working_dir: container.working_dir.clone().unwrap_or_default(),
-        envs: env_vars(pod, container),
+        envs: env_vars(pod, container, config_maps, secrets),
         mounts: mounts(container, host_paths),
         labels,
         log_path: format!("{}.log", container.name),
@@ -499,6 +564,8 @@ mod tests {
             &c,
             "docker.io/library/busybox@sha256:abc",
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(cfg.command, vec!["/bin/sh"]);
         assert_eq!(cfg.args, vec!["-c", "sleep 1"]);
@@ -543,7 +610,14 @@ mod tests {
             ..Default::default()
         });
         let host_paths = HashMap::from([("data".to_string(), "/host/data".to_string())]);
-        let cfg = container_config(&pod, &c, "img", &host_paths);
+        let cfg = container_config(
+            &pod,
+            &c,
+            "img",
+            &host_paths,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         // Only the resolvable mount is emitted; the unmapped one is skipped.
         assert_eq!(cfg.mounts.len(), 1);
         assert_eq!(cfg.mounts[0].container_path, "/data");
@@ -633,14 +707,200 @@ mod tests {
             containers: vec![c.clone()],
             ..Default::default()
         });
-        let sc = container_config(&pod, &c, "img", &HashMap::new())
-            .linux
-            .unwrap()
-            .security_context
-            .unwrap();
+        let sc = container_config(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .linux
+        .unwrap()
+        .security_context
+        .unwrap();
         assert!(sc.privileged);
         assert!(sc.readonly_rootfs);
         assert_eq!(sc.run_as_user.unwrap().value, 1000);
         assert_eq!(sc.run_as_group.unwrap().value, 2000);
+    }
+
+    fn env_from(
+        name: &str,
+        src: rusternetes_common::resources::pod::EnvVarSource,
+    ) -> rusternetes_common::resources::pod::EnvVar {
+        rusternetes_common::resources::pod::EnvVar {
+            name: name.to_string(),
+            value: None,
+            value_from: Some(src),
+        }
+    }
+
+    fn empty_source() -> rusternetes_common::resources::pod::EnvVarSource {
+        rusternetes_common::resources::pod::EnvVarSource {
+            config_map_key_ref: None,
+            secret_key_ref: None,
+            field_ref: None,
+            resource_field_ref: None,
+            file_key_ref: None,
+        }
+    }
+
+    #[test]
+    fn field_ref_resolves_labels_annotations_spec_and_phase() {
+        use rusternetes_common::types::Phase;
+        let mut pod = pod_with(PodSpec {
+            restart_policy: Some("OnFailure".to_string()),
+            scheduler_name: Some("custom-sched".to_string()),
+            ..Default::default()
+        });
+        pod.metadata.labels = Some(HashMap::from([("app".to_string(), "web".to_string())]));
+        pod.metadata.annotations = Some(HashMap::from([("team".to_string(), "infra".to_string())]));
+        pod.status = Some(rusternetes_common::resources::pod::PodStatus {
+            phase: Some(Phase::Running),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            pod_field_value(&pod, "metadata.labels['app']").as_deref(),
+            Some("web")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "metadata.annotations['team']").as_deref(),
+            Some("infra")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "spec.restartPolicy").as_deref(),
+            Some("OnFailure")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "spec.schedulerName").as_deref(),
+            Some("custom-sched")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "status.phase").as_deref(),
+            Some("Running")
+        );
+        // Missing subscript key resolves to None (var omitted).
+        assert_eq!(pod_field_value(&pod, "metadata.labels['nope']"), None);
+    }
+
+    #[test]
+    fn resource_field_ref_resolves_ephemeral_storage_and_hugepages() {
+        use rusternetes_common::types::ResourceRequirements;
+        let c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            resources: Some(ResourceRequirements {
+                limits: Some(HashMap::from([
+                    ("ephemeral-storage".to_string(), "1Gi".to_string()),
+                    ("hugepages-2Mi".to_string(), "4Mi".to_string()),
+                ])),
+                requests: None,
+                claims: None,
+            }),
+            ..Default::default()
+        };
+        // Both normalize to bytes, like memory (not raw passthrough).
+        assert_eq!(
+            container_resource_value(&c, "limits.ephemeral-storage").as_deref(),
+            Some("1073741824")
+        );
+        assert_eq!(
+            container_resource_value(&c, "limits.hugepages-2Mi").as_deref(),
+            Some("4194304")
+        );
+    }
+
+    #[test]
+    fn config_map_and_secret_key_ref_env_resolved() {
+        use rusternetes_common::resources::pod::{ConfigMapKeySelector, SecretKeySelector};
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.env = Some(vec![
+            env_from(
+                "FROM_CM",
+                rusternetes_common::resources::pod::EnvVarSource {
+                    config_map_key_ref: Some(ConfigMapKeySelector {
+                        name: "cfg".to_string(),
+                        key: "color".to_string(),
+                        optional: None,
+                    }),
+                    ..empty_source()
+                },
+            ),
+            env_from(
+                "FROM_SECRET",
+                rusternetes_common::resources::pod::EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: "creds".to_string(),
+                        key: "password".to_string(),
+                        optional: None,
+                    }),
+                    ..empty_source()
+                },
+            ),
+        ]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+
+        let mut cm = ConfigMap::new("cfg", "prod");
+        cm.data = Some(HashMap::from([("color".to_string(), "blue".to_string())]));
+        let mut secret = Secret::new("creds", "prod");
+        secret.data = Some(HashMap::from([(
+            "password".to_string(),
+            b"s3cr3t".to_vec(),
+        )]));
+        let config_maps = HashMap::from([("cfg".to_string(), cm)]);
+        let secrets = HashMap::from([("creds".to_string(), secret)]);
+
+        let cfg = container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &secrets);
+        let get = |k: &str| {
+            cfg.envs
+                .iter()
+                .find(|e| e.key == k)
+                .map(|e| e.value.as_str())
+        };
+        assert_eq!(get("FROM_CM"), Some("blue"));
+        assert_eq!(get("FROM_SECRET"), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn missing_key_ref_omits_var() {
+        use rusternetes_common::resources::pod::ConfigMapKeySelector;
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.env = Some(vec![env_from(
+            "MISSING",
+            rusternetes_common::resources::pod::EnvVarSource {
+                config_map_key_ref: Some(ConfigMapKeySelector {
+                    name: "absent".to_string(),
+                    key: "k".to_string(),
+                    optional: Some(true),
+                }),
+                ..empty_source()
+            },
+        )]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        let cfg = container_config(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(cfg.envs.iter().all(|e| e.key != "MISSING"));
     }
 }

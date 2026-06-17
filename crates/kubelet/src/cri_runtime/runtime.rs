@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusternetes_common::resources::pod::{Container, ContainerState, ContainerStatus, Pod, Probe};
+use rusternetes_common::resources::{ConfigMap, Secret};
 use rusternetes_cri::{v1, CriClient, CriError};
+use rusternetes_storage::Storage;
 use tracing::{debug, warn};
 
 use super::{probe, status, translate};
@@ -285,13 +287,68 @@ impl CriContainerRuntime {
             Some((pod, &container.name)),
         )
         .await?;
-        let mut cfg = translate::container_config(pod, container, &container.image, host_paths);
+        let (config_maps, secrets) = self.resolve_env_sources(pod, container).await;
+        let mut cfg = translate::container_config(
+            pod,
+            container,
+            &container.image,
+            host_paths,
+            &config_maps,
+            &secrets,
+        );
         self.inject_service_env(&mut cfg);
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
         cri.start_container(&container_id).await?;
         Ok(container_id)
+    }
+
+    /// Fetch the ConfigMap/Secret objects a container's `configMapKeyRef` /
+    /// `secretKeyRef` env vars reference, keyed by name, so [`translate`] can
+    /// resolve them without storage access. Mirrors the upstream kubelet's
+    /// configMap/secret managers feeding `makeEnvironmentVariables`. Missing or
+    /// un-fetchable sources are simply absent from the maps (translate then
+    /// omits the var); storage-less smoke runs return empty maps.
+    async fn resolve_env_sources(
+        &self,
+        pod: &Pod,
+        container: &Container,
+    ) -> (
+        std::collections::HashMap<String, ConfigMap>,
+        std::collections::HashMap<String, Secret>,
+    ) {
+        let mut config_maps = std::collections::HashMap::new();
+        let mut secrets = std::collections::HashMap::new();
+        let Some(storage) = self.volumes.as_ref().and_then(|v| v.storage.as_ref()) else {
+            return (config_maps, secrets);
+        };
+        let Some(env) = container.env.as_ref() else {
+            return (config_maps, secrets);
+        };
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        for e in env {
+            let Some(src) = e.value_from.as_ref() else {
+                continue;
+            };
+            if let Some(cmr) = src.config_map_key_ref.as_ref() {
+                if !config_maps.contains_key(&cmr.name) {
+                    let key = rusternetes_storage::build_key("configmaps", Some(ns), &cmr.name);
+                    if let Ok(cm) = storage.get::<ConfigMap>(&key).await {
+                        config_maps.insert(cmr.name.clone(), cm);
+                    }
+                }
+            }
+            if let Some(skr) = src.secret_key_ref.as_ref() {
+                if !secrets.contains_key(&skr.name) {
+                    let key = rusternetes_storage::build_key("secrets", Some(ns), &skr.name);
+                    if let Ok(s) = storage.get::<Secret>(&key).await {
+                        secrets.insert(skr.name.clone(), s);
+                    }
+                }
+            }
+        }
+        (config_maps, secrets)
     }
 
     /// Inject the standard `kubernetes` Service env vars (KUBERNETES_SERVICE_HOST
