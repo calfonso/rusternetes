@@ -189,7 +189,11 @@ async fn main() -> Result<()> {
             anyhow::bail!("TLS enabled but no certificate provided. Use --tls-cert-file and --tls-key-file, or --tls-self-signed");
         };
 
-        tls_config.cert_pem.clone()
+        // ca.crt distributed to SA tokens / kube-root-ca must be the issuing CA,
+        // not the (now leaf) serving cert — see resolve_ca_cert_pem.
+        tls_config.cert_pem.as_deref().map(|serving| {
+            rusternetes_api_server::resolve_ca_cert_pem(args.tls_cert_file.as_deref(), serving)
+        })
     } else {
         None
     };
