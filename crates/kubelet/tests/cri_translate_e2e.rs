@@ -268,7 +268,7 @@ async fn cri_container_runtime_lifecycle() {
 
     // Existence / termination / age introspection.
     assert!(
-        runtime.container_exists("sleeper").await,
+        runtime.container_exists(&pod.metadata.uid, "sleeper").await,
         "container_exists(sleeper) should be true"
     );
     assert!(
