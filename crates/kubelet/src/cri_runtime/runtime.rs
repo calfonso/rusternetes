@@ -323,7 +323,18 @@ impl CriContainerRuntime {
         let handler = self.runtime_handler.clone();
 
         let mut cri = self.cri.clone();
-        let sandbox_id = cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await?;
+        // Idempotent: reuse a ready sandbox if one already exists for this pod
+        // (start_pod is retried by the reconcile loop, and the runtime reserves
+        // the sandbox name, so re-running RunPodSandbox would fail with "name
+        // reserved"). A non-ready leftover sandbox is removed and recreated.
+        let sandbox_id = match self.ready_sandbox_for(&pod.metadata.name).await {
+            Some(existing) => existing,
+            None => {
+                // Drop any stale (not-ready) sandbox holding the name first.
+                let _ = self.stop_and_remove_pod(&pod.metadata.name).await;
+                cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await?
+            }
+        };
 
         // Init containers run sequentially to completion before app containers.
         if let Some(init_containers) = spec.init_containers.as_ref() {
@@ -375,6 +386,28 @@ impl CriContainerRuntime {
         let mut cri = self.cri.clone();
         let sandboxes = cri.list_pod_sandbox(Some(filter)).await?;
         Ok(sandboxes.into_iter().next().map(|s| s.id))
+    }
+
+    /// The id of a READY sandbox for the pod, if one exists — used by `start_pod`
+    /// to reuse a running sandbox across reconcile retries instead of trying to
+    /// create a new one (which would collide on the reserved sandbox name).
+    async fn ready_sandbox_for(&self, pod_name: &str) -> Option<String> {
+        let filter = v1::PodSandboxFilter {
+            state: Some(v1::PodSandboxStateValue {
+                state: v1::PodSandboxState::SandboxReady as i32,
+            }),
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::POD_NAME.to_string(),
+                pod_name.to_string(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        cri.list_pod_sandbox(Some(filter))
+            .await
+            .ok()
+            .and_then(|s| s.into_iter().next())
+            .map(|s| s.id)
     }
 
     /// True when at least one of the pod's containers is in the RUNNING state.
