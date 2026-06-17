@@ -45,6 +45,11 @@ spec:
     # --skip-auth, so the kubeconfig only needs the CA to validate the server's
     # TLS cert. The static pod joins rusternetes-network, where `api-server`
     # resolves to the api-server container (cert SANs include `api-server`).
+    # Node IPAM (--allocate-node-cidrs etc.) is opt-in: bootstrap-cluster.sh
+    # replaces the placeholder line at the end of args (the NODE_IPAM_ARGS token)
+    # with the allocator flags when ALLOCATE_NODE_CIDRS is set in its environment
+    # (the flannel stack does this — see compose.flannel.yml), and otherwise
+    # strips it. Off by default, so conformance/sqlite/etcd stacks are unchanged.
     args:
     - "--api-server-url"
     - "https://api-server:6443"
@@ -52,6 +57,7 @@ spec:
     - "@CERTS_PATH@/controller-manager.conf"
     - "--sync-interval"
     - "5"
+@NODE_IPAM_ARGS@
     volumeMounts:
     - name: certs
       mountPath: "@CERTS_PATH@"

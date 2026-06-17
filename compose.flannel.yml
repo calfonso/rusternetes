@@ -9,10 +9,13 @@
 # Usage:
 #   docker compose -f compose.flannel.yml build
 #   docker compose -f compose.flannel.yml up -d
-#   bash scripts/bootstrap-cluster.sh        # registers nodes + static pods
-#   # assign PodCIDRs (no node-ipam yet):
-#   kubectl patch node node-1 -p '{"spec":{"podCIDR":"10.244.0.0/24","podCIDRs":["10.244.0.0/24"]}}'
-#   kubectl patch node node-2 -p '{"spec":{"podCIDR":"10.244.1.0/24","podCIDRs":["10.244.1.0/24"]}}'
+#   # Enable node-IPAM so the controller-manager static pod allocates a
+#   # spec.podCIDR per node (flannel --kube-subnet-mgr derives its subnet from
+#   # it). ALLOCATE_NODE_CIDRS toggles the @NODE_IPAM_ARGS@ placeholder in
+#   # manifests/control-plane/kube-controller-manager.yaml; CLUSTER_CIDR matches
+#   # deploy/flannel/flannel-rs.yaml net-conf "Network". (#1187/#1194)
+#   ALLOCATE_NODE_CIDRS=1 CLUSTER_CIDR=10.244.0.0/16 \
+#     bash scripts/bootstrap-cluster.sh      # registers nodes + static pods
 #   kubectl apply -f deploy/flannel/flannel-rs.yaml
 
 x-sccache-args: &sccache-args
