@@ -149,6 +149,10 @@ services:
       - rusternetes-net
     volumes:
       - containerd-run:/run/containerd
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data:/var/lib/containerd
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
 
@@ -296,3 +300,7 @@ volumes:
   # CRI socket shared from the containerd service to the kubelets.
   containerd-run:
     name: rusternetes-containerd-run
+  # containerd's snapshotter root on a real (host-fs-backed) volume so the
+  # overlayfs snapshotter works inside the Docker-hosted containerd.
+  containerd-data:
+    name: rusternetes-containerd-data
