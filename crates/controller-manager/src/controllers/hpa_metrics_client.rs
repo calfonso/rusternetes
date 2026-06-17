@@ -180,12 +180,32 @@ impl MetricsClient for FakeMetricsClient {
 }
 
 /// Config for the real metrics client.
+///
+/// Two auth shapes are supported, matching the two ways the controller-manager
+/// runs:
+///   * **Legacy compose / direct-storage** — mTLS with the api-server client
+///     cert (`client_cert_path` + `client_key_path`) and a CA file path. This
+///     is what [`Default`] yields.
+///   * **In-cluster static pod (API mode)** — no client cert on disk; instead
+///     the kubeconfig-derived CA (`ca_pem`) and bearer `token` validate the
+///     server and authenticate the request, exactly like the data-plane
+///     `ApiClient`. See `run_api_mode` in `main.rs`.
 #[derive(Clone, Debug)]
 pub struct HttpMetricsConfig {
     pub api_server_url: String,
-    pub ca_cert_path: String,
-    pub client_cert_path: String,
-    pub client_key_path: String,
+    /// CA PEM held in memory (in-cluster path, from the kubeconfig). Takes
+    /// precedence over `ca_cert_path`. Ignored when `insecure_skip_tls_verify`.
+    pub ca_pem: Option<Vec<u8>>,
+    /// CA file path (legacy compose path). Ignored when `ca_pem` is set or when
+    /// `insecure_skip_tls_verify`.
+    pub ca_cert_path: Option<String>,
+    /// Client cert/key for mTLS auth (legacy compose path). Both `None` in the
+    /// in-cluster static pod, which authenticates with `token` instead.
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+    /// Bearer token for api-server auth (in-cluster path). `None` when the
+    /// api-server runs `--skip-auth` or when mTLS is used.
+    pub token: Option<String>,
     /// Skip server-certificate chain verification. The cluster ships a
     /// self-signed api-server cert (the CA file is a copy of the leaf), which
     /// rustls rejects as `CaUsedAsEndEntity`. Matches the repo convention for
@@ -194,12 +214,19 @@ pub struct HttpMetricsConfig {
 }
 
 impl Default for HttpMetricsConfig {
+    /// The legacy compose / direct-storage default: mTLS against
+    /// `api-server:6443` with the api-server cert under `/etc/kubernetes/pki`,
+    /// server verification skipped (self-signed leaf used as CA). The
+    /// in-cluster path overrides this wholesale via
+    /// `ControllerManagerConfig::metrics_config`.
     fn default() -> Self {
         Self {
             api_server_url: "https://api-server:6443".to_string(),
-            ca_cert_path: "/etc/kubernetes/pki/ca.crt".to_string(),
-            client_cert_path: "/etc/kubernetes/pki/api-server.crt".to_string(),
-            client_key_path: "/etc/kubernetes/pki/api-server.key".to_string(),
+            ca_pem: None,
+            ca_cert_path: Some("/etc/kubernetes/pki/ca.crt".to_string()),
+            client_cert_path: Some("/etc/kubernetes/pki/api-server.crt".to_string()),
+            client_key_path: Some("/etc/kubernetes/pki/api-server.key".to_string()),
+            token: None,
             insecure_skip_tls_verify: true,
         }
     }
@@ -221,27 +248,50 @@ impl HttpMetricsClient {
             rustls::crypto::aws_lc_rs::default_provider(),
         );
 
-        let mut identity_pem = std::fs::read(&cfg.client_cert_path)
-            .map_err(|e| anyhow::anyhow!("read client cert {}: {e}", cfg.client_cert_path))?;
-        let mut key = std::fs::read(&cfg.client_key_path)
-            .map_err(|e| anyhow::anyhow!("read client key {}: {e}", cfg.client_key_path))?;
-        identity_pem.push(b'\n');
-        identity_pem.append(&mut key);
-
         // Force the rustls backend: another workspace crate (kubectl) pulls
         // reqwest with default features, so native-tls is unified in and would
         // otherwise be the default backend — incompatible with the rustls
         // identity built by `Identity::from_pem`.
-        let mut builder = Client::builder()
-            .use_rustls_tls()
-            .identity(reqwest::Identity::from_pem(&identity_pem)?);
+        let mut builder = Client::builder().use_rustls_tls();
+
+        // Client cert (mTLS) — legacy compose path. Absent in the in-cluster
+        // static pod, which authenticates with a bearer token instead.
+        if let (Some(cert_path), Some(key_path)) =
+            (cfg.client_cert_path.as_ref(), cfg.client_key_path.as_ref())
+        {
+            let mut identity_pem = std::fs::read(cert_path)
+                .map_err(|e| anyhow::anyhow!("read client cert {cert_path}: {e}"))?;
+            let mut key = std::fs::read(key_path)
+                .map_err(|e| anyhow::anyhow!("read client key {key_path}: {e}"))?;
+            identity_pem.push(b'\n');
+            identity_pem.append(&mut key);
+            builder = builder.identity(reqwest::Identity::from_pem(&identity_pem)?);
+        }
+
+        // Server verification: insecure short-circuits; otherwise prefer the
+        // in-memory CA (in-cluster, from the kubeconfig) over a CA file path.
         if cfg.insecure_skip_tls_verify {
             builder = builder.danger_accept_invalid_certs(true);
-        } else {
-            let ca = std::fs::read(&cfg.ca_cert_path)
-                .map_err(|e| anyhow::anyhow!("read CA {}: {e}", cfg.ca_cert_path))?;
+        } else if let Some(ca) = cfg.ca_pem.as_ref() {
+            builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ca)?);
+        } else if let Some(ca_path) = cfg.ca_cert_path.as_ref() {
+            let ca =
+                std::fs::read(ca_path).map_err(|e| anyhow::anyhow!("read CA {ca_path}: {e}"))?;
             builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&ca)?);
         }
+
+        // Bearer token (in-cluster path) — applied to every metrics request via
+        // a default header so the per-call code stays unaware of auth.
+        if let Some(token) = cfg.token.as_ref() {
+            use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+            let mut headers = HeaderMap::new();
+            let mut val = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| anyhow::anyhow!("invalid bearer token: {e}"))?;
+            val.set_sensitive(true);
+            headers.insert(AUTHORIZATION, val);
+            builder = builder.default_headers(headers);
+        }
+
         let http = builder.build()?;
         Ok(Self {
             base: cfg.api_server_url.trim_end_matches('/').to_string(),
@@ -654,5 +704,43 @@ mod tests {
             .get_resource_metric("cpu", "default", &sel)
             .await
             .is_err());
+    }
+
+    /// In-cluster shape (#1144): no client cert on disk, just a bearer token
+    /// and `insecure_skip_tls_verify`. This is exactly what `run_api_mode`
+    /// builds; it must construct a client (and trim the base URL) rather than
+    /// failing on a missing `/etc/kubernetes/pki` cert read.
+    #[test]
+    fn http_client_builds_without_client_cert_insecure() {
+        let cfg = HttpMetricsConfig {
+            api_server_url: "https://api-server:6443/".to_string(),
+            ca_pem: None,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            token: Some("test-bearer-token".to_string()),
+            insecure_skip_tls_verify: true,
+        };
+        let client = HttpMetricsClient::new(cfg).expect("in-cluster (token, insecure) builds");
+        // Trailing slash is trimmed off the base.
+        assert_eq!(client.base, "https://api-server:6443");
+    }
+
+    /// Legacy mTLS path: a configured-but-missing client cert must surface a
+    /// clear read error naming the path (not a generic builder failure).
+    #[test]
+    fn http_client_missing_client_cert_errors_clearly() {
+        let cfg = HttpMetricsConfig {
+            client_cert_path: Some("/nonexistent/api-server.crt".to_string()),
+            client_key_path: Some("/nonexistent/api-server.key".to_string()),
+            ..HttpMetricsConfig::default()
+        };
+        let err = HttpMetricsClient::new(cfg)
+            .map(|_| ())
+            .expect_err("missing cert must error");
+        assert!(
+            err.to_string().contains("/nonexistent/api-server.crt"),
+            "error should name the missing cert path, got: {err}"
+        );
     }
 }

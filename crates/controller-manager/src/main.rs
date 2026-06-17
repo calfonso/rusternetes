@@ -130,13 +130,17 @@ async fn run_api_mode(args: Args) -> Result<()> {
     use rusternetes_client::http::ApiClient;
     use rusternetes_client::kubeconfig::KubeConfig;
 
-    let (ca_pem, kube_insecure) = if let Some(path) = args.kubeconfig.as_deref() {
+    let (ca_pem, kube_insecure, token) = if let Some(path) = args.kubeconfig.as_deref() {
         let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(path))?;
         let ca = cfg.get_ca_cert_pem().ok().flatten();
         let insecure = cfg.should_skip_tls_verify().unwrap_or(false);
-        (ca, insecure)
+        // Bearer token for the HPA metrics client (the data plane runs against
+        // an api-server with --skip-auth today, so the token is usually absent;
+        // pass it through so metrics keep working once authn (#1129) lands).
+        let token = cfg.get_token().ok().flatten();
+        (ca, insecure, token)
     } else {
-        (None, false)
+        (None, false, None)
     };
     let insecure = args.insecure_skip_tls_verify || kube_insecure;
     info!(
@@ -156,9 +160,24 @@ async fn run_api_mode(args: Args) -> Result<()> {
     )?);
     let config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
-        // HPA metric fetches over the api-server in API mode are a follow-up
-        // (need a client-cert/token path under the static pod).
-        metrics_config: None,
+        // Route HPA metric fetches through the same kubeconfig-derived
+        // credentials as the data plane (CA + bearer token, honouring the
+        // insecure flag) instead of the default mTLS client cert under
+        // /etc/kubernetes/pki, which the static pod doesn't have. (#1144)
+        // NB: the lib-qualified type — `ControllerManagerConfig` lives in the
+        // library crate, whose `HttpMetricsConfig` is distinct from the bin's
+        // own `mod controllers` copy imported at the top of this file.
+        metrics_config: Some(
+            rusternetes_controller_manager::controllers::hpa_metrics_client::HttpMetricsConfig {
+                api_server_url: args.api_server_url.clone(),
+                ca_pem: ca_pem.clone(),
+                ca_cert_path: None,
+                client_cert_path: None,
+                client_key_path: None,
+                token,
+                insecure_skip_tls_verify: insecure,
+            },
+        ),
         // The namespace controller can't read the CA from the api-server's
         // cert paths in its own container — hand it the kubeconfig-resolved CA
         // so it can (re)create kube-root-ca.crt in every namespace.
@@ -546,9 +565,11 @@ async fn main() -> Result<()> {
     // Start HPA controller
     let hpa_metrics_cfg = HttpMetricsConfig {
         api_server_url: args.api_server_url.clone(),
-        ca_cert_path: format!("{}/ca.crt", args.pki_dir),
-        client_cert_path: format!("{}/api-server.crt", args.pki_dir),
-        client_key_path: format!("{}/api-server.key", args.pki_dir),
+        ca_pem: None,
+        ca_cert_path: Some(format!("{}/ca.crt", args.pki_dir)),
+        client_cert_path: Some(format!("{}/api-server.crt", args.pki_dir)),
+        client_key_path: Some(format!("{}/api-server.key", args.pki_dir)),
+        token: None,
         insecure_skip_tls_verify: args.metrics_insecure_skip_tls_verify,
     };
     let hpa_controller = Arc::new(HorizontalPodAutoscalerController::with_config(
