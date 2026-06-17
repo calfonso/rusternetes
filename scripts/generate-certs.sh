@@ -26,30 +26,32 @@ fi
 # static pod (Task 3 of the scheduler-in-cluster plan). Runs whether or not the
 # api-server TLS cert already exists, so it is idempotently produced on reruns.
 #
-# AUTHN INVESTIGATION (crates/api-server + crates/middleware): the api-server's
-# auth middleware (crates/middleware/src/lib.rs `auth_middleware`) authenticates
-# ONLY via the `Authorization: Bearer <token>` header (SA JWT or bootstrap
-# token); there is NO client-certificate → user/group mapping. `--client-ca-file`
-# wires an mTLS *verifier* at the rustls layer (crates/common/src/tls.rs
-# `into_mtls_server_config`), but the request handler uses
-# `app.into_make_service()` (not `_with_connect_info`), so the peer cert never
-# reaches a handler and CN/O are never turned into a user. Separately, compose
-# runs the api-server with `--skip-auth`, which injects an admin AuthContext
-# (`system:masters`) for EVERY request and bypasses the authorizer entirely.
+# AUTHN (crates/api-server + crates/middleware): the api-server now supports BOTH
+# `Authorization: Bearer <token>` (SA JWT / bootstrap token) AND x509 client-cert
+# authentication (#1129). With `--client-ca-file` set, the api-server serves via
+# crates/api-server/src/peer_cert_acceptor.rs, which surfaces the rustls-verified
+# peer cert to the auth middleware; `auth_middleware` maps the cert's Subject
+# CommonName → user and each Organization → group (CommonNameUserConversion
+# parity). The client cert is OPTIONAL at the TLS layer (into_mtls_server_config
+# uses allow_unauthenticated), so bearer-token clients still connect.
+#
+# Separately, compose still runs the api-server with `--skip-auth`, which injects
+# an admin AuthContext (`system:masters`) for EVERY request and bypasses the
+# authorizer entirely. So under the current compose stack the scheduler cert is
+# still not strictly required — but it IS now honored the moment --skip-auth is
+# dropped and --client-ca-file is set.
 #
 # Consequences for the scheduler static pod:
-#   * It does NOT need client credentials — with --skip-auth every request is
-#     already admin, so authz passes. The kubeconfig only needs the CA so the
-#     scheduler can VALIDATE the api-server's self-signed serving cert.
-#   * No RBAC objects (ClusterRole/ClusterRoleBinding for system:kube-scheduler)
-#     are required, because the authorizer is not consulted under --skip-auth.
-#     bootstrap-cluster.sh therefore creates none (revisit if --skip-auth is
-#     ever dropped: then add a Bearer-token kubeconfig + RBAC, since cert authn
-#     is unimplemented — tracked as a follow-up).
+#   * Under --skip-auth: client credentials are not consulted (every request is
+#     admin). The kubeconfig still only needs the CA to VALIDATE the api-server's
+#     serving cert.
+#   * With --skip-auth dropped + --client-ca-file set: the CN=system:kube-scheduler
+#     cert below authenticates the scheduler as user `system:kube-scheduler`, and
+#     the ClusterRole/ClusterRoleBinding of the same name (bootstrap-cluster.yaml)
+#     grant it the verbs it issues.
 #
-# We still emit a CN=system:kube-scheduler client cert (kubeadm parity) and
-# embed it in scheduler.conf so the kubeconfig is forward-compatible the day
-# client-cert authn lands; it is simply unused by today's authenticator.
+# We emit a CN=system:kube-scheduler / O=system:kube-scheduler client cert
+# (kubeadm parity: CN → user, O → group) and embed it in scheduler.conf.
 generate_scheduler_kubeconfig() {
     local sched_key="${CERT_DIR}/kube-scheduler.key"
     local sched_crt="${CERT_DIR}/kube-scheduler.crt"

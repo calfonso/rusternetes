@@ -4673,6 +4673,7 @@ dependencies = [
  "ciborium",
  "http-body 1.0.1",
  "prost",
+ "rcgen",
  "rusternetes-common",
  "rusternetes-protobuf",
  "rusternetes-storage",
@@ -4681,6 +4682,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

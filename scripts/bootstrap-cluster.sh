@@ -140,10 +140,14 @@ echo ""
 # kubelet's --pod-manifest-path actually mounts. The loop below globs every
 # manifest, so new control-plane pods are picked up automatically.
 #
-# No RBAC is created for these static pods: the api-server runs with --skip-auth
-# (admin for every request), so the authorizer is bypassed and
-# system:kube-scheduler / system:kube-controller-manager ClusterRoleBindings
-# would be inert. See scripts/generate-certs.sh for the full authn investigation.
+# RBAC for system:kube-scheduler (ClusterRole + ClusterRoleBinding) is seeded by
+# bootstrap-cluster.yaml (applied below). It is inert while the api-server runs
+# with --skip-auth (the authorizer is bypassed), but is honored the moment
+# --skip-auth is dropped and --client-ca-file is set — the api-server then
+# authenticates the scheduler's CN=system:kube-scheduler client cert as that user
+# (x509 authn, #1129). The controller-manager equivalent
+# (system:kube-controller-manager) is still TODO. See scripts/generate-certs.sh
+# for the full authn notes.
 CERTS_PATH="$PROJECT_ROOT/.rusternetes/certs"
 export CERTS_PATH
 if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then

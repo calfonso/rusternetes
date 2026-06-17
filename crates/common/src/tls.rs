@@ -134,15 +134,29 @@ impl TlsConfig {
         let mut client_auth_roots = rustls::RootCertStore::empty();
         client_auth_roots.add_parsable_certificates(client_ca_certs);
 
+        // `allow_unauthenticated` makes the client certificate OPTIONAL, matching
+        // upstream apiserver semantics: `--client-ca-file` *enables* x509
+        // authentication but does not *require* a client cert (it requests one,
+        // RequestClientCert). Clients that authenticate by bearer token (kubectl,
+        // service accounts) connect without presenting a cert; clients that do
+        // present one get it verified against the CA, and the verified chain is
+        // surfaced to the auth middleware for CN→user / O→groups mapping (#1129).
+        // A mandatory verifier (`.build()`) would instead reject every
+        // bearer-token client at the TLS handshake.
         let client_cert_verifier =
             rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
+                .allow_unauthenticated()
                 .build()
                 .context("Failed to build client cert verifier")?;
 
-        let config = rustls::ServerConfig::builder()
+        let mut config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(client_cert_verifier)
             .with_single_cert(self.cert, self.key)
             .context("Failed to create mTLS server config")?;
+
+        // Match into_server_config: advertise h2 + http/1.1 so client-go uses
+        // HTTP/2 for watch multiplexing (see the note there).
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         Ok(Arc::new(config))
     }

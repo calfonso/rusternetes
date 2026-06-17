@@ -35,6 +35,48 @@ pub struct AuthContext {
     pub user: UserInfo,
 }
 
+/// The DER-encoded client certificate chain the TLS layer verified against the
+/// configured `--client-ca-file`, injected as a request extension by the
+/// api-server's per-connection acceptor when mTLS is enabled (#1129). The leaf
+/// is `chain[0]`. Absence of this extension means the client presented no
+/// certificate (e.g. a bearer-token client, or plaintext/serving-only TLS).
+///
+/// Holding raw DER (not a rustls type) keeps the middleware crate independent of
+/// rustls; the api-server converts each verified `CertificateDer` into bytes.
+#[derive(Clone, Debug)]
+pub struct PeerCertificates(pub Arc<Vec<Vec<u8>>>);
+
+/// Map a verified client-certificate chain to a user, mirroring upstream's
+/// `CommonNameUserConversion`
+/// (staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go):
+/// the leaf cert's Subject CommonName is the username and each Subject
+/// Organization is a group. Returns `None` when the chain is empty, unparsable,
+/// or carries an empty CommonName — upstream treats an empty CN as "this
+/// authenticator did not authenticate", so the caller falls back to anonymous.
+///
+/// The chain MUST already be TLS-verified against the client CA; this does no
+/// verification of its own.
+pub fn user_from_client_cert_der(der_chain: &[Vec<u8>]) -> Option<UserInfo> {
+    let leaf = der_chain.first()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf).ok()?;
+    let common_name = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .map(str::to_string)?;
+    if common_name.is_empty() {
+        return None;
+    }
+    let organizations: Vec<String> = cert
+        .subject()
+        .iter_organization()
+        .filter_map(|attr| attr.as_str().ok())
+        .map(str::to_string)
+        .collect();
+    Some(UserInfo::from_cert_identity(&common_name, &organizations))
+}
+
 /// One thing the caller is asking to impersonate, paired with the authorization
 /// attributes that must be allowed against the *original* caller before the
 /// switch is applied. Mirrors `buildImpersonationRequests` upstream.
@@ -484,6 +526,17 @@ pub async fn auth_middleware(
             warn!("Invalid token");
             return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
         }
+    } else if let Some(user) = request
+        .extensions()
+        .get::<PeerCertificates>()
+        .and_then(|certs| user_from_client_cert_der(&certs.0))
+    {
+        // No bearer token, but the client presented a certificate the TLS layer
+        // verified against --client-ca-file. Map CN→user / O→groups (x509 authn,
+        // #1129). This is how the in-cluster system:kube-scheduler cert is
+        // honored once --skip-auth is dropped.
+        debug!("Authenticated user (client cert): {}", user.username);
+        user
     } else {
         // Anonymous user
         debug!("Anonymous request");
@@ -2420,6 +2473,55 @@ pub async fn capture_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a DER-encoded self-signed cert with the given CN and Organizations,
+    /// for exercising the x509-authn subject mapping.
+    fn cert_der_with_subject(common_name: &str, organizations: &[&str]) -> Vec<u8> {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, common_name);
+        for o in organizations {
+            dn.push(DnType::OrganizationName, *o);
+        }
+        params.distinguished_name = dn;
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        cert.der().as_ref().to_vec()
+    }
+
+    #[test]
+    fn client_cert_maps_cn_to_user_and_orgs_to_groups() {
+        let der = cert_der_with_subject("system:kube-scheduler", &["system:kube-scheduler"]);
+        let user = user_from_client_cert_der(&[der]).expect("should authenticate");
+        assert_eq!(user.username, "system:kube-scheduler");
+        assert!(user.uid.is_empty());
+        assert!(user.groups.contains(&"system:kube-scheduler".to_string()));
+        assert!(user.groups.contains(&"system:authenticated".to_string()));
+    }
+
+    #[test]
+    fn client_cert_org_differs_from_cn_becomes_group() {
+        // rcgen's DistinguishedName is keyed by DnType, so a fixture can carry
+        // only one Organization; multi-O fan-out is covered purely in
+        // rusternetes_common (UserInfo::from_cert_identity). Here we just prove
+        // the O is read independently of the CN.
+        let der = cert_der_with_subject("dave", &["system:masters"]);
+        let user = user_from_client_cert_der(&[der]).expect("should authenticate");
+        assert_eq!(user.username, "dave");
+        assert!(user.groups.contains(&"system:masters".to_string()));
+        assert!(user.groups.contains(&"system:authenticated".to_string()));
+    }
+
+    #[test]
+    fn client_cert_empty_chain_is_not_authenticated() {
+        assert!(user_from_client_cert_der(&[]).is_none());
+    }
+
+    #[test]
+    fn client_cert_garbage_der_is_not_authenticated() {
+        assert!(user_from_client_cert_der(&[vec![0xde, 0xad, 0xbe, 0xef]]).is_none());
+    }
 
     #[test]
     fn extract_json_skips_embedded_non_resource_json() {

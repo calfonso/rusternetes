@@ -14,6 +14,7 @@ mod ip_allocator;
 use rusternetes_middleware as middleware;
 mod openapi;
 mod patch;
+mod peer_cert_acceptor;
 mod prometheus_client;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
@@ -338,10 +339,25 @@ async fn main() -> Result<()> {
                 TlsConfig::generate_self_signed("rusternetes-api", sans)?
             };
 
-        let rustls_config = RustlsConfig::from_config(tls_config.into_server_config()?);
+        // `--client-ca-file` enables x509 client-cert authentication: build an
+        // mTLS server config (client cert OPTIONAL — bearer-token clients still
+        // connect) and serve via PeerCertAcceptor so the verified cert reaches
+        // handlers for CN→user / O→groups mapping (#1129). Without it, plain
+        // serving-only TLS as before.
+        let client_cert_authn = args.client_ca_file.is_some();
+        let server_config = if let Some(ref client_ca) = args.client_ca_file {
+            info!(
+                "Client certificate authentication enabled (CA: {})",
+                client_ca
+            );
+            tls_config.into_mtls_server_config(client_ca)?
+        } else {
+            tls_config.into_server_config()?
+        };
+        let rustls_config = RustlsConfig::from_config(server_config);
 
         info!("HTTPS server listening on {}", args.bind_address);
-        let mut server = axum_server::bind_rustls(args.bind_address.parse()?, rustls_config);
+        let addr = args.bind_address.parse()?;
 
         // Configure HTTP/2 settings to match K8s API server.
         // K8s sets these in secure_serving.go:175-199:
@@ -353,25 +369,40 @@ async fn main() -> Result<()> {
         // stalls with many concurrent watches — the flow control windows
         // fill up and events can't be delivered, causing client-go's
         // "Watch failed: context canceled" errors.
-        {
-            let builder = server.http_builder();
-            // Set timer first — required for HTTP/2 keepalive to function
-            builder
-                .http2()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .initial_stream_window_size(256 * 1024) // 256KB per stream (K8s: 256KB)
-                .initial_connection_window_size(256 * 1024 * 100) // 25MB total (K8s: 256KB * 100)
-                .max_concurrent_streams(1000) // High limit — watch timeout (2min) handles stream recycling
-                // HTTP/2 PING keepalive: send PING frames to keep connections alive.
-                // Without this, network intermediaries (Podman Machine virtio-net,
-                // Docker Desktop proxy) may close idle TCP connections, killing
-                // watch streams with "context canceled".
-                // K8s Go server uses net.KeepAlive = 3 minutes on the TCP listener.
-                .keep_alive_interval(std::time::Duration::from_secs(30))
-                .keep_alive_timeout(std::time::Duration::from_secs(20));
+        //
+        // `apply_http2_tuning!` keeps the two acceptor branches (mTLS vs
+        // serving-only) in sync — the Server type differs by acceptor, so the
+        // tuning can't be hoisted into a plain fn without naming both types.
+        macro_rules! apply_http2_tuning {
+            ($server:expr) => {{
+                let builder = $server.http_builder();
+                // Set timer first — required for HTTP/2 keepalive to function
+                builder
+                    .http2()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .initial_stream_window_size(256 * 1024) // 256KB per stream (K8s: 256KB)
+                    .initial_connection_window_size(256 * 1024 * 100) // 25MB total (K8s: 256KB * 100)
+                    .max_concurrent_streams(1000) // High limit — watch timeout (2min) handles stream recycling
+                    // HTTP/2 PING keepalive: send PING frames to keep connections alive.
+                    // Without this, network intermediaries (Podman Machine virtio-net,
+                    // Docker Desktop proxy) may close idle TCP connections, killing
+                    // watch streams with "context canceled".
+                    // K8s Go server uses net.KeepAlive = 3 minutes on the TCP listener.
+                    .keep_alive_interval(std::time::Duration::from_secs(30))
+                    .keep_alive_timeout(std::time::Duration::from_secs(20));
+            }};
         }
 
-        server.serve(app.into_make_service()).await?;
+        if client_cert_authn {
+            let mut server = axum_server::bind(addr)
+                .acceptor(peer_cert_acceptor::PeerCertAcceptor::new(rustls_config));
+            apply_http2_tuning!(server);
+            server.serve(app.into_make_service()).await?;
+        } else {
+            let mut server = axum_server::bind_rustls(addr, rustls_config);
+            apply_http2_tuning!(server);
+            server.serve(app.into_make_service()).await?;
+        }
     } else {
         info!("TLS disabled - starting HTTP server (not recommended for production)");
         info!("API Server listening on {}", args.bind_address);

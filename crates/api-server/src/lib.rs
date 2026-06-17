@@ -15,6 +15,7 @@ pub mod ip_allocator;
 pub use rusternetes_middleware as middleware;
 pub mod openapi;
 pub mod patch;
+pub mod peer_cert_acceptor;
 pub mod prometheus_client;
 pub use rusternetes_protobuf as protobuf;
 #[allow(dead_code)]
@@ -56,9 +57,11 @@ pub struct ApiServerConfig {
     /// serves the console UI at `/console/` and falls back to `index.html`
     /// for client-side routing.
     pub console_dir: Option<PathBuf>,
-    /// Path to client CA certificate for mTLS client certificate authentication.
-    /// When set, the API server requires clients to present a certificate signed
-    /// by this CA. The CN field becomes the username and O fields become groups.
+    /// Path to client CA certificate for x509 client-certificate authentication.
+    /// When set, the API server verifies any client cert presented against this
+    /// CA and maps its Subject CN→username and O→groups (#1129). The cert is
+    /// OPTIONAL — bearer-token clients still connect; presenting one is just an
+    /// additional way to authenticate.
     pub client_ca_file: Option<String>,
 }
 
@@ -251,6 +254,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
             TlsConfig::generate_self_signed("rusternetes-api", sans)?
         };
 
+        let client_cert_authn = config.client_ca_file.is_some();
         let server_config = if let Some(ref client_ca) = config.client_ca_file {
             info!(
                 "Client certificate authentication enabled (CA: {})",
@@ -262,14 +266,30 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         };
         let rustls_config = RustlsConfig::from_config(server_config);
         info!("HTTPS server listening on {}", config.bind_address);
-        let mut server = axum_server::bind_rustls(config.bind_address.parse()?, rustls_config);
-        server
-            .http_builder()
-            .http2()
-            .initial_stream_window_size(256 * 1024)
-            .initial_connection_window_size(256 * 1024 * 100)
-            .max_concurrent_streams(250);
-        server.serve(app.into_make_service()).await?;
+        let addr = config.bind_address.parse()?;
+        if client_cert_authn {
+            // mTLS: serve via PeerCertAcceptor so the verified client cert reaches
+            // handlers for x509 authn (CN→user / O→groups, #1129).
+            let mut server = axum_server::bind(addr).acceptor(
+                crate::peer_cert_acceptor::PeerCertAcceptor::new(rustls_config),
+            );
+            server
+                .http_builder()
+                .http2()
+                .initial_stream_window_size(256 * 1024)
+                .initial_connection_window_size(256 * 1024 * 100)
+                .max_concurrent_streams(250);
+            server.serve(app.into_make_service()).await?;
+        } else {
+            let mut server = axum_server::bind_rustls(addr, rustls_config);
+            server
+                .http_builder()
+                .http2()
+                .initial_stream_window_size(256 * 1024)
+                .initial_connection_window_size(256 * 1024 * 100)
+                .max_concurrent_streams(250);
+            server.serve(app.into_make_service()).await?;
+        }
     } else {
         info!(
             "API Server listening on {} (HTTP, no TLS)",
