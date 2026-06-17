@@ -112,7 +112,13 @@ services:
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
+    # --eviction-hard="" disables the eviction manager: this box shares one
+    # ~99%-full host disk across every node container, so the default
+    # imagefs.available<15% hard threshold would (correctly, by its own logic)
+    # evict every running pod — including flannel — into Failed, and the
+    # DaemonSet controller then GCs and recreates them in a tight loop. kind
+    # disables eviction the same way for local clusters.
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests", "--eviction-hard", ""]
 
   # Worker node.
   node-2:
@@ -136,7 +142,8 @@ services:
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    # See node-1: eviction disabled because the shared host disk is ~99% full.
+    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
 
   # kube-proxy per node, in that node's network namespace, so its Service
   # iptables apply where the node's pods live (flannel pod network).
