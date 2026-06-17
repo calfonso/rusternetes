@@ -9,6 +9,14 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CERT_DIR="${PROJECT_ROOT}/.rusternetes/certs"
 CERT_FILE="${CERT_DIR}/api-server.crt"
 KEY_FILE="${CERT_DIR}/api-server.key"
+# Cluster CA — a real CA (CA:TRUE) that signs the api-server's leaf serving cert
+# and every client cert, and is distributed as ca.crt (kubeconfigs + SA tokens).
+# Kept distinct from the serving cert: a CA:TRUE leaf is rejected by strict TLS
+# stacks (rustls/webpki: "CaUsedAsEndEntity"), which breaks Rust in-cluster
+# clients such as kube-rs (flannel-rs). Go's crypto/tls tolerates it, hence the
+# old single-cert shortcut went unnoticed until a CNI written in Rust appeared.
+CA_CERT="${CERT_DIR}/ca.crt"
+CA_KEY="${CERT_DIR}/ca.key"
 
 # Generate SA signing key pair (always — even if TLS certs exist)
 SA_KEY="${CERT_DIR}/sa.key"
@@ -74,7 +82,7 @@ generate_scheduler_kubeconfig() {
             -subj "/CN=system:kube-scheduler/O=system:kube-scheduler"
         # Sign with the api-server CA (clientAuth EKU).
         openssl x509 -req -in "${CERT_DIR}/kube-scheduler.csr" \
-            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
             -out "$sched_crt" -days 3650 \
             -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
         rm -f "${CERT_DIR}/kube-scheduler.csr"
@@ -131,7 +139,7 @@ generate_controller_manager_kubeconfig() {
         openssl req -new -key "$cm_key" -out "${CERT_DIR}/kube-controller-manager.csr" \
             -subj "/CN=system:kube-controller-manager/O=system:kube-controller-manager"
         openssl x509 -req -in "${CERT_DIR}/kube-controller-manager.csr" \
-            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
             -out "$cm_crt" -days 3650 \
             -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
         rm -f "${CERT_DIR}/kube-controller-manager.csr"
@@ -188,7 +196,7 @@ generate_kubelet_kubeconfig() {
         openssl req -new -key "$kl_key" -out "${CERT_DIR}/kubelet.csr" \
             -subj "/CN=system:node:rusternetes/O=system:nodes"
         openssl x509 -req -in "${CERT_DIR}/kubelet.csr" \
-            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
             -out "$kl_crt" -days 3650 \
             -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
         rm -f "${CERT_DIR}/kubelet.csr"
@@ -245,7 +253,7 @@ generate_kube_proxy_kubeconfig() {
         openssl req -new -key "$kp_key" -out "${CERT_DIR}/kube-proxy.csr" \
             -subj "/CN=system:kube-proxy/O=system:node-proxier"
         openssl x509 -req -in "${CERT_DIR}/kube-proxy.csr" \
-            -CA "$CERT_FILE" -CAkey "$KEY_FILE" -CAcreateserial \
+            -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
             -out "$kp_crt" -days 3650 \
             -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
         rm -f "${CERT_DIR}/kube-proxy.csr"
@@ -304,10 +312,28 @@ echo "Generating TLS certificates for API server..."
 # Create certs directory if it doesn't exist
 mkdir -p "$CERT_DIR"
 
-# Use OpenSSL to generate a self-signed certificate
-# This matches the behavior of the Rust TLS generation but persists it
+# Two-tier PKI: a self-signed CA (CA:TRUE) signs a separate api-server leaf
+# serving cert (CA:FALSE, serverAuth). Distributing the CA as ca.crt — rather
+# than the old shortcut of serving the CA cert itself — keeps strict TLS stacks
+# (rustls/webpki) happy: a CA:TRUE cert presented as the leaf is rejected with
+# "CaUsedAsEndEntity", which is exactly what blocked flannel-rs's kube-rs client.
 
-# Generate private key
+# Generate the CA key + self-signed CA cert (only if absent, so reruns keep the
+# CA stable and previously-signed client certs remain valid).
+if [ ! -f "$CA_KEY" ] || [ ! -f "$CA_CERT" ]; then
+    echo "Generating cluster CA..."
+    openssl ecparam -name prime256v1 -genkey -noout -out "$CA_KEY"
+    openssl req -new -x509 \
+        -key "$CA_KEY" \
+        -out "$CA_CERT" \
+        -days 3650 \
+        -subj "/CN=rusternetes-ca/O=Rusternetes/C=US" \
+        -addext "basicConstraints = critical, CA:TRUE" \
+        -addext "keyUsage = critical, digitalSignature, keyCertSign, cRLSign" \
+        -set_serial 01
+fi
+
+# Generate the api-server leaf serving-cert private key
 openssl ecparam -name prime256v1 -genkey -noout -out "$KEY_FILE"
 
 # Detect container runtime and get network subnet
@@ -345,9 +371,9 @@ O = Rusternetes
 C = US
 
 [v3_req]
-keyUsage = critical, digitalSignature, keyEncipherment, dataEncipherment, keyCertSign
+keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth, clientAuth
-basicConstraints = critical, CA:TRUE
+basicConstraints = critical, CA:FALSE
 subjectAltName = @alt_names
 
 [alt_names]
@@ -373,20 +399,27 @@ if [ -n "$BASE_IP" ]; then
     done
 fi
 
-# Generate self-signed certificate (valid for 10 years, matching the Rust implementation)
-openssl req -new -x509 \
+# Generate the api-server leaf serving cert: CSR signed by the CA (valid 10y).
+# The leaf carries the SANs + serverAuth EKU; the CA stays in ca.crt.
+openssl req -new \
     -key "$KEY_FILE" \
+    -out "${CERT_DIR}/api-server.csr" \
+    -config "${CERT_DIR}/cert.conf"
+openssl x509 -req \
+    -in "${CERT_DIR}/api-server.csr" \
+    -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
     -out "$CERT_FILE" \
     -days 3650 \
-    -config "${CERT_DIR}/cert.conf" \
-    -extensions v3_req \
-    -set_serial 01
+    -extfile "${CERT_DIR}/cert.conf" \
+    -extensions v3_req
 
-# Clean up config file
-rm "${CERT_DIR}/cert.conf"
+# Clean up config + CSR
+rm "${CERT_DIR}/cert.conf" "${CERT_DIR}/api-server.csr"
 
-# Create ca.crt in certs directory for consistency
-cp "$CERT_FILE" "${CERT_DIR}/ca.crt"
+# ca.crt is already the cluster CA (written as $CA_CERT in the CA-generation
+# block above) — do NOT copy the serving cert over it (that was the old
+# single-cert model). CoreDNS SA-volume CA prestaging was dropped upstream as
+# dead (f3bbb1fa), so there is nothing further to distribute here.
 
 # Now that the api-server cert + CA exist, emit the kube-scheduler,
 # kube-controller-manager (static pods) and kube-proxy (host-network compose
