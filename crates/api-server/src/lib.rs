@@ -42,6 +42,47 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Resolve the cluster **CA** certificate PEM that gets embedded as `ca.crt` in
+/// ServiceAccount token secrets and `kube-root-ca.crt` ConfigMaps.
+///
+/// This MUST be the issuing CA, not the api-server's serving cert. The two used
+/// to be the same self-signed CA:TRUE cert, so handing back the serving cert
+/// happened to work; now the serving cert is a leaf (CA:FALSE) signed by a
+/// separate CA, and embedding the leaf makes in-cluster clients reject the
+/// api-server with `UnknownIssuer`. Prefer an explicit CA file, then the CA
+/// sitting next to the serving cert, then the well-known deploy paths; fall back
+/// to the serving cert only when no CA file exists (self-signed / legacy setups).
+pub fn resolve_ca_cert_pem(cert_file: Option<&str>, serving_cert_pem: &str) -> String {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("CA_CERT_PATH") {
+        candidates.push(p);
+    }
+    if let Some(cf) = cert_file {
+        if let Some(dir) = std::path::Path::new(cf).parent() {
+            candidates.push(dir.join("ca.crt").to_string_lossy().into_owned());
+        }
+    }
+    candidates.push("/etc/kubernetes/pki/ca.crt".to_string());
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{home}/.rusternetes/certs/ca.crt"));
+    }
+
+    for path in &candidates {
+        if let Ok(pem) = std::fs::read_to_string(path) {
+            if pem.contains("BEGIN CERTIFICATE") {
+                info!("Loaded cluster CA for SA tokens / kube-root-ca from {path}");
+                return pem;
+            }
+        }
+    }
+    warn!(
+        "No separate CA cert found (tried {:?}); falling back to the serving cert. \
+         In-cluster clients using a strict TLS stack may fail to verify the api-server.",
+        candidates
+    );
+    serving_cert_pem.to_string()
+}
+
 /// Configuration for the API server component.
 pub struct ApiServerConfig {
     pub bind_address: String,
@@ -118,7 +159,10 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         } else {
             anyhow::bail!("TLS enabled but no certificate provided");
         };
-        tls_config.cert_pem.clone()
+        tls_config
+            .cert_pem
+            .as_deref()
+            .map(|serving| resolve_ca_cert_pem(config.tls_cert_file.as_deref(), serving))
     } else {
         None
     };

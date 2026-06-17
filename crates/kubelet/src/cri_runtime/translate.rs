@@ -136,18 +136,91 @@ pub fn sandbox_config(pod: &Pod, log_directory: &str) -> v1::PodSandboxConfig {
 
 /// Translate literal env vars; `valueFrom` (secret/configMap/field refs) is
 /// resolved kubelet-side before translation and is not handled here.
-fn env_vars(container: &Container) -> Vec<v1::KeyValue> {
+fn env_vars(pod: &Pod, container: &Container) -> Vec<v1::KeyValue> {
     let Some(env) = container.env.as_ref() else {
         return Vec::new();
     };
     env.iter()
         .filter_map(|e| {
-            e.value.as_ref().map(|v| v1::KeyValue {
+            // Literal value wins; otherwise resolve a downward-API fieldRef /
+            // resourceFieldRef. configMap/secret keyRefs are resolved by the
+            // kubelet before translation (not handled here) and are skipped.
+            let value = if let Some(v) = e.value.as_ref() {
+                Some(v.clone())
+            } else if let Some(src) = e.value_from.as_ref() {
+                if let Some(fr) = src.field_ref.as_ref() {
+                    pod_field_value(pod, &fr.field_path)
+                } else if let Some(rfr) = src.resource_field_ref.as_ref() {
+                    container_resource_value(container, &rfr.resource)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            value.map(|v| v1::KeyValue {
                 key: e.name.clone(),
-                value: v.clone(),
+                value: v,
             })
         })
         .collect()
+}
+
+/// Resolve a downward-API pod field path (`fieldRef`) to a string value. Only
+/// the fields known at container-create time are returned; `None` otherwise.
+fn pod_field_value(pod: &Pod, field_path: &str) -> Option<String> {
+    match field_path {
+        "metadata.name" => Some(pod.metadata.name.clone()),
+        "metadata.namespace" => Some(namespace(pod).to_string()),
+        "metadata.uid" => Some(pod.metadata.uid.clone()),
+        "spec.nodeName" => pod.spec.as_ref().and_then(|s| s.node_name.clone()),
+        "spec.serviceAccountName" => pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.service_account_name.clone()),
+        // podIP is the pod's own address; hostIP is the NODE's address. These
+        // are distinct — upstream returns `podIP` vs `hostIPs[0]` respectively
+        // (pkg/kubelet/kubelet_pods.go podFieldSelectorRuntimeValue). Returning
+        // one for the other broke pods that read status.hostIP via fieldRef.
+        "status.podIP" => pod.status.as_ref().and_then(|st| st.pod_ip.clone()),
+        "status.hostIP" => pod.status.as_ref().and_then(|st| st.host_ip.clone()),
+        // Dual-stack plural forms: comma-joined list (matches upstream).
+        "status.podIPs" => pod.status.as_ref().and_then(|st| {
+            st.pod_i_ps.as_ref().map(|ips| {
+                ips.iter()
+                    .map(|p| p.ip.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        }),
+        "status.hostIPs" => pod.status.as_ref().and_then(|st| {
+            st.host_i_ps.as_ref().map(|ips| {
+                ips.iter()
+                    .map(|h| h.ip.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        }),
+        _ => None,
+    }
+}
+
+/// Resolve a `resourceFieldRef` (`limits.cpu` / `requests.memory`, etc.) to its
+/// numeric value as a decimal string. `None` if the resource is not set.
+fn container_resource_value(container: &Container, resource: &str) -> Option<String> {
+    let req = container.resources.as_ref()?;
+    let (kind, name) = resource.split_once('.')?;
+    let map = match kind {
+        "limits" => req.limits.as_ref(),
+        "requests" => req.requests.as_ref(),
+        _ => None,
+    }?;
+    let raw = map.get(name)?;
+    match name {
+        "cpu" => parse_cpu_millicores(raw).map(|m| m.to_string()),
+        "memory" => parse_memory_bytes(raw).map(|b| b.to_string()),
+        _ => Some(raw.clone()),
+    }
 }
 
 /// Translate volume mounts into CRI mounts using a resolved volume-name →
@@ -234,8 +307,20 @@ fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources>
 
 fn linux_security_context(container: &Container) -> Option<v1::LinuxContainerSecurityContext> {
     let sc = container.security_context.as_ref()?;
+    // Translate requested Linux capabilities. Names are passed through verbatim
+    // (e.g. "NET_ADMIN"), matching upstream — the kubelet does not add the
+    // "CAP_" prefix; the runtime (containerd) does when building the OCI spec.
+    // Without this, NET_ADMIN/NET_RAW never reach the container and capability-
+    // dependent workloads fail, e.g. flannel's vxlan link creation returns
+    // netlink EPERM ("Operation not permitted") and never writes subnet.env.
+    let capabilities = sc.capabilities.as_ref().map(|caps| v1::Capability {
+        add_capabilities: caps.add.clone().unwrap_or_default(),
+        drop_capabilities: caps.drop.clone().unwrap_or_default(),
+        add_ambient_capabilities: Vec::new(),
+    });
     Some(v1::LinuxContainerSecurityContext {
         privileged: sc.privileged.unwrap_or(false),
+        capabilities,
         run_as_user: sc.run_as_user.map(|v| v1::Int64Value { value: v }),
         run_as_group: sc.run_as_group.map(|v| v1::Int64Value { value: v }),
         readonly_rootfs: sc.read_only_root_filesystem.unwrap_or(false),
@@ -281,7 +366,7 @@ pub fn container_config(
         command: container.command.clone().unwrap_or_default(),
         args: container.args.clone().unwrap_or_default(),
         working_dir: container.working_dir.clone().unwrap_or_default(),
-        envs: env_vars(container),
+        envs: env_vars(pod, container),
         mounts: mounts(container, host_paths),
         labels,
         log_path: format!("{}.log", container.name),
@@ -300,6 +385,47 @@ mod tests {
         pod.metadata.uid = "uid-123".to_string();
         pod.metadata.namespace = Some("prod".to_string());
         pod
+    }
+
+    #[test]
+    fn downward_api_pod_ip_and_host_ip_are_distinct() {
+        use rusternetes_common::resources::pod::{HostIP, PodIP, PodStatus};
+        let mut pod = pod_with(PodSpec {
+            node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+        pod.status = Some(PodStatus {
+            pod_ip: Some("10.244.0.7".to_string()),
+            host_ip: Some("172.20.0.5".to_string()),
+            pod_i_ps: Some(vec![PodIP {
+                ip: "10.244.0.7".to_string(),
+            }]),
+            host_i_ps: Some(vec![HostIP {
+                ip: "172.20.0.5".to_string(),
+            }]),
+            ..Default::default()
+        });
+        // podIP is the pod's address; hostIP is the node's — never conflated.
+        assert_eq!(
+            pod_field_value(&pod, "status.podIP").as_deref(),
+            Some("10.244.0.7")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "status.hostIP").as_deref(),
+            Some("172.20.0.5")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "status.podIPs").as_deref(),
+            Some("10.244.0.7")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "status.hostIPs").as_deref(),
+            Some("172.20.0.5")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "spec.nodeName").as_deref(),
+            Some("node-1")
+        );
     }
 
     #[test]

@@ -99,6 +99,11 @@ pub struct CriContainerRuntime {
     probe_states: Arc<Mutex<std::collections::HashMap<String, ProbeState>>>,
     /// Records Kubernetes lifecycle events. `None` disables event emission.
     event_recorder: Option<rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>>,
+    /// ClusterIP + port of the default `kubernetes` Service, injected into every
+    /// container as KUBERNETES_SERVICE_HOST/PORT so in-cluster clients (kube-rs,
+    /// client-go) can reach the api-server.
+    service_host: String,
+    service_port: String,
 }
 
 impl CriContainerRuntime {
@@ -117,7 +122,18 @@ impl CriContainerRuntime {
             volumes: None,
             probe_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_recorder: None,
+            service_host: "10.96.0.1".to_string(),
+            service_port: "443".to_string(),
         })
+    }
+
+    /// Set the `kubernetes` Service host:port injected as KUBERNETES_SERVICE_*
+    /// env into pods (defaults to 10.96.0.1:443).
+    #[must_use]
+    pub fn with_service_host(mut self, host: impl Into<String>, port: impl Into<String>) -> Self {
+        self.service_host = host.into();
+        self.service_port = port.into();
+        self
     }
 
     /// Attach a [`VolumeManager`](crate::volumes::VolumeManager) so `start_pod`
@@ -269,12 +285,40 @@ impl CriContainerRuntime {
             Some((pod, &container.name)),
         )
         .await?;
-        let cfg = translate::container_config(pod, container, &container.image, host_paths);
+        let mut cfg = translate::container_config(pod, container, &container.image, host_paths);
+        self.inject_service_env(&mut cfg);
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
         cri.start_container(&container_id).await?;
         Ok(container_id)
+    }
+
+    /// Inject the standard `kubernetes` Service env vars (KUBERNETES_SERVICE_HOST
+    /// /PORT and the legacy KUBERNETES_PORT_* forms) so in-cluster clients can
+    /// reach the api-server. Existing same-named vars in the container spec win.
+    fn inject_service_env(&self, cfg: &mut v1::ContainerConfig) {
+        let (host, port) = (&self.service_host, &self.service_port);
+        let tcp = format!("tcp://{host}:{port}");
+        let vars = [
+            ("KUBERNETES_SERVICE_HOST", host.clone()),
+            ("KUBERNETES_SERVICE_PORT", port.clone()),
+            ("KUBERNETES_SERVICE_PORT_HTTPS", port.clone()),
+            ("KUBERNETES_PORT", tcp.clone()),
+            ("KUBERNETES_PORT_443_TCP", tcp),
+            ("KUBERNETES_PORT_443_TCP_PROTO", "tcp".to_string()),
+            ("KUBERNETES_PORT_443_TCP_PORT", port.clone()),
+            ("KUBERNETES_PORT_443_TCP_ADDR", host.clone()),
+        ];
+        for (key, value) in vars {
+            if cfg.envs.iter().any(|e| e.key == key) {
+                continue; // explicit pod env overrides the injected default
+            }
+            cfg.envs.push(v1::KeyValue {
+                key: key.to_string(),
+                value,
+            });
+        }
     }
 
     /// Poll a container until it exits, returning its exit code. Errors with
@@ -323,7 +367,18 @@ impl CriContainerRuntime {
         let handler = self.runtime_handler.clone();
 
         let mut cri = self.cri.clone();
-        let sandbox_id = cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await?;
+        // Idempotent: reuse a ready sandbox if one already exists for this pod
+        // (start_pod is retried by the reconcile loop, and the runtime reserves
+        // the sandbox name, so re-running RunPodSandbox would fail with "name
+        // reserved"). A non-ready leftover sandbox is removed and recreated.
+        let sandbox_id = match self.ready_sandbox_for(&pod.metadata.name).await {
+            Some(existing) => existing,
+            None => {
+                // Drop any stale (not-ready) sandbox holding the name first.
+                let _ = self.stop_and_remove_pod(&pod.metadata.name).await;
+                cri.run_pod_sandbox(sandbox_cfg.clone(), &handler).await?
+            }
+        };
 
         // Init containers run sequentially to completion before app containers.
         if let Some(init_containers) = spec.init_containers.as_ref() {
@@ -375,6 +430,28 @@ impl CriContainerRuntime {
         let mut cri = self.cri.clone();
         let sandboxes = cri.list_pod_sandbox(Some(filter)).await?;
         Ok(sandboxes.into_iter().next().map(|s| s.id))
+    }
+
+    /// The id of a READY sandbox for the pod, if one exists — used by `start_pod`
+    /// to reuse a running sandbox across reconcile retries instead of trying to
+    /// create a new one (which would collide on the reserved sandbox name).
+    async fn ready_sandbox_for(&self, pod_name: &str) -> Option<String> {
+        let filter = v1::PodSandboxFilter {
+            state: Some(v1::PodSandboxStateValue {
+                state: v1::PodSandboxState::SandboxReady as i32,
+            }),
+            label_selector: std::collections::HashMap::from([(
+                translate::labels::POD_NAME.to_string(),
+                pod_name.to_string(),
+            )]),
+            ..Default::default()
+        };
+        let mut cri = self.cri.clone();
+        cri.list_pod_sandbox(Some(filter))
+            .await
+            .ok()
+            .and_then(|s| s.into_iter().next())
+            .map(|s| s.id)
     }
 
     /// True when at least one of the pod's containers is in the RUNNING state.
@@ -1055,12 +1132,24 @@ impl CriContainerRuntime {
 
     /// Whether any container named `container_name` exists on the runtime,
     /// regardless of state.
-    pub async fn container_exists(&self, container_name: &str) -> bool {
+    /// Whether a container with the given name exists for the given pod, in any
+    /// state. Scoped by pod UID **and** container name to match the CRI labels we
+    /// actually write (`io.kubernetes.pod.uid` + `io.kubernetes.container.name`,
+    /// the upstream convention). The container name label is the bare
+    /// `container.name` (e.g. `kube-flannel`), shared across every pod of a
+    /// DaemonSet — so without the UID scope this would either never match (when
+    /// the caller passes a `pod_pod_name_container`-style key) or match the wrong
+    /// pod's container. Both break `computePodActions`, which then recreates a
+    /// container that already exists and collides with containerd's reserved name.
+    pub async fn container_exists(&self, pod_uid: &str, container_name: &str) -> bool {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();

@@ -167,6 +167,7 @@ COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/client/Cargo.toml             crates/client/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/cri/Cargo.toml                crates/cri/Cargo.toml
 COPY crates/discovery/Cargo.toml          crates/discovery/Cargo.toml
 COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
 COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
@@ -186,16 +187,20 @@ COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
 COPY crates/common/build.rs     crates/common/build.rs
 COPY crates/api-server/build.rs crates/api-server/build.rs
 COPY crates/api-server/proto    crates/api-server/proto
+# crates/cri/build.rs runs tonic-build over the vendored CRI proto at compile
+# time, so the proto must be present from Pass-1.
+COPY crates/cri/build.rs        crates/cri/build.rs
+COPY crates/cri/proto           crates/cri/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
-#   - lib only:   common, storage, cloud-providers, netstack
+#   - lib only:   common, storage, cloud-providers, netstack, cri
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet, kube-proxy,
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery; do \
+    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -248,6 +253,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-client \
         -p rusternetes-cloud-providers \
         -p rusternetes-common \
+        -p rusternetes-cri \
         -p rusternetes-middleware \
         -p rusternetes-protobuf \
         -p rusternetes-controller-manager \
@@ -281,6 +287,7 @@ COPY crates/common/src               crates/common/src
 COPY crates/common/tests             crates/common/tests
 COPY crates/controller-manager/src   crates/controller-manager/src
 COPY crates/controller-manager/tests crates/controller-manager/tests
+COPY crates/cri/src                  crates/cri/src
 COPY crates/discovery/src            crates/discovery/src
 COPY crates/dns/src                  crates/dns/src
 COPY crates/kubectl/src              crates/kubectl/src

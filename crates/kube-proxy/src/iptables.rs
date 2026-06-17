@@ -2,26 +2,78 @@ use anyhow::{Context, Result};
 use std::process::Command;
 use tracing::{debug, error, info, warn};
 
-/// Detect the correct iptables command to use.
-/// Docker Desktop uses nftables backend (`iptables`), while Podman uses `iptables-legacy`.
-/// We must match the backend that the container runtime uses, otherwise DNAT rules
-/// won't apply to container traffic.
-fn detect_iptables_cmd() -> &'static str {
-    // Try `iptables` first (nftables backend, used by Docker Desktop)
-    if let Ok(output) = Command::new("/usr/sbin/iptables")
-        .args(["-t", "nat", "-L", "PREROUTING", "-n"])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // If the DOCKER chain jump exists in iptables (nftables), Docker is using this backend
-        if stdout.contains("DOCKER") {
-            info!("Detected Docker nftables backend, using /usr/sbin/iptables");
-            return "/usr/sbin/iptables";
-        }
+/// Probe one iptables backend's nat table. Returns `(has_kube_chains,
+/// rule_count)`: whether the `KUBE-` chains kube-proxy/flannel install are
+/// present (the strongest signal a backend is the active one), and how many
+/// concrete `-A` rule lines it holds. A binary that is missing or errors
+/// reports `(false, 0)`.
+fn backend_signal(backend: &str) -> (bool, usize) {
+    let Ok(out) = Command::new(backend).args(["-t", "nat", "-S"]).output() else {
+        return (false, 0);
+    };
+    if !out.status.success() {
+        return (false, 0);
     }
-    // Fall back to iptables-legacy (Podman, older systems)
-    info!("Using /usr/sbin/iptables-legacy (Podman/legacy backend)");
-    "/usr/sbin/iptables-legacy"
+    let text = String::from_utf8_lossy(&out.stdout);
+    let has_kube = text.lines().any(|l| l.contains("KUBE-"));
+    // Count rules (-A ...), not chain declarations (-N/-P).
+    let rules = text.lines().filter(|l| l.starts_with("-A")).count();
+    (has_kube, rules)
+}
+
+/// Detect the correct iptables command to use.
+///
+/// kube-proxy MUST program the same backend (nft vs legacy) that the rest of
+/// the netns uses, or its DNAT/MASQUERADE rules land in a ruleset the kernel
+/// never evaluates for the traffic in question. The CNI plugin (flannel-rs's
+/// ip-masq + portmap) and any other rule-writer in the node must resolve to the
+/// SAME backend, or pod/service routing silently breaks.
+///
+/// We mirror the upstream `iptables-wrapper` heuristic
+/// (kubernetes-sigs/iptables-wrappers) — the same logic flannel-rs's
+/// `flanneld/src/ipmasq.rs::detect()` uses, so the two always agree:
+/// prefer the backend whose nat table holds the `KUBE-` chains; failing a clear
+/// winner, the busier table; failing that, the alternatives-managed default
+/// `/usr/sbin/iptables` (nft on every modern distro and our kind-style node).
+///
+/// The previous heuristic keyed off a `DOCKER` chain to decide "this is Docker's
+/// nftables backend". That marker only exists in the Docker host's own netns —
+/// in the per-node model kube-proxy shares the *node's* netns (a nested
+/// container with no DOCKER chain), so the check failed and we wrongly fell back
+/// to iptables-legacy while the node ran nf_tables. Result: the
+/// kubernetes-service DNAT was written to the legacy table and silently never
+/// took effect (flanneld could not reach 10.96.0.1:443).
+fn detect_iptables_cmd() -> &'static str {
+    const NFT: &str = "/usr/sbin/iptables-nft";
+    const LEGACY: &str = "/usr/sbin/iptables-legacy";
+    const DEFAULT: &str = "/usr/sbin/iptables";
+
+    let (nft_kube, nft_rules) = backend_signal(NFT);
+    let (legacy_kube, legacy_rules) = backend_signal(LEGACY);
+    debug!(
+        nft_kube,
+        nft_rules, legacy_kube, legacy_rules, "iptables backend signals"
+    );
+
+    let cmd = match (nft_kube, legacy_kube) {
+        (true, false) => NFT,
+        (false, true) => LEGACY,
+        // Both or neither show KUBE chains: fall back to the busier table, and
+        // to the alternatives default when neither responded usefully (e.g. a
+        // freshly-booted node where kube-proxy is the first rule-writer — the
+        // default resolves to nft on modern systems).
+        _ => {
+            if nft_rules >= legacy_rules && (nft_rules > 0 || nft_kube) {
+                NFT
+            } else if legacy_rules > 0 || legacy_kube {
+                LEGACY
+            } else {
+                DEFAULT
+            }
+        }
+    };
+    info!("Using {cmd} (iptables-wrapper heuristic: nft={nft_rules}r/kube={nft_kube}, legacy={legacy_rules}r/kube={legacy_kube})");
+    cmd
 }
 
 /// Detect the container bridge interface and its CIDR.

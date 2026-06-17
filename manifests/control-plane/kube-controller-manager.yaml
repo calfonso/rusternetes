@@ -24,7 +24,7 @@ metadata:
     component: kube-controller-manager
     tier: control-plane
 spec:
-  hostNetwork: false
+  hostNetwork: true
   # ndots:0 — resolve the `api-server` Docker name directly instead of trying
   # the cluster search domains first, which are slow to fail before cluster DNS
   # (10.96.0.10) is reachable and can push the first connect past the client

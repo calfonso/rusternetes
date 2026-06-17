@@ -34,3 +34,6 @@ services:
     image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
   dns:
     image: "ghcr.io/indyjonesnl/rusternetes/dns:${RUSTERNETES_IMAGE_TAG:-main}"
+  # CRI runtime image (containerd + youki + CNI) the kubelet talks to.
+  containerd:
+    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${RUSTERNETES_IMAGE_TAG:-main}"

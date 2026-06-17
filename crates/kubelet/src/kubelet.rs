@@ -375,7 +375,6 @@ impl Kubelet {
             &cluster_dns,
             &cluster_domain,
             &network,
-            &kubernetes_service_host,
             pod_network_mode,
             &netstack,
             &allowed_unsafe_sysctls,
@@ -396,11 +395,19 @@ impl Kubelet {
             token_manager,
         );
 
+        // The kubernetes Service host:port injected into pods as
+        // KUBERNETES_SERVICE_* so in-cluster clients reach the api-server.
+        let service_host = if kubernetes_service_host.is_empty() {
+            "10.96.0.1".to_string()
+        } else {
+            kubernetes_service_host
+        };
         let runtime = CriContainerRuntime::connect(&socket, runtime_handler, log_root)
             .await
             .map_err(|e| anyhow::anyhow!("connecting to CRI runtime at {socket}: {e}"))?
             .with_volumes(volumes)
-            .with_event_recorder(storage.clone());
+            .with_event_recorder(storage.clone())
+            .with_service_host(service_host, "443");
 
         // Log the resolved statvfs path once so operators can see which
         // mount we're measuring for eviction. Upstream cadvisor logs this
@@ -3532,8 +3539,11 @@ impl Kubelet {
                 // started (e.g., after a StatefulSet PATCH recreates the pod) or was removed.
                 if let Some(ref spec) = pod.spec {
                     for container in &spec.containers {
-                        let container_name = format!("{}_{}", pod_name, container.name);
-                        if !self.runtime.container_exists(&container_name).await {
+                        if !self
+                            .runtime
+                            .container_exists(&pod.metadata.uid, &container.name)
+                            .await
+                        {
                             info!(
                                 "Container {} missing for running pod {}/{}, creating",
                                 container.name, namespace, pod_name
@@ -3692,11 +3702,14 @@ impl Kubelet {
                         if let Some(ecs) = &spec.ephemeral_containers {
                             let mut started_any = false;
                             for ec in ecs {
-                                let ec_container_name = format!("{}_{}", pod_name, ec.name);
                                 // Ephemeral containers are one-shot — never restart them.
                                 // Skip if the container already exists in any state (running,
                                 // exited, created). Only start truly new ephemeral containers.
-                                if self.runtime.container_exists(&ec_container_name).await {
+                                if self
+                                    .runtime
+                                    .container_exists(&ec_pod.metadata.uid, &ec.name)
+                                    .await
+                                {
                                     continue;
                                 }
                                 info!(
