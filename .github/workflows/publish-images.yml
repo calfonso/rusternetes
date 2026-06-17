@@ -79,7 +79,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          for img in rhino api-server scheduler controller-manager kubelet kube-proxy dns; do
+          for img in rhino api-server scheduler controller-manager kubelet kube-proxy dns containerd; do
             docker tag \
               "ghcr.io/indyjonesnl/rusternetes/${img}:sha-${{ github.sha }}" \
               "ghcr.io/indyjonesnl/rusternetes/${img}:main"
