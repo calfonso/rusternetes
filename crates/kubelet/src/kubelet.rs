@@ -375,7 +375,6 @@ impl Kubelet {
             &cluster_dns,
             &cluster_domain,
             &network,
-            &kubernetes_service_host,
             pod_network_mode,
             &netstack,
             &allowed_unsafe_sysctls,
@@ -396,11 +395,19 @@ impl Kubelet {
             token_manager,
         );
 
+        // The kubernetes Service host:port injected into pods as
+        // KUBERNETES_SERVICE_* so in-cluster clients reach the api-server.
+        let service_host = if kubernetes_service_host.is_empty() {
+            "10.96.0.1".to_string()
+        } else {
+            kubernetes_service_host
+        };
         let runtime = CriContainerRuntime::connect(&socket, runtime_handler, log_root)
             .await
             .map_err(|e| anyhow::anyhow!("connecting to CRI runtime at {socket}: {e}"))?
             .with_volumes(volumes)
-            .with_event_recorder(storage.clone());
+            .with_event_recorder(storage.clone())
+            .with_service_host(service_host, "443");
 
         // Log the resolved statvfs path once so operators can see which
         // mount we're measuring for eviction. Upstream cadvisor logs this

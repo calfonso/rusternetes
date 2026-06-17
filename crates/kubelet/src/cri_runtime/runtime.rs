@@ -99,6 +99,11 @@ pub struct CriContainerRuntime {
     probe_states: Arc<Mutex<std::collections::HashMap<String, ProbeState>>>,
     /// Records Kubernetes lifecycle events. `None` disables event emission.
     event_recorder: Option<rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>>,
+    /// ClusterIP + port of the default `kubernetes` Service, injected into every
+    /// container as KUBERNETES_SERVICE_HOST/PORT so in-cluster clients (kube-rs,
+    /// client-go) can reach the api-server.
+    service_host: String,
+    service_port: String,
 }
 
 impl CriContainerRuntime {
@@ -117,7 +122,18 @@ impl CriContainerRuntime {
             volumes: None,
             probe_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_recorder: None,
+            service_host: "10.96.0.1".to_string(),
+            service_port: "443".to_string(),
         })
+    }
+
+    /// Set the `kubernetes` Service host:port injected as KUBERNETES_SERVICE_*
+    /// env into pods (defaults to 10.96.0.1:443).
+    #[must_use]
+    pub fn with_service_host(mut self, host: impl Into<String>, port: impl Into<String>) -> Self {
+        self.service_host = host.into();
+        self.service_port = port.into();
+        self
     }
 
     /// Attach a [`VolumeManager`](crate::volumes::VolumeManager) so `start_pod`
@@ -269,12 +285,40 @@ impl CriContainerRuntime {
             Some((pod, &container.name)),
         )
         .await?;
-        let cfg = translate::container_config(pod, container, &container.image, host_paths);
+        let mut cfg = translate::container_config(pod, container, &container.image, host_paths);
+        self.inject_service_env(&mut cfg);
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
         cri.start_container(&container_id).await?;
         Ok(container_id)
+    }
+
+    /// Inject the standard `kubernetes` Service env vars (KUBERNETES_SERVICE_HOST
+    /// /PORT and the legacy KUBERNETES_PORT_* forms) so in-cluster clients can
+    /// reach the api-server. Existing same-named vars in the container spec win.
+    fn inject_service_env(&self, cfg: &mut v1::ContainerConfig) {
+        let (host, port) = (&self.service_host, &self.service_port);
+        let tcp = format!("tcp://{host}:{port}");
+        let vars = [
+            ("KUBERNETES_SERVICE_HOST", host.clone()),
+            ("KUBERNETES_SERVICE_PORT", port.clone()),
+            ("KUBERNETES_SERVICE_PORT_HTTPS", port.clone()),
+            ("KUBERNETES_PORT", tcp.clone()),
+            ("KUBERNETES_PORT_443_TCP", tcp),
+            ("KUBERNETES_PORT_443_TCP_PROTO", "tcp".to_string()),
+            ("KUBERNETES_PORT_443_TCP_PORT", port.clone()),
+            ("KUBERNETES_PORT_443_TCP_ADDR", host.clone()),
+        ];
+        for (key, value) in vars {
+            if cfg.envs.iter().any(|e| e.key == key) {
+                continue; // explicit pod env overrides the injected default
+            }
+            cfg.envs.push(v1::KeyValue {
+                key: key.to_string(),
+                value,
+            });
+        }
     }
 
     /// Poll a container until it exits, returning its exit code. Errors with
