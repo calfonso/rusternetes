@@ -1132,12 +1132,27 @@ impl CriContainerRuntime {
 
     /// Whether any container named `container_name` exists on the runtime,
     /// regardless of state.
-    pub async fn container_exists(&self, container_name: &str) -> bool {
+    /// Whether a container with the given name exists for the given pod, in any
+    /// state. Scoped by pod UID **and** container name to match the CRI labels we
+    /// actually write (`io.kubernetes.pod.uid` + `io.kubernetes.container.name`,
+    /// the upstream convention). The container name label is the bare
+    /// `container.name` (e.g. `kube-flannel`), shared across every pod of a
+    /// DaemonSet — so without the UID scope this would either never match (when
+    /// the caller passes a `pod_pod_name_container`-style key) or match the wrong
+    /// pod's container. Both break `computePodActions`, which then recreates a
+    /// container that already exists and collides with containerd's reserved name.
+    pub async fn container_exists(&self, pod_uid: &str, container_name: &str) -> bool {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (
+                    translate::labels::POD_UID.to_string(),
+                    pod_uid.to_string(),
+                ),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();

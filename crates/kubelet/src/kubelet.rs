@@ -3539,8 +3539,11 @@ impl Kubelet {
                 // started (e.g., after a StatefulSet PATCH recreates the pod) or was removed.
                 if let Some(ref spec) = pod.spec {
                     for container in &spec.containers {
-                        let container_name = format!("{}_{}", pod_name, container.name);
-                        if !self.runtime.container_exists(&container_name).await {
+                        if !self
+                            .runtime
+                            .container_exists(&pod.metadata.uid, &container.name)
+                            .await
+                        {
                             info!(
                                 "Container {} missing for running pod {}/{}, creating",
                                 container.name, namespace, pod_name
@@ -3699,11 +3702,14 @@ impl Kubelet {
                         if let Some(ecs) = &spec.ephemeral_containers {
                             let mut started_any = false;
                             for ec in ecs {
-                                let ec_container_name = format!("{}_{}", pod_name, ec.name);
                                 // Ephemeral containers are one-shot — never restart them.
                                 // Skip if the container already exists in any state (running,
                                 // exited, created). Only start truly new ephemeral containers.
-                                if self.runtime.container_exists(&ec_container_name).await {
+                                if self
+                                    .runtime
+                                    .container_exists(&ec_pod.metadata.uid, &ec.name)
+                                    .await
+                                {
                                     continue;
                                 }
                                 info!(
