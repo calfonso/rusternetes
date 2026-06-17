@@ -22,7 +22,15 @@ cargo clippy --all-targets --all-features -- -D warnings  # Lint
 make pre-commit                # Format + clippy + test (run before commits)
 
 # Cluster (Podman or Docker)
+# One-shot bring-up (teardown → certs → build → up → bootstrap). Pre-creates
+# the bind-mount host dirs so a fresh checkout works with no manual chown:
+bash scripts/cluster-up.sh                       # SQLite (default); --backend etcd|redis
+
+# Manual bring-up. IMPORTANT: pre-create .rusternetes/manifests (and volumes)
+# BEFORE `compose up` — otherwise the daemon creates the bind-mount source as
+# root and bootstrap-cluster.sh fails to template static-pod YAML into it (#1152).
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+mkdir -p .rusternetes/manifests .rusternetes/certs "$KUBELET_VOLUMES_PATH"
 podman compose build           # Build images (~1 hour first build, faster with cache)
 podman compose up -d           # Start cluster (etcd, default)
 podman compose down            # Stop cluster
