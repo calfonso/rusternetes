@@ -383,13 +383,7 @@ openssl req -new -x509 \
 # Clean up config file
 rm "${CERT_DIR}/cert.conf"
 
-# Copy certificate to CoreDNS volume location for ca.crt
-COREDNS_CA_DIR="${PROJECT_ROOT}/.rusternetes/volumes/coredns/kube-api-access"
-mkdir -p "$COREDNS_CA_DIR"
-cp "$CERT_FILE" "${COREDNS_CA_DIR}/ca.crt"
-echo "Copied certificate to CoreDNS volume: ${COREDNS_CA_DIR}/ca.crt"
-
-# Also create ca.crt in certs directory for consistency
+# Create ca.crt in certs directory for consistency
 cp "$CERT_FILE" "${CERT_DIR}/ca.crt"
 
 # Now that the api-server cert + CA exist, emit the kube-scheduler,
@@ -405,7 +399,6 @@ echo "Certificates generated successfully:"
 echo "  Cert: $CERT_FILE"
 echo "  Key:  $KEY_FILE"
 echo "  CA:   ${CERT_DIR}/ca.crt"
-echo "  CoreDNS CA: ${COREDNS_CA_DIR}/ca.crt"
 echo "  SA Key: ${CERT_DIR}/sa.key"
 echo ""
 echo "Certificate details:"

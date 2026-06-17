@@ -93,26 +93,21 @@ echo "This script will prepare service account volumes for conformance testing."
 echo "It will copy the latest certificates into the volumes directory."
 echo ""
 echo "What would you like to do?"
-echo "  1) Prepare volumes for CoreDNS only"
-echo "  2) Prepare volumes for Sonobuoy only"
-echo "  3) Prepare volumes for both CoreDNS and Sonobuoy"
-echo "  4) Clean up all volumes (fresh start)"
-echo "  5) Clean and prepare both"
+echo "  1) Prepare volumes for Sonobuoy"
+echo "  2) Clean up all volumes (fresh start)"
+echo "  3) Clean and prepare Sonobuoy"
 echo ""
-read -p "Enter your choice [1-5]: " choice
+read -p "Enter your choice [1-3]: " choice
 
+# NOTE: cluster DNS (rusternetes-dns) is a Deployment with its own
+# ServiceAccount, so the kubelet auto-projects its SA token — it needs no
+# pre-staged volume here. Only Sonobuoy still requires manual pre-staging
+# (#1172).
 case $choice in
     1)
-        prepare_sa_volume "coredns" "kube-system"
+        prepare_sa_volume "sonobuoy" "sonobuoy"
         ;;
     2)
-        prepare_sa_volume "sonobuoy" "sonobuoy"
-        ;;
-    3)
-        prepare_sa_volume "coredns" "kube-system"
-        prepare_sa_volume "sonobuoy" "sonobuoy"
-        ;;
-    4)
         print_step "Cleaning up all volumes..."
         if [ -d "${VOLUMES_DIR}" ]; then
             # Clean up but preserve the directory structure
@@ -128,14 +123,13 @@ case $choice in
             print_warning "Volumes directory doesn't exist yet"
         fi
         ;;
-    5)
+    3)
         print_step "Cleaning up all volumes..."
         if [ -d "${VOLUMES_DIR}" ]; then
             rm -rf "${VOLUMES_DIR}"/*
             print_success "All volumes cleaned"
         fi
         print_step "Preparing fresh volumes..."
-        prepare_sa_volume "coredns" "kube-system"
         prepare_sa_volume "sonobuoy" "sonobuoy"
         ;;
     *)
