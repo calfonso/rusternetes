@@ -288,8 +288,20 @@ fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources>
 
 fn linux_security_context(container: &Container) -> Option<v1::LinuxContainerSecurityContext> {
     let sc = container.security_context.as_ref()?;
+    // Translate requested Linux capabilities. Names are passed through verbatim
+    // (e.g. "NET_ADMIN"), matching upstream — the kubelet does not add the
+    // "CAP_" prefix; the runtime (containerd) does when building the OCI spec.
+    // Without this, NET_ADMIN/NET_RAW never reach the container and capability-
+    // dependent workloads fail, e.g. flannel's vxlan link creation returns
+    // netlink EPERM ("Operation not permitted") and never writes subnet.env.
+    let capabilities = sc.capabilities.as_ref().map(|caps| v1::Capability {
+        add_capabilities: caps.add.clone().unwrap_or_default(),
+        drop_capabilities: caps.drop.clone().unwrap_or_default(),
+        add_ambient_capabilities: Vec::new(),
+    });
     Some(v1::LinuxContainerSecurityContext {
         privileged: sc.privileged.unwrap_or(false),
+        capabilities,
         run_as_user: sc.run_as_user.map(|v| v1::Int64Value { value: v }),
         run_as_group: sc.run_as_group.map(|v| v1::Int64Value { value: v }),
         readonly_rootfs: sc.read_only_root_filesystem.unwrap_or(false),
