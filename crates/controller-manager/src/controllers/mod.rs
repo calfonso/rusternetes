@@ -21,6 +21,7 @@ pub mod loadbalancer;
 pub mod namespace;
 pub mod network_policy;
 pub mod node;
+pub mod node_ipam;
 pub mod pod_disruption_budget;
 pub mod priorityclass;
 pub mod pv_binder;

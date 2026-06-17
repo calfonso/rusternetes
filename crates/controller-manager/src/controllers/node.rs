@@ -5,9 +5,11 @@ use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::{Lease, Node, NodeCondition, NodeStatus, Pod, PodStatus};
 use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+use super::node_ipam::{self, NodeIpamConfig};
 
 /// NodeController monitors node health and manages node lifecycle.
 ///
@@ -30,6 +32,9 @@ pub struct NodeController<S: Storage> {
     storage: Arc<S>,
     first_seen: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     observed_conditions: Arc<std::sync::Mutex<ObservedConditions>>,
+    /// Pod-CIDR allocation config. `None` (the default) disables node IPAM,
+    /// matching upstream's `--allocate-node-cidrs=false`.
+    ipam: Option<NodeIpamConfig>,
 }
 
 impl<S: Storage + 'static> NodeController<S> {
@@ -38,7 +43,17 @@ impl<S: Storage + 'static> NodeController<S> {
             storage,
             first_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
             observed_conditions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ipam: None,
         }
+    }
+
+    /// Enable node IPAM: allocate each node a `spec.podCIDR` from the cluster
+    /// CIDR (upstream `nodeipam` range allocator). Off unless wired by
+    /// `--allocate-node-cidrs`.
+    #[must_use]
+    pub fn with_node_ipam(mut self, cfg: NodeIpamConfig) -> Self {
+        self.ipam = Some(cfg);
+        self
     }
 
     /// Test helper: mark `node_name` as first seen long enough ago that the
@@ -170,9 +185,82 @@ impl<S: Storage + 'static> NodeController<S> {
         Ok(())
     }
 
+    /// Allocate `spec.podCIDR`/`podCIDRs` from the cluster CIDR if node IPAM is
+    /// enabled and the node has none yet. No-op otherwise.
+    ///
+    /// Mirrors upstream `rangeAllocator.AllocateOrOccupyCIDR`: a node that
+    /// already has a pod CIDR keeps it; the used-set is derived from every
+    /// node's current `spec.podCIDR(s)` so allocations survive controller
+    /// restarts and never collide. The single reconcile worker serialises this,
+    /// so no in-process lock is needed.
+    async fn ensure_pod_cidr(&self, node: &Node) -> Result<()> {
+        let Some(cfg) = self.ipam.as_ref() else {
+            return Ok(());
+        };
+        if node
+            .spec
+            .as_ref()
+            .and_then(|s| s.pod_cidr.as_deref())
+            .is_some()
+        {
+            return Ok(()); // already allocated (occupy)
+        }
+
+        // Build the used-set from all nodes' existing pod CIDRs.
+        let nodes: Vec<Node> = self.storage.list("/registry/nodes/").await?;
+        let mut used = HashSet::new();
+        for n in &nodes {
+            let Some(spec) = n.spec.as_ref() else {
+                continue;
+            };
+            if let Some(c) = spec.pod_cidr.as_deref() {
+                node_ipam::add_used(c, &mut used);
+            }
+            for c in spec.pod_cidrs.iter().flatten() {
+                node_ipam::add_used(c, &mut used);
+            }
+        }
+
+        let Some(subnet) = node_ipam::next_free_pod_cidr(cfg, &used) else {
+            warn!(
+                "pod CIDR range {} exhausted; cannot allocate podCIDR for node {}",
+                cfg.cluster_cidr, node.metadata.name
+            );
+            return Ok(());
+        };
+
+        // Re-fetch and write under the latest revision; re-check in case a
+        // concurrent actor set the CIDR between our list and this update.
+        let key = build_key("nodes", None, &node.metadata.name);
+        let mut updated: Node = self.storage.get(&key).await?;
+        let spec = updated
+            .spec
+            .get_or_insert(rusternetes_common::resources::NodeSpec {
+                pod_cidr: None,
+                pod_cidrs: None,
+                provider_id: None,
+                unschedulable: None,
+                taints: None,
+            });
+        if spec.pod_cidr.is_some() {
+            return Ok(());
+        }
+        let cidr = subnet.to_string();
+        spec.pod_cidr = Some(cidr.clone());
+        spec.pod_cidrs = Some(vec![cidr.clone()]);
+        self.storage.update(&key, &updated).await?;
+        info!("Allocated podCIDR {} to node {}", cidr, node.metadata.name);
+        Ok(())
+    }
+
     /// Reconcile a single node
     async fn reconcile_node(&self, node: &Node) -> Result<()> {
         let node_name = &node.metadata.name;
+
+        // Allocate spec.podCIDR before anything else (and before the startup
+        // grace period below) — CNIs like flannel derive their per-node subnet
+        // from it the moment the node registers, independent of readiness.
+        self.ensure_pod_cidr(node).await?;
 
         // Don't change node conditions during startup grace period (K8s: nodeStartupGracePeriod = 60s)
         let first_seen_time = {
@@ -1017,5 +1105,76 @@ mod tests {
         };
 
         assert!(!controller.is_node_ready(&node_not_ready));
+    }
+
+    #[tokio::test]
+    async fn ensure_pod_cidr_allocates_and_is_idempotent() {
+        let storage = Arc::new(MemoryStorage::new());
+        let cfg = NodeIpamConfig::new("10.244.0.0/16", 24).unwrap();
+        let controller = NodeController::new(storage.clone()).with_node_ipam(cfg);
+
+        let n1 = Node::new("node-1");
+        let n2 = Node::new("node-2");
+        storage
+            .create(&build_key("nodes", None, "node-1"), &n1)
+            .await
+            .unwrap();
+        storage
+            .create(&build_key("nodes", None, "node-2"), &n2)
+            .await
+            .unwrap();
+
+        // First node gets the lowest /24; the second the next, non-overlapping.
+        controller.ensure_pod_cidr(&n1).await.unwrap();
+        let stored1: Node = storage
+            .get(&build_key("nodes", None, "node-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored1.spec.as_ref().unwrap().pod_cidr.as_deref(),
+            Some("10.244.0.0/24")
+        );
+        assert_eq!(
+            stored1.spec.as_ref().unwrap().pod_cidrs.as_deref(),
+            Some(["10.244.0.0/24".to_string()].as_slice())
+        );
+
+        controller.ensure_pod_cidr(&n2).await.unwrap();
+        let stored2: Node = storage
+            .get(&build_key("nodes", None, "node-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored2.spec.as_ref().unwrap().pod_cidr.as_deref(),
+            Some("10.244.1.0/24")
+        );
+
+        // Re-running keeps the existing allocation (occupy, not reallocate).
+        controller.ensure_pod_cidr(&stored1).await.unwrap();
+        let again: Node = storage
+            .get(&build_key("nodes", None, "node-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            again.spec.as_ref().unwrap().pod_cidr.as_deref(),
+            Some("10.244.0.0/24")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_pod_cidr_noop_when_ipam_disabled() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = NodeController::new(storage.clone());
+        let n = Node::new("node-1");
+        storage
+            .create(&build_key("nodes", None, "node-1"), &n)
+            .await
+            .unwrap();
+        controller.ensure_pod_cidr(&n).await.unwrap();
+        let stored: Node = storage
+            .get(&build_key("nodes", None, "node-1"))
+            .await
+            .unwrap();
+        assert!(stored.spec.is_none() || stored.spec.unwrap().pod_cidr.is_none());
     }
 }

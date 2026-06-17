@@ -341,6 +341,9 @@ async fn async_main() -> Result<()> {
         sync_interval: args.sync_interval,
         metrics_config,
         ca_cert_pem: cm_ca_pem,
+        // All-in-one does not expose node-IPAM flags; pod-CIDR allocation is a
+        // multi-node compose concern (flannel stack runs the standalone CM).
+        node_ipam: None,
     };
     // The controller-manager reaches cluster state through the embedded
     // api-server over the same loopback client as scheduler/DNS (#1128),
