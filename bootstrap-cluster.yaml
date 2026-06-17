@@ -83,3 +83,49 @@ spec:
   - name: metrics
     port: 9153
     protocol: TCP
+---
+# RBAC for the in-cluster scheduler (#1129).
+#
+# generate-certs.sh emits a CN=system:kube-scheduler / O=system:kube-scheduler
+# client cert + scheduler.conf; with --client-ca-file set, the api-server now
+# maps that verified cert to user `system:kube-scheduler` (group
+# `system:kube-scheduler`) via x509 authn. These objects grant that user the
+# verbs the scheduler actually issues.
+#
+# Seeded unconditionally: harmless (inert) while the api-server runs with
+# --skip-auth (the authorizer is bypassed), and already in place the day
+# --skip-auth is dropped. Minimal set — narrower than upstream's
+# system:kube-scheduler ClusterRole; widen here as the scheduler grows.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:kube-scheduler
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/binding"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["pods/status"]
+  verbs: ["update"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:kube-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-scheduler
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: system:kube-scheduler

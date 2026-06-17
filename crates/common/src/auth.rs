@@ -447,6 +447,28 @@ impl UserInfo {
             extra: std::collections::HashMap::new(),
         }
     }
+
+    /// Build a user from a verified client certificate's parsed identity,
+    /// mirroring upstream's `CommonNameUserConversion`
+    /// (staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go):
+    /// the Subject CommonName becomes the username and each Subject
+    /// Organization becomes a group. The union authenticator then layers on the
+    /// `system:authenticated` group (group.NewAuthenticatedGroupAdder), which we
+    /// add here. UID is left empty — x509 carries no stable UID upstream.
+    ///
+    /// Callers MUST only invoke this for a certificate the TLS layer already
+    /// verified against the configured client CA; this function does no
+    /// verification of its own.
+    pub fn from_cert_identity(common_name: &str, organizations: &[String]) -> Self {
+        let mut groups: Vec<String> = organizations.to_vec();
+        groups.push("system:authenticated".to_string());
+        Self {
+            username: common_name.to_string(),
+            uid: String::new(),
+            groups,
+            extra: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// Bootstrap Token Manager for node authentication
@@ -947,6 +969,43 @@ mod tests {
         assert_eq!(user.username, "admin");
         assert!(user.groups.contains(&"system:masters".to_string()));
         assert!(user.groups.contains(&"system:authenticated".to_string()));
+    }
+
+    #[test]
+    fn test_user_info_from_cert_identity() {
+        // CommonNameUserConversion parity: CN → username, each O → group, plus
+        // the union authenticator's system:authenticated; x509 carries no UID.
+        let user = UserInfo::from_cert_identity(
+            "system:kube-scheduler",
+            &["system:kube-scheduler".to_string()],
+        );
+        assert_eq!(user.username, "system:kube-scheduler");
+        assert!(user.uid.is_empty());
+        assert!(user.groups.contains(&"system:kube-scheduler".to_string()));
+        assert!(user.groups.contains(&"system:authenticated".to_string()));
+    }
+
+    #[test]
+    fn test_user_info_from_cert_identity_multiple_orgs() {
+        // Each Subject Organization maps to its own group, in order, followed by
+        // system:authenticated.
+        let user = UserInfo::from_cert_identity("dave", &["dev".to_string(), "ops".to_string()]);
+        assert_eq!(
+            user.groups,
+            vec![
+                "dev".to_string(),
+                "ops".to_string(),
+                "system:authenticated".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_user_info_from_cert_identity_no_orgs() {
+        // No Organization → only the system:authenticated group is present.
+        let user = UserInfo::from_cert_identity("dave", &[]);
+        assert_eq!(user.username, "dave");
+        assert_eq!(user.groups, vec!["system:authenticated".to_string()]);
     }
 
     #[test]

@@ -25,3 +25,7 @@ prost.workspace = true
 base64 = "0.22"
 bytes = "1.5"
 http-body = "1"
+x509-parser = { workspace = true } # parse verified client-cert subject (CN→user / O→groups, #1129)
+
+[dev-dependencies]
+rcgen = { workspace = true } # generate client certs with custom CN/O for x509-authn tests
