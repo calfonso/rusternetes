@@ -117,16 +117,43 @@ pub struct NFSVolumeSource {
     pub read_only: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ISCSIVolumeSource {
     pub target_portal: String,
     pub iqn: String,
     pub lun: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub iscsi_interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// iSCSI Target Portal List (other than the primary target_portal)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portals: Option<Vec<String>>,
+    /// whether to support iSCSI Discovery CHAP authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chap_auth_discovery: Option<bool>,
+    /// whether to support iSCSI Session CHAP authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chap_auth_session: Option<bool>,
+    /// CHAP Secret for iSCSI target and initiator authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<SecretReference>,
+    /// custom iSCSI Initiator Name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiator_name: Option<String>,
+}
+
+/// SecretReference represents a Secret reference by name and namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretReference {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,7 +164,7 @@ pub struct LocalVolumeSource {
     pub fs_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CSIVolumeSource {
     pub driver: String,
@@ -149,6 +176,18 @@ pub struct CSIVolumeSource {
     pub fs_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_attributes: Option<HashMap<String, String>>,
+
+    // CSIPersistentVolumeSource secret references (PersistentVolume csi source).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_publish_secret_ref: Option<SecretReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_stage_secret_ref: Option<SecretReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_publish_secret_ref: Option<SecretReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_expand_secret_ref: Option<SecretReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_expand_secret_ref: Option<SecretReference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

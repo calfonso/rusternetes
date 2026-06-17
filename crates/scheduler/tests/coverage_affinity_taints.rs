@@ -245,6 +245,7 @@ fn pod_with_required_pod_affinity(
                 label_selector: selector,
                 namespaces,
                 topology_key: topology_key.to_string(),
+                ..Default::default()
             }]),
             preferred_during_scheduling_ignored_during_execution: None,
         }),
@@ -276,6 +277,7 @@ fn pod_with_preferred_pod_affinity(
                         label_selector: selector,
                         namespaces: None,
                         topology_key: topology_key.to_string(),
+                        ..Default::default()
                     },
                 },
             ]),
@@ -300,6 +302,7 @@ fn pod_with_required_anti_affinity(name: &str, selector: LabelSelector, topology
                 label_selector: selector,
                 namespaces: None,
                 topology_key: topology_key.to_string(),
+                ..Default::default()
             }]),
             preferred_during_scheduling_ignored_during_execution: None,
         }),
@@ -331,6 +334,7 @@ fn pod_with_preferred_anti_affinity(
                         label_selector: selector,
                         namespaces: None,
                         topology_key: topology_key.to_string(),
+                        ..Default::default()
                     },
                 },
             ]),
@@ -1159,6 +1163,7 @@ fn pod_anti_affinity_preferred_multiple_terms_accumulate() {
                         label_selector: label_sel(&[("app", "db")]),
                         namespaces: None,
                         topology_key: "kubernetes.io/hostname".to_string(),
+                        ..Default::default()
                     },
                 },
                 WeightedPodAffinityTerm {
@@ -1167,6 +1172,7 @@ fn pod_anti_affinity_preferred_multiple_terms_accumulate() {
                         label_selector: label_sel(&[("tier", "backend")]),
                         namespaces: None,
                         topology_key: "kubernetes.io/hostname".to_string(),
+                        ..Default::default()
                     },
                 },
             ]),

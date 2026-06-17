@@ -93,7 +93,7 @@ pub struct EndpointPort {
 }
 
 /// EndpointReference contains enough information to let you identify the referenced object.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointReference {
     /// Kind of the referent.
@@ -111,4 +111,17 @@ pub struct EndpointReference {
     /// UID of the referent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+
+    /// API version of the referent.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "apiVersion")]
+    pub api_version: Option<String>,
+
+    /// Specific resourceVersion to which this reference is made, if any.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "resourceVersion")]
+    pub resource_version: Option<String>,
+
+    /// If referring to a piece of an object instead of an entire object, this
+    /// string should contain a valid JSON/Go field access statement.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fieldPath")]
+    pub field_path: Option<String>,
 }

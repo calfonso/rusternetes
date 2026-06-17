@@ -156,6 +156,7 @@ fn create_test_cronjob(name: &str, namespace: &str, schedule: &str) -> CronJob {
                                 tty: None,
                                 env_from: None,
                                 volume_devices: None,
+                                ..Default::default()
                             }],
                             init_containers: None,
                             restart_policy: Some("Never".to_string()),
@@ -196,6 +197,7 @@ fn create_test_cronjob(name: &str, namespace: &str, schedule: &str) -> CronJob {
                             os: None,
                             scheduling_gates: None,
                             resources: None,
+                            ..Default::default()
                         },
                     },
                     selector: None,

@@ -65,6 +65,7 @@ fn pod_with_hostport(
                 stdin: None,
                 stdin_once: None,
                 tty: None,
+                ..Default::default()
             }],
             ..PodSpec::default()
         }),

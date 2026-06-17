@@ -50,6 +50,7 @@ fn create_minimal_pod(name: &str, namespace: &str) -> Pod {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             volumes: None,
@@ -90,6 +91,7 @@ fn create_minimal_pod(name: &str, namespace: &str) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

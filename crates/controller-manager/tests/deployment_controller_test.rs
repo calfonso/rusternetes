@@ -98,6 +98,7 @@ fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Deploym
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     restart_policy: Some("Always".to_string()),
@@ -138,6 +139,7 @@ fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Deploym
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             strategy: None,

@@ -72,6 +72,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             },
         }
     }
@@ -96,6 +97,7 @@ mod tests {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         }
     }
 

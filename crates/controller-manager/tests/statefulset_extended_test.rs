@@ -65,6 +65,7 @@ fn empty_pod_spec(image: &str, container_name: &str) -> PodSpec {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }],
         init_containers: None,
         restart_policy: Some("Always".to_string()),
@@ -105,6 +106,7 @@ fn empty_pod_spec(image: &str, container_name: &str) -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     }
 }
 
@@ -1160,6 +1162,7 @@ async fn statefulset_propagates_init_containers_in_order() {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         },
         Container {
             name: "init-schema".to_string(),
@@ -1186,6 +1189,7 @@ async fn statefulset_propagates_init_containers_in_order() {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         },
     ]);
 

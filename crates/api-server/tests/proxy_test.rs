@@ -200,6 +200,7 @@ async fn test_proxy_pod_missing_ip() {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Pending),
@@ -219,6 +220,7 @@ async fn test_proxy_pod_missing_ip() {
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         }),
     };
 
@@ -329,6 +331,7 @@ async fn test_proxy_pod_named_port_storage_round_trip() {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Running),
@@ -350,6 +353,7 @@ async fn test_proxy_pod_named_port_storage_round_trip() {
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         }),
     };
 

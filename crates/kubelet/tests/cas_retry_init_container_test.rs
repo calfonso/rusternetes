@@ -257,6 +257,7 @@ fn make_pod_with_inits(name: &str, namespace: &str) -> Pod {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: Some(vec![
                 Container {
@@ -288,6 +289,7 @@ fn make_pod_with_inits(name: &str, namespace: &str) -> Pod {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 },
                 Container {
                     name: "init-2".to_string(),
@@ -318,6 +320,7 @@ fn make_pod_with_inits(name: &str, namespace: &str) -> Pod {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 },
             ]),
             ephemeral_containers: None,
@@ -358,6 +361,7 @@ fn make_pod_with_inits(name: &str, namespace: &str) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Pending),
@@ -377,6 +381,7 @@ fn make_pod_with_inits(name: &str, namespace: &str) -> Pod {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         }),
     }
 }

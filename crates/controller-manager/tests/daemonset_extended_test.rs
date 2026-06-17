@@ -57,6 +57,7 @@ fn empty_pod_spec(image: &str, container_name: &str) -> PodSpec {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }],
         init_containers: None,
         restart_policy: Some("Always".to_string()),
@@ -97,6 +98,7 @@ fn empty_pod_spec(image: &str, container_name: &str) -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     }
 }
 
@@ -1196,6 +1198,7 @@ async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
                 },
                 namespaces: Some(vec![ns.to_string()]),
                 topology_key: "kubernetes.io/hostname".to_string(),
+                ..Default::default()
             }]),
             preferred_during_scheduling_ignored_during_execution: None,
         }),

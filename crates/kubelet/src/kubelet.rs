@@ -2862,6 +2862,7 @@ impl Kubelet {
                                 nominated_node_name: None,
                                 qos_class: Some(qos),
                                 start_time: Some(chrono::Utc::now()),
+                                ..Default::default()
                             });
 
                             if let Err(e) = self.storage.update_status(&key, &new_pod).await {
@@ -3057,6 +3058,7 @@ impl Kubelet {
                                     nominated_node_name: None,
                                     qos_class: Some(qos),
                                     start_time: Some(chrono::Utc::now()),
+                                    ..Default::default()
                                 });
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
@@ -3214,6 +3216,7 @@ impl Kubelet {
                                     nominated_node_name: None,
                                     qos_class: Some(qos),
                                     start_time: Some(chrono::Utc::now()),
+                                    ..Default::default()
                                 });
 
                                 if let Err(e) = self.storage.update_status(&key, &new_pod).await {
@@ -3345,6 +3348,7 @@ impl Kubelet {
                         nominated_node_name: None,
                         qos_class: Some(qos),
                         start_time: Some(chrono::Utc::now()),
+                        ..Default::default()
                     });
 
                     // Use non-fatal update: if the write fails (e.g., concurrency conflict),
@@ -3727,6 +3731,7 @@ impl Kubelet {
                                     restart_policy: None,
                                     resize_policy: None,
                                     volume_devices: None,
+                                    ..Default::default()
                                 };
                                 let volume_paths = self
                                     .runtime
@@ -3926,6 +3931,7 @@ impl Kubelet {
                                             nominated_node_name: None,
                                             qos_class: None,
                                             start_time: None,
+                                            ..Default::default()
                                         });
                                     }
 
@@ -5534,6 +5540,7 @@ mod tests {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }
     }
 
@@ -5589,6 +5596,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         }
@@ -5639,6 +5647,7 @@ mod tests {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         let status = pod.status.as_ref().unwrap();
@@ -5677,6 +5686,7 @@ mod tests {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         let status = pod.status.as_ref().unwrap();
@@ -5892,6 +5902,7 @@ mod tests {
             resize: Some("Proposed".to_string()),
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         let resize_status = pod
@@ -5929,6 +5940,7 @@ mod tests {
             resize: Some("InProgress".to_string()),
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         let resize_status = pod
@@ -5964,6 +5976,7 @@ mod tests {
             resize: Some("InProgress".to_string()),
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         // Simulate the kubelet marking resize as complete
@@ -6048,6 +6061,7 @@ mod tests {
             resize: Some("InProgress".to_string()),
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         // Simulate the kubelet logic: after successful resize, populate allocatedResources
@@ -6122,6 +6136,7 @@ mod tests {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         let resize_status = pod
@@ -6169,6 +6184,7 @@ mod tests {
             resize: Some("Proposed".to_string()),
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
 
         // Step 1: API sets resize="Proposed"
@@ -6300,6 +6316,7 @@ mod tests {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
         pod
     }

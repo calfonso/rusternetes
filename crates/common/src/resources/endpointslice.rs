@@ -108,6 +108,7 @@ impl EndpointSlice {
                             uid: tr.uid.clone(),
                             resource_version: None,
                             field_path: None,
+                            ..Default::default()
                         }),
                         node_name: addr.node_name.clone(),
                         zone: None,
@@ -135,6 +136,7 @@ impl EndpointSlice {
                             uid: tr.uid.clone(),
                             resource_version: None,
                             field_path: None,
+                            ..Default::default()
                         }),
                         node_name: addr.node_name.clone(),
                         zone: None,
@@ -252,12 +254,16 @@ pub struct EndpointPort {
 }
 
 /// EndpointReference contains enough information to let you identify the referenced object.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointReference {
     /// Kind of the referent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+
+    /// API version of the referent.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "apiVersion")]
+    pub api_version: Option<String>,
 
     /// Namespace of the referent.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -49,6 +49,7 @@ fn empty_pod_spec() -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     }
 }
 

@@ -36,6 +36,7 @@ fn create_pod_with_init_containers(name: &str, init_count: usize, app_count: usi
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         });
     }
 
@@ -66,6 +67,7 @@ fn create_pod_with_init_containers(name: &str, init_count: usize, app_count: usi
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         });
     }
 
@@ -116,6 +118,7 @@ fn create_pod_with_init_containers(name: &str, init_count: usize, app_count: usi
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }
@@ -184,6 +187,7 @@ fn test_init_container_status_sequence() {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     });
 
     let status = pod.status.as_ref().unwrap();
@@ -292,6 +296,7 @@ fn test_init_containers_completed_app_starting() {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     });
 
     let status = pod.status.as_ref().unwrap();
@@ -370,6 +375,7 @@ fn test_init_container_failure_blocks_app() {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     });
 
     let status = pod.status.as_ref().unwrap();
@@ -439,6 +445,7 @@ fn test_init_container_restart_count() {
         resource_claim_statuses: None,
         observed_generation: None,
         conditions: None,
+        ..Default::default()
     });
 
     let status = pod.status.as_ref().unwrap();

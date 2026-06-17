@@ -329,6 +329,7 @@ mod tests {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 }],
                 restart_policy: None,
                 node_selector: None,
@@ -368,6 +369,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: Some(PodStatus {
                 phase: Some(match phase {
@@ -393,6 +395,7 @@ mod tests {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         }
     }

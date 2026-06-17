@@ -37,6 +37,7 @@ fn create_running_pod(name: &str) -> Pod {
                 tty: None,
                 env_from: None,
                 volume_devices: None,
+                ..Default::default()
             }],
             init_containers: None,
             ephemeral_containers: None,
@@ -77,6 +78,7 @@ fn create_running_pod(name: &str) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: Some(PodStatus {
             phase: Some(Phase::Running),
@@ -114,6 +116,7 @@ fn create_running_pod(name: &str) -> Pod {
             resource_claim_statuses: None,
             observed_generation: None,
             conditions: None,
+            ..Default::default()
         }),
     }
 }
@@ -139,6 +142,7 @@ fn create_ephemeral_container(name: &str, target_container: Option<&str>) -> Eph
         resources: None,
         termination_message_path: None,
         termination_message_policy: None,
+        ..Default::default()
     }
 }
 
@@ -413,6 +417,7 @@ fn test_ephemeral_container_tty_and_stdin() {
         resources: None,
         termination_message_path: None,
         termination_message_policy: None,
+        ..Default::default()
     };
 
     assert_eq!(ephemeral.stdin, Some(true));

@@ -71,6 +71,7 @@ fn create_test_job(name: &str, namespace: &str, completions: i32, parallelism: i
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     restart_policy: Some("Never".to_string()),
@@ -111,6 +112,7 @@ fn create_test_job(name: &str, namespace: &str, completions: i32, parallelism: i
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             selector: None,
@@ -222,6 +224,7 @@ async fn test_job_completion_detection() {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
         let pod_key = build_key("pods", Some("default"), &pod.metadata.name);
         storage.update(&pod_key, &updated_pod).await.unwrap();
@@ -280,6 +283,7 @@ async fn test_job_creates_more_pods_as_they_complete() {
         resize: None,
         resource_claim_statuses: None,
         observed_generation: None,
+        ..Default::default()
     });
     let pod_key = build_key("pods", Some("default"), &pod_to_complete.metadata.name);
     storage.update(&pod_key, &updated_pod).await.unwrap();
@@ -329,6 +333,7 @@ async fn test_job_backoff_limit() {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
         let pod_key = build_key("pods", Some("default"), &pod.metadata.name);
         storage.update(&pod_key, &failed_pod).await.unwrap();
@@ -357,6 +362,7 @@ async fn test_job_backoff_limit() {
         resize: None,
         resource_claim_statuses: None,
         observed_generation: None,
+        ..Default::default()
     });
     let extra_key = build_key("pods", Some("default"), &extra_pod_name);
     storage.create(&extra_key, &extra_pod).await.unwrap();
@@ -410,6 +416,7 @@ async fn test_job_single_completion() {
         resize: None,
         resource_claim_statuses: None,
         observed_generation: None,
+        ..Default::default()
     });
     let pod_key = build_key("pods", Some("default"), &pod.metadata.name);
     storage.update(&pod_key, &pod).await.unwrap();

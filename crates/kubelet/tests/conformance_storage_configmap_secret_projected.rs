@@ -825,6 +825,7 @@ fn projected_configmap_should_be_consumable_from_pods() {
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -863,6 +864,7 @@ fn projected_configmap_should_be_consumable_with_mappings() {
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -894,6 +896,7 @@ fn projected_secret_should_be_consumable_from_pods() {
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -939,6 +942,7 @@ fn projected_secret_should_be_consumable_as_non_root_with_defaultmode_and_fsgrou
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: Some(0o440),
     };
@@ -987,6 +991,7 @@ fn projected_secret_should_be_consumable_with_mappings() {
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -1021,6 +1026,7 @@ fn projected_downwardapi_should_provide_podname_only() {
                 }]),
             }),
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -1065,6 +1071,7 @@ fn projected_downwardapi_should_set_defaultmode_on_files() {
                 }]),
             }),
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: Some(0o400),
     };
@@ -1106,6 +1113,7 @@ fn projected_downwardapi_should_set_mode_on_item_file() {
                 }]),
             }),
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: Some(0o644),
     };
@@ -1148,6 +1156,7 @@ fn projected_combined_should_project_all_components_into_same_directory() {
                 service_account_token: None,
                 downward_api: None,
                 cluster_trust_bundle: None,
+                ..Default::default()
             },
             VolumeProjection {
                 secret: Some(SecretProjection {
@@ -1159,6 +1168,7 @@ fn projected_combined_should_project_all_components_into_same_directory() {
                 service_account_token: None,
                 downward_api: None,
                 cluster_trust_bundle: None,
+                ..Default::default()
             },
             VolumeProjection {
                 secret: None,
@@ -1176,6 +1186,7 @@ fn projected_combined_should_project_all_components_into_same_directory() {
                     }]),
                 }),
                 cluster_trust_bundle: None,
+                ..Default::default()
             },
         ]),
         default_mode: None,
@@ -1210,6 +1221,7 @@ fn projected_serviceaccount_token_should_be_mounted_at_path() {
             }),
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -1247,6 +1259,7 @@ fn projected_secret_optional_missing_should_skip_source() {
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -1281,6 +1294,7 @@ fn projected_configmap_optional_missing_should_skip_source() {
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -1315,6 +1329,7 @@ fn projected_required_missing_configmap_should_error() {
             service_account_token: None,
             downward_api: None,
             cluster_trust_bundle: None,
+            ..Default::default()
         }]),
         default_mode: None,
     };
@@ -1425,6 +1440,7 @@ fn pod_volume_with_projected_source_preserves_sources_list() {
                         service_account_token: None,
                         downward_api: None,
                         cluster_trust_bundle: None,
+                        ..Default::default()
                     },
                     VolumeProjection {
                         secret: None,
@@ -1436,6 +1452,7 @@ fn pod_volume_with_projected_source_preserves_sources_list() {
                         service_account_token: None,
                         downward_api: None,
                         cluster_trust_bundle: None,
+                        ..Default::default()
                     },
                 ]),
                 default_mode: Some(0o644),

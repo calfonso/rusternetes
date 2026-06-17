@@ -97,6 +97,7 @@ fn make_container_req(cpu: &str, memory: &str) -> Container {
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 
@@ -137,6 +138,7 @@ fn make_container_with_port(
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 
@@ -1320,6 +1322,7 @@ fn resource_score_extended_resource_missing_scores_zero() {
             stdin: None,
             stdin_once: None,
             tty: None,
+            ..Default::default()
         };
         let spec = PodSpec {
             containers: vec![container],
@@ -1395,6 +1398,7 @@ fn resource_score_extended_resource_present_allows_scheduling() {
             stdin: None,
             stdin_once: None,
             tty: None,
+            ..Default::default()
         };
         let spec = PodSpec {
             containers: vec![container],

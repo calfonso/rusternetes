@@ -66,6 +66,7 @@ fn create_test_rc(name: &str, namespace: &str, replicas: i32) -> ReplicationCont
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     ephemeral_containers: None,
@@ -106,6 +107,7 @@ fn create_test_rc(name: &str, namespace: &str, replicas: i32) -> ReplicationCont
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             min_ready_seconds: Some(0),
@@ -565,6 +567,7 @@ async fn test_rc_multiple_containers() {
         tty: None,
         env_from: None,
         volume_devices: None,
+        ..Default::default()
     });
 
     let key = build_key(

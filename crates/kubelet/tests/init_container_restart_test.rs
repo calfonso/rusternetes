@@ -48,6 +48,7 @@ fn make_init(name: &str, restart_policy: Option<&str>) -> Container {
         tty: None,
         env_from: None,
         volume_devices: None,
+        ..Default::default()
     }
 }
 
@@ -105,6 +106,7 @@ fn make_pod(name: &str, restart_policy: &str, inits: Vec<Container>) -> Pod {
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }

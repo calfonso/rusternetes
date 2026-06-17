@@ -70,6 +70,7 @@ fn empty_pod_spec(image: &str, container_name: &str) -> PodSpec {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }],
         init_containers: None,
         restart_policy: Some("Always".to_string()),
@@ -110,6 +111,7 @@ fn empty_pod_spec(image: &str, container_name: &str) -> PodSpec {
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     }
 }
 

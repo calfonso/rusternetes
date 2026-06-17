@@ -116,9 +116,22 @@ pub struct IngressBackend {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<IngressServiceBackend>,
 
-    /// Resource is an ObjectRef to another Kubernetes resource
+    /// Resource is a reference to another Kubernetes resource backend
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<crate::resources::service_account::ObjectReference>,
+    pub resource: Option<TypedLocalObjectReference>,
+}
+
+/// TypedLocalObjectReference references a typed object in the same namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypedLocalObjectReference {
+    /// APIGroup of the referent. Empty/None for the core API group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_group: Option<String>,
+    /// Kind of the referent.
+    pub kind: String,
+    /// Name of the referent.
+    pub name: String,
 }
 
 /// IngressServiceBackend references a Kubernetes Service as a backend

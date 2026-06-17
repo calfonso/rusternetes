@@ -191,6 +191,7 @@ async fn test_volumeattachment_with_attach_error() {
         attach_error: Some(VolumeError {
             time: Some("2026-03-16T10:00:00Z".to_string()),
             message: Some("Failed to attach volume: volume not found".to_string()),
+            ..Default::default()
         }),
         detach_error: None,
     });
@@ -228,6 +229,7 @@ async fn test_volumeattachment_with_detach_error() {
         detach_error: Some(VolumeError {
             time: Some("2026-03-16T11:00:00Z".to_string()),
             message: Some("Failed to detach volume: device busy".to_string()),
+            ..Default::default()
         }),
     });
 

@@ -1430,6 +1430,7 @@ impl<S: Storage + 'static> JobController<S> {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         };
 
@@ -1583,6 +1584,7 @@ mod tests {
             tty: None,
             resize_policy: None,
             restart_policy: None,
+            ..Default::default()
         }
     }
 

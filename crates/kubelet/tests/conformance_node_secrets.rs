@@ -66,6 +66,7 @@ fn env_var_secret_key_ref_serializes_camel_case() {
             secret_key_ref: Some(SecretKeySelector {
                 name: "db-creds".to_string(),
                 key: "password".to_string(),
+                ..Default::default()
             }),
             config_map_key_ref: None,
             field_ref: None,

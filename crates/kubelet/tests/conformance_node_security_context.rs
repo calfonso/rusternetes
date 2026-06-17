@@ -54,6 +54,7 @@ fn container_with(sc: SecurityContext) -> Container {
         stdin: None,
         stdin_once: None,
         tty: None,
+        ..Default::default()
     }
 }
 

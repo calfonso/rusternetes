@@ -89,6 +89,7 @@ fn create_test_daemonset(name: &str, namespace: &str) -> DaemonSet {
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     restart_policy: Some("Always".to_string()),
@@ -129,6 +130,7 @@ fn create_test_daemonset(name: &str, namespace: &str) -> DaemonSet {
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             update_strategy: None,

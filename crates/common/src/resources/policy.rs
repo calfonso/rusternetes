@@ -364,10 +364,11 @@ pub struct PodDisruptionBudgetStatus {
 }
 
 /// PodDisruptionBudgetCondition contains details for the current condition of this PDB
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodDisruptionBudgetCondition {
     /// Type of PDB condition
+    #[serde(rename = "type")]
     pub condition_type: String,
 
     /// Status of the condition (True, False, Unknown)
@@ -384,6 +385,10 @@ pub struct PodDisruptionBudgetCondition {
     /// Human-readable message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+
+    /// observedGeneration represents the .metadata.generation the condition was based upon
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
 }
 
 #[cfg(test)]

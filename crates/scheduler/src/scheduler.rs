@@ -1047,6 +1047,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
+                ..Default::default()
             });
         }
 
@@ -1738,6 +1739,7 @@ mod tests {
                     tty: None,
                     resize_policy: None,
                     restart_policy: None,
+                    ..Default::default()
                 }],
                 scheduler_name: Some("default-scheduler".to_string()),
                 init_containers: None,
@@ -1778,6 +1780,7 @@ mod tests {
                 resource_claims: None,
                 host_users: None,
                 resources: None,
+                ..Default::default()
             }),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
@@ -1797,6 +1800,7 @@ mod tests {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         }
     }
@@ -2078,6 +2082,7 @@ mod tests {
             resize: None,
             resource_claim_statuses: None,
             observed_generation: None,
+            ..Default::default()
         });
         storage
             .create("/registry/pods/default/low-pod", &low_pod)

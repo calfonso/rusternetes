@@ -640,6 +640,7 @@ mod tests {
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }
     }
 
@@ -696,6 +697,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         }
@@ -1886,6 +1888,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         }
@@ -2073,6 +2076,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         };
@@ -2709,6 +2713,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         };
@@ -2796,6 +2801,7 @@ mod tests {
             nominated_node_name: None,
             qos_class: None,
             start_time: None,
+            ..Default::default()
         }
     }
 
@@ -3387,6 +3393,7 @@ mod tests {
                 termination_message_path: None,
                 termination_message_policy: None,
                 resources: None,
+                ..Default::default()
             },
             EphemeralContainer {
                 name: "logger".to_string(),
@@ -3411,6 +3418,7 @@ mod tests {
                 termination_message_path: None,
                 termination_message_policy: None,
                 resources: None,
+                ..Default::default()
             },
         ];
 
@@ -3459,6 +3467,7 @@ mod tests {
             termination_message_path: Some("/dev/termination-log".to_string()),
             termination_message_policy: Some("File".to_string()),
             resources: None,
+            ..Default::default()
         };
 
         let container = Container {
@@ -3486,6 +3495,7 @@ mod tests {
             restart_policy: None,
             resize_policy: None,
             volume_devices: None,
+            ..Default::default()
         };
 
         assert_eq!(container.name, "debugger");

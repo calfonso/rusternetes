@@ -45,6 +45,7 @@ fn make_container(name: &str, image: &str) -> Container {
         tty: None,
         env_from: None,
         volume_devices: None,
+        ..Default::default()
     }
 }
 
@@ -96,6 +97,7 @@ fn make_pod(name: &str, restart_policy: &str, init: Vec<Container>, app: Vec<Con
             os: None,
             scheduling_gates: None,
             resources: None,
+            ..Default::default()
         }),
         status: None,
     }
@@ -191,6 +193,7 @@ fn make_pod_status_succeeded(
         conditions: None,
         ephemeral_container_statuses: None,
         resource_claim_statuses: None,
+        ..Default::default()
     }
 }
 
@@ -1049,6 +1052,7 @@ fn new_ephemeral_container_detected_for_start() {
                 resources: None,
                 restart_policy: None,
                 resize_policy: None,
+                ..Default::default()
             }]),
             ..Default::default()
         }),
@@ -1123,6 +1127,7 @@ fn already_started_ephemeral_container_not_restarted() {
                 resources: None,
                 restart_policy: None,
                 resize_policy: None,
+                ..Default::default()
             }]),
             ..Default::default()
         }),

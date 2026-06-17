@@ -15,7 +15,7 @@ pub struct CSIDriver {
     pub spec: CSIDriverSpec,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CSIDriverSpec {
     /// attachRequired indicates this CSI volume driver requires an attach operation
@@ -56,6 +56,11 @@ pub struct CSIDriverSpec {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_allocatable_update_period_seconds: Option<i64>,
+
+    /// serviceAccountTokenInSecrets indicates tokens from tokenRequests are also
+    /// stored in a Secret accessible to the driver (k8s 1.35)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_account_token_in_secrets: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -220,7 +225,7 @@ pub struct VolumeAttachmentStatus {
     pub detach_error: Option<VolumeError>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeError {
     /// time the error was encountered
@@ -230,6 +235,10 @@ pub struct VolumeError {
     /// message is a string detailing the encountered error
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+
+    /// errorCode is a programmatic error code categorising the error (gRPC code)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<i32>,
 }
 
 /// CSIStorageCapacity stores the result of one CSI GetCapacity call
@@ -294,6 +303,7 @@ mod tests {
                 requires_republish: Some(false),
                 se_linux_mount: Some(false),
                 node_allocatable_update_period_seconds: None,
+                ..Default::default()
             },
         };
 

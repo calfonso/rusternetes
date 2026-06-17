@@ -75,6 +75,7 @@ fn make_statefulset(name: &str, namespace: &str, replicas: i32) -> StatefulSet {
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     restart_policy: Some("Always".to_string()),
@@ -115,6 +116,7 @@ fn make_statefulset(name: &str, namespace: &str, replicas: i32) -> StatefulSet {
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             service_name: format!("{}-headless", name),
@@ -235,6 +237,7 @@ async fn seed_pod(
             tty: None,
             env_from: None,
             volume_devices: None,
+            ..Default::default()
         }],
         init_containers: None,
         restart_policy: Some("Always".to_string()),
@@ -275,6 +278,7 @@ async fn seed_pod(
         os: None,
         scheduling_gates: None,
         resources: None,
+        ..Default::default()
     });
 
     storage.create(&pod_key, &pod).await.unwrap();

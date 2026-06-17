@@ -983,6 +983,7 @@ mod tests {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 }],
                 init_containers: None,
                 restart_policy: None,
@@ -1023,6 +1024,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: None,
         };
@@ -1084,6 +1086,7 @@ mod tests {
                     tty: None,
                     env_from: None,
                     volume_devices: None,
+                    ..Default::default()
                 }],
                 init_containers: None,
                 restart_policy: None,
@@ -1124,6 +1127,7 @@ mod tests {
                 os: None,
                 scheduling_gates: None,
                 resources: None,
+                ..Default::default()
             }),
             status: Some(rusternetes_common::resources::PodStatus {
                 phase: Some(Phase::Running),
@@ -1143,6 +1147,7 @@ mod tests {
                 resize: None,
                 resource_claim_statuses: None,
                 observed_generation: None,
+                ..Default::default()
             }),
         };
 

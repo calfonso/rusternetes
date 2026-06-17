@@ -84,6 +84,7 @@ fn create_test_statefulset(name: &str, namespace: &str, replicas: i32) -> Statef
                         tty: None,
                         env_from: None,
                         volume_devices: None,
+                        ..Default::default()
                     }],
                     init_containers: None,
                     restart_policy: Some("Always".to_string()),
@@ -124,6 +125,7 @@ fn create_test_statefulset(name: &str, namespace: &str, replicas: i32) -> Statef
                     os: None,
                     scheduling_gates: None,
                     resources: None,
+                    ..Default::default()
                 },
             },
             service_name: format!("{}-headless", name),
