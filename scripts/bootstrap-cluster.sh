@@ -58,6 +58,67 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# --- control-plane image resolution ----------------------------------------
+# The kube-scheduler / kube-controller-manager static pods AND the
+# rusternetes-dns Deployment run INSIDE the containerd CRI service, which keeps
+# its own image store (the `containerd-data` volume). That store is separate
+# from the docker/podman daemon `compose build`/`compose pull` write to, so the
+# images must be put there one of two ways:
+#
+#   * CI prebuilt path — CONTROL_PLANE_IMAGE_REGISTRY is set (the
+#     bring-up-cluster action exports ghcr.io/indyjonesnl/rusternetes when the
+#     GHCR pull succeeds). We template that registry ref + tag into the static
+#     pod manifests / dns Deployment and let imagePullPolicy: IfNotPresent make
+#     containerd pull from the registry itself (the packages are public).
+#
+#   * Local build path — registry unset. Images were built into the local
+#     docker/podman daemon as rusternetes-<component>:latest, which the separate
+#     containerd store cannot see, so we `save | ctr -n k8s.io images import`
+#     them over the CRI socket. Without this every static pod / dns pod fails
+#     with `pull access denied ... docker.io/library/rusternetes-*` (the kubelet
+#     falls back to docker.io for the unqualified local tag).
+CONTROL_PLANE_IMAGE_REGISTRY="${CONTROL_PLANE_IMAGE_REGISTRY:-}"
+CONTROL_PLANE_IMAGE_TAG="${RUSTERNETES_IMAGE_TAG:-main}"
+CONTAINERD_SERVICE_CONTAINER="${CONTAINERD_SERVICE_CONTAINER:-rusternetes-containerd}"
+
+# Resolve the image ref for an in-containerd component (scheduler,
+# controller-manager, dns): GHCR ref on the prebuilt path, local :latest tag
+# otherwise.
+resolve_cluster_image() {
+    local component="$1"
+    if [ -n "$CONTROL_PLANE_IMAGE_REGISTRY" ]; then
+        echo "${CONTROL_PLANE_IMAGE_REGISTRY}/${component}:${CONTROL_PLANE_IMAGE_TAG}"
+    else
+        echo "rusternetes-${component}:latest"
+    fi
+}
+
+# Import a locally-built image into the containerd CRI service's image store so
+# imagePullPolicy: IfNotPresent resolves it without a registry round-trip. No-op
+# when there is no separate containerd service (all-in-one stack) or the source
+# image was never built locally. `docker save` emits a docker-archive tarball
+# that `ctr images import` auto-detects; ctr normalizes the RepoTag
+# rusternetes-X:latest to docker.io/library/rusternetes-X:latest, the exact ref
+# the CRI ImageService resolves the unqualified pod-spec name to, so the lookup
+# matches.
+import_image_into_containerd() {
+    local image="$1"
+    if ! $CONTAINER_RT inspect "$CONTAINERD_SERVICE_CONTAINER" >/dev/null 2>&1; then
+        return 0   # all-in-one / no separate containerd service
+    fi
+    if ! $CONTAINER_RT image inspect "$image" >/dev/null 2>&1; then
+        print_warning "Local image $image not found — skipping containerd import (build it: $CONTAINER_RT compose --profile build build)"
+        return 0
+    fi
+    echo "  Importing $image into $CONTAINERD_SERVICE_CONTAINER (k8s.io namespace)..."
+    if $CONTAINER_RT save "$image" \
+        | $CONTAINER_RT exec -i "$CONTAINERD_SERVICE_CONTAINER" ctr -n k8s.io images import -; then
+        print_success "Imported $image into containerd"
+    else
+        print_warning "Failed to import $image into containerd — its pod may stay ImagePullBackOff"
+    fi
+}
+
 # Discover the Docker bridge gateway (always [subnet].1) so we can
 # bootstrap rusternetes-dns and other resources without hardcoding an IP.
 # Uses the discover-bridge-gateway helper; callers can override via
@@ -169,13 +230,26 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     for src in "$PROJECT_ROOT/manifests/control-plane/"*.yaml; do
         [ -e "$src" ] || continue
         dst="$PROJECT_ROOT/.rusternetes/manifests/$(basename "$src")"
-        sed "s|@CERTS_PATH@|${CERTS_PATH}|g" "$src" > "$dst"
+        # Derive the component (and thus the image) from the manifest name:
+        # kube-scheduler.yaml -> scheduler, kube-controller-manager.yaml ->
+        # controller-manager. resolve_cluster_image picks GHCR vs local :latest.
+        component="$(basename "$src" .yaml)"
+        component="${component#kube-}"
+        cp_image="$(resolve_cluster_image "$component")"
+        sed -e "s|@CERTS_PATH@|${CERTS_PATH}|g" \
+            -e "s|@CONTROL_PLANE_IMAGE@|${cp_image}|g" "$src" > "$dst"
         if [ -n "$node_ipam_args" ]; then
             sed -i "s|@NODE_IPAM_ARGS@|${node_ipam_args}|" "$dst"
         else
             sed -i '/@NODE_IPAM_ARGS@/d' "$dst"
         fi
-        echo "  $(basename "$src") -> $dst"
+        echo "  $(basename "$src") -> $dst (image: $cp_image)"
+        # Local build path: the image only exists in the docker/podman daemon —
+        # import it into the containerd CRI store so IfNotPresent resolves it.
+        # GHCR path: containerd pulls $cp_image itself, no import needed.
+        if [ -z "$CONTROL_PLANE_IMAGE_REGISTRY" ]; then
+            import_image_into_containerd "$cp_image"
+        fi
     done
     # Persist CERTS_PATH so a compose restart picks up the same mount path.
     if [ -f "$PROJECT_ROOT/.env" ] && grep -q '^CERTS_PATH=' "$PROJECT_ROOT/.env" 2>/dev/null; then
@@ -363,7 +437,17 @@ EOF
         $KUBECTL $KUBECTL_FLAGS delete endpointslice kube-dns-rusternetes -n kube-system 2>/dev/null \
             && echo "  Deleted stale kube-dns-rusternetes EndpointSlice" || true
 
-        $KUBECTL $KUBECTL_FLAGS apply -f "$PROJECT_ROOT/bootstrap-dns.yaml"
+        # The dns pod runs inside containerd too (same store problem as the
+        # static pods). Resolve its image: GHCR ref on the prebuilt path (swap
+        # the committed rusternetes-dns:latest literal), local :latest imported
+        # into containerd otherwise.
+        dns_image="$(resolve_cluster_image dns)"
+        echo "  rusternetes-dns image: $dns_image"
+        if [ -z "$CONTROL_PLANE_IMAGE_REGISTRY" ]; then
+            import_image_into_containerd "$dns_image"
+        fi
+        sed "s|image: rusternetes-dns:latest|image: ${dns_image}|" \
+            "$PROJECT_ROOT/bootstrap-dns.yaml" | $KUBECTL $KUBECTL_FLAGS apply -f -
 
         print_step "Waiting for the rusternetes-dns Deployment to be ready..."
         MAX_WAIT=60

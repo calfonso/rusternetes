@@ -43,7 +43,12 @@ spec:
     effect: NoSchedule
   containers:
   - name: kube-scheduler
-    image: rusternetes-scheduler:latest
+    # @CONTROL_PLANE_IMAGE@ is templated by bootstrap-cluster.sh: the local
+    # build path leaves rusternetes-scheduler:latest (imported into containerd
+    # from the docker/podman daemon), the CI prebuilt path swaps in the GHCR
+    # ref so the containerd CRI service pulls it directly. See
+    # bootstrap-cluster.sh "control-plane image resolution".
+    image: "@CONTROL_PLANE_IMAGE@"
     imagePullPolicy: IfNotPresent
     # The api-server runs with --skip-auth, so the kubeconfig only needs the CA
     # to validate the server's TLS cert (see scripts/generate-certs.sh). The

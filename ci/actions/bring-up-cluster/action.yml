@@ -176,24 +176,22 @@ runs:
         if [ -n "$IMAGE_TAG" ]; then
           export RUSTERNETES_IMAGE_TAG="$IMAGE_TAG"
           if docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml --profile build pull; then
-            # bootstrap-dns.yaml references rusternetes-dns:latest with
-            # imagePullPolicy IfNotPresent — retag the pulled GHCR image so
-            # the kubelet's local-image lookup finds it.
-            docker tag "ghcr.io/indyjonesnl/rusternetes/dns:$IMAGE_TAG" rusternetes-dns:latest
-            # Same problem for the control-plane STATIC PODS (landed 2026-06-12):
-            # manifests/control-plane/{kube-controller-manager,kube-scheduler}.yaml
-            # hardcode `image: rusternetes-{controller-manager,scheduler}:latest`
-            # with imagePullPolicy IfNotPresent. Under the GHCR overlay those
-            # local `:latest` names don't exist (images arrive as ghcr.io/.../*
-            # :$IMAGE_TAG), so the kubelet falls back to docker.io and 404s, the
-            # static pods never start, and the "Verify control-plane static pods
-            # are Running" step fails the whole bring-up (every workflow_run-
-            # triggered canary red since the static-pod control-plane landed).
-            # Retag both so IfNotPresent resolves locally, exactly like dns.
-            docker tag "ghcr.io/indyjonesnl/rusternetes/controller-manager:$IMAGE_TAG" rusternetes-controller-manager:latest
-            docker tag "ghcr.io/indyjonesnl/rusternetes/scheduler:$IMAGE_TAG" rusternetes-scheduler:latest
+            # The kube-scheduler / kube-controller-manager static pods and the
+            # rusternetes-dns Deployment run INSIDE the containerd CRI service
+            # (54bd2ee7, 2026-06-17), not as docker containers. containerd keeps
+            # its own image store, so the previous `docker tag ... :latest`
+            # retag on the docker daemon was invisible to it — the kubelet then
+            # fell back to docker.io for the unqualified local tag and 404'd
+            # with `pull access denied`, and "Verify control-plane static pods
+            # are Running" failed the whole bring-up.
+            #
+            # Fix: hand bootstrap-cluster.sh the GHCR registry + tag. It
+            # templates the registry ref into the static-pod manifests and the
+            # dns Deployment so containerd pulls them directly (the packages are
+            # public). No cross-daemon retag needed.
             echo "GHCR_OVERLAY=-f compose.ghcr.yml" >> "$GITHUB_ENV"
             echo "RUSTERNETES_IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+            echo "CONTROL_PLANE_IMAGE_REGISTRY=ghcr.io/indyjonesnl/rusternetes" >> "$GITHUB_ENV"
             echo "using prebuilt images: tag=$IMAGE_TAG"
             exit 0
           fi

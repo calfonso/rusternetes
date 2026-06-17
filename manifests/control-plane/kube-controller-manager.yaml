@@ -38,7 +38,12 @@ spec:
     effect: NoSchedule
   containers:
   - name: kube-controller-manager
-    image: rusternetes-controller-manager:latest
+    # @CONTROL_PLANE_IMAGE@ is templated by bootstrap-cluster.sh: the local
+    # build path leaves rusternetes-controller-manager:latest (imported into
+    # containerd from the docker/podman daemon), the CI prebuilt path swaps in
+    # the GHCR ref so the containerd CRI service pulls it directly. See
+    # bootstrap-cluster.sh "control-plane image resolution".
+    image: "@CONTROL_PLANE_IMAGE@"
     imagePullPolicy: IfNotPresent
     # API mode: every controller's Storage calls proxy to the api-server via
     # ApiStorage (no direct storage handle). The api-server runs with
