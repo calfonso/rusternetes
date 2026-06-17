@@ -80,6 +80,16 @@ services:
       # CRI socket from the containerd service: the api-server reads container
       # stats (metrics) and runs exec/logs over CRI, not the Docker socket.
       - containerd-run:/run/containerd
+      # Pod container logs. containerd (the CRI runtime) writes each container's
+      # stdout/stderr under ${KUBELET_VOLUMES_PATH}/pod-logs/<ns>_<pod>_<uid>/...
+      # (the kubelet's log_root). GET pods/<p>/log?follow=true is served by the
+      # api-server reading those files off the filesystem (see
+      # api-server/handlers/pod_subresources.rs::stream_container_logs), so it
+      # must see the same host dir at the SAME absolute path the CRI
+      # ContainerStatus.log_path reports. Without this the read fails and the
+      # follow stream RST_STREAMs (INTERNAL_ERROR), which is fatal to hydrophone
+      # — every conformance pod's log fetch died there. Read-only is enough.
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:ro
     environment:
       - RUST_LOG=info
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock

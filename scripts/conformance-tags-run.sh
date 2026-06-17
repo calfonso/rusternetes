@@ -170,6 +170,16 @@ run_phase() {
     info "  parallel : $threads"
     info "================================================================"
 
+    # Clear any leftover conformance namespace / clusterrole(binding) before
+    # deploying. hydrophone refuses to deploy into an existing `conformance`
+    # namespace ("namespace conformance already exists, please run with
+    # --cleanup first"), so a phase that died before its own teardown — e.g. an
+    # infra error mid-run — would otherwise cascade into the NEXT phase failing
+    # at deploy with a misleading "already exists". Make each phase
+    # self-contained instead of trusting the prior phase cleaned up.
+    info "[$label] pre-run cleanup (clear any leftover conformance namespace)..."
+    "$HYDROPHONE_BIN" --cleanup --kubeconfig "$KUBECONFIG_PATH" >/dev/null 2>&1 || true
+
     set +e
     "$HYDROPHONE_BIN" \
         --focus "$focus" \
