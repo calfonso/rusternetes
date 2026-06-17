@@ -21,6 +21,17 @@ inputs:
       action logs a warning and falls back to the local build.
     required: false
     default: ""
+  require-prebuilt:
+    description: >-
+      When "true" AND image-tag is set, a failed GHCR pull is a HARD ERROR
+      (exit 1) instead of a silent fall-back to the local build. Use this on
+      paths where the tag MUST exist — e.g. the canary's workflow_run trigger,
+      which fires right after "Publish images" succeeded for the exact sha, so
+      a missing sha-<head_sha> tag means the GHCR packages are still private
+      (the one-time visibility flip was forgotten) rather than a transient
+      miss. Default "false" keeps the pull-or-build fallback (#1108).
+    required: false
+    default: "false"
 outputs:
   kubeconfig:
     description: Path to the generated kubeconfig
@@ -152,6 +163,7 @@ runs:
       shell: bash
       env:
         IMAGE_TAG: ${{ inputs.image-tag }}
+        REQUIRE_PREBUILT: ${{ inputs.require-prebuilt }}
       run: |
         set -euo pipefail
         # Stamp the git SHA into the binaries (logged at startup) so a running
@@ -185,7 +197,30 @@ runs:
             echo "using prebuilt images: tag=$IMAGE_TAG"
             exit 0
           fi
+          # Pull failed. On require-prebuilt paths the tag MUST exist (publish
+          # just succeeded for this exact sha), so a miss means the GHCR
+          # packages are still private — hard-fail instead of silently
+          # compiling locally forever (#1108).
+          if [ "${REQUIRE_PREBUILT:-false}" = "true" ]; then
+            echo "::error::prebuilt images tag=$IMAGE_TAG not pullable on a require-prebuilt path — the 7 ghcr.io/indyjonesnl/rusternetes/* packages are likely still private (flip them to public, see PR #1106 checklist) or the publish did not push this tag. Refusing to fall back to a local build."
+            {
+              echo "### ❌ Prebuilt-image pull failed (hard error)"
+              echo
+              echo "Tag \`$IMAGE_TAG\` was not pullable and \`require-prebuilt\` is set."
+              echo "Most likely the \`ghcr.io/indyjonesnl/rusternetes/*\` packages are still **private** — flip them to public (one-time, PR #1106 post-merge checklist)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # Soft fallback path: surface the fallback in the job summary so a
+          # forgotten visibility flip is visible at a glance, not buried in the
+          # step log where it builds locally and stays green forever (#1108).
           echo "::warning::prebuilt images tag=$IMAGE_TAG not pullable — falling back to local build"
+          {
+            echo "### ⚠️ Prebuilt-image fallback: built locally"
+            echo
+            echo "Tag \`$IMAGE_TAG\` was not pullable, so images were **compiled locally**."
+            echo "If this persists, the \`ghcr.io/indyjonesnl/rusternetes/*\` packages may still be private (PR #1106 post-merge checklist)."
+          } >> "$GITHUB_STEP_SUMMARY"
         fi
         docker compose -f compose.sqlite.yml -f compose.dind.yml --profile build build --parallel
 
