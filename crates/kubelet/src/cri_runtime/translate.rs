@@ -178,10 +178,29 @@ fn pod_field_value(pod: &Pod, field_path: &str) -> Option<String> {
             .spec
             .as_ref()
             .and_then(|s| s.service_account_name.clone()),
-        "status.podIP" | "status.hostIP" => pod
-            .status
-            .as_ref()
-            .and_then(|st| st.pod_ip.clone().or_else(|| st.host_ip.clone())),
+        // podIP is the pod's own address; hostIP is the NODE's address. These
+        // are distinct — upstream returns `podIP` vs `hostIPs[0]` respectively
+        // (pkg/kubelet/kubelet_pods.go podFieldSelectorRuntimeValue). Returning
+        // one for the other broke pods that read status.hostIP via fieldRef.
+        "status.podIP" => pod.status.as_ref().and_then(|st| st.pod_ip.clone()),
+        "status.hostIP" => pod.status.as_ref().and_then(|st| st.host_ip.clone()),
+        // Dual-stack plural forms: comma-joined list (matches upstream).
+        "status.podIPs" => pod.status.as_ref().and_then(|st| {
+            st.pod_i_ps.as_ref().map(|ips| {
+                ips.iter()
+                    .map(|p| p.ip.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        }),
+        "status.hostIPs" => pod.status.as_ref().and_then(|st| {
+            st.host_i_ps.as_ref().map(|ips| {
+                ips.iter()
+                    .map(|h| h.ip.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        }),
         _ => None,
     }
 }
@@ -366,6 +385,47 @@ mod tests {
         pod.metadata.uid = "uid-123".to_string();
         pod.metadata.namespace = Some("prod".to_string());
         pod
+    }
+
+    #[test]
+    fn downward_api_pod_ip_and_host_ip_are_distinct() {
+        use rusternetes_common::resources::pod::{HostIP, PodIP, PodStatus};
+        let mut pod = pod_with(PodSpec {
+            node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+        pod.status = Some(PodStatus {
+            pod_ip: Some("10.244.0.7".to_string()),
+            host_ip: Some("172.20.0.5".to_string()),
+            pod_i_ps: Some(vec![PodIP {
+                ip: "10.244.0.7".to_string(),
+            }]),
+            host_i_ps: Some(vec![HostIP {
+                ip: "172.20.0.5".to_string(),
+            }]),
+            ..Default::default()
+        });
+        // podIP is the pod's address; hostIP is the node's — never conflated.
+        assert_eq!(
+            pod_field_value(&pod, "status.podIP").as_deref(),
+            Some("10.244.0.7")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "status.hostIP").as_deref(),
+            Some("172.20.0.5")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "status.podIPs").as_deref(),
+            Some("10.244.0.7")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "status.hostIPs").as_deref(),
+            Some("172.20.0.5")
+        );
+        assert_eq!(
+            pod_field_value(&pod, "spec.nodeName").as_deref(),
+            Some("node-1")
+        );
     }
 
     #[test]
