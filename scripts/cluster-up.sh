@@ -130,7 +130,23 @@ fi
 
 # kubelet needs an absolute host path for its volume mounts.
 export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-$PROJECT_ROOT/.rusternetes/volumes}"
-mkdir -p "$KUBELET_VOLUMES_PATH"
+
+# Pre-create every bind-mount host directory as the invoking user BEFORE the
+# first `compose up`. Docker/Podman create a missing bind-mount source as root,
+# and the non-root scripts that write into them afterwards then fail with
+# "Permission denied" with no sudo to repair it: bootstrap-cluster.sh templates
+# the control-plane static-pod YAML into .rusternetes/manifests, and
+# generate-certs.sh + the SA tooling write .rusternetes/certs. (#1152)
+ensure_writable_dir() {
+    local d="$1"
+    mkdir -p "$d" 2>/dev/null || true
+    if [[ ! -d "$d" || ! -w "$d" ]]; then
+        die "$d is not writable by $(id -un) — likely root-owned from a prior bare '${COMPOSE[*]} up'. Recover with: sudo chown -R \$USER:\$USER $PROJECT_ROOT/.rusternetes"
+    fi
+}
+ensure_writable_dir "$KUBELET_VOLUMES_PATH"
+ensure_writable_dir "$PROJECT_ROOT/.rusternetes/manifests"
+ensure_writable_dir "$PROJECT_ROOT/.rusternetes/certs"
 
 # ---- pick a bootstrap kubectl ---------------------------------------------
 # The in-tree kubectl currently drops --insecure-skip-tls-verify / the
