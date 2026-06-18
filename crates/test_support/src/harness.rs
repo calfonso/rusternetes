@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
 };
 use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
@@ -21,6 +21,11 @@ use tower::ServiceExt;
 
 /// A ready-to-drive api-server: the `MemoryStorage` backend (for direct seeding
 /// / assertions) plus the built router.
+///
+/// `Clone` is cheap and shares state: both the `Arc<MemoryStorage>` and the
+/// `axum::Router` clone to handles backed by the *same* storage, mirroring the
+/// `router.clone()` pattern the per-file harnesses used for repeated `oneshot`s.
+#[derive(Clone)]
 pub struct TestApiServer {
     pub storage: Arc<MemoryStorage>,
     pub router: axum::Router,
@@ -73,9 +78,48 @@ impl TestApiServer {
         content_type: Option<&str>,
         body: Option<Vec<u8>>,
     ) -> (StatusCode, Vec<u8>, Value) {
-        let mut builder = Request::builder().method(method).uri(uri);
+        let (status, _headers, bytes, value) =
+            self.send_full(method, uri, content_type, None, body).await;
+        (status, bytes, value)
+    }
+
+    /// Like [`send_bytes`](Self::send_bytes) but also lets the caller set a
+    /// `content-type` and/or `accept` request header and returns the response
+    /// [`HeaderMap`] — for tests that assert on response headers (e.g. strict-
+    /// decoding `Warning:` headers) or drive content negotiation (`Accept`).
+    /// For other request headers use [`send_with_headers`](Self::send_with_headers).
+    pub async fn send_full(
+        &self,
+        method: &str,
+        uri: &str,
+        content_type: Option<&str>,
+        accept: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>, Value) {
+        let mut headers: Vec<(&str, &str)> = Vec::new();
         if let Some(ct) = content_type {
-            builder = builder.header("content-type", ct);
+            headers.push(("content-type", ct));
+        }
+        if let Some(a) = accept {
+            headers.push(("accept", a));
+        }
+        self.send_with_headers(method, uri, &headers, body).await
+    }
+
+    /// Fullest primitive: send a request with an arbitrary set of request
+    /// headers and an optional raw body; returns status, the response
+    /// [`HeaderMap`], the raw body bytes, and the body parsed as JSON
+    /// (`Value::Null` if it isn't JSON).
+    pub async fn send_with_headers(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
         }
         let req = match body {
             Some(b) => builder.body(Body::from(b)).expect("build request"),
@@ -88,12 +132,13 @@ impl TestApiServer {
             .await
             .expect("router oneshot");
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read response body")
             .to_vec();
         let value = json_or_null(&bytes);
-        (status, bytes, value)
+        (status, headers, bytes, value)
     }
 
     /// As [`send_raw`](Self::send_raw) but drops the raw bytes.

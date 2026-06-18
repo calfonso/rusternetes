@@ -32,75 +32,46 @@
 //! `tower::ServiceExt::oneshot`. Same shape as
 //! `decoder_content_type_test.rs` and the `conformance_apimachinery_*` files.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "default";
 
 // ---------------------------------------------------------------------------
-// HTTP harness — inline, same pattern as `decoder_content_type_test.rs`.
+// HTTP harness — thin shims over the shared `TestApiServer`. `send_with_headers`
+// drives content negotiation (Accept / Accept-Encoding) and returns the
+// response `HeaderMap` so these tests can read the resulting Content-Type /
+// Content-Encoding. `mem` is the backing store for seeding GET targets.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
-}
-
-/// GET helper with an arbitrary list of request headers.
+/// GET helper with an arbitrary list of request headers. Returns
+/// `(status, response Content-Type, body bytes)`.
 async fn get_with_headers(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     headers: &[(&str, &str)],
 ) -> (StatusCode, String, Vec<u8>) {
-    let mut req = Request::builder().method(Method::GET).uri(uri);
-    for (k, v) in headers {
-        req = req.header(*k, *v);
-    }
-    let response = router
-        .oneshot(req.body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
+    let (status, header_map, bytes, _) = router.send_with_headers("GET", uri, headers, None).await;
+    let content_type = header_map
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, content_type, bytes.to_vec())
+    (status, content_type, bytes)
 }
 
 /// Convenience wrapper for the most common case: a single `Accept` header.
 async fn get_with_accept(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     accept: &str,
 ) -> (StatusCode, String, Vec<u8>) {
@@ -597,25 +568,19 @@ async fn accept_encoding_gzip_returns_identity() {
     let (mem, router) = spawn_router();
     seed_pod(&mem, "p-gz").await;
 
-    let mut req = Request::builder()
-        .method(Method::GET)
-        .uri("/api/v1/namespaces/default/pods/p-gz");
-    req = req.header("accept", "application/json");
-    req = req.header("accept-encoding", "gzip");
-    let response = router
-        .oneshot(req.body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let content_encoding = response
-        .headers()
+    let (status, header_map, bytes, _) = router
+        .send_with_headers(
+            "GET",
+            "/api/v1/namespaces/default/pods/p-gz",
+            &[("accept", "application/json"), ("accept-encoding", "gzip")],
+            None,
+        )
+        .await;
+    let content_encoding = header_map
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
 
     assert_eq!(status, StatusCode::OK);
     // Rusternetes does not compress; Content-Encoding header is either

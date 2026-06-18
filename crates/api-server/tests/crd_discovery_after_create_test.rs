@@ -26,65 +26,38 @@
 //!
 //! Harness mirrors `tests/conformance_apimachinery_crd_lifecycle.rs`.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-fn spawn_router() -> Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    build_router(state, None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
+/// Issue a request with an explicit `Accept` header (for aggregated-discovery
+/// content negotiation) and return `(status, parsed body)`.
 async fn send_accept(
-    router: &Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,
     accept: &str,
 ) -> (StatusCode, Value) {
-    let builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header("accept", accept);
-    let req = match body {
-        Some(v) => builder
-            .body(Body::from(serde_json::to_vec(v).unwrap()))
-            .unwrap(),
-        None => builder.body(Body::empty()).unwrap(),
-    };
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+    let bytes = body.map(|v| serde_json::to_vec(v).unwrap());
+    let (status, _headers, _bytes, value) = router
+        .send_full(
+            method.as_str(),
+            uri,
+            Some("application/json"),
+            Some(accept),
+            bytes,
+        )
+        .await;
+    (status, value)
 }
 
 async fn send(
-    router: &Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,

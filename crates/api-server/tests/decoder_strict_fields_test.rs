@@ -22,64 +22,44 @@
 //! Tests are named `test_field_validation_<mode>_<scenario>` per the unit
 //! brief.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_storage::memory::MemoryStorage;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `integration_dryrun_all_resources.rs:82-100`.
+// HTTP harness — thin shims over the shared `TestApiServer`. `send_raw` returns
+// the flattened response headers so the tests can assert on strict-decoding
+// `Warning:` headers; `send_full` exposes the response `HeaderMap`.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "fieldvalidation";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// Send a raw JSON byte body so we can exercise duplicate keys that would
 /// otherwise be normalized away by `serde_json::to_vec`.
 async fn send_raw(
-    router: Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     body: Vec<u8>,
 ) -> (StatusCode, Vec<(String, String)>, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let headers: Vec<(String, String)> = response
-        .headers()
+    let (status, header_map, _bytes, value) = router
+        .send_full(
+            method.as_str(),
+            uri,
+            Some("application/json"),
+            None,
+            Some(body),
+        )
+        .await;
+    let headers: Vec<(String, String)> = header_map
         .iter()
         .map(|(k, v)| {
             (
@@ -88,15 +68,11 @@ async fn send_raw(
             )
         })
         .collect();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, headers, v)
+    (status, headers, value)
 }
 
 async fn send_json(
-    router: Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     body: &Value,
