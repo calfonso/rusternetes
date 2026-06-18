@@ -19,89 +19,49 @@
 //! Harness mirrors `list_empty_items_router_test.rs`: `Arc<MemoryStorage>`,
 //! `AlwaysAllowAuthorizer` + `skip_auth=true`, one `oneshot` per request.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin shims over the shared `TestApiServer`, preserving this
+// file's `send(&state, method, uri, body, content_type)` call sites.
 // ---------------------------------------------------------------------------
 
-fn make_state() -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_value: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_value)
+fn make_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
 async fn send(
-    state: &Arc<ApiServerState>,
+    state: &TestApiServer,
     method: &str,
     uri: &str,
     body: Option<&Value>,
     content_type: &str,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    let req = match body {
-        Some(b) => {
-            builder = builder.header("content-type", content_type);
-            builder
-                .body(Body::from(serde_json::to_vec(b).unwrap()))
-                .unwrap()
-        }
-        None => builder.body(Body::empty()).unwrap(),
-    };
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
+    // Match the original: only attach a content-type header when there's a body.
+    let ct = body.map(|_| content_type);
+    state.send(method, uri, ct, body).await
 }
 
-async fn post_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
+async fn post_json(state: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
     send(state, "POST", uri, Some(body), "application/json").await
 }
 
-async fn put_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
+async fn put_json(state: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
     send(state, "PUT", uri, Some(body), "application/json").await
 }
 
-async fn get_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
+async fn get_json(state: &TestApiServer, uri: &str) -> (StatusCode, Value) {
     send(state, "GET", uri, None, "application/json").await
 }
 
-async fn delete(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
+async fn delete(state: &TestApiServer, uri: &str) -> (StatusCode, Value) {
     send(state, "DELETE", uri, None, "application/json").await
 }
 
 /// JSON-merge PATCH (Content-Type: application/merge-patch+json).
-async fn patch_merge(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
+async fn patch_merge(state: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
     send(
         state,
         "PATCH",
@@ -112,7 +72,7 @@ async fn patch_merge(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (S
     .await
 }
 
-async fn create_namespace(state: &Arc<ApiServerState>, ns: &str) {
+async fn create_namespace(state: &TestApiServer, ns: &str) {
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",

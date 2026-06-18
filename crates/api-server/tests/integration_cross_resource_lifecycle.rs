@@ -28,90 +28,43 @@
 //! `scan_and_collect()` between request phases. This mirrors the pattern
 //! in `crates/api-server/tests/e2e_inprocess_smoke_test.rs`.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
+use axum::http::{Method, StatusCode};
 use rusternetes_controller_manager::controllers::{
     garbage_collector::GarbageCollector, namespace::NamespaceController,
 };
-use rusternetes_storage::{
-    build_key, build_prefix, memory::MemoryStorage, Storage, StorageBackend,
-};
+use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `integration_dryrun_all_resources.rs:82-100`.
+// HTTP harness — thin shims over the shared `TestApiServer`. `mem` is the
+// backing store so the GC/namespace controllers drive it directly.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
-}
-
-async fn send_with_body(
-    router: axum::Router,
-    method: Method,
-    uri: &str,
-    body: Body,
-    content_type: Option<&str>,
-) -> (StatusCode, Value) {
-    let mut req = Request::builder().method(method).uri(uri);
-    if let Some(ct) = content_type {
-        req = req.header("content-type", ct);
-    }
-    let response = router.oneshot(req.body(body).unwrap()).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 async fn send_json(
-    router: axum::Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     body: &Value,
 ) -> (StatusCode, Value) {
-    send_with_body(
-        router,
-        method,
-        uri,
-        Body::from(serde_json::to_vec(body).unwrap()),
-        Some("application/json"),
-    )
-    .await
+    router
+        .send(method.as_str(), uri, Some("application/json"), Some(body))
+        .await
 }
 
-async fn send_get(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    send_with_body(router, Method::GET, uri, Body::empty(), None).await
+async fn send_get(router: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.get(uri).await
 }
 
-async fn send_delete(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    send_with_body(router, Method::DELETE, uri, Body::empty(), None).await
+async fn send_delete(router: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.delete(uri).await
 }
 
 async fn snapshot(mem: &Arc<MemoryStorage>, key: &str) -> Option<Value> {
@@ -257,7 +210,7 @@ async fn test_lifecycle_namespace_child_resources_visible() {
     let (mem, router) = spawn_router();
 
     let (status, body) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         &namespace_stub("test-ns"),
@@ -289,7 +242,7 @@ async fn test_lifecycle_namespace_child_resources_visible() {
         ),
     ];
     for (label, uri, body) in posts {
-        let (status, resp) = send_json(router.clone(), Method::POST, uri, &body).await;
+        let (status, resp) = send_json(&router, Method::POST, uri, &body).await;
         assert_success(label, status, &resp);
     }
 
@@ -299,7 +252,7 @@ async fn test_lifecycle_namespace_child_resources_visible() {
         ("secret", "/api/v1/namespaces/test-ns/secrets/secret-a"),
         ("service", "/api/v1/namespaces/test-ns/services/svc-a"),
     ] {
-        let (status, body) = send_get(router.clone(), uri).await;
+        let (status, body) = send_get(&router, uri).await;
         assert_success(&format!("GET {kind} at {uri}"), status, &body);
         assert_eq!(
             body["metadata"]["namespace"].as_str(),
@@ -309,7 +262,7 @@ async fn test_lifecycle_namespace_child_resources_visible() {
     }
 
     let (status, body) = send_get(
-        router.clone(),
+        &router,
         "/api/v1/namespaces/test-ns/pods?labelSelector=app%3Ddemo",
     )
     .await;
@@ -343,7 +296,7 @@ async fn test_lifecycle_cross_namespace_isolation() {
 
     for ns in ["ns-a", "ns-b"] {
         let (status, body) = send_json(
-            router.clone(),
+            &router,
             Method::POST,
             "/api/v1/namespaces",
             &namespace_stub(ns),
@@ -365,24 +318,23 @@ async fn test_lifecycle_cross_namespace_isolation() {
         ),
     ];
     for (label, uri, body) in posts {
-        let (status, resp) = send_json(router.clone(), Method::POST, uri, &body).await;
+        let (status, resp) = send_json(&router, Method::POST, uri, &body).await;
         assert_success(label, status, &resp);
     }
 
-    let (status, _) = send_get(router.clone(), "/api/v1/namespaces/ns-b/pods/foo").await;
+    let (status, _) = send_get(&router, "/api/v1/namespaces/ns-b/pods/foo").await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "pod foo must not be visible in ns-b, got {status}",
     );
 
-    let (status, body) = send_get(router.clone(), "/api/v1/namespaces/ns-a/pods/foo").await;
+    let (status, body) = send_get(&router, "/api/v1/namespaces/ns-a/pods/foo").await;
     assert_success("pod foo must be visible in ns-a", status, &body);
     assert_eq!(body["metadata"]["namespace"].as_str(), Some("ns-a"));
 
     for (ns, expected) in [("ns-a", vec!["foo"]), ("ns-b", vec!["bar"])] {
-        let (status, body) =
-            send_get(router.clone(), &format!("/api/v1/namespaces/{ns}/pods")).await;
+        let (status, body) = send_get(&router, &format!("/api/v1/namespaces/{ns}/pods")).await;
         assert_success(&format!("list {ns}/pods"), status, &body);
         let got = names(&body);
         assert_eq!(
@@ -405,7 +357,7 @@ async fn test_lifecycle_namespace_delete_marks_terminating_and_keeps_children() 
     let (mem, router) = spawn_router();
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         &namespace_stub("doomed-ns"),
@@ -414,7 +366,7 @@ async fn test_lifecycle_namespace_delete_marks_terminating_and_keeps_children() 
     assert_success("namespace POST", s, &b);
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces/doomed-ns/pods",
         &pod_stub("doomed-ns", "p", json!({})),
@@ -423,7 +375,7 @@ async fn test_lifecycle_namespace_delete_marks_terminating_and_keeps_children() 
     assert_success("pod POST", s, &b);
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces/doomed-ns/configmaps",
         &configmap_stub("doomed-ns", "c", json!({})),
@@ -431,7 +383,7 @@ async fn test_lifecycle_namespace_delete_marks_terminating_and_keeps_children() 
     .await;
     assert_success("configmap POST", s, &b);
 
-    let (status, body) = send_delete(router.clone(), "/api/v1/namespaces/doomed-ns").await;
+    let (status, body) = send_delete(&router, "/api/v1/namespaces/doomed-ns").await;
     assert_success("namespace DELETE", status, &body);
 
     let stored_ns = snapshot(&mem, &build_key("namespaces", None, "doomed-ns"))
@@ -493,7 +445,7 @@ async fn test_lifecycle_namespace_cascade_deletes_children() {
 
     // 1. POST namespace + 2. POST children (pod + configmap).
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         &namespace_stub("ns-c"),
@@ -502,7 +454,7 @@ async fn test_lifecycle_namespace_cascade_deletes_children() {
     assert_success("namespace POST", s, &b);
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces/ns-c/pods",
         &pod_stub("ns-c", "p", json!({})),
@@ -511,7 +463,7 @@ async fn test_lifecycle_namespace_cascade_deletes_children() {
     assert_success("pod POST", s, &b);
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces/ns-c/configmaps",
         &configmap_stub("ns-c", "c", json!({})),
@@ -521,7 +473,7 @@ async fn test_lifecycle_namespace_cascade_deletes_children() {
 
     // 3. DELETE namespace — api-server stamps deletionTimestamp +
     //    Terminating phase and keeps the `kubernetes` finalizer in place.
-    let (status, body) = send_delete(router.clone(), "/api/v1/namespaces/ns-c").await;
+    let (status, body) = send_delete(&router, "/api/v1/namespaces/ns-c").await;
     assert_success("namespace DELETE", status, &body);
 
     // 4. Tick the namespace controller. The controller's `reconcile_namespace`
@@ -553,7 +505,7 @@ async fn test_lifecycle_namespace_cascade_deletes_children() {
         ("pod", "/api/v1/namespaces/ns-c/pods/p"),
         ("configmap", "/api/v1/namespaces/ns-c/configmaps/c"),
     ] {
-        let (status, _) = send_get(router.clone(), uri).await;
+        let (status, _) = send_get(&router, uri).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
@@ -571,7 +523,7 @@ async fn test_lifecycle_namespace_cascade_deletes_children() {
     }
 
     // 6. Namespace itself is gone.
-    let (status, _) = send_get(router.clone(), "/api/v1/namespaces/ns-c").await;
+    let (status, _) = send_get(&router, "/api/v1/namespaces/ns-c").await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
@@ -593,7 +545,7 @@ async fn test_lifecycle_owner_foreground_deletion_marks_owner() {
     let (mem, router) = spawn_router();
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         &namespace_stub("gc-fg"),
@@ -602,7 +554,7 @@ async fn test_lifecycle_owner_foreground_deletion_marks_owner() {
     assert_success("namespace POST", s, &b);
 
     let (s, rs_body) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/apis/apps/v1/namespaces/gc-fg/replicasets",
         &replicaset_stub("gc-fg", "rs1"),
@@ -616,7 +568,7 @@ async fn test_lifecycle_owner_foreground_deletion_marks_owner() {
 
     for pod_name in ["pod-x", "pod-y"] {
         let (s, b) = send_json(
-            router.clone(),
+            &router,
             Method::POST,
             "/api/v1/namespaces/gc-fg/pods",
             &owned_pod_stub("gc-fg", pod_name, "ReplicaSet", "rs1", &owner_uid),
@@ -626,7 +578,7 @@ async fn test_lifecycle_owner_foreground_deletion_marks_owner() {
     }
 
     let (status, body) = send_delete(
-        router.clone(),
+        &router,
         "/apis/apps/v1/namespaces/gc-fg/replicasets/rs1?propagationPolicy=Foreground",
     )
     .await;
@@ -671,7 +623,7 @@ async fn test_lifecycle_owner_background_deletion_removes_owner() {
     let (mem, router) = spawn_router();
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         &namespace_stub("gc-bg"),
@@ -680,7 +632,7 @@ async fn test_lifecycle_owner_background_deletion_removes_owner() {
     assert_success("namespace POST", s, &b);
 
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/apis/apps/v1/namespaces/gc-bg/replicasets",
         &replicaset_stub("gc-bg", "rs2"),
@@ -689,7 +641,7 @@ async fn test_lifecycle_owner_background_deletion_removes_owner() {
     assert_success("replicaset POST", s, &b);
 
     let (status, body) = send_delete(
-        router.clone(),
+        &router,
         "/apis/apps/v1/namespaces/gc-bg/replicasets/rs2?propagationPolicy=Background",
     )
     .await;
@@ -720,7 +672,7 @@ async fn test_lifecycle_owner_foreground_eventual_dependent_deletion() {
     // 1. POST namespace + owner ReplicaSet + dependent pods with
     //    controller=true.
     let (s, b) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         &namespace_stub("gc-cascade"),
@@ -729,7 +681,7 @@ async fn test_lifecycle_owner_foreground_eventual_dependent_deletion() {
     assert_success("namespace POST", s, &b);
 
     let (s, rs_body) = send_json(
-        router.clone(),
+        &router,
         Method::POST,
         "/apis/apps/v1/namespaces/gc-cascade/replicasets",
         &replicaset_stub("gc-cascade", "rs1"),
@@ -743,7 +695,7 @@ async fn test_lifecycle_owner_foreground_eventual_dependent_deletion() {
 
     for pod_name in ["pod-x", "pod-y"] {
         let (s, b) = send_json(
-            router.clone(),
+            &router,
             Method::POST,
             "/api/v1/namespaces/gc-cascade/pods",
             &owned_pod_stub("gc-cascade", pod_name, "ReplicaSet", "rs1", &owner_uid),
@@ -756,7 +708,7 @@ async fn test_lifecycle_owner_foreground_eventual_dependent_deletion() {
     //    the foregroundDeletion finalizer + deletionTimestamp; nothing is
     //    actually removed yet.
     let (status, body) = send_delete(
-        router.clone(),
+        &router,
         "/apis/apps/v1/namespaces/gc-cascade/replicasets/rs1?propagationPolicy=Foreground",
     )
     .await;
@@ -804,7 +756,7 @@ async fn test_lifecycle_owner_foreground_eventual_dependent_deletion() {
         "ReplicaSet rs1 must be removed once GC clears foregroundDeletion",
     );
     let (status, _) = send_get(
-        router.clone(),
+        &router,
         "/apis/apps/v1/namespaces/gc-cascade/replicasets/rs1",
     )
     .await;
@@ -824,7 +776,7 @@ async fn test_lifecycle_label_selector_does_not_cross_namespaces() {
 
     for ns in ["proj-a", "proj-b"] {
         let (s, b) = send_json(
-            router.clone(),
+            &router,
             Method::POST,
             "/api/v1/namespaces",
             &namespace_stub(ns),
@@ -835,7 +787,7 @@ async fn test_lifecycle_label_selector_does_not_cross_namespaces() {
         for i in 0..3 {
             let labels = json!({"tier": if i == 0 { "frontend" } else { "backend" }});
             let (s, b) = send_json(
-                router.clone(),
+                &router,
                 Method::POST,
                 &format!("/api/v1/namespaces/{ns}/pods"),
                 &pod_stub(ns, &format!("p{i}"), labels),
@@ -846,7 +798,7 @@ async fn test_lifecycle_label_selector_does_not_cross_namespaces() {
     }
 
     let (status, body) = send_get(
-        router.clone(),
+        &router,
         "/api/v1/namespaces/proj-a/pods?labelSelector=tier%3Dbackend",
     )
     .await;

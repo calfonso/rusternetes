@@ -32,92 +32,55 @@
 //!     observably different results for the same input, particularly for
 //!     arrays-of-maps with a `name` merge key).
 
-use axum::{
-    body::Body,
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::Method;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — same pattern as `integration_dryrun_all_resources.rs` and
-// `patch_cas_retry_test.rs`. Helpers are intentionally inline (no shared
-// `tests/common` mod) so each test file stays self-contained.
+// HTTP harness — thin shims over the shared `TestApiServer`. `send_bytes` lets
+// us push an arbitrary raw body with an explicit (or absent) Content-Type so
+// the request-decoding middleware is exercised verbatim. `mem` is the backing
+// store for stored-object assertions.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "default";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// Send an arbitrary-body request with an explicit `Content-Type` header
 /// (no normalization on the test side — the middleware is what we are
 /// exercising).
 async fn send_with_ct(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     content_type: &str,
     body: Vec<u8>,
 ) -> (u16, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", content_type)
-        .body(Body::from(body))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let (status, _, value) = router
+        .send_bytes(method.as_str(), uri, Some(content_type), Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
 /// Same as `send_with_ct` but no `Content-Type` header at all. Mirrors
 /// upstream's "no Content-Type" decode test.
 async fn send_without_ct(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     body: Vec<u8>,
 ) -> (u16, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(Body::from(body))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let (status, _, value) = router
+        .send_bytes(method.as_str(), uri, None, Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
 /// Read the JSON stored at `key`. Panics if the key is absent.
