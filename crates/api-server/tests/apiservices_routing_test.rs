@@ -12,57 +12,19 @@
 //! PR #78) which had to work around the bug by seeding APIServices through
 //! the storage layer instead.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::StorageBackend;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-async fn make_test_state() -> Arc<ApiServerState> {
-    let storage = Arc::new(StorageBackend::new_memory());
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(
-        MetricsRegistry::new()
-            .with_api_server_metrics()
-            .expect("metrics init"),
-    );
-    Arc::new(ApiServerState::new(
-        storage,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth — middleware still injects an anonymous AuthContext
-    ))
+async fn make_test_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
-async fn send(
-    state: Arc<ApiServerState>,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let router = build_router(state, None);
-    let mut builder = Request::builder().method(method).uri(path);
-    let request_body = match body {
-        Some(v) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(&v).unwrap())
-        }
-        None => Body::empty(),
-    };
-    let req = builder.body(request_body).unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!(null));
-    (status, body_json)
+// Thin `(u16, Value)` shim over the shared harness, preserving this file's
+// `send(&state, method, path, Option<Value>)` call sites.
+async fn send(api: &TestApiServer, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    let content_type = body.as_ref().map(|_| "application/json");
+    let (status, value) = api.send(method, path, content_type, body.as_ref()).await;
+    (status.as_u16(), value)
 }
 
 fn local_apiservice(name: &str) -> Value {
@@ -83,7 +45,7 @@ fn local_apiservice(name: &str) -> Value {
 async fn create_apiservice_returns_201_not_500() {
     let state = make_test_state().await;
     let (status, body) = send(
-        state,
+        &state,
         "POST",
         "/apis/apiregistration.k8s.io/v1/apiservices",
         Some(local_apiservice("v1.example.com")),
@@ -105,7 +67,7 @@ async fn list_apiservices_returns_200_not_500() {
     let state = make_test_state().await;
     // Seed one via POST first so the list is non-empty.
     let (post_status, _) = send(
-        state.clone(),
+        &state,
         "POST",
         "/apis/apiregistration.k8s.io/v1/apiservices",
         Some(local_apiservice("v1.list.example.com")),
@@ -114,7 +76,7 @@ async fn list_apiservices_returns_200_not_500() {
     assert_eq!(post_status, 201, "seed POST must succeed");
 
     let (status, body) = send(
-        state,
+        &state,
         "GET",
         "/apis/apiregistration.k8s.io/v1/apiservices",
         None,
@@ -132,14 +94,14 @@ async fn list_apiservices_returns_200_not_500() {
 async fn get_apiservice_by_name_returns_200_not_500() {
     let state = make_test_state().await;
     let (_, _) = send(
-        state.clone(),
+        &state,
         "POST",
         "/apis/apiregistration.k8s.io/v1/apiservices",
         Some(local_apiservice("v1.get.example.com")),
     )
     .await;
     let (status, body) = send(
-        state,
+        &state,
         "GET",
         "/apis/apiregistration.k8s.io/v1/apiservices/v1.get.example.com",
         None,
@@ -156,7 +118,7 @@ async fn get_apiservice_by_name_returns_200_not_500() {
 async fn update_apiservice_returns_200_not_500() {
     let state = make_test_state().await;
     send(
-        state.clone(),
+        &state,
         "POST",
         "/apis/apiregistration.k8s.io/v1/apiservices",
         Some(local_apiservice("v1.put.example.com")),
@@ -165,7 +127,7 @@ async fn update_apiservice_returns_200_not_500() {
     let mut updated = local_apiservice("v1.put.example.com");
     updated["spec"]["versionPriority"] = json!(200);
     let (status, body) = send(
-        state,
+        &state,
         "PUT",
         "/apis/apiregistration.k8s.io/v1/apiservices/v1.put.example.com",
         Some(updated),
@@ -187,14 +149,14 @@ async fn update_apiservice_returns_200_not_500() {
 async fn delete_apiservice_returns_200_not_500() {
     let state = make_test_state().await;
     send(
-        state.clone(),
+        &state,
         "POST",
         "/apis/apiregistration.k8s.io/v1/apiservices",
         Some(local_apiservice("v1.del.example.com")),
     )
     .await;
     let (status, _) = send(
-        state,
+        &state,
         "DELETE",
         "/apis/apiregistration.k8s.io/v1/apiservices/v1.del.example.com",
         None,
@@ -209,7 +171,7 @@ async fn delete_apiservice_returns_200_not_500() {
 #[tokio::test]
 async fn discovery_route_stays_public_and_unauthenticated() {
     let state = make_test_state().await;
-    let (status, body) = send(state, "GET", "/apis/apiregistration.k8s.io/v1", None).await;
+    let (status, body) = send(&state, "GET", "/apis/apiregistration.k8s.io/v1", None).await;
     assert_eq!(status, 200);
     assert!(
         body.get("resources").is_some(),

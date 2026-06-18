@@ -30,56 +30,20 @@
 //! the server returns 2xx, NOT 400 BadRequest. Three of the five tests
 //! fail on `fork/main` HEAD as of 2026-05-21.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "default";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ))
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-fn spawn_router() -> Router {
-    let mem = Arc::new(MemoryStorage::new());
-    build_router(make_state(mem), None)
-}
-
-async fn post_pod(router: Router, body: Value) -> (StatusCode, Value) {
-    let bytes = serde_json::to_vec(&body).unwrap();
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/api/v1/namespaces/{}/pods", TEST_NS))
-        .header("content-type", "application/json")
-        .body(Body::from(bytes))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+// Consumes the harness per request, matching the original by-value Router.
+async fn post_pod(api: TestApiServer, body: Value) -> (StatusCode, Value) {
+    api.post(&format!("/api/v1/namespaces/{TEST_NS}/pods"), &body)
         .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!(null));
-    (status, v)
 }
 
 /// `metadata.creationTimestamp: null` is what `time.Time{}.MarshalJSON()`
