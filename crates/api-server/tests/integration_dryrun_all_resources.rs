@@ -60,68 +60,35 @@
 //! `is_dry_run` will fail one of the three assertions with a clear message
 //! identifying which GVR / verb regressed.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `patch_cas_retry_test.rs` / `conformance_*` style.
+// HTTP harness — thin shims over the shared `TestApiServer`. `mem` is the
+// backing store so tests can assert that dry-run requests never persist.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "dryrunnamespace";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+async fn send_json(router: TestApiServer, method: Method, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router
+        .send(method.as_str(), uri, Some("application/json"), Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
-async fn send_json(router: axum::Router, method: Method, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
-}
-
-async fn send_delete(router: axum::Router, uri: &str) -> StatusCode {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    router.oneshot(req).await.unwrap().status()
+async fn send_delete(router: TestApiServer, uri: &str) -> StatusCode {
+    let (status, _) = router.delete(uri).await;
+    status
 }
 
 /// Seed `mem` with `body` at the conventional registry key.

@@ -17,54 +17,23 @@
 //!
 //! Harness mirrors `tests/decoder_strict_fields_test.rs`.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-fn spawn_router() -> Router {
-    let mem = Arc::new(MemoryStorage::new());
-    build_router(make_state(mem), None)
-}
-
-async fn send_json(router: Router, method: Method, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let bytes = serde_json::to_vec(body).unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(bytes))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+async fn send_json(
+    router: TestApiServer,
+    method: Method,
+    uri: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    router
+        .send(method.as_str(), uri, Some("application/json"), Some(body))
         .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
 }
 
 // ---------------------------------------------------------------------------
