@@ -15,56 +15,18 @@
 //! the parsed JSON body. Byte-level diff against upstream is intentionally
 //! out of scope here — those live in dedicated `byte_diff_*` mirrors.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::Value;
-use std::sync::Arc;
-use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// HTTP harness — mirrors `integration_dryrun_all_resources.rs:82-100`.
-// ---------------------------------------------------------------------------
-
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`.
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    build_router(make_state(mem), None)
-}
-
-async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|e| panic!("response body for {uri} was not JSON: {e}; raw={bytes:?}"));
-    (status, v)
+async fn get_json(api: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    api.get(uri).await
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +36,7 @@ async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn test_openapi_v2_shape() {
     let router = spawn_router();
-    let (status, body) = get_json(router, "/openapi/v2").await;
+    let (status, body) = get_json(&router, "/openapi/v2").await;
     assert_eq!(status, StatusCode::OK, "GET /openapi/v2 must return 200");
 
     assert_eq!(
@@ -118,7 +80,7 @@ async fn test_openapi_v2_shape() {
 #[tokio::test]
 async fn test_openapi_v2_shape_includes_core_pod_definition() {
     let router = spawn_router();
-    let (status, body) = get_json(router, "/openapi/v2").await;
+    let (status, body) = get_json(&router, "/openapi/v2").await;
     assert_eq!(status, StatusCode::OK);
     let definitions = body
         .get("definitions")
@@ -138,7 +100,7 @@ async fn test_openapi_v2_shape_includes_core_pod_definition() {
 #[tokio::test]
 async fn test_openapi_v3_shape() {
     let router = spawn_router();
-    let (status, body) = get_json(router, "/openapi/v3").await;
+    let (status, body) = get_json(&router, "/openapi/v3").await;
     assert_eq!(status, StatusCode::OK, "GET /openapi/v3 must return 200");
 
     let paths = body
@@ -171,7 +133,7 @@ async fn test_openapi_v3_subdocument_shape() {
     // URLs and assert the body shape (`openapi: 3.0.x`, `paths`,
     // `components.schemas`).
     let router = spawn_router();
-    let (status, root) = get_json(router.clone(), "/openapi/v3").await;
+    let (status, root) = get_json(&router, "/openapi/v3").await;
     assert_eq!(status, StatusCode::OK);
 
     let paths = root
@@ -191,7 +153,7 @@ async fn test_openapi_v3_subdocument_shape() {
         "serverRelativeURL must start with `/` (server-relative), got {sub_url:?}"
     );
 
-    let (sub_status, sub) = get_json(router, sub_url).await;
+    let (sub_status, sub) = get_json(&router, sub_url).await;
     assert_eq!(
         sub_status,
         StatusCode::OK,
@@ -232,7 +194,7 @@ async fn test_openapi_v3_subdocument_shape() {
 #[tokio::test]
 async fn test_api_root_shape() {
     let router = spawn_router();
-    let (status, body) = get_json(router, "/api").await;
+    let (status, body) = get_json(&router, "/api").await;
     assert_eq!(status, StatusCode::OK, "GET /api must return 200");
 
     assert_eq!(
@@ -269,7 +231,7 @@ async fn test_api_root_shape() {
 #[tokio::test]
 async fn test_apis_root_shape() {
     let router = spawn_router();
-    let (status, body) = get_json(router, "/apis").await;
+    let (status, body) = get_json(&router, "/apis").await;
     assert_eq!(status, StatusCode::OK, "GET /apis must return 200");
 
     assert_eq!(
@@ -307,7 +269,7 @@ async fn test_apis_root_shape() {
 #[tokio::test]
 async fn test_api_v1_resources_shape() {
     let router = spawn_router();
-    let (status, body) = get_json(router, "/api/v1").await;
+    let (status, body) = get_json(&router, "/api/v1").await;
     assert_eq!(status, StatusCode::OK, "GET /api/v1 must return 200");
 
     assert_eq!(
@@ -353,7 +315,7 @@ async fn test_api_v1_resources_shape() {
 #[tokio::test]
 async fn test_apis_apps_v1_resources_shape() {
     let router = spawn_router();
-    let (status, body) = get_json(router, "/apis/apps/v1").await;
+    let (status, body) = get_json(&router, "/apis/apps/v1").await;
     assert_eq!(status, StatusCode::OK, "GET /apis/apps/v1 must return 200");
 
     assert_eq!(
