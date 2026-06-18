@@ -27,84 +27,29 @@
 //! The harness reuses the in-process Axum router pattern from
 //! `strategy_pod_test.rs` — duplicated inline per the per-file contract.
 
-use axum::{
-    body::{Body, Bytes},
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "pods-gen";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+// Harness: thin `(u16, Value)` shims over `TestApiServer` (rusternetes-test-support),
+// preserving this file's `*_json(&router, …)` call sites.
+async fn post_json(api: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = api.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+async fn put_json(api: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = api.put(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn send(router: &axum::Router, req: Request<Body>) -> (u16, Value, Bytes) {
-    let resp = router.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status().as_u16();
-    let bytes: Bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body, bytes)
+async fn get_json(api: &TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = api.get(uri).await;
+    (status.as_u16(), value)
 }
 
-async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let (s, b, _) = send(router, req).await;
-    (s, b)
-}
-
-async fn put_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let (s, b, _) = send(router, req).await;
-    (s, b)
-}
-
-async fn get_json(router: &axum::Router, uri: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let (s, b, _) = send(router, req).await;
-    (s, b)
-}
-
-async fn create_namespace(router: &axum::Router) {
+async fn create_namespace(router: &TestApiServer) {
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -170,7 +115,7 @@ fn add_go_defaults(mut pod: Value) -> Value {
 /// Regression coverage for closes #483.
 #[tokio::test]
 async fn test_pod_generation_empty_update_does_not_bump() {
-    let (_mem, router) = spawn_router();
+    let router = TestApiServer::new();
     create_namespace(&router).await;
 
     // Create.
@@ -214,7 +159,7 @@ async fn test_pod_generation_empty_update_does_not_bump() {
 /// expect `metadata.generation` to advance to 2.
 #[tokio::test]
 async fn test_pod_generation_image_swap_bumps_to_2() {
-    let (_mem, router) = spawn_router();
+    let router = TestApiServer::new();
     create_namespace(&router).await;
 
     let body = agnhost_pod_with_init("gen-image-swap");
@@ -246,7 +191,7 @@ async fn test_pod_generation_image_swap_bumps_to_2() {
 /// flipping `spec.activeDeadlineSeconds` bumps generation.
 #[tokio::test]
 async fn test_pod_generation_active_deadline_bumps() {
-    let (_mem, router) = spawn_router();
+    let router = TestApiServer::new();
     create_namespace(&router).await;
 
     let body = agnhost_pod_with_init("gen-ads");
@@ -278,7 +223,7 @@ async fn test_pod_generation_active_deadline_bumps() {
 /// flipping `metadata.annotations` leaves generation untouched.
 #[tokio::test]
 async fn test_pod_generation_metadata_update_does_not_bump() {
-    let (_mem, router) = spawn_router();
+    let router = TestApiServer::new();
     create_namespace(&router).await;
 
     let body = agnhost_pod_with_init("gen-meta");
@@ -313,7 +258,7 @@ async fn test_pod_generation_metadata_update_does_not_bump() {
 /// server must keep generation at 1.)
 #[tokio::test]
 async fn test_pod_generation_client_set_value_is_ignored() {
-    let (_mem, router) = spawn_router();
+    let router = TestApiServer::new();
     create_namespace(&router).await;
 
     let body = agnhost_pod_with_init("gen-clientset");

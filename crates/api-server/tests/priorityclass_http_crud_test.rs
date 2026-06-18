@@ -16,18 +16,9 @@
 //!   * `AlwaysAllowAuthorizer` + `skip_auth=true` so no bearer token is needed.
 //!   * `tower::ServiceExt::oneshot` per request.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const PC_COLLECTION: &str = "/apis/scheduling.k8s.io/v1/priorityclasses";
 
@@ -35,89 +26,34 @@ const PC_COLLECTION: &str = "/apis/scheduling.k8s.io/v1/priorityclasses";
 // HTTP harness (inline, matches the in-process pattern used elsewhere).
 // ---------------------------------------------------------------------------
 
-fn make_state() -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+// Harness: thin delegates over `TestApiServer` (rusternetes-test-support),
+// preserving this file's `*_json(&state, …)` call sites. `patch_json` keeps its
+// explicit content-type arg (the merge- vs strategic-merge cases below).
+async fn post_json(state: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
+    state.post(uri, body).await
 }
 
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
+async fn get_json(state: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    state.get(uri).await
 }
 
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_value: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_value)
-}
-
-async fn send(
-    state: &Arc<ApiServerState>,
-    method: &str,
-    uri: &str,
-    content_type: Option<&str>,
-    body: Body,
-) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(ct) = content_type {
-        builder = builder.header("content-type", ct);
-    }
-    let req = builder.body(body).unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
-
-async fn post_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let bytes = serde_json::to_vec(body).unwrap();
-    send(
-        state,
-        "POST",
-        uri,
-        Some("application/json"),
-        Body::from(bytes),
-    )
-    .await
-}
-
-async fn get_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    send(state, "GET", uri, None, Body::empty()).await
-}
-
-async fn put_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let bytes = serde_json::to_vec(body).unwrap();
-    send(
-        state,
-        "PUT",
-        uri,
-        Some("application/json"),
-        Body::from(bytes),
-    )
-    .await
+async fn put_json(state: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
+    state.put(uri, body).await
 }
 
 async fn patch_json(
-    state: &Arc<ApiServerState>,
+    state: &TestApiServer,
     uri: &str,
     content_type: &str,
     body: &Value,
 ) -> (StatusCode, Value) {
-    let bytes = serde_json::to_vec(body).unwrap();
-    send(state, "PATCH", uri, Some(content_type), Body::from(bytes)).await
+    state
+        .send("PATCH", uri, Some(content_type), Some(body))
+        .await
 }
 
-async fn delete_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    send(state, "DELETE", uri, None, Body::empty()).await
+async fn delete_json(state: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    state.delete(uri).await
 }
 
 fn sample_priority_class(name: &str, value: i64) -> Value {
@@ -137,7 +73,7 @@ fn sample_priority_class(name: &str, value: i64) -> Value {
 /// POST (create) → GET → LIST → PUT (update) → PATCH → DELETE.
 #[tokio::test]
 async fn priority_class_full_http_crud_lifecycle() {
-    let state = make_state();
+    let state = TestApiServer::new();
     let name = "high-priority";
     let item_uri = format!("{PC_COLLECTION}/{name}");
 
@@ -203,7 +139,7 @@ async fn priority_class_full_http_crud_lifecycle() {
 /// an empty `items` array (never `null`, never absent).
 #[tokio::test]
 async fn priority_class_list_empty_collection() {
-    let state = make_state();
+    let state = TestApiServer::new();
     let (status, body) = get_json(&state, PC_COLLECTION).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["kind"], "PriorityClassList");
@@ -217,7 +153,7 @@ async fn priority_class_list_empty_collection() {
 /// Unprocessable Entity, the api-server mapping for an invalid resource).
 #[tokio::test]
 async fn priority_class_value_is_immutable_on_put() {
-    let state = make_state();
+    let state = TestApiServer::new();
     let name = "immutable-pc";
     let item_uri = format!("{PC_COLLECTION}/{name}");
 
@@ -242,7 +178,7 @@ async fn priority_class_value_is_immutable_on_put() {
 /// changes the value is rejected, and the stored value is preserved.
 #[tokio::test]
 async fn priority_class_value_is_immutable_on_patch() {
-    let state = make_state();
+    let state = TestApiServer::new();
     let name = "immutable-patch-pc";
     let item_uri = format!("{PC_COLLECTION}/{name}");
 
