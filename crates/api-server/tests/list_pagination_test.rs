@@ -41,80 +41,32 @@
 //! `Storage::list_paginated`) is implemented and unit-tested elsewhere; this
 //! file is the wire-level contract pin.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// Harness
+// Harness — thin shims over the shared `TestApiServer`, preserving this file's
+// `post_json(&state, …)` / `get_json(&state, …)` call sites.
 // ---------------------------------------------------------------------------
 
-/// Build a fully-wired `ApiServerState` with in-memory storage and
-/// `AlwaysAllow` authorization, `skip_auth=true`. Mirrors the pattern in
-/// `integration_configmap_lifecycle.rs`.
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn make_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
-/// Build a fresh router per request (`oneshot` consumes the service).
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
+async fn post_json(state: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
+    state.post(uri, body).await
 }
 
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body)
-}
-
-async fn post_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
-
-async fn get_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
+async fn get_json(state: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    state.get(uri).await
 }
 
 /// Issue a paginated LIST and return `(status, body)`. The caller assembles
 /// the `?limit=...&continue=...` query string explicitly so test failures
 /// surface the exact URL.
 async fn list_with_paging(
-    state: &Arc<ApiServerState>,
+    state: &TestApiServer,
     namespace: &str,
     query: &str,
 ) -> (StatusCode, Value) {
@@ -129,7 +81,7 @@ async fn list_with_paging(
 /// Create namespace `ns` via the REST surface so the per-namespace LIST
 /// routes resolve. Idempotent for the test setup — we only need it to
 /// succeed once per test.
-async fn create_namespace(state: &Arc<ApiServerState>, ns: &str) {
+async fn create_namespace(state: &TestApiServer, ns: &str) {
     let ns_body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -146,7 +98,7 @@ async fn create_namespace(state: &Arc<ApiServerState>, ns: &str) {
 
 /// Seed `n` ConfigMaps named `cm-NNN` (zero-padded so lexicographic sort ==
 /// numeric sort). Returns the sorted list of seeded names.
-async fn seed_configmaps(state: &Arc<ApiServerState>, ns: &str, n: usize) -> Vec<String> {
+async fn seed_configmaps(state: &TestApiServer, ns: &str, n: usize) -> Vec<String> {
     create_namespace(state, ns).await;
     let mut names = Vec::with_capacity(n);
     for i in 0..n {
@@ -215,7 +167,7 @@ fn urlencode(s: &str) -> String {
 /// `metadata.remainingItemCount` reflecting the items not yet sent.
 #[tokio::test]
 async fn limit_first_page_returns_n_plus_continue_token() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-first";
     seed_configmaps(&state, ns, 100).await;
 
@@ -264,7 +216,7 @@ async fn limit_first_page_returns_n_plus_continue_token() {
 /// page omits the continue token, (e) results are sorted.
 #[tokio::test]
 async fn limit_continue_chain_covers_all_items_exactly_once() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-chain";
     let seeded = seed_configmaps(&state, ns, 100).await;
 
@@ -368,7 +320,7 @@ async fn limit_continue_chain_covers_all_items_exactly_once() {
 /// the basic LIST surface stays pinned.
 #[tokio::test]
 async fn limit_greater_than_total_returns_all_no_continue() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-over";
     let seeded = seed_configmaps(&state, ns, 100).await;
 
@@ -402,7 +354,7 @@ async fn limit_greater_than_total_returns_all_no_continue() {
 /// not "empty page". Pin the expected upstream wire behaviour.
 #[tokio::test]
 async fn limit_zero_returns_all_items() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-zero";
     let seeded = seed_configmaps(&state, ns, 100).await;
 
@@ -441,7 +393,7 @@ async fn limit_zero_returns_all_items() {
 /// the same continue chain.
 #[tokio::test]
 async fn limit_with_explicit_resource_version_is_consistent() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-rv";
     seed_configmaps(&state, ns, 100).await;
 
@@ -504,7 +456,7 @@ async fn limit_with_explicit_resource_version_is_consistent() {
 /// with a `Status` body (`kind: Status`).
 #[tokio::test]
 async fn malformed_continue_token_returns_status_error() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-malformed";
     seed_configmaps(&state, ns, 5).await;
 
@@ -543,7 +495,7 @@ async fn malformed_continue_token_returns_status_error() {
 /// asserting a behaviour the system can't yet exhibit.
 #[tokio::test]
 async fn expired_continue_token_returns_410_gone() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-expired";
     seed_configmaps(&state, ns, 5).await;
 
@@ -583,7 +535,7 @@ async fn expired_continue_token_returns_410_gone() {
 /// list's RV.
 #[tokio::test]
 async fn mid_pagination_insert_not_visible_in_continue_chain() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-midmut";
     seed_configmaps(&state, ns, 100).await;
 
@@ -676,7 +628,7 @@ async fn mid_pagination_insert_not_visible_in_continue_chain() {
 /// `#[ignore]`d pagination test isn't masking a harness regression.
 #[tokio::test]
 async fn baseline_no_paging_list_returns_all_items() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = make_state();
     let ns = "pag-baseline";
     let seeded = seed_configmaps(&state, ns, 100).await;
 

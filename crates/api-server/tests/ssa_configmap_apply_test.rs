@@ -14,49 +14,17 @@
 //! `build_router` + `tower::ServiceExt::oneshot`. `skip_auth=true` so no
 //! bearer token is required.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-fn make_state() -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ))
-}
-
-fn router(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body)
+fn make_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
 /// Issue an SSA PATCH with `Content-Type: application/apply-patch+yaml`.
 async fn apply(
-    state: &Arc<ApiServerState>,
+    state: &TestApiServer,
     namespace: &str,
     name: &str,
     field_manager: &str,
@@ -71,16 +39,16 @@ async fn apply(
         uri.push_str("&force=true");
     }
     // YAML body is the canonical SSA content-type. We send JSON-as-YAML
-    // (well-formed JSON parses as YAML 1.2).
-    let body = serde_json::to_vec(desired).unwrap();
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(&uri)
-        .header("content-type", "application/apply-patch+yaml")
-        .body(Body::from(body))
-        .unwrap();
-    let response = router(state).oneshot(req).await.unwrap();
-    read_body(response).await
+    // (well-formed JSON parses as YAML 1.2), so the standard `send` path —
+    // which serialises the `Value` to JSON bytes — produces a valid body.
+    state
+        .send(
+            "PATCH",
+            &uri,
+            Some("application/apply-patch+yaml"),
+            Some(desired),
+        )
+        .await
 }
 
 fn desired_configmap(name: &str, data: serde_json::Value) -> Value {
@@ -198,13 +166,9 @@ async fn ssa_conflict_without_force_returns_409_and_preserves_value() {
     assert_eq!(body["reason"], "Conflict");
 
     // Stored object must still have k1=A and manager-a as owner.
-    let get_req = Request::builder()
-        .method("GET")
-        .uri("/api/v1/namespaces/default/configmaps/cm-conflict")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router(&state).oneshot(get_req).await.unwrap();
-    let (gs, gbody) = read_body(resp).await;
+    let (gs, gbody) = state
+        .get("/api/v1/namespaces/default/configmaps/cm-conflict")
+        .await;
     assert_eq!(gs, StatusCode::OK);
     assert_eq!(gbody["data"]["k1"], "A");
     let mf = gbody["metadata"]["managedFields"].as_array().unwrap();
@@ -250,14 +214,14 @@ async fn ssa_force_transfers_ownership_and_returns_200() {
 async fn ssa_missing_field_manager_returns_400() {
     let state = make_state();
     let body = desired_configmap("cm-nofm", json!({"k1": "v1"}));
-    let req = Request::builder()
-        .method("PATCH")
-        .uri("/api/v1/namespaces/default/configmaps/cm-nofm")
-        .header("content-type", "application/apply-patch+yaml")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = router(&state).oneshot(req).await.unwrap();
-    let (status, _) = read_body(resp).await;
+    let (status, _) = state
+        .send(
+            "PATCH",
+            "/api/v1/namespaces/default/configmaps/cm-nofm",
+            Some("application/apply-patch+yaml"),
+            Some(&body),
+        )
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -269,14 +233,14 @@ async fn ssa_missing_field_manager_returns_400() {
 async fn ssa_apply_patch_json_content_type_is_accepted() {
     let state = make_state();
     let body = desired_configmap("cm-json", json!({"k1": "v1"}));
-    let req = Request::builder()
-        .method("PATCH")
-        .uri("/api/v1/namespaces/default/configmaps/cm-json?fieldManager=kubectl")
-        .header("content-type", "application/apply-patch+json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = router(&state).oneshot(req).await.unwrap();
-    let (status, body) = read_body(resp).await;
+    let (status, body) = state
+        .send(
+            "PATCH",
+            "/api/v1/namespaces/default/configmaps/cm-json?fieldManager=kubectl",
+            Some("application/apply-patch+json"),
+            Some(&body),
+        )
+        .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
     assert_eq!(body["data"]["k1"], "v1");
 }
@@ -297,14 +261,9 @@ async fn ssa_immutable_configmap_rejects_data_change() {
         "data": { "k1": "v1" },
         "immutable": true,
     });
-    let post = Request::builder()
-        .method("POST")
-        .uri("/api/v1/namespaces/default/configmaps")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
-        .unwrap();
-    let resp = router(&state).oneshot(post).await.unwrap();
-    let (cs, _) = read_body(resp).await;
+    let (cs, _) = state
+        .post("/api/v1/namespaces/default/configmaps", &create_body)
+        .await;
     assert_eq!(cs, StatusCode::CREATED);
 
     // Attempt SSA mutation of data on an immutable ConfigMap.

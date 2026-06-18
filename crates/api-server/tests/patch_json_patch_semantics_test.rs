@@ -31,44 +31,23 @@
 //! Pattern follows `decoder_content_type_test.rs` — helpers inline, no
 //! shared `tests/common` mod, all assertions ride on the public HTTP surface.
 
-use axum::{
-    body::Body,
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin wrappers over the shared `TestApiServer`. `mem` is the
+// backing store so tests seed pods and assert stored bytes directly.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "default";
 const JSON_PATCH_CT: &str = "application/json-patch+json";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// Seed a Pod into memory storage and return its registry key. Carries an
@@ -99,21 +78,12 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) -> String {
 }
 
 /// Send a JSON-Patch PATCH request and return (status, response_body).
-async fn apply_patch(router: axum::Router, pod_name: &str, ops: &Value) -> (u16, Value) {
+async fn apply_patch(router: TestApiServer, pod_name: &str, ops: &Value) -> (u16, Value) {
     let uri = format!("/api/v1/namespaces/{TEST_NS}/pods/{pod_name}");
-    let req = Request::builder()
-        .method(Method::PATCH)
-        .uri(uri)
-        .header("content-type", JSON_PATCH_CT)
-        .body(Body::from(serde_json::to_vec(ops).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let (status, value) = router
+        .send("PATCH", &uri, Some(JSON_PATCH_CT), Some(ops))
+        .await;
+    (status.as_u16(), value)
 }
 
 /// Read the JSON stored at `key`. Panics if the key is absent.
