@@ -19,55 +19,24 @@
 //!   [sig-api-machinery] ResourceQuota ... life of a pod/replication controller
 //!   [sig-api-machinery] Garbage collector should orphan pods created by rc
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "rc-e2e";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-fn spawn_router() -> Router {
-    let mem = Arc::new(MemoryStorage::new());
-    build_router(make_state(mem), None)
-}
-
-async fn post_raw(router: Router, uri: &str, body: Vec<u8>) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+// Posts the exact e2e-framework byte stream (built via `serde_json::to_vec`) so
+// the test pins what client-go sends on the wire. `send_bytes` accepts the raw
+// body verbatim rather than re-serialising a `Value`.
+async fn post_raw(router: TestApiServer, uri: &str, body: Vec<u8>) -> (StatusCode, Value) {
+    let (status, _, value) = router
+        .send_bytes("POST", uri, Some("application/json"), Some(body))
+        .await;
+    (status, value)
 }
 
 /// The canonical RC JSON produced by the upstream e2e framework's `NewRC` /
