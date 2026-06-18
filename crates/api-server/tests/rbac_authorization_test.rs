@@ -35,19 +35,16 @@
 
 #![allow(clippy::too_many_lines)]
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
-    auth::{TokenManager, UserInfo},
+    auth::UserInfo,
     authz::{Authorizer, Decision, RBACAuthorizer, RequestAttributes},
-    observability::MetricsRegistry,
     resources::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject},
     types::{ObjectMeta, TypeMeta},
 };
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // HTTP / authorizer harness
@@ -61,22 +58,16 @@ use tower::ServiceExt;
 /// so that the SAR endpoint's caller-side `authorize(create
 /// subjectaccessreviews)` does not 403 before the *interesting* decision
 /// runs.
-async fn spawn_state() -> (Arc<ApiServerState>, Arc<MemoryStorage>, Arc<StorageBackend>) {
-    let mem = Arc::new(MemoryStorage::new());
+async fn spawn_state() -> (TestApiServer, Arc<MemoryStorage>, Arc<StorageBackend>) {
+    let api = TestApiServer::builder()
+        .rbac()
+        .secret(b"rbac-authz-test-secret")
+        .build();
+    let mem = api.storage.clone();
     let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"rbac-authz-test-secret"));
-    let authorizer = Arc::new(RBACAuthorizer::new(backend.clone()));
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend.clone(),
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth — injects admin/system:masters
-    ));
 
     seed_bootstrap_cluster_admin(&mem).await;
-    (state, mem, backend)
+    (api, mem, backend)
 }
 
 /// Seed a `ClusterRole` + `ClusterRoleBinding` pair granting the `system:masters`
@@ -147,20 +138,13 @@ async fn seed_bootstrap_cluster_admin(mem: &Arc<MemoryStorage>) {
 /// role and lacks the `escalate` verb. With a full cluster-admin bootstrap the
 /// escalation superset check is trivially satisfied, so this scoped caller is
 /// required to exercise the 403 path.
-async fn spawn_state_rbac_admin_only(
-) -> (Arc<ApiServerState>, Arc<MemoryStorage>, Arc<StorageBackend>) {
-    let mem = Arc::new(MemoryStorage::new());
+async fn spawn_state_rbac_admin_only() -> (TestApiServer, Arc<MemoryStorage>, Arc<StorageBackend>) {
+    let api = TestApiServer::builder()
+        .rbac()
+        .secret(b"rbac-authz-test-secret")
+        .build();
+    let mem = api.storage.clone();
     let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"rbac-authz-test-secret"));
-    let authorizer = Arc::new(RBACAuthorizer::new(backend.clone()));
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend.clone(),
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth — injects admin/system:masters
-    ));
 
     let cr = ClusterRole {
         type_meta: TypeMeta {
@@ -244,41 +228,17 @@ async fn spawn_state_rbac_admin_only(
     .await
     .unwrap();
 
-    (state, mem, backend)
+    (api, mem, backend)
 }
 
-async fn post_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn post_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn put_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn put_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.put(uri, body).await;
+    (status.as_u16(), value)
 }
 
 /// Build a `SubjectAccessReview` JSON body for the given principal + verb +
@@ -316,7 +276,7 @@ fn sar_body(
 
 /// Drive a SAR through the api-server and return `(allowed, reason)`.
 async fn ask_sar(
-    state: Arc<ApiServerState>,
+    state: TestApiServer,
     user: &str,
     groups: &[&str],
     verb: &str,
