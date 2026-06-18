@@ -4768,6 +4768,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-test-support"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "rusternetes-api-server",
+ "rusternetes-common",
+ "rusternetes-storage",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.4.13",
+]
+
+[[package]]
 name = "rusticata-macros"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
