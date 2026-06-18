@@ -13,109 +13,51 @@
 //! `MemoryStorage`, so the assertion surface is the same JSON/HTTP that
 //! Sonobuoy drives.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
     auth::{ServiceAccountClaims, TokenManager},
-    authz::AlwaysAllowAuthorizer,
-    observability::MetricsRegistry,
     resources::{
         ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, ServiceAccount,
         Subject,
     },
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin shims over the shared `TestApiServer`. `mem` is the
+// backing store so tests pre-seed SAs/roles directly.
 // ---------------------------------------------------------------------------
 
-/// Build an `ApiServerState` backed by a fresh `MemoryStorage` and the
-/// `AlwaysAllowAuthorizer` (matches `skip_auth = true`). The state is also
-/// returned so individual tests can pre-seed storage via the backend.
-fn spawn_state() -> (Arc<ApiServerState>, Arc<MemoryStorage>) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"conformance-auth-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth – exercises routes without bearer tokens
-    ));
-    (state, mem)
+fn spawn_state() -> (TestApiServer, Arc<MemoryStorage>) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
 /// POST `body` (JSON) to `uri`, returning `(status, parsed body)`.
-async fn post_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_json)
+async fn post_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
 /// GET `uri`, returning `(status, parsed body)`.
-async fn get_json(state: Arc<ApiServerState>, uri: &str) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_json)
+async fn get_json(state: TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = state.get(uri).await;
+    (status.as_u16(), value)
 }
 
 /// PATCH `uri` with merge-patch JSON.
-async fn patch_merge(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", "application/merge-patch+json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_json)
+async fn patch_merge(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.patch(uri, body).await;
+    (status.as_u16(), value)
 }
 
 /// DELETE `uri`.
-async fn delete(state: Arc<ApiServerState>, uri: &str) -> u16 {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    response.status().as_u16()
+async fn delete(state: TestApiServer, uri: &str) -> u16 {
+    state.delete(uri).await.0.as_u16()
 }
 
 /// Pre-seed a ServiceAccount directly through the storage backend so tests
@@ -250,19 +192,13 @@ async fn service_account_should_update() {
     let mut updated = created.clone();
     updated["automountServiceAccountToken"] = json!(true);
 
-    let router = build_router(state.clone(), None);
-    let req = Request::builder()
-        .method("PUT")
-        .uri(format!("/api/v1/namespaces/{ns}/serviceaccounts/{name}"))
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&updated).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    assert_eq!(response.status().as_u16(), 200, "PUT must succeed");
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let after: Value = serde_json::from_slice(&bytes).unwrap();
+    let (put_status, after) = state
+        .put(
+            &format!("/api/v1/namespaces/{ns}/serviceaccounts/{name}"),
+            &updated,
+        )
+        .await;
+    assert_eq!(put_status.as_u16(), 200, "PUT must succeed");
     assert_eq!(after["automountServiceAccountToken"], true);
 }
 

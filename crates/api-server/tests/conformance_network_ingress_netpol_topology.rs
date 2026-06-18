@@ -22,95 +22,39 @@
 //! and drive it through `tower::ServiceExt::oneshot`. This is the same
 //! handler stack the production api-server uses for kubectl traffic.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::StorageBackend;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness (inline per-file per batch convention; see plan §"HTTP harness")
+// HTTP harness — thin `(u16, Value)` shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-/// Build an `ApiServerState` backed by `StorageBackend::Memory` with
-/// `skip_auth = true`. Mirrors `router_smoke_test::make_test_state`.
-fn spawn_state() -> Arc<ApiServerState> {
-    let storage = Arc::new(StorageBackend::new_memory());
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        storage,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ))
+fn spawn_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
-/// Send a request through a fresh `build_router` and parse the JSON body.
-/// The router is built per-call because `Router::oneshot` consumes `self`.
-async fn send(state: Arc<ApiServerState>, req: Request<Body>) -> (u16, Value) {
-    let router = build_router(state, None);
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+async fn post_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn post_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(state, req).await
+async fn get_json(state: TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = state.get(uri).await;
+    (status.as_u16(), value)
 }
 
-async fn get_json(state: Arc<ApiServerState>, uri: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    send(state, req).await
+async fn put_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.put(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn put_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(state, req).await
+async fn patch_merge(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.patch(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn patch_merge(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", "application/merge-patch+json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(state, req).await
-}
-
-async fn delete(state: Arc<ApiServerState>, uri: &str) -> u16 {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    send(state, req).await.0
+async fn delete(state: TestApiServer, uri: &str) -> u16 {
+    state.delete(uri).await.0.as_u16()
 }
 
 // ---------------------------------------------------------------------------
