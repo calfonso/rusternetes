@@ -7,35 +7,19 @@
 //! everything else. Mirrors upstream
 //! `pkg/apis/core/validation/validation.go::ValidatePodUpdate` (release-1.35).
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::resources::pod::{PodSchedulingGate, PodSecurityContext};
 use rusternetes_common::resources::{Container, EphemeralContainer, Pod, PodSpec, Toleration};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
-use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
+use serde_json::Value;
 
 // ---------------------------------------------------------------------------
-// Test harness
+// Test harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn make_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
 fn make_container(name: &str, image: &str) -> Container {
@@ -87,7 +71,7 @@ fn baseline_pod() -> Pod {
     }
 }
 
-async fn seed(state: &Arc<ApiServerState>, pod: &Pod) {
+async fn seed(state: &TestApiServer, pod: &Pod) {
     let key = build_key(
         "pods",
         pod.metadata.namespace.as_deref(),
@@ -97,49 +81,31 @@ async fn seed(state: &Arc<ApiServerState>, pod: &Pod) {
 }
 
 /// Send PUT for the regular update path. Returns (status, body json).
-async fn put_pod(state: Arc<ApiServerState>, pod: &Pod) -> (u16, Value) {
-    let router = build_router(state, None);
-    let body = serde_json::to_vec(pod).unwrap();
-    let req = Request::builder()
-        .method("PUT")
-        .uri(format!(
-            "/api/v1/namespaces/{}/pods/{}",
-            pod.metadata.namespace.as_deref().unwrap_or("default"),
-            pod.metadata.name
-        ))
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn put_pod(state: TestApiServer, pod: &Pod) -> (u16, Value) {
+    let uri = format!(
+        "/api/v1/namespaces/{}/pods/{}",
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name
+    );
+    let body = serde_json::to_value(pod).unwrap();
+    let (status, value) = state
+        .send("PUT", &uri, Some("application/json"), Some(&body))
+        .await;
+    (status.as_u16(), value)
 }
 
 /// Send PUT for the /ephemeralcontainers subresource.
-async fn put_ephemeralcontainers(state: Arc<ApiServerState>, pod: &Pod) -> (u16, Value) {
-    let router = build_router(state, None);
-    let body = serde_json::to_vec(pod).unwrap();
-    let req = Request::builder()
-        .method("PUT")
-        .uri(format!(
-            "/api/v1/namespaces/{}/pods/{}/ephemeralcontainers",
-            pod.metadata.namespace.as_deref().unwrap_or("default"),
-            pod.metadata.name
-        ))
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn put_ephemeralcontainers(state: TestApiServer, pod: &Pod) -> (u16, Value) {
+    let uri = format!(
+        "/api/v1/namespaces/{}/pods/{}/ephemeralcontainers",
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name
+    );
+    let body = serde_json::to_value(pod).unwrap();
+    let (status, value) = state
+        .send("PUT", &uri, Some("application/json"), Some(&body))
+        .await;
+    (status.as_u16(), value)
 }
 
 fn assert_rejected(status: u16, body: &Value, needle: &str) {
@@ -159,8 +125,7 @@ fn assert_rejected(status: u16, body: &Value, needle: &str) {
 
 #[tokio::test]
 async fn test_update_image_change_accepted() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -172,8 +137,7 @@ async fn test_update_image_change_accepted() {
 
 #[tokio::test]
 async fn test_update_ads_decrease_accepted() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -185,8 +149,7 @@ async fn test_update_ads_decrease_accepted() {
 
 #[tokio::test]
 async fn test_update_toleration_addition_accepted() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -217,8 +180,7 @@ async fn test_update_toleration_addition_accepted() {
 
 #[tokio::test]
 async fn test_update_scheduling_gate_deletion_accepted() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -230,8 +192,7 @@ async fn test_update_scheduling_gate_deletion_accepted() {
 
 #[tokio::test]
 async fn test_update_tgps_negative_to_one_accepted() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let mut pod = baseline_pod();
     pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(-5);
     seed(&state, &pod).await;
@@ -255,8 +216,7 @@ async fn test_ephemeral_container_add_via_subresource_accepted() {
     // Critical regression test for the EC munge-fix in validation::pod.
     // Without `is_ephemeral_subresource=true` resetting ephemeral_containers
     // in the munged copy, the fence would reject this legitimate addition.
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -296,8 +256,7 @@ async fn test_ephemeral_container_add_via_subresource_accepted() {
 
 #[tokio::test]
 async fn test_update_container_count_added_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -314,8 +273,7 @@ async fn test_update_container_count_added_rejected() {
 
 #[tokio::test]
 async fn test_update_container_count_removed_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let mut pod = baseline_pod();
     pod.spec
         .as_mut()
@@ -332,8 +290,7 @@ async fn test_update_container_count_removed_rejected() {
 
 #[tokio::test]
 async fn test_update_ads_increase_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -345,8 +302,7 @@ async fn test_update_ads_increase_rejected() {
 
 #[tokio::test]
 async fn test_update_ads_positive_to_nil_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -358,8 +314,7 @@ async fn test_update_ads_positive_to_nil_rejected() {
 
 #[tokio::test]
 async fn test_update_toleration_removal_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -375,8 +330,7 @@ async fn test_update_toleration_removal_rejected() {
 
 #[tokio::test]
 async fn test_update_scheduling_gate_addition_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -395,8 +349,7 @@ async fn test_update_scheduling_gate_addition_rejected() {
 
 #[tokio::test]
 async fn test_update_tgps_arbitrary_change_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -416,8 +369,7 @@ async fn test_update_tgps_arbitrary_change_rejected() {
 
 #[tokio::test]
 async fn test_update_node_name_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -433,8 +385,7 @@ async fn test_update_node_name_rejected() {
 
 #[tokio::test]
 async fn test_update_host_network_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -450,8 +401,7 @@ async fn test_update_host_network_rejected() {
 
 #[tokio::test]
 async fn test_update_dns_policy_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -467,8 +417,7 @@ async fn test_update_dns_policy_rejected() {
 
 #[tokio::test]
 async fn test_update_restart_policy_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -484,8 +433,7 @@ async fn test_update_restart_policy_rejected() {
 
 #[tokio::test]
 async fn test_update_service_account_name_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -501,8 +449,7 @@ async fn test_update_service_account_name_rejected() {
 
 #[tokio::test]
 async fn test_update_security_context_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -521,8 +468,7 @@ async fn test_update_security_context_rejected() {
 
 #[tokio::test]
 async fn test_update_container_body_except_image_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 
@@ -555,8 +501,7 @@ async fn test_update_container_resources_via_plain_put_rejected() {
     use rusternetes_common::types::ResourceRequirements;
     use std::collections::HashMap;
 
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let mut pod = baseline_pod();
     let mut req = HashMap::new();
     req.insert("cpu".to_string(), "100m".to_string());
@@ -593,8 +538,7 @@ async fn test_update_container_resources_via_plain_put_rejected() {
 
 #[tokio::test]
 async fn test_ephemeral_container_remove_via_subresource_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let mut pod = baseline_pod();
     pod.spec.as_mut().unwrap().ephemeral_containers = Some(vec![EphemeralContainer {
         name: "debug".to_string(),
@@ -631,8 +575,7 @@ async fn test_ephemeral_container_remove_via_subresource_rejected() {
 
 #[tokio::test]
 async fn test_ephemeral_container_on_main_path_rejected() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = make_state();
     let pod = baseline_pod();
     seed(&state, &pod).await;
 

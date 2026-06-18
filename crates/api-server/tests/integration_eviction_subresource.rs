@@ -27,98 +27,54 @@
 //! TDD pins. When a feature lands, drop the `#[ignore]` on the green
 //! assertion and delete the red one — never weaken the upstream assertion.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
+use axum::http::StatusCode;
 use rusternetes_common::resources::{
     Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors patch_cas_retry_test.rs.
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
-
-/// Build a fully-wired `ApiServerState` backed by an in-memory storage with
-/// `skip_auth=true` so no token is required (the same shape used by the other
-/// integration tests in this directory).
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
 
 /// `(storage, router)` factory — each test owns its own backend so they
 /// remain trivially parallelizable.
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// POST JSON helper for the eviction subresource.
 async fn post_eviction(
-    router: axum::Router,
+    router: TestApiServer,
     namespace: &str,
     name: &str,
     body: &Value,
 ) -> (StatusCode, Value) {
     let uri = format!("/api/v1/namespaces/{}/pods/{}/eviction", namespace, name);
-    let req = Request::builder()
-        .method("POST")
-        .uri(&uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+    router
+        .send("POST", &uri, Some("application/json"), Some(body))
         .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
 }
 
 /// Generic method dispatcher for `TestEvictionVersions` — we need to verify
 /// non-POST verbs return MethodNotAllowed.
 async fn request_eviction(
-    router: axum::Router,
+    router: TestApiServer,
     method: &str,
     namespace: &str,
     name: &str,
     body: Option<&Value>,
 ) -> StatusCode {
     let uri = format!("/api/v1/namespaces/{}/pods/{}/eviction", namespace, name);
-    let mut builder = Request::builder().method(method).uri(&uri);
-    let req = match body {
-        Some(b) => {
-            builder = builder.header("content-type", "application/json");
-            builder
-                .body(Body::from(serde_json::to_vec(b).unwrap()))
-                .unwrap()
-        }
-        None => builder.body(Body::empty()).unwrap(),
-    };
-    let response = router.oneshot(req).await.unwrap();
-    response.status()
+    let content_type = body.as_ref().map(|_| "application/json");
+    router.send(method, &uri, content_type, body).await.0
 }
 
 // ---------------------------------------------------------------------------

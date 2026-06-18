@@ -29,44 +29,22 @@
 //! strategic-merge implementation. See the inline annotation for the
 //! specific divergence; production code is NOT modified by this corpus.
 
-use axum::{
-    body::Body,
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness (inlined; same pattern as decoder_content_type_test.rs).
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "default";
 const SMP_CT: &str = "application/strategic-merge-patch+json";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// Seed a Pod with the given JSON shape into memory storage. The caller
@@ -79,21 +57,10 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str, body: Value) -> String {
 
 /// Apply a strategic-merge-patch to `name` in the default namespace and
 /// return (status, response body).
-async fn apply_patch(router: axum::Router, name: &str, patch: &Value) -> (u16, Value) {
+async fn apply_patch(router: TestApiServer, name: &str, patch: &Value) -> (u16, Value) {
     let uri = format!("/api/v1/namespaces/{}/pods/{}", TEST_NS, name);
-    let req = Request::builder()
-        .method(Method::PATCH)
-        .uri(&uri)
-        .header("content-type", SMP_CT)
-        .body(Body::from(serde_json::to_vec(patch).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let (status, value) = router.send("PATCH", &uri, Some(SMP_CT), Some(patch)).await;
+    (status.as_u16(), value)
 }
 
 /// Read the stored object for `name` and return its JSON.
