@@ -21,47 +21,14 @@
 //!
 //! Harness mirrors `list_resource_version_router_test.rs`.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
+// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`.
 
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body)
-}
-
-async fn post_podtemplate(state: &Arc<ApiServerState>, namespace: &str, name: &str) {
+async fn post_podtemplate(state: &TestApiServer, namespace: &str, name: &str) {
     let body = json!({
         "apiVersion": "v1",
         "kind": "PodTemplate",
@@ -71,23 +38,17 @@ async fn post_podtemplate(state: &Arc<ApiServerState>, namespace: &str, name: &s
             "spec": { "containers": [ { "name": "c", "image": "pause" } ] }
         }
     });
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("/api/v1/namespaces/{namespace}/podtemplates"))
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let (status, body) = read_body(router_for(state).oneshot(req).await.unwrap()).await;
+    let (status, body) = state
+        .post(
+            &format!("/api/v1/namespaces/{namespace}/podtemplates"),
+            &body,
+        )
+        .await;
     assert_eq!(status, StatusCode::CREATED, "POST {name} failed: {body}");
 }
 
-async fn get_list(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    read_body(router_for(state).oneshot(req).await.unwrap()).await
+async fn get_list(state: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    state.get(uri).await
 }
 
 fn page_names(body: &Value) -> Vec<String> {
@@ -104,8 +65,7 @@ fn page_names(body: &Value) -> Vec<String> {
 /// bounded by `limit`.
 #[tokio::test]
 async fn chunked_podtemplate_list_pages_in_key_order_without_gaps() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = TestApiServer::new();
 
     // Insert in an order that is deliberately NOT sorted, so a handler that
     // pages over raw storage iteration order (or insertion order) would

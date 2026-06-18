@@ -27,106 +27,14 @@
 //! Part of the /batch landing upstream integration-test mirrors as RED-state
 //! TDD pins.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
-use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
+use serde_json::json;
 
-// ---------------------------------------------------------------------------
-// HTTP harness
-// ---------------------------------------------------------------------------
-
-/// Build a fully-wired `ApiServerState` backed by an in-memory storage. The
-/// authorizer is `AlwaysAllow` and `skip_auth=true` so the router uses
-/// `skip_auth_middleware` and no token is needed.
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-/// Build a fresh router for every request — `oneshot` consumes the service.
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body)
-}
-
-async fn post_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
-
-async fn get_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
-
-async fn put_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
-
-async fn patch_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", "application/merge-patch+json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
-
-async fn delete_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
+// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`. The verb
+// helpers map to `state.{post,get,put,patch,delete}` (patch =
+// application/merge-patch+json).
 
 // ---------------------------------------------------------------------------
 // Mirror of upstream TestConfigMap / DoTestConfigMap
@@ -151,8 +59,7 @@ async fn delete_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Val
 /// admission with `configMapKeyRef` flips this red.
 #[tokio::test]
 async fn test_configmap() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = TestApiServer::new();
 
     // -----------------------------------------------------------------------
     // Upstream: framework.CreateNamespaceOrDie(client, "config-map", t)
@@ -163,7 +70,7 @@ async fn test_configmap() {
         "kind": "Namespace",
         "metadata": { "name": ns_name }
     });
-    let (status, body) = post_json(&state, "/api/v1/namespaces", &ns_body).await;
+    let (status, body) = state.post("/api/v1/namespaces", &ns_body).await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "namespace create must return 201/200, got {} body={}",
@@ -191,7 +98,7 @@ async fn test_configmap() {
     let cm_list_uri = format!("/api/v1/namespaces/{}/configmaps", ns_name);
     let cm_item_uri = format!("/api/v1/namespaces/{}/configmaps/{}", ns_name, cm_name);
 
-    let (status, body) = post_json(&state, &cm_list_uri, &cm_body).await;
+    let (status, body) = state.post(&cm_list_uri, &cm_body).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -211,12 +118,12 @@ async fn test_configmap() {
     );
 
     // GET — pin the read path.
-    let (status, body) = get_json(&state, &cm_item_uri).await;
+    let (status, body) = state.get(&cm_item_uri).await;
     assert_eq!(status, StatusCode::OK, "ConfigMap GET must return 200");
     assert_eq!(body["data"]["data-2"], "value-2");
 
     // LIST — pin the list path.
-    let (status, body) = get_json(&state, &cm_list_uri).await;
+    let (status, body) = state.get(&cm_list_uri).await;
     assert_eq!(status, StatusCode::OK, "ConfigMap LIST must return 200");
     let items = body["items"].as_array().expect("LIST must return .items");
     assert!(
@@ -276,7 +183,7 @@ async fn test_configmap() {
     let pod_list_uri = format!("/api/v1/namespaces/{}/pods", ns_name);
     let pod_item_uri = format!("/api/v1/namespaces/{}/pods/{}", ns_name, pod_name);
 
-    let (status, body) = post_json(&state, &pod_list_uri, &pod_body).await;
+    let (status, body) = state.post(&pod_list_uri, &pod_body).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -302,7 +209,7 @@ async fn test_configmap() {
         "data-2": "value-2",
         "data-3": "value-3-replaced",
     });
-    let (status, body) = put_json(&state, &cm_item_uri, &replace_body).await;
+    let (status, body) = state.put(&cm_item_uri, &replace_body).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -319,7 +226,7 @@ async fn test_configmap() {
             "data-4": "value-4",
         }
     });
-    let (status, body) = patch_json(&state, &cm_item_uri, &patch).await;
+    let (status, body) = state.patch(&cm_item_uri, &patch).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -337,21 +244,21 @@ async fn test_configmap() {
     //   integration.DeletePodOrErrorf(t, client, ns.Name, pod.Name)
     //   deleteConfigMapOrErrorf(t, client, ns.Name, configMap.Name)
     // -----------------------------------------------------------------------
-    let (status, _) = delete_json(&state, &pod_item_uri).await;
+    let (status, _) = state.delete(&pod_item_uri).await;
     assert!(
         status == StatusCode::OK || status == StatusCode::ACCEPTED,
         "Pod DELETE must return 200/202, got {}",
         status
     );
 
-    let (status, _) = delete_json(&state, &cm_item_uri).await;
+    let (status, _) = state.delete(&cm_item_uri).await;
     assert!(
         status == StatusCode::OK || status == StatusCode::ACCEPTED,
         "ConfigMap DELETE must return 200/202, got {}",
         status
     );
 
-    let (status, _) = get_json(&state, &cm_item_uri).await;
+    let (status, _) = state.get(&cm_item_uri).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
