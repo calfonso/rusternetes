@@ -31,59 +31,30 @@
 //! spawn the router with `MemoryStorage`, drive it via `tower::ServiceExt::oneshot`,
 //! and assert both the HTTP response body AND the stored object.
 
-use axum::{
-    body::Body,
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::Method;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — re-implemented inline per batch convention.
+// HTTP harness — thin shims over the shared `TestApiServer`. `mem` is the
+// backing store for stored-object assertions.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "batchstrategy";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
-}
-
-async fn send_json(router: axum::Router, method: Method, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn send_json(router: TestApiServer, method: Method, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router
+        .send(method.as_str(), uri, Some("application/json"), Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
 async fn read_stored(mem: &Arc<MemoryStorage>, resource: &str, name: &str) -> Value {

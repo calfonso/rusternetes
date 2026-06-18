@@ -29,75 +29,38 @@
 //! `Arc<MemoryStorage>` via `tower::ServiceExt::oneshot` so each test owns
 //! its own storage and runs concurrently.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_storage::memory::MemoryStorage;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `spawn_router()` from
-// `tests/integration_namespace_conditions.rs:74`.
+// HTTP harness — thin shims over the shared `TestApiServer`. `mem` is the
+// backing store; each test owns its own storage and runs concurrently.
 // ---------------------------------------------------------------------------
 
-/// Build a fresh `ApiServerState` backed by an in-memory store with
-/// `skip_auth=true` + `AlwaysAllowAuthorizer` so handlers do not short-circuit
-/// on auth.
-fn spawn_router() -> (axum::Router, Arc<MemoryStorage>) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ));
-    (build_router(state, None), mem)
+fn spawn_router() -> (TestApiServer, Arc<MemoryStorage>) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
 /// Issue a single oneshot request and return `(status, parsed JSON body)`.
 async fn send(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    let req_body = match body {
-        Some(b) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(b).unwrap())
-        }
-        None => {
-            builder = builder.header("content-length", "0");
-            Body::empty()
-        }
-    };
-    let req = builder.body(req_body).unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let content_type = body.as_ref().map(|_| "application/json");
+    router.send(method.as_str(), uri, content_type, body).await
 }
 
 /// Pre-create a namespace so the secret routes don't have to fall back to a
 /// "default" namespace assumption. Mirrors upstream `framework.Namespace`
 /// allocation done by the e2e harness before every test body runs.
-async fn create_namespace(router: &axum::Router, name: &str) {
+async fn create_namespace(router: &TestApiServer, name: &str) {
     let (status, body) = send(
         router.clone(),
         Method::POST,
