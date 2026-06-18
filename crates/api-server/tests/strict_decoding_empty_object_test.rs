@@ -20,53 +20,18 @@
 //! fixed in PR #687. This file pins the `{}` case so the heuristic in
 //! `find_unknown_fields_recursive` accepts both forms.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "default";
 
-fn make_router() -> (Arc<MemoryStorage>, Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ));
-    let router = build_router(state, None);
-    (mem, router)
-}
-
-async fn send(router: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
-    let bytes = serde_json::to_vec(&body).unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(bytes))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bs = axum::body::to_bytes(resp.into_body(), usize::MAX)
+// Thin shim over the shared harness, preserving this file's
+// `send(router, Method, uri, Value)` call sites (the TestApiServer is consumed
+// per request, matching the original by-value Router).
+async fn send(api: TestApiServer, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
+    api.send(method.as_str(), uri, Some("application/json"), Some(&body))
         .await
-        .unwrap();
-    (status, serde_json::from_slice(&bs).unwrap_or(json!(null)))
 }
 
 /// Pod create with `status.containerStatuses[0].lastState: {}` must be
@@ -74,7 +39,7 @@ async fn send(router: Router, method: Method, uri: &str, body: Value) -> (Status
 /// container has no prior terminated/waiting/running state.
 #[tokio::test]
 async fn test_pod_with_empty_last_state_accepted_under_strict() {
-    let (_, router) = make_router();
+    let router = TestApiServer::new();
     let body = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -114,7 +79,7 @@ async fn test_pod_with_empty_last_state_accepted_under_strict() {
 /// silently drop it.
 #[tokio::test]
 async fn test_pod_with_empty_init_container_last_state_accepted_under_strict() {
-    let (_, router) = make_router();
+    let router = TestApiServer::new();
     let body = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -154,7 +119,7 @@ async fn test_pod_with_empty_init_container_last_state_accepted_under_strict() {
 /// truly-unknown fields are still rejected.
 #[tokio::test]
 async fn test_genuinely_unknown_non_empty_field_still_rejected_under_strict() {
-    let (_, router) = make_router();
+    let router = TestApiServer::new();
     let body = json!({
         "apiVersion": "v1",
         "kind": "Pod",
