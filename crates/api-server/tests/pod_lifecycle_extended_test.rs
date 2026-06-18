@@ -31,69 +31,35 @@
 //! over `MemoryStorage` + `AlwaysAllowAuthorizer`, driven through
 //! `tower::ServiceExt::oneshot`. No real cluster, no kubelet, no scheduler.
 
-use axum::{
-    body::{Body, Bytes},
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_storage::memory::MemoryStorage;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-fn spawn_router() -> (axum::Router, Arc<MemoryStorage>) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    (build_router(state, None), mem)
+fn spawn_router() -> (TestApiServer, Arc<MemoryStorage>) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
 async fn send(
-    router: &axum::Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    let req_body = match body {
-        Some(b) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(b).unwrap())
-        }
-        None => {
-            builder = builder.header("content-length", "0");
-            Body::empty()
-        }
-    };
-    let req = builder.body(req_body).unwrap();
-    let resp = router.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status();
-    let bytes: Bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body bytes");
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+    let content_type = body.as_ref().map(|_| "application/json");
+    router.send(method.as_str(), uri, content_type, body).await
 }
 
 /// Create the target namespace before any pod operation. Upstream's
 /// `framework.NewDefaultFramework` does the equivalent for every test case.
-async fn create_namespace(router: &axum::Router, name: &str) {
+async fn create_namespace(router: &TestApiServer, name: &str) {
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",

@@ -20,69 +20,34 @@
 //!   `(u16, serde_json::Value)`. Both the core/v1 (`/api/v1/…`) and
 //!   `events.k8s.io/v1` (`/apis/events.k8s.io/v1/…`) surfaces are exercised.
 
-use axum::{
-    body::Body,
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::Method;
+use rusternetes_storage::memory::MemoryStorage;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// Harness
+// Harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// Drive one request through the router and return `(status_u16, body_json)`.
 async fn send(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     content_type: Option<&str>,
     body: Option<Value>,
 ) -> (u16, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(ct) = content_type {
-        builder = builder.header("content-type", ct);
-    }
-    let raw_body = match body {
-        Some(v) => Body::from(serde_json::to_vec(&v).unwrap()),
-        None => Body::empty(),
-    };
-    let response = router
-        .oneshot(builder.body(raw_body).unwrap())
-        .await
-        .unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let (status, value) = router
+        .send(method.as_str(), uri, content_type, body.as_ref())
+        .await;
+    (status.as_u16(), value)
 }
 
 // ---------------------------------------------------------------------------

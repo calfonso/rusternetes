@@ -61,88 +61,49 @@
 //! `integration_dryrun_all_resources.rs` so that this file remains a
 //! single-file mirror of one upstream test file.
 
-use axum::{
-    body::{Body, Bytes},
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::Method;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — duplicated inline from
-// `integration_dryrun_all_resources.rs:82-100` so this file stays self-
-// contained (unit contract: do NOT factor a shared module).
+// HTTP harness — thin `(u16, Value)` shims over the shared `TestApiServer`.
+// `mem` is the backing store for direct post-prepare object assertions.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "podstrategy";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
-}
-
-async fn send(router: &axum::Router, req: Request<Body>) -> (u16, Value) {
-    let resp = router.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status().as_u16();
-    let bytes: Bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 async fn send_with_ct(
-    router: &axum::Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     content_type: &str,
     body: &Value,
 ) -> (u16, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", content_type)
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+    let (status, value) = router
+        .send(method.as_str(), uri, Some(content_type), Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
-async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
+async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
     send_with_ct(router, Method::POST, uri, "application/json", body).await
 }
 
-async fn put_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
+async fn put_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
     send_with_ct(router, Method::PUT, uri, "application/json", body).await
 }
 
-async fn get_json(router: &axum::Router, uri: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    send(router, req).await
+async fn get_json(router: &TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = router.get(uri).await;
+    (status.as_u16(), value)
 }
 
 /// Read the raw JSON object that was actually persisted under
@@ -172,7 +133,7 @@ fn pod_body(name: &str, image: &str) -> Value {
     })
 }
 
-async fn create_namespace(router: &axum::Router) {
+async fn create_namespace(router: &TestApiServer) {
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -189,7 +150,7 @@ async fn create_namespace(router: &axum::Router) {
 
 /// Create a pod through the handler and return the parsed response body. The
 /// stored object is implicitly available via `stored_pod()`.
-async fn create_pod(router: &axum::Router, name: &str, image: &str) -> Value {
+async fn create_pod(router: &TestApiServer, name: &str, image: &str) -> Value {
     let body = pod_body(name, image);
     let uri = format!("/api/v1/namespaces/{}/pods", TEST_NS);
     let (status, resp) = post_json(router, &uri, &body).await;
