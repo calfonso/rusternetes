@@ -33,152 +33,81 @@
 //! and the api-server half (storing/serving `status.certificate`) is covered by
 //! `csr_full_lifecycle_with_signer_issues_certificate` below.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
-    auth::TokenManager,
-    authz::AlwaysAllowAuthorizer,
-    observability::MetricsRegistry,
     resources::ServiceAccount,
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness (mirrors conformance_auth_rbac_serviceaccount.rs exactly)
+// HTTP harness — thin shims over the shared `TestApiServer`. The token-signing
+// secret matches the per-test `TokenManager` callers build to verify issued
+// tokens; the CA-cert variant injects a stub PEM so the namespace handler seeds
+// `kube-root-ca.crt`.
 // ---------------------------------------------------------------------------
 
-/// Build an owned `ApiServerState` (and its backing storage) with an optional
-/// CA cert PEM. Callers wrap the state in an `Arc` themselves; this keeps the
-/// `with_ca_cert` builder usable before the `Arc` is taken.
-fn build_state(ca_cert_pem: Option<String>) -> (ApiServerState, Arc<MemoryStorage>) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"conformance-auth-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    )
-    .with_ca_cert(ca_cert_pem);
-    (state, mem)
-}
+const TOKEN_SECRET: &[u8] = b"conformance-auth-secret";
 
-fn spawn_state() -> (Arc<ApiServerState>, Arc<MemoryStorage>) {
-    let (state, mem) = build_state(None);
-    (Arc::new(state), mem)
+fn spawn_state() -> (TestApiServer, Arc<MemoryStorage>) {
+    let api = TestApiServer::builder().secret(TOKEN_SECRET).build();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
 /// Build a state with a fake CA cert so the namespace handler creates the
 /// `kube-root-ca.crt` ConfigMap. In production the cert comes from a TLS
-/// cert file on disk; in unit tests we inject it via `state.ca_cert_pem`.
-fn spawn_state_with_ca_cert() -> (Arc<ApiServerState>, Arc<MemoryStorage>) {
+/// cert file on disk; in unit tests we inject it via the harness builder.
+fn spawn_state_with_ca_cert() -> (TestApiServer, Arc<MemoryStorage>) {
     // A self-signed PEM stub — not a real certificate, but non-empty so the
     // namespace handler creates kube-root-ca.crt with a ca.crt key.
     let fake_ca = "-----BEGIN CERTIFICATE-----\n\
                    MIIBpTCCAU+gAwIBAgIUConformanceTestCA\n\
-                   -----END CERTIFICATE-----\n"
-        .to_string();
-    let (state, mem) = build_state(Some(fake_ca));
-    (Arc::new(state), mem)
+                   -----END CERTIFICATE-----\n";
+    let api = TestApiServer::builder()
+        .secret(TOKEN_SECRET)
+        .ca_cert_pem(fake_ca)
+        .build();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
-async fn post_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_json)
+async fn post_json(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
 /// Like [`post_json`] but attaches arbitrary request headers. Used to drive
-/// inbound impersonation (`Impersonate-*`) through the auth middleware. Header
-/// names may repeat (e.g. multiple `Impersonate-Group`), which `append`
-/// preserves.
+/// inbound impersonation (`Impersonate-*`) through the auth middleware.
 async fn post_json_with_headers(
-    state: Arc<ApiServerState>,
+    state: TestApiServer,
     uri: &str,
     body: &Value,
     headers: &[(&str, &str)],
 ) -> (u16, Value) {
-    let router = build_router(state, None);
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json");
-    for (name, value) in headers {
-        builder = builder.header(*name, *value);
-    }
-    let req = builder
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_json)
+    let mut all_headers = vec![("content-type", "application/json")];
+    all_headers.extend_from_slice(headers);
+    let bytes = serde_json::to_vec(body).unwrap();
+    let (status, _h, _b, value) = state
+        .send_with_headers("POST", uri, &all_headers, Some(bytes))
+        .await;
+    (status.as_u16(), value)
 }
 
-async fn get_json(state: Arc<ApiServerState>, uri: &str) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_json)
+async fn get_json(state: TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = state.get(uri).await;
+    (status.as_u16(), value)
 }
 
-async fn patch_merge(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", "application/merge-patch+json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body_json)
+async fn patch_merge(state: TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = state.patch(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn delete(state: Arc<ApiServerState>, uri: &str) -> u16 {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    response.status().as_u16()
+async fn delete(state: TestApiServer, uri: &str) -> u16 {
+    state.delete(uri).await.0.as_u16()
 }
 
 /// Seed a ServiceAccount through storage (no HTTP round-trip needed).
@@ -847,16 +776,17 @@ async fn csr_approval_condition_stored_via_status_subresource() {
         }]
     });
 
-    let router = build_router(state.clone(), None);
-    let req = Request::builder()
-        .method("PUT")
-        .uri("/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-approve/approval")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&approval_body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let approval_status = response.status().as_u16();
-    assert_eq!(approval_status, 200, "CSR approval PUT must return 200");
+    let (approval_status, _) = state
+        .put(
+            "/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-approve/approval",
+            &approval_body,
+        )
+        .await;
+    assert_eq!(
+        approval_status.as_u16(),
+        200,
+        "CSR approval PUT must return 200"
+    );
 }
 
 /// Full CSR lifecycle through the API server: create → approve → an issued
@@ -907,19 +837,13 @@ async fn csr_full_lifecycle_with_signer_issues_certificate() {
         }],
         "certificate": issued_pem,
     });
-    let router = build_router(state.clone(), None);
-    let req = Request::builder()
-        .method("PUT")
-        .uri("/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-issued/status")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&status_body).unwrap()))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "CSR status PUT must return 200"
-    );
+    let (put_status, _) = state
+        .put(
+            "/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-issued/status",
+            &status_body,
+        )
+        .await;
+    assert_eq!(put_status.as_u16(), 200, "CSR status PUT must return 200");
 
     // GET must serve the issued certificate back.
     let (get_status, fetched) = get_json(

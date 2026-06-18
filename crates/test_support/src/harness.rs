@@ -13,7 +13,9 @@ use axum::{
 };
 use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
+    auth::TokenManager,
+    authz::{AlwaysAllowAuthorizer, Authorizer, RBACAuthorizer},
+    observability::MetricsRegistry,
 };
 use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
 use serde_json::Value;
@@ -34,19 +36,19 @@ pub struct TestApiServer {
 impl TestApiServer {
     /// Build a fresh api-server with empty in-memory storage and `--skip-auth`.
     pub fn new() -> Self {
-        let mem = Arc::new(MemoryStorage::new());
-        let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-        let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-        let authorizer = Arc::new(AlwaysAllowAuthorizer);
-        let metrics = Arc::new(MetricsRegistry::new());
-        let state = Arc::new(ApiServerState::new(
-            backend,
-            token_manager,
-            authorizer,
-            metrics,
-            true, // skip_auth
-        ));
-        let router = build_router(state, None);
+        Self::builder().build()
+    }
+
+    /// Start a [`TestApiServerBuilder`] for the non-default cases: a real RBAC
+    /// authorizer, `skip_auth=false` (exercise the auth middleware), a custom
+    /// token-signing secret, or an injected CA cert (so the namespace handler
+    /// seeds `kube-root-ca.crt`). The default build is identical to [`new`].
+    pub fn builder() -> TestApiServerBuilder {
+        TestApiServerBuilder::default()
+    }
+
+    fn from_parts(mem: Arc<MemoryStorage>, state: ApiServerState) -> Self {
+        let router = build_router(Arc::new(state), None);
         Self {
             storage: mem,
             router,
@@ -191,6 +193,74 @@ impl TestApiServer {
 impl Default for TestApiServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Builder for the non-default [`TestApiServer`] shapes — see
+/// [`TestApiServer::builder`]. Defaults match [`TestApiServer::new`]:
+/// `skip_auth=true`, `AlwaysAllowAuthorizer`, token secret `b"test-secret"`,
+/// no CA cert.
+pub struct TestApiServerBuilder {
+    skip_auth: bool,
+    rbac: bool,
+    secret: Vec<u8>,
+    ca_cert_pem: Option<String>,
+}
+
+impl Default for TestApiServerBuilder {
+    fn default() -> Self {
+        Self {
+            skip_auth: true,
+            rbac: false,
+            secret: b"test-secret".to_vec(),
+            ca_cert_pem: None,
+        }
+    }
+}
+
+impl TestApiServerBuilder {
+    /// Toggle the auth middleware. `false` exercises the real bearer-token /
+    /// authorizer pipeline instead of the skip-auth shortcut.
+    pub fn skip_auth(mut self, skip_auth: bool) -> Self {
+        self.skip_auth = skip_auth;
+        self
+    }
+
+    /// Use a real [`RBACAuthorizer`] (backed by the same storage) instead of
+    /// the default allow-all authorizer.
+    pub fn rbac(mut self) -> Self {
+        self.rbac = true;
+        self
+    }
+
+    /// Override the token-signing secret. Tests that decode/verify issued
+    /// tokens with their own [`TokenManager`] must pass the same bytes here.
+    pub fn secret(mut self, secret: &[u8]) -> Self {
+        self.secret = secret.to_vec();
+        self
+    }
+
+    /// Inject a CA-cert PEM so the namespace handler seeds `kube-root-ca.crt`.
+    pub fn ca_cert_pem(mut self, pem: impl Into<String>) -> Self {
+        self.ca_cert_pem = Some(pem.into());
+        self
+    }
+
+    /// Build the configured [`TestApiServer`].
+    pub fn build(self) -> TestApiServer {
+        let mem = Arc::new(MemoryStorage::new());
+        let backend = Arc::new(StorageBackend::Memory(mem.clone()));
+        let token_manager = Arc::new(TokenManager::new(&self.secret));
+        let authorizer: Arc<dyn Authorizer> = if self.rbac {
+            Arc::new(RBACAuthorizer::new(backend.clone()))
+        } else {
+            Arc::new(AlwaysAllowAuthorizer)
+        };
+        let metrics = Arc::new(MetricsRegistry::new());
+        let state =
+            ApiServerState::new(backend, token_manager, authorizer, metrics, self.skip_auth)
+                .with_ca_cert(self.ca_cert_pem);
+        TestApiServer::from_parts(mem, state)
     }
 }
 
