@@ -68,6 +68,13 @@ services:
     restart: unless-stopped
     ports:
       - "6443:6443"
+    # NET_ADMIN lets the entrypoint install a route to the pod CIDR
+    # (10.244.0.0/16) via the containerd container, so the pod/service proxy
+    # subresources can reach pod IPs that live in containerd's CNI netns. The
+    # DNS conformance tests read results through GET pods/<p>/proxy/...; without
+    # the route those fail with "error trying to reach backend".
+    cap_add:
+      - NET_ADMIN
     depends_on:
       rhino:
         condition: service_healthy
