@@ -39,167 +39,93 @@
 //!
 //! Part of the /batch landing upstream integration-test mirrors.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
+use axum::http::StatusCode;
 use rusternetes_common::{
-    authz::{AlwaysAllowAuthorizer, RBACAuthorizer},
-    observability::MetricsRegistry,
     resources::{ClusterRole, Namespace, PolicyRule, RoleRef, ServiceAccount, Subject},
     types::{ObjectMeta, TypeMeta},
 };
 use rusternetes_controller_manager::controllers::serviceaccount::ServiceAccountController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // HTTP harness
 // ---------------------------------------------------------------------------
 
-/// Build a fully-wired `ApiServerState` backed by an in-memory storage with
-/// `skip_auth = true` and `AlwaysAllow` authorizer. Used by tests 1 and 2.
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(rusternetes_common::auth::TokenManager::new(
-        b"integration-sa-token-secret",
-    ));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+const TOKEN_SECRET: &[u8] = b"integration-sa-token-secret";
+
+/// `skip_auth = true` + `AlwaysAllow` authorizer. Used by tests 1 and 2.
+fn spawn_state() -> TestApiServer {
+    TestApiServer::builder().secret(TOKEN_SECRET).build()
 }
 
-fn spawn_state() -> Arc<ApiServerState> {
-    let mem = Arc::new(MemoryStorage::new());
-    make_state(mem)
-}
-
-/// Build a wired `ApiServerState` with `skip_auth = false` and an RBAC
-/// authorizer. Used by test 3 to exercise the real bearer-token pipeline.
-fn spawn_authn_state() -> Arc<ApiServerState> {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(rusternetes_common::auth::TokenManager::new(
-        b"integration-sa-token-secret",
-    ));
-    let authorizer = Arc::new(RBACAuthorizer::new(backend.clone()));
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        false, // skip_auth — exercise real auth middleware
-    ))
+/// `skip_auth = false` + real `RBACAuthorizer`. Used by test 3 to exercise the
+/// real bearer-token pipeline.
+fn spawn_authn_state() -> TestApiServer {
+    TestApiServer::builder()
+        .secret(TOKEN_SECRET)
+        .rbac()
+        .skip_auth(false)
+        .build()
 }
 
 /// POST JSON, return `(status, body)`.
-async fn post_json(router: axum::Router, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
+    router.post(uri, body).await
 }
 
 /// GET JSON, return `(status, body)`.
-async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn get_json(router: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.get(uri).await
 }
 
 /// DELETE, return `(status, body)`.
-async fn delete(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn delete(router: &TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.delete(uri).await
 }
 
 /// POST JSON with a bearer token, return `(status, body)`.
 async fn post_json_bearer(
-    router: axum::Router,
+    router: &TestApiServer,
     uri: &str,
     token: &str,
     body: &Value,
 ) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let auth = format!("Bearer {token}");
+    let bytes = serde_json::to_vec(body).unwrap();
+    let (status, _h, _b, value) = router
+        .send_with_headers(
+            "POST",
+            uri,
+            &[
+                ("content-type", "application/json"),
+                ("authorization", &auth),
+            ],
+            Some(bytes),
+        )
+        .await;
+    (status, value)
 }
 
 /// GET with a bearer token, return `(status, body)`.
-async fn get_json_bearer(router: axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn get_json_bearer(router: &TestApiServer, uri: &str, token: &str) -> (StatusCode, Value) {
+    let auth = format!("Bearer {token}");
+    let (status, _h, _b, value) = router
+        .send_with_headers("GET", uri, &[("authorization", &auth)], None)
+        .await;
+    (status, value)
 }
 
 /// Convenience: POST a Namespace by name.
-async fn create_namespace(state: &Arc<ApiServerState>, name: &str) -> (StatusCode, Value) {
-    let router = build_router(state.clone(), None);
+async fn create_namespace(state: &TestApiServer, name: &str) -> (StatusCode, Value) {
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": {"name": name},
     });
-    post_json(router, "/api/v1/namespaces", &body).await
+    post_json(state, "/api/v1/namespaces", &body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -254,9 +180,8 @@ async fn test_service_account_auto_create() {
     );
 
     // (2) The `default` ServiceAccount must exist in the new namespace.
-    let router = build_router(state.clone(), None);
     let (status, default_sa) = get_json(
-        router,
+        &state,
         &format!("/api/v1/namespaces/{ns}/serviceaccounts/default"),
     )
     .await;
@@ -274,9 +199,8 @@ async fn test_service_account_auto_create() {
         .to_string();
 
     // (3) Delete the default ServiceAccount.
-    let router = build_router(state.clone(), None);
     let (status, body) = delete(
-        router,
+        &state,
         &format!("/api/v1/namespaces/{ns}/serviceaccounts/default"),
     )
     .await;
@@ -292,9 +216,8 @@ async fn test_service_account_auto_create() {
     let mut recreated_uid: Option<String> = None;
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let router = build_router(state.clone(), None);
         let (status, recreated) = get_json(
-            router,
+            &state,
             &format!("/api/v1/namespaces/{ns}/serviceaccounts/default"),
         )
         .await;
@@ -343,9 +266,8 @@ async fn test_service_account_token_auto_mount() {
             }],
         },
     });
-    let router = build_router(state.clone(), None);
     let (status, created) =
-        post_json(router, &format!("/api/v1/namespaces/{ns}/pods"), &pod_body).await;
+        post_json(&state, &format!("/api/v1/namespaces/{ns}/pods"), &pod_body).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -386,7 +308,7 @@ async fn test_service_account_token_auto_mount() {
 /// to ClusterRole + RoleBinding because rusternetes' RBAC checker walks
 /// both surfaces.
 async fn grant_sa_pods_verbs(
-    state: &Arc<ApiServerState>,
+    state: &TestApiServer,
     role_name: &str,
     namespace: &str,
     sa_name: &str,
@@ -440,7 +362,7 @@ async fn grant_sa_pods_verbs(
 
 /// Seed a Namespace directly through storage (used by tests that disable
 /// `skip_auth` and have no privileged client to talk through the HTTP API).
-async fn seed_namespace(state: &Arc<ApiServerState>, name: &str) {
+async fn seed_namespace(state: &TestApiServer, name: &str) {
     let ns = Namespace {
         type_meta: TypeMeta {
             api_version: "v1".to_string(),
@@ -459,7 +381,7 @@ async fn seed_namespace(state: &Arc<ApiServerState>, name: &str) {
 }
 
 /// Seed a ServiceAccount directly through storage and return the assigned UID.
-async fn seed_service_account(state: &Arc<ApiServerState>, namespace: &str, name: &str) -> String {
+async fn seed_service_account(state: &TestApiServer, namespace: &str, name: &str) -> String {
     let uid = uuid::Uuid::new_v4().to_string();
     let sa = ServiceAccount {
         type_meta: TypeMeta {
@@ -490,7 +412,7 @@ async fn seed_service_account(state: &Arc<ApiServerState>, namespace: &str, name
 ///   iss: "https://kubernetes.default.svc.cluster.local"
 ///   aud: ["https://kubernetes.default.svc"]
 ///   kubernetes.io: {namespace, serviceaccount: {name, uid}}
-fn mint_sa_token(state: &Arc<ApiServerState>, namespace: &str, sa_name: &str, uid: &str) -> String {
+fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
     let now = chrono::Utc::now();
     let claims = rusternetes_common::auth::ServiceAccountClaims {
         sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
@@ -514,7 +436,11 @@ fn mint_sa_token(state: &Arc<ApiServerState>, namespace: &str, sa_name: &str, ui
         node_name: None,
         node_uid: None,
     };
-    state.token_manager.generate_token(claims).unwrap()
+    // The server verifies with a `TokenManager` built from the same secret, so
+    // a locally-constructed manager produces an identical, acceptable signature.
+    rusternetes_common::auth::TokenManager::new(TOKEN_SECRET)
+        .generate_token(claims)
+        .unwrap()
 }
 
 /// Upstream: `TestServiceAccountTokenAuthentication` — release-1.35
@@ -551,8 +477,8 @@ async fn test_service_account_token_authentication() {
 
     // (3) Mint a bearer token for each.
     let mut tokens: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
-    tokens.insert("ro", mint_sa_token(&state, auth_ns, "ro", &ro_uid));
-    tokens.insert("rw", mint_sa_token(&state, auth_ns, "rw", &rw_uid));
+    tokens.insert("ro", mint_sa_token(auth_ns, "ro", &ro_uid));
+    tokens.insert("rw", mint_sa_token(auth_ns, "rw", &rw_uid));
 
     // Seed RBAC: ro can get/list/watch pods in auth-ns; rw can do everything.
     grant_sa_pods_verbs(
@@ -573,9 +499,8 @@ async fn test_service_account_token_authentication() {
     .await;
 
     // (4) ro may list pods in auth-ns but not create them.
-    let router = build_router(state.clone(), None);
     let (status, body) = get_json_bearer(
-        router,
+        &state,
         &format!("/api/v1/namespaces/{auth_ns}/pods"),
         &tokens["ro"],
     )
@@ -588,9 +513,8 @@ async fn test_service_account_token_authentication() {
         "metadata": {"name": "ro-pod"},
         "spec": {"containers": [{"name": "c", "image": "nginx"}]},
     });
-    let router = build_router(state.clone(), None);
     let (status, body) = post_json_bearer(
-        router,
+        &state,
         &format!("/api/v1/namespaces/{auth_ns}/pods"),
         &tokens["ro"],
         &pod_body,
@@ -609,9 +533,8 @@ async fn test_service_account_token_authentication() {
         "metadata": {"name": "rw-pod"},
         "spec": {"containers": [{"name": "c", "image": "nginx"}]},
     });
-    let router = build_router(state.clone(), None);
     let (status, body) = post_json_bearer(
-        router,
+        &state,
         &format!("/api/v1/namespaces/{auth_ns}/pods"),
         &tokens["rw"],
         &pod_body,
@@ -624,9 +547,8 @@ async fn test_service_account_token_authentication() {
     );
 
     // (5) Cross-namespace: rw may not list pods in other-ns.
-    let router = build_router(state.clone(), None);
     let (status, body) = get_json_bearer(
-        router,
+        &state,
         &format!("/api/v1/namespaces/{other_ns}/pods"),
         &tokens["rw"],
     )
@@ -645,9 +567,8 @@ async fn test_service_account_token_authentication() {
     let ro_key = build_key("serviceaccounts", Some(auth_ns), "ro");
     state.storage.delete(&ro_key).await.unwrap();
 
-    let router = build_router(state.clone(), None);
     let (status, body) = get_json_bearer(
-        router,
+        &state,
         &format!("/api/v1/namespaces/{auth_ns}/pods"),
         &tokens["ro"],
     )
