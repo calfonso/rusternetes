@@ -1,0 +1,36 @@
+[package]
+name = "rusternetes-test-support"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Shared test fixtures for the rusternetes workspace: resource builders, an
+# in-process api-server harness, and (behind features) Rust analogs of the Go
+# test fakes used when porting upstream Kubernetes unit tests. This crate is
+# wired into other crates only under [dev-dependencies]; the api-server harness
+# is feature-gated so crates that just need builders don't pull api-server in.
+
+[dependencies]
+rusternetes-common = { path = "../common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# apiserver-harness: in-process router + MemoryStorage. Optional so `common`,
+# `kube-proxy`, `kubelet` etc. can use the builders without compiling api-server.
+rusternetes-api-server = { path = "../api-server", optional = true }
+rusternetes-storage = { path = "../storage", optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+bytes = { version = "1.5", optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+apiserver-harness = [
+    "dep:rusternetes-api-server",
+    "dep:rusternetes-storage",
+    "dep:axum",
+    "dep:tower",
+    "dep:bytes",
+    "dep:tokio",
+]

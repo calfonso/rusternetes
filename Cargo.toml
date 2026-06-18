@@ -19,6 +19,7 @@ members = [
     "crates/dns",
     "crates/netstack",
     "crates/rusternetes",
+    "crates/test_support",
 ]
 # rhino is a vendored third-party submodule (its own upstream project), wired in
 # only as an optional path dependency of crates/storage. Exclude it from the
