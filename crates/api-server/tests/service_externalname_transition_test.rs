@@ -7,71 +7,26 @@
 //! not clear externalName, and previously hit
 //! `spec.externalName: Forbidden: may not be set for non-ExternalName services`.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
-use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
-
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = Arc::new(ApiServerState::new(
-        Arc::new(StorageBackend::Memory(mem)),
-        Arc::new(TokenManager::new(b"test-secret")),
-        Arc::new(AlwaysAllowAuthorizer),
-        Arc::new(MetricsRegistry::new()),
-        true,
-    ));
-    build_router(state, None)
-}
-
-async fn send(
-    router: &axum::Router,
-    method: Method,
-    uri: &str,
-    body: &Value,
-) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
+use serde_json::json;
 
 #[tokio::test]
 async fn externalname_to_clusterip_full_put_clears_externalname() {
-    let router = spawn_router();
+    let api = TestApiServer::new();
     let ns = "/api/v1/namespaces/default/services";
 
     // 1. Create an ExternalName service.
-    let (cs, _created) = send(
-        &router,
-        Method::POST,
-        ns,
-        &json!({
-            "apiVersion": "v1", "kind": "Service",
-            "metadata": {"name": "extn", "namespace": "default"},
-            "spec": {"type": "ExternalName", "externalName": "foo.example.com"}
-        }),
-    )
-    .await;
+    let (cs, _created) = api
+        .post(
+            ns,
+            &json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": "extn", "namespace": "default"},
+                "spec": {"type": "ExternalName", "externalName": "foo.example.com"}
+            }),
+        )
+        .await;
     assert_eq!(
         cs,
         StatusCode::CREATED,
@@ -80,21 +35,20 @@ async fn externalname_to_clusterip_full_put_clears_externalname() {
 
     // 2. Flip to ClusterIP via a full PUT that STILL carries externalName
     //    (what the DNS e2e does). Must NOT be rejected.
-    let (us, updated) = send(
-        &router,
-        Method::PUT,
-        "/api/v1/namespaces/default/services/extn",
-        &json!({
-            "apiVersion": "v1", "kind": "Service",
-            "metadata": {"name": "extn", "namespace": "default"},
-            "spec": {
-                "type": "ClusterIP",
-                "externalName": "foo.example.com",
-                "ports": [{"port": 80}]
-            }
-        }),
-    )
-    .await;
+    let (us, updated) = api
+        .put(
+            "/api/v1/namespaces/default/services/extn",
+            &json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": "extn", "namespace": "default"},
+                "spec": {
+                    "type": "ClusterIP",
+                    "externalName": "foo.example.com",
+                    "ports": [{"port": 80}]
+                }
+            }),
+        )
+        .await;
 
     assert_eq!(
         us,

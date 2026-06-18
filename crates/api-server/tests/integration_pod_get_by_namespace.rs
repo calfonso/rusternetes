@@ -12,60 +12,24 @@
 //! line 683 and crates/kubectl/src/client.rs `get_list`). Exercising the
 //! REST surface here reproduces any server-side bug kubectl would surface.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ));
-    build_router(state, None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
+// Thin shim over the shared harness, preserving this file's (Method, Option<&Value>)
+// call sites. `TestApiServer` boots build_router on MemoryStorage with --skip-auth.
 async fn send(
-    router: axum::Router,
+    api: &TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    let req_body = match body {
-        Some(b) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(b).unwrap())
-        }
-        None => {
-            builder = builder.header("content-length", "0");
-            Body::empty()
-        }
-    };
-    let req = builder.body(req_body).unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let content_type = body.map(|_| "application/json");
+    api.send(method.as_str(), uri, content_type, body).await
 }
 
 fn pod_body(name: &str, namespace: &str) -> Value {
@@ -92,7 +56,7 @@ async fn kubectl_get_pods_in_created_namespace_returns_pod() {
     let pod_name = "nginx-1";
 
     let (status, body) = send(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         Some(&json!({
@@ -109,7 +73,7 @@ async fn kubectl_get_pods_in_created_namespace_returns_pod() {
     );
 
     let (status, body) = send(
-        router.clone(),
+        &router,
         Method::POST,
         &format!("/api/v1/namespaces/{ns}/pods"),
         Some(&pod_body(pod_name, ns)),
@@ -122,7 +86,7 @@ async fn kubectl_get_pods_in_created_namespace_returns_pod() {
     );
 
     let (status, body) = send(
-        router.clone(),
+        &router,
         Method::GET,
         &format!("/api/v1/namespaces/{ns}/pods"),
         None,
@@ -160,7 +124,7 @@ async fn kubectl_get_pods_does_not_leak_across_namespaces() {
 
     for ns in ["team-a", "team-b"] {
         let (status, _) = send(
-            router.clone(),
+            &router,
             Method::POST,
             "/api/v1/namespaces",
             Some(&json!({
@@ -174,7 +138,7 @@ async fn kubectl_get_pods_does_not_leak_across_namespaces() {
     }
 
     let (status, _) = send(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces/team-a/pods",
         Some(&pod_body("only-in-a", "team-a")),
@@ -182,13 +146,7 @@ async fn kubectl_get_pods_does_not_leak_across_namespaces() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let (status, body) = send(
-        router.clone(),
-        Method::GET,
-        "/api/v1/namespaces/team-b/pods",
-        None,
-    )
-    .await;
+    let (status, body) = send(&router, Method::GET, "/api/v1/namespaces/team-b/pods", None).await;
     assert_eq!(status, StatusCode::OK);
     let items = body["items"].as_array().expect("items must be an array");
     assert!(
