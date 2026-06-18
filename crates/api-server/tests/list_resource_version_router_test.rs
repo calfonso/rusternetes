@@ -18,67 +18,15 @@
 //!   * `AlwaysAllowAuthorizer` + `skip_auth=true`.
 //!   * `tower::ServiceExt::oneshot` per request.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Vec<u8>, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_value: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, bytes.to_vec(), body_value)
-}
-
-async fn post_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    let (status, _raw, value) = read_body(response).await;
-    (status, value)
-}
-
-async fn get_list(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Vec<u8>, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
+// Harness: `TestApiServer` (rusternetes-test-support) boots the real
+// `build_router` on `MemoryStorage` (whose `current_revision()` is a unix
+// timestamp, always > 0) with `--skip-auth`, driven via `tower::oneshot`.
+// `send_raw` returns the raw bytes so the wire-level resourceVersion check
+// below can inspect them.
 
 /// Assert the list body carries a valid `metadata.resourceVersion`.
 fn assert_valid_list_rv(label: &str, raw: &[u8], body: &Value) {
@@ -111,13 +59,13 @@ fn assert_valid_list_rv(label: &str, raw: &[u8], body: &Value) {
     );
 }
 
-async fn create_namespace(state: &Arc<ApiServerState>, ns: &str) {
+async fn create_namespace(state: &TestApiServer, ns: &str) {
     let ns_body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": { "name": ns },
     });
-    let (status, _body) = post_json(state, "/api/v1/namespaces", &ns_body).await;
+    let (status, _body) = state.post("/api/v1/namespaces", &ns_body).await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "namespace create returned {status}",
@@ -128,7 +76,7 @@ async fn create_namespace(state: &Arc<ApiServerState>, ns: &str) {
 /// list RV must be a valid revision.
 #[tokio::test]
 async fn list_configmaps_has_valid_resource_version() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = TestApiServer::new();
     let ns = "rv-cm-ns";
     create_namespace(&state, ns).await;
 
@@ -138,14 +86,16 @@ async fn list_configmaps_has_valid_resource_version() {
         "metadata": { "name": "cm-1", "namespace": ns },
         "data": { "k": "v" },
     });
-    let (status, _b) = post_json(&state, &format!("/api/v1/namespaces/{ns}/configmaps"), &cm).await;
+    let (status, _b) = state
+        .post(&format!("/api/v1/namespaces/{ns}/configmaps"), &cm)
+        .await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "configmap create returned {status}",
     );
 
     let uri = format!("/api/v1/namespaces/{ns}/configmaps");
-    let (status, raw, body) = get_list(&state, &uri).await;
+    let (status, raw, body) = state.send_raw("GET", &uri, None, None).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -158,7 +108,7 @@ async fn list_configmaps_has_valid_resource_version() {
 /// Namespaced pods.
 #[tokio::test]
 async fn list_pods_has_valid_resource_version() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = TestApiServer::new();
     let ns = "rv-pod-ns";
     create_namespace(&state, ns).await;
 
@@ -168,14 +118,16 @@ async fn list_pods_has_valid_resource_version() {
         "metadata": { "name": "pod-1", "namespace": ns },
         "spec": { "containers": [{ "name": "c", "image": "nginx" }] },
     });
-    let (status, _b) = post_json(&state, &format!("/api/v1/namespaces/{ns}/pods"), &pod).await;
+    let (status, _b) = state
+        .post(&format!("/api/v1/namespaces/{ns}/pods"), &pod)
+        .await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "pod create returned {status}",
     );
 
     let uri = format!("/api/v1/namespaces/{ns}/pods");
-    let (status, raw, body) = get_list(&state, &uri).await;
+    let (status, raw, body) = state.send_raw("GET", &uri, None, None).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -188,11 +140,11 @@ async fn list_pods_has_valid_resource_version() {
 /// Cluster-scoped namespaces list.
 #[tokio::test]
 async fn list_namespaces_has_valid_resource_version() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = TestApiServer::new();
     create_namespace(&state, "rv-ns-a").await;
 
     let uri = "/api/v1/namespaces";
-    let (status, raw, body) = get_list(&state, uri).await;
+    let (status, raw, body) = state.send_raw("GET", uri, None, None).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -206,12 +158,12 @@ async fn list_namespaces_has_valid_resource_version() {
 /// case that broke Lens (empty collection -> `resourceVersion: ""`).
 #[tokio::test]
 async fn list_empty_configmaps_has_valid_resource_version() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = TestApiServer::new();
     let ns = "rv-empty-cm-ns";
     create_namespace(&state, ns).await;
 
     let uri = format!("/api/v1/namespaces/{ns}/configmaps");
-    let (status, raw, body) = get_list(&state, &uri).await;
+    let (status, raw, body) = state.send_raw("GET", &uri, None, None).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -229,7 +181,7 @@ async fn list_empty_configmaps_has_valid_resource_version() {
 /// `current_revision()`.
 #[tokio::test]
 async fn list_secrets_uses_store_revision_not_item_rv() {
-    let state = make_state(Arc::new(MemoryStorage::new()));
+    let state = TestApiServer::new();
     let ns = "rv-secret-ns";
     create_namespace(&state, ns).await;
 
@@ -239,15 +191,16 @@ async fn list_secrets_uses_store_revision_not_item_rv() {
         "metadata": { "name": "s-1", "namespace": ns },
         "stringData": { "k": "v" },
     });
-    let (status, _b) =
-        post_json(&state, &format!("/api/v1/namespaces/{ns}/secrets"), &secret).await;
+    let (status, _b) = state
+        .post(&format!("/api/v1/namespaces/{ns}/secrets"), &secret)
+        .await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "secret create returned {status}",
     );
 
     let uri = format!("/api/v1/namespaces/{ns}/secrets");
-    let (status, raw, body) = get_list(&state, &uri).await;
+    let (status, raw, body) = state.send_raw("GET", &uri, None, None).await;
     assert_eq!(
         status,
         StatusCode::OK,

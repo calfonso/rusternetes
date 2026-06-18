@@ -4398,6 +4398,7 @@ dependencies = [
  "rusternetes-middleware",
  "rusternetes-protobuf",
  "rusternetes-storage",
+ "rusternetes-test-support",
  "serde",
  "serde_ignored",
  "serde_json",
