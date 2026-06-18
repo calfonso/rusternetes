@@ -69,92 +69,41 @@
 //! rather than a flat `String`, and the IntoResponse impl maps each entry to
 //! its upstream `causes[].reason`), drop every `#[ignore]` below.
 
-use axum::{
-    body::{Body, Bytes},
-    http::Request,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — same pattern used by
-// `integration_pods_topology_labels.rs` and the apimachinery conformance
-// tests. We drive the production axum router with an in-memory storage and
-// AlwaysAllow authorizer so the full handler / IntoResponse stack runs.
+// HTTP harness — thin `(u16, Value)` shims over the shared `TestApiServer`. We
+// drive the production axum router so the full handler / IntoResponse stack runs.
 // ---------------------------------------------------------------------------
 
-fn make_state() -> Arc<ApiServerState> {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-fn spawn_router() -> axum::Router {
-    let state = make_state();
-    build_router(state, None)
+async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn send(router: &axum::Router, req: Request<Body>) -> (u16, Value) {
-    let resp = router.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status().as_u16();
-    let bytes: Bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
-}
-
-async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
-}
-
-async fn put_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+async fn put_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.put(uri, body).await;
+    (status.as_u16(), value)
 }
 
 async fn patch_json(
-    router: &axum::Router,
+    router: &TestApiServer,
     uri: &str,
     content_type: &str,
     body: &Value,
 ) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", content_type)
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+    let (status, value) = router
+        .send("PATCH", uri, Some(content_type), Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
-async fn create_namespace(router: &axum::Router, name: &str) {
+async fn create_namespace(router: &TestApiServer, name: &str) {
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",

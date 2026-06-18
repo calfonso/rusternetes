@@ -32,64 +32,42 @@
 //!    test pins the contract for `spec: null`; here we exercise the contrast
 //!    with the omitted case.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "default";
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `decoder_strict_fields_test.rs`.
+// HTTP harness — thin shims over the shared `TestApiServer`. `send_raw` pushes
+// an arbitrary byte body (duplicate keys / odd formatting that `to_vec` would
+// normalize away) via `send_bytes`.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> Router {
-    let mem = Arc::new(MemoryStorage::new());
-    build_router(make_state(mem), None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
 /// Send a raw JSON byte body so we can exercise duplicate keys / odd
 /// formatting that would otherwise be normalized away by `serde_json::to_vec`.
-async fn send_raw(router: Router, method: Method, uri: &str, body: Vec<u8>) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+async fn send_raw(
+    router: TestApiServer,
+    method: Method,
+    uri: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Value) {
+    let (status, _, value) = router
+        .send_bytes(method.as_str(), uri, Some("application/json"), Some(body))
+        .await;
+    (status, value)
 }
 
-async fn send_json(router: Router, method: Method, uri: &str, body: &Value) -> (StatusCode, Value) {
+async fn send_json(
+    router: TestApiServer,
+    method: Method,
+    uri: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
     let bytes = serde_json::to_vec(body).unwrap();
     send_raw(router, method, uri, bytes).await
 }
