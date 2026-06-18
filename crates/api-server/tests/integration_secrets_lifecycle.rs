@@ -41,84 +41,45 @@
 //! `tests/conformance_apimachinery_admission_webhooks.rs` and
 //! `tests/patch_cas_retry_test.rs`.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `tests/patch_cas_retry_test.rs` and
-// `tests/conformance_apimachinery_admission_webhooks.rs`.
+// HTTP harness — thin `(u16, Value)` shims over the shared `TestApiServer`,
+// preserving this file's `send(&router, …)` / `send_json(&router, …)` call sites.
 // ---------------------------------------------------------------------------
 
-/// Build a fully-wired `ApiServerState` backed by an in-memory storage with
-/// `skip_auth=true` so the router uses `skip_auth_middleware` and no token is
-/// needed.
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+/// `TestApiServer` factory (kept tuple-shaped: tests destructure
+/// `let (_mem, router) = spawn_router();`, where `_mem` is the backing store).
+fn spawn_router() -> (
+    std::sync::Arc<rusternetes_storage::memory::MemoryStorage>,
+    TestApiServer,
+) {
+    let api = TestApiServer::new();
+    (api.storage.clone(), api)
 }
 
-/// `(storage, router)` factory used by the test.
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
-}
-
-/// Issue a request and return `(status, parsed body)`. JSON-encodes `body`
-/// when present. The `content_type` argument lets the test pick
-/// `application/json` for POST/PUT vs `application/strategic-merge-patch+json`
-/// for PATCH (mirroring upstream's `types.StrategicMergePatchType`).
+/// Issue a request and return `(status, parsed body)`. The `content_type`
+/// argument lets the test pick `application/json` for POST/PUT vs
+/// `application/strategic-merge-patch+json` for PATCH.
 async fn send(
-    router: axum::Router,
+    api: &TestApiServer,
     method: &str,
     uri: &str,
     body: Option<&Value>,
     content_type: &str,
 ) -> (u16, Value) {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", content_type);
-    let body = match body {
-        Some(b) => Body::from(serde_json::to_vec(b).unwrap()),
-        None => {
-            builder = builder.header("content-length", "0");
-            Body::empty()
-        }
-    };
-    let req = builder.body(body).unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, parsed)
+    let (status, value) = api.send(method, uri, Some(content_type), body).await;
+    (status.as_u16(), value)
 }
 
 async fn send_json(
-    router: axum::Router,
+    api: &TestApiServer,
     method: &str,
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    send(router, method, uri, body, "application/json").await
+    send(api, method, uri, body, "application/json").await
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +124,7 @@ async fn test_secrets() {
         "data": { "data": "dmFsdWUxCg==" }
     });
     let (status, body) = send_json(
-        router.clone(),
+        &router,
         "POST",
         &format!("/api/v1/namespaces/{}/secrets", ns),
         Some(&secret_body),
@@ -211,7 +172,7 @@ async fn test_secrets() {
 
     // Pod 1: `uses-secret` — references an existing Secret.
     let (status, body) = send_json(
-        router.clone(),
+        &router,
         "POST",
         &format!("/api/v1/namespaces/{}/pods", ns),
         Some(&pod_template("uses-secret")),
@@ -230,7 +191,7 @@ async fn test_secrets() {
     // currently prevent this." Admission must NOT reject; the kubelet is
     // responsible for surfacing the missing Secret as a volume-mount failure.
     let (status, body) = send_json(
-        router.clone(),
+        &router,
         "POST",
         &format!("/api/v1/namespaces/{}/pods", ns),
         Some(&pod_template("uses-non-existent-secret")),
@@ -245,7 +206,7 @@ async fn test_secrets() {
 
     // Clean up the Secret to mirror upstream's `defer deleteSecretOrErrorf`.
     let (status, body) = send_json(
-        router.clone(),
+        &router,
         "DELETE",
         &format!("/api/v1/namespaces/{}/secrets/secret", ns),
         None,
@@ -278,7 +239,7 @@ async fn test_secrets() {
         "data": { "emptyData": "" }
     });
     let (status, body) = send_json(
-        router.clone(),
+        &router,
         "POST",
         &format!("/api/v1/namespaces/{}/secrets", ns),
         Some(&immutable_body),
@@ -314,7 +275,7 @@ async fn test_secrets() {
         "data": { "emptyData": "" }
     });
     let (status, body) = send(
-        router.clone(),
+        &router,
         "PATCH",
         &format!("/api/v1/namespaces/{}/secrets/secret", ns),
         Some(&patch_body),
@@ -342,7 +303,7 @@ async fn test_secrets() {
 
     // Mirror upstream's deferred cleanup.
     let (status, body) = send_json(
-        router,
+        &router,
         "DELETE",
         &format!("/api/v1/namespaces/{}/secrets/secret", ns),
         None,
