@@ -2241,8 +2241,25 @@ impl Kubelet {
 
             // Stop the pod containers, executing preStop lifecycle hooks.
             // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:849
-            if let Err(e) = self.runtime.stop_pod_for(pod, grace_period).await {
-                warn!("Error stopping pod {}/{}: {}", namespace, pod_name, e);
+            //
+            // ONLY when the pod is actually being deleted (deletionTimestamp
+            // set). A pod that reached a terminal phase ON ITS OWN
+            // (Succeeded/Failed with restartPolicy != Always) has already had
+            // every container exit — there is nothing left to stop. Crucially,
+            // stop_pod_for also REMOVES the pod sandbox, which deletes the
+            // exited containers and, with them, the CRI log files the api-server
+            // serves `kubectl logs` / `GET pods/<p>/log` from
+            // (resolve_container_id then returns "no container found"). Tearing
+            // them down the instant the pod completes breaks log retrieval for
+            // every run-to-completion pod — i.e. most output-checking
+            // conformance tests. Leave the exited containers in place; the
+            // container GC keeps one dead container per still-existing pod for
+            // log access and reaps the rest, exactly like upstream
+            // SyncTerminatingPod (which kills containers but never removes them).
+            if pod.metadata.deletion_timestamp.is_some() {
+                if let Err(e) = self.runtime.stop_pod_for(pod, grace_period).await {
+                    warn!("Error stopping pod {}/{}: {}", namespace, pod_name, e);
+                }
             }
 
             // Transition to TerminatedPod — containers are stopped.
