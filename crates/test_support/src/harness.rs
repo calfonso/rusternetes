@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{Method, Request, StatusCode},
+    http::{Request, StatusCode},
 };
 use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
@@ -48,22 +48,26 @@ impl TestApiServer {
         }
     }
 
-    /// Issue one request, returning the status and raw response body bytes.
-    pub async fn request(
+    /// Low-level request primitive — returns status, raw body bytes, and the
+    /// body parsed as JSON (`Value::Null` if it isn't JSON). Mirrors the
+    /// `send`/`read_body` helpers duplicated across `crates/api-server/tests/`.
+    pub async fn send_raw(
         &self,
-        method: Method,
+        method: &str,
         uri: &str,
-        body: Option<Value>,
-    ) -> (StatusCode, Vec<u8>) {
+        content_type: Option<&str>,
+        body: Option<&Value>,
+    ) -> (StatusCode, Vec<u8>, Value) {
         let mut builder = Request::builder().method(method).uri(uri);
-        let body = match body {
-            Some(v) => {
-                builder = builder.header("content-type", "application/json");
-                Body::from(serde_json::to_vec(&v).expect("serialize request body"))
-            }
-            None => Body::empty(),
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let req = match body {
+            Some(b) => builder
+                .body(Body::from(serde_json::to_vec(b).expect("serialize body")))
+                .expect("build request"),
+            None => builder.body(Body::empty()).expect("build request"),
         };
-        let req = builder.body(body).expect("build request");
         let resp = self
             .router
             .clone()
@@ -73,26 +77,56 @@ impl TestApiServer {
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
-            .expect("read response body");
-        (status, bytes.to_vec())
+            .expect("read response body")
+            .to_vec();
+        let value = json_or_null(&bytes);
+        (status, bytes, value)
     }
 
-    /// GET, decoding the body as JSON (`Value::Null` if the body isn't JSON).
+    /// As [`send_raw`](Self::send_raw) but drops the raw bytes.
+    pub async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        content_type: Option<&str>,
+        body: Option<&Value>,
+    ) -> (StatusCode, Value) {
+        let (status, _bytes, value) = self.send_raw(method, uri, content_type, body).await;
+        (status, value)
+    }
+
+    /// GET, decoding the body as JSON.
     pub async fn get(&self, uri: &str) -> (StatusCode, Value) {
-        let (status, bytes) = self.request(Method::GET, uri, None).await;
-        (status, json_or_null(&bytes))
+        self.send("GET", uri, None, None).await
     }
 
-    /// POST a JSON body, decoding the response as JSON.
-    pub async fn post(&self, uri: &str, body: Value) -> (StatusCode, Value) {
-        let (status, bytes) = self.request(Method::POST, uri, Some(body)).await;
-        (status, json_or_null(&bytes))
+    /// POST a JSON body.
+    pub async fn post(&self, uri: &str, body: &Value) -> (StatusCode, Value) {
+        self.send("POST", uri, Some("application/json"), Some(body))
+            .await
     }
 
-    /// DELETE, decoding the response as JSON.
+    /// PUT a JSON body.
+    pub async fn put(&self, uri: &str, body: &Value) -> (StatusCode, Value) {
+        self.send("PUT", uri, Some("application/json"), Some(body))
+            .await
+    }
+
+    /// PATCH with `application/merge-patch+json` (the common test default; use
+    /// [`send`](Self::send) for JSON-patch / strategic-merge content types).
+    pub async fn patch(&self, uri: &str, body: &Value) -> (StatusCode, Value) {
+        self.send(
+            "PATCH",
+            uri,
+            Some("application/merge-patch+json"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// DELETE.
     pub async fn delete(&self, uri: &str) -> (StatusCode, Value) {
-        let (status, bytes) = self.request(Method::DELETE, uri, None).await;
-        (status, json_or_null(&bytes))
+        self.send("DELETE", uri, None, None).await
     }
 }
 

@@ -72,6 +72,7 @@ prost-build = "0.13"
 [dev-dependencies]
 tokio-test = "0.4"
 rusternetes-controller-manager = { path = "../controller-manager" }
+rusternetes-test-support = { path = "../test_support", features = ["apiserver-harness"] }
 warp.workspace = true
 async-trait.workspace = true
 protox-parse = "0.7"

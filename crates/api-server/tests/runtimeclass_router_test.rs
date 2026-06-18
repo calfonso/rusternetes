@@ -20,93 +20,14 @@
 //!   * Pod admission: `crates/api-server/src/handlers/pod.rs` (RuntimeClass
 //!     existence check + overhead injection).
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// HTTP harness
-// ---------------------------------------------------------------------------
-
-fn make_state() -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body)
-}
-
-async fn send(
-    state: &Arc<ApiServerState>,
-    method: &str,
-    uri: &str,
-    content_type: Option<&str>,
-    body: Option<&Value>,
-) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(ct) = content_type {
-        builder = builder.header("content-type", ct);
-    }
-    let req = match body {
-        Some(b) => builder
-            .body(Body::from(serde_json::to_vec(b).unwrap()))
-            .unwrap(),
-        None => builder.body(Body::empty()).unwrap(),
-    };
-    let response = router_for(state).oneshot(req).await.unwrap();
-    read_body(response).await
-}
-
-async fn post(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    send(state, "POST", uri, Some("application/json"), Some(body)).await
-}
-
-async fn get(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    send(state, "GET", uri, None, None).await
-}
-
-async fn delete(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    send(state, "DELETE", uri, None, None).await
-}
-
-async fn patch(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    send(
-        state,
-        "PATCH",
-        uri,
-        Some("application/merge-patch+json"),
-        Some(body),
-    )
-    .await
-}
+// HTTP harness: `TestApiServer` (rusternetes-test-support) boots the real
+// `build_router` on `MemoryStorage` with `--skip-auth` and drives it via
+// `tower::oneshot`, replacing the per-file make_state/send/post/get/... helpers
+// these tests used to duplicate.
 
 const RC_COLLECTION: &str = "/apis/node.k8s.io/v1/runtimeclasses";
 
@@ -114,13 +35,13 @@ fn rc_item(name: &str) -> String {
     format!("/apis/node.k8s.io/v1/runtimeclasses/{name}")
 }
 
-async fn create_namespace(state: &Arc<ApiServerState>, name: &str) {
+async fn create_namespace(state: &TestApiServer, name: &str) {
     let ns = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": { "name": name },
     });
-    let (status, _) = post(state, "/api/v1/namespaces", &ns).await;
+    let (status, _) = state.post("/api/v1/namespaces", &ns).await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "namespace create returned {status}",
@@ -149,7 +70,7 @@ fn pod_with_rc(name: &str, rc_name: &str) -> Value {
 /// Mirrors upstream "should support RuntimeClasses API operations".
 #[tokio::test]
 async fn runtimeclass_crud_lifecycle() {
-    let state = make_state();
+    let state = TestApiServer::new();
 
     // -- create --
     let rc = json!({
@@ -158,7 +79,7 @@ async fn runtimeclass_crud_lifecycle() {
         "metadata": { "name": "crud-rc" },
         "handler": "runc",
     });
-    let (status, body) = post(&state, RC_COLLECTION, &rc).await;
+    let (status, body) = state.post(RC_COLLECTION, &rc).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -169,12 +90,12 @@ async fn runtimeclass_crud_lifecycle() {
     assert_eq!(body["metadata"]["name"], "crud-rc");
 
     // -- get --
-    let (status, body) = get(&state, &rc_item("crud-rc")).await;
+    let (status, body) = state.get(&rc_item("crud-rc")).await;
     assert_eq!(status, StatusCode::OK, "get returned {status}: {body}");
     assert_eq!(body["handler"], "runc");
 
     // -- list --
-    let (status, body) = get(&state, RC_COLLECTION).await;
+    let (status, body) = state.get(RC_COLLECTION).await;
     assert_eq!(status, StatusCode::OK, "list returned {status}: {body}");
     assert_eq!(body["kind"], "RuntimeClassList");
     let items = body["items"].as_array().expect("items must be an array");
@@ -183,7 +104,7 @@ async fn runtimeclass_crud_lifecycle() {
 
     // -- patch (merge-patch a label) --
     let patch_body = json!({ "metadata": { "labels": { "tier": "secure" } } });
-    let (status, body) = patch(&state, &rc_item("crud-rc"), &patch_body).await;
+    let (status, body) = state.patch(&rc_item("crud-rc"), &patch_body).await;
     assert_eq!(status, StatusCode::OK, "patch returned {status}: {body}");
     assert_eq!(
         body["metadata"]["labels"]["tier"], "secure",
@@ -196,14 +117,14 @@ async fn runtimeclass_crud_lifecycle() {
     );
 
     // -- delete --
-    let (status, _body) = delete(&state, &rc_item("crud-rc")).await;
+    let (status, _body) = state.delete(&rc_item("crud-rc")).await;
     assert!(
         status == StatusCode::OK || status == StatusCode::ACCEPTED,
         "delete returned {status}",
     );
 
     // -- get after delete: gone --
-    let (status, _body) = get(&state, &rc_item("crud-rc")).await;
+    let (status, _body) = state.get(&rc_item("crud-rc")).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
@@ -221,7 +142,7 @@ async fn runtimeclass_crud_lifecycle() {
 /// requesting a deleted RuntimeClass".
 #[tokio::test]
 async fn pod_referencing_deleted_runtimeclass_is_rejected() {
-    let state = make_state();
+    let state = TestApiServer::new();
     create_namespace(&state, "default").await;
 
     // Create RuntimeClass "myrc".
@@ -231,12 +152,14 @@ async fn pod_referencing_deleted_runtimeclass_is_rejected() {
         "metadata": { "name": "myrc" },
         "handler": "runc",
     });
-    let (status, body) = post(&state, RC_COLLECTION, &rc).await;
+    let (status, body) = state.post(RC_COLLECTION, &rc).await;
     assert_eq!(status, StatusCode::CREATED, "rc create: {status} {body}");
 
     // First Pod referencing "myrc" is accepted while the RC exists.
     let pods_uri = "/api/v1/namespaces/default/pods";
-    let (status, body) = post(&state, pods_uri, &pod_with_rc("pod-before", "myrc")).await;
+    let (status, body) = state
+        .post(pods_uri, &pod_with_rc("pod-before", "myrc"))
+        .await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -244,17 +167,19 @@ async fn pod_referencing_deleted_runtimeclass_is_rejected() {
     );
 
     // Delete "myrc".
-    let (status, _body) = delete(&state, &rc_item("myrc")).await;
+    let (status, _body) = state.delete(&rc_item("myrc")).await;
     assert!(
         status == StatusCode::OK || status == StatusCode::ACCEPTED,
         "rc delete returned {status}",
     );
     // Confirm it is gone.
-    let (status, _body) = get(&state, &rc_item("myrc")).await;
+    let (status, _body) = state.get(&rc_item("myrc")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "RC must be deleted");
 
     // A new Pod referencing the now-deleted "myrc" must be rejected (Forbidden).
-    let (status, body) = post(&state, pods_uri, &pod_with_rc("pod-after", "myrc")).await;
+    let (status, body) = state
+        .post(pods_uri, &pod_with_rc("pod-after", "myrc"))
+        .await;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
@@ -262,7 +187,9 @@ async fn pod_referencing_deleted_runtimeclass_is_rejected() {
     );
 
     // The Pod created before deletion is unaffected — deletion only gates new pods.
-    let (status, body) = get(&state, "/api/v1/namespaces/default/pods/pod-before").await;
+    let (status, body) = state
+        .get("/api/v1/namespaces/default/pods/pod-before")
+        .await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -281,7 +208,7 @@ async fn pod_referencing_deleted_runtimeclass_is_rejected() {
 /// the scheduler).
 #[tokio::test]
 async fn pod_overhead_injected_from_runtimeclass() {
-    let state = make_state();
+    let state = TestApiServer::new();
     create_namespace(&state, "default").await;
 
     // RuntimeClass with overhead.podFixed = {cpu: 250m, memory: 120Mi}.
@@ -292,12 +219,14 @@ async fn pod_overhead_injected_from_runtimeclass() {
         "handler": "kata",
         "overhead": { "podFixed": { "cpu": "250m", "memory": "120Mi" } },
     });
-    let (status, body) = post(&state, RC_COLLECTION, &rc).await;
+    let (status, body) = state.post(RC_COLLECTION, &rc).await;
     assert_eq!(status, StatusCode::CREATED, "rc create: {status} {body}");
 
     // Create a Pod referencing it.
     let pods_uri = "/api/v1/namespaces/default/pods";
-    let (status, body) = post(&state, pods_uri, &pod_with_rc("over-pod", "overhead-rc")).await;
+    let (status, body) = state
+        .post(pods_uri, &pod_with_rc("over-pod", "overhead-rc"))
+        .await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -305,7 +234,7 @@ async fn pod_overhead_injected_from_runtimeclass() {
     );
 
     // GET the pod and assert overhead was injected to match podFixed.
-    let (status, body) = get(&state, "/api/v1/namespaces/default/pods/over-pod").await;
+    let (status, body) = state.get("/api/v1/namespaces/default/pods/over-pod").await;
     assert_eq!(status, StatusCode::OK, "get pod: {status} {body}");
     let overhead = &body["spec"]["overhead"];
     assert!(
@@ -327,7 +256,7 @@ async fn pod_overhead_injected_from_runtimeclass() {
 /// RuntimeClass without PodOverhead" (the admission half).
 #[tokio::test]
 async fn pod_without_overhead_runtimeclass_has_no_injected_overhead() {
-    let state = make_state();
+    let state = TestApiServer::new();
     create_namespace(&state, "default").await;
 
     // RuntimeClass with no overhead.
@@ -337,18 +266,20 @@ async fn pod_without_overhead_runtimeclass_has_no_injected_overhead() {
         "metadata": { "name": "plain-rc" },
         "handler": "runc",
     });
-    let (status, body) = post(&state, RC_COLLECTION, &rc).await;
+    let (status, body) = state.post(RC_COLLECTION, &rc).await;
     assert_eq!(status, StatusCode::CREATED, "rc create: {status} {body}");
 
     let pods_uri = "/api/v1/namespaces/default/pods";
-    let (status, body) = post(&state, pods_uri, &pod_with_rc("plain-pod", "plain-rc")).await;
+    let (status, body) = state
+        .post(pods_uri, &pod_with_rc("plain-pod", "plain-rc"))
+        .await;
     assert_eq!(
         status,
         StatusCode::CREATED,
         "pod create must succeed, got {status}: {body}",
     );
 
-    let (status, body) = get(&state, "/api/v1/namespaces/default/pods/plain-pod").await;
+    let (status, body) = state.get("/api/v1/namespaces/default/pods/plain-pod").await;
     assert_eq!(status, StatusCode::OK, "get pod: {status} {body}");
     let overhead = &body["spec"]["overhead"];
     assert!(
