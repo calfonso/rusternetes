@@ -22,58 +22,32 @@
 //! Each `test_malformed_<scenario>` POSTs a malformed body to
 //! `/api/v1/namespaces/default/pods` and asserts the contract above.
 
-use axum::{
-    body::Body,
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::Value;
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `integration_dryrun_all_resources.rs:82-100`.
+// HTTP harness — thin wrappers over the shared `TestApiServer`, preserving this
+// file's `spawn_router()` / `post_pod_raw(router, body)` call sites. Malformed
+// bodies (truncated JSON, invalid UTF-8) go through `send_bytes`, which accepts
+// arbitrary raw bytes instead of a `serde_json::Value`.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    build_router(make_state(mem), None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
 /// Send a raw byte body to the pod create endpoint and return
 /// `(status, body_bytes)`.
-async fn post_pod_raw(router: axum::Router, body: Vec<u8>) -> (u16, Vec<u8>) {
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/api/v1/namespaces/default/pods")
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
-    (status, bytes)
+async fn post_pod_raw(router: TestApiServer, body: Vec<u8>) -> (u16, Vec<u8>) {
+    let (status, bytes, _) = router
+        .send_bytes(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some("application/json"),
+            Some(body),
+        )
+        .await;
+    (status.as_u16(), bytes)
 }
 
 /// Assert the contract described in the file-level docs:

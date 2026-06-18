@@ -58,14 +58,27 @@ impl TestApiServer {
         content_type: Option<&str>,
         body: Option<&Value>,
     ) -> (StatusCode, Vec<u8>, Value) {
+        let bytes = body.map(|b| serde_json::to_vec(b).expect("serialize body"));
+        self.send_bytes(method, uri, content_type, bytes).await
+    }
+
+    /// Lowest-level primitive: send an arbitrary raw byte body (or `None` for an
+    /// empty body) and return `(status, raw bytes, parsed-or-null JSON)`. Use
+    /// this for malformed-input, non-UTF-8, or non-JSON content-type tests that
+    /// cannot route their body through a `serde_json::Value`.
+    pub async fn send_bytes(
+        &self,
+        method: &str,
+        uri: &str,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> (StatusCode, Vec<u8>, Value) {
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
         }
         let req = match body {
-            Some(b) => builder
-                .body(Body::from(serde_json::to_vec(b).expect("serialize body")))
-                .expect("build request"),
+            Some(b) => builder.body(Body::from(b)).expect("build request"),
             None => builder.body(Body::empty()).expect("build request"),
         };
         let resp = self

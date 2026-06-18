@@ -44,75 +44,36 @@
 // search by upstream symbol works exactly as it does in `go test`.
 #![allow(non_snake_case)]
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager,
-    authz::AlwaysAllowAuthorizer,
-    observability::MetricsRegistry,
-    resources::{Deployment, Pod},
-};
+use axum::http::{Method, StatusCode};
+use rusternetes_common::resources::{Deployment, Pod};
 use rusternetes_controller_manager::controllers::namespace::NamespaceController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors the `spawn_router()` pattern from
-// `conformance_apimachinery_admission_webhooks.rs`.
+// HTTP harness — thin shims over the shared `TestApiServer`, preserving this
+// file's `(router, mem) = spawn_router()` + `send(&router, Method::X, …)` call
+// sites. `mem` is the backing `MemoryStorage` so tests can seed and inspect
+// storage directly (mirroring upstream's `dynamicClient` escape hatch).
 // ---------------------------------------------------------------------------
 
-/// Build a fresh `ApiServerState` backed by an in-memory store with
-/// `skip_auth=true` + `AlwaysAllowAuthorizer` so handlers don't short-circuit
-/// on auth. The `MemoryStorage` handle is returned alongside the router so
-/// tests can seed and inspect storage directly (mirroring upstream's
-/// `dynamicClient` escape hatch).
-fn spawn_router() -> (axum::Router, Arc<MemoryStorage>) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ));
-    (build_router(state, None), mem)
+fn spawn_router() -> (TestApiServer, Arc<MemoryStorage>) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
-/// Issue a single oneshot request and return `(status, parsed JSON body)`.
+/// Issue a single request and return `(status, parsed JSON body)`.
 async fn send(
-    router: axum::Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    let req_body = match body {
-        Some(b) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(b).unwrap())
-        }
-        None => {
-            builder = builder.header("content-length", "0");
-            Body::empty()
-        }
-    };
-    let req = builder.body(req_body).unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let content_type = body.as_ref().map(|_| "application/json");
+    router.send(method.as_str(), uri, content_type, body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +97,7 @@ async fn TestNamespaceCondition() {
     // (1) Create the namespace via the REST surface, matching upstream's
     // `kubeClient.CoreV1().Namespaces().Create(...)`.
     let (status, _) = send(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         Some(&json!({
@@ -204,7 +165,7 @@ async fn TestNamespaceCondition() {
     // (3) DELETE the namespace via REST (sets deletionTimestamp + kicks the
     // controller path).
     let (status, _) = send(
-        router.clone(),
+        &router,
         Method::DELETE,
         &format!("/api/v1/namespaces/{ns_name}"),
         None,
@@ -229,7 +190,7 @@ async fn TestNamespaceCondition() {
     // truth — upstream's `kubeClient.CoreV1().Namespaces().Get(...)` goes via
     // REST, so we mirror that.
     let (status, body) = send(
-        router.clone(),
+        &router,
         Method::GET,
         &format!("/api/v1/namespaces/{ns_name}"),
         None,
@@ -301,7 +262,7 @@ async fn TestNamespaceLabels() {
     // server is expected to materialise a unique `metadata.name`, then
     // populate `metadata.labels["kubernetes.io/metadata.name"]` with it.
     let (status, body) = send(
-        router.clone(),
+        &router,
         Method::POST,
         "/api/v1/namespaces",
         Some(&json!({
@@ -342,8 +303,7 @@ async fn TestNamespaceLabels() {
 
     // Upstream also lists every namespace and re-asserts the invariant. The
     // REST list endpoint returns `{items: [...]}`.
-    let (list_status, list_body) =
-        send(router.clone(), Method::GET, "/api/v1/namespaces", None).await;
+    let (list_status, list_body) = send(&router, Method::GET, "/api/v1/namespaces", None).await;
     assert_eq!(list_status, StatusCode::OK, "list status should be 200");
     let items = list_body
         .get("items")

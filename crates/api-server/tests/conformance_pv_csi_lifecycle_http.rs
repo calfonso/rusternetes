@@ -8,63 +8,20 @@
 //!   create replacement PV + PVC, PUT-update labels, deleteCollection both +
 //!   confirm. Mirrors the harness in `list_resource_version_router_test.rs`.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
-fn make_state() -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ))
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body)
-}
-
+// Thin shim over the shared `TestApiServer`, preserving this file's
+// `send(&state, method, uri, content_type, body)` call sites.
 async fn send(
-    state: &Arc<ApiServerState>,
+    state: &TestApiServer,
     method: &str,
     uri: &str,
     content_type: Option<&str>,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(ct) = content_type {
-        builder = builder.header("content-type", ct);
-    }
-    let body = match body {
-        Some(v) => Body::from(serde_json::to_vec(v).unwrap()),
-        None => Body::empty(),
-    };
-    let req = builder.body(body).unwrap();
-    let response = build_router(state.clone(), None)
-        .oneshot(req)
-        .await
-        .unwrap();
-    read_body(response).await
+    state.send(method, uri, content_type, body).await
 }
 
 fn label(body: &Value, key: &str) -> Option<String> {
@@ -107,7 +64,7 @@ fn pvc_body(name: &str) -> Value {
 
 #[tokio::test]
 async fn pv_pvc_csi_lifecycle_over_http() {
-    let state = make_state();
+    let state = TestApiServer::new();
     let pvc_uri = format!("/api/v1/namespaces/{NS}/persistentvolumeclaims");
 
     // 1. Create PV + PVC.
