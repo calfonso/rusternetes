@@ -67,97 +67,44 @@
 //! complementary handler-level pod tests already covering create/get/update/
 //! delete plumbing.
 
-use axum::{
-    body::{Body, Bytes},
-    http::Request,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_storage::memory::MemoryStorage;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — clone of the helper used in
-// `conformance_apimachinery_crd_lifecycle.rs`.
+// HTTP harness — thin `(u16, Value)` shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    let router = build_router(state.clone(), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
-async fn send(router: &axum::Router, req: Request<Body>) -> (u16, Value) {
-    let resp = router.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status().as_u16();
-    let bytes: Bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+async fn put_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.put(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn put_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+async fn patch_merge(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.patch(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn patch_merge(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", "application/merge-patch+json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+async fn get(router: &TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = router.get(uri).await;
+    (status.as_u16(), value)
 }
 
-async fn get(router: &axum::Router, uri: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    send(router, req).await
-}
-
-async fn delete(router: &axum::Router, uri: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    send(router, req).await
+async fn delete(router: &TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = router.delete(uri).await;
+    (status.as_u16(), value)
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +142,7 @@ fn prototype_pod(name: &str) -> Value {
 }
 
 /// Helper to create the namespace before any pod operation.
-async fn create_namespace(router: &axum::Router, name: &str) {
+async fn create_namespace(router: &TestApiServer, name: &str) {
     let (status, body) = post_json(router, "/api/v1/namespaces", &ns_body(name)).await;
     assert!(
         status == 201 || status == 200,

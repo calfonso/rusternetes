@@ -27,84 +27,45 @@
 //! `#[ignore]`d test that documents the failure mode — the rest of the
 //! file demonstrates each individual lifecycle step still works.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::resources::{
     Container, LimitRange, LimitRangeItem, LimitRangeSpec, Pod, PodSpec, PodStatus, ResourceQuota,
     ResourceQuotaSpec,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
 use rusternetes_controller_manager::controllers::resource_quota::ResourceQuotaController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin shims over the shared `TestApiServer`. `mem` is the
+// backing store so tests seed/inspect storage and drive the quota controller.
 // ---------------------------------------------------------------------------
 
-/// Inline `spawn_router()` helper required by the scoped-conformance plan.
-///
-/// Builds a fresh `Arc<MemoryStorage>`, wraps it in `StorageBackend::Memory`,
-/// constructs an `ApiServerState` with `skip_auth=true` +
-/// `AlwaysAllowAuthorizer` so that handlers never short-circuit on auth, and
-/// returns both the live router and the underlying `MemoryStorage` handle so
-/// tests can seed/inspect storage directly.
-fn spawn_router() -> (axum::Router, Arc<MemoryStorage>) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ));
-    (build_router(state, None), mem)
+fn spawn_router() -> (TestApiServer, Arc<MemoryStorage>) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
 /// Issue a request and return `(status, parsed body)`.
 /// Pass `body=None` for verb-only requests (GET/DELETE); otherwise the body
-/// is JSON-encoded with the given `content_type` (defaults to
-/// `application/json`).
+/// is JSON-encoded with the given `content_type`.
 async fn send(
-    router: axum::Router,
+    router: TestApiServer,
     method: &str,
     uri: &str,
     body: Option<&Value>,
     content_type: &str,
 ) -> (u16, Value) {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", content_type);
-    let body = match body {
-        Some(b) => Body::from(serde_json::to_vec(b).unwrap()),
-        None => {
-            builder = builder.header("content-length", "0");
-            Body::empty()
-        }
-    };
-    let req = builder.body(body).unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, parsed)
+    let (status, value) = router.send(method, uri, Some(content_type), body).await;
+    (status.as_u16(), value)
 }
 
 async fn send_json(
-    router: axum::Router,
+    router: TestApiServer,
     method: &str,
     uri: &str,
     body: Option<&Value>,
@@ -113,7 +74,7 @@ async fn send_json(
 }
 
 async fn send_patch(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     body: &Value,
     content_type: &str,

@@ -27,26 +27,18 @@
 //! `Arc<MemoryStorage>` wrapped in `StorageBackend::Memory`, router built via
 //! `build_router`, requests dispatched with `tower::ServiceExt::oneshot`.
 
-use axum::{
-    body::Body,
-    http::{Method, Request},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
-    auth::TokenManager,
-    authz::AlwaysAllowAuthorizer,
-    observability::MetricsRegistry,
     resources::{IntOrString, PodDisruptionBudget, PodDisruptionBudgetSpec},
     types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — same shape as patch_strategic_merge_semantics_test.rs.
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "default";
@@ -56,24 +48,10 @@ const SMP_CT: &str = "application/strategic-merge-patch+json";
 const MERGE_CT: &str = "application/merge-patch+json";
 const APPLY_CT: &str = "application/apply-patch+yaml";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// Mirror of the upstream base PDB used by `TestPatchCompatibility`:
@@ -122,7 +100,7 @@ async fn seed_base_pdb(mem: &Arc<MemoryStorage>) -> String {
 /// Send a PATCH request to the PDB endpoint with the given content-type and
 /// body. Returns `(http_status_code, response_body_json)`.
 async fn patch_pdb(
-    router: axum::Router,
+    router: TestApiServer,
     content_type: &str,
     query: Option<&str>,
     body: &Value,
@@ -137,19 +115,10 @@ async fn patch_pdb(
         uri.push_str(q);
     }
 
-    let req = Request::builder()
-        .method(Method::PATCH)
-        .uri(&uri)
-        .header("content-type", content_type)
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+    let (status, value) = router
+        .send("PATCH", &uri, Some(content_type), Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
 /// Read the stored PDB as raw JSON so per-field assertions don't have to
