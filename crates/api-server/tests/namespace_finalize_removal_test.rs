@@ -22,105 +22,33 @@
 //! `oneshot`, reading storage state via the HTTP surface so the handler logic
 //! (not just the backend) is exercised.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
-use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
+use serde_json::json;
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn router_for(state: &Arc<ApiServerState>) -> axum::Router {
-    build_router(state.clone(), None)
-}
-
-async fn read_body(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, body)
-}
-
-async fn post_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    read_body(router_for(state).oneshot(req).await.unwrap()).await
-}
-
-async fn get_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    read_body(router_for(state).oneshot(req).await.unwrap()).await
-}
-
-async fn put_json(state: &Arc<ApiServerState>, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    read_body(router_for(state).oneshot(req).await.unwrap()).await
-}
-
-async fn delete_json(state: &Arc<ApiServerState>, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    read_body(router_for(state).oneshot(req).await.unwrap()).await
-}
+// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`.
 
 /// DELETE marks the namespace Terminating and keeps it (the `kubernetes`
 /// finalizer added on create blocks immediate removal) — the controller has
 /// not finished cleanup yet.
 #[tokio::test]
 async fn delete_keeps_namespace_terminating_until_finalizers_drained() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = TestApiServer::new();
 
-    let (sc, _) = post_json(
-        &state,
-        "/api/v1/namespaces",
-        &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-keep"}}),
-    )
-    .await;
+    let (sc, _) = state
+        .post(
+            "/api/v1/namespaces",
+            &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-keep"}}),
+        )
+        .await;
     assert_eq!(sc, StatusCode::CREATED, "namespace create should succeed");
 
-    let (sc, _) = delete_json(&state, "/api/v1/namespaces/ns-keep").await;
+    let (sc, _) = state.delete("/api/v1/namespaces/ns-keep").await;
     assert!(sc.is_success(), "delete should accept (202/200), got {sc}");
 
     // Still present, now Terminating with the kubernetes finalizer.
-    let (sc, ns) = get_json(&state, "/api/v1/namespaces/ns-keep").await;
+    let (sc, ns) = state.get("/api/v1/namespaces/ns-keep").await;
     assert_eq!(
         sc,
         StatusCode::OK,
@@ -151,19 +79,18 @@ async fn delete_keeps_namespace_terminating_until_finalizers_drained() {
 /// namespace leaked Terminating forever.
 #[tokio::test]
 async fn finalize_with_drained_finalizers_removes_namespace() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = TestApiServer::new();
 
-    post_json(
-        &state,
-        "/api/v1/namespaces",
-        &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-gc"}}),
-    )
-    .await;
-    delete_json(&state, "/api/v1/namespaces/ns-gc").await;
+    state
+        .post(
+            "/api/v1/namespaces",
+            &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-gc"}}),
+        )
+        .await;
+    state.delete("/api/v1/namespaces/ns-gc").await;
 
     // Read the Terminating object as the controller would.
-    let (_, mut ns) = get_json(&state, "/api/v1/namespaces/ns-gc").await;
+    let (_, mut ns) = state.get("/api/v1/namespaces/ns-gc").await;
     assert!(
         ns.pointer("/metadata/deletionTimestamp").is_some(),
         "precondition: namespace Terminating"
@@ -173,11 +100,11 @@ async fn finalize_with_drained_finalizers_removes_namespace() {
     if let Some(meta) = ns.get_mut("metadata").and_then(|m| m.as_object_mut()) {
         meta.insert("finalizers".to_string(), json!([]));
     }
-    let (sc, _) = put_json(&state, "/api/v1/namespaces/ns-gc/finalize", &ns).await;
+    let (sc, _) = state.put("/api/v1/namespaces/ns-gc/finalize", &ns).await;
     assert!(sc.is_success(), "finalize should succeed, got {sc}");
 
     // The namespace must now be GONE from storage.
-    let (sc, _) = get_json(&state, "/api/v1/namespaces/ns-gc").await;
+    let (sc, _) = state.get("/api/v1/namespaces/ns-gc").await;
     assert_eq!(
         sc,
         StatusCode::NOT_FOUND,
@@ -189,26 +116,27 @@ async fn finalize_with_drained_finalizers_removes_namespace() {
 /// must NOT be removed — its external owner has not released it yet.
 #[tokio::test]
 async fn finalize_with_remaining_custom_finalizer_keeps_namespace() {
-    let mem = Arc::new(MemoryStorage::new());
-    let state = make_state(mem);
+    let state = TestApiServer::new();
 
-    post_json(
-        &state,
-        "/api/v1/namespaces",
-        &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-custom"}}),
-    )
-    .await;
-    delete_json(&state, "/api/v1/namespaces/ns-custom").await;
+    state
+        .post(
+            "/api/v1/namespaces",
+            &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-custom"}}),
+        )
+        .await;
+    state.delete("/api/v1/namespaces/ns-custom").await;
 
-    let (_, mut ns) = get_json(&state, "/api/v1/namespaces/ns-custom").await;
+    let (_, mut ns) = state.get("/api/v1/namespaces/ns-custom").await;
     // Controller removed `kubernetes` but a custom finalizer remains.
     if let Some(meta) = ns.get_mut("metadata").and_then(|m| m.as_object_mut()) {
         meta.insert("finalizers".to_string(), json!(["example.com/keep"]));
     }
-    let (sc, _) = put_json(&state, "/api/v1/namespaces/ns-custom/finalize", &ns).await;
+    let (sc, _) = state
+        .put("/api/v1/namespaces/ns-custom/finalize", &ns)
+        .await;
     assert!(sc.is_success());
 
-    let (sc, _) = get_json(&state, "/api/v1/namespaces/ns-custom").await;
+    let (sc, _) = state.get("/api/v1/namespaces/ns-custom").await;
     assert_eq!(
         sc,
         StatusCode::OK,

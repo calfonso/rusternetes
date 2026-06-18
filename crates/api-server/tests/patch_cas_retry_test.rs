@@ -16,56 +16,22 @@
 //! Revert scenario: reverting the retry loop causes the Conflict to be surfaced
 //! to the client as HTTP 409 instead of the expected 200.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Construct a minimal `ApiServerState` backed by the given `MemoryStorage`.
-/// `skip_auth = true` so the router uses `skip_auth_middleware` and no token
-/// is needed.
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-/// Send a PATCH request to `uri` with the given JSON body and
-/// `Content-Type: application/merge-patch+json`.
-/// Returns the HTTP status code and the response body as a `serde_json::Value`.
-async fn patch_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let body_bytes = serde_json::to_vec(body).unwrap();
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", "application/merge-patch+json")
-        .body(Body::from(body_bytes))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!(null));
-    (status, body_json)
+/// Thin shim over the shared harness, preserving this file's `(u16, Value)`
+/// return. `TestApiServer::new()` boots `build_router` on `MemoryStorage` with
+/// `--skip-auth`; `api.storage` is the backing store whose `inject_conflicts`
+/// primes the CAS mismatch these tests exercise. `patch` uses
+/// `application/merge-patch+json`.
+async fn patch_json(api: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = api.patch(uri, body).await;
+    (status.as_u16(), value)
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +49,8 @@ async fn patch_json(state: Arc<ApiServerState>, uri: &str, body: &Value) -> (u16
 /// patched resource.
 #[tokio::test]
 async fn test_patch_generic_retries_on_conflict() {
-    let mem = Arc::new(MemoryStorage::new());
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
 
     // Pre-create a ConfigMap so the handler finds it.
     let cm = json!({
@@ -102,11 +69,9 @@ async fn test_patch_generic_retries_on_conflict() {
 
     // Arm the conflict injector: the NEXT update() call returns Error::Conflict.
     mem.inject_conflicts(1);
-
-    let state = make_state(mem.clone());
     let patch = json!({"data": {"key": "patched"}});
     let (status, body) = patch_json(
-        state,
+        &api,
         "/api/v1/namespaces/default/configmaps/cm-retry-test",
         &patch,
     )
@@ -139,7 +104,8 @@ async fn test_patch_generic_retries_on_conflict() {
 /// With the fix, the handler retries and returns HTTP 200 with the patched scale.
 #[tokio::test]
 async fn test_patch_scale_retries_on_conflict() {
-    let mem = Arc::new(MemoryStorage::new());
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
 
     // Pre-create a Deployment so patch_scale can find it.
     let deployment = json!({
@@ -170,12 +136,10 @@ async fn test_patch_scale_retries_on_conflict() {
 
     // Arm the conflict injector.
     mem.inject_conflicts(1);
-
-    let state = make_state(mem.clone());
     // K8s scale PATCH body: {"spec":{"replicas": N}}
     let patch = json!({"spec": {"replicas": 5}});
     let (status, body) = patch_json(
-        state,
+        &api,
         "/apis/apps/v1/namespaces/default/deployments/scale-retry-deploy/scale",
         &patch,
     )
