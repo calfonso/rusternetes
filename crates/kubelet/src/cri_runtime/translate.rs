@@ -11,9 +11,10 @@
 //! `valueFrom` env is resolved here from inputs the kubelet fetches first:
 //! `fieldRef`/`resourceFieldRef` from the pod itself, `configMapKeyRef`/
 //! `secretKeyRef` from caller-supplied ConfigMap/Secret maps (the runtime reads
-//! these from storage before translation — see `container_config`). Deferred
-//! (tracked separately): `envFrom`, probes (driven kubelet-side via ExecSync),
-//! and windows configs.
+//! these from storage before translation — see `container_config`). `envFrom`
+//! bulk-imports a ConfigMap/Secret's keys (optionally prefixed). Deferred
+//! (tracked separately): probes (driven kubelet-side via ExecSync) and windows
+//! configs.
 
 use std::collections::HashMap;
 
@@ -144,17 +145,55 @@ pub fn sandbox_config(pod: &Pod, log_directory: &str) -> v1::PodSandboxConfig {
 /// (fetched from storage by the caller). A ref whose source/key is absent
 /// yields no var (matching the optional case); the caller is responsible for
 /// pre-validating non-optional refs.
+/// Insert or override `key` in an ordered env list (env vars are name-unique;
+/// a later write replaces an earlier one in place, keeping its position).
+fn upsert_env(out: &mut Vec<v1::KeyValue>, key: String, value: String) {
+    match out.iter_mut().find(|kv| kv.key == key) {
+        Some(kv) => kv.value = value,
+        None => out.push(v1::KeyValue { key, value }),
+    }
+}
+
 fn env_vars(
     pod: &Pod,
     container: &Container,
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
 ) -> Vec<v1::KeyValue> {
-    let Some(env) = container.env.as_ref() else {
-        return Vec::new();
-    };
-    env.iter()
-        .filter_map(|e| {
+    let mut out: Vec<v1::KeyValue> = Vec::new();
+
+    // 1. envFrom: bulk-expand referenced ConfigMaps/Secrets (declared order),
+    //    each key optionally prefixed. A later source overrides an earlier one.
+    if let Some(sources) = container.env_from.as_ref() {
+        for src in sources {
+            let prefix = src.prefix.as_deref().unwrap_or("");
+            if let Some(cmr) = src.config_map_ref.as_ref() {
+                if let Some(data) = config_maps.get(&cmr.name).and_then(|cm| cm.data.as_ref()) {
+                    for (k, v) in data {
+                        upsert_env(&mut out, format!("{prefix}{k}"), v.clone());
+                    }
+                }
+            }
+            if let Some(skr) = src.secret_ref.as_ref() {
+                if let Some(data) = secrets.get(&skr.name).and_then(|s| s.data.as_ref()) {
+                    for (k, v) in data {
+                        // Secret data is decoded bytes; env values are the UTF-8
+                        // interpretation (upstream casts []byte→string).
+                        upsert_env(
+                            &mut out,
+                            format!("{prefix}{k}"),
+                            String::from_utf8_lossy(v).into_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Individual env entries (declared order); each overrides any
+    //    envFrom-supplied var of the same name.
+    if let Some(env) = container.env.as_ref() {
+        for e in env {
             let value = if let Some(v) = e.value.as_ref() {
                 Some(v.clone())
             } else if let Some(src) = e.value_from.as_ref() {
@@ -181,12 +220,13 @@ fn env_vars(
             } else {
                 None
             };
-            value.map(|v| v1::KeyValue {
-                key: e.name.clone(),
-                value: v,
-            })
-        })
-        .collect()
+            if let Some(v) = value {
+                upsert_env(&mut out, e.name.clone(), v);
+            }
+        }
+    }
+
+    out
 }
 
 /// Resolve a downward-API pod field path (`fieldRef`) to a string value. Only
@@ -924,6 +964,103 @@ mod tests {
         };
         assert_eq!(get("FROM_CM"), Some("blue"));
         assert_eq!(get("FROM_SECRET"), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn env_from_bulk_imports_configmap_and_secret_with_prefix() {
+        use rusternetes_common::resources::pod::{
+            ConfigMapEnvSource, EnvFromSource, SecretEnvSource,
+        };
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.env_from = Some(vec![
+            EnvFromSource {
+                prefix: None,
+                config_map_ref: Some(ConfigMapEnvSource {
+                    name: "cfg".to_string(),
+                    optional: None,
+                }),
+                secret_ref: None,
+            },
+            EnvFromSource {
+                prefix: Some("SEC_".to_string()),
+                config_map_ref: None,
+                secret_ref: Some(SecretEnvSource {
+                    name: "creds".to_string(),
+                    optional: None,
+                }),
+            },
+        ]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+
+        let mut cm = ConfigMap::new("cfg", "prod");
+        cm.data = Some(HashMap::from([
+            ("COLOR".to_string(), "blue".to_string()),
+            ("SIZE".to_string(), "large".to_string()),
+        ]));
+        let mut secret = Secret::new("creds", "prod");
+        secret.data = Some(HashMap::from([("TOKEN".to_string(), b"abc".to_vec())]));
+        let config_maps = HashMap::from([("cfg".to_string(), cm)]);
+        let secrets = HashMap::from([("creds".to_string(), secret)]);
+
+        let cfg = container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &secrets);
+        let get = |k: &str| {
+            cfg.envs
+                .iter()
+                .find(|e| e.key == k)
+                .map(|e| e.value.as_str())
+        };
+        assert_eq!(get("COLOR"), Some("blue"));
+        assert_eq!(get("SIZE"), Some("large"));
+        // The secretRef prefix is prepended to every imported key.
+        assert_eq!(get("SEC_TOKEN"), Some("abc"));
+    }
+
+    #[test]
+    fn explicit_env_overrides_env_from_without_duplicating() {
+        use rusternetes_common::resources::pod::{ConfigMapEnvSource, EnvFromSource, EnvVar};
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.env_from = Some(vec![EnvFromSource {
+            prefix: None,
+            config_map_ref: Some(ConfigMapEnvSource {
+                name: "cfg".to_string(),
+                optional: None,
+            }),
+            secret_ref: None,
+        }]);
+        c.env = Some(vec![EnvVar {
+            name: "COLOR".to_string(),
+            value: Some("red".to_string()),
+            value_from: None,
+        }]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+
+        let mut cm = ConfigMap::new("cfg", "prod");
+        cm.data = Some(HashMap::from([("COLOR".to_string(), "blue".to_string())]));
+        let config_maps = HashMap::from([("cfg".to_string(), cm)]);
+
+        let cfg = container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &HashMap::new());
+        let colors: Vec<&str> = cfg
+            .envs
+            .iter()
+            .filter(|e| e.key == "COLOR")
+            .map(|e| e.value.as_str())
+            .collect();
+        // Explicit env wins over envFrom, and there is exactly one COLOR entry.
+        assert_eq!(colors, vec!["red"]);
     }
 
     #[test]
