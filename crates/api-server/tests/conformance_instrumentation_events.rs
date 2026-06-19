@@ -15,8 +15,9 @@
 //!     (events.go:217 — already in `newly-passing.txt` for this batch)
 //!
 //! Harness:
-//!   `spawn_router()` → `ApiServerState::new(…)` + `build_router(state, None)`
-//!   driven via `tower::ServiceExt::oneshot` with a `send` helper that returns
+//!   `spawn_router()` → `TestApiServer::new()` (the shared
+//!   `rusternetes-test-support` harness: `build_router` + `MemoryStorage` +
+//!   `AlwaysAllowAuthorizer`), driven via a `send` helper that returns
 //!   `(u16, serde_json::Value)`. Both the core/v1 (`/api/v1/…`) and
 //!   `events.k8s.io/v1` (`/apis/events.k8s.io/v1/…`) surfaces are exercised.
 
