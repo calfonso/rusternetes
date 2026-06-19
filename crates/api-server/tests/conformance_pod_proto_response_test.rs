@@ -41,23 +41,13 @@
 //! 6. Non-opted-in resources (e.g. ConfigMap) fall back to JSON.
 //! 7. WATCH requests (Accept stream=watch) do NOT get protobuf-wrapped.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{
-    protobuf::PROTO_REGISTRY, router::build_router, state::ApiServerState,
-};
-use rusternetes_common::{
-    auth::TokenManager,
-    authz::AlwaysAllowAuthorizer,
-    observability::MetricsRegistry,
-    protobuf::{is_protobuf, Unknown, PROTOBUF_MAGIC},
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_api_server::protobuf::PROTO_REGISTRY;
+use rusternetes_common::protobuf::{is_protobuf, Unknown, PROTOBUF_MAGIC};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 /// Round-trip a `k8s\0`-framed envelope back into its JSON form by
 /// decoding `Unknown.raw` through `PROTO_REGISTRY.decode_message(kind, …)`.
@@ -85,24 +75,10 @@ const CLIENT_GO_ACCEPT: &str = "application/vnd.kubernetes.protobuf, application
 // Harness — mirrors `decoder_accept_header_test.rs`.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) {
@@ -122,34 +98,29 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) {
 }
 
 async fn http_request(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     accept: Option<&str>,
     body: Option<(&str, Vec<u8>)>,
 ) -> (StatusCode, String, Vec<u8>) {
-    let mut req = Request::builder().method(method).uri(uri);
+    let mut headers: Vec<(&str, &str)> = Vec::new();
     if let Some(a) = accept {
-        req = req.header(axum::http::header::ACCEPT, a);
+        headers.push(("accept", a));
     }
-    let body = if let Some((ct, bytes)) = body {
-        req = req.header(axum::http::header::CONTENT_TYPE, ct);
-        Body::from(bytes)
-    } else {
-        Body::empty()
-    };
-    let response = router.oneshot(req.body(body).unwrap()).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
+    let body_bytes = body.map(|(ct, bytes)| {
+        headers.push(("content-type", ct));
+        bytes
+    });
+    let (status, hmap, bytes, _) = router
+        .send_with_headers(method.as_str(), uri, &headers, body_bytes)
+        .await;
+    let content_type = hmap
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, content_type, bytes.to_vec())
+    (status, content_type, bytes)
 }
 
 // ---------------------------------------------------------------------------

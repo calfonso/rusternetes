@@ -34,91 +34,47 @@
 //! `Arc<MemoryStorage>` + `build_router(...)` + `tower::ServiceExt::oneshot`,
 //! `skip_auth=true` + `AlwaysAllowAuthorizer`.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
+use axum::http::{Method, StatusCode};
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_storage::memory::MemoryStorage;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "configmap-consumption";
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    (mem, build_router(state, None))
-}
-
-async fn drain(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, v)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 async fn send_json(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     body: &Value,
 ) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    drain(router.oneshot(req).await.unwrap()).await
+    router
+        .send(method.as_str(), uri, Some("application/json"), Some(body))
+        .await
 }
 
-async fn send_get(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    drain(router.oneshot(req).await.unwrap()).await
+async fn send_get(router: TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.get(uri).await
 }
 
-async fn send_delete(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    drain(router.oneshot(req).await.unwrap()).await
+async fn send_delete(router: TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.delete(uri).await
 }
 
-async fn create_namespace(router: axum::Router, name: &str) {
+async fn create_namespace(router: TestApiServer, name: &str) {
     let (status, body) = send_json(
         router,
         Method::POST,
@@ -139,17 +95,12 @@ async fn create_namespace(router: axum::Router, name: &str) {
 /// Collect up to `max_events` `\n`-delimited JSON envelopes from a watch URL.
 /// Mirrors `collect_watch_events` in `integration_watch_rv_test.rs`.
 async fn collect_watch_events(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     max_events: usize,
     deadline: Duration,
 ) -> (StatusCode, Vec<Value>) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.respond("GET", uri, None, None).await;
     let status = response.status();
     let mut stream = response.into_body().into_data_stream();
     let mut buffer = String::new();
