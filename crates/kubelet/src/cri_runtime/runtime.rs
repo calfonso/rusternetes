@@ -106,6 +106,11 @@ pub struct CriContainerRuntime {
     /// client-go) can reach the api-server.
     service_host: String,
     service_port: String,
+    /// Cluster DNS server IPs (`--cluster-dns`) and domain (`--cluster-domain`)
+    /// used to build the pod-sandbox `DnsConfig` for `ClusterFirst*` pods. Empty
+    /// `cluster_dns` => pods inherit the node's resolv.conf.
+    cluster_dns: Vec<String>,
+    cluster_domain: String,
 }
 
 impl CriContainerRuntime {
@@ -126,6 +131,8 @@ impl CriContainerRuntime {
             event_recorder: None,
             service_host: "10.96.0.1".to_string(),
             service_port: "443".to_string(),
+            cluster_dns: Vec::new(),
+            cluster_domain: "cluster.local".to_string(),
         })
     }
 
@@ -135,6 +142,24 @@ impl CriContainerRuntime {
     pub fn with_service_host(mut self, host: impl Into<String>, port: impl Into<String>) -> Self {
         self.service_host = host.into();
         self.service_port = port.into();
+        self
+    }
+
+    /// Set the cluster DNS servers + domain used to populate `ClusterFirst*`
+    /// pods' sandbox `DnsConfig`. `cluster_dns` is the raw `--cluster-dns` value
+    /// (comma- or whitespace-separated IPs); empty leaves pods on node DNS. An
+    /// empty `cluster_domain` falls back to `cluster.local`.
+    #[must_use]
+    pub fn with_cluster_dns(mut self, cluster_dns: &str, cluster_domain: &str) -> Self {
+        self.cluster_dns = cluster_dns
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if !cluster_domain.is_empty() {
+            self.cluster_domain = cluster_domain.to_string();
+        }
         self
     }
 
@@ -246,7 +271,9 @@ impl CriContainerRuntime {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no sandbox for pod {}", pod.metadata.name))?;
         let log_dir = self.log_dir_for(pod);
-        let sandbox_cfg = translate::sandbox_config(pod, &log_dir);
+        let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
+        sandbox_cfg.dns_config =
+            translate::dns_config(pod, &self.cluster_dns, &self.cluster_domain);
         let mut cri = self.cri.clone();
         self.create_and_start_container(
             &mut cri,
@@ -429,7 +456,9 @@ impl CriContainerRuntime {
         // host-path map the container translation mounts.
         let host_paths = self.create_pod_volumes(pod).await?;
 
-        let sandbox_cfg = translate::sandbox_config(pod, &log_dir);
+        let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
+        sandbox_cfg.dns_config =
+            translate::dns_config(pod, &self.cluster_dns, &self.cluster_domain);
         let handler = self.runtime_handler.clone();
 
         let mut cri = self.cri.clone();
