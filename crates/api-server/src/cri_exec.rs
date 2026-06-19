@@ -45,6 +45,25 @@ pub async fn connect() -> anyhow::Result<CriClient> {
         .map_err(|e| anyhow::anyhow!("failed to connect to CRI runtime at {socket}: {e}"))
 }
 
+/// Rewrite a CRI streaming URL's host:port to a network-reachable target.
+///
+/// containerd returns exec/attach/port-forward URLs whose host is its configured
+/// `stream_server_address` — we bind `0.0.0.0:10010` (see
+/// `deploy/containerd/config.toml`). `0.0.0.0` is not dialable from the
+/// api-server container, so the streaming proxy rewrites the host to the
+/// `containerd` compose service before connecting, preserving the runtime-issued
+/// path + token query. Building block for the interactive streaming-exec proxy
+/// (#1173 follow-up); the one-shot `ExecSync` path does not use it.
+pub fn rewrite_stream_url(stream_url: &str, host: &str, port: u16) -> anyhow::Result<String> {
+    let mut u = url::Url::parse(stream_url)
+        .map_err(|e| anyhow::anyhow!("parsing CRI stream URL {stream_url:?}: {e}"))?;
+    u.set_host(Some(host))
+        .map_err(|e| anyhow::anyhow!("setting stream host {host:?}: {e}"))?;
+    u.set_port(Some(port))
+        .map_err(|()| anyhow::anyhow!("setting stream port {port}"))?;
+    Ok(u.into())
+}
+
 /// Resolve the CRI container id for a pod's named container.
 ///
 /// Filters `ListContainers` by the pod uid + container name labels the kubelet
@@ -256,6 +275,32 @@ pub fn read_log_file(path: &Path, opts: &LogReadOptions) -> anyhow::Result<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_stream_url_replaces_host_port_keeping_path_and_query() {
+        let got = rewrite_stream_url(
+            "http://0.0.0.0:10010/exec/abc123?command=ls&output=1",
+            "containerd",
+            10010,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            "http://containerd:10010/exec/abc123?command=ls&output=1"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_overrides_any_original_host() {
+        let got =
+            rewrite_stream_url("http://127.0.0.1:34567/attach/tok", "containerd", 10010).unwrap();
+        assert_eq!(got, "http://containerd:10010/attach/tok");
+    }
+
+    #[test]
+    fn rewrite_stream_url_rejects_garbage() {
+        assert!(rewrite_stream_url("not a url", "containerd", 10010).is_err());
+    }
 
     #[test]
     fn parses_full_line_strips_stream_and_tag() {

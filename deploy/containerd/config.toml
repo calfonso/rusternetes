@@ -16,6 +16,21 @@ disabled_plugins = []
   [plugins.'io.containerd.cri.v1.images'.pinned_images]
     sandbox = 'registry.k8s.io/pause:3.10.1'
 
+# CRI streaming server for interactive exec/attach/port-forward. In containerd
+# v2 the stream server still lives on the legacy `io.containerd.grpc.v1.cri`
+# plugin (the cri.v1.images / cri.v1.runtime split does not own it). The default
+# binds 127.0.0.1:<random>, which is unreachable from the api-server container
+# (it drives this runtime over the shared CRI socket but lives in a separate
+# netns). Bind a fixed, predictable port on all interfaces so the api-server's
+# streaming proxy can dial it over the compose network at containerd:10010. The
+# exec() URL containerd returns carries this address as its host, so the proxy
+# rewrites the host to the reachable `containerd` service name (#1173
+# streaming-exec follow-up). Inert today: exec still runs one-shot via ExecSync,
+# so nothing connects to this port yet.
+[plugins.'io.containerd.grpc.v1.cri']
+  stream_server_address = '0.0.0.0'
+  stream_server_port = '10010'
+
 [plugins.'io.containerd.cri.v1.runtime']
   [plugins.'io.containerd.cri.v1.runtime'.containerd]
     default_runtime_name = 'youki'
