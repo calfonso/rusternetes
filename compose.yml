@@ -44,7 +44,11 @@ services:
         # `COPY --from=rhino` into the right spot.
         rhino: ./rhino
     container_name: rusternetes-api-server
-    privileged: true
+    # NET_ADMIN lets the entrypoint install a route to the pod CIDR
+    # (10.244.0.0/16) via the containerd container, so the pod/service proxy
+    # subresources can reach pod IPs that live in containerd's CNI netns.
+    cap_add:
+      - NET_ADMIN
     ports:
       - "6443:6443"
     depends_on:
@@ -57,12 +61,18 @@ services:
     volumes:
       # Mount persistent TLS certificates
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-      # Podman socket for exec/attach via bollard (mounted at both paths for compatibility)
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
+      # CRI socket from the containerd service: the api-server reads container
+      # stats (metrics) and runs exec/logs over CRI, not a Docker socket.
+      - containerd-run:/run/containerd
+      # Pod container logs. containerd writes each container's stdout/stderr
+      # under ${KUBELET_VOLUMES_PATH}/pod-logs/...; GET pods/<p>/log is served by
+      # the api-server reading those files off the filesystem at the SAME
+      # absolute path the CRI ContainerStatus.log_path reports (see
+      # api-server/handlers/pod_subresources.rs::stream_container_logs).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - RUSTERNETES_DUMP_PAYLOADS=${RUSTERNETES_DUMP_PAYLOADS:-}
     command:
       - "--bind-address"
@@ -114,6 +124,30 @@ services:
         rhino: ./rhino
     image: rusternetes-controller-manager:latest
 
+  # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelets talk to
+  # this over CRI v1 instead of a Docker/Podman socket; pods run as containers
+  # inside this service. The CRI socket is shared with the kubelets via the
+  # `containerd-run` volume, and KUBELET_VOLUMES_PATH is bind-mounted at the same
+  # host path so the pod volumes the kubelet provisions resolve here too.
+  containerd:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.containerd
+    container_name: rusternetes-containerd
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - rusternetes-net
+    volumes:
+      - containerd-run:/run/containerd
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data:/var/lib/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+
   # Kubelet - node agent that manages containers
   kubelet:
     build:
@@ -129,11 +163,12 @@ services:
     depends_on:
       - etcd
       - api-server
+      - containerd
     networks:
       - rusternetes-net
     volumes:
-      # Podman socket
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      # CRI socket shared from the containerd service.
+      - containerd-run:/run/containerd
       # Share volume directory so ConfigMap/Secret volumes can be mounted into pods.
       # rshared so kubelet tmpfs mounts (Memory-medium emptyDir) propagate to the
       # host daemon and persist across container restarts (#445).
@@ -147,7 +182,7 @@ services:
       - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
       - RUSTERNETES_DUMP_PAYLOADS=${RUSTERNETES_DUMP_PAYLOADS:-}
     command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
@@ -167,20 +202,29 @@ services:
     depends_on:
       - etcd
       - api-server
+      - containerd
     networks:
       - rusternetes-net
     volumes:
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      # CRI socket shared from the containerd service.
+      - containerd-run:/run/containerd
+      # rshared so Memory-medium emptyDir tmpfs mounts propagate to the host
+      # mount namespace and survive container restarts (#445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
       - RUSTERNETES_DUMP_PAYLOADS=${RUSTERNETES_DUMP_PAYLOADS:-}
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
-  # Kube-proxy - network proxy
+  # Kube-proxy runs INSIDE the containerd service's network namespace
+  # (network_mode: service:containerd) so its iptables Service rules live where
+  # the pods are: pod IPs come from CNI (cni0, 10.244.0.0/16) inside containerd,
+  # which the host netns cannot reach. Sharing containerd's netns lets ClusterIP
+  # DNAT resolve to real pod IPs. It reaches the api-server over the compose
+  # network (containerd is attached to rusternetes-net) at api-server:6443.
   kube-proxy:
     build:
       context: .
@@ -192,9 +236,10 @@ services:
         rhino: ./rhino
     container_name: rusternetes-kube-proxy
     privileged: true
-    network_mode: host
+    network_mode: "service:containerd"
     user: "0:0"
     depends_on:
+      - containerd
       - api-server
     cap_add:
       - NET_ADMIN
@@ -214,8 +259,9 @@ services:
     environment:
       - RUST_LOG=info
     # API mode: read cluster state from the api-server via ApiStorage (no storage
-    # handle). Host-network → api-server reached at its host-published port.
-    command: ["--node-name", "node-1", "--api-server-url", "https://localhost:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
+    # handle). Sharing containerd's netns → api-server reached at its compose
+    # alias api-server:6443.
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
 
   # DNS - authoritative cluster.local DNS server, build-only. The dns
   # binary no longer runs as a compose container: bootstrap-cluster.sh
@@ -244,3 +290,10 @@ networks:
 volumes:
   etcd-data:
     name: rusternetes-etcd-data
+  # CRI socket shared from the containerd service to the kubelets + api-server.
+  containerd-run:
+    name: rusternetes-containerd-run
+  # containerd's snapshotter root on a real (host-fs-backed) volume so the
+  # overlayfs snapshotter works inside the Docker-hosted containerd.
+  containerd-data:
+    name: rusternetes-containerd-data

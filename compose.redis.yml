@@ -67,7 +67,11 @@ services:
         rhino: ./rhino
       target: api-server
     container_name: rusternetes-api-server
-    privileged: true
+    # NET_ADMIN lets the entrypoint install a route to the pod CIDR
+    # (10.244.0.0/16) via the containerd container, so the pod/service proxy
+    # subresources can reach pod IPs that live in containerd's CNI netns.
+    cap_add:
+      - NET_ADMIN
     ports:
       - "6443:6443"
     depends_on:
@@ -79,11 +83,18 @@ services:
           - api-server
     volumes:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
+      # CRI socket from the containerd service: the api-server reads container
+      # stats (metrics) and runs exec/logs over CRI, not a Docker socket.
+      - containerd-run:/run/containerd
+      # Pod container logs. containerd writes each container's stdout/stderr
+      # under ${KUBELET_VOLUMES_PATH}/pod-logs/...; GET pods/<p>/log is served by
+      # the api-server reading those files off the filesystem at the SAME
+      # absolute path the CRI ContainerStatus.log_path reports (see
+      # api-server/handlers/pod_subresources.rs::stream_container_logs).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
@@ -116,8 +127,13 @@ services:
       target: scheduler
     image: rusternetes-scheduler:latest
 
-  # Controller Manager - runs controllers
+  # Controller Manager — build-only. Runs in-cluster as a static pod on node-1
+  # (manifests/control-plane/kube-controller-manager.yaml, API mode via
+  # ApiStorage); `compose --profile build build` produces
+  # rusternetes-controller-manager:latest for the static pod. It never starts
+  # under `up` (gated by the `build` profile).
   controller-manager:
+    profiles: ["build"]
     build:
       context: .
       dockerfile: Dockerfile.services
@@ -126,17 +142,31 @@ services:
       additional_contexts:
         rhino: ./rhino
       target: controller-manager
-    container_name: rusternetes-controller-manager
-    depends_on:
-      - rhino
-      - api-server
+    image: rusternetes-controller-manager:latest
+
+  # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelets talk to
+  # this over CRI v1 instead of a Docker/Podman socket; pods run as containers
+  # inside this service. The CRI socket is shared with the kubelets via the
+  # `containerd-run` volume, and KUBELET_VOLUMES_PATH is bind-mounted at the same
+  # host path so the pod volumes the kubelet provisions resolve here too.
+  containerd:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.containerd
+    container_name: rusternetes-containerd
+    restart: unless-stopped
+    privileged: true
     networks:
       - rusternetes-net
     volumes:
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-    environment:
-      - RUST_LOG=info
-    command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "3", "--api-server-url", "https://api-server:6443"]
+      - containerd-run:/run/containerd
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data:/var/lib/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
 
   # Kubelet - node agent that manages containers
   kubelet:
@@ -153,11 +183,15 @@ services:
     depends_on:
       - rhino
       - api-server
+      - containerd
     networks:
       - rusternetes-net
     volumes:
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      # CRI socket shared from the containerd service.
+      - containerd-run:/run/containerd
+      # rshared so Memory-medium emptyDir tmpfs mounts propagate to the host
+      # mount namespace and survive container restarts (#445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
       # Templated control-plane static pod manifests (kube-scheduler) +
       # host-absolute certs mount for the scheduler static pod's hostPath. See
@@ -166,7 +200,7 @@ services:
       - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
@@ -186,20 +220,28 @@ services:
     depends_on:
       - rhino
       - api-server
+      - containerd
     networks:
       - rusternetes-net
     volumes:
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      # CRI socket shared from the containerd service.
+      - containerd-run:/run/containerd
+      # rshared so Memory-medium emptyDir tmpfs mounts propagate to the host
+      # mount namespace and survive container restarts (#445).
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command: ["--node-name", "node-2", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
-  # Kube-proxy - network proxy (host network mode for iptables)
+  # Kube-proxy runs INSIDE the containerd service's network namespace
+  # (network_mode: service:containerd) so its iptables Service rules live where
+  # the pods are: pod IPs come from CNI (cni0, 10.244.0.0/16) inside containerd,
+  # which the host netns cannot reach. It reaches rhino over the compose network
+  # (containerd is attached to rusternetes-net) at rhino:2379.
   kube-proxy:
     build:
       context: .
@@ -211,9 +253,10 @@ services:
       target: kube-proxy
     container_name: rusternetes-kube-proxy
     privileged: true
-    network_mode: host
+    network_mode: "service:containerd"
     user: "0:0"
     depends_on:
+      - containerd
       - api-server
     cap_add:
       - NET_ADMIN
@@ -230,8 +273,9 @@ services:
       - /lib/modules:/lib/modules:ro
     environment:
       - RUST_LOG=info
-    # Host network: rhino is accessible via the mapped port on localhost
-    command: ["--node-name", "node-1", "--etcd-servers", "http://localhost:2379"]
+    # Storage mode: read cluster state straight from rhino. Sharing containerd's
+    # netns → rhino reached at its compose alias rhino:2379.
+    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379"]
 
   # DNS image, build-only. The dns binary runs as a kube-system Deployment
   # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster
@@ -257,3 +301,10 @@ networks:
 volumes:
   redis-data:
     name: rusternetes-redis-data
+  # CRI socket shared from the containerd service to the kubelets + api-server.
+  containerd-run:
+    name: rusternetes-containerd-run
+  # containerd's snapshotter root on a real (host-fs-backed) volume so the
+  # overlayfs snapshotter works inside the Docker-hosted containerd.
+  containerd-data:
+    name: rusternetes-containerd-data
