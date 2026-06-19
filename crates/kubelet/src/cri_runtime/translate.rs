@@ -105,6 +105,25 @@ fn protocol_to_cri(proto: Option<&str>) -> i32 {
     }
 }
 
+/// Sysctls to apply to the pod sandbox, from `spec.securityContext.sysctls`.
+///
+/// CRI carries these as `LinuxPodSandboxConfig.sysctls` (a `name -> value`
+/// map); the runtime applies them to the sandbox's network/IPC namespaces. We
+/// pass through what the pod declares — admission (allowed/unsafe-sysctl
+/// gating) is a separate concern upstream, not the translation layer's.
+fn sysctls(pod: &Pod) -> HashMap<String, String> {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.security_context.as_ref())
+        .and_then(|sc| sc.sysctls.as_ref())
+        .map(|list| {
+            list.iter()
+                .map(|s| (s.name.clone(), s.value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Translate the pod into a CRI [`PodSandboxConfig`](v1::PodSandboxConfig).
 ///
 /// `log_directory` is the kubelet-owned dir the runtime writes container logs
@@ -132,6 +151,7 @@ pub fn sandbox_config(pod: &Pod, log_directory: &str) -> v1::PodSandboxConfig {
                 namespace_options: Some(namespace_options(pod)),
                 ..Default::default()
             }),
+            sysctls: sysctls(pod),
             ..Default::default()
         }),
         ..Default::default()
@@ -735,6 +755,40 @@ mod tests {
         assert_eq!(ns.pid, v1::NamespaceMode::Node as i32);
         assert_eq!(ns.ipc, v1::NamespaceMode::Node as i32);
         assert_eq!(ns.network, v1::NamespaceMode::Pod as i32);
+    }
+
+    #[test]
+    fn pod_sysctls_map_onto_sandbox_linux_config() {
+        use rusternetes_common::resources::pod::{PodSecurityContext, Sysctl};
+        let pod = pod_with(PodSpec {
+            security_context: Some(PodSecurityContext {
+                sysctls: Some(vec![
+                    Sysctl {
+                        name: "net.core.somaxconn".to_string(),
+                        value: "1024".to_string(),
+                    },
+                    Sysctl {
+                        name: "kernel.shm_rmid_forced".to_string(),
+                        value: "1".to_string(),
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let sysctls = sandbox_config(&pod, "/log").linux.unwrap().sysctls;
+        assert_eq!(sysctls.len(), 2);
+        assert_eq!(sysctls.get("net.core.somaxconn").map(String::as_str), Some("1024"));
+        assert_eq!(
+            sysctls.get("kernel.shm_rmid_forced").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn no_pod_sysctls_yields_empty_sandbox_map() {
+        let pod = pod_with(PodSpec::default());
+        assert!(sandbox_config(&pod, "/log").linux.unwrap().sysctls.is_empty());
     }
 
     #[test]
