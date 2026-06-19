@@ -18,144 +18,60 @@
 //! upstream conformance suite exercises; mocking the handler functions
 //! directly would mask the very routing/publish bugs Sonobuoy catches.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::StorageBackend;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
+
+const CRDS_URI: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
 
 // ---------------------------------------------------------------------------
-// HTTP harness (inline per-file per batch convention; see plan §"HTTP harness")
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-/// Build an `ApiServerState` backed by `StorageBackend::Memory` with
-/// `skip_auth = true`. Mirrors `router_smoke_test::make_test_state`.
-fn spawn_state() -> Arc<ApiServerState> {
-    let storage = Arc::new(StorageBackend::new_memory());
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        storage,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ))
+fn spawn_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
-/// POST the given CRD JSON to `/apis/apiextensions.k8s.io/v1/customresourcedefinitions`.
-/// Returns `(status, body)` so tests can assert the publish round-trip.
-async fn post_crd(state: Arc<ApiServerState>, crd_body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(crd_body).unwrap()))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+/// POST the given CRD JSON. Returns `(status, body)`.
+async fn post_crd(state: &TestApiServer, crd_body: &Value) -> (u16, Value) {
+    let (status, value) = state.post(CRDS_URI, crd_body).await;
+    (status.as_u16(), value)
 }
 
 /// PUT the given CRD JSON to update an existing CRD.
-async fn put_crd(state: Arc<ApiServerState>, name: &str, crd_body: &Value) -> (u16, Value) {
-    let router = build_router(state, None);
-    let uri = format!(
-        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{}",
-        name
-    );
-    let req = Request::builder()
-        .method("PUT")
-        .uri(&uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(crd_body).unwrap()))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+async fn put_crd(state: &TestApiServer, name: &str, crd_body: &Value) -> (u16, Value) {
+    let (status, value) = state.put(&format!("{CRDS_URI}/{name}"), crd_body).await;
+    (status.as_u16(), value)
 }
 
 /// DELETE an existing CRD by name.
-async fn delete_crd(state: Arc<ApiServerState>, name: &str) -> u16 {
-    let router = build_router(state, None);
-    let uri = format!(
-        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{}",
-        name
-    );
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(&uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    resp.status().as_u16()
+async fn delete_crd(state: &TestApiServer, name: &str) -> u16 {
+    state.delete(&format!("{CRDS_URI}/{name}")).await.0.as_u16()
 }
 
 /// GET the published v2 swagger spec. Returns the parsed JSON body.
-async fn get_openapi_v2(state: Arc<ApiServerState>) -> Value {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("GET")
-        .uri("/openapi/v2")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+async fn get_openapi_v2(state: &TestApiServer) -> Value {
+    let (status, value) = state.get("/openapi/v2").await;
     assert_eq!(
-        resp.status().as_u16(),
+        status.as_u16(),
         200,
         "/openapi/v2 must serve 200 (upstream tests poll until valid)"
     );
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    serde_json::from_slice(&bytes).expect("/openapi/v2 must be JSON")
+    value
 }
 
 /// GET `/openapi/v3/apis/<group>/<version>`. Returns the parsed JSON body.
-async fn get_openapi_v3_for_group(state: Arc<ApiServerState>, group: &str, version: &str) -> Value {
-    let router = build_router(state, None);
+async fn get_openapi_v3_for_group(state: &TestApiServer, group: &str, version: &str) -> Value {
     let uri = format!("/openapi/v3/apis/{}/{}", group, version);
-    let req = Request::builder()
-        .method("GET")
-        .uri(&uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status().as_u16(), 200, "{} must serve 200", uri);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    serde_json::from_slice(&bytes).expect("openapi v3 body must be JSON")
+    let (status, value) = state.get(&uri).await;
+    assert_eq!(status.as_u16(), 200, "{} must serve 200", uri);
+    value
 }
 
 /// GET `/openapi/v3` (root discovery doc).
-async fn get_openapi_v3_root(state: Arc<ApiServerState>) -> Value {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("GET")
-        .uri("/openapi/v3")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status().as_u16(), 200, "/openapi/v3 must serve 200");
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    serde_json::from_slice(&bytes).expect("/openapi/v3 must be JSON")
+async fn get_openapi_v3_root(state: &TestApiServer) -> Value {
+    let (status, value) = state.get("/openapi/v3").await;
+    assert_eq!(status.as_u16(), 200, "/openapi/v3 must serve 200");
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -396,14 +312,14 @@ async fn crd_with_validation_schema_publishes_to_openapi_v2() {
         "e2e-test-foos",
         "Foo",
     );
-    let (status, _body) = post_crd(state.clone(), &crd).await;
+    let (status, _body) = post_crd(&state, &crd).await;
     assert!(
         (200..300).contains(&status),
         "CRD POST must succeed, got {}",
         status
     );
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let definitions = v2
         .pointer("/definitions")
         .and_then(|v| v.as_object())
@@ -447,10 +363,10 @@ async fn crd_without_validation_schema_publishes_to_openapi_v2() {
         "e2e-test-bars",
         "Bar",
     );
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let definitions = v2
         .pointer("/definitions")
         .and_then(|v| v.as_object())
@@ -488,10 +404,10 @@ async fn crd_preserves_unknown_fields_at_root_in_openapi_v2() {
         "e2e-test-pur",
         "Pur",
     );
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let def = v2
         .pointer("/definitions/com.example.v1.Pur")
         .expect("definition published");
@@ -531,10 +447,10 @@ async fn crd_preserves_unknown_fields_in_embedded_object_in_openapi_v2() {
         "e2e-test-pue",
         "Pue",
     );
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let def = v2
         .pointer("/definitions/com.example.v1.Pue")
         .expect("definition published");
@@ -557,11 +473,11 @@ async fn multiple_crds_of_different_groups_publish_independently() {
     let state = spawn_state();
     let foo = schema_foo_crd("foos.alpha.example.com", "alpha.example.com", "foos", "Foo");
     let bar = schema_foo_crd("bars.beta.example.com", "beta.example.com", "bars", "Bar");
-    let (s1, _) = post_crd(state.clone(), &foo).await;
-    let (s2, _) = post_crd(state.clone(), &bar).await;
+    let (s1, _) = post_crd(&state, &foo).await;
+    let (s2, _) = post_crd(&state, &bar).await;
     assert!((200..300).contains(&s1) && (200..300).contains(&s2));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     assert!(
         defs.contains_key("com.example.alpha.v1.Foo"),
@@ -581,10 +497,10 @@ async fn multiple_crds_of_different_groups_publish_independently() {
 async fn multiple_crds_same_group_different_versions_publish_separately() {
     let state = spawn_state();
     let crd = multi_version_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     assert!(
         defs.contains_key("com.example.v2.Foo"),
@@ -605,11 +521,11 @@ async fn multiple_crds_same_group_version_different_kinds_publish_separately() {
     let state = spawn_state();
     let foo = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
     let bar = schema_foo_crd("bars.example.com", "example.com", "bars", "Bar");
-    let (s1, _) = post_crd(state.clone(), &foo).await;
-    let (s2, _) = post_crd(state.clone(), &bar).await;
+    let (s1, _) = post_crd(&state, &foo).await;
+    let (s2, _) = post_crd(&state, &bar).await;
     assert!((200..300).contains(&s1) && (200..300).contains(&s2));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     assert!(defs.contains_key("com.example.v1.Foo"));
     assert!(defs.contains_key("com.example.v1.Bar"));
@@ -628,16 +544,16 @@ async fn multiple_crds_same_group_version_different_kinds_publish_separately() {
 async fn crd_rename_version_updates_published_openapi_v2() {
     let state = spawn_state();
     let crd = multi_version_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (s1, _) = post_crd(state.clone(), &crd).await;
+    let (s1, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&s1));
 
     // Update: rename v3 → v4
     let mut updated = crd.clone();
     updated["spec"]["versions"][1]["name"] = json!("v4");
-    let (s2, _) = put_crd(state.clone(), "foos.example.com", &updated).await;
+    let (s2, _) = put_crd(&state, "foos.example.com", &updated).await;
     assert!((200..300).contains(&s2));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     assert!(
         defs.contains_key("com.example.v4.Foo"),
@@ -659,16 +575,16 @@ async fn crd_rename_version_updates_published_openapi_v2() {
 async fn crd_unserved_version_is_removed_from_published_openapi_v2() {
     let state = spawn_state();
     let crd = multi_version_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (s1, _) = post_crd(state.clone(), &crd).await;
+    let (s1, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&s1));
 
     // Update: set v3.served = false.
     let mut updated = crd.clone();
     updated["spec"]["versions"][1]["served"] = json!(false);
-    let (s2, _) = put_crd(state.clone(), "foos.example.com", &updated).await;
+    let (s2, _) = put_crd(&state, "foos.example.com", &updated).await;
     assert!((200..300).contains(&s2));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     assert!(
         defs.contains_key("com.example.v2.Foo"),
@@ -694,10 +610,10 @@ async fn crd_unserved_version_is_removed_from_published_openapi_v2() {
 async fn crd_publish_does_not_collide_with_builtin_plural_name() {
     let state = spawn_state();
     let crd = schema_foo_crd("pods.example.com", "example.com", "pods", "PodLike");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let def = v2
         .pointer("/definitions/com.example.v1.PodLike")
         .expect("CRD definition keyed by GVK not by plural — no collision with core/v1 Pod");
@@ -831,29 +747,14 @@ async fn spawn_mock_conversion_webhook() -> String {
 
 /// Issue a request through the router built on `state` and return `(status, body)`.
 async fn router_request(
-    state: Arc<ApiServerState>,
+    state: &TestApiServer,
     method: &str,
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let router = build_router(state, None);
-    let mut req = Request::builder().method(method).uri(uri);
-    if body.is_some() {
-        req = req.header("content-type", "application/json");
-    }
-    let req = match body {
-        Some(b) => req
-            .body(Body::from(serde_json::to_vec(b).unwrap()))
-            .unwrap(),
-        None => req.body(Body::empty()).unwrap(),
-    };
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+    let content_type = body.as_ref().map(|_| "application/json");
+    let (status, value) = state.send(method, uri, content_type, body).await;
+    (status.as_u16(), value)
 }
 
 /// [sig-api-machinery] CustomResourceConversionWebhook should be able to convert from CR v1 to CR v2 [Conformance]
@@ -915,7 +816,7 @@ async fn crd_conversion_webhook_converts_v1_to_v2() {
             ]
         }
     });
-    let (status, body) = post_crd(state.clone(), &crd).await;
+    let (status, body) = post_crd(&state, &crd).await;
     assert!(
         (200..300).contains(&status),
         "conversion-strategy=Webhook CRD must be accepted, got {} body={:?}",
@@ -931,7 +832,7 @@ async fn crd_conversion_webhook_converts_v1_to_v2() {
         "hostPort": "localhost:8080"
     });
     let (cs, cb) = router_request(
-        state.clone(),
+        &state,
         "POST",
         "/apis/example.com/v1/namespaces/default/conversions",
         Some(&cr_v1),
@@ -946,7 +847,7 @@ async fn crd_conversion_webhook_converts_v1_to_v2() {
 
     // GET the same CR at v2 — must round-trip through the webhook.
     let (gs, gb) = router_request(
-        state,
+        &state,
         "GET",
         "/apis/example.com/v2/namespaces/default/conversions/sample",
         None,
@@ -1026,7 +927,7 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
             ]
         }
     });
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
     // CR #1: created at v1 (stored as v1).
@@ -1037,7 +938,7 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
         "hostPort": "alpha:1000"
     });
     let (s1, _) = router_request(
-        state.clone(),
+        &state,
         "POST",
         "/apis/example.com/v1/namespaces/default/mixeds",
         Some(&cr_v1),
@@ -1055,7 +956,7 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
         "port": "2000"
     });
     let (s2, _) = router_request(
-        state.clone(),
+        &state,
         "POST",
         "/apis/example.com/v2/namespaces/default/mixeds",
         Some(&cr_v2),
@@ -1066,7 +967,7 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
     // LIST at v2 — webhook must convert the v1-stored item, the v2-stored
     // item must pass through untouched.
     let (ls, lb) = router_request(
-        state,
+        &state,
         "GET",
         "/apis/example.com/v2/namespaces/default/mixeds",
         None,
@@ -1127,11 +1028,11 @@ async fn crd_conversion_webhook_converts_non_homogeneous_list() {
 async fn crd_definition_appears_under_openapi_v3_group_version() {
     let state = spawn_state();
     let crd = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
     // Root v3 doc must advertise the new group/version path.
-    let root = get_openapi_v3_root(state.clone()).await;
+    let root = get_openapi_v3_root(&state).await;
     let paths = root.pointer("/paths").and_then(|v| v.as_object()).unwrap();
     assert!(
         paths.contains_key("apis/example.com/v1"),
@@ -1140,7 +1041,7 @@ async fn crd_definition_appears_under_openapi_v3_group_version() {
     );
 
     // The per-GV spec must include the CRD schema under components/schemas.
-    let gv_spec = get_openapi_v3_for_group(state, "example.com", "v1").await;
+    let gv_spec = get_openapi_v3_for_group(&state, "example.com", "v1").await;
     let schemas = gv_spec
         .pointer("/components/schemas")
         .and_then(|v| v.as_object())
@@ -1161,10 +1062,10 @@ async fn crd_definition_appears_under_openapi_v3_group_version() {
 async fn crd_publish_preserves_description_metadata() {
     let state = spawn_state();
     let crd = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let def = v2
         .pointer("/definitions/com.example.v1.Foo")
         .expect("definition published");
@@ -1193,10 +1094,10 @@ async fn crd_publish_preserves_description_metadata() {
 async fn crd_publish_preserves_required_fields() {
     let state = spawn_state();
     let crd = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let required = v2
         .pointer("/definitions/com.example.v1.Foo/properties/spec/properties/bars/items/required")
         .and_then(|v| v.as_array())
@@ -1218,23 +1119,23 @@ async fn crd_publish_preserves_required_fields() {
 async fn delete_crd_drops_definition_from_published_openapi_v2() {
     let state = spawn_state();
     let crd = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
     // Sanity: published.
-    let v2_before = get_openapi_v2(state.clone()).await;
+    let v2_before = get_openapi_v2(&state).await;
     assert!(v2_before
         .pointer("/definitions/com.example.v1.Foo")
         .is_some());
 
-    let del = delete_crd(state.clone(), "foos.example.com").await;
+    let del = delete_crd(&state, "foos.example.com").await;
     assert!(
         (200..300).contains(&del),
         "DELETE CRD must succeed, got {}",
         del
     );
 
-    let v2_after = get_openapi_v2(state).await;
+    let v2_after = get_openapi_v2(&state).await;
     let defs = v2_after
         .pointer("/definitions")
         .unwrap()
@@ -1257,7 +1158,7 @@ async fn delete_crd_drops_definition_from_published_openapi_v2() {
 #[tokio::test]
 async fn openapi_v2_baseline_has_no_crd_definitions() {
     let state = spawn_state();
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     // No entry should look like a CRD key (reverse-domain group + version + kind).
     // Both `io.k8s.apimachinery.*` (shared meta types) and `io.k8s.api.*`
@@ -1282,7 +1183,7 @@ async fn openapi_v2_baseline_has_no_crd_definitions() {
 #[tokio::test]
 async fn openapi_v2_is_recomputed_after_crd_create() {
     let state = spawn_state();
-    let v2_pre = get_openapi_v2(state.clone()).await;
+    let v2_pre = get_openapi_v2(&state).await;
     let pre_defs = v2_pre
         .pointer("/definitions")
         .and_then(|v| v.as_object())
@@ -1290,10 +1191,10 @@ async fn openapi_v2_is_recomputed_after_crd_create() {
         .unwrap_or(0);
 
     let crd = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2_post = get_openapi_v2(state).await;
+    let v2_post = get_openapi_v2(&state).await;
     let post_defs = v2_post
         .pointer("/definitions")
         .and_then(|v| v.as_object())
@@ -1316,10 +1217,10 @@ async fn openapi_v2_is_recomputed_after_crd_create() {
 async fn crd_publish_includes_namespaced_get_path() {
     let state = spawn_state();
     let crd = schema_foo_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (status, _) = post_crd(state.clone(), &crd).await;
+    let (status, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&status));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let paths = v2.pointer("/paths").and_then(|v| v.as_object()).unwrap();
     let expected = "/apis/example.com/v1/namespaces/{namespace}/foos";
     assert!(
@@ -1341,7 +1242,7 @@ async fn crd_publish_includes_namespaced_get_path() {
 async fn crd_schema_update_reflected_in_published_openapi_v2() {
     let state = spawn_state();
     let crd_v1 = schema_foo_crd("widgets.example.com", "example.com", "widgets", "Widget");
-    let (s1, _) = post_crd(state.clone(), &crd_v1).await;
+    let (s1, _) = post_crd(&state, &crd_v1).await;
     assert!((200..300).contains(&s1));
 
     // Remove the `feeling` enum field via PUT.
@@ -1355,10 +1256,10 @@ async fn crd_schema_update_reflected_in_published_openapi_v2() {
             "age": { "type": "string" }
         }
     });
-    let (s2, _) = put_crd(state.clone(), "widgets.example.com", &crd_v2).await;
+    let (s2, _) = put_crd(&state, "widgets.example.com", &crd_v2).await;
     assert!((200..300).contains(&s2));
 
-    let v2 = get_openapi_v2(state).await;
+    let v2 = get_openapi_v2(&state).await;
     let item_props = v2
         .pointer(
             "/definitions/com.example.v1.Widget/properties/spec/properties/bars/items/properties",
@@ -1383,15 +1284,15 @@ async fn crd_schema_update_reflected_in_published_openapi_v2() {
 async fn crd_unserved_version_absent_from_openapi_v3_group_version() {
     let state = spawn_state();
     let crd = multi_version_crd("foos.example.com", "example.com", "foos", "Foo");
-    let (s1, _) = post_crd(state.clone(), &crd).await;
+    let (s1, _) = post_crd(&state, &crd).await;
     assert!((200..300).contains(&s1));
 
     let mut updated = crd.clone();
     updated["spec"]["versions"][1]["served"] = json!(false);
-    let (s2, _) = put_crd(state.clone(), "foos.example.com", &updated).await;
+    let (s2, _) = put_crd(&state, "foos.example.com", &updated).await;
     assert!((200..300).contains(&s2));
 
-    let gv_spec = get_openapi_v3_for_group(state, "example.com", "v3").await;
+    let gv_spec = get_openapi_v3_for_group(&state, "example.com", "v3").await;
     let schemas = gv_spec
         .pointer("/components/schemas")
         .and_then(|v| v.as_object())
