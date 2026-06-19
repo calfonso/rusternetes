@@ -179,6 +179,7 @@ COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
+COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 # build.rs scripts + proto/ files belong with the manifests because
 # they participate in dependency resolution / codegen during the
@@ -194,13 +195,13 @@ COPY crates/cri/proto           crates/cri/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
-#   - lib only:   common, storage, cloud-providers, netstack, cri
+#   - lib only:   common, storage, cloud-providers, netstack, cri, test_support
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet, kube-proxy,
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri; do \
+    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -301,6 +302,12 @@ COPY crates/rusternetes/src          crates/rusternetes/src
 COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
 COPY crates/storage/src              crates/storage/src
+# test_support: the in-process api-server test harness. A workspace member, so
+# its manifest is required for `cargo` to resolve the workspace even though the
+# release bins don't depend on it (dev-dependency); src is copied so in-image
+# `cargo test` works (#1202 added the crate; the build broke until it was
+# enumerated here — keep in sync with the [workspace] members list).
+COPY crates/test_support/src         crates/test_support/src
 
 # Rebuild with real sources. Pass 1 already wiped the dummy workspace
 # artefacts via `cargo clean -p`, so cargo compiles every workspace
