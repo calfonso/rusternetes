@@ -16,50 +16,26 @@
 //! Upstream behavior: Kubernetes never fails a watch because of one bad stored
 //! object. It simply skips it and continues streaming valid objects.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
+use axum::http::StatusCode;
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tower::ServiceExt;
 
 const NS: &str = "watch-skip-test";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    Arc::new(ApiServerState::new(
-        backend,
-        Arc::new(TokenManager::new(b"test-secret")),
-        Arc::new(AlwaysAllowAuthorizer),
-        Arc::new(MetricsRegistry::new()),
-        true, // skip_auth
-    ))
-}
-
 /// Open a watch stream, collect up to `max` newline-delimited JSON events
-/// within `deadline`, and return them. Spawned as its own task so the caller
-/// can also mutate storage concurrently.
+/// within `deadline`, and return them. Uses the harness `respond` escape hatch
+/// to get the un-buffered streaming `Response`.
 async fn collect_watch_events(
-    router: axum::Router,
+    router: &TestApiServer,
     uri: String,
     max: usize,
     deadline: Duration,
 ) -> (StatusCode, Vec<Value>) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(&uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.respond("GET", &uri, None, None).await;
     let status = resp.status();
 
     // If not 200, return immediately — no events to collect.
@@ -164,18 +140,15 @@ async fn seed_deployments(mem: &MemoryStorage) {
 ///   (b) still deliver ADDED events for every valid object.
 #[tokio::test]
 async fn watch_skips_undeserializable_object_and_delivers_valid_objects() {
-    let mem = Arc::new(MemoryStorage::new());
-    seed_deployments(&mem).await;
-
-    let state = make_state(mem.clone());
-    let router = build_router(state, None);
+    let api = TestApiServer::new();
+    seed_deployments(&api.storage).await;
 
     let uri = format!("/apis/apps/v1/namespaces/{NS}/deployments?watch=true&resourceVersion=0");
 
     // Collect 1 non-bookmark event (the ADDED for "valid-deploy") with a 3-second
     // deadline. The partial Deployment must be skipped; if it caused a 400 the
     // test fails on the status check before even reading events.
-    let (status, events) = collect_watch_events(router, uri, 1, Duration::from_secs(3)).await;
+    let (status, events) = collect_watch_events(&api, uri, 1, Duration::from_secs(3)).await;
 
     // (a) Must be 200, not 400.
     assert_eq!(

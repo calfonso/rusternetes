@@ -8,42 +8,19 @@
 //! RoleBinding in a namespace, and assert an `ADDED` envelope arrives on the
 //! cluster-wide stream.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
+use axum::http::StatusCode;
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tower::ServiceExt;
 
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        Arc::new(TokenManager::new(b"test-secret")),
-        Arc::new(AlwaysAllowAuthorizer),
-        Arc::new(MetricsRegistry::new()),
-        true, // skip_auth
-    ));
-    build_router(state, None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-async fn collect(router: axum::Router, uri: &str, max: usize, deadline: Duration) -> Vec<Value> {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+async fn collect(router: TestApiServer, uri: &str, max: usize, deadline: Duration) -> Vec<Value> {
+    let resp = router.respond("GET", uri, None, None).await;
     let mut stream = resp.into_body().into_data_stream();
     let mut buf = String::new();
     let mut events = Vec::new();
@@ -96,15 +73,14 @@ async fn all_namespaces_rolebinding_watch_streams_added() {
         "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "r"},
         "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "default"}]
     });
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&rb).unwrap()))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+    let (status, _) = router
+        .post(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings",
+            &rb,
+        )
+        .await;
     assert_eq!(
-        resp.status(),
+        status,
         StatusCode::CREATED,
         "RoleBinding create should succeed"
     );

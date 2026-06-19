@@ -108,6 +108,33 @@ impl TestApiServer {
         self.send_with_headers(method, uri, &headers, body).await
     }
 
+    /// Lowest-level escape hatch: drive one request and hand back the raw
+    /// [`axum::response::Response`] *without* consuming the body. Use this for
+    /// streaming responses (e.g. incremental `?watch=true` event collection via
+    /// `resp.into_body().into_data_stream()`) where the other helpers — which
+    /// buffer the whole body to EOF — would block on a non-self-closing stream.
+    pub async fn respond(
+        &self,
+        method: &str,
+        uri: &str,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let req = match body {
+            Some(b) => builder.body(Body::from(b)).expect("build request"),
+            None => builder.body(Body::empty()).expect("build request"),
+        };
+        self.router
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("router oneshot")
+    }
+
     /// Fullest primitive: send a request with an arbitrary set of request
     /// headers and an optional raw body; returns status, the response
     /// [`HeaderMap`], the raw body bytes, and the body parsed as JSON
