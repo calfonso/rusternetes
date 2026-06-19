@@ -212,6 +212,9 @@ async fn main() -> Result<()> {
             e
         );
     }
+    // Keep the kubernetes endpoint tracking the live api-server IP across
+    // container recreates / IP changes (upstream EndpointReconciler, #1188).
+    bootstrap::spawn_endpoint_reconciler(storage.clone(), api_port);
 
     // Create default ServiceCIDR "kubernetes" (required by conformance tests)
     {
