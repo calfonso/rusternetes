@@ -25,37 +25,38 @@
 //! Harness mirrors `decoder_accept_header_test.rs` — in-process axum router
 //! over `MemoryStorage`, driven via `tower::ServiceExt::oneshot`.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{
-    protobuf::ProtoRegistry, router::build_router, state::ApiServerState,
-};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_api_server::protobuf::ProtoRegistry;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::Value;
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const K8S_MAGIC: &[u8] = b"k8s\0";
 
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth — bypass JWT so the request reaches the NotFound handler
-    ));
-    build_router(state, None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
+}
+
+/// Send a request with an explicit `Accept` (and optional content-type + body);
+/// return `(status, response Content-Type, raw body bytes)`.
+async fn send_accept(
+    router: &TestApiServer,
+    method: &str,
+    uri: &str,
+    accept: &str,
+    content_type: Option<&str>,
+    body: Option<Vec<u8>>,
+) -> (StatusCode, String, Vec<u8>) {
+    let mut headers = vec![("accept", accept)];
+    if let Some(ct) = content_type {
+        headers.push(("content-type", ct));
+    }
+    let (status, hmap, bytes, _) = router.send_with_headers(method, uri, &headers, body).await;
+    let content_type = hmap
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (status, content_type, bytes)
 }
 
 /// Read the `Unknown.raw` (proto field 2, wire type 2) payload out of a K8s
@@ -165,25 +166,15 @@ fn read_varint(buf: &[u8]) -> (u64, usize) {
 async fn status_404_returns_native_protobuf_when_accept_is_protobuf() {
     let router = spawn_router();
 
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/api/v1/namespaces/default/pods/does-not-exist")
-        .header("accept", "application/vnd.kubernetes.protobuf")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
+    let (status, content_type, bytes) = send_accept(
+        &router,
+        "GET",
+        "/api/v1/namespaces/default/pods/does-not-exist",
+        "application/vnd.kubernetes.protobuf",
+        None,
+        None,
+    )
+    .await;
 
     assert_eq!(
         status,
@@ -263,24 +254,15 @@ async fn status_404_returns_native_protobuf_when_accept_is_protobuf() {
 async fn status_404_stays_json_when_accept_is_json() {
     let router = spawn_router();
 
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/api/v1/namespaces/default/pods/does-not-exist")
-        .header("accept", "application/json")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let (status, content_type, bytes) = send_accept(
+        &router,
+        "GET",
+        "/api/v1/namespaces/default/pods/does-not-exist",
+        "application/json",
+        None,
+        None,
+    )
+    .await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
@@ -314,25 +296,15 @@ async fn non_status_json_passes_through_unchanged_when_accept_is_protobuf() {
 
     // `/version` is the canonical kind-less JSON endpoint: `VersionInfo`
     // serialises to a flat object without `apiVersion` or `kind`.
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/version")
-        .header("accept", "application/vnd.kubernetes.protobuf")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
+    let (status, content_type, bytes) = send_accept(
+        &router,
+        "GET",
+        "/version",
+        "application/vnd.kubernetes.protobuf",
+        None,
+        None,
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK, "/version must return 200");
     assert!(
@@ -380,26 +352,15 @@ async fn status_422_invalid_pod_round_trips_causes_as_native_protobuf() {
         "spec": { "containers": [] },
     });
 
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/api/v1/namespaces/default/pods")
-        .header("accept", "application/vnd.kubernetes.protobuf")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
+    let (status, content_type, bytes) = send_accept(
+        &router,
+        "POST",
+        "/api/v1/namespaces/default/pods",
+        "application/vnd.kubernetes.protobuf",
+        Some("application/json"),
+        Some(serde_json::to_vec(&body).unwrap()),
+    )
+    .await;
 
     assert_eq!(
         status,
@@ -490,25 +451,15 @@ async fn status_422_invalid_pod_round_trips_causes_as_native_protobuf() {
 async fn status_200_success_returns_native_protobuf_when_accept_is_protobuf() {
     let router = spawn_router();
 
-    let request = Request::builder()
-        .method(Method::DELETE)
-        .uri("/apis/apps/v1/namespaces/default/statefulsets")
-        .header("accept", "application/vnd.kubernetes.protobuf")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
+    let (status, content_type, bytes) = send_accept(
+        &router,
+        "DELETE",
+        "/apis/apps/v1/namespaces/default/statefulsets",
+        "application/vnd.kubernetes.protobuf",
+        None,
+        None,
+    )
+    .await;
 
     assert_eq!(
         status,
@@ -555,28 +506,15 @@ async fn status_200_success_returns_native_protobuf_when_accept_is_protobuf() {
 async fn status_404_with_protobuf_then_json_accept_picks_protobuf() {
     let router = spawn_router();
 
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/api/v1/namespaces/default/pods/does-not-exist")
-        .header(
-            "accept",
-            "application/vnd.kubernetes.protobuf, application/json",
-        )
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
+    let (status, content_type, bytes) = send_accept(
+        &router,
+        "GET",
+        "/api/v1/namespaces/default/pods/does-not-exist",
+        "application/vnd.kubernetes.protobuf, application/json",
+        None,
+        None,
+    )
+    .await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
