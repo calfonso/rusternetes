@@ -15,68 +15,31 @@
 //! delete the object and assert the three envelopes arrive (filtered to the
 //! object we touched, by `object.metadata.name`).
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
+use axum::http::{Method, StatusCode};
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tower::ServiceExt;
 
 const NS: &str = "watchmatrix";
 const OBJ: &str = "w1";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    Arc::new(ApiServerState::new(
-        backend,
-        Arc::new(TokenManager::new(b"test-secret")),
-        Arc::new(AlwaysAllowAuthorizer),
-        Arc::new(MetricsRegistry::new()),
-        true, // skip_auth
-    ))
-}
-
 async fn send(
-    router: &axum::Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let mut req = Request::builder().method(method).uri(uri);
-    let req = if let Some(b) = body {
-        req = req.header("content-type", "application/json");
-        req.body(Body::from(serde_json::to_vec(b).unwrap()))
-            .unwrap()
-    } else {
-        req.body(Body::empty()).unwrap()
-    };
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+    let content_type = body.as_ref().map(|_| "application/json");
+    router.send(method.as_str(), uri, content_type, body).await
 }
 
 /// Collect up to `max` `\n`-delimited watch envelopes from a watch URI, giving
 /// up at `deadline`. Runs as its own task so the caller can mutate concurrently.
-async fn collect(router: axum::Router, uri: String, max: usize, deadline: Duration) -> Vec<Value> {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(&uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+async fn collect(router: TestApiServer, uri: String, max: usize, deadline: Duration) -> Vec<Value> {
+    let resp = router.respond("GET", &uri, None, None).await;
     let mut stream = resp.into_body().into_data_stream();
     let mut buf = String::new();
     let mut events = Vec::new();
@@ -144,13 +107,13 @@ fn types_for_obj(events: &[Value]) -> Vec<String> {
 /// Drive one kind through watch→create→update→delete; return the list of
 /// problems (empty == fully working).
 async fn run_case(case: &Case) -> Vec<String> {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
+    let router = TestApiServer::new();
     let mut problems = Vec::new();
 
     // Seed the namespace so namespaced creates aren't rejected for a missing ns.
     if case.namespaced {
-        let _ = mem
+        let _ = router
+            .storage
             .create(
                 &build_key("namespaces", None, NS),
                 &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":NS}}),

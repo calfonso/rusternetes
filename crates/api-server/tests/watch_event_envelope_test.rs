@@ -43,21 +43,14 @@
 //! handler regression that hangs the stream surfaces as a failed test, not
 //! an indefinite wait.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
+use axum::http::{Method, StatusCode};
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // HTTP harness — inlined per task scope (no shared module).
@@ -66,24 +59,10 @@ use tower::ServiceExt;
 
 const TEST_NS: &str = "envns";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 fn cm_stub(name: &str) -> Value {
@@ -95,41 +74,19 @@ fn cm_stub(name: &str) -> Value {
     })
 }
 
-async fn drain(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, v)
-}
-
 async fn send_json(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     body: &Value,
 ) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    drain(router.oneshot(req).await.unwrap()).await
+    router
+        .send(method.as_str(), uri, Some("application/json"), Some(body))
+        .await
 }
 
-async fn send_delete(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    drain(router.oneshot(req).await.unwrap()).await
+async fn send_delete(router: TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.delete(uri).await
 }
 
 /// Drive a watch URL through the router and collect newline-delimited JSON
@@ -137,17 +94,12 @@ async fn send_delete(router: axum::Router, uri: &str) -> (StatusCode, Value) {
 /// Returns the HTTP status plus the parsed envelopes — empty if the stream
 /// produced nothing in time.
 async fn collect_watch_events(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     max_events: usize,
     deadline: Duration,
 ) -> (StatusCode, Vec<Value>) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.respond("GET", uri, None, None).await;
     let status = response.status();
     let mut stream = response.into_body().into_data_stream();
     let mut buffer = String::new();
