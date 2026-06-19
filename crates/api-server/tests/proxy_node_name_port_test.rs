@@ -32,36 +32,14 @@
 //! All three behaviours are independently asserted via the response body
 //! pass-through and the absence of a 404 on the node lookup.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::resources::{
     DaemonEndpoint, Node, NodeAddress, NodeDaemonEndpoints, NodeStatus,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
-use std::sync::Arc;
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tower::ServiceExt;
-
-/// Build an `ApiServerState` backed by the supplied `MemoryStorage` with
-/// `skip_auth = true` — matches `conformance_network_services_proxy.rs`.
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ))
-}
 
 /// Spawn an HTTP-1.1 backend on a random `127.0.0.1` port that returns
 /// `200 OK` with a deterministic body for any request. The handler exits
@@ -124,20 +102,10 @@ fn node_with_addresses(name: &str, advertised_port: i32) -> Node {
 
 /// GET helper — drive a request through the api-server router and
 /// return `(status, body)`.
-async fn proxy_get(state: Arc<ApiServerState>, uri: &str) -> (u16, String) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
+async fn proxy_get(router: &TestApiServer, uri: &str) -> (u16, String) {
+    let (status, _headers, body_bytes, _) = router.send_full("GET", uri, None, None, None).await;
     let body = String::from_utf8_lossy(&body_bytes).to_string();
-    (status, body)
+    (status.as_u16(), body)
 }
 
 /// Regression: `/api/v1/nodes/<name>:<port>/proxy/<path>` must use the
@@ -157,17 +125,17 @@ async fn proxy_node_with_port_in_name_routes_correctly() {
 
     // 2. Seed storage with a Node whose InternalIP is the loopback and
     //    whose advertised kubelet port is intentionally wrong.
-    let mem = Arc::new(MemoryStorage::new());
+    let api = TestApiServer::new();
     let node = node_with_addresses("node-1", 10250);
-    mem.create(&build_key("nodes", None, "node-1"), &node)
+    api.storage
+        .create(&build_key("nodes", None, "node-1"), &node)
         .await
         .expect("create node");
-    let state = make_state(mem);
 
     // 3. Drive the request through the router using the `<name>:<port>`
     //    form the upstream e2e framework constructs.
     let uri = format!("/api/v1/nodes/node-1:{}/proxy/pods", kubelet_port);
-    let (status, body) = proxy_get(state.clone(), &uri).await;
+    let (status, body) = proxy_get(&api, &uri).await;
 
     // 4. The handler must split the id, look up by name, and dial the
     //    URL-supplied port. Both conditions must hold:
@@ -193,16 +161,16 @@ async fn proxy_node_with_port_in_name_routes_correctly() {
 async fn proxy_node_without_port_uses_advertised_port() {
     let (kubelet_port, _handle) = spawn_kubelet_backend("default-port-ok", 2).await;
 
-    let mem = Arc::new(MemoryStorage::new());
+    let api = TestApiServer::new();
     // Node advertises the listener's port. URL omits the port, so the
     // handler must read it off `daemonEndpoints.kubeletEndpoint.port`.
     let node = node_with_addresses("node-2", kubelet_port as i32);
-    mem.create(&build_key("nodes", None, "node-2"), &node)
+    api.storage
+        .create(&build_key("nodes", None, "node-2"), &node)
         .await
         .expect("create node");
-    let state = make_state(mem);
 
-    let (status, body) = proxy_get(state, "/api/v1/nodes/node-2/proxy/pods").await;
+    let (status, body) = proxy_get(&api, "/api/v1/nodes/node-2/proxy/pods").await;
     assert_eq!(status, 200, "plain `<name>` form must still work");
     assert!(
         body.contains("default-port-ok"),

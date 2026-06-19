@@ -20,44 +20,21 @@
 //! backend response verbatim — through both the pod-proxy URL and the
 //! service-proxy URL.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::resources::endpointslice::EndpointPort as ESEndpointPort;
 use rusternetes_common::resources::{
     Container, ContainerPort, Endpoint, EndpointConditions, EndpointSlice, IntOrString, Pod, PodIP,
     PodSpec, PodStatus, Service, ServicePort, ServiceSpec, ServiceType,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tower::ServiceExt;
 
 // --------------------------------------------------------------------------
 // Test fixtures
 // --------------------------------------------------------------------------
-
-/// Build an `ApiServerState` backed by the supplied `MemoryStorage`.
-/// `skip_auth = true` matches the convention used by `patch_cas_retry_test.rs`
-/// so requests don't need to carry a token.
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
 
 /// Build a Pod listening on `127.0.0.1:<port>`. The api-server proxy
 /// handler reads `status.podIPs` first, then falls back to `status.podIP`,
@@ -224,25 +201,14 @@ async fn spawn_response_matrix_backend(max_requests: usize) -> (u16, tokio::task
 
 /// Drive a GET request through the api-server router and return
 /// (status, body, location-header).
-async fn proxy_get(state: Arc<ApiServerState>, uri: &str) -> (u16, String, Option<String>) {
-    let router = build_router(state, None);
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status().as_u16();
-    let location = response
-        .headers()
+async fn proxy_get(router: &TestApiServer, uri: &str) -> (u16, String, Option<String>) {
+    let (status, headers, body_bytes, _) = router.send_full("GET", uri, None, None, None).await;
+    let location = headers
         .get("location")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
     let body = String::from_utf8_lossy(&body_bytes).to_string();
-    (status, body, location)
+    (status.as_u16(), body, location)
 }
 
 // --------------------------------------------------------------------------
@@ -272,26 +238,27 @@ async fn proxy_valid_responses_for_pod_and_service() {
 
     // 2. Seed MemoryStorage with the Pod / Service / EndpointSlice shape
     //    the api-server proxy handlers query.
-    let mem = Arc::new(MemoryStorage::new());
+    let api = TestApiServer::new();
     let pod = pod_listening_on("default", "proxy-pod", backend_port);
-    mem.create(&build_key("pods", Some("default"), "proxy-pod"), &pod)
+    api.storage
+        .create(&build_key("pods", Some("default"), "proxy-pod"), &pod)
         .await
         .expect("create pod");
 
     let svc = service_to_pod_port("default", "proxy-svc", 80, backend_port);
-    mem.create(&build_key("services", Some("default"), "proxy-svc"), &svc)
+    api.storage
+        .create(&build_key("services", Some("default"), "proxy-svc"), &svc)
         .await
         .expect("create service");
 
     let slice = endpoint_slice_for("default", "proxy-svc", "127.0.0.1", backend_port);
-    mem.create(
-        &build_key("endpointslices", Some("default"), &slice.metadata.name),
-        &slice,
-    )
-    .await
-    .expect("create endpointslice");
-
-    let state = make_state(mem);
+    api.storage
+        .create(
+            &build_key("endpointslices", Some("default"), &slice.metadata.name),
+            &slice,
+        )
+        .await
+        .expect("create endpointslice");
 
     // 3. Walk the response matrix through the Pod-proxy URL.
     //    Format: /api/v1/namespaces/{ns}/pods/{name}/proxy/{path}
@@ -301,7 +268,7 @@ async fn proxy_valid_responses_for_pod_and_service() {
     //    backend_port above).
     let pod_base = "/api/v1/namespaces/default/pods/proxy-pod/proxy";
 
-    let (status, body, _) = proxy_get(state.clone(), &format!("{}/", pod_base)).await;
+    let (status, body, _) = proxy_get(&api, &format!("{}/", pod_base)).await;
     assert_eq!(status, 200, "pod proxy GET / should return 200");
     assert!(
         body.contains("pod-and-service-proxy-ok"),
@@ -309,16 +276,15 @@ async fn proxy_valid_responses_for_pod_and_service() {
         body
     );
 
-    let (status, body, _) = proxy_get(state.clone(), &format!("{}/notfound", pod_base)).await;
+    let (status, body, _) = proxy_get(&api, &format!("{}/notfound", pod_base)).await;
     assert_eq!(status, 404, "pod proxy /notfound should return 404");
     assert_eq!(body, "missing", "pod proxy 404 body mismatch");
 
-    let (status, body, _) = proxy_get(state.clone(), &format!("{}/unavailable", pod_base)).await;
+    let (status, body, _) = proxy_get(&api, &format!("{}/unavailable", pod_base)).await;
     assert_eq!(status, 503, "pod proxy /unavailable should return 503");
     assert_eq!(body, "down", "pod proxy 503 body mismatch");
 
-    let (status, _body, location) =
-        proxy_get(state.clone(), &format!("{}/redirect", pod_base)).await;
+    let (status, _body, location) = proxy_get(&api, &format!("{}/redirect", pod_base)).await;
     assert_eq!(status, 301, "pod proxy /redirect should return 301");
     // The redirect-following policy is `none` (proxy.rs:577) so the 301
     // and Location header must be forwarded verbatim — the e2e client
@@ -337,7 +303,7 @@ async fn proxy_valid_responses_for_pod_and_service() {
     //    slice's `ports[0]` — both pointing at 127.0.0.1:backend_port.
     let svc_base = "/api/v1/namespaces/default/services/proxy-svc/proxy";
 
-    let (status, body, _) = proxy_get(state.clone(), &format!("{}/", svc_base)).await;
+    let (status, body, _) = proxy_get(&api, &format!("{}/", svc_base)).await;
     assert_eq!(status, 200, "service proxy GET / should return 200");
     assert!(
         body.contains("pod-and-service-proxy-ok"),
@@ -345,16 +311,15 @@ async fn proxy_valid_responses_for_pod_and_service() {
         body
     );
 
-    let (status, body, _) = proxy_get(state.clone(), &format!("{}/notfound", svc_base)).await;
+    let (status, body, _) = proxy_get(&api, &format!("{}/notfound", svc_base)).await;
     assert_eq!(status, 404, "service proxy /notfound should return 404");
     assert_eq!(body, "missing", "service proxy 404 body mismatch");
 
-    let (status, body, _) = proxy_get(state.clone(), &format!("{}/unavailable", svc_base)).await;
+    let (status, body, _) = proxy_get(&api, &format!("{}/unavailable", svc_base)).await;
     assert_eq!(status, 503, "service proxy /unavailable should return 503");
     assert_eq!(body, "down", "service proxy 503 body mismatch");
 
-    let (status, _body, location) =
-        proxy_get(state.clone(), &format!("{}/redirect", svc_base)).await;
+    let (status, _body, location) = proxy_get(&api, &format!("{}/redirect", svc_base)).await;
     assert_eq!(status, 301, "service proxy /redirect should return 301");
     assert_eq!(
         location.as_deref(),
