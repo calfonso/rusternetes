@@ -16,72 +16,35 @@
 //! Harness: in-process axum router over `StorageBackend::Memory`, driven via
 //! `tower::ServiceExt::oneshot`. No Docker, no etcd, no kubelet.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tower::ServiceExt;
 use warp::Filter;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-/// Build a fresh `ApiServerState` backed by an in-memory storage. `skip_auth`
-/// is on so the conformance tests can issue unauthenticated requests through
-/// the router exactly as the upstream Ginkgo suite does with an admin client.
-fn spawn_state() -> Arc<ApiServerState> {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"conformance-test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ))
-}
-
-/// Build the router exposed by the api-server crate. Equivalent to wiring up
-/// the real binary, minus the TLS / listener layer.
-fn spawn_router(state: Arc<ApiServerState>) -> axum::Router {
-    build_router(state, None)
+fn spawn_state() -> TestApiServer {
+    TestApiServer::new()
 }
 
 /// GET helper — returns (status, parsed JSON body).
-async fn http_get(router: axum::Router, uri: &str) -> (StatusCode, Value) {
+async fn http_get(router: TestApiServer, uri: &str) -> (StatusCode, Value) {
     http_get_with_headers(router, uri, &[]).await
 }
 
 /// GET helper that injects additional request headers (used to negotiate
 /// aggregated discovery V2 via the Accept header).
 async fn http_get_with_headers(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     headers: &[(&str, &str)],
 ) -> (StatusCode, Value) {
-    let mut req = Request::builder().method("GET").uri(uri);
-    for (k, v) in headers {
-        req = req.header(*k, *v);
-    }
-    let req = req.body(Body::empty()).unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let (status, _h, _b, body) = router.send_with_headers("GET", uri, headers, None).await;
     (status, body)
 }
 
@@ -136,7 +99,7 @@ fn apiservice_remote(
 /// Sonobuoy (Round 160, 2026-04-26): PASS (not in failure list)
 #[tokio::test]
 async fn discovery_core_api_lists_v1_and_resources() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
 
     // GET /api → APIVersions object listing core API versions.
     let (status, body) = http_get(router.clone(), "/api").await;
@@ -177,7 +140,7 @@ async fn discovery_core_api_lists_v1_and_resources() {
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn discovery_reports_enabled_resources_present() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
 
     // namespaces ∈ /api/v1
     let (_, core) = http_get(router.clone(), "/api/v1").await;
@@ -211,7 +174,7 @@ async fn discovery_reports_enabled_resources_present() {
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn discovery_reports_missing_resources_absent() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
 
     // No nonsense resource in apps/v1.
     let (_, apps) = http_get(router.clone(), "/apis/apps/v1").await;
@@ -249,7 +212,7 @@ async fn discovery_reports_missing_resources_absent() {
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn discovery_apis_preferred_version_is_one_of_versions() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
     let (status, body) = http_get(router, "/apis").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["kind"].as_str(), Some("APIGroupList"));
@@ -294,7 +257,7 @@ async fn discovery_apis_preferred_version_is_one_of_versions() {
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn discovery_group_apps_v1_returns_groupversion_and_deployments() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
     let (status, body) = http_get(router, "/apis/apps/v1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["kind"].as_str(), Some("APIResourceList"));
@@ -319,7 +282,7 @@ async fn discovery_group_apps_v1_returns_groupversion_and_deployments() {
 /// deployment, not the discovery doc)
 #[tokio::test]
 async fn discovery_apiregistration_v1_lists_apiservices_resource() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
     let (status, body) = http_get(router, "/apis/apiregistration.k8s.io/v1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["kind"].as_str(), Some("APIResourceList"));
@@ -354,7 +317,7 @@ async fn discovery_apiregistration_v1_lists_apiservices_resource() {
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn discovery_aggregated_v2_negotiated_via_accept_header() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
     let (status, body) = http_get_with_headers(
         router,
         "/apis",
@@ -392,7 +355,7 @@ async fn discovery_aggregated_v2_negotiated_via_accept_header() {
 /// Sonobuoy (Round 160): PASS
 #[tokio::test]
 async fn discovery_aggregated_v2_on_core_api() {
-    let router = spawn_router(spawn_state());
+    let router = spawn_state();
     let (status, body) = http_get_with_headers(
         router,
         "/api",
@@ -447,7 +410,7 @@ async fn discovery_aggregated_v2_on_core_api() {
 /// `create_apiservice` had been invoked. Mirrors the same seeded status
 /// conditions the handler would write so downstream merge logic sees the same
 /// shape it would in production.
-async fn seed_apiservice(state: &Arc<ApiServerState>, body: Value) {
+async fn seed_apiservice(state: &TestApiServer, body: Value) {
     let name = body["metadata"]["name"]
         .as_str()
         .expect("apiservice has metadata.name")
@@ -576,15 +539,14 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
         "sample-apiserver",
         mock_addr.port(),
     );
-    let req = Request::builder()
-        .method("POST")
-        .uri("/apis/apiregistration.k8s.io/v1/apiservices")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&apiservice_body).unwrap()))
-        .unwrap();
-    let resp = spawn_router(state.clone()).oneshot(req).await.unwrap();
+    let (post_status, _) = state
+        .post(
+            "/apis/apiregistration.k8s.io/v1/apiservices",
+            &apiservice_body,
+        )
+        .await;
     assert_eq!(
-        resp.status(),
+        post_status,
         StatusCode::CREATED,
         "POST APIService must return 201"
     );
@@ -619,17 +581,15 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
             "message": "all checks passed",
         }]
     });
-    let req = Request::builder()
-        .method("PUT")
-        .uri("/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.wardle.example.com/status")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&flipped).unwrap()))
-        .unwrap();
-    let resp = spawn_router(state.clone()).oneshot(req).await.unwrap();
+    let (put_status, _) = state
+        .put(
+            "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.wardle.example.com/status",
+            &flipped,
+        )
+        .await;
     assert!(
-        resp.status().is_success(),
-        "PUT /status must succeed, got {}",
-        resp.status()
+        put_status.is_success(),
+        "PUT /status must succeed, got {put_status}"
     );
     let after: Value = state.storage.get(&key).await.unwrap();
     let cond = after["status"]["conditions"]
@@ -648,7 +608,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     // Sub-assertion 4: discovery merge — aggregated group appears in /apis
     // and /apis/wardle.example.com.
     // -------------------------------------------------------------------
-    let (status, body) = http_get(spawn_router(state.clone()), "/apis").await;
+    let (status, body) = http_get(state.clone(), "/apis").await;
     assert_eq!(status, StatusCode::OK);
     let group_names: Vec<&str> = body["groups"]
         .as_array()
@@ -781,18 +741,15 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     // single-delete route since DeleteCollection is covered by the watch/gc
     // mirror unit.
     // -------------------------------------------------------------------
-    let req = Request::builder()
-        .method("DELETE")
-        .uri("/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.wardle.example.com")
-        .body(Body::empty())
-        .unwrap();
-    let resp = spawn_router(state.clone()).oneshot(req).await.unwrap();
+    let (del_status, _) = state
+        .delete("/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.wardle.example.com")
+        .await;
     assert!(
-        resp.status().is_success(),
+        del_status.is_success(),
         "DELETE APIService must succeed, got {}",
-        resp.status()
+        del_status
     );
-    let (_, after_delete) = http_get(spawn_router(state.clone()), "/apis").await;
+    let (_, after_delete) = http_get(state.clone(), "/apis").await;
     let names_after: Vec<&str> = after_delete["groups"]
         .as_array()
         .unwrap()
@@ -898,7 +855,7 @@ async fn aggregator_registered_apiservice_appears_in_discovery() {
     )
     .await;
 
-    let router = spawn_router(state);
+    let router = state;
     let (status, body) = http_get(router, "/apis").await;
     assert_eq!(status, StatusCode::OK);
     let group_names: Vec<&str> = body["groups"]
@@ -938,7 +895,7 @@ async fn aggregator_delete_apiservice_removes_from_discovery() {
     .await;
 
     // Sanity: the group is present before deletion.
-    let (_, before) = http_get(spawn_router(state.clone()), "/apis").await;
+    let (_, before) = http_get(state.clone(), "/apis").await;
     let before_names: Vec<&str> = before["groups"]
         .as_array()
         .unwrap()
@@ -952,7 +909,7 @@ async fn aggregator_delete_apiservice_removes_from_discovery() {
     let key = build_key("apiservices", None, "v1alpha1.wardle.example.com");
     state.storage.delete(&key).await.expect("delete apiservice");
 
-    let (status, after) = http_get(spawn_router(state), "/apis").await;
+    let (status, after) = http_get(state, "/apis").await;
     assert_eq!(status, StatusCode::OK);
     let after_names: Vec<&str> = after["groups"]
         .as_array()
