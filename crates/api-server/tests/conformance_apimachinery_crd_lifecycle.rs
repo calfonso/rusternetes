@@ -14,102 +14,40 @@
 //! JSONPath rooted at the CR) are `#[ignore]`d with a reason pointing back to
 //! the doc fragment.
 
-use axum::{
-    body::{Body, Bytes},
-    http::Request,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness
+// HTTP harness — thin `(u16, Value)` shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-/// Spin up an `Arc<ApiServerState>` whose storage is a brand-new
-/// `MemoryStorage`, with `skip_auth=true` so requests do not need a token.
-/// Returns the underlying memory handle (for tests that want to inspect raw
-/// storage), the state, and the built axum `Router`.
-fn spawn_router() -> (Arc<MemoryStorage>, Arc<ApiServerState>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    let router = build_router(state.clone(), None);
-    (mem, state, router)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-/// Send a request through the router and return the (status, body-as-JSON)
-/// pair. Body is parsed best-effort; non-JSON responses become `Value::Null`.
-async fn send(router: &axum::Router, req: Request<Body>) -> (u16, Value) {
-    let resp = router.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status().as_u16();
-    let bytes: Bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.post(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+async fn put_json(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.put(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn put_json(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+async fn patch_merge(router: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
+    let (status, value) = router.patch(uri, body).await;
+    (status.as_u16(), value)
 }
 
-async fn patch_merge(router: &axum::Router, uri: &str, body: &Value) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", "application/merge-patch+json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    send(router, req).await
+async fn get(router: &TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = router.get(uri).await;
+    (status.as_u16(), value)
 }
 
-async fn get(router: &axum::Router, uri: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    send(router, req).await
-}
-
-async fn delete(router: &axum::Router, uri: &str) -> (u16, Value) {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    send(router, req).await
+async fn delete(router: &TestApiServer, uri: &str) -> (u16, Value) {
+    let (status, value) = router.delete(uri).await;
+    (status.as_u16(), value)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +165,7 @@ fn default_flavoured_crd() -> Value {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_create_and_delete_round_trip() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let crd = basic_crd("foos", "foo", "Foo", "example.com");
 
     let (status, body) = post_json(
@@ -290,7 +228,7 @@ async fn crd_create_and_delete_round_trip() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_list_filters_by_label_selector_and_deletecollection() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
 
     // Two CRDs, one labelled match=true, one not.
     let mut matching = basic_crd("alphas", "alpha", "Alpha", "example.com");
@@ -352,7 +290,7 @@ async fn crd_list_filters_by_label_selector_and_deletecollection() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS (covered by the discovery test)
 #[tokio::test]
 async fn crd_list_all_includes_newly_created() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let (status, body) = get(
         &router,
         "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
@@ -388,7 +326,7 @@ async fn crd_list_all_includes_newly_created() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_get_unknown_name_returns_not_found() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let (status, body) = get(
         &router,
         "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/missing.example.com",
@@ -414,7 +352,7 @@ async fn crd_get_unknown_name_returns_not_found() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_status_subresource_get_update_patch() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
 
     let crd = basic_crd("gizmos", "gizmo", "Gizmo", "example.com");
     let (s, _) = post_json(
@@ -494,7 +432,7 @@ async fn crd_status_subresource_get_update_patch() {
 /// Sonobuoy (Round 160): was FAIL; fixed by PR #86 — scale subresource JSONPath resolved against CR root not narrowed spec.
 #[tokio::test]
 async fn crd_scale_subresource_get_and_update() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let crd = scaled_crd("scalers", "scaler", "Scaler", "example.com");
     let (s, _) = post_json(
         &router,
@@ -569,7 +507,7 @@ async fn crd_scale_subresource_get_and_update() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_resources_in_discovery_documents() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
 
     // /apis must include apiextensions.k8s.io
     let (status, body) = get(&router, "/apis").await;
@@ -611,7 +549,7 @@ async fn crd_resources_in_discovery_documents() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn crd_defaulting_for_requests_and_storage() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let crd = default_flavoured_crd();
     let (s, _) = post_json(
         &router,
@@ -665,7 +603,7 @@ async fn crd_defaulting_for_requests_and_storage() {
 /// produce monotonic resourceVersion changes observable via GET.
 #[tokio::test]
 async fn crd_watch_create_modify_delete() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let crd = basic_crd("watched", "watched", "Watched", "example.com");
     let (s, _) = post_json(
         &router,
@@ -751,7 +689,7 @@ async fn crd_watch_create_modify_delete() {
 /// tests; this test verifies the list path only.
 #[tokio::test]
 async fn crd_selectable_fields_list_watch_informer() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
 
     // CRD with `.spec.color` declared as a selectable field.
     let crd = json!({
@@ -922,7 +860,7 @@ async fn crd_selectable_fields_list_watch_informer() {
 /// `/apis/{g}/{v}/namespaces/{ns}/{plural}?fieldSelector=...` matched no route.
 #[tokio::test]
 async fn crd_deletecollection_honours_field_and_label_selectors() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
 
     // CRD with two selectable fields.
     let crd = json!({
@@ -1076,7 +1014,7 @@ fn crd_with_cel_rule(rule: &str, message: &str) -> Value {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_satisfied_create_succeeds() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let crd = crd_with_cel_rule("self.replicas <= 5", "too many replicas");
     let (s, body) = post_json(
         &router,
@@ -1113,7 +1051,7 @@ async fn cel_rule_satisfied_create_succeeds() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_violated_create_fails() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let crd = crd_with_cel_rule("self.replicas <= 5", "replicas must be <= 5");
     let (s, _) = post_json(
         &router,
@@ -1152,7 +1090,7 @@ async fn cel_rule_violated_create_fails() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_unknown_property_crd_rejected() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     // `self.nonsense` is not declared in properties — CRD must be rejected.
     let crd = crd_with_cel_rule("self.nonsense > 0", "msg");
     let (s, body) = post_json(
@@ -1173,7 +1111,7 @@ async fn cel_rule_unknown_property_crd_rejected() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_syntax_error_crd_rejected() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     // `self.replicas <=` is incomplete — must be a parse error.
     let crd = crd_with_cel_rule("self.replicas <= ", "msg");
     let (s, body) = post_json(
@@ -1194,7 +1132,7 @@ async fn cel_rule_syntax_error_crd_rejected() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_rule_cost_limit_exceeded_crd_rejected() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     // Nested `.all(...)` calls inflate estimated cost past the 10M-token limit.
     let expensive = "self.foo.all(a, self.foo.all(b, self.foo.all(c, c == a)))";
     let crd = crd_with_cel_rule(expensive, "msg");
@@ -1220,7 +1158,7 @@ async fn cel_rule_cost_limit_exceeded_crd_rejected() {
 /// individually is cheap but the request total exceeds the runtime limit.
 #[tokio::test]
 async fn cel_rule_runtime_cost_limit_exceeded() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     // Many comprehension-style rules → per-request total trips the runtime
     // budget. Each rule's estimated cost is rule_len * 1024 (one `all(`) →
     // ~50K. We need cumulative cost > 100M, so 3000+ rules suffice.
@@ -1301,7 +1239,7 @@ async fn cel_rule_runtime_cost_limit_exceeded() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn cel_transition_rule_violated_update_fails() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     // Transition rule: replicas may not decrease.
     let crd = crd_with_cel_rule(
         "self.replicas >= oldSelf.replicas",
@@ -1434,7 +1372,7 @@ fn ratchet_tight_crd(group: &str, spec_props: Value) -> Value {
     })
 }
 
-async fn ratchet_install_crd(router: &axum::Router, body: &Value) {
+async fn ratchet_install_crd(router: &TestApiServer, body: &Value) {
     let (s, b) = post_json(
         router,
         "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
@@ -1444,14 +1382,14 @@ async fn ratchet_install_crd(router: &axum::Router, body: &Value) {
     assert_eq!(s, 201, "lax CRD must install, body={b}");
 }
 
-async fn ratchet_tighten_crd(router: &axum::Router, group: &str, body: &Value) {
+async fn ratchet_tighten_crd(router: &TestApiServer, group: &str, body: &Value) {
     let uri = format!("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/ratchets.{group}");
     let (s, b) = put_json(router, &uri, body).await;
     assert_eq!(s, 200, "tight CRD update must succeed, body={b}");
 }
 
 async fn ratchet_post_cr(
-    router: &axum::Router,
+    router: &TestApiServer,
     group: &str,
     name: &str,
     spec: Value,
@@ -1467,7 +1405,7 @@ async fn ratchet_post_cr(
 }
 
 async fn ratchet_put_cr(
-    router: &axum::Router,
+    router: &TestApiServer,
     group: &str,
     name: &str,
     spec: Value,
@@ -1493,7 +1431,7 @@ async fn ratchet_put_cr(
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let group = "rl1.example.com";
 
     // 1) Permissive CRD.
@@ -1571,7 +1509,7 @@ async fn ratcheting_unchanged_correlatable_jsonschema_errors_allowed() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let group = "rl2.example.com";
 
     ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
@@ -1632,7 +1570,7 @@ async fn ratcheting_unchanged_uncorrelatable_jsonschema_errors_blocked() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_changed_jsonschema_errors_blocked() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let group = "rl3.example.com";
 
     ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
@@ -1709,7 +1647,7 @@ async fn ratcheting_changed_jsonschema_errors_blocked() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let group = "rl4.example.com";
 
     ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
@@ -1813,7 +1751,7 @@ async fn ratcheting_unchanged_correlatable_cel_errors_allowed() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let group = "rl5.example.com";
 
     ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
@@ -1870,7 +1808,7 @@ async fn ratcheting_unchanged_uncorrelatable_cel_errors_blocked() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_changed_cel_errors_blocked() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let group = "rl6.example.com";
 
     ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
@@ -1957,7 +1895,7 @@ async fn ratcheting_changed_cel_errors_blocked() {
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
 async fn ratcheting_transition_rule_errors_never_ratcheted() {
-    let (_mem, _state, router) = spawn_router();
+    let router = spawn_router();
     let group = "rl7.example.com";
 
     ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;

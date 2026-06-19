@@ -38,72 +38,41 @@
 //!     Random bytes sent with `application/cbor` must produce a 4xx, not
 //!     a panic and not silent data corruption.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{cbor, router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_api_server::cbor;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "default";
 
 // ---------------------------------------------------------------------------
-// HTTP harness — inline, same pattern as `decoder_content_type_test.rs`.
-// Each test spawns its own router so state never leaks across tests.
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth — handlers see admin context
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 async fn send(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     headers: &[(&str, &str)],
     body: Vec<u8>,
 ) -> (StatusCode, String, Vec<u8>) {
-    let mut req = Request::builder().method(method).uri(uri);
-    for (k, v) in headers {
-        req = req.header(*k, *v);
-    }
-    let response = router
-        .oneshot(req.body(Body::from(body)).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
+    let (status, hmap, bytes, _) = router
+        .send_with_headers(method.as_str(), uri, headers, Some(body))
+        .await;
+    let content_type = hmap
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, content_type, bytes.to_vec())
+    (status, content_type, bytes)
 }
 
 /// POST a ConfigMap encoded as CBOR. The middleware must decode the body
