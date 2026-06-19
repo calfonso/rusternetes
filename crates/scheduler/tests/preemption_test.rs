@@ -18,8 +18,7 @@
 use std::collections::HashMap;
 
 use rusternetes_common::resources::{
-    Container, IntOrString, Node, NodeStatus, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec,
-    PodSpec, PodStatus,
+    Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
 use rusternetes_scheduler::advanced::check_preemption_with_pdbs;
@@ -61,28 +60,7 @@ fn make_container(cpu: &str, memory: &str) -> Container {
     }
 }
 
-fn make_node(name: &str, cpu: &str, memory: &str) -> Node {
-    let mut allocatable = HashMap::new();
-    allocatable.insert("cpu".to_string(), cpu.to_string());
-    allocatable.insert("memory".to_string(), memory.to_string());
-    let mut node = Node::new(name);
-    node.status = Some(NodeStatus {
-        capacity: None,
-        allocatable: Some(allocatable),
-        conditions: None,
-        addresses: None,
-        node_info: None,
-        images: None,
-        volumes_in_use: None,
-        volumes_attached: None,
-        daemon_endpoints: None,
-        config: None,
-        features: None,
-        runtime_handlers: None,
-        declared_features: None,
-    });
-    node
-}
+use rusternetes_test_support::node_with_resources as make_node;
 
 fn make_pod_with_labels(
     name: &str,

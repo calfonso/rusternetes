@@ -21,4 +21,6 @@ pub mod builders;
 #[cfg(feature = "apiserver-harness")]
 pub mod harness;
 
-pub use builders::{endpoint_slice, node, pod, service, PodBuilder, ResourceBuilder};
+pub use builders::{
+    endpoint_slice, node, node_with_resources, pod, service, PodBuilder, ResourceBuilder,
+};

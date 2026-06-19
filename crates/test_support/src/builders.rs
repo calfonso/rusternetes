@@ -5,8 +5,29 @@
 //! existing tests seed resources with `json!(...)`, while giving porting code
 //! precise control over malformed inputs.
 
+use rusternetes_common::resources::{Node, NodeStatus};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+
+/// Typed `Node` with `cpu`/`memory` set on both `status.capacity` and
+/// `status.allocatable` — the shape scheduler fit/preemption tests need.
+///
+/// Lifted from the `make_node(name, cpu, memory) -> Node` helper that was
+/// copy-pasted byte-for-byte across `crates/scheduler/tests/*`. Returns a typed
+/// `Node` (not JSON) so it drops straight in for those `make_node` call sites.
+pub fn node_with_resources(name: &str, cpu: &str, memory: &str) -> Node {
+    let mut quantities = HashMap::new();
+    quantities.insert("cpu".to_string(), cpu.to_string());
+    quantities.insert("memory".to_string(), memory.to_string());
+    let mut node = Node::new(name);
+    node.status = Some(NodeStatus {
+        capacity: Some(quantities.clone()),
+        allocatable: Some(quantities),
+        ..Default::default()
+    });
+    node
+}
 
 /// Deep-merge `src` into `dst` (objects merged recursively, scalars/arrays
 /// overwritten). Used by the builders' `merge` setters.

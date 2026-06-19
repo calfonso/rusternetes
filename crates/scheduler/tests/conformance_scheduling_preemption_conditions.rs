@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 
 use rusternetes_common::resources::{
-    Container, ContainerPort, Node, NodeStatus, Pod, PodCondition, PodSpec, PodStatus,
+    Container, ContainerPort, Pod, PodCondition, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{Phase, ResourceRequirements};
 use rusternetes_scheduler::advanced::{check_host_port_conflicts, check_preemption};
@@ -107,28 +107,7 @@ fn container_with_host_port(
     c
 }
 
-fn make_node(name: &str, cpu: &str, memory: &str) -> Node {
-    let mut allocatable = HashMap::new();
-    allocatable.insert("cpu".to_string(), cpu.to_string());
-    allocatable.insert("memory".to_string(), memory.to_string());
-    let mut node = Node::new(name);
-    node.status = Some(NodeStatus {
-        capacity: Some(allocatable.clone()),
-        allocatable: Some(allocatable),
-        conditions: None,
-        addresses: None,
-        node_info: None,
-        images: None,
-        volumes_in_use: None,
-        volumes_attached: None,
-        daemon_endpoints: None,
-        config: None,
-        features: None,
-        runtime_handlers: None,
-        declared_features: None,
-    });
-    node
-}
+use rusternetes_test_support::node_with_resources as make_node;
 
 /// Scheduled, running pod on `node_name` with the given priority.
 fn make_running_pod(name: &str, priority: i32, cpu: &str, memory: &str, node_name: &str) -> Pod {

@@ -4736,6 +4736,7 @@ dependencies = [
  "rusternetes-common",
  "rusternetes-controller-manager",
  "rusternetes-storage",
+ "rusternetes-test-support",
  "serde",
  "serde_json",
  "tokio",

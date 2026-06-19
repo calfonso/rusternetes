@@ -43,3 +43,6 @@ uuid.workspace = true
 # the scheduler mutates. Listed dev-only so the production scheduler binary
 # stays decoupled from the controller-manager crate.
 rusternetes-controller-manager = { path = "../controller-manager" }
+# Shared resource-fixture builders (e.g. `node_with_resources`), default
+# feature only — the api-server harness is not needed here.
+rusternetes-test-support = { path = "../test_support" }

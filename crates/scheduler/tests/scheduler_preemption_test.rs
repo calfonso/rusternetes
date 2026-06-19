@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rusternetes_common::resources::{
-    Container, IntOrString, Node, NodeStatus, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec,
-    PodSpec, PodStatus, PriorityClass,
+    Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
+    PriorityClass,
 };
 use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
 use rusternetes_scheduler::advanced::{check_preemption, check_preemption_with_pdbs};
@@ -83,28 +83,7 @@ fn make_container(cpu: &str, memory: &str) -> Container {
     }
 }
 
-fn make_node(name: &str, cpu: &str, memory: &str) -> Node {
-    let mut allocatable = HashMap::new();
-    allocatable.insert("cpu".to_string(), cpu.to_string());
-    allocatable.insert("memory".to_string(), memory.to_string());
-    let mut node = Node::new(name);
-    node.status = Some(NodeStatus {
-        capacity: Some(allocatable.clone()),
-        allocatable: Some(allocatable),
-        conditions: None,
-        addresses: None,
-        node_info: None,
-        images: None,
-        volumes_in_use: None,
-        volumes_attached: None,
-        daemon_endpoints: None,
-        config: None,
-        features: None,
-        runtime_handlers: None,
-        declared_features: None,
-    });
-    node
-}
+use rusternetes_test_support::node_with_resources as make_node;
 
 fn make_scheduled_pod(name: &str, priority: i32, cpu: &str, memory: &str, node_name: &str) -> Pod {
     make_pod_with_labels(name, priority, cpu, memory, Some(node_name), None)

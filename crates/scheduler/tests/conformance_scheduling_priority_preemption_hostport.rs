@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rusternetes_common::resources::{
-    Container, ContainerPort, Node, NodeStatus, Pod, PodCondition, PodSpec, PodStatus,
-    PriorityClass, ReplicaSet, ReplicaSetSpec,
+    Container, ContainerPort, Pod, PodCondition, PodSpec, PodStatus, PriorityClass, ReplicaSet,
+    ReplicaSetSpec,
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, ResourceRequirements, TypeMeta};
 use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
@@ -92,28 +92,7 @@ fn container_with_host_port(
     c
 }
 
-fn make_node(name: &str, cpu: &str, memory: &str) -> Node {
-    let mut allocatable = HashMap::new();
-    allocatable.insert("cpu".to_string(), cpu.to_string());
-    allocatable.insert("memory".to_string(), memory.to_string());
-    let mut node = Node::new(name);
-    node.status = Some(NodeStatus {
-        capacity: Some(allocatable.clone()),
-        allocatable: Some(allocatable),
-        conditions: None,
-        addresses: None,
-        node_info: None,
-        images: None,
-        volumes_in_use: None,
-        volumes_attached: None,
-        daemon_endpoints: None,
-        config: None,
-        features: None,
-        runtime_handlers: None,
-        declared_features: None,
-    });
-    node
-}
+use rusternetes_test_support::node_with_resources as make_node;
 
 fn make_scheduled_pod(name: &str, priority: i32, cpu: &str, memory: &str, node_name: &str) -> Pod {
     let spec = PodSpec {
