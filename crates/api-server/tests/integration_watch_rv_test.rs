@@ -39,83 +39,40 @@
 //! handler regression that hangs the response surfaces as a test failure, not
 //! an indefinite wait.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
+use axum::http::{Method, StatusCode};
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors integration_dryrun_all_resources.rs:82-100
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
 const TEST_NS: &str = "watchrvns";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
-}
-
-async fn drain(response: axum::response::Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, v)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 async fn send_json(
-    router: axum::Router,
+    router: TestApiServer,
     method: Method,
     uri: &str,
     body: &Value,
 ) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    drain(router.oneshot(req).await.unwrap()).await
+    router
+        .send(method.as_str(), uri, Some("application/json"), Some(body))
+        .await
 }
 
-async fn send_delete(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    drain(router.oneshot(req).await.unwrap()).await
+async fn send_delete(router: TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.delete(uri).await
 }
 
 fn pod_stub(name: &str) -> Value {
@@ -141,17 +98,12 @@ fn cm_stub(name: &str) -> Value {
 /// HTTP status plus the parsed events. The router clone is dropped after the
 /// stream prefix is collected so background tasks are released.
 async fn collect_watch_events(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     max_events: usize,
     deadline: Duration,
 ) -> (StatusCode, Vec<Value>) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.respond("GET", uri, None, None).await;
     let status = response.status();
     let mut stream = response.into_body().into_data_stream();
     let mut buffer = String::new();
@@ -439,15 +391,8 @@ async fn test_watch_observes_subsequent_create() {
 #[tokio::test]
 async fn test_watch_response_streaming_headers() {
     let (_mem, router) = spawn_router();
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!(
-            "/api/v1/namespaces/{}/configmaps?watch=true&resourceVersion=0",
-            TEST_NS
-        ))
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+    let uri = format!("/api/v1/namespaces/{TEST_NS}/configmaps?watch=true&resourceVersion=0");
+    let response = router.respond("GET", &uri, None, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let ct = response
         .headers()
@@ -597,15 +542,18 @@ async fn test_delete_with_mismatched_precondition_rv_returns_409() {
         "apiVersion": "v1",
         "preconditions": {"resourceVersion": "1"},
     });
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri(format!("/api/v1/namespaces/{}/configmaps/delprec", TEST_NS))
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+    let uri = format!("/api/v1/namespaces/{TEST_NS}/configmaps/delprec");
+    let (status, _headers, _bytes, _) = router
+        .send_full(
+            "DELETE",
+            &uri,
+            Some("application/json"),
+            None,
+            Some(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
     assert_eq!(
-        resp.status(),
+        status,
         StatusCode::CONFLICT,
         "mismatched precondition RV must surface as 409"
     );
