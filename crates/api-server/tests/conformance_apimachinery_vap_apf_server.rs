@@ -20,15 +20,10 @@
 //! `#[tokio::test]` and must pass. Tests mirroring still-FAILING outcomes
 //! (failing.txt) are `#[ignore = "GAP: …; upstream …"]`.
 
-use axum::{body::Body, http::Request};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use rusternetes_storage::memory::MemoryStorage;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // HTTP harness
@@ -37,92 +32,53 @@ use tower::ServiceExt;
 /// Returns `(router, storage)` backed by a fresh `MemoryStorage` with
 /// `skip_auth=true` so tests can drive requests without bearer tokens,
 /// exactly as the upstream Ginkgo suite uses an admin client.
-fn spawn_router() -> (axum::Router, Arc<MemoryStorage>) {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem.clone()));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    (build_router(state, None), mem)
+fn spawn_router() -> (TestApiServer, Arc<MemoryStorage>) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (api, mem)
 }
 
 /// Issue a request and return `(status_u16, parsed_json_body)`.
 async fn send(
-    router: &axum::Router,
+    router: &TestApiServer,
     method: &str,
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    let http_body = match body {
-        Some(b) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(b).unwrap())
-        }
-        None => {
-            builder = builder.header("content-length", "0");
-            Body::empty()
-        }
-    };
-    let req = builder.body(http_body).unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+    let content_type = body.as_ref().map(|_| "application/json");
+    let (status, value) = router.send(method, uri, content_type, body).await;
+    (status.as_u16(), value)
 }
 
 /// POST a JSON body with an explicit `Accept` header; return `(status, body)`.
 async fn send_post_with_accept(
-    router: &axum::Router,
+    router: &TestApiServer,
     uri: &str,
     body: &Value,
     accept: &str,
 ) -> (u16, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header("accept", accept)
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+    let bytes = serde_json::to_vec(body).unwrap();
+    let (status, _h, _b, value) = router
+        .send_with_headers(
+            "POST",
+            uri,
+            &[("content-type", "application/json"), ("accept", accept)],
+            Some(bytes),
+        )
+        .await;
+    (status.as_u16(), value)
 }
 
 async fn patch_json(
-    router: &axum::Router,
+    router: &TestApiServer,
     uri: &str,
     body: &Value,
     content_type: &str,
 ) -> (u16, Value) {
-    let req = Request::builder()
-        .method("PATCH")
-        .uri(uri)
-        .header("content-type", content_type)
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, v)
+    let (status, value) = router
+        .send("PATCH", uri, Some(content_type), Some(body))
+        .await;
+    (status.as_u16(), value)
 }
 
 // ===========================================================================
