@@ -7,7 +7,7 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use rusternetes_common::resources::Pod;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Handle WebSocket exec by proxying to the kubelet
 ///
@@ -39,14 +39,10 @@ pub async fn handle_ws_exec(
         pod.metadata.name, container_name
     );
 
-    // Resolve the container's CRI id and run the command one-shot via ExecSync.
-    //
-    // TODO(cri): this path was never truly interactive — it always collected
-    // exec output one-shot — so ExecSync preserves the external behavior. Real
-    // interactive streaming (live stdin → process, incremental stdout) would
-    // need the CRI streaming `Exec` RPC + a proxy to the returned URL; stdin
-    // frames (channel 0) and resize (channel 4) are accepted and drained but
-    // not forwarded to the process.
+    // Resolve the container's CRI id, then open an interactive streaming exec
+    // (CRI `Exec` RPC → WebSocket to the runtime's stream server) and proxy it.
+    // If streaming can't be established, fall back to the one-shot `ExecSync`
+    // path so the non-interactive case never regresses (#1256).
     let mut cri = match crate::cri_exec::connect().await {
         Ok(c) => c,
         Err(e) => {
@@ -103,30 +99,117 @@ pub async fn handle_ws_exec(
         command, container_id, stdin, tty
     );
 
+    match crate::cri_exec::open_exec_stream(&mut cri, &container_id, &command, tty, stdin).await {
+        Ok(runtime) => proxy_exec_streams(socket, runtime, &container_id).await,
+        Err(e) => {
+            warn!(
+                "WS exec: interactive streaming unavailable for {} ({}); falling back to ExecSync",
+                container_id, e
+            );
+            exec_sync_to_ws(socket, &mut cri, &container_id, &command).await;
+        }
+    }
+}
+
+/// Bidirectionally proxy a kubectl exec WebSocket (`client`) and the CRI
+/// runtime's exec WebSocket (`runtime`). Both legs speak the identical
+/// channel-framed `v5.channel.k8s.io` protocol (byte 0 = channel), so frames
+/// pass straight through: stdin (0) / resize (4) flow client→runtime; stdout
+/// (1) / stderr (2) / error+status (3) flow runtime→client. Whichever side
+/// closes first ends the session (the runtime closes after the process exits).
+async fn proxy_exec_streams(
+    client: WebSocket,
+    runtime: crate::cri_exec::CriStream,
+    container_id: &str,
+) {
+    use tokio_tungstenite::tungstenite::Message as TMsg;
+
+    let (mut client_tx, mut client_rx) = client.split();
+    let (mut rt_tx, mut rt_rx) = runtime.split();
+
+    // kubectl → runtime: stdin, resize, and the v5 close-stream control frames.
+    let client_to_runtime = async {
+        while let Some(Ok(msg)) = client_rx.next().await {
+            let forward = match msg {
+                Message::Binary(b) => rt_tx.send(TMsg::Binary(b)).await,
+                Message::Text(t) => rt_tx.send(TMsg::Text(t)).await,
+                Message::Close(_) => {
+                    let _ = rt_tx.send(TMsg::Close(None)).await;
+                    break;
+                }
+                // Pings/pongs are connection-local; don't relay.
+                Message::Ping(_) | Message::Pong(_) => Ok(()),
+            };
+            if forward.is_err() {
+                break;
+            }
+        }
+    };
+
+    // runtime → kubectl: stdout, stderr, and the channel-3 status frame.
+    let runtime_to_client = async {
+        while let Some(Ok(msg)) = rt_rx.next().await {
+            let forward = match msg {
+                TMsg::Binary(b) => client_tx.send(Message::Binary(b)).await,
+                TMsg::Text(t) => client_tx.send(Message::Text(t)).await,
+                TMsg::Close(_) => {
+                    let _ = client_tx
+                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1000,
+                            reason: "".to_string().into(),
+                        })))
+                        .await;
+                    break;
+                }
+                TMsg::Ping(_) | TMsg::Pong(_) | TMsg::Frame(_) => Ok(()),
+            };
+            if forward.is_err() {
+                break;
+            }
+        }
+    };
+
+    // The runtime side is authoritative for completion; either ending tears the
+    // proxy down.
+    tokio::select! {
+        _ = client_to_runtime => {}
+        _ = runtime_to_client => {}
+    }
+    debug!("WS exec proxy finished for {}", container_id);
+}
+
+/// One-shot exec fallback: run the command via CRI `ExecSync` and write the
+/// collected stdout/stderr + exit status back over the channel protocol. Used
+/// when interactive streaming can't be established; preserves the pre-#1256
+/// behavior so non-interactive `kubectl exec` never regresses.
+async fn exec_sync_to_ws(
+    socket: WebSocket,
+    cri: &mut rusternetes_cri::CriClient,
+    container_id: &str,
+    command: &[String],
+) {
     let (stdout_data, stderr_data, exit_code) =
-        match crate::cri_exec::exec_sync(&mut cri, &container_id, &command, 60).await {
+        match crate::cri_exec::exec_sync(cri, container_id, command, 60).await {
             Ok(out) => out,
             Err(e) => {
                 error!("WS exec: ExecSync failed for {}: {}", container_id, e);
-                let _ = socket
+                let mut s = socket;
+                let _ = s
                     .send(Message::Binary(
                         std::iter::once(3u8)
                             .chain(format!("Exec error: {}", e).bytes())
                             .collect(),
                     ))
                     .await;
-                let _ = socket.close().await;
+                let _ = s.close().await;
                 return;
             }
         };
 
-    // Split WebSocket into sender and receiver so we can drain client messages
-    // (stdin, close frames) without stalling the connection.
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Drain incoming client frames. ExecSync is one-shot, so stdin/resize are
-    // accepted but not forwarded (see TODO(cri) above); this only keeps the
-    // socket from stalling on client pings/close.
+    // accepted but not forwarded; this only keeps the socket from stalling.
     tokio::spawn(async move { while ws_receiver.next().await.is_some() {} });
 
     // K8s protocol requires channel 1 (stdout) to appear before channel 3
@@ -145,10 +228,6 @@ pub async fn handle_ws_exec(
         let _ = ws_sender.send(Message::Binary(data)).await;
     }
 
-    // Send exit code as status on error channel (channel 3).
-    // Only send for v4/v5 protocols — v1 (channel.k8s.io) doesn't use
-    // the status channel and clients fail if they see non-stdout data.
-    // K8s ref: staging/src/k8s.io/client-go/tools/remotecommand/v4.go
     info!(
         "WS exec: command finished for {} with exit_code={}",
         container_id, exit_code
@@ -156,7 +235,6 @@ pub async fn handle_ws_exec(
 
     let is_v1 = V1_PROTOCOL_FLAG.load(std::sync::atomic::Ordering::Relaxed);
     if !is_v1 || exit_code != 0 {
-        // v4/v5: always send status. v1: only send for non-zero exit (error reporting).
         let status_json = if exit_code == 0 {
             r#"{"status":"Success"}"#.to_string()
         } else {
@@ -170,15 +248,13 @@ pub async fn handle_ws_exec(
         let _ = ws_sender.send(Message::Binary(status_data)).await;
     }
 
-    // Send proper close frame. The client (client-go) expects a 1000 close after
-    // receiving status on channel 3. Wait briefly then close.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let close_frame = axum::extract::ws::CloseFrame {
         code: 1000,
         reason: "".to_string().into(),
     };
     let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
-    debug!("WS exec completed for {}", container_id);
+    debug!("WS exec completed (ExecSync) for {}", container_id);
 }
 
 /// Prefix a payload with a single channel byte, producing one
