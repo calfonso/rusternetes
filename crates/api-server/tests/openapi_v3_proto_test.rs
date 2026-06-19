@@ -15,67 +15,43 @@
 //! Harness mirrors `openapi_discovery_test.rs` (in-process axum router over
 //! `StorageBackend::Memory`, driven via `tower::ServiceExt::oneshot`).
 
-use axum::{
-    body::Body,
-    http::{header, Method, Request, StatusCode},
-};
+use axum::http::{header, StatusCode};
 use prost::Message;
 use rusternetes_api_server::gnostic::openapi_v3::Document;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
-use std::sync::Arc;
-use tower::ServiceExt;
+use rusternetes_test_support::harness::TestApiServer;
 
 // ---------------------------------------------------------------------------
-// HTTP harness — mirrors `openapi_discovery_test.rs`.
+// HTTP harness — thin shims over the shared `TestApiServer`.
 // ---------------------------------------------------------------------------
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    build_router(make_state(mem), None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
 const V3_PROTO_ACCEPT: &str = "application/com.github.proto-openapi.spec.v3@v1.0+protobuf";
 
-async fn get_v3_subdoc_with_accept(
-    router: axum::Router,
-    accept: &str,
+/// GET the v3 sub-doc with an optional `Accept` header; returns
+/// `(status, response Content-Type, raw body bytes)`.
+async fn get_v3_subdoc(
+    router: TestApiServer,
+    accept: Option<&str>,
 ) -> (StatusCode, String, Vec<u8>) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/openapi/v3/apis/apps/v1")
-        .header(header::ACCEPT, accept)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
+    let (status, headers, bytes, _) = router
+        .send_full("GET", "/openapi/v3/apis/apps/v1", None, accept, None)
+        .await;
+    let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, content_type, bytes.to_vec())
+    (status, content_type, bytes)
+}
+
+async fn get_v3_subdoc_with_accept(
+    router: TestApiServer,
+    accept: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    get_v3_subdoc(router, Some(accept)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -88,19 +64,8 @@ async fn get_v3_subdoc_with_accept(
 #[tokio::test]
 async fn v3_subdoc_defaults_to_json() {
     let router = spawn_router();
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/openapi/v3/apis/apps/v1")
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let ct = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let (status, ct, _body) = get_v3_subdoc(router, None).await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
         ct.starts_with("application/json"),
         "default sub-doc Content-Type must be JSON; got {ct}"

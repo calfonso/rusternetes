@@ -25,36 +25,14 @@
 //! `spec` survives the decode (i.e. the create succeeds and the persisted /
 //! echoed object carries the spec fields, not an empty stub).
 
-use axum::{
-    body::Body,
-    http::{header, Method, Request, StatusCode},
-};
-use rusternetes_api_server::{
-    protobuf::ProtoRegistry, router::build_router, state::ApiServerState,
-};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
-use std::sync::Arc;
-use tower::ServiceExt;
+use axum::http::StatusCode;
+use rusternetes_api_server::protobuf::ProtoRegistry;
+use rusternetes_test_support::harness::TestApiServer;
 
 const PROTO_CT: &str = "application/vnd.kubernetes.protobuf";
 
-fn spawn_router() -> axum::Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    build_router(state, None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
 // ----- proto wire helpers ---------------------------------------------------
@@ -116,19 +94,15 @@ fn k8s_envelope(api_version: &str, kind: &str, raw: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn post_proto(router: axum::Router, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, PROTO_CT)
-        .header(header::ACCEPT, "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let resp = router.oneshot(req).await.expect("router oneshot");
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
+async fn post_proto(router: TestApiServer, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
+    let (status, _headers, bytes, _) = router
+        .send_with_headers(
+            "POST",
+            uri,
+            &[("content-type", PROTO_CT), ("accept", "application/json")],
+            Some(body),
+        )
+        .await;
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 

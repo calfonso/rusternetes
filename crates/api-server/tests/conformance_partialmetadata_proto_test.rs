@@ -27,66 +27,33 @@
 //!
 //!   cargo test -p rusternetes-api-server --test conformance_partialmetadata_proto_test
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
-use rusternetes_api_server::{
-    protobuf::ProtoRegistry, router::build_router, state::ApiServerState,
-};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_api_server::protobuf::ProtoRegistry;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "default";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 async fn get_with_accept(
-    router: axum::Router,
+    router: TestApiServer,
     uri: &str,
     accept: &str,
 ) -> (StatusCode, String, Vec<u8>) {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .header("accept", accept)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
+    let (status, headers, bytes, _) = router.send_full("GET", uri, None, Some(accept), None).await;
+    let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, content_type, bytes.to_vec())
+    (status, content_type, bytes)
 }
 
 async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) {
