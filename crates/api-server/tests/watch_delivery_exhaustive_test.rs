@@ -15,50 +15,23 @@
 //!
 //! Fast: pure `MemoryStorage` + in-process router, no containers.
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-};
+use axum::http::StatusCode;
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use tower::ServiceExt;
 
 const NS: &str = "watchexhaustive";
 const OBJ: &str = "probe1";
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    Arc::new(ApiServerState::new(
-        backend,
-        Arc::new(TokenManager::new(b"test-secret")),
-        Arc::new(AlwaysAllowAuthorizer),
-        Arc::new(MetricsRegistry::new()),
-        true,
-    ))
-}
-
-async fn get_json(router: &axum::Router, uri: &str) -> Option<Value> {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.ok()?;
-    if resp.status() != StatusCode::OK {
+async fn get_json(router: &TestApiServer, uri: &str) -> Option<Value> {
+    let (status, value) = router.get(uri).await;
+    if status != StatusCode::OK {
         return None;
     }
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
+    Some(value)
 }
 
 /// A served resource we should be able to watch.
@@ -130,7 +103,7 @@ fn parse_resource_list(doc: &Value, group: &str, version: &str, out: &mut Vec<Re
 }
 
 /// Enumerate every watchable resource from the live discovery documents.
-async fn enumerate(router: &axum::Router) -> Vec<Res> {
+async fn enumerate(router: &TestApiServer) -> Vec<Res> {
     let mut out = Vec::new();
 
     // Core group at /api/v1.
@@ -177,13 +150,8 @@ enum Outcome {
 
 /// GET the watch URL, read the body for up to `deadline`, and classify the
 /// response as a watch stream vs a one-shot list.
-async fn classify(router: axum::Router, uri: String, deadline: Duration) -> Outcome {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(&uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+async fn classify(router: TestApiServer, uri: String, deadline: Duration) -> Outcome {
+    let resp = router.respond("GET", &uri, None, None).await;
     if resp.status() != StatusCode::OK {
         return Outcome::NoResponse;
     }
@@ -262,15 +230,14 @@ async fn probe(res: &Res) -> (Outcome, bool) {
     let ns = if res.namespaced { Some(NS) } else { None };
 
     // --- attempt 1: seeded, expect Delivered ---
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
+    let router = TestApiServer::new();
     let key = build_key(&res.plural, ns, OBJ);
     let mut meta = json!({"name": OBJ});
     if res.namespaced {
         meta["namespace"] = json!(NS);
     }
     let obj = json!({"apiVersion": res.api_version(), "kind": res.kind, "metadata": meta});
-    let _ = mem.create(&key, &obj).await;
+    let _ = router.storage.create(&key, &obj).await;
     let uri = format!(
         "{}?watch=true&resourceVersion=0&allowWatchBookmarks=true",
         res.collection()
@@ -280,8 +247,7 @@ async fn probe(res: &Res) -> (Outcome, bool) {
     }
 
     // --- attempt 2: UNSEEDED dispatch check (seed couldn't deserialize) ---
-    let mem2 = Arc::new(MemoryStorage::new());
-    let router2 = build_router(make_state(mem2), None);
+    let router2 = TestApiServer::new();
     let uri2 = format!(
         "{}?watch=true&resourceVersion=0&allowWatchBookmarks=true",
         res.collection()
@@ -291,7 +257,7 @@ async fn probe(res: &Res) -> (Outcome, bool) {
 
 #[tokio::test]
 async fn watch_pushes_added_for_every_watchable_resource() {
-    let probe_router = build_router(make_state(Arc::new(MemoryStorage::new())), None);
+    let probe_router = TestApiServer::new();
     let resources = enumerate(&probe_router).await;
 
     assert!(
