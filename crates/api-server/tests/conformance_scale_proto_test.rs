@@ -34,21 +34,13 @@
 //! (router → middleware → handler → response) runs end-to-end without
 //! depending on a real apiserver.
 
-use axum::{
-    body::Body,
-    http::{header, Method, Request, StatusCode},
-};
-use rusternetes_api_server::{
-    handlers::scale::Scale, protobuf::ProtoRegistry, router::build_router, state::ApiServerState,
-};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-    protobuf::decode_unknown_raw,
-};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use axum::http::{header, StatusCode};
+use rusternetes_api_server::{handlers::scale::Scale, protobuf::ProtoRegistry};
+use rusternetes_common::protobuf::decode_unknown_raw;
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::json;
 use std::sync::Arc;
-use tower::ServiceExt;
 
 const TEST_NS: &str = "default";
 const PROTO_ACCEPT: &str = "application/vnd.kubernetes.protobuf";
@@ -187,24 +179,50 @@ fn test_scale_full_proto_decode_with_spec_and_status() {
 // router over `MemoryStorage` with `skip_auth = true`, seed a Deployment
 // with `spec.replicas`, and drive a real HTTP request via `oneshot`.
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+/// GET `uri` with an `Accept` header; returns `(status, response Content-Type,
+/// raw body bytes)`.
+async fn get_with_accept(
+    router: &TestApiServer,
+    uri: &str,
+    accept: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    let (status, headers, bytes, _) = router.send_full("GET", uri, None, Some(accept), None).await;
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (status, ct, bytes)
+}
+
+/// PUT a JSON body to `uri` with an explicit `Accept` header; returns
+/// `(status, response Content-Type, raw body bytes)`.
+async fn put_json_with_accept(
+    router: &TestApiServer,
+    uri: &str,
+    accept: &str,
+    body: Vec<u8>,
+) -> (StatusCode, String, Vec<u8>) {
+    let (status, headers, bytes, _) = router
+        .send_with_headers(
+            "PUT",
+            uri,
+            &[("accept", accept), ("content-type", "application/json")],
+            Some(body),
+        )
+        .await;
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (status, ct, bytes)
 }
 
 /// Seed an apps/v1 Deployment with `spec.replicas = 4`. The /scale handler
@@ -257,34 +275,23 @@ async fn get_scale_with_protobuf_accept_returns_k8s_envelope() {
     let (mem, router) = spawn_router();
     seed_deployment(&mem, "scale-proto", 4).await;
 
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/apis/apps/v1/namespaces/default/deployments/scale-proto/scale")
-        .header(header::ACCEPT, PROTO_ACCEPT)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.expect("router oneshot");
+    let (status, ct, body) = get_with_accept(
+        &router,
+        "/apis/apps/v1/namespaces/default/deployments/scale-proto/scale",
+        PROTO_ACCEPT,
+    )
+    .await;
 
     assert_eq!(
-        response.status(),
+        status,
         StatusCode::OK,
-        "GET /scale with proto Accept must return 200",
+        "GET /scale with proto Accept must return 200"
     );
-
-    let ct = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
     assert!(
         ct.starts_with("application/vnd.kubernetes.protobuf"),
         "Content-Type must be application/vnd.kubernetes.protobuf; got {ct:?}",
     );
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
     assert!(
         body.starts_with(b"k8s\0"),
         "response body must begin with the k8s\\0 magic prefix; first 8 bytes={:?}",
@@ -341,29 +348,19 @@ async fn get_scale_with_json_accept_returns_json() {
     let (mem, router) = spawn_router();
     seed_deployment(&mem, "scale-json", 2).await;
 
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/apis/apps/v1/namespaces/default/deployments/scale-json/scale")
-        .header(header::ACCEPT, "application/json")
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.expect("router oneshot");
+    let (status, ct, body) = get_with_accept(
+        &router,
+        "/apis/apps/v1/namespaces/default/deployments/scale-json/scale",
+        "application/json",
+    )
+    .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let ct = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    assert_eq!(status, StatusCode::OK);
     assert!(
         ct.starts_with("application/json"),
         "JSON Accept must keep returning JSON; got {ct:?}",
     );
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
     assert!(
         !body.starts_with(b"k8s\0"),
         "JSON response must NOT be wrapped in the protobuf envelope; first 4 bytes={:?}",
@@ -397,35 +394,24 @@ async fn put_scale_with_protobuf_accept_returns_k8s_envelope() {
     })
     .to_string();
 
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/apis/apps/v1/namespaces/default/deployments/scale-put-proto/scale")
-        .header(header::ACCEPT, PROTO_ACCEPT)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap();
-    let response = router.oneshot(req).await.expect("router oneshot");
+    let (status, ct, bytes) = put_json_with_accept(
+        &router,
+        "/apis/apps/v1/namespaces/default/deployments/scale-put-proto/scale",
+        PROTO_ACCEPT,
+        body.into_bytes(),
+    )
+    .await;
 
     assert_eq!(
-        response.status(),
+        status,
         StatusCode::OK,
-        "PUT /scale with proto Accept must return 200",
+        "PUT /scale with proto Accept must return 200"
     );
-
-    let ct = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
     assert!(
         ct.starts_with("application/vnd.kubernetes.protobuf"),
         "PUT response Content-Type must be proto; got {ct:?}",
     );
 
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
     assert!(
         bytes.starts_with(b"k8s\0"),
         "PUT response body must begin with k8s\\0; first 4 bytes={:?}",

@@ -42,21 +42,13 @@
 //!     handler upstream.
 //!   * JSON-side mirror: `tests/integration_eviction_subresource.rs`.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use rusternetes_api_server::{
-    protobuf::ProtoRegistry, router::build_router, state::ApiServerState,
-};
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
+use axum::http::StatusCode;
+use rusternetes_api_server::protobuf::ProtoRegistry;
 use rusternetes_common::resources::{Container, Pod, PodSpec, PodStatus};
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use std::sync::Arc;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // Proto wire-format helpers — small, copy-paste-stable across this file.
@@ -290,24 +282,24 @@ fn test_eviction_envelope_round_trips_via_decode_k8s_resource() {
 // `normalize_content_type_middleware` strips the envelope and routes the
 // decoded JSON into the existing `create_eviction` handler.
 
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+/// POST a protobuf-encoded body (`application/vnd.kubernetes.protobuf`) and
+/// return `(status, raw response bytes)`.
+async fn post_proto(router: &TestApiServer, uri: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
+    let (status, _headers, bytes, _) = router
+        .send_with_headers(
+            "POST",
+            uri,
+            &[("content-type", "application/vnd.kubernetes.protobuf")],
+            Some(body),
+        )
+        .await;
+    (status, bytes)
 }
 
 fn running_pod(name: &str, namespace: &str) -> Pod {
@@ -364,17 +356,7 @@ async fn test_eviction_subresource_accepts_protobuf_body() {
     let envelope = k8s_envelope("policy/v1", "Eviction", &inner);
 
     let uri = format!("/api/v1/namespaces/{}/pods/{}/eviction", ns, name);
-    let req = Request::builder()
-        .method("POST")
-        .uri(&uri)
-        .header("content-type", "application/vnd.kubernetes.protobuf")
-        .body(Body::from(envelope))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let (status, bytes) = post_proto(&router, &uri, envelope).await;
     let body_str = String::from_utf8_lossy(&bytes).to_string();
 
     assert!(
@@ -416,14 +398,7 @@ async fn test_eviction_subresource_protobuf_honors_matching_uid_precondition() {
     let envelope = k8s_envelope("policy/v1", "Eviction", &inner);
 
     let uri = format!("/api/v1/namespaces/{}/pods/{}/eviction", ns, name);
-    let req = Request::builder()
-        .method("POST")
-        .uri(&uri)
-        .header("content-type", "application/vnd.kubernetes.protobuf")
-        .body(Body::from(envelope))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
+    let (status, _bytes) = post_proto(&router, &uri, envelope).await;
 
     assert!(
         status == StatusCode::OK || status == StatusCode::CREATED,
@@ -460,14 +435,7 @@ async fn test_eviction_subresource_protobuf_rejects_mismatched_uid_precondition(
     let envelope = k8s_envelope("policy/v1", "Eviction", &inner);
 
     let uri = format!("/api/v1/namespaces/{}/pods/{}/eviction", ns, name);
-    let req = Request::builder()
-        .method("POST")
-        .uri(&uri)
-        .header("content-type", "application/vnd.kubernetes.protobuf")
-        .body(Body::from(envelope))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
+    let (status, _bytes) = post_proto(&router, &uri, envelope).await;
 
     assert!(
         status.is_client_error(),
