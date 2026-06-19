@@ -14,31 +14,24 @@
 //! either targets one of these mocks or `https://0.0.0.0:1/...` for the
 //! "fail closed without CA bundle" scenario.
 
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
+use axum::http::StatusCode;
 use rusternetes_api_server::admission_webhook::AdmissionWebhookManager;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
 use rusternetes_common::{
     admission::{
         AdmissionResponse, AdmissionReview, AdmissionReviewResponse, GroupVersionKind,
         GroupVersionResource, Operation, PatchOp, PatchOperation, UserInfo,
     },
-    auth::TokenManager,
-    authz::AlwaysAllowAuthorizer,
-    observability::MetricsRegistry,
     resources::{
         FailurePolicy, MatchCondition, MutatingWebhook, MutatingWebhookConfiguration,
         OperationType, ReinvocationPolicy, Rule, RuleWithOperations, SideEffectClass,
         ValidatingWebhook, ValidatingWebhookConfiguration, WebhookClientConfig,
     },
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tower::ServiceExt;
 use warp::Filter;
 
 // ---------------------------------------------------------------------------
@@ -49,103 +42,39 @@ use warp::Filter;
 /// authorizer is `AlwaysAllow` and `skip_auth=true` so the router uses
 /// `skip_auth_middleware` and no token is needed (mirrors the
 /// `patch_cas_retry_test.rs` helper exactly).
-fn make_state(mem: Arc<MemoryStorage>) -> Arc<ApiServerState> {
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ))
-}
-
 /// `(storage, router)` factory used by every HTTP-driven test. Each test
 /// owns its own storage so the tests are trivially parallel.
-fn spawn_router() -> (Arc<MemoryStorage>, axum::Router) {
-    let mem = Arc::new(MemoryStorage::new());
-    let router = build_router(make_state(mem.clone()), None);
-    (mem, router)
+fn spawn_router() -> (Arc<MemoryStorage>, TestApiServer) {
+    let api = TestApiServer::new();
+    let mem = api.storage.clone();
+    (mem, api)
 }
 
 /// HTTP helper: POST JSON, return `(status, body)`.
-async fn post_json(router: axum::Router, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn post_json(router: TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
+    router.post(uri, body).await
 }
 
 /// HTTP helper: GET JSON, return `(status, body)`.
-async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn get_json(router: TestApiServer, uri: &str) -> (StatusCode, Value) {
+    router.get(uri).await
 }
 
 /// HTTP helper: PUT JSON, return `(status, body)`.
-async fn put_json(router: axum::Router, uri: &str, body: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
-    (status, v)
+async fn put_json(router: TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {
+    router.put(uri, body).await
 }
 
 /// HTTP helper: DELETE, return status (some delete handlers return an empty
 /// body or a tombstone; we only care about the status code here).
-async fn delete_status(router: axum::Router, uri: &str) -> StatusCode {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    router.oneshot(req).await.unwrap().status()
+async fn delete_status(router: TestApiServer, uri: &str) -> StatusCode {
+    router.delete(uri).await.0
 }
 
 /// HTTP helper: DELETE, return `(status, body)` so the caller can assert on the
 /// webhook-denial Status payload.
-async fn delete_json(router: axum::Router, uri: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+async fn delete_json(router: TestApiServer, uri: &str) -> (StatusCode, Value) {
+    let (status, v) = router.delete(uri).await;
     (status, v)
 }
 
