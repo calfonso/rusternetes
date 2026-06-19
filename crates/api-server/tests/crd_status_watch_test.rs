@@ -7,59 +7,33 @@
 //! the controller never sees its own write and re-reconciles forever
 //! (hot-loop), so a Certificate is never issued.
 
-use axum::{
-    body::{to_bytes, Body},
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::{Method, StatusCode};
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::Duration;
-use tower::ServiceExt;
 
 const GROUP: &str = "stable.example.com";
 
-fn spawn_router() -> Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true,
-    ));
-    build_router(state, None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
 async fn send(
-    router: &Router,
+    router: &TestApiServer,
     method: Method,
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(match body {
-            Some(b) => Body::from(serde_json::to_vec(b).unwrap()),
-            None => Body::empty(),
-        })
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let val = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
-    (status, val)
+    let content_type = body.as_ref().map(|_| "application/json");
+    router.send(method.as_str(), uri, content_type, body).await
+}
+
+/// Collect a self-closing watch stream (`?watch=true&timeoutSeconds=…`) into a
+/// single string. `send_full` awaits the full body, which arrives once the
+/// server closes the stream at the timeout.
+async fn collect_watch(router: &TestApiServer, uri: &str) -> String {
+    let (_status, _headers, bytes, _) = router.send_full("GET", uri, None, None, None).await;
+    String::from_utf8(bytes).unwrap()
 }
 
 fn crd_with_status() -> Value {
@@ -114,16 +88,7 @@ async fn cr_status_update_is_delivered_to_watchers() {
     // Open the watch in a background task; it self-closes after timeoutSeconds.
     let watch_router = router.clone();
     let watch_uri = format!("{base}?watch=true&timeoutSeconds=3");
-    let watch = tokio::spawn(async move {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(&watch_uri)
-            .body(Body::empty())
-            .unwrap();
-        let resp = watch_router.oneshot(req).await.unwrap();
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
-    });
+    let watch = tokio::spawn(async move { collect_watch(&watch_router, &watch_uri).await });
 
     // Let the watch establish + send initial ADDED, then update status.
     tokio::time::sleep(Duration::from_millis(500)).await;

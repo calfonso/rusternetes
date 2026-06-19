@@ -14,60 +14,26 @@
 //! field-selected against the stored layout; this asserts the streamed object
 //! now carries `apiVersion: .../v2` and that the `color=blue` selector matches.
 
-use axum::{
-    body::{to_bytes, Body},
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
-    auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
-};
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use axum::http::StatusCode;
+use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tower::ServiceExt;
 
 const GROUP: &str = "stable.example.com";
 
-fn spawn_router() -> Router {
-    let mem = Arc::new(MemoryStorage::new());
-    let backend = Arc::new(StorageBackend::Memory(mem));
-    let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-    let authorizer = Arc::new(AlwaysAllowAuthorizer);
-    let metrics = Arc::new(MetricsRegistry::new());
-    let state = Arc::new(ApiServerState::new(
-        backend,
-        token_manager,
-        authorizer,
-        metrics,
-        true, // skip_auth
-    ));
-    build_router(state, None)
+fn spawn_router() -> TestApiServer {
+    TestApiServer::new()
 }
 
-async fn post_json(router: &Router, uri: &str, body: &Value) -> StatusCode {
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    router.clone().oneshot(req).await.unwrap().status()
+async fn post_json(router: &TestApiServer, uri: &str, body: &Value) -> StatusCode {
+    router.post(uri, body).await.0
 }
 
 /// Drive a `?watch=true` GET and collect the full streamed body (the watch
 /// closes itself after `timeoutSeconds`), returning the parsed line events.
-async fn collect_watch(router: &Router, uri: &str) -> Vec<Value> {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "watch must return 200");
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let body = String::from_utf8(bytes.to_vec()).unwrap();
+async fn collect_watch(router: &TestApiServer, uri: &str) -> Vec<Value> {
+    let (status, _headers, bytes, _) = router.send_full("GET", uri, None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "watch must return 200");
+    let body = String::from_utf8(bytes).unwrap();
     body.lines()
         .filter(|l| !l.is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
