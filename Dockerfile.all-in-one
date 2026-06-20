@@ -23,11 +23,15 @@
 #   Pass 2 — copy real src, touch Cargo.toml fingerprints, rebuild.
 #            Only changed workspace crates recompile.
 #
-# Workspace member list (Cargo.toml [workspace] members) — keep the
-# three CRATE-ENUMERATION blocks below in sync:
-#   admission-webhook, api-server, cloud-providers, common,
-#   controller-manager, discovery, dns, kubectl, kubelet, kube-proxy,
-#   middleware, netstack, protobuf, rusternetes, scheduler, storage
+# Workspace member list (Cargo.toml [workspace] members) — the manifest
+# COPY block (CRATE-ENUMERATION 1/3) must list ALL of them or cargo can't
+# resolve the workspace; the dummy/real-src blocks only need the crates the
+# all-in-one binary actually compiles. scripts/tests/test-dockerfile-crate-
+# enumeration.sh enforces the manifest block stays complete:
+#   admission-webhook, api-server, client, cloud-providers, common,
+#   controller-manager, cri, discovery, dns, kubectl, kubelet, kube-proxy,
+#   middleware, netstack, protobuf, rusternetes, scheduler, storage,
+#   test_support
 
 # Stage 1: Build the console SPA
 FROM node:24-slim AS console-builder

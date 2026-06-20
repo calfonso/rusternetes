@@ -8,10 +8,15 @@
 #   Pass 2 — copy real src, touch Cargo.toml fingerprints, rebuild.
 #            Only changed workspace crates recompile.
 #
-# Workspace member list (Cargo.toml [workspace] members) — keep the
-# three CRATE-ENUMERATION blocks below in sync:
-#   api-server, cloud-providers, common, controller-manager, kubectl,
-#   kubelet, kube-proxy, rusternetes, scheduler, storage
+# Workspace member list (Cargo.toml [workspace] members) — the manifest
+# COPY block (CRATE-ENUMERATION 1/3) must list ALL of them or cargo can't
+# resolve the workspace; the dummy/real-src blocks only need the crates the
+# kubectl binary actually compiles. scripts/tests/test-dockerfile-crate-
+# enumeration.sh enforces the manifest block stays complete:
+#   admission-webhook, api-server, client, cloud-providers, common,
+#   controller-manager, cri, discovery, dns, kubectl, kubelet, kube-proxy,
+#   middleware, netstack, protobuf, rusternetes, scheduler, storage,
+#   test_support
 #
 # Pin the rust toolchain — see Dockerfile.services for the cache-mount
 # rationale. Keep this version in lock-step with the other Dockerfiles
