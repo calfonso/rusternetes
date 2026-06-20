@@ -2975,6 +2975,13 @@ impl Kubelet {
                                             return Ok(());
                                         }
                                         let mut retry_pod = fresh_pod;
+                                        // observedGeneration tracks the generation of
+                                        // the re-read object, not the value computed
+                                        // from the pre-conflict read — a concurrent
+                                        // spec update is what bumped generation and
+                                        // caused this conflict (#1170). Capture before
+                                        // the mut borrow below.
+                                        let retry_gen = retry_pod.metadata.generation;
                                         // Re-fetch ALL statuses for the retry — stale
                                         // init_container_statuses from an intermediate
                                         // write may have ready=false for completed inits.
@@ -2989,6 +2996,7 @@ impl Kubelet {
                                             status.message =
                                                 Some("All containers ready".to_string());
                                             status.init_container_statuses = fresh_init_statuses;
+                                            status.observed_generation = retry_gen;
                                             if let Some(cs) = fresh_container_statuses {
                                                 status.container_statuses = Some(cs);
                                             }
@@ -4305,6 +4313,15 @@ impl Kubelet {
                                 // CAS conflict — re-read and retry once
                                 debug!("Pod status update CAS conflict, retrying: {}", e);
                                 if let Ok(mut fresh_pod) = self.storage.get::<Pod>(&key).await {
+                                    // observedGeneration MUST track the generation
+                                    // of the object we just re-read, not the stale
+                                    // value carried in new_pod / persisted earlier.
+                                    // A spec update that bumped generation is what
+                                    // caused this conflict; stamping the fresh
+                                    // generation here is how the kubelet converges
+                                    // observedGeneration under rapid parallel
+                                    // updates (#1170). Capture before the mut borrow.
+                                    let fresh_gen = fresh_pod.metadata.generation;
                                     if let Some(ref mut status) = fresh_pod.status {
                                         status.container_statuses = new_pod
                                             .status
@@ -4316,6 +4333,7 @@ impl Kubelet {
                                             .and_then(|s| s.conditions.clone());
                                         status.message =
                                             new_pod.status.as_ref().and_then(|s| s.message.clone());
+                                        status.observed_generation = fresh_gen;
                                         if let Some(ref new_status) = new_pod.status {
                                             if new_status.pod_ip.is_some() {
                                                 status.pod_ip = new_status.pod_ip.clone();
