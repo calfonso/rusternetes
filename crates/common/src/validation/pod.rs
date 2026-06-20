@@ -23,8 +23,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
-    Container, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate, PodSpec,
-    Probe, Toleration, Volume,
+    Container, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate,
+    PodSecurityContext, PodSpec, Probe, Toleration, Volume,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
@@ -183,6 +183,73 @@ pub fn validate_pod_spec(
         &fld_path.child("dnsConfig"),
     ));
 
+    // securityContext.sysctls name format / uniqueness.
+    if let Some(ref sc) = spec.security_context {
+        errs.extend(validate_sysctls(
+            sc,
+            &fld_path.child("securityContext").child("sysctls"),
+        ));
+    }
+
+    errs
+}
+
+/// Upstream `SysctlMaxLength` (`pkg/apis/core/validation/validation.go`).
+const SYSCTL_MAX_LENGTH: usize = 253;
+
+/// Printed form of upstream `sysctlContainSlashRegexp`, used verbatim in the
+/// error detail so log greps that key on the message stay valid.
+const SYSCTL_REGEX_STR: &str =
+    r"^([a-z0-9]([-_a-z0-9]*[a-z0-9])?[\./])*[a-z0-9]([-_a-z0-9]*[a-z0-9])?$";
+
+/// A single dot/slash-separated segment of a sysctl name. Mirrors upstream
+/// `SysctlSegmentFmt` = `[a-z0-9]([-_a-z0-9]*[a-z0-9])?`: lowercase-alnum at both
+/// ends, with `-`/`_`/alnum allowed in between.
+fn is_valid_sysctl_segment(seg: &str) -> bool {
+    let b = seg.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let is_alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let is_inner = |c: u8| is_alnum(c) || c == b'-' || c == b'_';
+    is_alnum(b[0]) && is_alnum(b[b.len() - 1]) && b.iter().all(|&c| is_inner(c))
+}
+
+/// Upstream `IsValidSysctlName`: at most [`SYSCTL_MAX_LENGTH`] chars and matching
+/// `SysctlContainSlashFmt` — one or more [`is_valid_sysctl_segment`] segments
+/// joined by `.` or `/` separators (no leading/trailing/empty segments).
+pub fn is_valid_sysctl_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > SYSCTL_MAX_LENGTH {
+        return false;
+    }
+    name.split(['.', '/']).all(is_valid_sysctl_segment)
+}
+
+/// Upstream `validateSysctls`: each `securityContext.sysctls[]` name must be
+/// present, a valid sysctl name, and unique.
+fn validate_sysctls(sc: &PodSecurityContext, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(sysctls) = sc.sysctls.as_ref() else {
+        return errs;
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, s) in sysctls.iter().enumerate() {
+        let name_path = fld_path.index(i).child("name");
+        if s.name.is_empty() {
+            errs.push(Error::required(&name_path, ""));
+        } else if !is_valid_sysctl_name(&s.name) {
+            errs.push(Error::invalid(
+                &name_path,
+                s.name.clone(),
+                format!(
+                    "must have at most {SYSCTL_MAX_LENGTH} characters and match regex {SYSCTL_REGEX_STR}"
+                ),
+            ));
+        } else if seen.contains(s.name.as_str()) {
+            errs.push(Error::duplicate(&name_path, s.name.clone()));
+        }
+        seen.insert(s.name.as_str());
+    }
     errs
 }
 
@@ -1127,6 +1194,74 @@ fn fill_nulls_from(dst: &mut serde_json::Value, src: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::pod::Sysctl;
+
+    #[test]
+    fn sysctl_name_validity_matches_upstream() {
+        // Valid: dot- and slash-separated lowercase-alnum segments, inner -/_.
+        assert!(is_valid_sysctl_name("kernel.shmmax"));
+        assert!(is_valid_sysctl_name("kernel/shm_rmid_forced")); // slash separator
+        assert!(is_valid_sysctl_name("safe-and-unsafe")); // single segment, inner '-'
+        assert!(is_valid_sysctl_name("net.ipv4.tcp_keepalive_time"));
+
+        // Invalid: trailing '-', empty segments, leading/trailing separators.
+        assert!(!is_valid_sysctl_name("foo-"));
+        assert!(!is_valid_sysctl_name("bar.."));
+        assert!(!is_valid_sysctl_name(""));
+        assert!(!is_valid_sysctl_name(".leading"));
+        assert!(!is_valid_sysctl_name("trailing."));
+        assert!(!is_valid_sysctl_name("Upper.Case"));
+        assert!(!is_valid_sysctl_name(&"a".repeat(SYSCTL_MAX_LENGTH + 1)));
+    }
+
+    fn sc_with_sysctls(names: &[&str]) -> PodSecurityContext {
+        PodSecurityContext {
+            sysctls: Some(
+                names
+                    .iter()
+                    .map(|n| Sysctl {
+                        name: n.to_string(),
+                        value: "1".to_string(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_sysctls_rejects_invalid_names_only() {
+        // Mirrors the [sig-node] "should reject invalid sysctls" conformance
+        // case: foo- and bar.. are rejected; kernel.shmmax and safe-and-unsafe
+        // are accepted.
+        let sc = sc_with_sysctls(&["foo-", "kernel.shmmax", "safe-and-unsafe", "bar.."]);
+        let errs = validate_sysctls(
+            &sc,
+            &Path::new("spec").child("securityContext").child("sysctls"),
+        );
+        let bad: Vec<&str> = errs
+            .iter()
+            .filter_map(|e| match &e.bad_value {
+                crate::validation::field::BadValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(bad.contains(&"foo-"), "foo- must be rejected: {errs:?}");
+        assert!(bad.contains(&"bar.."), "bar.. must be rejected: {errs:?}");
+        assert!(!bad.contains(&"kernel.shmmax"));
+        assert!(!bad.contains(&"safe-and-unsafe"));
+        assert_eq!(errs.len(), 2, "exactly the two invalid names: {errs:?}");
+    }
+
+    #[test]
+    fn validate_sysctls_flags_duplicates_and_empty() {
+        let sc = sc_with_sysctls(&["kernel.shmmax", "kernel.shmmax", ""]);
+        let errs = validate_sysctls(
+            &sc,
+            &Path::new("spec").child("securityContext").child("sysctls"),
+        );
+        assert_eq!(errs.len(), 2, "one duplicate + one required: {errs:?}");
+    }
 
     fn t(key: &str) -> Toleration {
         Toleration {
