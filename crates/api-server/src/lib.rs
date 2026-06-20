@@ -23,6 +23,7 @@ pub mod response;
 pub mod router;
 #[allow(dead_code)]
 pub mod spdy;
+pub mod spdy3;
 #[allow(dead_code)]
 pub mod spdy_handlers;
 pub mod ssa;
