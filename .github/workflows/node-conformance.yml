@@ -15,7 +15,7 @@ on:
         description: "Upstream Kubernetes test tarball version"
         required: false
         default: "v1.35.0"
-      image_tag:
+      image-tag:
         description: "GHCR image tag to pull (default main; empty = build locally)"
         required: false
         default: main
@@ -80,12 +80,12 @@ jobs:
           KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
           FOCUS: ${{ github.event.inputs.focus || '\[NodeConformance\]' }}
           K8S_VERSION: ${{ github.event.inputs.k8s_version || 'v1.35.0' }}
-          RUSTERNETES_IMAGE_TAG: ${{ github.event_name == 'schedule' && 'main' || github.event.inputs.image_tag }}
+          RUSTERNETES_IMAGE_TAG: ${{ github.event_name == 'schedule' && 'main' || github.event.inputs.image-tag }}
           # Nightly uses the `main` tag, which must be pullable once the GHCR
           # packages are public. A miss there means the visibility flip was
           # forgotten — hard-fail rather than silently compile locally forever
           # (#1108). Manual dispatch keeps the soft fallback (an arbitrary or
-          # empty image_tag input is a legitimate "build locally" request).
+          # empty image-tag input is a legitimate "build locally" request).
           REQUIRE_PREBUILT: ${{ github.event_name == 'schedule' }}
         run: bash scripts/run-node-conformance.sh
 

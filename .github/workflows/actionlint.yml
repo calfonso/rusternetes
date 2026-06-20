@@ -1,0 +1,26 @@
+name: Actionlint
+
+# Lint GitHub Actions workflow YAML on PRs that touch it. Catches expression
+# typos (undefined context properties, e.g. an input-name mismatch), invalid
+# `runs-on`/`uses` refs, and shellcheck issues in `run:` steps before merge.
+# Self-hosted runner-set labels are whitelisted in .github/actionlint.yaml.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
