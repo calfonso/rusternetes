@@ -168,5 +168,5 @@ jobs:
       - name: Tear down cluster
         if: always()
         run: |
-          docker compose -f compose.sqlite.yml -f compose.dind.yml logs --tail=100 || true
-          docker compose -f compose.sqlite.yml -f compose.dind.yml down -v || true
+          docker compose -f compose.sqlite.yml logs --tail=100 || true
+          docker compose -f compose.sqlite.yml down -v || true

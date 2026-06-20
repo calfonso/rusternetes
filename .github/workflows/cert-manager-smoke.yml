@@ -72,4 +72,4 @@ jobs:
       - name: Tear down stack
         if: always()
         run: |
-          docker compose -f compose.sqlite.yml -f compose.dind.yml down -v --remove-orphans || true
+          docker compose -f compose.sqlite.yml down -v --remove-orphans || true

@@ -36,7 +36,7 @@ if docker inspect "$DIND_NAME" >/dev/null 2>&1; then
     -e COMPOSE_PROJECT_NAME=rusternetes \
     -e KUBELET_VOLUMES_PATH=/workspace/.rusternetes/agents/${AGENT_ID}/kubelet-volumes \
     "$DIND_NAME" \
-    docker compose -f compose.yml -f compose.dind.yml down -v 2>/dev/null || true
+    docker compose -f compose.yml down -v 2>/dev/null || true
   docker rm -f "$DIND_NAME" >/dev/null
   agent_banner "removed dind container"
 else

@@ -28,11 +28,9 @@ mkdir -p "${KUBELET_VOLUMES_PATH}"
 KUBECONFIG_FILE="${KUBECONFIG:-${HOME}/.kube/rusternetes-config}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
 
-# Rhino+SQLite stack, layered with the Docker-socket override on Docker hosts.
+# Rhino+SQLite stack. Pod runtime is the in-compose containerd service, so no
+# host runtime socket / DinD override is needed on Docker or Podman hosts.
 COMPOSE_FILES="-f ${PROJECT_ROOT}/compose.sqlite.yml"
-if [ "${CONTAINER_RUNTIME}" = "docker" ] && [ -f "${PROJECT_ROOT}/compose.dind.yml" ]; then
-    COMPOSE_FILES="${COMPOSE_FILES} -f ${PROJECT_ROOT}/compose.dind.yml"
-fi
 # shellcheck disable=SC2086
 COMPOSE="${CONTAINER_RUNTIME} compose ${COMPOSE_FILES}"
 
