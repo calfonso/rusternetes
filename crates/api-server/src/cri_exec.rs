@@ -64,6 +64,85 @@ pub fn rewrite_stream_url(stream_url: &str, host: &str, port: u16) -> anyhow::Re
     Ok(u.into())
 }
 
+/// A WebSocket stream to the CRI runtime's streaming server, carrying the
+/// channel-framed `remotecommand` protocol (byte 0 = channel).
+pub type CriStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Host:port the api-server dials to reach containerd's CRI streaming server.
+///
+/// containerd advertises exec/attach URLs with its bind address (`0.0.0.0` /
+/// `[::]`), which is not routable from the api-server container, so the proxy
+/// rewrites the host to this reachable target. Defaults to the `containerd`
+/// compose service on the fixed stream port (`deploy/containerd/config.toml`);
+/// override with `CONTAINERD_STREAM_HOST` / `CONTAINERD_STREAM_PORT`.
+pub fn stream_target() -> (String, u16) {
+    let host = std::env::var("CONTAINERD_STREAM_HOST").unwrap_or_else(|_| "containerd".to_string());
+    let port = std::env::var("CONTAINERD_STREAM_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(10010);
+    (host, port)
+}
+
+/// Open an interactive exec WebSocket to a container over CRI.
+///
+/// Calls the streaming `Exec` RPC, rewrites the runtime-advertised URL host to
+/// the reachable [`stream_target`], and opens a WebSocket carrying the
+/// `v5.channel.k8s.io` subprotocol. The returned stream speaks the same
+/// channel-framed protocol the api-server exposes to kubectl, so the exec
+/// handler proxies frames straight through. (Interactive streaming exec, #1256.)
+pub async fn open_exec_stream(
+    cri: &mut CriClient,
+    container_id: &str,
+    cmd: &[String],
+    tty: bool,
+    stdin: bool,
+) -> anyhow::Result<CriStream> {
+    // CRI forbids tty && stderr both set; with a TTY stdout+stderr are merged.
+    let url = cri
+        .exec(v1::ExecRequest {
+            container_id: container_id.to_string(),
+            cmd: cmd.to_vec(),
+            tty,
+            stdin,
+            stdout: true,
+            stderr: !tty,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("CRI Exec for {container_id}: {e}"))?;
+
+    let (host, port) = stream_target();
+    let rewritten = rewrite_stream_url(&url, &host, port)?;
+    // tungstenite needs a ws:// scheme; the runtime hands back http(s)://.
+    let ws_url = if let Some(rest) = rewritten.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if let Some(rest) = rewritten.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else {
+        rewritten
+    };
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("building WS request for {ws_url:?}: {e}"))?;
+    // Offer the full channel-protocol ladder; the runtime's stream server picks
+    // the highest it supports. Offering only v5 makes containerd's WebSocket
+    // handshake reject with 403 when it negotiates an older revision.
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+            "v5.channel.k8s.io, v4.channel.k8s.io, v3.channel.k8s.io, v2.channel.k8s.io, channel.k8s.io",
+        ),
+    );
+    let (stream, _resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting to CRI stream {ws_url:?}: {e}"))?;
+    Ok(stream)
+}
+
 /// Resolve the CRI container id for a pod's named container.
 ///
 /// Filters `ListContainers` by the pod uid + container name labels the kubelet
