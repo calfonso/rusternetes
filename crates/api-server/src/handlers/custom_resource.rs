@@ -146,10 +146,14 @@ pub async fn create_custom_resource(
         }
     }
     crate::handlers::validation::validate_strict_fields(&params, &body, &cr)?;
-    // Reject create with neither name nor generateName (#1065).
-    // NOTE: full ValidateObjectMeta is deferred for this kind because its
-    // name validator is non-DNS (name rules come from the target CRD scope, not a fixed DNS form) and not yet ported. Tracked in #1087.
-    crate::handlers::validation::require_object_name(&cr.metadata)?;
+    // Full create-time ValidateObjectMeta (#1087). Custom resources use the
+    // generic NameIsDNSSubdomain validator; namespaced-ness comes from the URL
+    // path (Some(ns) for a namespaced CRD scope, None for cluster-scoped).
+    crate::handlers::validation::validate_create_object_meta(
+        &cr.metadata,
+        namespace.as_deref(),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Use the CRD we already looked up for preserve-unknown-fields check
     let crd = crd_for_validation;

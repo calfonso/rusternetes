@@ -756,37 +756,15 @@ pub fn validate_resource_name(name: &str) -> Result<(), Error> {
 // `rusternetes_middleware::generate_name_middleware` for every create request
 // (#1052), so per-handler helpers are no longer needed here.
 
-/// Reject a persisted create whose object carries neither `metadata.name` nor a
-/// resolved `metadata.generateName`.
-///
-/// By the time a create handler runs, `generate_name_middleware` has already
-/// turned any non-empty `generateName` into a concrete `name` (#1052), so an
-/// empty `name` here means the client supplied neither field. Upstream's
-/// `ValidateObjectMeta` rejects this with HTTP 422 and the message
-/// `name or generateName is required`, instead of persisting the object at a
-/// malformed `/registry/<type>/<ns>/` key. GitHub #1065.
-///
-/// Non-persisted POSTs (SubjectAccessReview/TokenReview/TokenRequest/
-/// SelfSubjectReview, pod binding/eviction) legitimately have no name and must
-/// NOT call this.
-pub fn require_object_name(meta: &rusternetes_common::types::ObjectMeta) -> Result<(), Error> {
-    if meta.name.is_empty() {
-        use rusternetes_common::validation::field::{Error as FieldError, Path};
-        return Err(Error::Invalid(vec![FieldError::required(
-            &Path::new("metadata").child("name"),
-            "name or generateName is required",
-        )]));
-    }
-    Ok(())
-}
-
-/// [`require_object_name`] for resources whose generated metadata carries an
+/// Name-required check for resources whose generated metadata carries an
 /// `Option<String>` name rather than the shared [`ObjectMeta`] — the
 /// `resource.k8s.io` kinds (DeviceClass, ResourceClaim, ResourceClaimTemplate,
 /// ResourceSlice). Returns the resolved name on success so the caller can use
 /// it for the storage key.
 ///
-/// Same upstream semantics as [`require_object_name`]: a missing/empty name
+/// These kinds can't yet run the full [`validate_create_object_meta`] (their
+/// metadata isn't the shared [`ObjectMeta`]), so this covers only the upstream
+/// name-required case: a missing/empty name
 /// (after `generate_name_middleware` has resolved any `generateName`) is the
 /// 422 `name or generateName is required` from `ValidateObjectMeta`, with the
 /// structured `metadata.name` field cause — not a bare `InvalidResource`.
@@ -819,17 +797,26 @@ pub enum NameKind {
     DnsLabel,
     /// `path.IsValidPathSegmentName` — the RBAC kinds (`ValidateRBACName`).
     PathSegment,
+    /// `validation.IsValidIP` — the `IPAddress` kind (`ValidateIPAddressName`):
+    /// the name must be a canonical IP address.
+    Ip,
+    /// No name-format constraint — kinds whose upstream validator `return nil`,
+    /// e.g. `CertificateSigningRequest` (`ValidateCertificateRequestName`).
+    NoConstraint,
 }
 
 impl NameKind {
     fn name_fn(self) -> rusternetes_common::validation::objectmeta::ValidateNameFunc {
         use rusternetes_common::validation::objectmeta::{
-            name_is_dns_label, name_is_dns_subdomain, name_is_path_segment,
+            name_is_dns_label, name_is_dns_subdomain, name_is_ip, name_is_path_segment,
+            name_unconstrained,
         };
         match self {
             NameKind::DnsSubdomain => name_is_dns_subdomain,
             NameKind::DnsLabel => name_is_dns_label,
             NameKind::PathSegment => name_is_path_segment,
+            NameKind::Ip => name_is_ip,
+            NameKind::NoConstraint => name_unconstrained,
         }
     }
 }
@@ -879,29 +866,6 @@ pub fn validate_create_object_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn require_object_name_rejects_empty_name() {
-        let meta = rusternetes_common::types::ObjectMeta::default();
-        let err = require_object_name(&meta).expect_err("empty name must be rejected");
-        match err {
-            Error::Invalid(errs) => {
-                assert_eq!(errs.len(), 1);
-                assert_eq!(errs[0].field, "metadata.name");
-                assert_eq!(errs[0].detail, "name or generateName is required");
-            }
-            other => panic!("expected Error::Invalid, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn require_object_name_accepts_named() {
-        let meta = rusternetes_common::types::ObjectMeta {
-            name: "foo".to_string(),
-            ..Default::default()
-        };
-        assert!(require_object_name(&meta).is_ok());
-    }
 
     #[test]
     fn require_optional_object_name_rejects_missing_and_empty() {
@@ -984,6 +948,40 @@ mod tests {
         assert!(validate_create_object_meta(&bad, Some("default"), NameKind::PathSegment).is_err());
         let ok = meta_named("system:foo.bar");
         assert!(validate_create_object_meta(&ok, Some("default"), NameKind::PathSegment).is_ok());
+    }
+
+    #[test]
+    fn validate_create_object_meta_ip_kind() {
+        // Canonical IPs pass; non-IP and non-canonical names fail.
+        assert!(validate_create_object_meta(&meta_named("10.9.8.7"), None, NameKind::Ip).is_ok());
+        assert!(
+            validate_create_object_meta(&meta_named("2001:db8::ffff"), None, NameKind::Ip).is_ok()
+        );
+        assert!(validate_create_object_meta(&meta_named("not-an-ip"), None, NameKind::Ip).is_err());
+        // 2001:db8:0:0:0:0:0:1 is a valid but non-canonical spelling.
+        assert!(validate_create_object_meta(
+            &meta_named("2001:db8:0:0:0:0:0:1"),
+            None,
+            NameKind::Ip
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_create_object_meta_no_constraint_kind() {
+        // Any non-empty name is accepted; empty still fails the required check.
+        assert!(validate_create_object_meta(
+            &meta_named("Any.Weird_Name"),
+            None,
+            NameKind::NoConstraint
+        )
+        .is_ok());
+        assert!(validate_create_object_meta(
+            &rusternetes_common::types::ObjectMeta::default(),
+            None,
+            NameKind::NoConstraint
+        )
+        .is_err());
     }
 
     #[test]

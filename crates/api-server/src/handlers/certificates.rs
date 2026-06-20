@@ -32,10 +32,14 @@ pub async fn create_certificate_signing_request(
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
 
-    // Reject create with neither name nor generateName (#1065).
-    // NOTE: full ValidateObjectMeta is deferred for this kind because its
-    // name validator is non-DNS (any name is allowed (ValidateCertificateRequestName returns nil)) and not yet ported. Tracked in #1087.
-    crate::handlers::validation::require_object_name(&csr.metadata)?;
+    // Full create-time ValidateObjectMeta (#1087). CertificateSigningRequest is
+    // cluster-scoped and imposes no name-format constraint
+    // (ValidateCertificateRequestName returns nil).
+    crate::handlers::validation::validate_create_object_meta(
+        &csr.metadata,
+        None,
+        crate::handlers::validation::NameKind::NoConstraint,
+    )?;
 
     // Enrich metadata with system fields
     csr.metadata.ensure_uid();

@@ -125,6 +125,45 @@ pub fn name_is_path_segment(name: &str, _prefix: bool) -> Vec<String> {
     errs
 }
 
+/// Upstream `ValidateIPAddressName` (networking) → `validation.IsValidIP`
+/// (strict). A [`ValidateNameFunc`] for the `IPAddress` kind, whose name must
+/// be the canonical text form of an IP address. `prefix` is ignored — IPAddress
+/// does not support `generateName`.
+///
+/// Mirrors `parseIP(strict)` + the canonical-form check: a non-parseable value,
+/// an IPv4-mapped IPv6 address, or a non-canonical spelling each fail with the
+/// upstream wording.
+pub fn name_is_ip(name: &str, _prefix: bool) -> Vec<String> {
+    use std::net::IpAddr;
+    let parsed = match name.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => {
+            return vec![
+                "must be a valid IP address, (e.g. 10.9.8.7 or 2001:db8::ffff)".to_string(),
+            ];
+        }
+    };
+    let mut errs = Vec::new();
+    if let IpAddr::V6(v6) = parsed {
+        if v6.to_ipv4_mapped().is_some() {
+            errs.push("must not be an IPv4-mapped IPv6 address".to_string());
+        }
+    }
+    let canonical = parsed.to_string();
+    if canonical != name {
+        errs.push(format!("must be in canonical form (\"{canonical}\")"));
+    }
+    errs
+}
+
+/// A [`ValidateNameFunc`] that imposes no format constraint, mirroring upstream
+/// validators that `return nil` for any name — e.g.
+/// `certificates.ValidateCertificateRequestName`. The rest of
+/// `ValidateObjectMeta` (namespace, labels, etc.) still runs.
+pub fn name_unconstrained(_name: &str, _prefix: bool) -> Vec<String> {
+    Vec::new()
+}
+
 /// Upstream `ValidateNonnegativeField`.
 pub fn validate_nonnegative_field(value: i64, fld_path: &Path) -> ErrorList {
     let mut errs = Vec::new();
