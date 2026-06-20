@@ -36,6 +36,8 @@ pub async fn create_ipaddress(
     }
 
     // Reject create with neither name nor generateName (#1065).
+    // NOTE: full ValidateObjectMeta is deferred for this kind because its
+    // name validator is non-DNS (name must be a canonical IP address (ValidateIPAddressName)) and not yet ported. Tracked in #1087.
     crate::handlers::validation::require_object_name(&ipaddress.metadata)?;
 
     // Enrich metadata with system fields

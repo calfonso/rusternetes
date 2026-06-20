@@ -24,7 +24,11 @@ pub async fn create_volumeattachment(
     info!("Creating VolumeAttachment: {}", va.metadata.name);
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&va.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &va.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumeattachments")

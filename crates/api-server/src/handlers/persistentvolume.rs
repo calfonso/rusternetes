@@ -43,7 +43,11 @@ pub async fn create_pv(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&pv.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &pv.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     pv.metadata.ensure_uid();
     pv.metadata.ensure_creation_timestamp();

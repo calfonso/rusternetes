@@ -42,7 +42,11 @@ pub async fn create_replicationcontroller(
     let response_headers = build_warning_headers(&warnings);
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&rc.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &rc.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "replicationcontrollers")

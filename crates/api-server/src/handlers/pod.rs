@@ -78,7 +78,11 @@ pub async fn create(
     let response_headers = build_warning_headers(&warnings);
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&pod.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &pod.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);

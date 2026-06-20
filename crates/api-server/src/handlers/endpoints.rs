@@ -45,7 +45,11 @@ pub async fn create_endpoints(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&endpoints.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &endpoints.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     endpoints.metadata.namespace = Some(namespace.clone());
 

@@ -33,6 +33,8 @@ pub async fn create_certificate_signing_request(
     }
 
     // Reject create with neither name nor generateName (#1065).
+    // NOTE: full ValidateObjectMeta is deferred for this kind because its
+    // name validator is non-DNS (any name is allowed (ValidateCertificateRequestName returns nil)) and not yet ported. Tracked in #1087.
     crate::handlers::validation::require_object_name(&csr.metadata)?;
 
     // Enrich metadata with system fields

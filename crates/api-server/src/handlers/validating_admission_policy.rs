@@ -30,7 +30,11 @@ pub async fn create_validating_admission_policy(
     );
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&policy.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &policy.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "validatingadmissionpolicies")
@@ -246,7 +250,11 @@ pub async fn create_validating_admission_policy_binding(
     );
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&binding.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &binding.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization
     let attrs =

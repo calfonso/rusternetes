@@ -44,7 +44,11 @@ pub async fn create(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&pdb.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &pdb.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     pdb.metadata.namespace = Some(namespace.clone());
     pdb.metadata.ensure_uid();

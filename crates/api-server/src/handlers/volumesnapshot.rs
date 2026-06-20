@@ -28,7 +28,11 @@ pub async fn create_volumesnapshot(
     );
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&vs.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &vs.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization (namespace-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumesnapshots")

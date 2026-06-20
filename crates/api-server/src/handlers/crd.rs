@@ -106,6 +106,8 @@ pub async fn create_crd(
     // Strict field validation: reject unknown or duplicate fields when requested
     crate::handlers::validation::validate_strict_fields(&params, &body, &crd)?;
     // Reject create with neither name nor generateName (#1065).
+    // NOTE: full ValidateObjectMeta is deferred for this kind because its
+    // name validator is non-DNS (name must be `<plural>.<group>` (ValidateCustomResourceDefinitionName)) and not yet ported. Tracked in #1087.
     crate::handlers::validation::require_object_name(&crd.metadata)?;
     let crd_name = crd.metadata.name.clone();
     info!("Creating CustomResourceDefinition: {}", crd_name);

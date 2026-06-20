@@ -98,6 +98,33 @@ pub fn validate_namespace_name(name: &str, prefix: bool) -> Vec<String> {
     name_is_dns_label(name, prefix)
 }
 
+/// Strings that can never be a path-segment name. Mirrors upstream
+/// `path.NameMayNotBe` (`.` and `..`).
+const NAME_MAY_NOT_BE: [&str; 2] = [".", ".."];
+
+/// Substrings forbidden inside a path-segment name. Mirrors upstream
+/// `path.NameMayNotContain` (`/` and `%`).
+const NAME_MAY_NOT_CONTAIN: [&str; 2] = ["/", "%"];
+
+/// Upstream `path.IsValidPathSegmentName` exposed as a [`ValidateNameFunc`].
+/// Used by the RBAC kinds (`ValidateRBACName`) — names only need to encode
+/// safely as a REST/etcd path segment, so the DNS rules don't apply. The
+/// `prefix` flag is ignored (upstream `ValidateRBACName` ignores it too).
+pub fn name_is_path_segment(name: &str, _prefix: bool) -> Vec<String> {
+    for illegal in NAME_MAY_NOT_BE {
+        if name == illegal {
+            return vec![format!("may not be '{illegal}'")];
+        }
+    }
+    let mut errs = Vec::new();
+    for illegal in NAME_MAY_NOT_CONTAIN {
+        if name.contains(illegal) {
+            errs.push(format!("may not contain '{illegal}'"));
+        }
+    }
+    errs
+}
+
 /// Upstream `ValidateNonnegativeField`.
 pub fn validate_nonnegative_field(value: i64, fld_path: &Path) -> ErrorList {
     let mut errs = Vec::new();

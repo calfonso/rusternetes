@@ -25,7 +25,11 @@ pub async fn create_storageclass(
     info!("Creating StorageClass: {}", sc.metadata.name);
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&sc.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &sc.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "storageclasses")

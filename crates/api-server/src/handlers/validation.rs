@@ -805,6 +805,77 @@ pub fn require_optional_object_name(name: Option<&str>) -> Result<&str, Error> {
     }
 }
 
+/// Selects the per-kind name validator upstream attaches to each resource's
+/// strategy. Almost every kind uses [`NameKind::DnsSubdomain`]
+/// (`NameIsDNSSubdomain`); the handful that differ pick `DnsLabel` (Service,
+/// Namespace) or `PathSegment` (the RBAC Role/Binding kinds, via
+/// `ValidateRBACName`).
+#[derive(Clone, Copy, Debug)]
+pub enum NameKind {
+    /// `apimachineryvalidation.NameIsDNSSubdomain` — the default for nearly all
+    /// kinds.
+    DnsSubdomain,
+    /// `apimachineryvalidation.NameIsDNSLabel` — Service and Namespace.
+    DnsLabel,
+    /// `path.IsValidPathSegmentName` — the RBAC kinds (`ValidateRBACName`).
+    PathSegment,
+}
+
+impl NameKind {
+    fn name_fn(self) -> rusternetes_common::validation::objectmeta::ValidateNameFunc {
+        use rusternetes_common::validation::objectmeta::{
+            name_is_dns_label, name_is_dns_subdomain, name_is_path_segment,
+        };
+        match self {
+            NameKind::DnsSubdomain => name_is_dns_subdomain,
+            NameKind::DnsLabel => name_is_dns_label,
+            NameKind::PathSegment => name_is_path_segment,
+        }
+    }
+}
+
+/// Run upstream `ValidateObjectMeta` on a persisted create, replacing the
+/// name-only [`require_object_name`] check with the full validator: it covers
+/// the empty-name case (same 422 `name or generateName is required`), the name
+/// *format* (per `name_kind`), the namespace, and the `labels`, `annotations`,
+/// `ownerReferences`, `finalizers` and `managedFields`. GitHub #1087 item 2.
+///
+/// `namespace` mirrors upstream `rest.BeforeCreate`, which overwrites
+/// `metadata.namespace` with the request namespace *before* validation: pass
+/// `Some(ns)` for a namespaced kind (the value from the URL path) or `None` for
+/// a cluster-scoped kind. The caller need not have set `metadata.namespace`
+/// itself — this helper sets it on a working copy, so the validation point is
+/// independent of where the handler later assigns the namespace.
+///
+/// Like [`require_object_name`], this is for *persisted* creates only.
+/// Non-persisted POSTs (SubjectAccessReview/TokenReview/etc.) must not call it.
+pub fn validate_create_object_meta(
+    meta: &rusternetes_common::types::ObjectMeta,
+    namespace: Option<&str>,
+    name_kind: NameKind,
+) -> Result<(), Error> {
+    use rusternetes_common::validation::field::Path;
+    use rusternetes_common::validation::objectmeta::validate_object_meta;
+
+    // Upstream's REST layer forces metadata.namespace to the request namespace
+    // before strategy validation runs; mirror that on a clone so we don't
+    // mutate the caller's object (it sets the canonical namespace itself).
+    let mut m = meta.clone();
+    m.namespace = namespace.map(|s| s.to_string());
+
+    let errs = validate_object_meta(
+        &m,
+        namespace.is_some(),
+        name_kind.name_fn(),
+        &Path::new("metadata"),
+    );
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(errs))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +922,82 @@ mod tests {
     #[test]
     fn require_optional_object_name_returns_name() {
         assert_eq!(require_optional_object_name(Some("foo")).unwrap(), "foo");
+    }
+
+    fn meta_named(name: &str) -> rusternetes_common::types::ObjectMeta {
+        rusternetes_common::types::ObjectMeta {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_create_object_meta_accepts_valid() {
+        let meta = meta_named("foo");
+        assert!(
+            validate_create_object_meta(&meta, Some("default"), NameKind::DnsSubdomain).is_ok()
+        );
+        assert!(validate_create_object_meta(&meta, None, NameKind::DnsSubdomain).is_ok());
+    }
+
+    #[test]
+    fn validate_create_object_meta_empty_name_same_as_require() {
+        let meta = rusternetes_common::types::ObjectMeta::default();
+        let err = validate_create_object_meta(&meta, Some("default"), NameKind::DnsSubdomain)
+            .expect_err("empty name must be rejected");
+        match err {
+            Error::Invalid(errs) => {
+                assert_eq!(errs.len(), 1);
+                assert_eq!(errs[0].field, "metadata.name");
+                assert_eq!(errs[0].detail, "name or generateName is required");
+            }
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_create_object_meta_rejects_bad_name_format() {
+        // Upper-case is invalid for a DNS subdomain name.
+        let meta = meta_named("NotADNSName");
+        let err = validate_create_object_meta(&meta, Some("default"), NameKind::DnsSubdomain)
+            .expect_err("invalid name format must be rejected");
+        match err {
+            Error::Invalid(errs) => assert_eq!(errs[0].field, "metadata.name"),
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_create_object_meta_dns_label_rejects_subdomain_dots() {
+        // A Service/Namespace name (DNS *label*) may not contain dots.
+        let meta = meta_named("has.dots");
+        assert!(
+            validate_create_object_meta(&meta, None, NameKind::DnsLabel).is_err(),
+            "dotted name must be rejected for a DNS-label kind"
+        );
+    }
+
+    #[test]
+    fn validate_create_object_meta_path_segment_rejects_slash() {
+        // RBAC names use path-segment rules: '/' is forbidden but '.' is fine.
+        let bad = meta_named("a/b");
+        assert!(validate_create_object_meta(&bad, Some("default"), NameKind::PathSegment).is_err());
+        let ok = meta_named("system:foo.bar");
+        assert!(validate_create_object_meta(&ok, Some("default"), NameKind::PathSegment).is_ok());
+    }
+
+    #[test]
+    fn validate_create_object_meta_cluster_scoped_forbids_namespace() {
+        // A cluster-scoped create must reject a body that carries a namespace.
+        let meta = rusternetes_common::types::ObjectMeta {
+            name: "foo".to_string(),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        };
+        // namespace=None tells the helper the kind is cluster-scoped; it clears
+        // metadata.namespace on the working copy first, so this still passes —
+        // mirroring upstream rest.BeforeCreate overwriting the request ns.
+        assert!(validate_create_object_meta(&meta, None, NameKind::DnsSubdomain).is_ok());
     }
 
     /// A CRD whose validation schema sets standard JSON-Schema fields to their
