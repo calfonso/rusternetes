@@ -163,7 +163,13 @@ fn preemption_prefers_non_pdb_victim_when_possible() {
     let incoming = make_incoming_pod("high-pri", 1000, "1", "1Gi");
 
     let all_pods = vec![rs1, rs2, rs3, filler];
-    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &all_pods, &[pdb]);
+    let (can_preempt, victims) = check_preemption_with_pdbs(
+        &node,
+        &incoming,
+        &all_pods,
+        &[pdb],
+        &std::collections::HashMap::new(),
+    );
 
     assert!(can_preempt, "Preemption should succeed");
     assert_eq!(
@@ -222,7 +228,13 @@ fn preemption_minimizes_pdb_victim_count() {
     let incoming = make_incoming_pod("high-pri", 1000, "1", "1Gi");
 
     let all_pods = vec![rs1, rs2, rs3];
-    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &all_pods, &[pdb]);
+    let (can_preempt, victims) = check_preemption_with_pdbs(
+        &node,
+        &incoming,
+        &all_pods,
+        &[pdb],
+        &std::collections::HashMap::new(),
+    );
 
     assert!(
         can_preempt,
@@ -256,7 +268,13 @@ fn preemption_without_pdb_matches_legacy_behavior() {
 
     let incoming = make_incoming_pod("high-pri", 1000, "1", "1Gi");
 
-    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &[p1, p2], &[]);
+    let (can_preempt, victims) = check_preemption_with_pdbs(
+        &node,
+        &incoming,
+        &[p1, p2],
+        &[],
+        &std::collections::HashMap::new(),
+    );
 
     assert!(can_preempt);
     assert_eq!(
@@ -264,5 +282,53 @@ fn preemption_without_pdb_matches_legacy_behavior() {
         1,
         "Without PDB, exactly one victim suffices; got {:?}",
         victims
+    );
+}
+
+/// PriorityClass `preemptionPolicy: Never` fallback (#1111). A pod whose spec
+/// omits `preemptionPolicy` but references a class with `Never` must NOT preempt
+/// — `check_preemption_with_pdbs` falls back to the class policy via the
+/// PriorityClass map, mirroring `scheduler.rs::try_preempt`. The empty-map case
+/// (no fallback available) confirms the victim would otherwise be preempted, so
+/// it is the class fallback — not some other guard — that blocks it.
+#[test]
+fn preemption_falls_back_to_priorityclass_never_policy() {
+    use rusternetes_common::resources::PriorityClass;
+
+    // Node with room for exactly one unit pod, currently full.
+    let node = make_node("node-1", "1", "1Gi");
+    let victim = make_pod_with_labels("victim", 100, "1", "1Gi", "node-1", None);
+
+    // Incoming high-priority pod: spec.preemptionPolicy is unset; it references
+    // a class instead. Needs the victim's resources to fit.
+    let mut incoming = make_incoming_pod("high-pri", 1000, "1", "1Gi");
+    incoming.spec.as_mut().unwrap().preemption_policy = None;
+    incoming.spec.as_mut().unwrap().priority_class_name = Some("no-preempt".to_string());
+
+    let mut never_class = PriorityClass::new("no-preempt", 1000);
+    never_class.preemption_policy = Some("Never".to_string());
+    let mut pcs = std::collections::HashMap::new();
+    pcs.insert("no-preempt".to_string(), never_class);
+
+    // With the class map: the Never policy is resolved via the fallback → no preempt.
+    let (can_preempt, victims) =
+        check_preemption_with_pdbs(&node, &incoming, std::slice::from_ref(&victim), &[], &pcs);
+    assert!(
+        !can_preempt && victims.is_empty(),
+        "preemptionPolicy=Never from the PriorityClass must block preemption; got can_preempt={can_preempt} victims={victims:?}"
+    );
+
+    // Control: without the map there is no fallback, so the lower-priority
+    // victim is preempted — proving the class fallback is what blocked it above.
+    let (can_preempt_no_map, _) = check_preemption_with_pdbs(
+        &node,
+        &incoming,
+        &[victim],
+        &[],
+        &std::collections::HashMap::new(),
+    );
+    assert!(
+        can_preempt_no_map,
+        "without the class map the lower-priority victim should be preempted"
     );
 }
