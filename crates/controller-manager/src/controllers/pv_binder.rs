@@ -179,8 +179,29 @@ impl<S: Storage + 'static> PVBinderController<S> {
         // actually declares node affinity (upstream `volume_scheduling`).
         let mut nodes_cache: Option<Vec<Node>> = None;
 
-        // Find a matching available PV
-        for mut pv in pvs {
+        // Phase 1 (#1095): honor a pre-bound PV. A dynamically provisioned PV
+        // carries a `claimRef` naming the exact PVC it was provisioned for, so
+        // it must bind to THAT PVC and no other — otherwise two PVCs provisioned
+        // at the same time cross-bind to each other's PV. A PV whose claimRef
+        // points to this PVC was provisioned for us; one pointing elsewhere is
+        // unavailable. The pre-bound PV already satisfies the request (it was
+        // sized for it), so it wins over any unclaimed first-match candidate.
+        if let Some(pv) = pvs.iter().find(|pv| {
+            pv.spec
+                .claim_ref
+                .as_ref()
+                .is_some_and(|cr| claim_ref_points_to(cr, namespace, pvc_name, &pvc.metadata.uid))
+        }) {
+            info!(
+                "Completing pre-bound PVC {}/{} ↔ PV {} (claimRef)",
+                namespace, pvc_name, pv.metadata.name
+            );
+            return self.complete_binding(pv.clone(), pvc).await;
+        }
+
+        // Phase 2: first-match among genuinely unclaimed PVs (static volumes /
+        // legacy PVs with no claimRef).
+        for pv in pvs {
             debug!("Checking PV {} (storage_class={:?}, capacity={:?}, access_modes={:?}, claim_ref={:?})",
                 pv.metadata.name,
                 pv.spec.storage_class_name,
@@ -188,7 +209,8 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 pv.spec.access_modes,
                 pv.spec.claim_ref.is_some());
 
-            // Skip if PV is already bound
+            // Skip if PV is already bound/pre-bound (a pre-bind to this PVC was
+            // handled in phase 1; anything else belongs to another claim).
             if pv.spec.claim_ref.is_some() {
                 continue;
             }
@@ -232,63 +254,68 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 "Binding PVC {}/{} to PV {}",
                 namespace, pvc_name, pv.metadata.name
             );
-
-            // Clone values we need before mutating pv
-            let pv_access_modes = pv.spec.access_modes.clone();
-            let pv_capacity = pv.spec.capacity.clone();
-            let pv_name = pv.metadata.name.clone();
-
-            // Bind PV to PVC
-            pv.spec.claim_ref = Some(
-                rusternetes_common::resources::service_account::ObjectReference {
-                    kind: Some("PersistentVolumeClaim".to_string()),
-                    namespace: Some(namespace.to_string()),
-                    name: Some(pvc_name.to_string()),
-                    uid: Some(pvc.metadata.uid.clone()),
-                    api_version: Some("v1".to_string()),
-                    resource_version: None,
-                    field_path: None,
-                },
-            );
-
-            // Update PV status to Bound
-            pv.status = Some(PersistentVolumeStatus {
-                phase: PersistentVolumePhase::Bound,
-                message: None,
-                reason: None,
-                last_phase_transition_time: None,
-            });
-
-            let pv_key = build_key("persistentvolumes", None, &pv_name);
-            self.storage.update(&pv_key, &pv).await?;
-
-            // Bind PVC to PV
-            pvc.spec.volume_name = Some(pv_name.clone());
-
-            // Update PVC status to Bound
-            pvc.status = Some(PersistentVolumeClaimStatus {
-                phase: PersistentVolumeClaimPhase::Bound,
-                access_modes: Some(pv_access_modes),
-                capacity: Some(pv_capacity),
-                conditions: None,
-                allocated_resources: None,
-                allocated_resource_statuses: None,
-                resize_status: None,
-                current_volume_attributes_class_name: None,
-                modify_volume_status: None,
-            });
-
-            let pvc_key = build_key("persistentvolumeclaims", Some(namespace), pvc_name);
-            self.storage.update(&pvc_key, pvc).await?;
-
-            info!(
-                "Successfully bound PVC {}/{} to PV {}",
-                namespace, pvc_name, pv.metadata.name
-            );
-            return Ok(());
+            return self.complete_binding(pv, pvc).await;
         }
 
         debug!("No matching PV found for PVC {}/{}", namespace, pvc_name);
+        Ok(())
+    }
+
+    /// Complete a PVC↔PV binding: pin the PV's `claimRef` to this PVC, mark both
+    /// Bound, and persist them. Shared by the pre-bound (claimRef) and the
+    /// first-match (unclaimed) paths in [`Self::bind_pvc`].
+    async fn complete_binding(
+        &self,
+        mut pv: PersistentVolume,
+        pvc: &mut PersistentVolumeClaim,
+    ) -> Result<()> {
+        let namespace = pvc.metadata.namespace.clone().unwrap_or("default".into());
+        let pvc_name = pvc.metadata.name.clone();
+
+        let pv_access_modes = pv.spec.access_modes.clone();
+        let pv_capacity = pv.spec.capacity.clone();
+        let pv_name = pv.metadata.name.clone();
+
+        // Pin the PV to this PVC (idempotent for an already pre-bound PV).
+        pv.spec.claim_ref = Some(
+            rusternetes_common::resources::service_account::ObjectReference {
+                kind: Some("PersistentVolumeClaim".to_string()),
+                namespace: Some(namespace.clone()),
+                name: Some(pvc_name.clone()),
+                uid: Some(pvc.metadata.uid.clone()),
+                api_version: Some("v1".to_string()),
+                resource_version: None,
+                field_path: None,
+            },
+        );
+        pv.status = Some(PersistentVolumeStatus {
+            phase: PersistentVolumePhase::Bound,
+            message: None,
+            reason: None,
+            last_phase_transition_time: None,
+        });
+        let pv_key = build_key("persistentvolumes", None, &pv_name);
+        self.storage.update(&pv_key, &pv).await?;
+
+        pvc.spec.volume_name = Some(pv_name.clone());
+        pvc.status = Some(PersistentVolumeClaimStatus {
+            phase: PersistentVolumeClaimPhase::Bound,
+            access_modes: Some(pv_access_modes),
+            capacity: Some(pv_capacity),
+            conditions: None,
+            allocated_resources: None,
+            allocated_resource_statuses: None,
+            resize_status: None,
+            current_volume_attributes_class_name: None,
+            modify_volume_status: None,
+        });
+        let pvc_key = build_key("persistentvolumeclaims", Some(&namespace), &pvc_name);
+        self.storage.update(&pvc_key, pvc).await?;
+
+        info!(
+            "Successfully bound PVC {}/{} to PV {}",
+            namespace, pvc_name, pv_name
+        );
         Ok(())
     }
 
@@ -380,6 +407,21 @@ impl<S: Storage + 'static> PVBinderController<S> {
 /// and match field must hold (AND). Mirrors upstream
 /// `pkg/apis/core/v1/helper.MatchNodeSelectorTerms` semantics for the operators
 /// rusternetes models.
+/// True when a PV's `claimRef` names this exact PVC (namespace + name), with a
+/// matching UID when the ref carries one. A pre-bound PV from the dynamic
+/// provisioner sets all three; the UID guard prevents binding to a PV that was
+/// pinned to an earlier, since-deleted PVC of the same name (#1095).
+fn claim_ref_points_to(
+    claim_ref: &rusternetes_common::resources::service_account::ObjectReference,
+    namespace: &str,
+    pvc_name: &str,
+    pvc_uid: &str,
+) -> bool {
+    claim_ref.name.as_deref() == Some(pvc_name)
+        && claim_ref.namespace.as_deref() == Some(namespace)
+        && claim_ref.uid.as_ref().is_none_or(|u| u == pvc_uid)
+}
+
 fn node_affinity_satisfied(node_affinity: &VolumeNodeAffinity, nodes: &[Node]) -> bool {
     let required = match &node_affinity.required {
         Some(r) => r,
@@ -452,7 +494,17 @@ fn requirement_matches(value: Option<&str>, operator: &str, values: Option<&[Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::resources::service_account::ObjectReference;
+    use rusternetes_common::resources::volume::{
+        PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeClaimStatus,
+        ResourceRequirements,
+    };
+    use rusternetes_common::resources::{
+        PersistentVolumeClaimSpec, PersistentVolumeSpec, PersistentVolumeStatus,
+    };
+    use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
+    use std::collections::HashMap;
 
     #[test]
     fn test_storage_comparison() {
@@ -464,5 +516,185 @@ mod tests {
         assert!(!controller.storage_sufficient("5Gi", "10Gi"));
         assert!(controller.storage_sufficient("100Mi", "50Mi"));
         assert!(!controller.storage_sufficient("50Mi", "100Mi"));
+    }
+
+    #[test]
+    fn claim_ref_points_to_matches_name_namespace_uid() {
+        let cr = ObjectReference {
+            kind: Some("PersistentVolumeClaim".into()),
+            namespace: Some("ns".into()),
+            name: Some("pvc".into()),
+            uid: Some("uid-1".into()),
+            api_version: Some("v1".into()),
+            resource_version: None,
+            field_path: None,
+        };
+        assert!(claim_ref_points_to(&cr, "ns", "pvc", "uid-1"));
+        assert!(!claim_ref_points_to(&cr, "ns", "other", "uid-1")); // wrong name
+        assert!(!claim_ref_points_to(&cr, "other", "pvc", "uid-1")); // wrong ns
+        assert!(!claim_ref_points_to(&cr, "ns", "pvc", "uid-2")); // stale uid
+                                                                  // A pre-bind without a uid still counts.
+        let cr_no_uid = ObjectReference {
+            uid: None,
+            ..cr.clone()
+        };
+        assert!(claim_ref_points_to(&cr_no_uid, "ns", "pvc", "uid-1"));
+    }
+
+    fn make_pvc(name: &str, uid: &str) -> PersistentVolumeClaim {
+        let mut requests = HashMap::new();
+        requests.insert("storage".to_string(), "1Gi".to_string());
+        PersistentVolumeClaim {
+            type_meta: TypeMeta {
+                kind: "PersistentVolumeClaim".into(),
+                api_version: "v1".into(),
+            },
+            metadata: {
+                let mut m = ObjectMeta::new(name);
+                m.namespace = Some("sstest".into());
+                m.uid = uid.into();
+                m
+            },
+            spec: PersistentVolumeClaimSpec {
+                access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+                resources: ResourceRequirements {
+                    limits: None,
+                    requests: Some(requests),
+                },
+                volume_name: None,
+                storage_class_name: Some("standard".into()),
+                volume_mode: None,
+                selector: None,
+                data_source: None,
+                data_source_ref: None,
+                volume_attributes_class_name: None,
+            },
+            status: Some(PersistentVolumeClaimStatus {
+                phase: PersistentVolumeClaimPhase::Pending,
+                access_modes: None,
+                capacity: None,
+                conditions: None,
+                allocated_resources: None,
+                allocated_resource_statuses: None,
+                resize_status: None,
+                current_volume_attributes_class_name: None,
+                modify_volume_status: None,
+            }),
+        }
+    }
+
+    fn make_prebound_pv(pv_name: &str, pvc_name: &str, pvc_uid: &str) -> PersistentVolume {
+        let mut capacity = HashMap::new();
+        capacity.insert("storage".to_string(), "1Gi".to_string());
+        PersistentVolume {
+            type_meta: TypeMeta {
+                kind: "PersistentVolume".into(),
+                api_version: "v1".into(),
+            },
+            metadata: ObjectMeta::new(pv_name),
+            spec: PersistentVolumeSpec {
+                capacity,
+                host_path: None,
+                nfs: None,
+                iscsi: None,
+                local: None,
+                csi: None,
+                access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+                persistent_volume_reclaim_policy: None,
+                storage_class_name: Some("standard".into()),
+                mount_options: None,
+                volume_mode: None,
+                node_affinity: None,
+                claim_ref: Some(ObjectReference {
+                    kind: Some("PersistentVolumeClaim".into()),
+                    namespace: Some("sstest".into()),
+                    name: Some(pvc_name.into()),
+                    uid: Some(pvc_uid.into()),
+                    api_version: Some("v1".into()),
+                    resource_version: None,
+                    field_path: None,
+                }),
+                volume_attributes_class_name: None,
+            },
+            status: Some(PersistentVolumeStatus {
+                phase: PersistentVolumePhase::Available,
+                message: None,
+                reason: None,
+                last_phase_transition_time: None,
+            }),
+        }
+    }
+
+    /// #1095: two PVCs whose PVs were pre-bound (claimRef) by the dynamic
+    /// provisioner must each bind to THEIR OWN PV, never cross. PVs are stored
+    /// in the reverse of the bind order so a first-match binder would mis-pair.
+    #[tokio::test]
+    async fn prebound_pvs_do_not_cross_bind() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PVBinderController::new(storage.clone());
+
+        let pv_a = make_prebound_pv("pvc-sstest-explicit-pvc", "explicit-pvc", "uid-a");
+        let pv_b = make_prebound_pv("pvc-sstest-default-pvc", "default-pvc", "uid-b");
+        // Insert b first, a second — list order must not decide the pairing.
+        storage
+            .create(
+                &build_key("persistentvolumes", None, &pv_b.metadata.name),
+                &pv_b,
+            )
+            .await
+            .unwrap();
+        storage
+            .create(
+                &build_key("persistentvolumes", None, &pv_a.metadata.name),
+                &pv_a,
+            )
+            .await
+            .unwrap();
+
+        let mut explicit = make_pvc("explicit-pvc", "uid-a");
+        let mut default = make_pvc("default-pvc", "uid-b");
+        // PVCs exist in storage (created by the user) before binding; the binder
+        // persists the bound result via update().
+        for pvc in [&explicit, &default] {
+            storage
+                .create(
+                    &build_key(
+                        "persistentvolumeclaims",
+                        pvc.metadata.namespace.as_deref(),
+                        &pvc.metadata.name,
+                    ),
+                    pvc,
+                )
+                .await
+                .unwrap();
+        }
+
+        controller.bind_pvc(&mut explicit).await.unwrap();
+        assert_eq!(
+            explicit.spec.volume_name.as_deref(),
+            Some("pvc-sstest-explicit-pvc"),
+            "explicit-pvc must bind to its own pre-bound PV"
+        );
+
+        controller.bind_pvc(&mut default).await.unwrap();
+        assert_eq!(
+            default.spec.volume_name.as_deref(),
+            Some("pvc-sstest-default-pvc"),
+            "default-pvc must bind to its own pre-bound PV, not explicit-pvc's"
+        );
+
+        // Each PV's claimRef ends up pinned to the matching PVC.
+        let bound_a: PersistentVolume = storage
+            .get(&build_key(
+                "persistentvolumes",
+                None,
+                "pvc-sstest-explicit-pvc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            bound_a.spec.claim_ref.unwrap().name.as_deref(),
+            Some("explicit-pvc")
+        );
     }
 }

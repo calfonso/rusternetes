@@ -356,7 +356,22 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                 mount_options: None,
                 volume_mode: pvc.spec.volume_mode.clone(),
                 node_affinity: None,
-                claim_ref: None, // Will be bound by the PV binder controller
+                // Pre-bind the PV to the exact PVC it was provisioned for
+                // (#1095). Without this, the PV binder first-matches by
+                // capacity/class and can pair two concurrently-provisioned PVCs
+                // with each other's PV. The binder honors this claimRef and only
+                // completes the binding for the named PVC.
+                claim_ref: Some(
+                    rusternetes_common::resources::service_account::ObjectReference {
+                        kind: Some("PersistentVolumeClaim".to_string()),
+                        namespace: Some(namespace.to_string()),
+                        name: Some(pvc.metadata.name.clone()),
+                        uid: Some(pvc.metadata.uid.clone()),
+                        api_version: Some("v1".to_string()),
+                        resource_version: None,
+                        field_path: None,
+                    },
+                ),
                 volume_attributes_class_name: None,
             },
             status: Some(PersistentVolumeStatus {
@@ -584,5 +599,13 @@ mod tests {
             annotations.get("pv.kubernetes.io/provisioned-by"),
             Some(&"rusternetes.io/hostpath".to_string())
         );
+
+        // #1095: the PV is pre-bound — claimRef names the exact PVC it was
+        // provisioned for, so the binder can't cross-bind it to another PVC.
+        let cr = pv.spec.claim_ref.as_ref().expect("claimRef must be set");
+        assert_eq!(cr.kind.as_deref(), Some("PersistentVolumeClaim"));
+        assert_eq!(cr.namespace.as_deref(), Some("default"));
+        assert_eq!(cr.name.as_deref(), Some("test-pvc"));
+        assert_eq!(cr.uid.as_ref(), Some(&pvc.metadata.uid));
     }
 }
