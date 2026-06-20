@@ -33,6 +33,9 @@ impl ApiServerState {
     ) -> Self {
         let webhook_manager = Arc::new(AdmissionWebhookManager::new(storage.clone()));
         let watch_cache = Arc::new(WatchCache::new(storage.clone()));
+        // Reclaim per-prefix replay-ring memory once a prefix's watchers drop to
+        // zero (#1089).
+        watch_cache.spawn_idle_gc();
 
         Self {
             storage,

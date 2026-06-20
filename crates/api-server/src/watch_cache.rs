@@ -12,9 +12,25 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info};
 
 /// Maximum number of events to retain in the history ring buffer per prefix
+/// while the prefix has at least one live external watcher.
 /// K8s default watch cache capacity is 1000 events.
 /// 5000 × 26 prefixes × ~3KB = ~390MB of memory.
 const HISTORY_CAPACITY: usize = 500;
+
+/// Replay-ring size retained for a prefix with **zero** live external watchers
+/// (#1089). The full ring is only needed to replay history to reconnecting
+/// watchers; at idle there are none, so we keep just a small recent tail and
+/// free the rest. The tail still covers the short replay sequences the
+/// remaining ring consumers need — notably the CRD watch path, whose
+/// Established delivery replays just the ADDED+MODIFIED pair. The primary
+/// resourceVersion replay path is storage-backed (`watch_from_revision` +
+/// `is_revision_compacted` → 410), independent of this ring, so shrinking it
+/// cannot regress replay correctness.
+const HISTORY_IDLE_CAPACITY: usize = 16;
+
+/// How often the idle-GC sweep reclaims replay rings for prefixes that have
+/// dropped to zero watchers.
+const IDLE_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A cached watch event with metadata
 #[derive(Debug, Clone)]
@@ -151,7 +167,16 @@ impl WatchCache {
                                 > = history_ref.write().await;
                                 let buf = hist.entry(prefix_owned.clone()).or_default();
                                 buf.push_back(cached.clone());
-                                while buf.len() > HISTORY_CAPACITY {
+                                // Retain the full ring only while someone is
+                                // watching; once the last watcher leaves, trim to
+                                // the idle tail so a busy-then-idle prefix doesn't
+                                // pin ~500 events forever (#1089).
+                                let cap = if tx_clone.receiver_count() > 0 {
+                                    HISTORY_CAPACITY
+                                } else {
+                                    HISTORY_IDLE_CAPACITY
+                                };
+                                while buf.len() > cap {
                                     buf.pop_front();
                                 }
                             }
@@ -179,6 +204,55 @@ impl WatchCache {
         });
 
         rx
+    }
+
+    /// Spawn the background sweep that reclaims replay-ring memory for prefixes
+    /// whose external watcher count has dropped to zero (#1089). The append path
+    /// already trims to the idle tail when a new event arrives; this sweep covers
+    /// the steady-idle case where a busy prefix goes quiet with no further events
+    /// to trigger that trim, and `shrink_to_fit`s the freed capacity back.
+    pub fn spawn_idle_gc(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(IDLE_GC_INTERVAL);
+            tick.tick().await; // first tick fires immediately; skip it
+            loop {
+                tick.tick().await;
+                this.gc_idle_history().await;
+            }
+        });
+    }
+
+    /// Shrink the replay ring of every prefix that currently has no live
+    /// receivers down to [`HISTORY_IDLE_CAPACITY`], releasing the backing
+    /// capacity. Idempotent and cheap when nothing is idle.
+    async fn gc_idle_history(&self) {
+        let idle_prefixes: Vec<String> = {
+            let watchers = self.watchers.read().await;
+            watchers
+                .iter()
+                .filter(|(_, tx)| tx.receiver_count() == 0)
+                .map(|(prefix, _)| prefix.clone())
+                .collect()
+        };
+        if idle_prefixes.is_empty() {
+            return;
+        }
+        let mut hist = self.history.write().await;
+        for prefix in idle_prefixes {
+            if let Some(buf) = hist.get_mut(&prefix) {
+                if buf.len() > HISTORY_IDLE_CAPACITY {
+                    let drop_n = buf.len() - HISTORY_IDLE_CAPACITY;
+                    buf.drain(..drop_n);
+                    buf.shrink_to_fit();
+                    debug!(
+                        "WatchCache: idle-GC shrank replay ring for {} to {} events",
+                        prefix,
+                        buf.len()
+                    );
+                }
+            }
+        }
     }
 
     /// Get the current approximate revision
@@ -288,4 +362,62 @@ pub fn broadcast_to_stream_with_history(
         }
     };
     Box::pin(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_storage::StorageBackend;
+
+    fn make_event(rev: i64) -> CachedWatchEvent {
+        CachedWatchEvent {
+            event: WatchEventData::Added(format!("k{rev}"), Arc::new("{}".to_string())),
+            revision: rev,
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_gc_shrinks_only_prefixes_without_receivers() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        let cache = WatchCache::new(storage);
+
+        // Prefix "a": a watcher with a LIVE receiver — must not be shrunk.
+        let (tx_a, rx_a) = broadcast::channel(1000);
+        // Prefix "b": a watcher whose receiver was dropped — count 0, eligible.
+        let (tx_b, rx_b) = broadcast::channel(1000);
+        drop(rx_b);
+        {
+            let mut watchers = cache.watchers.write().await;
+            watchers.insert("a".to_string(), tx_a);
+            watchers.insert("b".to_string(), tx_b);
+        }
+        {
+            let mut hist = cache.history.write().await;
+            hist.insert("a".to_string(), (0..100).map(make_event).collect());
+            hist.insert("b".to_string(), (0..100).map(make_event).collect());
+        }
+
+        cache.gc_idle_history().await;
+
+        let hist = cache.history.read().await;
+        assert_eq!(
+            hist["a"].len(),
+            100,
+            "a prefix with a live receiver must not be shrunk"
+        );
+        assert_eq!(
+            hist["b"].len(),
+            HISTORY_IDLE_CAPACITY,
+            "an idle prefix is shrunk to the idle tail"
+        );
+        // The MOST RECENT events are retained, so recent replay (e.g. the CRD
+        // Established MODIFIED) still survives the shrink.
+        assert_eq!(hist["b"].back().unwrap().revision, 99);
+        assert_eq!(
+            hist["b"].front().unwrap().revision,
+            100 - HISTORY_IDLE_CAPACITY as i64
+        );
+
+        drop(rx_a); // keep the receiver alive across the GC sweep above
+    }
 }
