@@ -56,9 +56,7 @@ pub async fn create_deviceclass(
         metadata.creation_timestamp = Some(chrono::Utc::now());
     }
 
-    let name = metadata.name.as_ref().ok_or_else(|| {
-        rusternetes_common::Error::InvalidResource("metadata.name is required".to_string())
-    })?;
+    let name = crate::handlers::validation::require_optional_object_name(metadata.name.as_deref())?;
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
