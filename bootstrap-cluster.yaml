@@ -129,3 +129,50 @@ subjects:
 - apiGroup: rbac.authorization.k8s.io
   kind: User
   name: system:kube-scheduler
+---
+# RBAC for the in-cluster controller-manager (#1185, Phase 5 of #1129).
+#
+# generate-certs.sh emits a CN=system:kube-controller-manager /
+# O=system:kube-controller-manager client cert + controller-manager.conf
+# (kubeadm parity); with --client-ca-file set, the api-server maps that verified
+# cert to user `system:kube-controller-manager` via x509 authn. These objects
+# grant that user the verbs the controllers issue.
+#
+# Broad by necessity: rusternetes runs ALL ~40 controllers as concurrent tasks
+# in ONE process under this single identity — it does NOT split per-controller
+# ServiceAccounts the way upstream does with --use-service-account-credentials
+# (plugin/pkg/auth/authorizer/rbac/bootstrappolicy/controller_policy.go). So the
+# grant must be the UNION of every controller's verbs. Two controllers alone
+# force wildcard scope: the namespace controller deletes every resource in a
+# terminating namespace (upstream namespace-controller: get,list,watch,delete,
+# deletecollection on */*) and the garbage collector deletes any owned object
+# (upstream generic-garbage-collector: get,list,watch,patch,update,delete on
+# */*). The remaining controllers only add `create` (pods, replicasets,
+# endpoints, endpointslices, events, leases, …), so the union is exactly the
+# eight standard resource verbs below. Status/finalizer subresources (e.g.
+# pods/status, deployments/finalizers) are covered by the `*` resource match.
+#
+# Seeded unconditionally: inert while the api-server runs with --skip-auth (the
+# authorizer is bypassed), and already in place the day --skip-auth is dropped.
+# Same enable path as the scheduler block above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:kube-controller-manager
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:kube-controller-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-controller-manager
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: system:kube-controller-manager
