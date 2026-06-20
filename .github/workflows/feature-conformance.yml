@@ -27,6 +27,12 @@ on:
       - 'compose.sqlite.yml'
       - 'compose.node-conformance.yml'
       - 'scripts/tests/test-ghcr-overlays.sh'
+      - 'Dockerfile.services'
+      - 'Dockerfile.dns'
+      - 'Dockerfile.kubectl'
+      - 'Dockerfile.all-in-one'
+      - 'Cargo.toml'
+      - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
@@ -65,6 +71,8 @@ jobs:
         run: bash scripts/tests/test-conformance-features-discover.sh
       - name: GHCR overlay sync test
         run: bash scripts/tests/test-ghcr-overlays.sh
+      - name: Dockerfile crate-enumeration sync test
+        run: bash scripts/tests/test-dockerfile-crate-enumeration.sh
 
   matrix-gen:
     name: generate matrix
