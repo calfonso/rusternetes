@@ -1,0 +1,10 @@
+# actionlint configuration.
+# Register the self-hosted ARC runner-set labels this repo's workflows target
+# so actionlint's `runner-label` check doesn't flag them as unknown. These are
+# the helm release names of the gha-runner-scale-set installs in arc-runners
+# (see CLAUDE.local.md → "CI cluster (ARC self-hosted runners)").
+self-hosted-runner:
+  labels:
+    - arc-runner-set
+    - arc-runner-set-small
+    - arc-runner-set-conformance

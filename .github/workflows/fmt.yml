@@ -50,8 +50,8 @@ jobs:
         # project. Format only the workspace members enumerated by
         # `cargo metadata --no-deps`.
         run: |
-          PKGS=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[].name' \
-            | sed 's/^/-p /' \
-            | tr '\n' ' ')
-          cargo fmt $PKGS -- --check
+          pkgs=()
+          while IFS= read -r name; do
+            pkgs+=(-p "$name")
+          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          cargo fmt "${pkgs[@]}" -- --check
