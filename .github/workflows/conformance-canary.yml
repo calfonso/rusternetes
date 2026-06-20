@@ -4,7 +4,7 @@ name: Conformance canary
 # cluster brought up via `docker compose` inside the
 # `arc-runner-set-conformance` scale set (DinD-enabled).
 #
-# Stack: multi-container SQLite (`compose.sqlite.yml` + `compose.dind.yml`).
+# Stack: multi-container SQLite (`compose.sqlite.yml`).
 # Storage is rhino (etcd-compatible gRPC server backed by SQLite) instead of
 # etcd. rhino's SQLite driver compacts old revisions and reclaims disk on a
 # background loop (`auto_vacuum=incremental` + post-compact `incremental_vacuum`),
@@ -67,9 +67,9 @@ on:
     branches: [main]
 
 env:
-  # The dind sidecar exposes the daemon at this canonical path; the
-  # compose.dind.yml override makes every service use it instead of the
-  # podman socket compose.sqlite.yml hardcodes for dev-laptop parity.
+  # The dind sidecar exposes its daemon at this canonical path; DOCKER_HOST
+  # points the `docker compose` CLI at it to bring the stack up. The pod
+  # runtime itself is the in-compose containerd service, not this socket.
   DOCKER_HOST: unix:///var/run/docker.sock
   # Pin Hydrophone to a known release so a tag-rename upstream doesn't
   # silently break the workflow. The conformance image itself is pinned
@@ -185,5 +185,5 @@ jobs:
       - name: Tear down cluster
         if: always()
         run: |
-          docker compose -f compose.sqlite.yml -f compose.dind.yml logs --tail=200 || true
-          docker compose -f compose.sqlite.yml -f compose.dind.yml down -v || true
+          docker compose -f compose.sqlite.yml logs --tail=200 || true
+          docker compose -f compose.sqlite.yml down -v || true

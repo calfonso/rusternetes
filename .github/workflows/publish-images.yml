@@ -62,14 +62,14 @@ jobs:
         run: |
           # --profile build includes the build-only dns service (it runs as
           # an in-cluster Deployment, not a compose container).
-          docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml \
+          docker compose -f compose.sqlite.yml -f compose.ghcr.yml \
             --profile build build --parallel
 
       - name: Push sha tags
         env:
           RUSTERNETES_IMAGE_TAG: sha-${{ github.sha }}
         run: |
-          docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml \
+          docker compose -f compose.sqlite.yml -f compose.ghcr.yml \
             --profile build push
 
       - name: Retag + push :main

@@ -101,7 +101,7 @@ docker exec -w /workspace \
   -e COMPOSE_PROJECT_NAME=rusternetes \
   -e KUBELET_VOLUMES_PATH=/workspace/.rusternetes/agents/${AGENT_ID}/kubelet-volumes \
   "$DIND_NAME" \
-  docker compose -f compose.yml -f compose.dind.yml up -d --no-build
+  docker compose -f compose.yml up -d --no-build
 
 # --- wait for api-server healthz ---------------------------------------------
 # Check the HTTP status code, not the body. PRE-#182 api-server returns
@@ -121,10 +121,10 @@ for i in $(seq 1 90); do
     echo "api-server never returned 200 on /healthz (last: ${code})" >&2
     docker exec -w /workspace \
       -e COMPOSE_PROJECT_NAME=rusternetes "$DIND_NAME" \
-      docker compose -f compose.yml -f compose.dind.yml ps >&2 || true
+      docker compose -f compose.yml ps >&2 || true
     docker exec -w /workspace \
       -e COMPOSE_PROJECT_NAME=rusternetes "$DIND_NAME" \
-      docker compose -f compose.yml -f compose.dind.yml logs --tail=80 api-server >&2 || true
+      docker compose -f compose.yml logs --tail=80 api-server >&2 || true
     exit 1
   fi
   sleep 2

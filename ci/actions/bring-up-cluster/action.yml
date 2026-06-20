@@ -1,7 +1,7 @@
-name: Bring up rusternetes cluster (sqlite/dind + Hydrophone)
+name: Bring up rusternetes cluster (sqlite + Hydrophone)
 description: >
   Confirm docker, install kubectl + Hydrophone, build images, bring up the
-  compose.sqlite.yml + compose.dind.yml stack, discover the bridge gateway,
+  compose.sqlite.yml stack, discover the bridge gateway,
   wait for api-server health, and bootstrap. Shared by the conformance canary
   and the per-feature matrix. node-conformance uses a different stack and does
   NOT use this action.
@@ -175,7 +175,7 @@ runs:
         # in-cluster Deployment (bootstrap-dns.yaml), not a compose container.
         if [ -n "$IMAGE_TAG" ]; then
           export RUSTERNETES_IMAGE_TAG="$IMAGE_TAG"
-          if docker compose -f compose.sqlite.yml -f compose.dind.yml -f compose.ghcr.yml --profile build pull; then
+          if docker compose -f compose.sqlite.yml -f compose.ghcr.yml --profile build pull; then
             # The kube-scheduler / kube-controller-manager static pods and the
             # rusternetes-dns Deployment run INSIDE the containerd CRI service
             # (54bd2ee7, 2026-06-17), not as docker containers. containerd keeps
@@ -220,7 +220,7 @@ runs:
             echo "If this persists, the \`ghcr.io/indyjonesnl/rusternetes/*\` packages may still be private (PR #1106 post-merge checklist)."
           } >> "$GITHUB_STEP_SUMMARY"
         fi
-        docker compose -f compose.sqlite.yml -f compose.dind.yml --profile build build --parallel
+        docker compose -f compose.sqlite.yml --profile build build --parallel
 
     - name: Bring up cluster
       shell: bash
@@ -231,8 +231,8 @@ runs:
         # ${GHCR_OVERLAY:-} expands to "-f compose.ghcr.yml" when the pull
         # step succeeded, "" otherwise. --no-build keeps a half-missing pull
         # from silently recompiling.
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} up -d --no-build
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} ps
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} up -d --no-build
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} ps
 
     - id: discover-gateway
       name: Discover docker bridge gateway
@@ -264,8 +264,8 @@ runs:
         if [ -n "${RUSTERNETES_IMAGE_TAG:-}" ]; then
           echo "RUSTERNETES_IMAGE_TAG=${RUSTERNETES_IMAGE_TAG}" >> .env
         fi
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} up -d --no-build
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} ps
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} up -d --no-build
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} ps
 
     - name: Wait for api-server health
       # NOTE: composite-action steps do NOT support `timeout-minutes` at
@@ -297,8 +297,8 @@ runs:
           sleep 2
         done
         echo "api-server never became healthy — dumping diagnostics:"
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} ps || true
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} logs --tail=50 rusternetes || true
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} ps || true
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} logs --tail=50 rusternetes || true
         curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
         curl -kv --max-time 5 https://localhost:6443/healthz || true
         exit 1
@@ -333,7 +333,7 @@ runs:
         echo "control-plane static pods did not reach Running — dumping diagnostics:"
         kubectl get pods -n kube-system -o wide || true
         for p in $pods; do kubectl describe pod "$p" -n kube-system || true; done
-        docker compose -f compose.sqlite.yml -f compose.dind.yml ${GHCR_OVERLAY:-} logs --tail=80 kubelet || true
+        docker compose -f compose.sqlite.yml ${GHCR_OVERLAY:-} logs --tail=80 kubelet || true
         exit 1
 
     - name: Install Hydrophone

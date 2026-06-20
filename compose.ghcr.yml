@@ -12,7 +12,7 @@
 # the historic record. Bisect example:
 #
 #   RUSTERNETES_IMAGE_TAG=sha-<commit> \
-#   docker compose -f compose.sqlite.yml -f compose.ghcr.yml -f compose.dind.yml up -d
+#   docker compose -f compose.sqlite.yml -f compose.ghcr.yml up -d
 #
 # Keep the service list in sync with compose.sqlite.yml —
 # scripts/tests/test-ghcr-overlays.sh enforces it.

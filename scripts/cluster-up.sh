@@ -113,9 +113,10 @@ else
 fi
 
 # ---- compose file selection -----------------------------------------------
-# Map backend -> base compose file. On Docker, layer the DinD override that
-# swaps every podman-socket mount for the Docker socket (compose.yml hardcodes
-# the podman socket path).
+# Map backend -> base compose file. All three multi-container stacks talk to
+# the in-compose `containerd` service over the shared containerd-run volume
+# (CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock), so no
+# host runtime socket / DinD override is needed on either Docker or Podman.
 case "$BACKEND" in
     etcd)   BASE_COMPOSE="compose.yml" ;;
     sqlite) BASE_COMPOSE="compose.sqlite.yml" ;;
@@ -124,9 +125,6 @@ esac
 [[ -f "$BASE_COMPOSE" ]] || die "compose file not found: $BASE_COMPOSE"
 
 COMPOSE_ARGS=(-f "$BASE_COMPOSE")
-if [[ "$RUNTIME" == "docker" && -f "compose.dind.yml" ]]; then
-    COMPOSE_ARGS+=(-f "compose.dind.yml")
-fi
 
 # kubelet needs an absolute host path for its volume mounts.
 export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-$PROJECT_ROOT/.rusternetes/volumes}"
