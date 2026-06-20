@@ -1,5 +1,6 @@
 use rusternetes_common::resources::{
-    IntOrString, Node, Pod, PodDisruptionBudget, Taint, Toleration, TopologySpreadConstraint,
+    IntOrString, Node, Pod, PodDisruptionBudget, PriorityClass, Taint, Toleration,
+    TopologySpreadConstraint,
 };
 use std::collections::HashMap;
 use tracing::debug;
@@ -571,16 +572,21 @@ const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 ///
 /// This is the PDB-unaware entry point retained for callers that don't have
 /// PodDisruptionBudgets loaded. Equivalent to
-/// `check_preemption_with_pdbs(node, pod, all_pods, &[])`.
+/// `check_preemption_with_pdbs(node, pod, all_pods, &[], &HashMap::new())`.
 ///
 /// Returns (should_preempt, pods_to_evict).
+///
+/// Passes an empty PriorityClass map, so the `preemptionPolicy: Never` check
+/// honours only the pod's own `spec.preemptionPolicy` (no class fallback) — its
+/// callers don't load PriorityClasses. Use [`check_preemption_with_pdbs`] with a
+/// populated map when the class fallback is needed.
 ///
 /// `dead_code`: invoked from integration tests under `crates/scheduler/tests/`
 /// and from the legacy direct-scheduling path in `scheduler.rs`. The bin's
 /// Framework-based path doesn't call it.
 #[allow(dead_code)]
 pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<String>) {
-    check_preemption_with_pdbs(node, pod, all_pods, &[])
+    check_preemption_with_pdbs(node, pod, all_pods, &[], &HashMap::new())
 }
 
 /// PDB-aware preemption victim selection.
@@ -602,6 +608,7 @@ pub fn check_preemption_with_pdbs(
     pod: &Pod,
     all_pods: &[Pod],
     pdbs: &[PodDisruptionBudget],
+    priority_classes: &HashMap<String, PriorityClass>,
 ) -> (bool, Vec<String>) {
     // Get the priority of the incoming pod
     let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
@@ -611,11 +618,21 @@ pub fn check_preemption_with_pdbs(
         return (false, vec![]);
     }
 
-    // Check preemptionPolicy on the pod spec — if "Never", do not preempt
+    // Check preemptionPolicy — if "Never", do not preempt. Fall back to the
+    // PriorityClass's policy when the pod spec doesn't carry one (mirrors
+    // scheduler.rs::try_preempt: admission normally copies the class policy
+    // onto the pod, but pods written directly to storage may miss it).
     let preemption_policy = pod
         .spec
         .as_ref()
         .and_then(|s| s.preemption_policy.as_deref())
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.priority_class_name.as_deref())
+                .and_then(|name| priority_classes.get(name))
+                .and_then(|pc| pc.preemption_policy.as_deref())
+        })
         .unwrap_or("PreemptLowerPriority");
     if preemption_policy == "Never" {
         debug!(

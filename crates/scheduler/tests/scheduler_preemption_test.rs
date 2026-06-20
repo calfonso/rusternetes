@@ -307,7 +307,13 @@ fn pdb_aware_victim_selection_with_mixed_priority_candidates() {
     let incoming = make_incoming_pod("preemptor", 1000, "1", "1Gi");
 
     let all_pods = vec![rs_a, rs_b, filler_a, filler_b];
-    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &all_pods, &[pdb]);
+    let (can_preempt, victims) = check_preemption_with_pdbs(
+        &node,
+        &incoming,
+        &all_pods,
+        &[pdb],
+        &std::collections::HashMap::new(),
+    );
 
     assert!(can_preempt, "preemption must succeed");
     assert_eq!(

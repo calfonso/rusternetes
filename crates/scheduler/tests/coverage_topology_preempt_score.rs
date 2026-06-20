@@ -1098,7 +1098,13 @@ fn preemption_pdb_covered_pod_protected_when_alternative_exists() {
     let all_pods = vec![p1, p2];
     let preemptor = incoming_pod("high", 1000, "1", "1Gi");
 
-    let (ok, victims) = check_preemption_with_pdbs(&node, &preemptor, &all_pods, &[pdb]);
+    let (ok, victims) = check_preemption_with_pdbs(
+        &node,
+        &preemptor,
+        &all_pods,
+        &[pdb],
+        &std::collections::HashMap::new(),
+    );
     assert!(ok, "preemption must succeed — p2 can be evicted");
     assert!(
         victims.contains(&"p2-free".to_string()),
@@ -1161,7 +1167,13 @@ fn preemption_pdb_covered_pod_reprieved_when_non_pdb_victim_suffices() {
     let preemptor = incoming_pod("high", 1000, "2", "1Gi");
     let all_pods = vec![p_pdb, p_free];
 
-    let (ok, victims) = check_preemption_with_pdbs(&node, &preemptor, &all_pods, &[pdb]);
+    let (ok, victims) = check_preemption_with_pdbs(
+        &node,
+        &preemptor,
+        &all_pods,
+        &[pdb],
+        &std::collections::HashMap::new(),
+    );
     assert!(ok, "preemption must succeed — p-free can be evicted");
     assert!(
         victims.contains(&"p-free".to_string()),
