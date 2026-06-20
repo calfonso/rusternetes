@@ -2945,16 +2945,16 @@ impl Kubelet {
                         Err(e) => {
                             let err_msg = e.to_string();
 
-                            // K8s retries volume mounting when secrets/configmaps
-                            // aren't available yet. The pod stays Pending with
-                            // containers in Waiting{ContainerCreating} state.
-                            // syncPod returns early without creating any containers.
-                            // The pod worker retries on the next sync cycle.
+                            // K8s retries volume mounting when a volume source
+                            // isn't ready yet (Secret/ConfigMap not created, or a
+                            // PersistentVolumeClaim that doesn't exist / isn't
+                            // bound — #1096). The pod stays Pending with containers
+                            // in Waiting{ContainerCreating}; syncPod returns early
+                            // without creating any containers and the pod worker
+                            // retries on the next sync cycle.
                             // K8s ref: pkg/kubelet/kubelet.go:2204 — WaitForAttachAndMount
                             //          pkg/kubelet/kubelet_pods.go:2496 — defaultWaitingState
-                            if err_msg.contains("not found in namespace")
-                                && (err_msg.contains("Secret") || err_msg.contains("ConfigMap"))
-                            {
+                            if crate::lifecycle::is_volume_wait_error(&err_msg) {
                                 warn!(
                                     "Pod {}/{} waiting for volume (will retry): {}",
                                     namespace, pod_name, err_msg

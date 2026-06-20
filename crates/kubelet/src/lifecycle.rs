@@ -294,6 +294,25 @@ pub fn reason_from_anyhow(err: &anyhow::Error) -> Option<&'static str> {
 ///
 /// K8s ref: `pkg/kubelet/kuberuntime/kuberuntime_container.go` —
 /// `containerStartingError` to `Waiting.reason`.
+/// True when a `start_pod` error means the kubelet should keep the pod in
+/// `Pending` with containers `Waiting{ContainerCreating}` and retry, rather than
+/// treating it as a start failure — the pod is waiting on a volume source that
+/// isn't ready yet. Mirrors upstream `WaitForAttachAndMount`
+/// (`pkg/kubelet/volumemanager`): a Secret/ConfigMap that hasn't been created,
+/// or a PersistentVolumeClaim that doesn't exist or isn't bound yet (#1096).
+///
+/// Volumes are provisioned before the sandbox/containers in `start_pod`, so this
+/// gates container start on volume readiness; without this branch an unbound PVC
+/// would fall through to the start-failure path and surface as a misleading
+/// `error!` log + `InitContainerFailed` status instead of `ContainerCreating`.
+pub fn is_volume_wait_error(err_msg: &str) -> bool {
+    (err_msg.contains("not found in namespace")
+        && (err_msg.contains("Secret")
+            || err_msg.contains("ConfigMap")
+            || err_msg.contains("PersistentVolumeClaim")))
+        || err_msg.contains("is not bound to a volume")
+}
+
 pub fn container_reason_from_error_message(err_msg: &str) -> Option<&'static str> {
     if err_msg.starts_with("CreateContainerConfigError:") {
         Some("CreateContainerConfigError")
@@ -403,6 +422,30 @@ pub fn terminated_state_from_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_wait_error_classification() {
+        // PVC not bound / not found → wait (the #1096 cases). Messages mirror
+        // the wrapped CriRuntimeError::Volumes Display: "provisioning volumes
+        // for pod X: <source>".
+        assert!(is_volume_wait_error(
+            "provisioning volumes for pod p: PersistentVolumeClaim is not bound to a volume"
+        ));
+        assert!(is_volume_wait_error(
+            "provisioning volumes for pod p: PersistentVolumeClaim data not found in namespace ns"
+        ));
+        // Secret/ConfigMap not yet created → wait (pre-existing behavior).
+        assert!(is_volume_wait_error("Secret foo not found in namespace ns"));
+        assert!(is_volume_wait_error(
+            "ConfigMap foo not found in namespace ns"
+        ));
+        // Real start failures must NOT be treated as volume waits.
+        assert!(!is_volume_wait_error("CreateContainerConfigError: bad env"));
+        assert!(!is_volume_wait_error("port is already allocated"));
+        assert!(!is_volume_wait_error(
+            "PersistentVolume does not have a hostPath volume source"
+        ));
+    }
 
     #[test]
     fn should_run_prestop_threshold() {
