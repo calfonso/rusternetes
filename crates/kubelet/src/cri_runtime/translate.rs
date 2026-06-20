@@ -129,7 +129,9 @@ fn sysctls(pod: &Pod) -> HashMap<String, String> {
 /// (upstream `omitDuplicates`).
 fn dedup<I: IntoIterator<Item = String>>(iter: I) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    iter.into_iter().filter(|x| seen.insert(x.clone())).collect()
+    iter.into_iter()
+        .filter(|x| seen.insert(x.clone()))
+        .collect()
 }
 
 /// Merge resolv.conf options name-keyed (upstream `mergeDNSOptions`): an option
@@ -166,7 +168,11 @@ fn merge_dns_options(
 /// `/etc/resolv.conf` into the sandbox, which is exactly "inherit node DNS".
 /// (Merging an explicit `dnsConfig` onto the host base for `Default` would need
 /// the kubelet to read the host resolv.conf; not done here.)
-pub fn dns_config(pod: &Pod, cluster_dns: &[String], cluster_domain: &str) -> Option<v1::DnsConfig> {
+pub fn dns_config(
+    pod: &Pod,
+    cluster_dns: &[String],
+    cluster_domain: &str,
+) -> Option<v1::DnsConfig> {
     let policy = pod
         .spec
         .as_ref()
@@ -1016,7 +1022,10 @@ mod tests {
         assert!(dns.searches.contains(&"prod.svc.cluster.local".to_string()));
         assert!(dns.searches.contains(&"extra.example".to_string()));
         // ndots overridden in place; edns0 appended (no duplicate ndots).
-        assert_eq!(dns.options, vec!["ndots:3".to_string(), "edns0".to_string()]);
+        assert_eq!(
+            dns.options,
+            vec!["ndots:3".to_string(), "edns0".to_string()]
+        );
     }
 
     #[test]
