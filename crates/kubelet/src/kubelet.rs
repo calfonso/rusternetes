@@ -137,6 +137,27 @@ const CRASHLOOP_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
 /// Maximum CrashLoopBackOff delay. Matches upstream `MaxCrashLoopBackOff` (5m).
 const CRASHLOOP_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
+/// Defensive backoff for a terminal pod whose `finalize_terminated_pod_storage`
+/// reported removal but left the object in storage (#1157). The per-pod worker
+/// would otherwise re-enter `TerminatingPod` every reconcile and re-stop
+/// containers forever. We back off the terminate retry (initial, doubling,
+/// capped) and escalate the log so a storage-delete regression is loud.
+const TERMINAL_FINALIZE_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
+/// Cap for the terminal-finalize retry backoff.
+const TERMINAL_FINALIZE_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Attempt count at which the still-present warning escalates to `error!`.
+const TERMINAL_FINALIZE_ERROR_THRESHOLD: u32 = 3;
+
+/// Backoff delay before re-attempting termination of a terminal pod whose
+/// storage delete isn't taking effect, given the failed-attempt `count` (1 =
+/// first failure). Pure so it can be unit-tested without wall-clock state.
+fn terminal_finalize_backoff(count: u32) -> Duration {
+    let shifts = count.saturating_sub(1).min(6);
+    TERMINAL_FINALIZE_BACKOFF_INITIAL
+        .saturating_mul(2u32.pow(shifts))
+        .min(TERMINAL_FINALIZE_BACKOFF_MAX)
+}
+
 /// Per-container CrashLoopBackOff state. This is the kubelet-owned source of
 /// truth for `restartCount` and restart pacing, decoupled from sync frequency.
 ///
@@ -191,6 +212,11 @@ pub struct Kubelet {
     /// `"{namespace}/{pod}/{container}"`. Source of truth for restartCount +
     /// restart pacing. See [`RestartBackoff`].
     restart_backoff: Mutex<HashMap<String, RestartBackoff>>,
+    /// Terminal pods whose `finalize_terminated_pod_storage` reported removal
+    /// but left the object in storage, keyed by the `/registry/...` pod key.
+    /// Value is `(failed_attempts, last_attempt)` driving the retry backoff in
+    /// [`terminal_finalize_backoff`] (#1157). Cleared once the object is gone.
+    terminal_finalize_failures: Mutex<HashMap<String, (u32, Instant)>>,
     /// Track recently-deleted pod names (from watch events) so orphan cleanup
     /// can skip the grace period for pods that were explicitly deleted from storage.
     recently_deleted: Arc<Mutex<HashMap<String, Option<Pod>>>>,
@@ -424,6 +450,7 @@ impl Kubelet {
             eviction_root_dir,
             eviction_manager: Mutex::new(eviction_manager),
             pod_states: Mutex::new(HashMap::new()),
+            terminal_finalize_failures: Mutex::new(HashMap::new()),
             pod_sync_locks: Mutex::new(HashSet::new()),
             restart_backoff: Mutex::new(HashMap::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
@@ -2024,6 +2051,19 @@ impl Kubelet {
         // possibly-terminal fresh pod from storage carry it.
 
         if needs_terminating {
+            // Backoff guard (#1157): if a prior terminate cycle reported a
+            // finalize-removal but storage still has the object, don't re-stop
+            // containers every reconcile. Skip until the backoff window elapses
+            // — the failed-finalize path keeps extending it and escalating the
+            // log, so a storage-delete regression is loud, not a silent loop.
+            let key = build_key("pods", Some(namespace), pod_name);
+            if let Some(remaining) = self.terminal_finalize_backoff_remaining(&key) {
+                debug!(
+                    "Pod {}/{}: delaying re-terminate for {:?} (previous finalize did not remove the object)",
+                    namespace, pod_name, remaining
+                );
+                return Ok(());
+            }
             self.pod_states
                 .lock()
                 .unwrap()
@@ -2150,10 +2190,35 @@ impl Kubelet {
                 )
                 .await
                 {
-                    Ok(true) => debug!(
-                        "Pod {}/{} removed from storage (deletionTimestamp set, no finalizers)",
-                        namespace, pod_name
-                    ),
+                    Ok(true) => {
+                        // Defense in depth (#1157): a finalize that reports
+                        // removal but leaves the object behind would make this
+                        // worker re-enter TerminatingPod every reconcile and
+                        // re-stop containers forever. Verify the delete took;
+                        // if not, record a failure (drives the retry backoff at
+                        // the needs_terminating gate) and escalate the log so a
+                        // storage-delete regression is loud, not a silent loop.
+                        if self.storage.get::<Pod>(&key).await.is_ok() {
+                            let attempts = self.record_terminal_finalize_failure(&key);
+                            if attempts >= TERMINAL_FINALIZE_ERROR_THRESHOLD {
+                                error!(
+                                    "Pod {}/{}: finalize reported removal but the object is still in storage after {} attempts — storage delete is not taking effect (regression of #1156?)",
+                                    namespace, pod_name, attempts
+                                );
+                            } else {
+                                warn!(
+                                    "Pod {}/{}: finalize reported removal but the object is still in storage (attempt {}); backing off before retry",
+                                    namespace, pod_name, attempts
+                                );
+                            }
+                        } else {
+                            self.clear_terminal_finalize_failure(&key);
+                            debug!(
+                                "Pod {}/{} removed from storage (deletionTimestamp set, no finalizers)",
+                                namespace, pod_name
+                            );
+                        }
+                    }
                     Ok(false) => {
                         debug!("Pod {}/{} marked terminal in storage", namespace, pod_name)
                     }
@@ -4596,6 +4661,31 @@ impl Kubelet {
             .retain(|k, _| !k.starts_with(&prefix));
     }
 
+    /// Record one more failed terminal finalize for `key` (the object is still
+    /// present after a reported removal) and return the new attempt count (#1157).
+    fn record_terminal_finalize_failure(&self, key: &str) -> u32 {
+        let mut m = self.terminal_finalize_failures.lock().unwrap();
+        let entry = m.entry(key.to_string()).or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+        entry.0
+    }
+
+    /// Forget any terminal-finalize failure record for `key` (the object is now
+    /// gone, so the next delete starts fresh).
+    fn clear_terminal_finalize_failure(&self, key: &str) {
+        self.terminal_finalize_failures.lock().unwrap().remove(key);
+    }
+
+    /// `Some(remaining)` when `key` has a pending terminal-finalize backoff that
+    /// has not yet elapsed — the caller should skip re-terminating this cycle.
+    /// `None` when there is no record or the window has passed (retry now).
+    fn terminal_finalize_backoff_remaining(&self, key: &str) -> Option<Duration> {
+        let m = self.terminal_finalize_failures.lock().unwrap();
+        let (count, last) = m.get(key)?;
+        terminal_finalize_backoff(*count).checked_sub(last.elapsed())
+    }
+
     /// Preserve `last_transition_time` from existing conditions whose
     /// type+status match the incoming ones. Without this every status
     /// sync re-stamps the time → pod_status_equal returns false → write
@@ -5400,6 +5490,44 @@ mod tests {
         Container, ContainerState, ContainerStatus, Pod, PodStatus,
     };
     use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+
+    #[test]
+    fn terminal_finalize_backoff_grows_then_caps() {
+        use super::{
+            terminal_finalize_backoff, TERMINAL_FINALIZE_BACKOFF_INITIAL,
+            TERMINAL_FINALIZE_BACKOFF_MAX,
+        };
+        // First failure → initial; each subsequent doubles.
+        assert_eq!(
+            terminal_finalize_backoff(1),
+            TERMINAL_FINALIZE_BACKOFF_INITIAL
+        );
+        assert_eq!(
+            terminal_finalize_backoff(2),
+            TERMINAL_FINALIZE_BACKOFF_INITIAL * 2
+        );
+        assert_eq!(
+            terminal_finalize_backoff(3),
+            TERMINAL_FINALIZE_BACKOFF_INITIAL * 4
+        );
+        // Monotonic non-decreasing and never above the cap.
+        let mut prev = terminal_finalize_backoff(1);
+        for c in 2..=50u32 {
+            let d = terminal_finalize_backoff(c);
+            assert!(d >= prev, "backoff must not shrink");
+            assert!(
+                d <= TERMINAL_FINALIZE_BACKOFF_MAX,
+                "backoff must stay capped"
+            );
+            prev = d;
+        }
+        assert_eq!(terminal_finalize_backoff(50), TERMINAL_FINALIZE_BACKOFF_MAX);
+        // count 0 (defensive) must not panic and stays at the initial delay.
+        assert_eq!(
+            terminal_finalize_backoff(0),
+            TERMINAL_FINALIZE_BACKOFF_INITIAL
+        );
+    }
 
     fn cond(t: &str, status: &str, transition: chrono::DateTime<chrono::Utc>) -> PodCondition {
         PodCondition {
