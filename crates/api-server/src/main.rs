@@ -22,6 +22,12 @@ mod response;
 mod router;
 #[allow(dead_code)]
 mod spdy;
+// The bin only drives handle_spdy3_exec; the rest of the codec API is exercised
+// by the lib + tests, so allow dead_code in the binary build.
+#[allow(dead_code)]
+mod spdy3;
+#[allow(dead_code)]
+mod spdy3_handlers;
 #[allow(dead_code)]
 mod spdy_handlers;
 mod ssa;

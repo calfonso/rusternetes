@@ -674,8 +674,35 @@ pub async fn exec(
             .into_response());
     }
 
-    // For SPDY requests and plain HTTP: execute directly and return output
-    // kubectl will receive the output as the HTTP response body
+    // SPDY upgrade (older kubectl / client-go SPDY executor): bridge to the CRI
+    // exec stream over the real SPDY/3.1 codec (#1264).
+    if spdy::is_spdy_request(&req) {
+        info!("Upgrading exec to SPDY for pod {}/{}", namespace, name);
+        let response = spdy::create_spdy_upgrade_response()
+            .map_err(|e| Error::Internal(format!("Failed to create SPDY upgrade response: {e}")))?;
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    let io = hyper_util::rt::TokioIo::new(upgraded);
+                    crate::spdy3_handlers::handle_spdy3_exec(
+                        io,
+                        pod,
+                        container_name,
+                        query.command,
+                        query.stdin,
+                        query.stdout,
+                        query.stderr,
+                        query.tty,
+                    )
+                    .await;
+                }
+                Err(e) => tracing::error!("exec SPDY upgrade failed: {e}"),
+            }
+        });
+        return Ok(response.into_response());
+    }
+
+    // Plain HTTP (no upgrade): one-shot exec, return collected output as the body.
     info!(
         "Direct exec for pod {}/{}: {:?}",
         namespace, name, query.command
