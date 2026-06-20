@@ -778,7 +778,10 @@ mod tests {
         });
         let sysctls = sandbox_config(&pod, "/log").linux.unwrap().sysctls;
         assert_eq!(sysctls.len(), 2);
-        assert_eq!(sysctls.get("net.core.somaxconn").map(String::as_str), Some("1024"));
+        assert_eq!(
+            sysctls.get("net.core.somaxconn").map(String::as_str),
+            Some("1024")
+        );
         assert_eq!(
             sysctls.get("kernel.shm_rmid_forced").map(String::as_str),
             Some("1")
@@ -788,7 +791,11 @@ mod tests {
     #[test]
     fn no_pod_sysctls_yields_empty_sandbox_map() {
         let pod = pod_with(PodSpec::default());
-        assert!(sandbox_config(&pod, "/log").linux.unwrap().sysctls.is_empty());
+        assert!(sandbox_config(&pod, "/log")
+            .linux
+            .unwrap()
+            .sysctls
+            .is_empty());
     }
 
     #[test]
