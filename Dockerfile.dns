@@ -55,19 +55,28 @@ COPY --from=rhino . /app/rhino
 COPY Cargo.toml Cargo.lock* ./
 
 # Every workspace member's Cargo.toml — cargo refuses to resolve the
-# workspace if any member is missing.
+# workspace if any member is missing. The dns binary only compiles
+# common/storage/client (see the dummy-source loop), but cargo still
+# parses every member manifest, so all 19 must be present here.
+COPY crates/admission-webhook/Cargo.toml  crates/admission-webhook/Cargo.toml
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
 COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/client/Cargo.toml             crates/client/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/cri/Cargo.toml                crates/cri/Cargo.toml
+COPY crates/discovery/Cargo.toml          crates/discovery/Cargo.toml
 COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
 COPY crates/kubectl/Cargo.toml            crates/kubectl/Cargo.toml
 COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
 COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
+COPY crates/middleware/Cargo.toml         crates/middleware/Cargo.toml
+COPY crates/netstack/Cargo.toml           crates/netstack/Cargo.toml
+COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
+COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 COPY crates/api-server/build.rs crates/api-server/build.rs
 COPY crates/api-server/proto    crates/api-server/proto

@@ -88,6 +88,7 @@ COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud
 COPY rusternetes/crates/client/Cargo.toml             ./rusternetes/crates/client/Cargo.toml
 COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
 COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
+COPY rusternetes/crates/cri/Cargo.toml                ./rusternetes/crates/cri/Cargo.toml
 COPY rusternetes/crates/discovery/Cargo.toml          ./rusternetes/crates/discovery/Cargo.toml
 COPY rusternetes/crates/dns/Cargo.toml                ./rusternetes/crates/dns/Cargo.toml
 COPY rusternetes/crates/kubectl/Cargo.toml            ./rusternetes/crates/kubectl/Cargo.toml
@@ -99,22 +100,28 @@ COPY rusternetes/crates/protobuf/Cargo.toml           ./rusternetes/crates/proto
 COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/rusternetes/Cargo.toml
 COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
 COPY rusternetes/crates/storage/Cargo.toml            ./rusternetes/crates/storage/Cargo.toml
+COPY rusternetes/crates/test_support/Cargo.toml       ./rusternetes/crates/test_support/Cargo.toml
 
 # build.rs + proto/. api-server has both; common has a build.rs that stamps
 # the git SHA / build time into the version banner (see build_info.rs).
+# crates/cri/build.rs runs tonic-build over the vendored CRI proto (needs
+# protobuf-compiler, installed in the builder above) — cri is in the
+# all-in-one dep graph via kubelet.
 COPY rusternetes/crates/api-server/build.rs ./rusternetes/crates/api-server/build.rs
 COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/proto
 COPY rusternetes/crates/common/build.rs     ./rusternetes/crates/common/build.rs
+COPY rusternetes/crates/cri/build.rs        ./rusternetes/crates/cri/build.rs
+COPY rusternetes/crates/cri/proto           ./rusternetes/crates/cri/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
 #   - lib only:   common, storage, cloud-providers, netstack, protobuf,
-#                 middleware, admission-webhook, discovery
+#                 middleware, admission-webhook, discovery, cri
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet,
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery; do \
+    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -158,6 +165,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-cloud-providers \
         -p rusternetes-common \
         -p rusternetes-controller-manager \
+        -p rusternetes-cri \
         -p rusternetes-discovery \
         -p rusternetes-dns \
         -p rusternetes-kubectl \
@@ -183,6 +191,7 @@ COPY rusternetes/crates/common/src               ./crates/common/src
 COPY rusternetes/crates/common/tests             ./crates/common/tests
 COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src
 COPY rusternetes/crates/controller-manager/tests ./crates/controller-manager/tests
+COPY rusternetes/crates/cri/src                  ./crates/cri/src
 COPY rusternetes/crates/discovery/src            ./crates/discovery/src
 COPY rusternetes/crates/dns/src                  ./crates/dns/src
 COPY rusternetes/crates/kubectl/src              ./crates/kubectl/src
