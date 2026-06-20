@@ -125,6 +125,104 @@ fn sysctls(pod: &Pod) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// De-duplicate a sequence of strings, preserving first-seen order
+/// (upstream `omitDuplicates`).
+fn dedup<I: IntoIterator<Item = String>>(iter: I) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    iter.into_iter()
+        .filter(|x| seen.insert(x.clone()))
+        .collect()
+}
+
+/// Merge resolv.conf options name-keyed (upstream `mergeDNSOptions`): an option
+/// from the pod's `dnsConfig` overrides a base option of the same name (e.g.
+/// `ndots`), otherwise it is appended. Each option renders as `name` or
+/// `name:value`.
+fn merge_dns_options(
+    base: Vec<String>,
+    extra: &[rusternetes_common::resources::pod::PodDNSConfigOption],
+) -> Vec<String> {
+    let opt_name = |s: &str| s.split(':').next().unwrap_or(s).to_string();
+    let mut out = base;
+    for o in extra {
+        let rendered = match &o.value {
+            Some(v) => format!("{}:{}", o.name, v),
+            None => o.name.clone(),
+        };
+        match out.iter().position(|e| opt_name(e) == o.name) {
+            Some(pos) => out[pos] = rendered,
+            None => out.push(rendered),
+        }
+    }
+    out
+}
+
+/// Build the CRI [`DnsConfig`](v1::DnsConfig) for a pod from its
+/// `dnsPolicy`/`dnsConfig`, the cluster DNS server IPs, and the cluster domain.
+/// Ports the upstream kubelet `dns.Configurer.GetPodDNS`
+/// (`pkg/kubelet/network/dns/dns.go`).
+///
+/// Returns `None` for the `Default` policy — and for `ClusterFirst*` when no
+/// cluster DNS is configured (upstream falls back to `Default` there). Leaving
+/// `PodSandboxConfig.dns_config` unset makes the runtime copy the host's
+/// `/etc/resolv.conf` into the sandbox, which is exactly "inherit node DNS".
+/// (Merging an explicit `dnsConfig` onto the host base for `Default` would need
+/// the kubelet to read the host resolv.conf; not done here.)
+pub fn dns_config(
+    pod: &Pod,
+    cluster_dns: &[String],
+    cluster_domain: &str,
+) -> Option<v1::DnsConfig> {
+    let policy = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.dns_policy.as_deref())
+        // The api-server defaults an unset dnsPolicy to ClusterFirst.
+        .unwrap_or("ClusterFirst");
+
+    let mut cfg = match policy {
+        // DNSNone: empty base, populated solely from the pod's dnsConfig.
+        "None" => v1::DnsConfig::default(),
+        "ClusterFirst" | "ClusterFirstWithHostNet" => {
+            if cluster_dns.is_empty() {
+                return None; // no ClusterDNS -> fall back to Default (host DNS)
+            }
+            let domain = if cluster_domain.is_empty() {
+                "cluster.local"
+            } else {
+                cluster_domain
+            };
+            let ns = namespace(pod);
+            v1::DnsConfig {
+                servers: cluster_dns.to_vec(),
+                searches: vec![
+                    format!("{ns}.svc.{domain}"),
+                    format!("svc.{domain}"),
+                    domain.to_string(),
+                ],
+                options: vec!["ndots:5".to_string()],
+            }
+        }
+        // "Default" and any unknown value: inherit the node's resolv.conf.
+        _ => return None,
+    };
+
+    // appendDNSConfig: additively merge the pod's explicit dnsConfig.
+    if let Some(dns) = pod.spec.as_ref().and_then(|s| s.dns_config.as_ref()) {
+        if let Some(ns) = dns.nameservers.as_ref() {
+            cfg.servers = dedup(cfg.servers.into_iter().chain(ns.iter().cloned()));
+        }
+        if let Some(s) = dns.searches.as_ref() {
+            cfg.searches = dedup(cfg.searches.into_iter().chain(s.iter().cloned()));
+        }
+        if let Some(opts) = dns.options.as_ref() {
+            cfg.options = merge_dns_options(cfg.options, opts);
+        }
+    }
+
+    Some(cfg)
+}
+
 /// Translate the pod into a CRI [`PodSandboxConfig`](v1::PodSandboxConfig).
 ///
 /// `log_directory` is the kubelet-owned dir the runtime writes container logs
@@ -836,6 +934,98 @@ mod tests {
             .unwrap()
             .sysctls
             .is_empty());
+    }
+
+    #[test]
+    fn dns_cluster_first_is_default_with_cluster_searches_and_ndots() {
+        // No dnsPolicy => ClusterFirst (api-server default).
+        let pod = pod_with(PodSpec::default());
+        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local")
+            .expect("ClusterFirst yields a DnsConfig");
+        assert_eq!(dns.servers, vec!["10.96.0.10".to_string()]);
+        assert_eq!(
+            dns.searches,
+            vec![
+                "prod.svc.cluster.local".to_string(), // pod_with sets namespace=prod
+                "svc.cluster.local".to_string(),
+                "cluster.local".to_string(),
+            ]
+        );
+        assert_eq!(dns.options, vec!["ndots:5".to_string()]);
+    }
+
+    #[test]
+    fn dns_default_policy_inherits_host() {
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("Default".to_string()),
+            ..Default::default()
+        });
+        // None => leave dns_config unset so the runtime copies host resolv.conf.
+        assert!(dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").is_none());
+    }
+
+    #[test]
+    fn dns_cluster_first_without_cluster_dns_falls_back_to_host() {
+        let pod = pod_with(PodSpec::default());
+        assert!(dns_config(&pod, &[], "cluster.local").is_none());
+    }
+
+    #[test]
+    fn dns_none_uses_only_pod_dns_config() {
+        use rusternetes_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
+        let pod = pod_with(PodSpec {
+            dns_policy: Some("None".to_string()),
+            dns_config: Some(PodDNSConfig {
+                nameservers: Some(vec!["1.2.3.4".to_string()]),
+                searches: Some(vec!["custom.example".to_string()]),
+                options: Some(vec![PodDNSConfigOption {
+                    name: "ndots".to_string(),
+                    value: Some("2".to_string()),
+                }]),
+            }),
+            ..Default::default()
+        });
+        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").unwrap();
+        // No cluster defaults leak in for policy None.
+        assert_eq!(dns.servers, vec!["1.2.3.4".to_string()]);
+        assert_eq!(dns.searches, vec!["custom.example".to_string()]);
+        assert_eq!(dns.options, vec!["ndots:2".to_string()]);
+    }
+
+    #[test]
+    fn dns_cluster_first_merges_pod_dns_config_and_overrides_ndots() {
+        use rusternetes_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
+        let pod = pod_with(PodSpec {
+            dns_config: Some(PodDNSConfig {
+                nameservers: Some(vec!["1.1.1.1".to_string()]),
+                searches: Some(vec!["extra.example".to_string()]),
+                options: Some(vec![
+                    PodDNSConfigOption {
+                        name: "ndots".to_string(),
+                        value: Some("3".to_string()),
+                    },
+                    PodDNSConfigOption {
+                        name: "edns0".to_string(),
+                        value: None,
+                    },
+                ]),
+            }),
+            ..Default::default()
+        });
+        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").unwrap();
+        // cluster server + appended pod nameserver.
+        assert_eq!(
+            dns.servers,
+            vec!["10.96.0.10".to_string(), "1.1.1.1".to_string()]
+        );
+        // cluster searches + appended pod search.
+        assert!(dns.searches.contains(&"prod.svc.cluster.local".to_string()));
+        assert!(dns.searches.contains(&"extra.example".to_string()));
+        // ndots overridden in place; edns0 appended (no duplicate ndots).
+        assert_eq!(
+            dns.options,
+            vec!["ndots:3".to_string(), "edns0".to_string()]
+        );
     }
 
     #[test]

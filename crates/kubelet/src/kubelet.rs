@@ -371,9 +371,10 @@ impl Kubelet {
         // owned by containerd's CNI plugin, so the netstack/pod-network-mode and
         // unsafe-sysctl knobs from the bollard path are not applied here yet
         // (tracked for the CRI migration follow-ups).
+        // Pod networking is owned by containerd's CNI plugin and unsafe-sysctl
+        // admission is not yet wired on the CRI path (tracked in the CRI
+        // migration follow-ups); cluster DNS is applied below via the runtime.
         let _ = (
-            &cluster_dns,
-            &cluster_domain,
             &network,
             pod_network_mode,
             &netstack,
@@ -407,7 +408,8 @@ impl Kubelet {
             .map_err(|e| anyhow::anyhow!("connecting to CRI runtime at {socket}: {e}"))?
             .with_volumes(volumes)
             .with_event_recorder(storage.clone())
-            .with_service_host(service_host, "443");
+            .with_service_host(service_host, "443")
+            .with_cluster_dns(&cluster_dns, &cluster_domain);
 
         // Log the resolved statvfs path once so operators can see which
         // mount we're measuring for eviction. Upstream cadvisor logs this
