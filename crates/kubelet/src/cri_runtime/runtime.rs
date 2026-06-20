@@ -309,10 +309,11 @@ impl CriContainerRuntime {
         Ok(container_id)
     }
 
-    /// Fetch the ConfigMap/Secret objects a container's `configMapKeyRef` /
-    /// `secretKeyRef` env vars reference, keyed by name, so [`translate`] can
-    /// resolve them without storage access. Mirrors the upstream kubelet's
-    /// configMap/secret managers feeding `makeEnvironmentVariables`. Missing or
+    /// Fetch the ConfigMap/Secret objects a container's env references —
+    /// `configMapKeyRef`/`secretKeyRef` (`valueFrom`) and `configMapRef`/
+    /// `secretRef` (`envFrom`) — keyed by name, so [`translate`] can resolve
+    /// them without storage access. Mirrors the upstream kubelet's configMap/
+    /// secret managers feeding `makeEnvironmentVariables`. Missing or
     /// un-fetchable sources are simply absent from the maps (translate then
     /// omits the var); storage-less smoke runs return empty maps.
     async fn resolve_env_sources(
@@ -328,31 +329,48 @@ impl CriContainerRuntime {
         let Some(storage) = self.volumes.as_ref().and_then(|v| v.storage.as_ref()) else {
             return (config_maps, secrets);
         };
-        let Some(env) = container.env.as_ref() else {
-            return (config_maps, secrets);
-        };
         let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-        for e in env {
-            let Some(src) = e.value_from.as_ref() else {
-                continue;
-            };
-            if let Some(cmr) = src.config_map_key_ref.as_ref() {
-                if !config_maps.contains_key(&cmr.name) {
-                    let key = rusternetes_storage::build_key("configmaps", Some(ns), &cmr.name);
-                    if let Ok(cm) = storage.get::<ConfigMap>(&key).await {
-                        config_maps.insert(cmr.name.clone(), cm);
-                    }
+
+        // Collect the ConfigMap/Secret names referenced by both `valueFrom`
+        // keyrefs and `envFrom` bulk sources, then fetch each once.
+        let mut cm_names: Vec<&str> = Vec::new();
+        let mut secret_names: Vec<&str> = Vec::new();
+        for e in container.env.iter().flatten() {
+            if let Some(src) = e.value_from.as_ref() {
+                if let Some(cmr) = src.config_map_key_ref.as_ref() {
+                    cm_names.push(&cmr.name);
                 }
-            }
-            if let Some(skr) = src.secret_key_ref.as_ref() {
-                if !secrets.contains_key(&skr.name) {
-                    let key = rusternetes_storage::build_key("secrets", Some(ns), &skr.name);
-                    if let Ok(s) = storage.get::<Secret>(&key).await {
-                        secrets.insert(skr.name.clone(), s);
-                    }
+                if let Some(skr) = src.secret_key_ref.as_ref() {
+                    secret_names.push(&skr.name);
                 }
             }
         }
+        for ef in container.env_from.iter().flatten() {
+            if let Some(cmr) = ef.config_map_ref.as_ref() {
+                cm_names.push(&cmr.name);
+            }
+            if let Some(skr) = ef.secret_ref.as_ref() {
+                secret_names.push(&skr.name);
+            }
+        }
+
+        for name in cm_names {
+            if !config_maps.contains_key(name) {
+                let key = rusternetes_storage::build_key("configmaps", Some(ns), name);
+                if let Ok(cm) = storage.get::<ConfigMap>(&key).await {
+                    config_maps.insert(name.to_string(), cm);
+                }
+            }
+        }
+        for name in secret_names {
+            if !secrets.contains_key(name) {
+                let key = rusternetes_storage::build_key("secrets", Some(ns), name);
+                if let Ok(s) = storage.get::<Secret>(&key).await {
+                    secrets.insert(name.to_string(), s);
+                }
+            }
+        }
+
         (config_maps, secrets)
     }
 
