@@ -3053,3 +3053,114 @@ mod watch_bool_tests {
         assert!(!is_watch_request(&HashMap::new()), "no watch param = list");
     }
 }
+
+/// Deterministic unit tests for the watch field/label selector *transition*
+/// logic that backs `[sig-api-machinery] CustomResourceFieldSelectors` (#234):
+/// a watched object that is updated *out of* the selector must surface as a
+/// synthetic `DELETED`, and one updated *into* it as a synthetic `ADDED`, so an
+/// informer's local cache ends up holding exactly the matching objects. Mirrors
+/// upstream `staging/src/k8s.io/apiserver/pkg/storage/cacher`'s
+/// add/update/delete event derivation, exercised here on the pure helpers so
+/// the assertions stay timing-free.
+#[cfg(test)]
+mod selector_transition_tests {
+    use super::*;
+    use rusternetes_common::resources::CustomResource;
+    use rusternetes_common::types::ObjectMeta;
+    use std::collections::HashSet;
+
+    /// A custom resource with a top-level selectable field `color`, matching the
+    /// e2e CRD's `x-kubernetes-selectable-fields: [{ jsonPath: .color }]`.
+    fn cr(name: &str, color: &str) -> CustomResource {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("color".to_string(), serde_json::json!(color));
+        CustomResource {
+            api_version: "stable.example.com/v1".to_string(),
+            kind: "CronTab".to_string(),
+            metadata: ObjectMeta {
+                name: name.to_string(),
+                ..Default::default()
+            },
+            spec: None,
+            status: None,
+            extra,
+        }
+    }
+
+    fn sel(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn added_matches_tracks_exclusions() {
+        let fs = sel("color=blue");
+        let mut excluded = HashSet::new();
+
+        // A non-matching ADDED is dropped and remembered as excluded, so a later
+        // transition INTO the selector can be promoted to ADDED.
+        assert!(!watch_added_matches(
+            &cr("c1", "red"),
+            &None,
+            &fs,
+            &mut excluded
+        ));
+        assert!(excluded.contains("c1"));
+
+        // A matching ADDED passes and is not excluded.
+        assert!(watch_added_matches(
+            &cr("c2", "blue"),
+            &None,
+            &fs,
+            &mut excluded
+        ));
+        assert!(!excluded.contains("c2"));
+    }
+
+    #[test]
+    fn modified_out_of_selector_emits_deleted_once() {
+        let fs = sel("color=blue");
+        let mut excluded = HashSet::new();
+
+        // c1 was matching (not excluded); recolour red → falls out → DELETED.
+        let et = watch_modified_event_type(&cr("c1", "red"), &None, &fs, &mut excluded)
+            .expect("out-of-selector transition must emit an event");
+        assert!(matches!(et, WatchEventType::Deleted));
+        assert!(excluded.contains("c1"));
+
+        // A second non-matching update is suppressed (already excluded).
+        assert!(
+            watch_modified_event_type(&cr("c1", "green"), &None, &fs, &mut excluded).is_none(),
+            "repeat non-match must be suppressed, not a second DELETED"
+        );
+    }
+
+    #[test]
+    fn modified_into_selector_emits_added() {
+        let fs = sel("color=blue");
+        let mut excluded = HashSet::from(["c1".to_string()]);
+
+        // c1 was excluded (red); recolour blue → enters selector → ADDED.
+        let et = watch_modified_event_type(&cr("c1", "blue"), &None, &fs, &mut excluded)
+            .expect("into-selector transition must emit an event");
+        assert!(matches!(et, WatchEventType::Added));
+        assert!(!excluded.contains("c1"));
+    }
+
+    #[test]
+    fn modified_match_to_match_stays_modified() {
+        let fs = sel("color=blue");
+        let mut excluded = HashSet::new();
+        let et = watch_modified_event_type(&cr("c1", "blue"), &None, &fs, &mut excluded)
+            .expect("match→match must emit MODIFIED");
+        assert!(matches!(et, WatchEventType::Modified));
+    }
+
+    #[test]
+    fn modified_without_selector_always_modified() {
+        let mut excluded = HashSet::new();
+        let et = watch_modified_event_type(&cr("c1", "red"), &None, &None, &mut excluded)
+            .expect("no selector must always emit MODIFIED");
+        assert!(matches!(et, WatchEventType::Modified));
+        assert!(excluded.is_empty(), "no selector ⇒ no exclusion tracking");
+    }
+}
