@@ -1052,7 +1052,14 @@ mod tests {
         cm.data = Some(HashMap::from([("COLOR".to_string(), "blue".to_string())]));
         let config_maps = HashMap::from([("cfg".to_string(), cm)]);
 
-        let cfg = container_config(&pod, &c, "img", &HashMap::new(), &config_maps, &HashMap::new());
+        let cfg = container_config(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &config_maps,
+            &HashMap::new(),
+        );
         let colors: Vec<&str> = cfg
             .envs
             .iter()
