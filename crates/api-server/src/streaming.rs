@@ -100,7 +100,7 @@ pub async fn handle_ws_exec(
     );
 
     match crate::cri_exec::open_exec_stream(&mut cri, &container_id, &command, tty, stdin).await {
-        Ok(runtime) => proxy_exec_streams(socket, runtime, &container_id).await,
+        Ok(runtime) => proxy_remotecommand_streams(socket, runtime, &container_id).await,
         Err(e) => {
             warn!(
                 "WS exec: interactive streaming unavailable for {} ({}); falling back to ExecSync",
@@ -111,13 +111,14 @@ pub async fn handle_ws_exec(
     }
 }
 
-/// Bidirectionally proxy a kubectl exec WebSocket (`client`) and the CRI
-/// runtime's exec WebSocket (`runtime`). Both legs speak the identical
-/// channel-framed `v5.channel.k8s.io` protocol (byte 0 = channel), so frames
-/// pass straight through: stdin (0) / resize (4) flow client→runtime; stdout
-/// (1) / stderr (2) / error+status (3) flow runtime→client. Whichever side
-/// closes first ends the session (the runtime closes after the process exits).
-async fn proxy_exec_streams(
+/// Bidirectionally proxy a kubectl remotecommand WebSocket (`client`) and the
+/// CRI runtime's exec/attach WebSocket (`runtime`). Both legs speak the
+/// identical channel-framed `v5.channel.k8s.io` protocol (byte 0 = channel), so
+/// frames pass straight through: stdin (0) / resize (4) flow client→runtime;
+/// stdout (1) / stderr (2) / error+status (3) flow runtime→client. Whichever
+/// side closes first ends the session (the runtime closes when the process
+/// exits or the container detaches).
+async fn proxy_remotecommand_streams(
     client: WebSocket,
     runtime: crate::cri_exec::CriStream,
     container_id: &str,
@@ -332,24 +333,56 @@ pub async fn handle_ws_logs(mut socket: WebSocket, logs: String) {
 
 /// Handle WebSocket attach
 pub async fn handle_ws_attach(
-    mut socket: WebSocket,
+    socket: WebSocket,
     pod: Pod,
     container_name: String,
-    _stdin: bool,
+    stdin: bool,
     _stdout: bool,
     _stderr: bool,
-    _tty: bool,
+    tty: bool,
 ) {
     info!(
-        "WS attach: pod={}, container={}",
-        pod.metadata.name, container_name
+        "WS attach: pod={}, container={} (stdin={}, tty={})",
+        pod.metadata.name, container_name, stdin, tty
     );
-    let _ = socket
-        .send(Message::Text(
-            "Attach not fully implemented in proxy mode".into(),
-        ))
-        .await;
-    let _ = socket.close().await;
+
+    // Channel-3 (error/status) message then close — shared failure path.
+    async fn fail(mut socket: WebSocket, msg: String) {
+        let _ = socket
+            .send(Message::Binary(
+                std::iter::once(3u8).chain(msg.bytes()).collect(),
+            ))
+            .await;
+        let _ = socket.close().await;
+    }
+
+    let mut cri = match crate::cri_exec::connect().await {
+        Ok(c) => c,
+        Err(e) => return fail(socket, format!("Attach error: {e}")).await,
+    };
+
+    let container_id =
+        match crate::cri_exec::resolve_container_id(&mut cri, &pod, &container_name).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return fail(
+                    socket,
+                    format!("Attach error: container {container_name} not found"),
+                )
+                .await
+            }
+            Err(e) => return fail(socket, format!("Attach error: {e}")).await,
+        };
+
+    // Attach hooks the container's running process stdio over CRI and proxies it
+    // WS↔WS, identical to exec but with no command (#1256).
+    match crate::cri_exec::open_attach_stream(&mut cri, &container_id, tty, stdin).await {
+        Ok(runtime) => proxy_remotecommand_streams(socket, runtime, &container_id).await,
+        Err(e) => {
+            error!("WS attach: streaming failed for {}: {}", container_id, e);
+            fail(socket, format!("Attach error: {e}")).await
+        }
+    }
 }
 
 /// Simple URL encoding

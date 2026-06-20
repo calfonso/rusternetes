@@ -85,35 +85,12 @@ pub fn stream_target() -> (String, u16) {
     (host, port)
 }
 
-/// Open an interactive exec WebSocket to a container over CRI.
-///
-/// Calls the streaming `Exec` RPC, rewrites the runtime-advertised URL host to
-/// the reachable [`stream_target`], and opens a WebSocket carrying the
-/// `v5.channel.k8s.io` subprotocol. The returned stream speaks the same
-/// channel-framed protocol the api-server exposes to kubectl, so the exec
-/// handler proxies frames straight through. (Interactive streaming exec, #1256.)
-pub async fn open_exec_stream(
-    cri: &mut CriClient,
-    container_id: &str,
-    cmd: &[String],
-    tty: bool,
-    stdin: bool,
-) -> anyhow::Result<CriStream> {
-    // CRI forbids tty && stderr both set; with a TTY stdout+stderr are merged.
-    let url = cri
-        .exec(v1::ExecRequest {
-            container_id: container_id.to_string(),
-            cmd: cmd.to_vec(),
-            tty,
-            stdin,
-            stdout: true,
-            stderr: !tty,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("CRI Exec for {container_id}: {e}"))?;
-
+/// Open a WebSocket to a runtime streaming URL (exec / attach / port-forward).
+/// Rewrites the advertised host to the reachable [`stream_target`], converts the
+/// http(s) scheme to ws(s), and negotiates the channel-protocol subprotocol.
+async fn connect_stream(url: &str) -> anyhow::Result<CriStream> {
     let (host, port) = stream_target();
-    let rewritten = rewrite_stream_url(&url, &host, port)?;
+    let rewritten = rewrite_stream_url(url, &host, port)?;
     // tungstenite needs a ws:// scheme; the runtime hands back http(s)://.
     let ws_url = if let Some(rest) = rewritten.strip_prefix("http://") {
         format!("ws://{rest}")
@@ -141,6 +118,55 @@ pub async fn open_exec_stream(
         .await
         .map_err(|e| anyhow::anyhow!("connecting to CRI stream {ws_url:?}: {e}"))?;
     Ok(stream)
+}
+
+/// Open an interactive exec WebSocket to a container over CRI.
+///
+/// Calls the streaming `Exec` RPC, then [`connect_stream`]s to the returned URL.
+/// The stream speaks the same channel-framed protocol the api-server exposes to
+/// kubectl, so the exec handler proxies frames straight through. (#1256.)
+pub async fn open_exec_stream(
+    cri: &mut CriClient,
+    container_id: &str,
+    cmd: &[String],
+    tty: bool,
+    stdin: bool,
+) -> anyhow::Result<CriStream> {
+    // CRI forbids tty && stderr both set; with a TTY stdout+stderr are merged.
+    let url = cri
+        .exec(v1::ExecRequest {
+            container_id: container_id.to_string(),
+            cmd: cmd.to_vec(),
+            tty,
+            stdin,
+            stdout: true,
+            stderr: !tty,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("CRI Exec for {container_id}: {e}"))?;
+    connect_stream(&url).await
+}
+
+/// Open an interactive attach WebSocket to a container's running process over
+/// CRI. Like [`open_exec_stream`] but hooks the container's existing stdio
+/// (no command). Used by the WS attach handler. (#1256.)
+pub async fn open_attach_stream(
+    cri: &mut CriClient,
+    container_id: &str,
+    tty: bool,
+    stdin: bool,
+) -> anyhow::Result<CriStream> {
+    let url = cri
+        .attach(v1::AttachRequest {
+            container_id: container_id.to_string(),
+            stdin,
+            tty,
+            stdout: true,
+            stderr: !tty,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("CRI Attach for {container_id}: {e}"))?;
+    connect_stream(&url).await
 }
 
 /// Resolve the CRI container id for a pod's named container.
