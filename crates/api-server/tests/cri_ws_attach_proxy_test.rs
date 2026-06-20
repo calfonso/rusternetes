@@ -39,9 +39,11 @@ async fn open_attach_stream_echoes_stdin_on_stdout_from_live_containerd() {
         .expect("connect to CRI runtime");
 
     // Attach to the container's stdio with stdin enabled.
-    let mut ws = cri_exec::open_attach_stream(&mut cri, &container, /*tty*/ false, /*stdin*/ true)
-        .await
-        .expect("open interactive attach stream to containerd");
+    let mut ws = cri_exec::open_attach_stream(
+        &mut cri, &container, /*tty*/ false, /*stdin*/ true,
+    )
+    .await
+    .expect("open interactive attach stream to containerd");
 
     // Write a line on the stdin channel (byte 0 = stdin).
     let mut stdin_frame = vec![0u8];

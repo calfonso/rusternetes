@@ -66,9 +66,8 @@ pub fn rewrite_stream_url(stream_url: &str, host: &str, port: u16) -> anyhow::Re
 
 /// A WebSocket stream to the CRI runtime's streaming server, carrying the
 /// channel-framed `remotecommand` protocol (byte 0 = channel).
-pub type CriStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+pub type CriStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Host:port the api-server dials to reach containerd's CRI streaming server.
 ///
@@ -78,8 +77,7 @@ pub type CriStream = tokio_tungstenite::WebSocketStream<
 /// compose service on the fixed stream port (`deploy/containerd/config.toml`);
 /// override with `CONTAINERD_STREAM_HOST` / `CONTAINERD_STREAM_PORT`.
 pub fn stream_target() -> (String, u16) {
-    let host =
-        std::env::var("CONTAINERD_STREAM_HOST").unwrap_or_else(|_| "containerd".to_string());
+    let host = std::env::var("CONTAINERD_STREAM_HOST").unwrap_or_else(|_| "containerd".to_string());
     let port = std::env::var("CONTAINERD_STREAM_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
