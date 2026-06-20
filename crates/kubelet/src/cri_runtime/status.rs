@@ -28,6 +28,71 @@ fn empty_to_none(s: &str) -> Option<String> {
     }
 }
 
+/// Upstream `kubecontainer.MaxContainerTerminationMessageLength` (release-1.35,
+/// `pkg/kubelet/container/helpers.go`): the termination message is capped at 4
+/// KiB, keeping the trailing bytes.
+pub const MAX_TERMINATION_MESSAGE_LENGTH: usize = 1024 * 4;
+
+/// Resolve a terminated container's `message` the way upstream
+/// `kuberuntime_container.go::getTerminationMessage` does.
+///
+/// `file_read` is `Some(contents)` when the termination-message file
+/// (`terminationMessagePath`, default `/dev/termination-log`) was readable —
+/// even if empty — and `None` when it was absent/unreadable. `policy` is the
+/// container's `terminationMessagePolicy` (`"File"` by default, or
+/// `"FallbackToLogsOnError"`). `log_tail` lazily supplies the tail of the
+/// container log; it is consulted only on the fallback path.
+///
+/// Upstream contract (the file read `return`s as soon as it succeeds, so logs
+/// are a fallback only when the file is unreadable):
+/// - file readable → its contents win, even on a clean exit (this is the
+///   `[sig-node] ... report termination message from file when pod succeeds`
+///   conformance case). An empty file maps to `None` so we don't clobber the
+///   runtime-supplied message with a blank.
+/// - file unreadable → only `FallbackToLogsOnError` with a non-zero exit (or an
+///   OOMKilled reason) reads the log tail.
+///
+/// The chosen message is truncated to the last [`MAX_TERMINATION_MESSAGE_LENGTH`]
+/// bytes, mirroring upstream's `tail.ReadAtMost`.
+pub fn resolve_termination_message(
+    file_read: Option<String>,
+    policy: &str,
+    exit_code: i32,
+    reason: Option<&str>,
+    log_tail: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(contents) = file_read {
+        return non_empty(truncate_tail(&contents));
+    }
+    let fallback =
+        policy == "FallbackToLogsOnError" && (exit_code != 0 || reason == Some("OOMKilled"));
+    if fallback {
+        return log_tail().and_then(|l| non_empty(truncate_tail(&l)));
+    }
+    None
+}
+
+/// Keep the last [`MAX_TERMINATION_MESSAGE_LENGTH`] bytes of `s`, snapped to a
+/// char boundary so the result stays valid UTF-8.
+fn truncate_tail(s: &str) -> String {
+    if s.len() <= MAX_TERMINATION_MESSAGE_LENGTH {
+        return s.to_string();
+    }
+    let want = s.len() - MAX_TERMINATION_MESSAGE_LENGTH;
+    let start = (want..s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len());
+    s[start..].to_string()
+}
+
+fn non_empty(s: String) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Map the CRI runtime state into a rusternetes [`ContainerState`].
 fn map_state(cri: &v1::ContainerStatus) -> ContainerState {
     match v1::ContainerState::try_from(cri.state).unwrap_or(v1::ContainerState::ContainerUnknown) {
@@ -100,6 +165,99 @@ mod tests {
             exit_code: 0,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn termination_message_from_file_on_success() {
+        // #442: pod succeeds (exit 0), policy FallbackToLogsOnError, file has
+        // content -> message MUST be the file content (file wins over logs).
+        let msg = resolve_termination_message(
+            Some("DONE".to_string()),
+            "FallbackToLogsOnError",
+            0,
+            Some("Completed"),
+            || panic!("logs must not be read when the file is readable"),
+        );
+        assert_eq!(msg.as_deref(), Some("DONE"));
+    }
+
+    #[test]
+    fn termination_message_file_wins_for_file_policy() {
+        let msg = resolve_termination_message(
+            Some("from-file".to_string()),
+            "File",
+            1,
+            Some("Error"),
+            || Some("from-logs".to_string()),
+        );
+        assert_eq!(msg.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn termination_message_empty_file_yields_none() {
+        // A readable-but-empty file returns "" upstream; we map that to None so
+        // the runtime-provided message isn't clobbered with a blank.
+        let msg = resolve_termination_message(
+            Some(String::new()),
+            "FallbackToLogsOnError",
+            1,
+            Some("Error"),
+            || Some("from-logs".to_string()),
+        );
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn termination_message_fallback_to_logs_on_error() {
+        // File unreadable + FallbackToLogsOnError + non-zero exit -> log tail.
+        let msg =
+            resolve_termination_message(None, "FallbackToLogsOnError", 1, Some("Error"), || {
+                Some("boom from logs".to_string())
+            });
+        assert_eq!(msg.as_deref(), Some("boom from logs"));
+    }
+
+    #[test]
+    fn termination_message_no_fallback_on_clean_exit() {
+        // FallbackToLogsOnError but exit 0 and no file -> no log fallback.
+        let msg = resolve_termination_message(
+            None,
+            "FallbackToLogsOnError",
+            0,
+            Some("Completed"),
+            || Some("logs".to_string()),
+        );
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn termination_message_fallback_on_oomkilled() {
+        // OOMKilled counts as an error case for the log fallback even at exit 0.
+        let msg = resolve_termination_message(
+            None,
+            "FallbackToLogsOnError",
+            0,
+            Some("OOMKilled"),
+            || Some("oom logs".to_string()),
+        );
+        assert_eq!(msg.as_deref(), Some("oom logs"));
+    }
+
+    #[test]
+    fn termination_message_file_policy_never_reads_logs() {
+        // Default "File" policy: an unreadable file yields no message, never logs.
+        let msg = resolve_termination_message(None, "File", 1, Some("Error"), || {
+            panic!("File policy must not read logs")
+        });
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn termination_message_truncates_to_tail() {
+        let big = "x".repeat(MAX_TERMINATION_MESSAGE_LENGTH + 100) + "TAIL";
+        let msg = resolve_termination_message(Some(big), "File", 0, None, || None).unwrap();
+        assert_eq!(msg.len(), MAX_TERMINATION_MESSAGE_LENGTH);
+        assert!(msg.ends_with("TAIL"), "must keep the trailing bytes");
     }
 
     #[test]
