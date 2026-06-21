@@ -6,6 +6,7 @@
 //! [`metav1`] for the metav1 validators.
 
 pub mod apps;
+pub mod certificatesigningrequest;
 pub mod csistoragecapacity;
 pub mod endpointslice;
 pub mod events;

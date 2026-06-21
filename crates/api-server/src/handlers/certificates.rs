@@ -41,6 +41,15 @@ pub async fn create_certificate_signing_request(
         crate::handlers::validation::NameKind::NoConstraint,
     )?;
 
+    // Field validation (mirrors upstream ValidateCertificateSigningRequestCreate).
+    {
+        let errs =
+            rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_create(&csr);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Enrich metadata with system fields
     csr.metadata.ensure_uid();
     csr.metadata.ensure_creation_timestamp();

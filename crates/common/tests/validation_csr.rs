@@ -1,0 +1,108 @@
+use rusternetes_common::resources::certificates::CertificateSigningRequest;
+use rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_create;
+use serde_json::json;
+
+fn csr(spec: serde_json::Value) -> CertificateSigningRequest {
+    serde_json::from_value(json!({
+        "apiVersion": "certificates.k8s.io/v1",
+        "kind": "CertificateSigningRequest",
+        "metadata": {"name": "csr-1"},
+        "spec": spec
+    }))
+    .unwrap()
+}
+
+fn valid_spec() -> serde_json::Value {
+    json!({
+        "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+        "signerName": "kubernetes.io/kube-apiserver-client",
+        "usages": ["client auth", "digital signature"]
+    })
+}
+
+#[test]
+fn valid_csr_passes() {
+    assert!(validate_certificate_signing_request_create(&csr(valid_spec())).is_empty());
+}
+
+#[test]
+fn empty_request_rejected() {
+    let mut s = valid_spec();
+    s["request"] = json!("");
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("request")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn usages_required() {
+    let mut s = valid_spec();
+    s["usages"] = json!([]);
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("usages")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn duplicate_usages_rejected() {
+    let mut s = valid_spec();
+    s["usages"] = json!(["client auth", "client auth"]);
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("usages")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn signer_name_must_be_domain_slash_path() {
+    let mut s = valid_spec();
+    s["signerName"] = json!("no-slash");
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("signerName")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn signer_name_domain_needs_two_segments() {
+    let mut s = valid_spec();
+    s["signerName"] = json!("nodot/path");
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("signerName")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn legacy_signer_name_rejected() {
+    let mut s = valid_spec();
+    s["signerName"] = json!("kubernetes.io/legacy-unknown");
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("legacy")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn expiration_seconds_floor() {
+    let mut s = valid_spec();
+    s["expirationSeconds"] = json!(599);
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("expirationSeconds")),
+        "{errs:?}"
+    );
+
+    let mut ok = valid_spec();
+    ok["expirationSeconds"] = json!(600);
+    assert!(validate_certificate_signing_request_create(&csr(ok)).is_empty());
+}
