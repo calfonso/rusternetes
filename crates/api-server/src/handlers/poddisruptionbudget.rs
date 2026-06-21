@@ -46,6 +46,14 @@ pub async fn create(
     // Reject create with neither name nor generateName (#1065).
     crate::handlers::validation::require_object_name(&pdb.metadata)?;
 
+    // Field validation (mirrors upstream ValidatePodDisruptionBudget).
+    {
+        let errs = rusternetes_common::validation::pdb::validate_pod_disruption_budget(&pdb);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     pdb.metadata.namespace = Some(namespace.clone());
     pdb.metadata.ensure_uid();
     pdb.metadata.ensure_creation_timestamp();
