@@ -202,3 +202,51 @@ async fn priority_class_value_is_immutable_on_patch() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], 700, "value must remain immutable: {body}");
 }
+
+/// At most one PriorityClass may be `globalDefault: true` (upstream priority
+/// admission plugin). Creating a second default is rejected with 403 Forbidden;
+/// re-applying the same default class via PUT is allowed.
+#[tokio::test]
+async fn priority_class_global_default_uniqueness() {
+    let state = TestApiServer::new();
+
+    let mut first = sample_priority_class("default-a", 1000);
+    first["globalDefault"] = json!(true);
+    let (code, _) = post_json(&state, PC_COLLECTION, &first).await;
+    assert_eq!(code, StatusCode::CREATED, "first default must be accepted");
+
+    // A second globalDefault PriorityClass conflicts.
+    let mut second = sample_priority_class("default-b", 2000);
+    second["globalDefault"] = json!(true);
+    let (code, _) = post_json(&state, PC_COLLECTION, &second).await;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "second globalDefault PriorityClass must be rejected"
+    );
+
+    // A non-default PriorityClass is fine.
+    let third = sample_priority_class("regular", 500);
+    let (code, _) = post_json(&state, PC_COLLECTION, &third).await;
+    assert_eq!(code, StatusCode::CREATED, "non-default must be accepted");
+
+    // Re-applying the existing default via PUT is allowed (same name).
+    let mut reapply = sample_priority_class("default-a", 1000);
+    reapply["globalDefault"] = json!(true);
+    let (code, _) = put_json(&state, &format!("{PC_COLLECTION}/default-a"), &reapply).await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "re-marking the same class default must be allowed"
+    );
+
+    // Marking the regular class as default while default-a exists is rejected.
+    let mut promote = sample_priority_class("regular", 500);
+    promote["globalDefault"] = json!(true);
+    let (code, _) = put_json(&state, &format!("{PC_COLLECTION}/regular"), &promote).await;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "promoting a second class to default must be rejected"
+    );
+}

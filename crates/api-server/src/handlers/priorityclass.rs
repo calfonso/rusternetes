@@ -16,6 +16,27 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Find an existing PriorityClass marked `globalDefault: true`, if any.
+///
+/// Mirrors the upstream priority admission plugin's `getDefaultPriorityClass`
+/// (plugin/pkg/admission/priority/admission.go): when more than one default
+/// exists (race), the one with the lowest `value` wins. Returns the name of
+/// the chosen default.
+async fn find_default_priority_class(state: &Arc<ApiServerState>) -> Result<Option<String>> {
+    let prefix = build_prefix("priorityclasses", None);
+    let existing = state.storage.list::<PriorityClass>(&prefix).await?;
+    let mut default: Option<&PriorityClass> = None;
+    for pc in &existing {
+        if pc.global_default == Some(true) {
+            match default {
+                Some(cur) if cur.value <= pc.value => {}
+                _ => default = Some(pc),
+            }
+        }
+    }
+    Ok(default.map(|pc| pc.metadata.name.clone()))
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -48,6 +69,16 @@ pub async fn create(
     // Enrich metadata with system fields
     priority_class.metadata.ensure_uid();
     priority_class.metadata.ensure_creation_timestamp();
+
+    // At most one PriorityClass may be globalDefault (upstream priority
+    // admission plugin). On create, any existing default conflicts.
+    if priority_class.global_default == Some(true) {
+        if let Some(existing_default) = find_default_priority_class(&state).await? {
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "PriorityClass {existing_default} is already marked as default. Only one default can exist"
+            )));
+        }
+    }
 
     let key = build_key("priorityclasses", None, &priority_class.metadata.name);
 
@@ -125,6 +156,19 @@ pub async fn update(
                 "PriorityClass.value: Invalid value: \"{}\": field is immutable",
                 priority_class.value
             )));
+        }
+    }
+
+    // At most one PriorityClass may be globalDefault (upstream priority
+    // admission plugin). On update, a different existing default conflicts;
+    // re-marking the same class is allowed.
+    if priority_class.global_default == Some(true) {
+        if let Some(existing_default) = find_default_priority_class(&state).await? {
+            if existing_default != name {
+                return Err(rusternetes_common::Error::Forbidden(format!(
+                    "PriorityClass {existing_default} is already marked as default. Only one default can exist"
+                )));
+            }
         }
     }
 
