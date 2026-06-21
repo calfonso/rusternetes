@@ -237,6 +237,24 @@ pub fn apply_statefulset_defaults(ss: &mut rusternetes_common::resources::Statef
     if ss.spec.revision_history_limit.is_none() {
         ss.spec.revision_history_limit = Some(10);
     }
+    // SetDefaults_StatefulSet: persistentVolumeClaimRetentionPolicy defaults to
+    // a struct with whenDeleted=Retain and whenScaled=Retain.
+    {
+        use rusternetes_common::resources::workloads::StatefulSetPersistentVolumeClaimRetentionPolicy;
+        let policy = ss
+            .spec
+            .persistent_volume_claim_retention_policy
+            .get_or_insert(StatefulSetPersistentVolumeClaimRetentionPolicy {
+                when_deleted: None,
+                when_scaled: None,
+            });
+        if policy.when_deleted.as_deref().unwrap_or("").is_empty() {
+            policy.when_deleted = Some("Retain".to_string());
+        }
+        if policy.when_scaled.as_deref().unwrap_or("").is_empty() {
+            policy.when_scaled = Some("Retain".to_string());
+        }
+    }
     apply_pod_template_defaults(&mut ss.spec.template);
 }
 
