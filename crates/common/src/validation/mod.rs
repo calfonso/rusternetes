@@ -18,6 +18,7 @@ pub mod field;
 pub mod hpa;
 pub mod ingress;
 pub mod ingressclass;
+pub mod ipaddress;
 pub mod job;
 pub mod lease;
 pub mod limitrange;

@@ -43,6 +43,14 @@ pub async fn create_ipaddress(
         crate::handlers::validation::NameKind::Ip,
     )?;
 
+    // Field validation (mirrors upstream ValidateIPAddress — spec.parentRef).
+    {
+        let errs = rusternetes_common::validation::ipaddress::validate_ip_address(&ipaddress);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Enrich metadata with system fields
     ipaddress.metadata.ensure_uid();
     ipaddress.metadata.ensure_creation_timestamp();
