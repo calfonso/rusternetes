@@ -136,6 +136,17 @@ pub async fn update(
 
     let key = build_key("networkpolicies", Some(&namespace), &name);
 
+    // Field validation on update (mirrors upstream ValidateNetworkPolicyUpdate,
+    // which re-runs ValidateNetworkPolicySpec on the new object). The create
+    // path validated but the update path previously persisted PUTs unchecked.
+    {
+        let errs =
+            rusternetes_common::validation::networkpolicy::validate_network_policy(&network_policy);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
