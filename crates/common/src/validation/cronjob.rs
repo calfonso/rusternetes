@@ -8,8 +8,10 @@
 //! 52-character name cap (the controller appends an 11-char `-$TIMESTAMP`
 //! suffix when creating Jobs).
 //!
-//! `time.LoadLocation`-style timezone-DB existence checking is omitted (no tz DB
-//! dependency in this crate); the IANA naming-character rules are enforced.
+//! `timeZone` is fully validated: the IANA naming-character rules, the `Local`
+//! rejection, and the tz-DB existence check (upstream `time.LoadLocation`),
+//! resolved via `chrono_tz` — the same lookup the CronJob controller schedules
+//! with, so a zone accepted at create is also schedulable.
 
 use crate::resources::CronJob;
 use crate::validation::field::{Error, ErrorList, Path};
@@ -58,8 +60,9 @@ fn validate_schedule_format(schedule: &str, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Port of upstream `validateTimeZone` (naming rules only; tz-DB existence check
-/// is omitted — see module docs).
+/// Port of upstream `validateTimeZone`: naming-character rules, the `Local`
+/// rejection, and the tz-DB existence check (upstream `time.LoadLocation`),
+/// resolved via `chrono_tz` — the same lookup the CronJob controller uses.
 fn validate_time_zone(time_zone: Option<&str>, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let Some(tz) = time_zone else {
@@ -88,6 +91,19 @@ fn validate_time_zone(time_zone: Option<&str>, fld_path: &Path) -> ErrorList {
             fld_path,
             tz.to_string(),
             "timeZone must be an explicit time zone as defined in https://www.iana.org/time-zones",
+        ));
+        // Upstream `time.LoadLocation("Local")` succeeds, so it adds no further
+        // error here — return before the tz-DB check to match that behaviour.
+        return errs;
+    }
+    // tz-DB existence — upstream `time.LoadLocation`. Resolve against the same
+    // IANA database the CronJob controller schedules with so a zone accepted at
+    // create is also schedulable.
+    if tz.parse::<chrono_tz::Tz>().is_err() {
+        errs.push(Error::invalid(
+            fld_path,
+            tz.to_string(),
+            format!("unknown time zone {tz}"),
         ));
     }
     errs
@@ -166,4 +182,60 @@ pub fn validate_cron_job(cj: &CronJob) -> ErrorList {
     }
 
     errs
+}
+
+#[cfg(test)]
+mod time_zone_tests {
+    use super::validate_time_zone;
+    use crate::validation::field::Path;
+
+    fn check(tz: Option<&str>) -> Vec<String> {
+        validate_time_zone(tz, &Path::new("spec").child("timeZone"))
+            .into_iter()
+            .map(|e| e.detail)
+            .collect()
+    }
+
+    #[test]
+    fn nil_and_valid_zones_pass() {
+        assert!(check(None).is_empty());
+        assert!(check(Some("UTC")).is_empty());
+        assert!(check(Some("America/New_York")).is_empty());
+        assert!(check(Some("Europe/Amsterdam")).is_empty());
+    }
+
+    #[test]
+    fn empty_string_rejected() {
+        assert!(!check(Some("")).is_empty());
+    }
+
+    #[test]
+    fn syntactically_valid_but_unknown_zone_rejected() {
+        // The naming-character rules pass, but the zone is not in the tz DB.
+        let errs = check(Some("Foo/Bar"));
+        assert!(
+            errs.iter().any(|d| d.contains("unknown time zone Foo/Bar")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn local_rejected_once() {
+        let errs = check(Some("Local"));
+        assert_eq!(
+            errs.len(),
+            1,
+            "Local must yield exactly one error: {errs:?}"
+        );
+        assert!(errs[0].contains("explicit time zone"), "{errs:?}");
+    }
+
+    #[test]
+    fn bad_naming_characters_rejected() {
+        let errs = check(Some("../etc"));
+        assert!(
+            errs.iter().any(|d| d.contains("unknown time zone")),
+            "{errs:?}"
+        );
+    }
 }

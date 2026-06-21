@@ -33,6 +33,10 @@ x509-parser = "0.16"
 regex = "1.10"
 once_cell = "1.19"
 cron = "0.12"
+# IANA tz-DB lookup for CronJob spec.timeZone existence check (upstream
+# validateTimeZone's time.LoadLocation). Same crate/version the CronJob
+# controller resolves zones with, so create-validation and scheduling agree.
+chrono-tz = "0.10"
 etcd-client.workspace = true
 sha2 = "0.10.9"
 reqwest = { workspace = true }
