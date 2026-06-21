@@ -15,10 +15,12 @@
 //! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/apps/validation/validation.go>
 
 use crate::resources::deployment::{Deployment, DeploymentStrategy, RollingUpdateDeployment};
-use crate::resources::workloads::{ReplicaSet, ReplicaSetSpec};
+use crate::resources::workloads::{ReplicaSet, ReplicaSetSpec, StatefulSet, StatefulSetSpec};
 use crate::types::LabelSelector;
 use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::{validate_label_selector, LabelSelectorValidationOptions};
+use crate::validation::metav1::{
+    is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -403,6 +405,142 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
 /// Validate a new `ReplicaSet`. Mirrors upstream `ValidateReplicaSet`.
 pub fn validate_replicaset(rs: &ReplicaSet) -> ErrorList {
     validate_replicaset_spec(&rs.spec, &Path::new("spec"))
+}
+
+/// Validate a `StatefulSetSpec`. Mirrors upstream `ValidateStatefulSetSpec`
+/// (`pkg/apis/apps/validation/validation.go`). Intended to run *after*
+/// defaulting (the api-server defaults `podManagementPolicy` and
+/// `updateStrategy`), so the "required when empty" arms match upstream without
+/// rejecting objects that merely relied on defaulting.
+fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // podManagementPolicy: OrderedReady | Parallel.
+    match spec.pod_management_policy.as_deref() {
+        None | Some("") => errs.push(Error::required(&fld_path.child("podManagementPolicy"), "")),
+        Some("OrderedReady") | Some("Parallel") => {}
+        Some(other) => errs.push(Error::invalid(
+            &fld_path.child("podManagementPolicy"),
+            other.to_string(),
+            "must be 'OrderedReady' or 'Parallel'",
+        )),
+    }
+
+    // updateStrategy: RollingUpdate | OnDelete.
+    let us_path = fld_path.child("updateStrategy");
+    match &spec.update_strategy {
+        None => errs.push(Error::required(&us_path, "")),
+        Some(us) => match us.strategy_type.as_deref() {
+            None | Some("") => errs.push(Error::required(&us_path, "")),
+            Some("OnDelete") => {
+                if us.rolling_update.is_some() {
+                    errs.push(Error::invalid(
+                        &us_path.child("rollingUpdate"),
+                        "<set>".to_string(),
+                        "only allowed for updateStrategy 'RollingUpdate'",
+                    ));
+                }
+            }
+            Some("RollingUpdate") => {
+                if let Some(ru) = &us.rolling_update {
+                    if let Some(p) = ru.partition {
+                        if p < 0 {
+                            errs.push(Error::invalid(
+                                &us_path.child("rollingUpdate").child("partition"),
+                                p,
+                                "must be greater than or equal to 0",
+                            ));
+                        }
+                    }
+                }
+            }
+            Some(other) => errs.push(Error::invalid(
+                &us_path,
+                other.to_string(),
+                "must be 'RollingUpdate' or 'OnDelete'",
+            )),
+        },
+    }
+
+    // replicas >= 0
+    if let Some(r) = spec.replicas {
+        if r < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("replicas"),
+                r,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // minReadySeconds >= 0
+    if let Some(mrs) = spec.min_ready_seconds {
+        if mrs < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("minReadySeconds"),
+                mrs,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // ordinals.start >= 0
+    if let Some(ords) = &spec.ordinals {
+        if let Some(start) = ords.start {
+            if start < 0 {
+                errs.push(Error::invalid(
+                    &fld_path.child("ordinals.start"),
+                    start,
+                    "must be greater than or equal to 0",
+                ));
+            }
+        }
+    }
+
+    // serviceName, when set, must be a DNS-1123 label.
+    if !spec.service_name.is_empty() {
+        for msg in is_dns1123_label(&spec.service_name) {
+            errs.push(Error::invalid(
+                &fld_path.child("serviceName"),
+                spec.service_name.clone(),
+                msg,
+            ));
+        }
+    }
+
+    // selector is required and must be non-empty + valid; template labels must
+    // satisfy it.
+    if selector_is_empty(&spec.selector) {
+        errs.push(Error::required(
+            &fld_path.child("selector"),
+            "must be specified",
+        ));
+    } else {
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
+            &fld_path.child("selector"),
+        ));
+        let template_labels = spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.labels.clone())
+            .unwrap_or_default();
+        errs.extend(template_labels_match_selector(
+            &spec.selector,
+            &template_labels,
+            &fld_path.child("template").child("metadata").child("labels"),
+        ));
+    }
+
+    errs
+}
+
+/// Validate a new `StatefulSet`. Mirrors upstream `ValidateStatefulSet`.
+/// Run after defaulting (see [`validate_statefulset_spec`]).
+pub fn validate_statefulset(ss: &StatefulSet) -> ErrorList {
+    validate_statefulset_spec(&ss.spec, &Path::new("spec"))
 }
 
 /// Validate a `Deployment` update (`new` replaces `old`). Mirrors upstream
