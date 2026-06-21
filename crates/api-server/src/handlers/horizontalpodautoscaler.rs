@@ -50,6 +50,12 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // SetDefaults_HorizontalPodAutoscaler (pkg/apis/autoscaling/v1/defaults.go):
+    // spec.minReplicas defaults to 1 when unset.
+    if hpa.spec.min_replicas.is_none() {
+        hpa.spec.min_replicas = Some(1);
+    }
+
     // Field validation (mirrors upstream ValidateHorizontalPodAutoscaler).
     {
         let errs = rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler(&hpa);
