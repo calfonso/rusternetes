@@ -47,6 +47,14 @@ pub async fn create_validating_webhook(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Field validation (mirrors upstream ValidateValidatingWebhookConfiguration).
+    {
+        let errs = rusternetes_common::validation::webhookconfiguration::validate_validating_webhook_configuration(&config);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Validate matchConditions CEL expressions with type-checking
     if let Some(webhooks) = &config.webhooks {
         for webhook in webhooks {
@@ -365,6 +373,14 @@ pub async fn create_mutating_webhook(
         None,
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
+
+    // Field validation (mirrors upstream ValidateMutatingWebhookConfiguration).
+    {
+        let errs = rusternetes_common::validation::webhookconfiguration::validate_mutating_webhook_configuration(&config);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     // Validate matchConditions CEL expressions with type-checking
     if let Some(webhooks) = &config.webhooks {

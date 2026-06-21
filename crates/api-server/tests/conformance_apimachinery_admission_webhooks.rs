@@ -1478,7 +1478,7 @@ async fn listing_validating_webhooks_should_work() {
             webhooks: Some(vec![ValidatingWebhook {
                 rules: vec![rule_for("", "v1", "configmaps")],
                 ..validating(
-                    &format!("{name}.io"),
+                    &format!("{name}.k8s.io"),
                     "https://example.invalid/hook".to_string(),
                     vec![],
                     Some(FailurePolicy::Ignore),
@@ -1547,7 +1547,7 @@ async fn listing_mutating_webhooks_should_work() {
             webhooks: Some(vec![MutatingWebhook {
                 rules: vec![rule_for("", "v1", "configmaps")],
                 ..mutating(
-                    &format!("{name}.io"),
+                    &format!("{name}.k8s.io"),
                     "https://example.invalid/hook".to_string(),
                     vec![],
                     Some(FailurePolicy::Ignore),
