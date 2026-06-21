@@ -2,10 +2,10 @@
 //! `pkg/apis/core/validation/validation.go::ValidateResourceQuotaSpec`
 //! (release-1.35).
 //!
-//! Scope: `hard` quantities (valid, non-negative) and `scopes` (known values,
-//! no conflicting pairs). The per-resource integer check, deep resource-name
-//! qualification, and `scopeSelector` match-expression validation are left as a
-//! follow-up.
+//! Scope: `hard` quantities (valid, non-negative), `scopes` (known values, no
+//! conflicting pairs), and `scopeSelector.matchExpressions` (scope name +
+//! operator/values consistency + conflicting pairs). The per-resource integer
+//! check and deep resource-name qualification are left as a follow-up.
 
 use crate::quantity::Quantity;
 use crate::resources::policy::{ResourceQuota, ResourceQuotaSpec};
@@ -76,6 +76,89 @@ pub fn validate_resource_quota_spec(spec: &ResourceQuotaSpec, fld_path: &Path) -
         }
     }
 
+    // scopeSelector.matchExpressions
+    errs.extend(validate_scope_selector(spec, fld_path));
+
+    errs
+}
+
+/// Scopes that must use the `Exists` operator in a scopeSelector (only
+/// `PriorityClass` supports `In`/`NotIn` with values).
+const EXISTS_ONLY_SCOPES: &[&str] = &[
+    "BestEffort",
+    "NotBestEffort",
+    "Terminating",
+    "NotTerminating",
+    "CrossNamespacePodAffinity",
+];
+
+/// Port of upstream `validateScopedResourceSelectorRequirement`: each
+/// `scopeSelector.matchExpressions` entry has a known scopeName, an operator
+/// consistent with that scope, and values consistent with the operator; and no
+/// conflicting scope pair appears across the expressions.
+fn validate_scope_selector(spec: &ResourceQuotaSpec, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(sel) = &spec.scope_selector else {
+        return errs;
+    };
+    let me_path = fld_path.child("scopeSelector").child("matchExpressions");
+    let mut seen_scopes: Vec<&str> = Vec::new();
+
+    for req in &sel.match_expressions {
+        if !VALID_SCOPES.contains(&req.scope_name.as_str()) {
+            errs.push(Error::invalid(
+                &me_path.child("scopeName"),
+                req.scope_name.clone(),
+                "unsupported scope",
+            ));
+        }
+        // Exists-only scopes reject any other operator.
+        if EXISTS_ONLY_SCOPES.contains(&req.scope_name.as_str()) && req.operator != "Exists" {
+            errs.push(Error::invalid(
+                &me_path.child("operator"),
+                req.operator.clone(),
+                "must be 'Exists' when scope is any of ResourceQuotaScopeTerminating, ResourceQuotaScopeNotTerminating, ResourceQuotaScopeBestEffort, ResourceQuotaScopeNotBestEffort or ResourceQuotaScopeCrossNamespacePodAffinity",
+            ));
+        }
+        let values_len = req.values.as_ref().map_or(0, |v| v.len());
+        match req.operator.as_str() {
+            "In" | "NotIn" => {
+                if values_len == 0 {
+                    errs.push(Error::required(
+                        &me_path.child("values"),
+                        "must be at least one value when `operator` is 'In' or 'NotIn' for scope selector",
+                    ));
+                }
+            }
+            "Exists" | "DoesNotExist" => {
+                if values_len != 0 {
+                    errs.push(Error::invalid(
+                        &me_path.child("values"),
+                        req.values.clone().unwrap_or_default(),
+                        "must be no value when `operator` is 'Exist' or 'DoesNotExist' for scope selector",
+                    ));
+                }
+            }
+            other => {
+                errs.push(Error::invalid(
+                    &me_path.child("operator"),
+                    other.to_string(),
+                    "not a valid selector operator",
+                ));
+            }
+        }
+        seen_scopes.push(req.scope_name.as_str());
+    }
+
+    let has = |x: &str| seen_scopes.contains(&x);
+    if has("BestEffort") && has("NotBestEffort") || has("Terminating") && has("NotTerminating") {
+        errs.push(Error::invalid(
+            &me_path,
+            String::new(),
+            "conflicting scopes",
+        ));
+    }
+
     errs
 }
 
@@ -104,4 +187,83 @@ pub fn validate_resource_quota_update(new_rq: &ResourceQuota, old_rq: &ResourceQ
     }
 
     errs
+}
+
+#[cfg(test)]
+mod scope_selector_tests {
+    use super::*;
+
+    fn errs(json: serde_json::Value) -> Vec<String> {
+        let spec: ResourceQuotaSpec = serde_json::from_value(json).unwrap();
+        validate_resource_quota_spec(&spec, &Path::new("spec"))
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn priorityclass_in_with_values_passes() {
+        assert!(errs(serde_json::json!({
+            "scopeSelector": {"matchExpressions": [
+                {"scopeName": "PriorityClass", "operator": "In", "values": ["high"]}
+            ]}
+        }))
+        .is_empty());
+    }
+
+    #[test]
+    fn besteffort_must_use_exists() {
+        let e = errs(serde_json::json!({
+            "scopeSelector": {"matchExpressions": [
+                {"scopeName": "BestEffort", "operator": "In", "values": ["x"]}
+            ]}
+        }));
+        assert!(e.iter().any(|m| m.contains("must be 'Exists'")), "{e:?}");
+    }
+
+    #[test]
+    fn in_operator_requires_values() {
+        let e = errs(serde_json::json!({
+            "scopeSelector": {"matchExpressions": [
+                {"scopeName": "PriorityClass", "operator": "In"}
+            ]}
+        }));
+        assert!(e.iter().any(|m| m.contains("at least one value")), "{e:?}");
+    }
+
+    #[test]
+    fn exists_rejects_values() {
+        let e = errs(serde_json::json!({
+            "scopeSelector": {"matchExpressions": [
+                {"scopeName": "Terminating", "operator": "Exists", "values": ["x"]}
+            ]}
+        }));
+        assert!(e.iter().any(|m| m.contains("no value")), "{e:?}");
+    }
+
+    #[test]
+    fn bad_scope_and_operator_rejected() {
+        let e = errs(serde_json::json!({
+            "scopeSelector": {"matchExpressions": [
+                {"scopeName": "Nope", "operator": "Weird"}
+            ]}
+        }));
+        assert!(e.iter().any(|m| m.contains("unsupported scope")), "{e:?}");
+        assert!(
+            e.iter()
+                .any(|m| m.contains("not a valid selector operator")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn conflicting_scope_pair_rejected() {
+        let e = errs(serde_json::json!({
+            "scopeSelector": {"matchExpressions": [
+                {"scopeName": "BestEffort", "operator": "Exists"},
+                {"scopeName": "NotBestEffort", "operator": "Exists"}
+            ]}
+        }));
+        assert!(e.iter().any(|m| m.contains("conflicting scopes")), "{e:?}");
+    }
 }
