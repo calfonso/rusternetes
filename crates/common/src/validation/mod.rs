@@ -9,6 +9,7 @@ pub mod apps;
 pub mod events;
 pub mod field;
 pub mod metav1;
+pub mod networkpolicy;
 pub mod objectmeta;
 pub mod pod;
 pub mod service;
