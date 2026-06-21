@@ -46,6 +46,12 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream coordination ValidateLeaseSpec).
+    let errs = rusternetes_common::validation::lease::validate_lease(&lease);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     lease.metadata.namespace = Some(namespace.clone());
     lease.metadata.ensure_uid();
     lease.metadata.ensure_creation_timestamp();

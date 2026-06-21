@@ -11,6 +11,7 @@ pub mod endpointslice;
 pub mod events;
 pub mod field;
 pub mod ingress;
+pub mod lease;
 pub mod limitrange;
 pub mod metav1;
 pub mod namespace;
