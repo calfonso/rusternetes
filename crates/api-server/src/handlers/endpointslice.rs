@@ -48,6 +48,13 @@ pub async fn create_endpointslice(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // SetDefaults_EndpointSlice: each port protocol defaults to TCP.
+    for p in endpointslice.ports.iter_mut() {
+        if p.protocol.is_none() {
+            p.protocol = Some("TCP".to_string());
+        }
+    }
+
     // Field validation (mirrors upstream ValidateEndpointSlice).
     {
         let errs =

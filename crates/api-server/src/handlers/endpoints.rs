@@ -51,6 +51,17 @@ pub async fn create_endpoints(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // SetDefaults_Endpoints: each subset port protocol defaults to TCP.
+    for subset in endpoints.subsets.iter_mut() {
+        if let Some(ports) = subset.ports.as_mut() {
+            for p in ports.iter_mut() {
+                if p.protocol.is_none() {
+                    p.protocol = Some("TCP".to_string());
+                }
+            }
+        }
+    }
+
     // Field validation (mirrors upstream ValidateEndpoints).
     {
         let errs = rusternetes_common::validation::endpoints::validate_endpoints(&endpoints);
