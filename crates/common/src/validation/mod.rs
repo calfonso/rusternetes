@@ -9,6 +9,7 @@ pub mod apps;
 pub mod endpointslice;
 pub mod events;
 pub mod field;
+pub mod ingress;
 pub mod limitrange;
 pub mod metav1;
 pub mod networkpolicy;

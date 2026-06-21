@@ -47,6 +47,14 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Field validation (mirrors upstream ValidateIngress).
+    {
+        let errs = rusternetes_common::validation::ingress::validate_ingress(&ingress);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     ingress.metadata.namespace = Some(namespace.clone());
     ingress.metadata.ensure_uid();
     ingress.metadata.ensure_creation_timestamp();
