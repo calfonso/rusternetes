@@ -630,7 +630,12 @@ async fn apf_should_support_flow_schema_api_operations() {
                 "resourceRules": [{
                     "verbs": ["*"],
                     "apiGroups": ["*"],
-                    "resources": ["*"]
+                    "resources": ["*"],
+                    // A non-cluster-scoped resource rule must supply namespaces
+                    // (upstream ValidateFlowSchemaResourcePolicyRule); the
+                    // built-in system FlowSchemas use the cluster-scoped wildcard.
+                    "clusterScope": true,
+                    "namespaces": ["*"]
                 }]
             }]
         }

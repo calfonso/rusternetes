@@ -278,6 +278,13 @@ pub async fn create_flow_schema(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream APF ValidateFlowSchemaSpec): matchingPrecedence,
+    // priorityLevelConfiguration ref, and rules subjects/resource/nonResource.
+    let errs = rusternetes_common::validation::flowschema::validate_flow_schema(&fs);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     fs.metadata.ensure_uid();
     fs.metadata.ensure_creation_timestamp();
