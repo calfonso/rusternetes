@@ -2,10 +2,9 @@
 //! `pkg/apis/networking/validation/validation.go::ValidateNetworkPolicySpec`
 //! (release-1.35).
 //!
-//! Note: the ipBlock `except` "strict subset of cidr" check needs subnet
-//! arithmetic (a CIDR type we don't pull in here); we validate that the cidr
-//! and each except are syntactically valid CIDRs and leave the containment
-//! check as a follow-up.
+//! ipBlock is fully validated: the cidr and each `except` are syntactically
+//! valid CIDRs, and each `except` is a strict subset of the cidr (contained in
+//! it, with a longer prefix) — mirroring upstream `ValidateIPBlock`.
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -21,18 +20,58 @@ use crate::validation::metav1::{
 const MIN_PORT: i64 = 1;
 const MAX_PORT: i64 = 65535;
 
+/// Mask `bits` to its leading `prefix` bits within a `width`-bit address.
+fn mask_bits(bits: u128, prefix: u32, width: u32) -> u128 {
+    if prefix == 0 {
+        return 0;
+    }
+    if prefix >= width {
+        return bits;
+    }
+    let host = width - prefix;
+    (bits >> host) << host
+}
+
+/// Parse a CIDR into `(network_address, prefix, is_v6)`, where the address is
+/// already masked to the prefix. Returns `None` on any parse failure.
+fn parse_cidr_network(s: &str) -> Option<(u128, u8, bool)> {
+    let (ip, prefix) = s.split_once('/')?;
+    let prefix: u8 = prefix.parse().ok()?;
+    match IpAddr::from_str(ip).ok()? {
+        IpAddr::V4(v4) if prefix <= 32 => {
+            let bits = u32::from(v4) as u128;
+            Some((mask_bits(bits, prefix as u32, 32), prefix, false))
+        }
+        IpAddr::V6(v6) if prefix <= 128 => {
+            let bits = u128::from(v6);
+            Some((mask_bits(bits, prefix as u32, 128), prefix, true))
+        }
+        _ => None,
+    }
+}
+
 /// Syntactic CIDR validity: `IP/prefix`, prefix within the address family's
 /// bit-width. Mirrors the validity half of upstream `IsValidCIDR`.
 fn is_valid_cidr(s: &str) -> bool {
-    let Some((ip, prefix)) = s.split_once('/') else {
+    parse_cidr_network(s).is_some()
+}
+
+/// True iff `except` is a *strict* subset of `cidr` — same family, contained in
+/// the cidr's network, and with a strictly longer prefix. Mirrors upstream
+/// `ValidateIPBlock`'s `!cidr.Contains(except.IP) || cidrMask >= exceptMask`.
+fn is_strict_subset(except: &str, cidr: &str) -> bool {
+    let Some((ex_net, ex_prefix, ex_v6)) = parse_cidr_network(except) else {
         return false;
     };
-    let max_prefix = match IpAddr::from_str(ip) {
-        Ok(IpAddr::V4(_)) => 32u8,
-        Ok(IpAddr::V6(_)) => 128u8,
-        Err(_) => return false,
+    let Some((cidr_net, cidr_prefix, cidr_v6)) = parse_cidr_network(cidr) else {
+        return false;
     };
-    matches!(prefix.parse::<u8>(), Ok(p) if p <= max_prefix)
+    if ex_v6 != cidr_v6 {
+        return false;
+    }
+    let width = if cidr_v6 { 128 } else { 32 };
+    let ex_within_cidr = mask_bits(ex_net, cidr_prefix as u32, width) == cidr_net;
+    ex_within_cidr && ex_prefix > cidr_prefix
 }
 
 /// Upstream `IsValidPortName`: an IANA_SVC_NAME — a DNS-1123 label ≤15 chars
@@ -138,6 +177,12 @@ fn validate_ip_block(ipb: &IPBlock, fld_path: &Path) -> ErrorList {
                     &fld_path.child("except").index(i),
                     ex.clone(),
                     "must be a valid CIDR (e.g. 10.0.0.0/8)",
+                ));
+            } else if is_valid_cidr(&ipb.cidr) && !is_strict_subset(ex, &ipb.cidr) {
+                errs.push(Error::invalid(
+                    &fld_path.child("except").index(i),
+                    ex.clone(),
+                    "must be a strict subset of `cidr`",
                 ));
             }
         }
@@ -251,4 +296,64 @@ pub fn validate_network_policy_spec(spec: &NetworkPolicySpec, fld_path: &Path) -
 /// Validate a new `NetworkPolicy`. Mirrors upstream `ValidateNetworkPolicy`.
 pub fn validate_network_policy(np: &NetworkPolicy) -> ErrorList {
     validate_network_policy_spec(&np.spec, &Path::new("spec"))
+}
+
+#[cfg(test)]
+mod ip_block_tests {
+    use super::*;
+
+    fn ipb_errs(json: serde_json::Value) -> Vec<String> {
+        let ipb: IPBlock = serde_json::from_value(json).unwrap();
+        validate_ip_block(&ipb, &Path::new("ipBlock"))
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn valid_strict_subset_passes() {
+        assert!(ipb_errs(serde_json::json!({
+            "cidr": "10.0.0.0/8", "except": ["10.1.0.0/16", "10.2.3.0/24"]
+        }))
+        .is_empty());
+    }
+
+    #[test]
+    fn except_not_contained_rejected() {
+        let e = ipb_errs(serde_json::json!({
+            "cidr": "10.0.0.0/8", "except": ["192.168.0.0/16"]
+        }));
+        assert!(e.iter().any(|m| m.contains("strict subset")), "{e:?}");
+    }
+
+    #[test]
+    fn except_equal_or_shorter_prefix_rejected() {
+        // same prefix as cidr -> not strict (prefix must be longer)
+        let e = ipb_errs(serde_json::json!({
+            "cidr": "10.0.0.0/8", "except": ["10.0.0.0/8"]
+        }));
+        assert!(e.iter().any(|m| m.contains("strict subset")), "{e:?}");
+    }
+
+    #[test]
+    fn ipv6_strict_subset_passes() {
+        assert!(ipb_errs(serde_json::json!({
+            "cidr": "2001:db8::/32", "except": ["2001:db8:1::/48"]
+        }))
+        .is_empty());
+    }
+
+    #[test]
+    fn mixed_family_except_rejected() {
+        let e = ipb_errs(serde_json::json!({
+            "cidr": "10.0.0.0/8", "except": ["2001:db8::/64"]
+        }));
+        assert!(e.iter().any(|m| m.contains("strict subset")), "{e:?}");
+    }
+
+    #[test]
+    fn invalid_cidr_still_rejected() {
+        let e = ipb_errs(serde_json::json!({"cidr": "10.0.0.0/8", "except": ["notacidr"]}));
+        assert!(e.iter().any(|m| m.contains("valid CIDR")), "{e:?}");
+    }
 }
