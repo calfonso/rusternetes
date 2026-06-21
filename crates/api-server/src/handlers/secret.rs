@@ -168,6 +168,16 @@ pub async fn create(
     // Normalize: convert stringData to base64-encoded data
     secret.normalize();
 
+    // Type-specific required-key validation (upstream ValidateSecret's
+    // `switch secret.Type`). Runs after normalize() so keys supplied via
+    // stringData are present in `data`.
+    {
+        let errs = rusternetes_common::validation::secret::validate_secret_type(&secret);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let key = build_key("secrets", Some(&namespace), &secret.metadata.name);
 
     // If dry-run, skip storage operation but return the validated resource

@@ -34,6 +34,7 @@ pub mod pvc;
 pub mod replicationcontroller;
 pub mod resourcequota;
 pub mod runtimeclass;
+pub mod secret;
 pub mod service;
 pub mod servicecidr;
 pub mod storageclass;
