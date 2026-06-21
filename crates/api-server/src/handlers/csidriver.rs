@@ -15,6 +15,38 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// SetDefaults_CSIDriver (pkg/apis/storage/v1/defaults.go): fill in the optional
+/// bool/enum fields. Runs on both create and update (upstream re-defaults on
+/// update), so the update-path immutability checks compare like-for-like.
+fn apply_csidriver_spec_defaults(driver: &mut rusternetes_common::resources::CSIDriver) {
+    use rusternetes_common::resources::csi::{FSGroupPolicy, VolumeLifecycleMode};
+    let s = &mut driver.spec;
+    if s.attach_required.is_none() {
+        s.attach_required = Some(true);
+    }
+    if s.pod_info_on_mount.is_none() {
+        s.pod_info_on_mount = Some(false);
+    }
+    if s.storage_capacity.is_none() {
+        s.storage_capacity = Some(false);
+    }
+    if s.fs_group_policy.is_none() {
+        s.fs_group_policy = Some(FSGroupPolicy::ReadWriteOnceWithFSType);
+    }
+    if s.volume_lifecycle_modes
+        .as_ref()
+        .is_none_or(|v| v.is_empty())
+    {
+        s.volume_lifecycle_modes = Some(vec![VolumeLifecycleMode::Persistent]);
+    }
+    if s.requires_republish.is_none() {
+        s.requires_republish = Some(false);
+    }
+    if s.se_linux_mount.is_none() {
+        s.se_linux_mount = Some(false);
+    }
+}
+
 pub async fn create_csidriver(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -44,34 +76,7 @@ pub async fn create_csidriver(
     // SetDefaults_CSIDriver (pkg/apis/storage/v1/defaults.go): fill in the
     // optional bool/enum fields before validation, matching upstream's
     // default-then-validate ordering.
-    {
-        use rusternetes_common::resources::csi::{FSGroupPolicy, VolumeLifecycleMode};
-        let s = &mut driver.spec;
-        if s.attach_required.is_none() {
-            s.attach_required = Some(true);
-        }
-        if s.pod_info_on_mount.is_none() {
-            s.pod_info_on_mount = Some(false);
-        }
-        if s.storage_capacity.is_none() {
-            s.storage_capacity = Some(false);
-        }
-        if s.fs_group_policy.is_none() {
-            s.fs_group_policy = Some(FSGroupPolicy::ReadWriteOnceWithFSType);
-        }
-        if s.volume_lifecycle_modes
-            .as_ref()
-            .is_none_or(|v| v.is_empty())
-        {
-            s.volume_lifecycle_modes = Some(vec![VolumeLifecycleMode::Persistent]);
-        }
-        if s.requires_republish.is_none() {
-            s.requires_republish = Some(false);
-        }
-        if s.se_linux_mount.is_none() {
-            s.se_linux_mount = Some(false);
-        }
-    }
+    apply_csidriver_spec_defaults(&mut driver);
 
     // Validate the (defaulted) CSIDriver — upstream ValidateCSIDriver.
     let errs = rusternetes_common::validation::csidriver::validate_csi_driver(&driver);
@@ -181,13 +186,34 @@ pub async fn update_csidriver(
 
     driver.metadata.name = name.clone();
 
+    // SetDefaults_CSIDriver runs on update too, so the immutable-field checks
+    // compare defaulted-against-defaulted (e.g. volumeLifecycleModes defaults to
+    // [Persistent]); without this an update omitting a defaulted field would
+    // falsely trip the immutability check.
+    apply_csidriver_spec_defaults(&mut driver);
+
+    let key = build_key("csidrivers", None, &name);
+
+    // Immutability + re-validation on update (upstream ValidateCSIDriverUpdate):
+    // attachRequired and volumeLifecycleModes are immutable.
+    if let Ok(old) = state
+        .storage
+        .get::<rusternetes_common::resources::CSIDriver>(&key)
+        .await
+    {
+        let errs =
+            rusternetes_common::validation::csidriver::validate_csi_driver_update(&driver, &old);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: CSIDriver validated successfully (not updated)");
         return Ok(Json(driver));
     }
 
-    let key = build_key("csidrivers", None, &name);
     let updated = state.storage.update(&key, &driver).await?;
 
     Ok(Json(updated))

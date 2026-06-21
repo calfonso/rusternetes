@@ -59,3 +59,27 @@ pub fn validate_csi_driver(driver: &CSIDriver) -> ErrorList {
 
     errs
 }
+
+/// Validate a CSIDriver update — upstream `ValidateCSIDriverUpdate`
+/// (pkg/apis/storage/validation): `attachRequired` and `volumeLifecycleModes`
+/// are immutable, plus full re-validation of the new object.
+pub fn validate_csi_driver_update(new_d: &CSIDriver, old_d: &CSIDriver) -> ErrorList {
+    let mut errs = validate_csi_driver(new_d);
+    if new_d.spec.attach_required != old_d.spec.attach_required {
+        errs.push(Error::invalid(
+            &Path::new("spec").child("attachRequired"),
+            "<changed>".to_string(),
+            "field is immutable",
+        ));
+    }
+    if serde_json::to_value(&new_d.spec.volume_lifecycle_modes).ok()
+        != serde_json::to_value(&old_d.spec.volume_lifecycle_modes).ok()
+    {
+        errs.push(Error::invalid(
+            &Path::new("spec").child("volumeLifecycleModes"),
+            "<changed>".to_string(),
+            "field is immutable",
+        ));
+    }
+    errs
+}
