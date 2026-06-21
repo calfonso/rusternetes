@@ -3,10 +3,11 @@
 The "k3s without melting your laptop" thesis rests on a number nobody had
 measured. This page is the home for those numbers and how to reproduce them.
 
-> Status: harness landed (`scripts/footprint-benchmark.sh`). The binary-size row
-> below is a **real measurement** (release host target, glibc). The idle RSS /
-> CPU / time-to-cluster cells are placeholders until run on reference hardware
-> head-to-head against k3s — run the harness and replace the `TBD` cells.
+> Status: harness landed (`scripts/footprint-benchmark.sh`). Both binary-size
+> rows below are **real measurements** (release; glibc dynamic and musl static).
+> The idle RSS / CPU / time-to-cluster cells are placeholders until run on
+> reference hardware head-to-head against k3s — run the harness and replace the
+> `TBD` cells.
 
 ## Why this matters
 
@@ -92,14 +93,15 @@ Reference hardware: _TBD (record CPU/RAM/OS when filling this in)_.
 | Metric | rusternetes | k3s | Notes |
 |---|---|---|---|
 | Binary size (release, glibc) | **75.1 MiB** | — | dynamically linked; the release profile already strips symbols, so raw == stripped |
-| Binary size (musl+strip) | TBD | ~70 MB | static |
+| Binary size (musl, static) | **82.4 MiB** | ~70 MB | static-pie, stripped, self-contained (no glibc) |
 | Time-to-cluster | TBD | TBD | `up` → first node Ready |
 | Idle RSS (avg) | TBD | ~535–750 MB | all-in-one container |
 | Idle RSS (max) | TBD | — | |
 | Idle CPU (avg) | TBD | TBD | |
 
-The 75 MiB all-in-one binary is in the same ballpark as k3s's static binary
-(~70 MB) — but binary size is the *easy* dimension. The thesis lives or dies on
+The all-in-one binary — 75 MiB glibc-dynamic, 82 MiB musl-static (fully
+self-contained, no glibc) — is in the same ballpark as k3s's ~70 MB static
+binary. But binary size is the *easy* dimension. The thesis lives or dies on
 **idle RSS** (the `TBD` rows), which is why #1039/#1040 target it; measure those
 before claiming the niche.
 
