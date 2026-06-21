@@ -11,16 +11,19 @@
 //! (`generateSelector`), mirroring upstream `ValidateJob`, which validates the
 //! post-defaulting object.
 //!
-//! Niche policy sub-objects (`podFailurePolicy`, `successPolicy`,
-//! `podReplacementPolicy`, `managedBy`) are intentionally out of scope here.
+//! Also covers the policy sub-objects `podFailurePolicy`, `successPolicy`,
+//! `podReplacementPolicy` and `managedBy` (#1326). The `succeededIndexes`
+//! interval-format parser (`validateIndexesFormat`) is the one remaining gap.
 
-use crate::resources::workloads::{Job, JobSpec};
+use crate::resources::workloads::{Job, JobSpec, PodFailurePolicyRule, SuccessPolicyRule};
 use crate::types::LabelSelector;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
-    is_dns1123_label, validate_label_selector, LabelSelectorValidationOptions,
+    is_dns1123_label, is_dns1123_subdomain, is_qualified_name, validate_label_selector,
+    LabelSelectorValidationOptions,
 };
 use crate::validation::objectmeta::validate_nonnegative_field;
+use std::collections::HashSet;
 
 // Upstream constants (`pkg/apis/batch/validation/validation.go`).
 const MAX_PARALLELISM_FOR_INDEXED_JOB: i32 = 100_000;
@@ -28,9 +31,18 @@ const MAX_FAILED_INDEXES_FOR_INDEXED_JOB: i32 = 100_000;
 const COMPLETIONS_SOFT_LIMIT: i32 = 100_000;
 const PARALLELISM_LIMIT_FOR_HIGH_COMPLETIONS: i32 = 10_000;
 const MAX_FAILED_INDEXES_LIMIT_FOR_HIGH_COMPLETIONS: i32 = 10_000;
+const MAX_POD_FAILURE_POLICY_RULES: usize = 20;
+const MAX_ON_EXIT_CODES_VALUES: usize = 255;
+const MAX_ON_POD_CONDITIONS_PATTERNS: usize = 20;
+const MAX_SUCCESS_POLICY_RULES: usize = 20;
+const MAX_MANAGED_BY_LENGTH: usize = 63;
 
 const NON_INDEXED_COMPLETION: &str = "NonIndexed";
 const INDEXED_COMPLETION: &str = "Indexed";
+const POD_FAILURE_POLICY_ACTIONS: [&str; 4] = ["FailJob", "FailIndex", "Ignore", "Count"];
+const ON_EXIT_CODES_OPERATORS: [&str; 2] = ["In", "NotIn"];
+const ON_POD_CONDITIONS_STATUSES: [&str; 3] = ["True", "False", "Unknown"];
+const POD_REPLACEMENT_POLICIES: [&str; 2] = ["Failed", "TerminatingOrFailed"];
 
 fn selector_is_empty(sel: &LabelSelector) -> bool {
     sel.match_labels.as_ref().is_none_or(|m| m.is_empty())
@@ -217,6 +229,44 @@ fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
         ));
     }
 
+    // managedBy — domain-prefixed path, length-bounded.
+    if let Some(managed_by) = &spec.managed_by {
+        let mb_path = fld_path.child("managedBy");
+        errs.extend(validate_domain_prefixed_path(managed_by, &mb_path));
+        if managed_by.len() > MAX_MANAGED_BY_LENGTH {
+            errs.push(Error::too_long(&mb_path, MAX_MANAGED_BY_LENGTH));
+        }
+    }
+
+    // podFailurePolicy.
+    if let Some(pfp) = &spec.pod_failure_policy {
+        errs.extend(validate_pod_failure_policy(
+            spec,
+            &pfp.rules,
+            &fld_path.child("podFailurePolicy"),
+        ));
+    }
+
+    // successPolicy — Indexed-only; then the per-rule checks.
+    if let Some(sp) = &spec.success_policy {
+        let sp_path = fld_path.child("successPolicy");
+        if !is_indexed {
+            errs.push(Error::invalid(
+                &sp_path,
+                String::new(),
+                "requires indexed completion mode",
+            ));
+        } else {
+            errs.extend(validate_success_policy(spec, &sp.rules, &sp_path));
+        }
+    }
+
+    // podReplacementPolicy.
+    errs.extend(validate_pod_replacement_policy(
+        spec,
+        &fld_path.child("podReplacementPolicy"),
+    ));
+
     // Selector: required, valid, and matching the template labels.
     match &spec.selector {
         None => errs.push(Error::required(&fld_path.child("selector"), "")),
@@ -284,5 +334,248 @@ pub fn validate_job(job: &Job) -> ErrorList {
         }
     }
 
+    errs
+}
+
+/// Port of upstream `IsDomainPrefixedPath` (structure + host subdomain). The
+/// trailing path segment's `httpPathRegexp` is not replicated.
+fn validate_domain_prefixed_path(value: &str, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if value.is_empty() {
+        errs.push(Error::required(fld_path, ""));
+        return errs;
+    }
+    let segments: Vec<&str> = value.splitn(2, '/').collect();
+    if segments.len() != 2 || segments[0].is_empty() || segments[1].is_empty() {
+        errs.push(Error::invalid(
+            fld_path,
+            value.to_string(),
+            "must be a domain-prefixed path (such as \"acme.io/foo\")",
+        ));
+        return errs;
+    }
+    for msg in is_dns1123_subdomain(segments[0]) {
+        errs.push(Error::invalid(fld_path, segments[0].to_string(), msg));
+    }
+    errs
+}
+
+/// Port of upstream `validatePodReplacementPolicy`.
+fn validate_pod_replacement_policy(spec: &JobSpec, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(prp) = &spec.pod_replacement_policy {
+        if spec.pod_failure_policy.is_some() {
+            // With a podFailurePolicy, only "Failed" is allowed.
+            if prp != "Failed" {
+                errs.push(Error::not_supported(fld_path, prp.clone(), &["Failed"]));
+            }
+        } else if !POD_REPLACEMENT_POLICIES.contains(&prp.as_str()) {
+            errs.push(Error::not_supported(
+                fld_path,
+                prp.clone(),
+                &POD_REPLACEMENT_POLICIES,
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validatePodFailurePolicy` + `validatePodFailurePolicyRule`
+/// (+ the onExitCodes / onPodConditions sub-validators).
+fn validate_pod_failure_policy(
+    spec: &JobSpec,
+    rules: &[PodFailurePolicyRule],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let rules_path = fld_path.child("rules");
+    if rules.len() > MAX_POD_FAILURE_POLICY_RULES {
+        errs.push(Error::too_many(&rules_path, MAX_POD_FAILURE_POLICY_RULES));
+    }
+
+    let mut container_names: HashSet<&str> = HashSet::new();
+    for c in &spec.template.spec.containers {
+        container_names.insert(c.name.as_str());
+    }
+    if let Some(inits) = &spec.template.spec.init_containers {
+        for c in inits {
+            container_names.insert(c.name.as_str());
+        }
+    }
+
+    for (i, rule) in rules.iter().enumerate() {
+        let rule_path = rules_path.index(i);
+        let action_path = rule_path.child("action");
+        if rule.action.is_empty() {
+            errs.push(Error::required(
+                &action_path,
+                "valid values: \"Count\", \"FailIndex\", \"FailJob\", \"Ignore\"",
+            ));
+        } else if rule.action == "FailIndex" {
+            if spec.backoff_limit_per_index.is_none() {
+                errs.push(Error::invalid(
+                    &action_path,
+                    rule.action.clone(),
+                    "requires the backoffLimitPerIndex to be set",
+                ));
+            }
+        } else if !POD_FAILURE_POLICY_ACTIONS.contains(&rule.action.as_str()) {
+            errs.push(Error::not_supported(
+                &action_path,
+                rule.action.clone(),
+                &POD_FAILURE_POLICY_ACTIONS,
+            ));
+        }
+
+        if let Some(on_exit) = &rule.on_exit_codes {
+            let oec_path = rule_path.child("onExitCodes");
+            let op_path = oec_path.child("operator");
+            if on_exit.operator.is_empty() {
+                errs.push(Error::required(&op_path, "valid values: \"In\", \"NotIn\""));
+            } else if !ON_EXIT_CODES_OPERATORS.contains(&on_exit.operator.as_str()) {
+                errs.push(Error::not_supported(
+                    &op_path,
+                    on_exit.operator.clone(),
+                    &ON_EXIT_CODES_OPERATORS,
+                ));
+            }
+            if let Some(cn) = &on_exit.container_name {
+                if !container_names.contains(cn.as_str()) {
+                    errs.push(Error::invalid(
+                        &oec_path.child("containerName"),
+                        cn.clone(),
+                        "must be one of the container or initContainer names in the pod template",
+                    ));
+                }
+            }
+            let values_path = oec_path.child("values");
+            if on_exit.values.is_empty() {
+                errs.push(Error::invalid(
+                    &values_path,
+                    String::new(),
+                    "at least one value is required",
+                ));
+            } else if on_exit.values.len() > MAX_ON_EXIT_CODES_VALUES {
+                errs.push(Error::too_many(&values_path, MAX_ON_EXIT_CODES_VALUES));
+            }
+            let mut seen: HashSet<i32> = HashSet::new();
+            let mut ordered = true;
+            for (j, &v) in on_exit.values.iter().enumerate() {
+                let vp = values_path.index(j);
+                if on_exit.operator == "In" && v == 0 {
+                    errs.push(Error::invalid(&vp, v, "must not be 0 for the In operator"));
+                }
+                if !seen.insert(v) {
+                    errs.push(Error::duplicate(&vp, v));
+                }
+                if j > 0 && on_exit.values[j - 1] > v {
+                    ordered = false;
+                }
+            }
+            if !ordered {
+                errs.push(Error::invalid(
+                    &values_path,
+                    String::new(),
+                    "must be ordered",
+                ));
+            }
+        }
+
+        if !rule.on_pod_conditions.is_empty() {
+            let opc_path = rule_path.child("onPodConditions");
+            if rule.on_pod_conditions.len() > MAX_ON_POD_CONDITIONS_PATTERNS {
+                errs.push(Error::too_many(&opc_path, MAX_ON_POD_CONDITIONS_PATTERNS));
+            }
+            for (j, pattern) in rule.on_pod_conditions.iter().enumerate() {
+                let p_path = opc_path.index(j);
+                for msg in is_qualified_name(&pattern.condition_type) {
+                    errs.push(Error::invalid(
+                        &p_path.child("type"),
+                        pattern.condition_type.clone(),
+                        msg,
+                    ));
+                }
+                let status_path = p_path.child("status");
+                match pattern.status.as_deref() {
+                    None | Some("") => errs.push(Error::required(
+                        &status_path,
+                        "valid values: \"False\", \"True\", \"Unknown\"",
+                    )),
+                    Some(s) if !ON_POD_CONDITIONS_STATUSES.contains(&s) => {
+                        errs.push(Error::not_supported(
+                            &status_path,
+                            s.to_string(),
+                            &ON_POD_CONDITIONS_STATUSES,
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let has_exit = rule.on_exit_codes.is_some();
+        let has_cond = !rule.on_pod_conditions.is_empty();
+        if has_exit && has_cond {
+            errs.push(Error::invalid(
+                &rule_path,
+                String::new(),
+                "specifying both OnExitCodes and OnPodConditions is not supported",
+            ));
+        }
+        if !has_exit && !has_cond {
+            errs.push(Error::invalid(
+                &rule_path,
+                String::new(),
+                "specifying one of OnExitCodes and OnPodConditions is required",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateSuccessPolicy` + `validateSuccessPolicyRule`. The
+/// `succeededIndexes` interval-format parser (`validateIndexesFormat`) is left
+/// as a follow-up; presence/count + `succeededCount` bounds are ported.
+fn validate_success_policy(
+    spec: &JobSpec,
+    rules: &[SuccessPolicyRule],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let rules_path = fld_path.child("rules");
+    if rules.is_empty() {
+        errs.push(Error::required(
+            &rules_path,
+            "at least one rules must be specified when the successPolicy is specified",
+        ));
+    }
+    if rules.len() > MAX_SUCCESS_POLICY_RULES {
+        errs.push(Error::too_many(&rules_path, MAX_SUCCESS_POLICY_RULES));
+    }
+    for (i, rule) in rules.iter().enumerate() {
+        let rule_path = rules_path.index(i);
+        if rule.succeeded_count.is_none() && rule.succeeded_indexes.is_none() {
+            errs.push(Error::required(
+                &rule_path,
+                "at least one of succeededCount or succeededIndexes must be specified",
+            ));
+        }
+        if let Some(count) = rule.succeeded_count {
+            let cp = rule_path.child("succeededCount");
+            errs.extend(validate_nonnegative_field(count as i64, &cp));
+            if let Some(completions) = spec.completions {
+                if count > completions {
+                    errs.push(Error::invalid(
+                        &cp,
+                        count,
+                        format!(
+                            "must be less than or equal to {} (the number of specified completions)",
+                            completions
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     errs
 }

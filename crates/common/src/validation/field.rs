@@ -298,6 +298,17 @@ impl Error {
         }
     }
 
+    /// `field.TooMany` — bad value omitted, detail says the max count.
+    pub fn too_many(path: &Path, max_items: usize) -> Self {
+        Self {
+            error_type: ErrorType::TooMany,
+            field: path.to_string(),
+            bad_value: BadValue::Omit,
+            detail: format!("must have at most {max_items} items"),
+            origin: String::new(),
+        }
+    }
+
     /// Builder: attach an upstream-style origin tag (e.g. `format=k8s-label-key`).
     #[must_use]
     pub fn with_origin(mut self, origin: impl Into<String>) -> Self {

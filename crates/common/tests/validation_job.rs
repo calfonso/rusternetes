@@ -152,3 +152,142 @@ fn indexed_name_too_long_for_hostname_rejected() {
     let errs = validate_job(&j);
     assert!(has(&errs, "metadata.name"), "{:?}", errs);
 }
+
+// --- policy sub-objects (#1326) ---
+use rusternetes_common::resources::workloads::{
+    PodFailurePolicy, PodFailurePolicyOnExitCodesRequirement, PodFailurePolicyRule, SuccessPolicy,
+    SuccessPolicyRule,
+};
+
+#[test]
+fn bad_pod_replacement_policy_rejected() {
+    let mut j = valid_job();
+    j.spec.pod_replacement_policy = Some("Whenever".to_string());
+    assert!(has(&validate_job(&j), "spec.podReplacementPolicy"));
+}
+
+#[test]
+fn pod_replacement_failed_requires_failure_policy() {
+    let mut j = valid_job();
+    // "Failed" without a podFailurePolicy is allowed (it's in the base set).
+    j.spec.pod_replacement_policy = Some("Failed".to_string());
+    assert!(!has(&validate_job(&j), "spec.podReplacementPolicy"));
+    // With a podFailurePolicy, only "Failed" is allowed → "TerminatingOrFailed" rejected.
+    j.spec.pod_replacement_policy = Some("TerminatingOrFailed".to_string());
+    j.spec.pod_failure_policy = Some(PodFailurePolicy {
+        rules: vec![PodFailurePolicyRule {
+            action: "Ignore".to_string(),
+            on_exit_codes: Some(PodFailurePolicyOnExitCodesRequirement {
+                container_name: None,
+                operator: "In".to_string(),
+                values: vec![1],
+            }),
+            on_pod_conditions: vec![],
+        }],
+    });
+    assert!(has(&validate_job(&j), "spec.podReplacementPolicy"));
+}
+
+#[test]
+fn pfp_bad_action_rejected() {
+    let mut j = valid_job();
+    j.spec.pod_failure_policy = Some(PodFailurePolicy {
+        rules: vec![PodFailurePolicyRule {
+            action: "Explode".to_string(),
+            on_exit_codes: Some(PodFailurePolicyOnExitCodesRequirement {
+                container_name: None,
+                operator: "In".to_string(),
+                values: vec![1],
+            }),
+            on_pod_conditions: vec![],
+        }],
+    });
+    assert!(has(
+        &validate_job(&j),
+        "spec.podFailurePolicy.rules[0].action"
+    ));
+}
+
+#[test]
+fn pfp_zero_value_for_in_rejected() {
+    let mut j = valid_job();
+    j.spec.pod_failure_policy = Some(PodFailurePolicy {
+        rules: vec![PodFailurePolicyRule {
+            action: "FailJob".to_string(),
+            on_exit_codes: Some(PodFailurePolicyOnExitCodesRequirement {
+                container_name: None,
+                operator: "In".to_string(),
+                values: vec![0],
+            }),
+            on_pod_conditions: vec![],
+        }],
+    });
+    assert!(has(
+        &validate_job(&j),
+        "spec.podFailurePolicy.rules[0].onExitCodes.values[0]"
+    ));
+}
+
+#[test]
+fn pfp_both_exit_and_conditions_rejected() {
+    use rusternetes_common::resources::workloads::PodFailurePolicyOnPodConditionsPattern;
+    let mut j = valid_job();
+    j.spec.pod_failure_policy = Some(PodFailurePolicy {
+        rules: vec![PodFailurePolicyRule {
+            action: "FailJob".to_string(),
+            on_exit_codes: Some(PodFailurePolicyOnExitCodesRequirement {
+                container_name: None,
+                operator: "In".to_string(),
+                values: vec![1],
+            }),
+            on_pod_conditions: vec![PodFailurePolicyOnPodConditionsPattern {
+                condition_type: "DisruptionTarget".to_string(),
+                status: Some("True".to_string()),
+            }],
+        }],
+    });
+    let errs = validate_job(&j);
+    assert!(errs
+        .iter()
+        .any(|e| e.detail.contains("both OnExitCodes and OnPodConditions")));
+}
+
+#[test]
+fn success_policy_requires_indexed() {
+    let mut j = valid_job();
+    // valid_job is NonIndexed.
+    j.spec.success_policy = Some(SuccessPolicy {
+        rules: vec![SuccessPolicyRule {
+            succeeded_indexes: None,
+            succeeded_count: Some(1),
+        }],
+    });
+    let errs = validate_job(&j);
+    assert!(errs
+        .iter()
+        .any(|e| e.detail.contains("requires indexed completion mode")));
+}
+
+#[test]
+fn success_policy_count_exceeds_completions_rejected() {
+    let mut j = valid_job();
+    j.spec.completion_mode = Some("Indexed".to_string());
+    j.spec.completions = Some(3);
+    j.spec.success_policy = Some(SuccessPolicy {
+        rules: vec![SuccessPolicyRule {
+            succeeded_indexes: None,
+            succeeded_count: Some(5), // > completions(3)
+        }],
+    });
+    assert!(has(
+        &validate_job(&j),
+        "spec.successPolicy.rules[0].succeededCount"
+    ));
+}
+
+#[test]
+fn managed_by_bad_path_rejected() {
+    let mut j = valid_job();
+    j.spec.managed_by = Some("notdomainprefixed".to_string());
+    assert!(has(&validate_job(&j), "spec.managedBy"));
+}
