@@ -9,6 +9,7 @@ pub mod apps;
 pub mod certificatesigningrequest;
 pub mod configmap;
 pub mod csidriver;
+pub mod csinode;
 pub mod csistoragecapacity;
 pub mod endpoints;
 pub mod endpointslice;

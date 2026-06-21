@@ -34,6 +34,13 @@ pub async fn create_csinode(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream storage ValidateCSINode): driver name format,
+    // nodeID, allocatable.count, topologyKeys, duplicate driver names.
+    let errs = rusternetes_common::validation::csinode::validate_csi_node(&node);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "csinodes")
         .with_api_group("storage.k8s.io");
