@@ -153,13 +153,25 @@ pub async fn update_volumeattributesclass(
 
     vac.metadata.name = name.clone();
 
+    let key = build_key("volumeattributesclasses", None, &name);
+
+    // Immutability + re-validation on update (upstream
+    // ValidateVolumeAttributesClassUpdate): driverName and parameters are
+    // immutable. Validation runs before the dry-run short-circuit.
+    {
+        let old_vac: VolumeAttributesClass = state.storage.get(&key).await?;
+        let errs = rusternetes_common::validation::volumeattributesclass::validate_volume_attributes_class_update(&vac, &old_vac);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: VolumeAttributesClass validated successfully (not updated)");
         return Ok(Json(vac));
     }
 
-    let key = build_key("volumeattributesclasses", None, &name);
     let updated = state.storage.update(&key, &vac).await?;
 
     Ok(Json(updated))
