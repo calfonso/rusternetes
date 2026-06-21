@@ -6,6 +6,13 @@
 //! in-cluster config when running as a pod) so the binary can run as a
 //! kube-system Deployment without direct storage access.
 
+// mimalloc as the global allocator (off by default; `--features mimalloc`).
+// Required for the musl static builds — musl's default allocator is ~10x
+// slower under multi-threaded lock contention — and lowers idle RSS (#1041).
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use rusternetes_client::config::{ClientConfig, SA_DIR};

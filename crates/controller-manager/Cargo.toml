@@ -14,6 +14,7 @@ name = "controller-manager"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 rusternetes-common = { path = "../common" }
 # api-client: StorageBackend::Api + the ApiStorage adapter used by run_with_api.
 rusternetes-storage = { path = "../storage", features = ["api-client"] }
@@ -47,6 +48,7 @@ rustls = { workspace = true }
 x509-parser = { workspace = true }
 
 [features]
+mimalloc = ["dep:mimalloc"]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
