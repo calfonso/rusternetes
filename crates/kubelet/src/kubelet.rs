@@ -207,7 +207,7 @@ pub struct Kubelet {
     /// same-fullname barrier exists only for static pods (allowStaticPodStart,
     /// startedStaticPodsByFullname). Our name-keyed skip-and-retry is a
     /// rusternetes-specific serialization achieving the same effect.
-    pod_sync_locks: Mutex<HashSet<String>>,
+    pod_sync_locks: crate::sync_locks::SyncLocks,
     /// Per-container CrashLoopBackOff state, keyed by
     /// `"{namespace}/{pod}/{container}"`. Source of truth for restartCount +
     /// restart pacing. See [`RestartBackoff`].
@@ -451,7 +451,7 @@ impl Kubelet {
             eviction_manager: Mutex::new(eviction_manager),
             pod_states: Mutex::new(HashMap::new()),
             terminal_finalize_failures: Mutex::new(HashMap::new()),
-            pod_sync_locks: Mutex::new(HashSet::new()),
+            pod_sync_locks: crate::sync_locks::SyncLocks::new(),
             restart_backoff: Mutex::new(HashMap::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
@@ -1972,30 +1972,18 @@ impl Kubelet {
         // (issue #1112). Same-name pods cannot legitimately coexist in
         // storage, so name-keyed skip-and-retry loses no real concurrency.
         let sync_lock_key = format!("{}/{}", namespace, pod_name);
-        {
-            let mut locks = self.pod_sync_locks.lock().unwrap();
-            if locks.contains(&sync_lock_key) {
+        // Skip-and-retry: if another sync already holds this pod's key, bail (a
+        // later reconcile retries). The guard releases the key on every return
+        // path. See `crate::sync_locks` for the rationale + tests.
+        let _sync_guard = match self.pod_sync_locks.try_acquire(sync_lock_key) {
+            Some(guard) => guard,
+            None => {
                 debug!(
                     "Skipping sync for pod {}/{} (uid {}) — already syncing",
                     namespace, pod_name, pod_uid
                 );
                 return Ok(());
             }
-            locks.insert(sync_lock_key.clone());
-        }
-        // Release the lock when this function returns (on any path)
-        struct SyncGuard<'a> {
-            locks: &'a Mutex<HashSet<String>>,
-            key: String,
-        }
-        impl<'a> Drop for SyncGuard<'a> {
-            fn drop(&mut self) {
-                self.locks.lock().unwrap().remove(&self.key);
-            }
-        }
-        let _sync_guard = SyncGuard {
-            locks: &self.pod_sync_locks,
-            key: sync_lock_key,
         };
 
         debug!("Syncing pod: {}/{}", namespace, pod_name);
