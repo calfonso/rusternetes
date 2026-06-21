@@ -826,8 +826,12 @@ async fn csr_full_lifecycle_with_signer_issues_certificate() {
 
     // The signing controller, after approving, writes the issued certificate
     // into status.certificate via the /status subresource. Simulate that write.
+    // `certificate` is []byte upstream, i.e. base64-encoded PEM on the wire;
+    // validateCertificate base64-decodes then x509-parses each CERTIFICATE block,
+    // so this must be a real certificate's PEM, base64-encoded (a placeholder is
+    // correctly rejected). Self-signed leaf generated for the test.
     let issued_pem =
-        "-----BEGIN CERTIFICATE-----\nMIIBIssuedLeafForE2E\n-----END CERTIFICATE-----\n";
+        "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJmRENDQVNHZ0F3SUJBZ0lVRmJPakN5UUNnWEMrL0ZvREFWWTgrT0FXSFM0d0NnWUlLb1pJemowRUF3SXcKRXpFUk1BOEdBMVVFQXd3SVpUSmxMV3hsWVdZd0hoY05Nall3TmpJeE1qSXlNRFV6V2hjTk16WXdOakU0TWpJeQpNRFV6V2pBVE1SRXdEd1lEVlFRRERBaGxNbVV0YkdWaFpqQlpNQk1HQnlxR1NNNDlBZ0VHQ0NxR1NNNDlBd0VICkEwSUFCTStKZ3M4elVMZHVlcHZSK2xFMEptVTRkK1Q4c3dndnUwK1FzU0sxM1hCNXE4ZXFjRlFTYkdPKzI2WnQKYjB6QkNsS0pqS2kxM2NabTY1QW5JL3h6OVIyalV6QlJNQjBHQTFVZERnUVdCQlF0YnFBRVozQklobVZkeldGeApwZXdQcEs4eUVqQWZCZ05WSFNNRUdEQVdnQlF0YnFBRVozQklobVZkeldGeHBld1BwSzh5RWpBUEJnTlZIUk1CCkFmOEVCVEFEQVFIL01Bb0dDQ3FHU000OUJBTUNBMGtBTUVZQ0lRRC9RVW85b1BBMGR0TVFta3VTTkN3Q25CUTAKN2gzSDFNQXdlM3pqSFk1ZWpBSWhBS2pMOGlsOUh6WU9VRXJHQk9aa1dSdkV1N21ISjdRM0VUWXRJZWhYRC9BcAotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==";
     let mut status_body = created.clone();
     status_body["status"] = json!({
         "conditions": [{

@@ -259,3 +259,120 @@ pub fn validate_csr_status_conditions(
     }
     errs
 }
+
+/// PEM-validate `status.certificate` — upstream `validateCertificate`. The field
+/// carries the base64 of the PEM data (Go `[]byte` JSON marshalling). Returns
+/// `Some(detail)` on the first failure, `None` when valid or unset/empty.
+fn status_certificate_error(certificate: Option<&str>) -> Option<String> {
+    let cert = certificate?;
+    if cert.is_empty() {
+        return None;
+    }
+    let pem_bytes = match base64::engine::general_purpose::STANDARD.decode(cert) {
+        Ok(b) => b,
+        Err(e) => return Some(format!("invalid base64: {e}")),
+    };
+    let blocks = match pem::parse_many(&pem_bytes) {
+        Ok(b) => b,
+        Err(e) => return Some(format!("invalid PEM data: {e}")),
+    };
+    for block in &blocks {
+        if block.tag() != "CERTIFICATE" {
+            return Some(format!(
+                "only CERTIFICATE PEM blocks are allowed, found {:?}",
+                block.tag()
+            ));
+        }
+        if block.headers().iter().next().is_some() {
+            return Some("no PEM block headers are permitted".to_string());
+        }
+        if x509_parser::certificate::X509Certificate::from_der(block.contents()).is_err() {
+            return Some(
+                "found CERTIFICATE PEM block containing an invalid certificate".to_string(),
+            );
+        }
+    }
+    // Upstream requires at least one CERTIFICATE block once non-empty data is
+    // present (a `pem.Decode` loop that found nothing).
+    if blocks.is_empty() {
+        return Some("must contain at least one CERTIFICATE PEM block".to_string());
+    }
+    None
+}
+
+/// Validate CSR `status.certificate` — upstream `validateCertificate`, used on
+/// the `/status` and `/approval` update paths. When set, the certificate must
+/// be one or more PEM `CERTIFICATE` blocks (no other block type, no PEM
+/// headers), each a parseable X.509 certificate, with at least one block.
+pub fn validate_csr_status_certificate(certificate: Option<&str>) -> ErrorList {
+    let mut errs = ErrorList::new();
+    if let Some(detail) = status_certificate_error(certificate) {
+        errs.push(Error::invalid(
+            &Path::new("status").child("certificate"),
+            "<certificate data>".to_string(),
+            detail,
+        ));
+    }
+    errs
+}
+
+#[cfg(test)]
+mod status_certificate_tests {
+    use super::status_certificate_error;
+    use base64::Engine;
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
+
+    /// A real self-signed cert PEM via rcgen.
+    fn valid_cert_pem() -> String {
+        rcgen::generate_simple_self_signed(vec!["test.example.com".to_string()])
+            .expect("cert")
+            .cert
+            .pem()
+    }
+
+    #[test]
+    fn unset_or_empty_passes() {
+        assert_eq!(status_certificate_error(None), None);
+        assert_eq!(status_certificate_error(Some("")), None);
+    }
+
+    #[test]
+    fn valid_certificate_passes() {
+        let data = b64(&valid_cert_pem());
+        assert_eq!(status_certificate_error(Some(&data)), None);
+    }
+
+    #[test]
+    fn two_concatenated_certs_pass() {
+        let chain = format!("{}{}", valid_cert_pem(), valid_cert_pem());
+        let data = b64(&chain);
+        assert_eq!(status_certificate_error(Some(&data)), None);
+    }
+
+    #[test]
+    fn garbage_base64_rejected() {
+        assert!(status_certificate_error(Some("not base64!!!")).is_some());
+    }
+
+    #[test]
+    fn non_pem_payload_rejected() {
+        // valid base64, but no PEM blocks inside.
+        let data = b64("definitely not a pem block");
+        let err = status_certificate_error(Some(&data)).expect("err");
+        assert!(err.contains("at least one CERTIFICATE PEM block"), "{err}");
+    }
+
+    #[test]
+    fn wrong_block_type_rejected() {
+        let data =
+            b64("-----BEGIN CERTIFICATE REQUEST-----\nMIIB\n-----END CERTIFICATE REQUEST-----\n");
+        let err = status_certificate_error(Some(&data)).expect("err");
+        assert!(
+            err.contains("only CERTIFICATE PEM blocks are allowed"),
+            "{err}"
+        );
+    }
+}

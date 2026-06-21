@@ -296,6 +296,19 @@ pub async fn update_certificate_signing_request_status(
         }
     }
 
+    // Validate status.certificate (upstream validateCertificate): when set it
+    // must be one or more PEM CERTIFICATE blocks, each a parseable X.509 cert.
+    let cert_errs =
+        rusternetes_common::validation::certificatesigningrequest::validate_csr_status_certificate(
+            existing_csr
+                .status
+                .as_ref()
+                .and_then(|s| s.certificate.as_deref()),
+        );
+    if !cert_errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(cert_errs));
+    }
+
     // Merge annotations from the patch into existing (don't replace entirely)
     if let Some(new_annotations) = updated_csr.metadata.annotations {
         let annotations = existing_csr
