@@ -12,3 +12,4 @@ pub mod metav1;
 pub mod objectmeta;
 pub mod pod;
 pub mod service;
+pub mod storageclass;
