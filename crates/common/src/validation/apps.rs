@@ -676,3 +676,28 @@ pub fn validate_deployment_update(new: &Deployment, old: &Deployment) -> ErrorLi
 
     errs
 }
+
+/// Validate a `StatefulSet` update — the immutability rule from upstream
+/// `ValidateStatefulSetUpdate`. All spec fields except `replicas`, `ordinals`,
+/// `template`, `updateStrategy`, `revisionHistoryLimit`,
+/// `persistentVolumeClaimRetentionPolicy` and `minReadySeconds` are immutable.
+///
+/// Here we check the immutable fields explicitly (`serviceName`,
+/// `podManagementPolicy`, `volumeClaimTemplates`) rather than a whole-spec
+/// deep-equal, so legitimate mutations to the allowed fields never false-trip.
+/// `selector` immutability is enforced by the handler's
+/// `validate_selector_immutable` call.
+pub fn validate_statefulset_update(new: &StatefulSet, old: &StatefulSet) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let immutable_changed = new.spec.service_name != old.spec.service_name
+        || new.spec.pod_management_policy != old.spec.pod_management_policy
+        || serde_json::to_value(&new.spec.volume_claim_templates).ok()
+            != serde_json::to_value(&old.spec.volume_claim_templates).ok();
+    if immutable_changed {
+        errs.push(Error::forbidden(
+            &Path::new("spec"),
+            "updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'revisionHistoryLimit', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden",
+        ));
+    }
+    errs
+}

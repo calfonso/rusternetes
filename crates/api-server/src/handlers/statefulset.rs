@@ -155,7 +155,15 @@ pub async fn update(
 
     // Load stored object so we can enforce upstream Strategy.PrepareForUpdate
     // (status reset + selector immutability) and ValidateStatefulSetUpdate.
-    let old_statefulset: StatefulSet = state.storage.get(&key).await?;
+    let mut old_statefulset: StatefulSet = state.storage.get(&key).await?;
+
+    // Default the stored object the same way as the incoming one before the
+    // immutability comparison. Upstream validates new vs old in their defaulted
+    // internal form (old is already defaulted in etcd); defaulting is idempotent,
+    // so this is a no-op for normally-created objects but prevents a defaulted
+    // field (e.g. podManagementPolicy "OrderedReady") on the new object from
+    // looking like a forbidden change against an undefaulted stored object.
+    crate::handlers::defaults::apply_statefulset_defaults(&mut old_statefulset);
 
     crate::handlers::lifecycle::check_resource_version(
         old_statefulset.metadata.resource_version.as_deref(),
@@ -168,6 +176,16 @@ pub async fn update(
         &statefulset.spec.selector,
         "StatefulSet",
     )?;
+
+    // Enforce the remaining update immutability (upstream ValidateStatefulSetUpdate):
+    // serviceName, podManagementPolicy and volumeClaimTemplates are immutable.
+    let errs = rusternetes_common::validation::apps::validate_statefulset_update(
+        &statefulset,
+        &old_statefulset,
+    );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     // Status only mutates via /status; mirror upstream PrepareForUpdate.
     statefulset.status = old_statefulset.status.clone();
