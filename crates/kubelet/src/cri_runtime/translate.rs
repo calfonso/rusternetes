@@ -584,6 +584,19 @@ pub fn validate_env_key_refs(
 /// Translate volume mounts into CRI mounts using a resolved volume-name →
 /// host-path map (volume provisioning is runtime-agnostic and done earlier).
 /// Mounts whose volume is absent from the map are skipped.
+/// Map `volumeMount.mountPropagation` to the CRI propagation mode, porting
+/// upstream `translateMountPropagation` (`pkg/kubelet/kubelet_pods.go`): unset,
+/// `None`, and any unknown value → `Private` (the default);
+/// `HostToContainer`/`Bidirectional` map straight through.
+fn translate_mount_propagation(mode: Option<&str>) -> i32 {
+    use v1::MountPropagation;
+    match mode {
+        Some("HostToContainer") => MountPropagation::PropagationHostToContainer as i32,
+        Some("Bidirectional") => MountPropagation::PropagationBidirectional as i32,
+        _ => MountPropagation::PropagationPrivate as i32,
+    }
+}
+
 fn mounts(container: &Container, host_paths: &HashMap<String, String>) -> Vec<v1::Mount> {
     let Some(vms) = container.volume_mounts.as_ref() else {
         return Vec::new();
@@ -594,6 +607,7 @@ fn mounts(container: &Container, host_paths: &HashMap<String, String>) -> Vec<v1
                 container_path: vm.mount_path.clone(),
                 host_path: host.clone(),
                 readonly: vm.read_only.unwrap_or(false),
+                propagation: translate_mount_propagation(vm.mount_propagation.as_deref()),
                 ..Default::default()
             })
         })
@@ -1138,6 +1152,49 @@ mod tests {
         assert_eq!(cfg.mounts[0].container_path, "/data");
         assert_eq!(cfg.mounts[0].host_path, "/host/data");
         assert!(cfg.mounts[0].readonly);
+        // Unset propagation defaults to Private.
+        assert_eq!(
+            cfg.mounts[0].propagation,
+            v1::MountPropagation::PropagationPrivate as i32
+        );
+    }
+
+    #[test]
+    fn mount_propagation_modes() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        use v1::MountPropagation;
+        let mk = |mode: Option<&str>| VolumeMount {
+            name: "v".to_string(),
+            mount_path: "/v".to_string(),
+            read_only: None,
+            sub_path: None,
+            sub_path_expr: None,
+            mount_propagation: mode.map(str::to_string),
+            recursive_read_only: None,
+        };
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        let host_paths = HashMap::from([("v".to_string(), "/host/v".to_string())]);
+        let mut prop = |mode: Option<&str>| -> i32 {
+            c.volume_mounts = Some(vec![mk(mode)]);
+            mounts(&c, &host_paths)[0].propagation
+        };
+        assert_eq!(
+            prop(Some("HostToContainer")),
+            MountPropagation::PropagationHostToContainer as i32
+        );
+        assert_eq!(
+            prop(Some("Bidirectional")),
+            MountPropagation::PropagationBidirectional as i32
+        );
+        assert_eq!(
+            prop(Some("None")),
+            MountPropagation::PropagationPrivate as i32
+        );
+        assert_eq!(prop(None), MountPropagation::PropagationPrivate as i32);
     }
 
     #[test]
