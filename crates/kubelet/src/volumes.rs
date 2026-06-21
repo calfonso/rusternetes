@@ -308,6 +308,28 @@ impl VolumeManager {
                         let mut expected_files: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
 
+                        // Per-file permissions must survive a resync rewrite, matching
+                        // the initial-mount path and upstream's atomic writer (which
+                        // re-applies each file's mode on every update). A plain
+                        // `fs::write` of a *new* key (added after pod start) would
+                        // otherwise leave it at the umask default instead of the
+                        // item's `mode` / the projection `defaultMode` (#1050).
+                        let proj_default_mode = projected.default_mode.unwrap_or(0o644);
+                        let apply_mode = |path: &str, mode: i32| {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(
+                                    path,
+                                    std::fs::Permissions::from_mode(mode as u32),
+                                );
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = (path, mode);
+                            }
+                        };
+
                         for source in sources {
                             if let Some(cm_proj) = &source.config_map {
                                 if let Some(cm_name) = &cm_proj.name {
@@ -341,7 +363,12 @@ impl VolumeManager {
                                                     {
                                                         let _ = std::fs::create_dir_all(parent);
                                                     }
-                                                    let _ = std::fs::write(&file_path, value);
+                                                    if std::fs::write(&file_path, value).is_ok() {
+                                                        apply_mode(
+                                                            &file_path,
+                                                            item.mode.unwrap_or(proj_default_mode),
+                                                        );
+                                                    }
                                                 }
                                             }
                                         } else if let Some(data) = &cm.data {
@@ -356,7 +383,9 @@ impl VolumeManager {
                                                         continue;
                                                     }
                                                 }
-                                                let _ = std::fs::write(&file_path, v);
+                                                if std::fs::write(&file_path, v).is_ok() {
+                                                    apply_mode(&file_path, proj_default_mode);
+                                                }
                                             }
                                         }
                                     }
@@ -382,7 +411,9 @@ impl VolumeManager {
                                                         continue;
                                                     }
                                                 }
-                                                let _ = std::fs::write(&file_path, v);
+                                                if std::fs::write(&file_path, v).is_ok() {
+                                                    apply_mode(&file_path, proj_default_mode);
+                                                }
                                             }
                                         }
                                     }
@@ -1861,5 +1892,72 @@ impl VolumeManager {
             // Unknown resource type, return raw value
             Ok(raw_value.unwrap_or_else(|| "0".to_string()))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod projected_mode_tests {
+    use super::*;
+    use rusternetes_storage::{build_key, Storage, StorageBackend};
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    /// A projected configMap item with an explicit `mode` must have that mode
+    /// applied to the file the resync path (re)writes — matching the
+    /// initial-mount path and upstream's atomic writer. Regression guard for the
+    /// resync gap where new keys landed at the umask default (#1050).
+    #[tokio::test]
+    async fn resync_projected_configmap_applies_item_mode() {
+        let tmp = std::env::temp_dir().join(format!("rn-projmode-{}-{}", std::process::id(), "cm"));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let cm: rusternetes_common::resources::ConfigMap = serde_json::from_value(json!({
+            "metadata": {"name": "cfg", "namespace": "default"},
+            "data": {"app.conf": "hello"}
+        }))
+        .unwrap();
+        Storage::create(
+            storage.as_ref(),
+            &build_key("configmaps", Some("default"), "cfg"),
+            &cm,
+        )
+        .await
+        .unwrap();
+
+        // defaultMode 0644 (420), item mode 0400 (256).
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "proj",
+                "projected": {
+                    "defaultMode": 420,
+                    "sources": [{"configMap": {
+                        "name": "cfg",
+                        "items": [{"key": "app.conf", "path": "app.conf", "mode": 256}]
+                    }}]
+                }
+            }]}
+        }))
+        .unwrap();
+
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+
+        let file = tmp.join("p").join("proj").join("app.conf");
+        let perms = std::fs::metadata(&file)
+            .expect("projected file must exist after resync")
+            .permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o400,
+            "projected configMap item mode must be applied on resync"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
