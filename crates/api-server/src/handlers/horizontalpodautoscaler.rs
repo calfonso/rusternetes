@@ -50,6 +50,14 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Field validation (mirrors upstream ValidateHorizontalPodAutoscaler).
+    {
+        let errs = rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler(&hpa);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     hpa.metadata.namespace = Some(namespace.clone());
     hpa.metadata.ensure_uid();
     hpa.metadata.ensure_creation_timestamp();

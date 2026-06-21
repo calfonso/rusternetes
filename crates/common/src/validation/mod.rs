@@ -10,6 +10,7 @@ pub mod csistoragecapacity;
 pub mod endpointslice;
 pub mod events;
 pub mod field;
+pub mod hpa;
 pub mod ingress;
 pub mod lease;
 pub mod limitrange;
