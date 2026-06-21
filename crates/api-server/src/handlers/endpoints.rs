@@ -239,6 +239,16 @@ pub async fn update_endpoints(
 
     let key = build_key("endpoints", Some(&namespace), &name);
 
+    // Field validation on update (upstream ValidateEndpointsUpdate re-runs
+    // ValidateEndpoints on the new object). The create path validated but the
+    // update path previously persisted PUTs unchecked.
+    {
+        let errs = rusternetes_common::validation::endpoints::validate_endpoints(&endpoints);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
