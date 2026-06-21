@@ -61,13 +61,55 @@ impl<S: Storage + 'static> PriorityClassController<S> {
     /// `network_policy.rs` so future watch-based work can slot in without
     /// changing the call site.
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        use futures::StreamExt;
         info!("Starting PriorityClass controller");
 
         loop {
+            // Reconcile once, then block on PriorityClass writes instead of
+            // busy-polling — idle CPU drops to ~0 between real changes. The
+            // periodic resync is the wedge-safe fallback, matching the
+            // informer+resync model the other controllers already use (#1040).
             if let Err(e) = self.reconcile_all().await {
                 tracing::error!("PriorityClass reconcile failed: {}", e);
             }
-            time::sleep(self.interval).await;
+
+            let mut watch = match self
+                .storage
+                .watch(&build_prefix("priorityclasses", None))
+                .await
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(
+                        "PriorityClass watch failed: {e}; retrying in {:?}",
+                        self.interval
+                    );
+                    time::sleep(self.interval).await;
+                    continue;
+                }
+            };
+            let mut resync = time::interval(self.interval);
+            resync.tick().await; // drop the immediate first tick
+
+            loop {
+                tokio::select! {
+                    ev = watch.next() => match ev {
+                        Some(Ok(_)) => {
+                            if let Err(e) = self.reconcile_all().await {
+                                tracing::error!("PriorityClass reconcile failed: {}", e);
+                            }
+                        }
+                        // Stream ended/errored → reconnect via the outer loop
+                        // (which re-reconciles first).
+                        _ => break,
+                    },
+                    _ = resync.tick() => {
+                        if let Err(e) = self.reconcile_all().await {
+                            tracing::error!("PriorityClass reconcile failed: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -69,12 +69,51 @@ impl<S: Storage + 'static> PvcController<S> {
     /// else in this method needs to change.
     #[allow(dead_code)]
     pub async fn run(&self) -> Result<()> {
+        use futures::StreamExt;
         info!("Starting PVC Controller (stub)");
+
+        // reconcile_all is a no-op stub, so the old fixed-interval loop just
+        // burned a wake-up every interval forever. Block on PVC writes instead
+        // (idle CPU → ~0); the periodic resync is the wedge-safe fallback and
+        // keeps the loop event-driven for when the real PVC lifecycle reconcile
+        // lands (#1040). (Actual binding is the watch-driven pv_binder.)
         loop {
             if let Err(e) = self.reconcile_all().await {
                 debug!("PVC reconcile_all returned error: {}", e);
             }
-            time::sleep(self.interval).await;
+
+            let mut watch = match self
+                .storage
+                .watch("/registry/persistentvolumeclaims/")
+                .await
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("PVC watch failed: {e}; retrying in {:?}", self.interval);
+                    time::sleep(self.interval).await;
+                    continue;
+                }
+            };
+            let mut resync = time::interval(self.interval);
+            resync.tick().await; // drop the immediate first tick
+
+            loop {
+                tokio::select! {
+                    ev = watch.next() => match ev {
+                        Some(Ok(_)) => {
+                            if let Err(e) = self.reconcile_all().await {
+                                debug!("PVC reconcile_all returned error: {}", e);
+                            }
+                        }
+                        _ => break,
+                    },
+                    _ = resync.tick() => {
+                        if let Err(e) = self.reconcile_all().await {
+                            debug!("PVC reconcile_all returned error: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 
