@@ -168,6 +168,15 @@ pub async fn create(
     if let Some(ref mut spec) = pod.spec {
         crate::handlers::defaults::apply_pod_spec_defaults(spec);
 
+        // SetDefaults_Pod (Pod-only, NOT templates): enableServiceLinks defaults
+        // to true (v1.DefaultEnableServiceLinks). Defaulting this on embedded
+        // PodTemplateSpecs would diverge from upstream and break ControllerRevision
+        // byte-comparisons, so it lives here on the standalone Pod path.
+        // K8s ref: pkg/apis/core/v1/defaults.go SetDefaults_Pod.
+        if spec.enable_service_links.is_none() {
+            spec.enable_service_links = Some(true);
+        }
+
         // K8s pod-only defaulting: if a container has explicit limits but no requests,
         // default requests to the limit value. This happens BEFORE LimitRange so that
         // explicit limits take precedence over LimitRange defaultRequest.
@@ -356,6 +365,10 @@ pub async fn create(
     // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go
     if let Some(ref mut spec) = pod.spec {
         crate::handlers::defaults::apply_pod_spec_defaults(spec);
+        // SetDefaults_Pod (Pod-only): enableServiceLinks defaults to true.
+        if spec.enable_service_links.is_none() {
+            spec.enable_service_links = Some(true);
+        }
     }
 
     // Inject service account token (built-in admission controller)
