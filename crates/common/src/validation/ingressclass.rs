@@ -160,3 +160,28 @@ pub fn validate_ingress_class(ic: &IngressClass) -> ErrorList {
 
     errs
 }
+
+/// Validate an IngressClass update — upstream `ValidateIngressClassUpdate`
+/// (pkg/apis/networking/validation): `spec.controller` is immutable, plus full
+/// re-validation of the new object.
+pub fn validate_ingress_class_update(new_ic: &IngressClass, old_ic: &IngressClass) -> ErrorList {
+    let mut errs = validate_ingress_class(new_ic);
+    let new_ctrl = new_ic
+        .spec
+        .as_ref()
+        .map(|s| s.controller.as_str())
+        .unwrap_or("");
+    let old_ctrl = old_ic
+        .spec
+        .as_ref()
+        .map(|s| s.controller.as_str())
+        .unwrap_or("");
+    if new_ctrl != old_ctrl {
+        errs.push(Error::invalid(
+            &Path::new("spec").child("controller"),
+            new_ctrl.to_string(),
+            "field is immutable",
+        ));
+    }
+    errs
+}

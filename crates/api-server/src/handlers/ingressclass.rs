@@ -114,14 +114,30 @@ pub async fn update_ingressclass(
 
     ingress_class.metadata.name = name.clone();
 
+    let key = build_key("ingressclasses", None, &name);
+
+    // Field validation + spec.controller immutability on update (upstream
+    // ValidateIngressClassUpdate). Validates before the dry-run short-circuit.
+    if let Ok(old) = state
+        .storage
+        .get::<rusternetes_common::resources::IngressClass>(&key)
+        .await
+    {
+        let errs = rusternetes_common::validation::ingressclass::validate_ingress_class_update(
+            &ingress_class,
+            &old,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: IngressClass validated successfully (not updated)");
         return Ok(Json(ingress_class));
     }
-
-    let key = build_key("ingressclasses", None, &name);
 
     // Try to update first, if not found then create (upsert behavior)
     let result = match state.storage.update(&key, &ingress_class).await {
