@@ -85,6 +85,37 @@ fn waiting_status(name: &str) -> ContainerStatus {
     }
 }
 
+/// Find a container's spec by name across the pod's regular and init containers
+/// (used to resolve its `terminationMessagePolicy`). Ephemeral containers carry
+/// a distinct type and always use the default `File` policy here.
+fn find_container<'a>(pod: &'a Pod, name: &str) -> Option<&'a Container> {
+    let spec = pod.spec.as_ref()?;
+    spec.containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten())
+        .find(|c| c.name == name)
+}
+
+/// Read the last [`status::MAX_TERMINATION_MESSAGE_LENGTH`] bytes of a container
+/// log file for the `FallbackToLogsOnError` path. `None` if the log is absent or
+/// empty. Returns the raw log tail; the CRI log line framing is left intact
+/// (this is only the error-fallback source, not the primary message).
+fn read_log_tail(log_path: &str) -> Option<String> {
+    let data = std::fs::read(log_path).ok()?;
+    if data.is_empty() {
+        return None;
+    }
+    let start = data
+        .len()
+        .saturating_sub(status::MAX_TERMINATION_MESSAGE_LENGTH);
+    let tail = String::from_utf8_lossy(&data[start..]).into_owned();
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
+}
+
 /// Drives a CRI v1 runtime (containerd → Youki) for the kubelet.
 #[derive(Clone)]
 pub struct CriContainerRuntime {
@@ -296,6 +327,56 @@ impl CriContainerRuntime {
         )
     }
 
+    /// Host path of a container's termination-message file. Lives next to the
+    /// container logs in the per-pod dir; the same path is bind-mounted into the
+    /// container at its `terminationMessagePath` on create and read back on exit
+    /// (#442). Derivable identically on the create and status paths, so no extra
+    /// plumbing is needed.
+    fn termination_log_host_path(&self, pod: &Pod, container_name: &str) -> String {
+        format!(
+            "{}/{}-termination-log",
+            self.log_dir_for(pod),
+            container_name
+        )
+    }
+
+    /// Apply upstream `getTerminationMessage` semantics to a just-mapped
+    /// container status: for a terminated container, read its termination-message
+    /// file (and, for `FallbackToLogsOnError`, the log tail) and override the
+    /// runtime-supplied message. No-op for non-terminated states. #442.
+    fn apply_termination_message(&self, pod: &Pod, name: &str, status: &mut ContainerStatus) {
+        let Some(ContainerState::Terminated {
+            exit_code,
+            reason,
+            message,
+            ..
+        }) = status.state.as_mut()
+        else {
+            return;
+        };
+
+        let policy = find_container(pod, name)
+            .and_then(|c| c.termination_message_policy.clone())
+            .unwrap_or_else(|| "File".to_string());
+
+        let host_path = self.termination_log_host_path(pod, name);
+        let file_read = std::fs::read_to_string(&host_path).ok();
+
+        let log_path = format!("{}/{}.log", self.log_dir_for(pod), name);
+        let exit = *exit_code;
+        let reason = reason.clone();
+        let resolved = status::resolve_termination_message(
+            file_read,
+            &policy,
+            exit,
+            reason.as_deref(),
+            || read_log_tail(&log_path),
+        );
+        if let Some(m) = resolved {
+            *message = Some(m);
+        }
+    }
+
     /// Create and start one container from its translated config, returning its
     /// id. Pulls the image on behalf of the sandbox first.
     async fn create_and_start_container(
@@ -329,6 +410,35 @@ impl CriContainerRuntime {
             &secrets,
         );
         self.inject_service_env(&mut cfg);
+
+        // Bind-mount a per-container host file at the container's
+        // terminationMessagePath so it can write a termination message that the
+        // kubelet reads back on exit (#442). Best-effort: if the host file can't
+        // be created we omit the mount, leaving behaviour unchanged. The file
+        // must exist before create so the runtime bind-mounts a file (not a new
+        // dir) — matching upstream makeMounts, which Creates+Chmods it first.
+        let term_host = self.termination_log_host_path(pod, &container.name);
+        if let Some(parent) = Path::new(&term_host).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match crate::runtime::setup_termination_message_file(&term_host) {
+            Ok(()) => {
+                let container_path = container
+                    .termination_message_path
+                    .clone()
+                    .unwrap_or_else(|| "/dev/termination-log".to_string());
+                cfg.mounts.push(v1::Mount {
+                    container_path,
+                    host_path: term_host,
+                    readonly: false,
+                    ..Default::default()
+                });
+            }
+            Err(e) => warn!(
+                "container {}: termination-log setup failed, message unavailable: {e}",
+                container.name
+            ),
+        }
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
@@ -612,11 +722,12 @@ impl CriContainerRuntime {
             match by_name.get(name) {
                 Some(id) => {
                     let full = cri.container_status(id, false).await?;
-                    let mapped = full
+                    let mut mapped = full
                         .status
                         .as_ref()
                         .map(status::map_container_status)
                         .unwrap_or_else(|| waiting_status(name));
+                    self.apply_termination_message(pod, name, &mut mapped);
                     out.push(mapped);
                 }
                 None => out.push(waiting_status(name)),
@@ -1464,7 +1575,51 @@ fn service_env_vars(host: &str, port: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::resources::pod::PodSpec;
     use std::collections::HashMap;
+
+    #[test]
+    fn find_container_searches_regular_and_init() {
+        let spec = PodSpec {
+            containers: vec![Container {
+                name: "app".to_string(),
+                ..Default::default()
+            }],
+            init_containers: Some(vec![Container {
+                name: "setup".to_string(),
+                termination_message_policy: Some("FallbackToLogsOnError".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let pod = Pod::new("web", spec);
+        assert_eq!(
+            find_container(&pod, "app").map(|c| c.name.as_str()),
+            Some("app")
+        );
+        assert_eq!(
+            find_container(&pod, "setup").and_then(|c| c.termination_message_policy.as_deref()),
+            Some("FallbackToLogsOnError")
+        );
+        assert!(find_container(&pod, "missing").is_none());
+    }
+
+    #[test]
+    fn read_log_tail_keeps_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.log");
+        let big = "a".repeat(status::MAX_TERMINATION_MESSAGE_LENGTH + 50) + "END";
+        std::fs::write(&path, &big).unwrap();
+        let tail = read_log_tail(path.to_str().unwrap()).unwrap();
+        assert_eq!(tail.len(), status::MAX_TERMINATION_MESSAGE_LENGTH);
+        assert!(tail.ends_with("END"));
+
+        // Missing / empty logs yield None.
+        assert!(read_log_tail(dir.path().join("nope.log").to_str().unwrap()).is_none());
+        let empty = dir.path().join("empty.log");
+        std::fs::write(&empty, "").unwrap();
+        assert!(read_log_tail(empty.to_str().unwrap()).is_none());
+    }
 
     #[test]
     fn service_env_derives_port_from_actual_service_port() {
