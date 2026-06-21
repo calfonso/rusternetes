@@ -98,3 +98,49 @@ pub fn validate_persistent_volume_claim_spec(
 pub fn validate_persistent_volume_claim(pvc: &PersistentVolumeClaim) -> ErrorList {
     validate_persistent_volume_claim_spec(&pvc.spec, &Path::new("spec"))
 }
+
+/// Validate a `PersistentVolumeClaim` update. Ports the safe, conformance-tested
+/// immutability subset of upstream `ValidatePersistentVolumeClaimUpdate`:
+/// `volumeMode` is immutable, and the storage request may not shrink. The broad
+/// "spec is immutable except resources.requests" deep-equal check (which needs
+/// careful per-field normalization to avoid false positives on binding) is left
+/// as a follow-up.
+pub fn validate_persistent_volume_claim_update(
+    new_pvc: &PersistentVolumeClaim,
+    old_pvc: &PersistentVolumeClaim,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // volumeMode is immutable.
+    if new_pvc.spec.volume_mode != old_pvc.spec.volume_mode {
+        errs.push(Error::forbidden(
+            &Path::new("volumeMode"),
+            "field is immutable",
+        ));
+    }
+
+    // resources.requests["storage"] may not decrease (Kubernetes supports growth
+    // only, not shrinking).
+    let storage = |spec: &PersistentVolumeClaimSpec| -> Option<String> {
+        spec.resources
+            .requests
+            .as_ref()
+            .and_then(|m| m.get("storage"))
+            .cloned()
+    };
+    if let (Some(old_s), Some(new_s)) = (storage(&old_pvc.spec), storage(&new_pvc.spec)) {
+        if let (Ok(o), Ok(n)) = (Quantity::parse(&old_s), Quantity::parse(&new_s)) {
+            if n.cmp_value(&o) == std::cmp::Ordering::Less {
+                errs.push(Error::forbidden(
+                    &Path::new("spec")
+                        .child("resources")
+                        .child("requests")
+                        .child("storage"),
+                    "field can not be less than previous value",
+                ));
+            }
+        }
+    }
+
+    errs
+}

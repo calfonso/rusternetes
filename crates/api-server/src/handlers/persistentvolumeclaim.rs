@@ -297,6 +297,21 @@ pub async fn update_pvc(
 
     let key = build_key("persistentvolumeclaims", Some(&namespace), &name);
 
+    // Enforce update immutability (upstream ValidatePersistentVolumeClaimUpdate):
+    // volumeMode immutable + storage request may not shrink.
+    if let Ok(existing) = state
+        .storage
+        .get::<rusternetes_common::resources::PersistentVolumeClaim>(&key)
+        .await
+    {
+        let errs = rusternetes_common::validation::pvc::validate_persistent_volume_claim_update(
+            &pvc, &existing,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
