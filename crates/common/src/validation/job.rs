@@ -12,8 +12,10 @@
 //! post-defaulting object.
 //!
 //! Also covers the policy sub-objects `podFailurePolicy`, `successPolicy`,
-//! `podReplacementPolicy` and `managedBy` (#1326). The `succeededIndexes`
-//! interval-format parser (`validateIndexesFormat`) is the one remaining gap.
+//! `podReplacementPolicy` and `managedBy` (#1326), including the
+//! `successPolicy.rules[].succeededIndexes` interval-format validation
+//! (`validateIndexesFormat`) and the `succeededCount <= totalIndexes`
+//! cross-check (#1344).
 
 use crate::resources::workloads::{
     Job, JobSpec, JobTemplateSpec, PodFailurePolicyRule, SuccessPolicyRule,
@@ -37,6 +39,70 @@ const MAX_POD_FAILURE_POLICY_RULES: usize = 20;
 const MAX_ON_EXIT_CODES_VALUES: usize = 255;
 const MAX_ON_POD_CONDITIONS_PATTERNS: usize = 20;
 const MAX_SUCCESS_POLICY_RULES: usize = 20;
+/// Upstream `maxJobSuccessPolicySucceededIndexesLimit` — 64 KiB cap on the
+/// `succeededIndexes` string.
+const MAX_JOB_SUCCESS_POLICY_SUCCEEDED_INDEXES_LIMIT: usize = 64 * 1024;
+
+/// Parse one `succeededIndexes` interval (`"3"` or `"3-5"`) against
+/// `completions`, returning the inclusive `(start, end)`. Mirrors upstream
+/// `parseIndexInterval` (pkg/apis/batch/validation).
+fn parse_index_interval(interval: &str, completions: i32) -> Result<(i32, i32), String> {
+    let limits: Vec<&str> = interval.split('-').collect();
+    if limits.len() > 2 {
+        return Err(format!(
+            "the fragment {interval:?} violates the requirement that an index interval can have at most two parts separated by '-'"
+        ));
+    }
+    let x: i32 = limits[0].parse().map_err(|_| {
+        format!(
+            "cannot convert string to integer for index: {:?}",
+            limits[0]
+        )
+    })?;
+    if x >= completions {
+        return Err(format!("too large index: {:?}", limits[0]));
+    }
+    if limits.len() == 2 {
+        let y: i32 = limits[1].parse().map_err(|_| {
+            format!(
+                "cannot convert string to integer for index: {:?}",
+                limits[1]
+            )
+        })?;
+        if y >= completions {
+            return Err(format!("too large index: {:?}", limits[1]));
+        }
+        if x >= y {
+            return Err(format!("non-increasing order, previous: {x}, current: {y}"));
+        }
+        return Ok((x, y));
+    }
+    Ok((x, x))
+}
+
+/// Parse a `succeededIndexes` string (`"1,3-5,7"`) against `completions`,
+/// returning the total number of covered indexes. Intervals must be in strictly
+/// increasing, non-overlapping order. Mirrors upstream `validateIndexesFormat`.
+fn validate_indexes_format(indexes: &str, completions: i32) -> Result<i32, String> {
+    if indexes.is_empty() {
+        return Ok(0);
+    }
+    let mut last_index: Option<i32> = None;
+    let mut total: i32 = 0;
+    for interval in indexes.split(',') {
+        let (x, y) = parse_index_interval(interval, completions)?;
+        if let Some(last) = last_index {
+            if last >= x {
+                return Err(format!(
+                    "non-increasing order, previous: {last}, current: {x}"
+                ));
+            }
+        }
+        total += y - x + 1;
+        last_index = Some(y);
+    }
+    Ok(total)
+}
 const MAX_MANAGED_BY_LENGTH: usize = 63;
 
 const NON_INDEXED_COMPLETION: &str = "NonIndexed";
@@ -597,6 +663,28 @@ fn validate_success_policy(
                 "at least one of succeededCount or succeededIndexes must be specified",
             ));
         }
+        // succeededIndexes: length cap + interval-format parse (upstream
+        // validateSuccessPolicyRule). `total_indexes` feeds the succeededCount
+        // cross-check below.
+        let mut total_indexes: i32 = 0;
+        if let Some(indexes) = &rule.succeeded_indexes {
+            let sip = rule_path.child("succeededIndexes");
+            if indexes.len() > MAX_JOB_SUCCESS_POLICY_SUCCEEDED_INDEXES_LIMIT {
+                errs.push(Error::too_long(
+                    &sip,
+                    MAX_JOB_SUCCESS_POLICY_SUCCEEDED_INDEXES_LIMIT,
+                ));
+            }
+            let completions = spec.completions.unwrap_or(0);
+            match validate_indexes_format(indexes, completions) {
+                Ok(t) => total_indexes = t,
+                Err(e) => errs.push(Error::invalid(
+                    &sip,
+                    indexes.clone(),
+                    format!("error parsing succeededIndexes: {e}"),
+                )),
+            }
+        }
         if let Some(count) = rule.succeeded_count {
             let cp = rule_path.child("succeededCount");
             errs.extend(validate_nonnegative_field(count as i64, &cp));
@@ -612,7 +700,58 @@ fn validate_success_policy(
                     ));
                 }
             }
+            if rule.succeeded_indexes.is_some() && count > total_indexes {
+                errs.push(Error::invalid(
+                    &cp,
+                    count,
+                    format!(
+                        "must be less than or equal to {} (the number of indexes in the specified succeededIndexes field)",
+                        total_indexes
+                    ),
+                ));
+            }
         }
     }
     errs
+}
+
+#[cfg(test)]
+mod success_policy_indexes_tests {
+    use super::{parse_index_interval, validate_indexes_format};
+
+    #[test]
+    fn single_and_range_intervals() {
+        assert_eq!(parse_index_interval("3", 5), Ok((3, 3)));
+        assert_eq!(parse_index_interval("1-3", 5), Ok((1, 3)));
+    }
+
+    #[test]
+    fn index_out_of_range_rejected() {
+        assert!(parse_index_interval("5", 5).is_err()); // >= completions
+        assert!(parse_index_interval("2-5", 5).is_err());
+    }
+
+    #[test]
+    fn non_increasing_interval_rejected() {
+        assert!(parse_index_interval("3-1", 5).is_err());
+    }
+
+    #[test]
+    fn total_count_for_valid_format() {
+        assert_eq!(validate_indexes_format("", 5), Ok(0));
+        assert_eq!(validate_indexes_format("0-2", 5), Ok(3));
+        assert_eq!(validate_indexes_format("1,3-5,7", 8), Ok(5));
+    }
+
+    #[test]
+    fn non_increasing_across_intervals_rejected() {
+        // second interval starts at/below the previous end
+        assert!(validate_indexes_format("0-3,2", 8).is_err());
+        assert!(validate_indexes_format("2,2", 8).is_err());
+    }
+
+    #[test]
+    fn three_part_interval_rejected() {
+        assert!(parse_index_interval("1-2-3", 8).is_err());
+    }
 }
