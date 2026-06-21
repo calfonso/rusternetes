@@ -16,6 +16,41 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Port of upstream `SetDefaults_LimitRangeItem` (pkg/apis/core/v1/defaults.go).
+/// For `Container`-type limits: default `Default` from `Max`, then
+/// `DefaultRequest` from `Default`, then `DefaultRequest` from `Min`. This is
+/// what lets a LimitRange that only specifies `max`/`min` still inject limit
+/// and request defaults into admitted pods.
+fn apply_limit_range_defaults(lr: &mut LimitRange) {
+    for item in &mut lr.spec.limits {
+        if item.item_type != "Container" {
+            continue;
+        }
+        // Default <- Max (for keys not already in Default).
+        let default = item.default.get_or_insert_with(HashMap::new);
+        if let Some(max) = &item.max {
+            for (k, v) in max {
+                default.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        // DefaultRequest <- Default, then <- Min.
+        let default_snapshot = default.clone();
+        let default_request = item.default_request.get_or_insert_with(HashMap::new);
+        for (k, v) in &default_snapshot {
+            default_request
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        if let Some(min) = &item.min {
+            for (k, v) in min {
+                default_request
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
+            }
+        }
+    }
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -49,6 +84,9 @@ pub async fn create(
         Some(&namespace),
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
+
+    // Defaulting (SetDefaults_LimitRangeItem) runs before validation upstream.
+    apply_limit_range_defaults(&mut limit_range);
 
     // Field validation (mirrors upstream ValidateLimitRange).
     {
@@ -135,6 +173,9 @@ pub async fn update(
     limit_range.metadata.namespace = Some(namespace.clone());
 
     let key = build_key("limitranges", Some(&namespace), &name);
+
+    // Defaulting (SetDefaults_LimitRangeItem) runs before validation upstream.
+    apply_limit_range_defaults(&mut limit_range);
 
     // Field validation on update (upstream LimitRange update strategy re-runs
     // ValidateLimitRange on the new object). The create path validated but the
@@ -402,4 +443,83 @@ pub async fn deletecollection_limitranges(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    fn defaulted(json: serde_json::Value) -> LimitRange {
+        let mut lr: LimitRange = serde_json::from_value(json).unwrap();
+        apply_limit_range_defaults(&mut lr);
+        lr
+    }
+
+    #[test]
+    fn container_default_from_max_then_request_chain() {
+        let lr = defaulted(serde_json::json!({
+            "metadata": {"name": "lr"},
+            "spec": {"limits": [
+                {"type": "Container", "max": {"cpu": "2"}, "min": {"memory": "64Mi"}}
+            ]}
+        }));
+        let item = &lr.spec.limits[0];
+        // Default <- Max
+        assert_eq!(
+            item.default
+                .as_ref()
+                .unwrap()
+                .get("cpu")
+                .map(String::as_str),
+            Some("2")
+        );
+        // DefaultRequest <- Default (cpu) and <- Min (memory)
+        let dr = item.default_request.as_ref().unwrap();
+        assert_eq!(dr.get("cpu").map(String::as_str), Some("2"));
+        assert_eq!(dr.get("memory").map(String::as_str), Some("64Mi"));
+    }
+
+    #[test]
+    fn explicit_default_is_preserved() {
+        let lr = defaulted(serde_json::json!({
+            "metadata": {"name": "lr"},
+            "spec": {"limits": [
+                {"type": "Container", "max": {"cpu": "2"}, "default": {"cpu": "1"}}
+            ]}
+        }));
+        // explicit default cpu=1 not overwritten by max
+        assert_eq!(
+            lr.spec.limits[0]
+                .default
+                .as_ref()
+                .unwrap()
+                .get("cpu")
+                .map(String::as_str),
+            Some("1")
+        );
+        // defaultRequest derived from the explicit default
+        assert_eq!(
+            lr.spec.limits[0]
+                .default_request
+                .as_ref()
+                .unwrap()
+                .get("cpu")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn non_container_type_untouched() {
+        let lr = defaulted(serde_json::json!({
+            "metadata": {"name": "lr"},
+            "spec": {"limits": [
+                {"type": "Pod", "max": {"cpu": "2"}}
+            ]}
+        }));
+        assert!(
+            lr.spec.limits[0].default.is_none(),
+            "Pod-type limits get no Default defaulting"
+        );
+    }
 }
