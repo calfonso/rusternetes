@@ -56,6 +56,42 @@ pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
             apply_container_defaults(container);
         }
     }
+    // K8s: SetDefaults_EphemeralContainer (the EphemeralContainerCommon shares
+    // Container's defaulting for terminationMessage*, imagePullPolicy, ports).
+    if let Some(ref mut ephemeral) = spec.ephemeral_containers {
+        for ec in ephemeral {
+            apply_ephemeral_container_defaults(ec);
+        }
+    }
+}
+
+/// Apply K8s defaults to an EphemeralContainer. Mirrors the
+/// `EphemeralContainerCommon`/`Container` shared defaulting in
+/// SetDefaults_PodSpec: terminationMessagePath/Policy, imagePullPolicy and
+/// port protocol. (Ephemeral containers have no probes.)
+fn apply_ephemeral_container_defaults(
+    ec: &mut rusternetes_common::resources::pod::EphemeralContainer,
+) {
+    if ec.termination_message_path.is_none() {
+        ec.termination_message_path = Some("/dev/termination-log".to_string());
+    }
+    if ec.termination_message_policy.is_none() {
+        ec.termination_message_policy = Some("File".to_string());
+    }
+    if ec.image_pull_policy.is_none() {
+        if ec.image.contains(":latest") || !ec.image.contains(':') {
+            ec.image_pull_policy = Some("Always".to_string());
+        } else {
+            ec.image_pull_policy = Some("IfNotPresent".to_string());
+        }
+    }
+    if let Some(ref mut ports) = ec.ports {
+        for port in ports.iter_mut() {
+            if port.protocol.is_none() {
+                port.protocol = Some("TCP".to_string());
+            }
+        }
+    }
 }
 
 /// Apply K8s defaults to a Container.
@@ -371,6 +407,35 @@ mod tests {
         );
         assert_eq!(c.termination_message_policy.as_deref(), Some("File"));
         assert_eq!(c.image_pull_policy.as_deref(), Some("IfNotPresent"));
+    }
+
+    #[test]
+    fn test_ephemeral_container_defaults() {
+        use rusternetes_common::resources::pod::EphemeralContainer;
+        let mut spec = PodSpec {
+            containers: vec![Container {
+                name: "app".to_string(),
+                image: "nginx:1.19".to_string(),
+                ..Default::default()
+            }],
+            ephemeral_containers: Some(vec![EphemeralContainer {
+                name: "debugger".to_string(),
+                image: "busybox:latest".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        apply_pod_spec_defaults(&mut spec);
+
+        let ec = &spec.ephemeral_containers.as_ref().unwrap()[0];
+        assert_eq!(
+            ec.termination_message_path.as_deref(),
+            Some("/dev/termination-log")
+        );
+        assert_eq!(ec.termination_message_policy.as_deref(), Some("File"));
+        // ":latest" tag → Always
+        assert_eq!(ec.image_pull_policy.as_deref(), Some("Always"));
     }
 
     #[test]
