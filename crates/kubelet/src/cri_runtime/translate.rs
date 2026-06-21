@@ -223,6 +223,78 @@ pub fn dns_config(
     Some(cfg)
 }
 
+/// Whether any container in the pod requests `privileged` (upstream
+/// `kubecontainer.HasPrivilegedContainer`). Covers regular + init containers.
+fn pod_has_privileged_container(pod: &Pod) -> bool {
+    let Some(spec) = pod.spec.as_ref() else {
+        return false;
+    };
+    let any_priv = |cs: &[Container]| {
+        cs.iter().any(|c| {
+            c.security_context
+                .as_ref()
+                .and_then(|s| s.privileged)
+                .unwrap_or(false)
+        })
+    };
+    any_priv(&spec.containers)
+        || spec
+            .init_containers
+            .as_deref()
+            .map(any_priv)
+            .unwrap_or(false)
+}
+
+/// Build the pod sandbox's [`LinuxSandboxSecurityContext`], porting upstream
+/// `generatePodSandboxLinuxConfig` (`pkg/kubelet/kuberuntime/kuberuntime_sandbox.go`).
+///
+/// Beyond the namespace options we already set, this carries the pod-level
+/// security context onto the sandbox: `privileged` (if any container is),
+/// `runAsUser`/`runAsGroup`, `supplementalGroups` (`fsGroup` first, then the
+/// pod's `supplementalGroups`) + its policy, and `seLinuxOptions`. The sandbox
+/// seccomp is forced to `RuntimeDefault` so pods can still pick least-privileged
+/// seccomp at the container level (upstream issue #84623).
+fn sandbox_security_context(pod: &Pod) -> v1::LinuxSandboxSecurityContext {
+    use v1::security_profile::ProfileType;
+    let mut sc = v1::LinuxSandboxSecurityContext {
+        namespace_options: Some(namespace_options(pod)),
+        privileged: pod_has_privileged_container(pod),
+        seccomp: Some(v1::SecurityProfile {
+            profile_type: ProfileType::RuntimeDefault as i32,
+            localhost_ref: String::new(),
+        }),
+        ..Default::default()
+    };
+    if let Some(psc) = pod.spec.as_ref().and_then(|s| s.security_context.as_ref()) {
+        sc.run_as_user = psc.run_as_user.map(|v| v1::Int64Value { value: v });
+        sc.run_as_group = psc.run_as_group.map(|v| v1::Int64Value { value: v });
+        let mut groups: Vec<i64> = Vec::new();
+        if let Some(fsg) = psc.fs_group {
+            groups.push(fsg);
+        }
+        if let Some(sg) = psc.supplemental_groups.as_ref() {
+            groups.extend(sg.iter().copied());
+        }
+        sc.supplemental_groups = groups;
+        if let Some(policy) = psc.supplemental_groups_policy.as_deref() {
+            sc.supplemental_groups_policy = match policy {
+                "Strict" => v1::SupplementalGroupsPolicy::Strict as i32,
+                // "Merge" (default) and any unknown value.
+                _ => v1::SupplementalGroupsPolicy::Merge as i32,
+            };
+        }
+        if let Some(opts) = psc.se_linux_options.as_ref() {
+            sc.selinux_options = Some(v1::SeLinuxOption {
+                user: opts.user.clone().unwrap_or_default(),
+                role: opts.role.clone().unwrap_or_default(),
+                r#type: opts.type_.clone().unwrap_or_default(),
+                level: opts.level.clone().unwrap_or_default(),
+            });
+        }
+    }
+    sc
+}
+
 /// Translate the pod into a CRI [`PodSandboxConfig`](v1::PodSandboxConfig).
 ///
 /// `log_directory` is the kubelet-owned dir the runtime writes container logs
@@ -246,10 +318,7 @@ pub fn sandbox_config(pod: &Pod, log_directory: &str) -> v1::PodSandboxConfig {
         labels: pod_labels(pod),
         port_mappings: port_mappings(pod),
         linux: Some(v1::LinuxPodSandboxConfig {
-            security_context: Some(v1::LinuxSandboxSecurityContext {
-                namespace_options: Some(namespace_options(pod)),
-                ..Default::default()
-            }),
+            security_context: Some(sandbox_security_context(pod)),
             sysctls: sysctls(pod),
             ..Default::default()
         }),
@@ -594,25 +663,157 @@ fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources>
     any.then_some(r)
 }
 
-fn linux_security_context(container: &Container) -> Option<v1::LinuxContainerSecurityContext> {
-    let sc = container.security_context.as_ref()?;
+/// Resolve the effective container seccomp profile to a CRI [`SecurityProfile`].
+///
+/// Ports upstream `getSeccompProfile`/`fieldSeccompProfile`
+/// (`pkg/kubelet/kuberuntime/helpers.go`): the container's
+/// `securityContext.seccompProfile` wins, falling back to the pod's. `None` when
+/// neither is set (the runtime then applies its own default; upstream's
+/// `fallbackToRuntimeDefault` is off by default, so we don't force RuntimeDefault).
+///
+/// Note: for `Localhost`, upstream sets `localhost_ref` to
+/// `join(seccompProfileRoot, localhostProfile)`. We pass the `localhostProfile`
+/// through as-is (the translate layer is path-pure and has no kubelet root);
+/// RuntimeDefault/Unconfined — the common cases — need no path.
+fn seccomp_security_profile(pod: &Pod, container: &Container) -> Option<v1::SecurityProfile> {
+    use rusternetes_common::resources::pod::SeccompProfile;
+    let scmp: &SeccompProfile = container
+        .security_context
+        .as_ref()
+        .and_then(|c| c.seccomp_profile.as_ref())
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|p| p.seccomp_profile.as_ref())
+        })?;
+    use v1::security_profile::ProfileType;
+    let profile = match scmp.r#type.as_str() {
+        "RuntimeDefault" => v1::SecurityProfile {
+            profile_type: ProfileType::RuntimeDefault as i32,
+            localhost_ref: String::new(),
+        },
+        "Localhost" => v1::SecurityProfile {
+            profile_type: ProfileType::Localhost as i32,
+            localhost_ref: scmp.localhost_profile.clone().unwrap_or_default(),
+        },
+        // "Unconfined" and any unknown value → Unconfined (upstream default arm).
+        _ => v1::SecurityProfile {
+            profile_type: ProfileType::Unconfined as i32,
+            localhost_ref: String::new(),
+        },
+    };
+    Some(profile)
+}
+
+/// Resolve the effective AppArmor profile to a CRI [`SecurityProfile`].
+///
+/// Ports upstream `getAppArmorProfile`/`apparmor.GetProfile`
+/// (`pkg/kubelet/kuberuntime/helpers.go`): container `appArmorProfile` wins over
+/// the pod's; `RuntimeDefault`/`Unconfined`/`Localhost` map to the CRI profile
+/// (Localhost carries `localhost_ref`). We set only the modern `apparmor`
+/// `SecurityProfile`, not the deprecated `apparmor_profile` string (that exists
+/// solely for runtimes older than the CRI-v1 containerd we target).
+fn apparmor_security_profile(pod: &Pod, container: &Container) -> Option<v1::SecurityProfile> {
+    use rusternetes_common::resources::pod::AppArmorProfile;
+    let profile: &AppArmorProfile = container
+        .security_context
+        .as_ref()
+        .and_then(|c| c.app_armor_profile.as_ref())
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|p| p.app_armor_profile.as_ref())
+        })?;
+    use v1::security_profile::ProfileType;
+    let profile = match profile.type_.as_str() {
+        "RuntimeDefault" => v1::SecurityProfile {
+            profile_type: ProfileType::RuntimeDefault as i32,
+            localhost_ref: String::new(),
+        },
+        "Localhost" => v1::SecurityProfile {
+            profile_type: ProfileType::Localhost as i32,
+            localhost_ref: profile.localhost_profile.clone().unwrap_or_default(),
+        },
+        // "Unconfined" and any unknown value → Unconfined.
+        _ => v1::SecurityProfile {
+            profile_type: ProfileType::Unconfined as i32,
+            localhost_ref: String::new(),
+        },
+    };
+    Some(profile)
+}
+
+/// Effective SELinux options for the container (container `seLinuxOptions` wins
+/// over the pod's), mapped to the CRI [`SeLinuxOption`] (upstream
+/// `convertToRuntimeSELinuxOption`).
+fn selinux_options(pod: &Pod, container: &Container) -> Option<v1::SeLinuxOption> {
+    let opts = container
+        .security_context
+        .as_ref()
+        .and_then(|c| c.se_linux_options.as_ref())
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|p| p.se_linux_options.as_ref())
+        })?;
+    Some(v1::SeLinuxOption {
+        user: opts.user.clone().unwrap_or_default(),
+        role: opts.role.clone().unwrap_or_default(),
+        r#type: opts.type_.clone().unwrap_or_default(),
+        level: opts.level.clone().unwrap_or_default(),
+    })
+}
+
+fn linux_security_context(
+    pod: &Pod,
+    container: &Container,
+) -> Option<v1::LinuxContainerSecurityContext> {
+    // seccomp/apparmor/selinux may come from the pod even when the container has
+    // no security context of its own, so resolve them before the early-out.
+    let seccomp = seccomp_security_profile(pod, container);
+    let apparmor = apparmor_security_profile(pod, container);
+    let selinux_options = selinux_options(pod, container);
+    let sc = container.security_context.as_ref();
+    if sc.is_none() && seccomp.is_none() && apparmor.is_none() && selinux_options.is_none() {
+        return None;
+    }
     // Translate requested Linux capabilities. Names are passed through verbatim
     // (e.g. "NET_ADMIN"), matching upstream — the kubelet does not add the
     // "CAP_" prefix; the runtime (containerd) does when building the OCI spec.
     // Without this, NET_ADMIN/NET_RAW never reach the container and capability-
     // dependent workloads fail, e.g. flannel's vxlan link creation returns
     // netlink EPERM ("Operation not permitted") and never writes subnet.env.
-    let capabilities = sc.capabilities.as_ref().map(|caps| v1::Capability {
-        add_capabilities: caps.add.clone().unwrap_or_default(),
-        drop_capabilities: caps.drop.clone().unwrap_or_default(),
-        add_ambient_capabilities: Vec::new(),
-    });
+    let capabilities = sc
+        .and_then(|sc| sc.capabilities.as_ref())
+        .map(|caps| v1::Capability {
+            add_capabilities: caps.add.clone().unwrap_or_default(),
+            drop_capabilities: caps.drop.clone().unwrap_or_default(),
+            add_ambient_capabilities: Vec::new(),
+        });
     Some(v1::LinuxContainerSecurityContext {
-        privileged: sc.privileged.unwrap_or(false),
+        privileged: sc.and_then(|s| s.privileged).unwrap_or(false),
         capabilities,
-        run_as_user: sc.run_as_user.map(|v| v1::Int64Value { value: v }),
-        run_as_group: sc.run_as_group.map(|v| v1::Int64Value { value: v }),
-        readonly_rootfs: sc.read_only_root_filesystem.unwrap_or(false),
+        run_as_user: sc
+            .and_then(|s| s.run_as_user)
+            .map(|v| v1::Int64Value { value: v }),
+        run_as_group: sc
+            .and_then(|s| s.run_as_group)
+            .map(|v| v1::Int64Value { value: v }),
+        readonly_rootfs: sc
+            .and_then(|s| s.read_only_root_filesystem)
+            .unwrap_or(false),
+        // `allowPrivilegeEscalation: false` → `no_new_privs`, blocking setuid/
+        // file-capability escalation in the container. Upstream
+        // `securitycontext.AddNoNewPrivileges`: true *only* when the field is
+        // explicitly false (unset/true → false). Without this a pod that set
+        // `allowPrivilegeEscalation: false` could still escalate.
+        no_new_privs: sc.and_then(|s| s.allow_privilege_escalation) == Some(false),
+        seccomp,
+        apparmor,
+        selinux_options,
         ..Default::default()
     })
 }
@@ -637,7 +838,7 @@ pub fn container_config(
 
     let linux = {
         let resources = linux_resources(container);
-        let security_context = linux_security_context(container);
+        let security_context = linux_security_context(pod, container);
         if resources.is_some() || security_context.is_some() {
             Some(v1::LinuxContainerConfig {
                 resources,
@@ -1085,6 +1286,267 @@ mod tests {
         assert!(sc.readonly_rootfs);
         assert_eq!(sc.run_as_user.unwrap().value, 1000);
         assert_eq!(sc.run_as_group.unwrap().value, 2000);
+        // allowPrivilegeEscalation unset -> no_new_privs stays false.
+        assert!(!sc.no_new_privs);
+    }
+
+    #[test]
+    fn no_new_privs_only_when_allow_priv_esc_false() {
+        use serde_json::json;
+        let no_new_privs = |sec_ctx: serde_json::Value| -> bool {
+            let c: Container = serde_json::from_value(json!({
+                "name": "app",
+                "image": "busybox",
+                "securityContext": sec_ctx
+            }))
+            .unwrap();
+            let pod = pod_with(PodSpec {
+                containers: vec![c.clone()],
+                ..Default::default()
+            });
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .unwrap()
+            .security_context
+            .unwrap()
+            .no_new_privs
+        };
+        // Upstream AddNoNewPrivileges: true only when explicitly false.
+        assert!(
+            no_new_privs(json!({"allowPrivilegeEscalation": false})),
+            "explicit false must set no_new_privs"
+        );
+        assert!(
+            !no_new_privs(json!({"allowPrivilegeEscalation": true})),
+            "explicit true must not set no_new_privs"
+        );
+        assert!(!no_new_privs(json!({})), "unset must not set no_new_privs");
+    }
+
+    #[test]
+    fn seccomp_profile_container_pod_fallback_and_types() {
+        use serde_json::json;
+        use v1::security_profile::ProfileType;
+
+        // Returns (profile_type, localhost_ref) of the container's seccomp, or
+        // None if unset, from a pod spec JSON.
+        let seccomp = |spec: serde_json::Value| -> Option<(i32, String)> {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default"},
+                "spec": spec
+            }))
+            .unwrap();
+            let c = pod.spec.as_ref().unwrap().containers[0].clone();
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .and_then(|l| l.security_context)
+            .and_then(|s| s.seccomp)
+            .map(|sp| (sp.profile_type, sp.localhost_ref))
+        };
+
+        // Container RuntimeDefault.
+        assert_eq!(
+            seccomp(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}}
+            }]})),
+            Some((ProfileType::RuntimeDefault as i32, String::new()))
+        );
+
+        // Container Localhost carries the profile ref.
+        assert_eq!(
+            seccomp(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"seccompProfile": {"type": "Localhost", "localhostProfile": "profiles/audit.json"}}
+            }]})),
+            Some((
+                ProfileType::Localhost as i32,
+                "profiles/audit.json".to_string()
+            ))
+        );
+
+        // Pod-level profile applies when the container has none.
+        assert_eq!(
+            seccomp(json!({
+                "securityContext": {"seccompProfile": {"type": "Unconfined"}},
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            Some((ProfileType::Unconfined as i32, String::new()))
+        );
+
+        // Container profile overrides the pod's.
+        assert_eq!(
+            seccomp(json!({
+                "securityContext": {"seccompProfile": {"type": "Unconfined"}},
+                "containers": [{
+                    "name": "app", "image": "busybox",
+                    "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}}
+                }]
+            })),
+            Some((ProfileType::RuntimeDefault as i32, String::new()))
+        );
+
+        // No seccomp anywhere → unset.
+        assert_eq!(
+            seccomp(json!({"containers": [{"name": "app", "image": "busybox"}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn sandbox_security_context_carries_pod_fields() {
+        use serde_json::json;
+        use v1::security_profile::ProfileType;
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {
+                "securityContext": {
+                    "runAsUser": 1000,
+                    "runAsGroup": 3000,
+                    "fsGroup": 2000,
+                    "supplementalGroups": [5, 6],
+                    "supplementalGroupsPolicy": "Strict",
+                    "seLinuxOptions": {"level": "s0:c1,c2"}
+                },
+                "containers": [{
+                    "name": "app", "image": "busybox",
+                    "securityContext": {"privileged": true}
+                }]
+            }
+        }))
+        .unwrap();
+        let sc = sandbox_config(&pod, "/log")
+            .linux
+            .unwrap()
+            .security_context
+            .unwrap();
+        assert!(sc.privileged, "sandbox privileged when a container is");
+        assert_eq!(sc.run_as_user.unwrap().value, 1000);
+        assert_eq!(sc.run_as_group.unwrap().value, 3000);
+        // fsGroup first, then supplementalGroups.
+        assert_eq!(sc.supplemental_groups, vec![2000, 5, 6]);
+        assert_eq!(
+            sc.supplemental_groups_policy,
+            v1::SupplementalGroupsPolicy::Strict as i32
+        );
+        assert_eq!(sc.selinux_options.unwrap().level, "s0:c1,c2");
+        // Sandbox seccomp is always forced to RuntimeDefault (#84623).
+        assert_eq!(
+            sc.seccomp.unwrap().profile_type,
+            ProfileType::RuntimeDefault as i32
+        );
+    }
+
+    #[test]
+    fn apparmor_profile_container_pod_fallback_and_types() {
+        use serde_json::json;
+        use v1::security_profile::ProfileType;
+        let apparmor = |spec: serde_json::Value| -> Option<(i32, String)> {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default"}, "spec": spec
+            }))
+            .unwrap();
+            let c = pod.spec.as_ref().unwrap().containers[0].clone();
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .and_then(|l| l.security_context)
+            .and_then(|s| s.apparmor)
+            .map(|p| (p.profile_type, p.localhost_ref))
+        };
+        assert_eq!(
+            apparmor(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"appArmorProfile": {"type": "Localhost", "localhostProfile": "k8s-audit"}}
+            }]})),
+            Some((ProfileType::Localhost as i32, "k8s-audit".to_string()))
+        );
+        // Pod-level applies when the container has none.
+        assert_eq!(
+            apparmor(json!({
+                "securityContext": {"appArmorProfile": {"type": "RuntimeDefault"}},
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            Some((ProfileType::RuntimeDefault as i32, String::new()))
+        );
+        assert_eq!(
+            apparmor(json!({"containers": [{"name": "app", "image": "busybox"}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn selinux_options_mapped_with_pod_fallback() {
+        use serde_json::json;
+        let selinux = |spec: serde_json::Value| -> Option<(String, String, String, String)> {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default"}, "spec": spec
+            }))
+            .unwrap();
+            let c = pod.spec.as_ref().unwrap().containers[0].clone();
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .and_then(|l| l.security_context)
+            .and_then(|s| s.selinux_options)
+            .map(|o| (o.user, o.role, o.r#type, o.level))
+        };
+        // Container options win.
+        assert_eq!(
+            selinux(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"seLinuxOptions": {"level": "s0:c1,c2", "type": "spc_t"}}
+            }]})),
+            Some((
+                String::new(),
+                String::new(),
+                "spc_t".to_string(),
+                "s0:c1,c2".to_string()
+            ))
+        );
+        // Pod-level applies when the container has none.
+        assert_eq!(
+            selinux(json!({
+                "securityContext": {"seLinuxOptions": {"user": "system_u"}},
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            Some((
+                "system_u".to_string(),
+                String::new(),
+                String::new(),
+                String::new()
+            ))
+        );
+        assert_eq!(
+            selinux(json!({"containers": [{"name": "app", "image": "busybox"}]})),
+            None
+        );
     }
 
     fn env_from(
