@@ -45,6 +45,15 @@ pub async fn create(
     // Reject create with neither name nor generateName (#1065).
     crate::handlers::validation::require_object_name(&network_policy.metadata)?;
 
+    // Field validation (mirrors upstream ValidateNetworkPolicy).
+    {
+        let errs =
+            rusternetes_common::validation::networkpolicy::validate_network_policy(&network_policy);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     network_policy.metadata.namespace = Some(namespace.clone());
     network_policy.metadata.ensure_uid();
     network_policy.metadata.ensure_creation_timestamp();
