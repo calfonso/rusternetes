@@ -61,7 +61,11 @@ pub async fn create(
     let response_headers = build_warning_headers(&warnings);
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&deployment.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &deployment.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Field validation (mirrors upstream ValidateDeployment).
     {

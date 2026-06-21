@@ -35,7 +35,11 @@ pub async fn create_priority_level_configuration(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&plc.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &plc.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Enrich metadata with system fields
     plc.metadata.ensure_uid();
@@ -251,7 +255,11 @@ pub async fn create_flow_schema(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&fs.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &fs.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Enrich metadata with system fields
     fs.metadata.ensure_uid();

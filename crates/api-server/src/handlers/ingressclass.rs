@@ -36,7 +36,11 @@ pub async fn create_ingressclass(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&ingress_class.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &ingress_class.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Enrich metadata with system fields
     ingress_class.metadata.ensure_uid();

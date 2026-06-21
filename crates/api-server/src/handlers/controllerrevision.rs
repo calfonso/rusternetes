@@ -40,7 +40,11 @@ pub async fn create_controllerrevision(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&cr.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &cr.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Ensure namespace is set from the URL path
     cr.metadata.namespace = Some(namespace.clone());

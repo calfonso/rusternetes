@@ -25,7 +25,11 @@ pub async fn create_servicecidr(
     info!("Creating ServiceCIDR: {}", servicecidr.metadata.name);
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&servicecidr.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &servicecidr.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "servicecidrs")

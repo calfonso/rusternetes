@@ -39,7 +39,11 @@ pub async fn create(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&priority_class.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &priority_class.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Enrich metadata with system fields
     priority_class.metadata.ensure_uid();

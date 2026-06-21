@@ -41,7 +41,11 @@ pub async fn create_validating_webhook(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&config.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &config.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Validate matchConditions CEL expressions with type-checking
     if let Some(webhooks) = &config.webhooks {
@@ -356,7 +360,11 @@ pub async fn create_mutating_webhook(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&config.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &config.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Validate matchConditions CEL expressions with type-checking
     if let Some(webhooks) = &config.webhooks {

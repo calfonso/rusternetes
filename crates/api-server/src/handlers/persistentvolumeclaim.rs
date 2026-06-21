@@ -43,7 +43,11 @@ pub async fn create_pvc(
     }
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&pvc.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &pvc.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Field validation (mirrors upstream ValidatePersistentVolumeClaim).
     {

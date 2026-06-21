@@ -28,7 +28,11 @@ pub async fn create_csinode(
     info!("Creating CSINode: {}", node.metadata.name);
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&node.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &node.metadata,
+        None,
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "csinodes")

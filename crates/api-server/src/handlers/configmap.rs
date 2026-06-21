@@ -30,7 +30,11 @@ pub async fn create(
     );
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&configmap.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &configmap.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Validate resource name
     crate::handlers::validation::validate_resource_name(&configmap.metadata.name)?;

@@ -35,8 +35,13 @@ pub async fn create_ipaddress(
         }
     }
 
-    // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&ipaddress.metadata)?;
+    // Full create-time ValidateObjectMeta (#1087). IPAddress is cluster-scoped
+    // and its name must be a canonical IP address (ValidateIPAddressName).
+    crate::handlers::validation::validate_create_object_meta(
+        &ipaddress.metadata,
+        None,
+        crate::handlers::validation::NameKind::Ip,
+    )?;
 
     // Enrich metadata with system fields
     ipaddress.metadata.ensure_uid();

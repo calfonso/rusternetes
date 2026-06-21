@@ -32,7 +32,11 @@ pub async fn create(
     );
 
     // Reject create with neither name nor generateName (#1065).
-    crate::handlers::validation::require_object_name(&statefulset.metadata)?;
+    crate::handlers::validation::validate_create_object_meta(
+        &statefulset.metadata,
+        Some(&namespace),
+        crate::handlers::validation::NameKind::DnsSubdomain,
+    )?;
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
