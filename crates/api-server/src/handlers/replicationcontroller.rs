@@ -81,6 +81,18 @@ pub async fn create_replicationcontroller(
     // Apply K8s defaults to pod template
     crate::handlers::defaults::apply_pod_template_defaults(&mut rc.spec.template);
 
+    // Field validation (mirrors upstream ValidateReplicationController). Runs
+    // after defaulting so the selector is populated from the template labels.
+    {
+        let errs =
+            rusternetes_common::validation::replicationcontroller::validate_replication_controller(
+                &rc,
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let key = build_key(
         "replicationcontrollers",
         Some(&namespace),
