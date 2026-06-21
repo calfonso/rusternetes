@@ -109,6 +109,16 @@ pub async fn update_priority_level_configuration(
     plc.kind = "PriorityLevelConfiguration".to_string();
     plc.api_version = "flowcontrol.apiserver.k8s.io/v1".to_string();
 
+    // Field validation on update (upstream re-runs ValidatePriorityLevelConfiguration
+    // on the new object — the spec is mutable, no immutability). The create path
+    // validated but the update path previously persisted PUTs unchecked.
+    {
+        let errs = rusternetes_common::validation::prioritylevelconfiguration::validate_priority_level_configuration(&plc);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
