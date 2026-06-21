@@ -10,9 +10,10 @@
 //! `selectPolicy` (`Max` default, `Min`, `Disabled`). A per-HPA history of
 //! recent scale events feeds the period windows.
 //!
-//! Behavior `stabilizationWindowSeconds` is NOT handled here — only the rate
-//! policies; the controller's existing recommendation stabilization still
-//! applies. `now` is injected so the pure math is unit-testable.
+//! Also implements `behavior.{scaleUp,scaleDown}.stabilizationWindowSeconds`
+//! ([`stabilize_recommendation`] + [`RecommendationStore`], upstream
+//! `stabilizeRecommendationWithBehaviors`). `now` is injected so the pure math
+//! is unit-testable.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -226,6 +227,76 @@ impl ScaleEventStore {
     }
 }
 
+/// Upstream `stabilizeRecommendationWithBehaviors`: clamp `desired` between the
+/// *min* recommendation seen within the scale-up window and the *max* within the
+/// scale-down window (each also bounded by `desired`), measured around
+/// `current`. `recs` is the recent (unstabilized) recommendation history. This
+/// holds the replica count at a recent high during a transient dip (downscale
+/// stabilization) and at a recent low during a transient spike (upscale).
+pub fn stabilize_recommendation(
+    current: i32,
+    desired: i32,
+    up_window_s: i32,
+    down_window_s: i32,
+    recs: &[(DateTime<Utc>, i32)],
+    now: DateTime<Utc>,
+) -> i32 {
+    let up_cutoff = now - Duration::seconds(up_window_s as i64);
+    let down_cutoff = now - Duration::seconds(down_window_s as i64);
+    let mut up_rec = desired;
+    let mut down_rec = desired;
+    for (t, r) in recs {
+        if *t > up_cutoff {
+            up_rec = up_rec.min(*r);
+        }
+        if *t > down_cutoff {
+            down_rec = down_rec.max(*r);
+        }
+    }
+    let mut rec = current;
+    if rec < up_rec {
+        rec = up_rec;
+    }
+    if rec > down_rec {
+        rec = down_rec;
+    }
+    rec
+}
+
+/// A timestamped recommendation: `(observed_at, replicas)`. Mirrors upstream
+/// `timestampedRecommendation`.
+pub type Recommendation = (DateTime<Utc>, i32);
+
+/// Per-HPA history of recent (unstabilized) recommendations feeding
+/// [`stabilize_recommendation`]. Mirrors upstream's `recommendations` map of
+/// `timestampedRecommendation`.
+#[derive(Default)]
+pub struct RecommendationStore {
+    inner: Mutex<HashMap<String, Vec<Recommendation>>>,
+}
+
+impl RecommendationStore {
+    /// Recent recommendations for `key` (empty if none).
+    pub fn snapshot(&self, key: &str) -> Vec<Recommendation> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Append a recommendation, pruning entries older than `max_window_s` (the
+    /// longest of the two stabilization windows).
+    pub fn record(&self, key: &str, recommendation: i32, max_window_s: i32, now: DateTime<Utc>) {
+        let mut map = self.inner.lock().unwrap();
+        let v = map.entry(key.to_string()).or_default();
+        let cutoff = now - Duration::seconds(max_window_s as i64);
+        v.retain(|(t, _)| *t >= cutoff);
+        v.push((now, recommendation));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +440,44 @@ mod tests {
         assert_eq!(up.len(), 1, "stale event pruned: {up:?}");
         assert_eq!(up[0].change, 2);
         assert_eq!(change_in_period(&up, 60, now()), 2);
+    }
+
+    #[test]
+    fn stabilize_holds_recent_high_on_downscale() {
+        // 8 replicas, metric now wants 2, but a recent recommendation of 8 is
+        // within the 300s down-window → max(2,8)=8 → hold at 8.
+        let recs = vec![(now() - Duration::seconds(30), 8)];
+        assert_eq!(stabilize_recommendation(8, 2, 0, 300, &recs, now()), 8);
+    }
+
+    #[test]
+    fn stabilize_allows_downscale_with_empty_history() {
+        // No recent high → down_rec = desired → scale down proceeds.
+        assert_eq!(stabilize_recommendation(8, 2, 0, 300, &[], now()), 2);
+    }
+
+    #[test]
+    fn stabilize_holds_recent_low_on_upscale() {
+        // 2 replicas, metric now wants 8, recent low of 2 within the up-window
+        // → min(8,2)=2 → hold at 2 (don't chase a transient spike).
+        let recs = vec![(now() - Duration::seconds(30), 2)];
+        assert_eq!(stabilize_recommendation(2, 8, 300, 0, &recs, now()), 2);
+    }
+
+    #[test]
+    fn stabilize_ignores_samples_outside_window() {
+        // The high sample is older than the 300s down-window → not counted.
+        let recs = vec![(now() - Duration::seconds(600), 8)];
+        assert_eq!(stabilize_recommendation(8, 2, 0, 300, &recs, now()), 2);
+    }
+
+    #[test]
+    fn recommendation_store_records_and_prunes() {
+        let store = RecommendationStore::default();
+        store.record("ns/h", 8, 300, now() - Duration::seconds(600));
+        store.record("ns/h", 2, 300, now());
+        let recs = store.snapshot("ns/h");
+        assert_eq!(recs.len(), 1, "stale recommendation pruned: {recs:?}");
+        assert_eq!(recs[0].1, 2);
     }
 }

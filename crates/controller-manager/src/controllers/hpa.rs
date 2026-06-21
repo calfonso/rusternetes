@@ -20,6 +20,9 @@ pub struct HorizontalPodAutoscalerController<S: Storage> {
     metrics_client: Arc<dyn MetricsClient>,
     /// Per-HPA scale-event history feeding `spec.behavior` rate policies.
     scale_events: crate::controllers::hpa_behavior::ScaleEventStore,
+    /// Per-HPA recommendation history feeding `spec.behavior`
+    /// stabilizationWindowSeconds.
+    recommendations: crate::controllers::hpa_behavior::RecommendationStore,
 }
 
 impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
@@ -43,6 +46,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             storage,
             metrics_client,
             scale_events: Default::default(),
+            recommendations: Default::default(),
         }
     }
 
@@ -53,6 +57,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             storage,
             metrics_client,
             scale_events: Default::default(),
+            recommendations: Default::default(),
         }
     }
 
@@ -436,16 +441,46 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         // upstream normalizeDesiredReplicasWithBehaviors. Without behavior, the
         // plain clamp is unchanged.
         let rated = if let Some(behavior) = hpa.spec.behavior.as_ref() {
+            use crate::controllers::hpa_behavior as bhv;
             let key = format!("{}/{}", namespace, hpa.metadata.name);
-            let events = self.scale_events.snapshot(&key);
-            crate::controllers::hpa_behavior::convert_with_behavior_rate(
+            let now = Utc::now();
+
+            // 1. Stabilize against the recommendation history (upstream
+            // stabilizeRecommendationWithBehaviors): hold at a recent high
+            // during a transient dip / recent low during a spike. Record the
+            // *unstabilized* recommendation, then prune to the longer window.
+            let up_w = behavior
+                .scale_up
+                .as_ref()
+                .and_then(|r| r.stabilization_window_seconds)
+                .unwrap_or(0);
+            let down_w = behavior
+                .scale_down
+                .as_ref()
+                .and_then(|r| r.stabilization_window_seconds)
+                .unwrap_or(0);
+            let recs = self.recommendations.snapshot(&key);
+            let stabilized = bhv::stabilize_recommendation(
                 current_replicas,
                 max_desired,
+                up_w,
+                down_w,
+                &recs,
+                now,
+            );
+            self.recommendations
+                .record(&key, max_desired, up_w.max(down_w), now);
+
+            // 2. Rate-limit the stabilized recommendation per the scale policies.
+            let events = self.scale_events.snapshot(&key);
+            bhv::convert_with_behavior_rate(
+                current_replicas,
+                stabilized,
                 min_replicas,
                 max_replicas,
                 behavior,
                 &events,
-                Utc::now(),
+                now,
             )
         } else {
             max_desired

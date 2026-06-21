@@ -45,6 +45,10 @@ rustls = { workspace = true }
 
 [dev-dependencies]
 x509-parser = { workspace = true }
+# Stateful fake MetricsClient in hpa_controller_test (changing readings across
+# reconciles for the stabilization test).
+async-trait = { workspace = true }
+chrono = { workspace = true }
 
 [features]
 default = []
