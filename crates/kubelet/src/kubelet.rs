@@ -245,6 +245,10 @@ pub struct Kubelet {
     /// Workers consult this before storage so static pods survive
     /// mirror-pod deletion.
     static_pods: Arc<Mutex<HashMap<String, Pod>>>,
+    /// Sysctl admission allowlist (safe set + `--allowed-unsafe-sysctls`).
+    /// A pod declaring a forbidden sysctl is rejected with reason
+    /// `SysctlForbidden`. Upstream `pkg/kubelet/sysctl`.
+    sysctl_allowlist: crate::sysctl::Allowlist,
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -394,18 +398,12 @@ impl Kubelet {
     ) -> Result<Self> {
         // CRI runtime backend (containerd + Youki). The endpoint and runtime
         // handler come from the standard kubelet env vars; pod networking is
-        // owned by containerd's CNI plugin, so the netstack/pod-network-mode and
-        // unsafe-sysctl knobs from the bollard path are not applied here yet
-        // (tracked for the CRI migration follow-ups).
-        // Pod networking is owned by containerd's CNI plugin and unsafe-sysctl
-        // admission is not yet wired on the CRI path (tracked in the CRI
-        // migration follow-ups); cluster DNS is applied below via the runtime.
-        let _ = (
-            &network,
-            pod_network_mode,
-            &netstack,
-            &allowed_unsafe_sysctls,
-        );
+        // owned by containerd's CNI plugin, so the netstack/pod-network-mode
+        // knobs from the bollard path are not applied here yet (tracked for the
+        // CRI migration follow-ups). `allowed_unsafe_sysctls` IS wired: it builds
+        // the sysctl admission allowlist below. Cluster DNS is applied via the
+        // runtime.
+        let _ = (&network, pod_network_mode, &netstack);
         let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
             .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
         let runtime_handler = std::env::var("CONTAINER_RUNTIME_HANDLER").unwrap_or_default();
@@ -459,6 +457,7 @@ impl Kubelet {
             metrics_port,
             pod_manifest_path: None,
             static_pods: Arc::new(Mutex::new(HashMap::new())),
+            sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
         })
     }
 
@@ -2460,6 +2459,27 @@ impl Kubelet {
                     }
                     return Ok(());
                 }
+            }
+        }
+
+        // K8s kubelet admission: reject a pod requesting a forbidden sysctl. A
+        // sysctl is allowed only if it is safe (namespaced + isolated) or
+        // explicitly permitted via --allowed-unsafe-sysctls; otherwise the pod
+        // is rejected with Phase=Failed, reason=SysctlForbidden (without ever
+        // creating containers). K8s ref: pkg/kubelet/sysctl/allowlist.go::Admit.
+        if matches!(current_phase, Phase::Pending) && !is_running {
+            if let Err(message) = self.sysctl_allowlist.admit(pod) {
+                info!("Pod {}/{} rejected: {}", namespace, pod_name, message);
+                let key = build_key("pods", Some(namespace), pod_name);
+                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                    if let Some(ref mut status) = p.status {
+                        status.phase = Some(Phase::Failed);
+                        status.reason = Some(crate::sysctl::FORBIDDEN_REASON.to_string());
+                        status.message = Some(message);
+                    }
+                    let _ = self.storage.update_status(&key, &p).await;
+                }
+                return Ok(());
             }
         }
 

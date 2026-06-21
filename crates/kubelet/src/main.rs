@@ -34,6 +34,7 @@ mod runtime;
 mod server;
 mod static_pods;
 mod sync_locks;
+mod sysctl;
 #[allow(dead_code)]
 mod volumes;
 

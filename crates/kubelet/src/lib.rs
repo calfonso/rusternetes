@@ -13,6 +13,7 @@ pub mod runtime;
 pub mod server;
 pub mod static_pods;
 pub mod sync_locks;
+pub mod sysctl;
 pub mod volumes;
 
 pub use kubelet::PodWorkerState;
