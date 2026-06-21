@@ -66,6 +66,16 @@ on:
     types: [completed]
     branches: [main]
 
+# Newest main merge wins (#1107). The canary fires after every "Publish images"
+# run (i.e. every main push), and a run can take hours on the shared
+# arc-runner-set-conformance scale set, so without this a busy day queues >24h
+# of canary work. Superseded merges' `sha-<sha>` images stay on GHCR, so any
+# skipped sha is still re-dispatchable via the `image-tag` workflow_dispatch
+# input — cancelling in-progress runs loses no recoverable signal.
+concurrency:
+  group: conformance-canary
+  cancel-in-progress: true
+
 env:
   # The dind sidecar exposes its daemon at this canonical path; DOCKER_HOST
   # points the `docker compose` CLI at it to bring the stack up. The pod
