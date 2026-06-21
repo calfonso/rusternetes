@@ -50,6 +50,14 @@ pub async fn create_csistoragecapacity(
     csc.metadata.ensure_uid();
     csc.metadata.ensure_creation_timestamp();
 
+    // Validate spec (upstream storage ValidateCSIStorageCapacity): nodeTopology
+    // selector, storageClassName, capacity quantity.
+    let errs =
+        rusternetes_common::validation::csistoragecapacity::validate_csi_storage_capacity(&csc);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: CSIStorageCapacity validated successfully (not created)");
