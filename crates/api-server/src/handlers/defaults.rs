@@ -403,6 +403,21 @@ fn apply_job_defaults_to_spec(spec: &mut rusternetes_common::resources::JobSpec)
     apply_pod_template_defaults(&mut spec.template);
 }
 
+/// Apply SetDefaults_PersistentVolumeClaimSpec: `volumeMode` defaults to
+/// `Filesystem` when unset. Upstream runs this on both create and update, so
+/// callers must default on the update path too — otherwise the merged
+/// volumeMode-immutability check would compare a defaulted old value against a
+/// nil new value and falsely reject an update that omits volumeMode.
+/// K8s ref: pkg/apis/core/v1/defaults.go SetDefaults_PersistentVolumeClaimSpec.
+pub fn apply_pvc_spec_defaults(
+    spec: &mut rusternetes_common::resources::volume::PersistentVolumeClaimSpec,
+) {
+    if spec.volume_mode.is_none() {
+        spec.volume_mode =
+            Some(rusternetes_common::resources::volume::PersistentVolumeMode::Filesystem);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

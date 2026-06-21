@@ -94,6 +94,9 @@ pub async fn create_pvc(
     pvc.metadata.ensure_uid();
     pvc.metadata.ensure_creation_timestamp();
 
+    // SetDefaults_PersistentVolumeClaimSpec: volumeMode defaults to Filesystem.
+    crate::handlers::defaults::apply_pvc_spec_defaults(&mut pvc.spec);
+
     let key = build_key(
         "persistentvolumeclaims",
         Some(&namespace),
@@ -295,15 +298,26 @@ pub async fn update_pvc(
     pvc.metadata.name = name.clone();
     pvc.metadata.namespace = Some(namespace.clone());
 
+    // SetDefaults_PersistentVolumeClaimSpec runs on update too; default
+    // volumeMode before the immutability check so an update that omits it
+    // (→ Filesystem) is not falsely rejected against a defaulted old value.
+    crate::handlers::defaults::apply_pvc_spec_defaults(&mut pvc.spec);
+
     let key = build_key("persistentvolumeclaims", Some(&namespace), &name);
 
     // Enforce update immutability (upstream ValidatePersistentVolumeClaimUpdate):
     // volumeMode immutable + storage request may not shrink.
-    if let Ok(existing) = state
+    if let Ok(mut existing) = state
         .storage
         .get::<rusternetes_common::resources::PersistentVolumeClaim>(&key)
         .await
     {
+        // Default the stored object the same way as the incoming one before the
+        // immutability comparison. The new PVC is defaulted above, so a stored
+        // object that predates volumeMode defaulting would otherwise look like a
+        // forbidden volumeMode change (None → "Filesystem"). Defaulting is
+        // idempotent, matching upstream's defaulted-new-vs-defaulted-old compare.
+        crate::handlers::defaults::apply_pvc_spec_defaults(&mut existing.spec);
         let errs = rusternetes_common::validation::pvc::validate_persistent_volume_claim_update(
             &pvc, &existing,
         );
