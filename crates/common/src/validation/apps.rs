@@ -15,6 +15,7 @@
 //! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/apps/validation/validation.go>
 
 use crate::resources::deployment::{Deployment, DeploymentStrategy, RollingUpdateDeployment};
+use crate::resources::workloads::{ReplicaSet, ReplicaSetSpec};
 use crate::types::LabelSelector;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{validate_label_selector, LabelSelectorValidationOptions};
@@ -341,6 +342,67 @@ pub fn validate_deployment(d: &Deployment) -> ErrorList {
     errs.extend(validate_deployment_spec(&d.spec, &Path::new("spec")));
 
     errs
+}
+
+/// Validate a `ReplicaSetSpec`. Mirrors upstream `ValidateReplicaSetSpec`
+/// (`pkg/apis/apps/validation/validation.go`): non-negative `replicas` and
+/// `minReadySeconds`, a required + structurally-valid `selector`, and template
+/// labels that satisfy the selector.
+fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // replicas must be non-negative
+    if spec.replicas < 0 {
+        errs.push(Error::invalid(
+            &fld_path.child("replicas"),
+            spec.replicas,
+            "must be greater than or equal to 0",
+        ));
+    }
+
+    // minReadySeconds must be non-negative
+    if let Some(mrs) = spec.min_ready_seconds {
+        if mrs < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("minReadySeconds"),
+                mrs,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // selector is required and must be non-empty + structurally valid; the
+    // template's labels must satisfy it.
+    if selector_is_empty(&spec.selector) {
+        errs.push(Error::required(
+            &fld_path.child("selector"),
+            "must be specified",
+        ));
+    } else {
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
+            &fld_path.child("selector"),
+        ));
+        let template_labels = spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.labels.clone())
+            .unwrap_or_default();
+        errs.extend(template_labels_match_selector(
+            &spec.selector,
+            &template_labels,
+            &fld_path.child("template").child("metadata").child("labels"),
+        ));
+    }
+
+    errs
+}
+
+/// Validate a new `ReplicaSet`. Mirrors upstream `ValidateReplicaSet`.
+pub fn validate_replicaset(rs: &ReplicaSet) -> ErrorList {
+    validate_replicaset_spec(&rs.spec, &Path::new("spec"))
 }
 
 /// Validate a `Deployment` update (`new` replaces `old`). Mirrors upstream
