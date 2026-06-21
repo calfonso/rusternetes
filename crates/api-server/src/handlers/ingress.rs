@@ -131,6 +131,17 @@ pub async fn update(
 
     let key = build_key("ingresses", Some(&namespace), &name);
 
+    // Field validation on update (mirrors upstream ValidateIngressUpdate, which
+    // re-runs validateIngress on the new object). The create path validates but
+    // the update path previously persisted PUTs unchecked, so an invalid spec
+    // could be written via update.
+    {
+        let errs = rusternetes_common::validation::ingress::validate_ingress(&ingress);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
