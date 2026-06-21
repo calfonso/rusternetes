@@ -49,6 +49,14 @@ pub async fn create(
     // Reject create with neither name nor generateName (#1065).
     crate::handlers::validation::require_object_name(&replicaset.metadata)?;
 
+    // Field validation (mirrors upstream ValidateReplicaSet).
+    {
+        let errs = rusternetes_common::validation::apps::validate_replicaset(&replicaset);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     replicaset.metadata.namespace = Some(namespace.clone());
     replicaset.metadata.ensure_uid();
     replicaset.metadata.ensure_creation_timestamp();

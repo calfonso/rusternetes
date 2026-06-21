@@ -57,6 +57,15 @@ pub async fn create(
     // Apply K8s defaults (SetDefaults_StatefulSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_statefulset_defaults(&mut statefulset);
 
+    // Field validation (mirrors upstream ValidateStatefulSet). Runs after
+    // defaulting so podManagementPolicy/updateStrategy are populated.
+    {
+        let errs = rusternetes_common::validation::apps::validate_statefulset(&statefulset);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
