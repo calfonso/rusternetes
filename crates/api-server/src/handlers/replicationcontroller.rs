@@ -67,6 +67,11 @@ pub async fn create_replicationcontroller(
     rc.metadata.ensure_uid();
     rc.metadata.ensure_creation_timestamp();
 
+    // K8s defaults RC.Spec.Replicas to 1 (declarative default on the v1 type).
+    if rc.spec.replicas.is_none() {
+        rc.spec.replicas = Some(1);
+    }
+
     // K8s defaults RC.Spec.Selector from Template.Labels when not provided.
     // See: pkg/registry/core/replicationcontroller/strategy.go
     if rc.spec.selector.is_none() {
