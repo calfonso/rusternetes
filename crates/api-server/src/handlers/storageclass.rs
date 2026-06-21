@@ -45,6 +45,23 @@ pub async fn create_storageclass(
     sc.metadata.ensure_uid();
     sc.metadata.ensure_creation_timestamp();
 
+    // SetDefaults_StorageClass: reclaimPolicy → Delete, volumeBindingMode →
+    // Immediate when unset (upstream pkg/apis/storage/v1/defaults.go).
+    if sc.reclaim_policy.is_none() {
+        sc.reclaim_policy =
+            Some(rusternetes_common::resources::volume::PersistentVolumeReclaimPolicy::Delete);
+    }
+    if sc.volume_binding_mode.is_none() {
+        sc.volume_binding_mode =
+            Some(rusternetes_common::resources::volume::VolumeBindingMode::Immediate);
+    }
+
+    // Validate the (defaulted) StorageClass — upstream ValidateStorageClass.
+    let errs = rusternetes_common::validation::storageclass::validate_storage_class(&sc);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: StorageClass validated successfully (not created)");

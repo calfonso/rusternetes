@@ -17,3 +17,4 @@ pub mod pdb;
 pub mod pod;
 pub mod pvc;
 pub mod service;
+pub mod storageclass;
