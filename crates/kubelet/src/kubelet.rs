@@ -1256,17 +1256,26 @@ impl Kubelet {
                                 );
                                 let mut evicted = pod.clone();
                                 evicted.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                                if let Some(ref mut status) = evicted.status {
-                                    status.phase = Some(Phase::Failed);
-                                    status.reason = Some("Evicted".to_string());
-                                    status.message = Some("Taint-based eviction".to_string());
-                                }
+                                let status = evicted.status.get_or_insert_with(Default::default);
+                                status.phase = Some(Phase::Failed);
+                                status.reason = Some("Evicted".to_string());
+                                status.message = Some("Taint-based eviction".to_string());
                                 let pod_key = build_key(
                                     "pods",
                                     evicted.metadata.namespace.as_deref(),
                                     &evicted.metadata.name,
                                 );
-                                let _ = self.storage.update(&pod_key, &evicted).await;
+                                // Mode-aware graceful eviction (#1284): storage
+                                // mode persists deletionTimestamp+status via the
+                                // whole-pod write; API mode can't (the api-server
+                                // owns deletionTimestamp on a PUT) so it stamps
+                                // /status then issues a real DELETE-with-grace.
+                                let grace = pod
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|s| s.termination_grace_period_seconds)
+                                    .unwrap_or(30);
+                                let _ = self.storage.evict_pod(&pod_key, &evicted, grace).await;
                                 break;
                             }
                         }
