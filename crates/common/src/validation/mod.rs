@@ -8,6 +8,7 @@
 pub mod apps;
 pub mod events;
 pub mod field;
+pub mod limitrange;
 pub mod metav1;
 pub mod objectmeta;
 pub mod pod;
