@@ -60,7 +60,12 @@ indexmap = "2.14"
 tokio-tungstenite = "0.21"
 bytes = "1.5"
 get_if_addrs = "0.5"
-prometheus-http-query = "0.8"
+# rustls-only: the default features pull reqwest's native-tls → openssl-sys,
+# which drags OpenSSL into the all-in-one (breaks the musl static build and the
+# rustls-only goal). #1041.
+prometheus-http-query = { version = "0.8", default-features = false, features = [
+    "rustls-tls",
+] }
 url = "2.5.8"
 cel.workspace = true
 sha2 = "0.10"
