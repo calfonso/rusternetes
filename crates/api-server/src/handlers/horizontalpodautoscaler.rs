@@ -138,6 +138,16 @@ pub async fn update(
 
     let key = build_key("horizontalpodautoscalers", Some(&namespace), &name);
 
+    // Field validation on update (upstream ValidateHorizontalPodAutoscalerUpdate
+    // re-runs validateHorizontalPodAutoscalerSpec on the new object). The create
+    // path validated but the update path previously persisted PUTs unchecked.
+    {
+        let errs = rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler(&hpa);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
