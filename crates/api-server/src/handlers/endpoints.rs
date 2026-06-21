@@ -51,6 +51,14 @@ pub async fn create_endpoints(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Field validation (mirrors upstream ValidateEndpoints).
+    {
+        let errs = rusternetes_common::validation::endpoints::validate_endpoints(&endpoints);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     endpoints.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields

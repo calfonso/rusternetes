@@ -8,6 +8,7 @@
 pub mod apps;
 pub mod certificatesigningrequest;
 pub mod csistoragecapacity;
+pub mod endpoints;
 pub mod endpointslice;
 pub mod events;
 pub mod field;
