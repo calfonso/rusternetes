@@ -7,6 +7,7 @@
 
 pub mod apps;
 pub mod certificatesigningrequest;
+pub mod configmap;
 pub mod csistoragecapacity;
 pub mod endpoints;
 pub mod endpointslice;

@@ -39,6 +39,12 @@ pub async fn create(
     // Validate resource name
     crate::handlers::validation::validate_resource_name(&configmap.metadata.name)?;
 
+    // Validate ConfigMap data/binaryData keys (upstream ValidateConfigMap).
+    let errs = rusternetes_common::validation::configmap::validate_config_map(&configmap);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 

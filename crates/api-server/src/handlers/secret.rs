@@ -141,6 +141,26 @@ pub async fn create(
         }
     }
 
+    // Enforce the MaxSecretSize (1 MiB) total-size cap (upstream ValidateSecret).
+    // stringData is merged into data before persistence, so it counts toward the
+    // same budget; sum both. Upstream attaches the error to the `data` path.
+    {
+        use rusternetes_common::validation::configmap::MAX_SECRET_SIZE;
+        let mut total_size: usize = 0;
+        if let Some(ref data) = secret.data {
+            total_size += data.values().map(|v| v.len()).sum::<usize>();
+        }
+        if let Some(ref string_data) = secret.string_data {
+            total_size += string_data.values().map(|v| v.len()).sum::<usize>();
+        }
+        if total_size > MAX_SECRET_SIZE {
+            use rusternetes_common::validation::field::{Error as FieldError, Path};
+            return Err(rusternetes_common::Error::Invalid(vec![
+                FieldError::too_long(&Path::new("data"), MAX_SECRET_SIZE),
+            ]));
+        }
+    }
+
     // Enrich metadata with system fields
     secret.metadata.ensure_uid();
     secret.metadata.ensure_creation_timestamp();
