@@ -163,13 +163,22 @@ pub async fn update(
     // status onto the incoming object so status (used/hard) only mutates via the
     // /status subresource. Without this, a spec-only PUT carries an empty status
     // and wipes the controller-computed usage until the next reconcile.
-    let old_status = match state.storage.get::<ResourceQuota>(&key).await {
-        Ok(old) => Some(old.status),
+    let old_quota = match state.storage.get::<ResourceQuota>(&key).await {
+        Ok(old) => Some(old),
         Err(rusternetes_common::Error::NotFound(_)) => None,
         Err(e) => return Err(e),
     };
-    if let Some(status) = old_status {
-        quota.status = status;
+    if let Some(old) = &old_quota {
+        // Field validation on update (upstream ValidateResourceQuotaUpdate):
+        // re-validate the spec and reject changes to the immutable spec.scopes.
+        let errs = rusternetes_common::validation::resourcequota::validate_resource_quota_update(
+            &quota, old,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+        // PrepareForUpdate: status only mutates via the /status subresource.
+        quota.status = old.status.clone();
     }
 
     // If dry-run, skip storage operation but return the validated resource

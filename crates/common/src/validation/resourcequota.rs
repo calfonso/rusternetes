@@ -83,3 +83,25 @@ pub fn validate_resource_quota_spec(spec: &ResourceQuotaSpec, fld_path: &Path) -
 pub fn validate_resource_quota(rq: &ResourceQuota) -> ErrorList {
     validate_resource_quota_spec(&rq.spec, &Path::new("spec"))
 }
+
+/// Validate a ResourceQuota update — upstream `ValidateResourceQuotaUpdate`
+/// (pkg/apis/core/validation): re-validate the spec, and `spec.scopes` is
+/// immutable (compared as a set).
+pub fn validate_resource_quota_update(new_rq: &ResourceQuota, old_rq: &ResourceQuota) -> ErrorList {
+    let mut errs = validate_resource_quota_spec(&new_rq.spec, &Path::new("spec"));
+
+    let new_scopes: std::collections::HashSet<&String> =
+        new_rq.spec.scopes.iter().flatten().collect();
+    let old_scopes: std::collections::HashSet<&String> =
+        old_rq.spec.scopes.iter().flatten().collect();
+    if new_scopes != old_scopes {
+        let shown = new_rq.spec.scopes.clone().unwrap_or_default().join(",");
+        errs.push(Error::invalid(
+            &Path::new("spec").child("scopes"),
+            shown,
+            "field is immutable",
+        ));
+    }
+
+    errs
+}
