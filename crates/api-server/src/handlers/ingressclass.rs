@@ -42,6 +42,13 @@ pub async fn create_ingressclass(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream networking ValidateIngressClass): controller
+    // domain-prefixed path + parameters reference scope/namespace coupling.
+    let errs = rusternetes_common::validation::ingressclass::validate_ingress_class(&ingress_class);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     ingress_class.metadata.ensure_uid();
     ingress_class.metadata.ensure_creation_timestamp();
