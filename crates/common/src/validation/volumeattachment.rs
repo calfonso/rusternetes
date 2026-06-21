@@ -55,3 +55,21 @@ pub fn validate_volume_attachment(va: &VolumeAttachment) -> ErrorList {
 
     errs
 }
+
+/// Validate a VolumeAttachment update — upstream `ValidateVolumeAttachmentUpdate`
+/// (pkg/apis/storage/validation): the spec is read-only (immutable), plus full
+/// re-validation of the new object.
+pub fn validate_volume_attachment_update(
+    new_va: &VolumeAttachment,
+    old_va: &VolumeAttachment,
+) -> ErrorList {
+    let mut errs = validate_volume_attachment(new_va);
+    if serde_json::to_value(&new_va.spec).ok() != serde_json::to_value(&old_va.spec).ok() {
+        errs.push(Error::invalid(
+            &Path::new("spec"),
+            "<spec>".to_string(),
+            "field is immutable",
+        ));
+    }
+    errs
+}

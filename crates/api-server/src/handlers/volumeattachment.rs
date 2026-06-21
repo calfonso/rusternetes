@@ -150,13 +150,29 @@ pub async fn update_volumeattachment(
 
     va.metadata.name = name.clone();
 
+    let key = build_key("volumeattachments", None, &name);
+
+    // Spec is read-only on update (upstream ValidateVolumeAttachmentUpdate).
+    if let Ok(old) = state
+        .storage
+        .get::<rusternetes_common::resources::VolumeAttachment>(&key)
+        .await
+    {
+        let errs =
+            rusternetes_common::validation::volumeattachment::validate_volume_attachment_update(
+                &va, &old,
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: VolumeAttachment validated successfully (not updated)");
         return Ok(Json(va));
     }
 
-    let key = build_key("volumeattachments", None, &name);
     let updated = state.storage.update(&key, &va).await?;
 
     Ok(Json(updated))
