@@ -170,6 +170,17 @@ pub async fn update_scale(
         }
     }
 
+    // Scale.spec.replicas must be non-negative (upstream ValidateScale).
+    if scale.spec.replicas < 0 {
+        return Err(Error::Invalid(vec![
+            rusternetes_common::validation::field::Error::invalid(
+                &rusternetes_common::validation::field::Path::new("spec").child("replicas"),
+                scale.spec.replicas,
+                "must be greater than or equal to 0",
+            ),
+        ]));
+    }
+
     // Get the current resource
     let key = build_key(&resource, Some(&namespace), &name);
     let mut resource_obj: Value = state.storage.get(&key).await?;
@@ -300,6 +311,16 @@ pub async fn patch_scale(
             .map(|r| r as i32);
 
         if let Some(replicas) = new_replicas {
+            // Scale.spec.replicas must be non-negative (upstream ValidateScale).
+            if replicas < 0 {
+                return Err(Error::Invalid(vec![
+                    rusternetes_common::validation::field::Error::invalid(
+                        &rusternetes_common::validation::field::Path::new("spec").child("replicas"),
+                        replicas,
+                        "must be greater than or equal to 0",
+                    ),
+                ]));
+            }
             // Update the replicas in the resource spec
             if let Some(spec) = resource_obj.get_mut("spec") {
                 if let Some(spec_obj) = spec.as_object_mut() {
