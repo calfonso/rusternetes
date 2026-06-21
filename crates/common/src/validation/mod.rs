@@ -29,6 +29,7 @@ pub mod networkpolicy;
 pub mod node;
 pub mod objectmeta;
 pub mod pdb;
+pub mod persistentvolume;
 pub mod pod;
 pub mod podtemplate;
 pub mod priorityclass;

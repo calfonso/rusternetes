@@ -245,7 +245,11 @@ async fn test_pv_with_capacity_is_accepted() {
 async fn test_pv_without_capacity_decodes() {
     let router = spawn_router();
 
-    // No `capacity`, no `accessModes` — both optional upstream.
+    // No `capacity`, no `accessModes`: both are `omitempty` on the wire, so
+    // decode must admit the object — but upstream `ValidatePersistentVolumeSpec`
+    // requires them for a non-inline PV (`field.Required(accessModes)` and,
+    // when `!validateInlinePersistentVolumeSpec`, `field.Required(capacity)`),
+    // so create must then be rejected by *validation*, not by serde.
     let pv = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolume",
@@ -263,17 +267,25 @@ async fn test_pv_without_capacity_decodes() {
     let (status, body) = send_json(router, Method::POST, "/api/v1/persistentvolumes", &pv).await;
 
     let msg = body["message"].as_str().unwrap_or_default();
+    // Decode admitted the object: no raw serde missing-field error.
     assert!(
         !msg.contains("missing field"),
-        "PV decode must not surface a missing-field error for optional capacity/accessModes \
+        "PV decode must not surface a missing-field error for omitempty capacity/accessModes \
          (status {}): {}",
         status,
         body
     );
+    // Validation then handled the absent required fields (upstream parity:
+    // 422 FieldValueRequired, not a 2xx create).
     assert!(
-        status.is_success(),
-        "PV without capacity should decode and be created, got {}: {}",
+        !status.is_success(),
+        "PV without capacity/accessModes must be rejected by validation, got {}: {}",
         status,
+        body
+    );
+    assert!(
+        msg.contains("capacity") || msg.contains("accessModes"),
+        "rejection must name the missing required field(s): {}",
         body
     );
 }

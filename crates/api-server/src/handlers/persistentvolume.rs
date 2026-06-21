@@ -49,6 +49,15 @@ pub async fn create_pv(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Field validation (mirrors upstream ValidatePersistentVolume).
+    {
+        let errs =
+            rusternetes_common::validation::persistentvolume::validate_persistent_volume(&pv);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     pv.metadata.ensure_uid();
     pv.metadata.ensure_creation_timestamp();
 
