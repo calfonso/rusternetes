@@ -4437,6 +4437,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "once_cell",
+ "pem",
  "prometheus",
  "proptest",
  "prost",
@@ -4459,6 +4460,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

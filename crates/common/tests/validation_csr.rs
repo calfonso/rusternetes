@@ -12,9 +12,13 @@ fn csr(spec: serde_json::Value) -> CertificateSigningRequest {
     .unwrap()
 }
 
+/// A real ECDSA P-256 PKCS#10 certificate request, base64 of the PEM
+/// (CN=test.example.com). This is what `spec.request` carries on the wire.
+const REAL_CSR_B64: &str = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIc01JR1RBZ0VBTURFeEdUQVhCZ05WQkFNTUVIUmxjM1F1WlhoaGJYQnNaUzVqYjIweEZEQVNCZ05WQkFvTQpDM0oxYzNSbGNtNWxkR1Z6TUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFL2k2cjBkem16d3dRCnFWTXhSTDlkK2MwOE5VNzNCVTRjNzRFVS9GazgxVGI0UVFJMWhHNVE3U3hocklaUjIzQ3NMTFFEaFNJUitweHgKODhiSkpaNzRJYUFBTUFvR0NDcUdTTTQ5QkFNQ0EwZ0FNRVVDSUgvbE5mWkdDOUtsTlgzRmh5M0tzTFhzVituSApZMlRybGRabWo5Zm5rTVVjQWlFQW4xRTM4S0hLb050NUl6aFVSVWZPRDdlNTB1aDBVcjVBNTdzcDU5b2gyQTA9Ci0tLS0tRU5EIENFUlRJRklDQVRFIFJFUVVFU1QtLS0tLQo=";
+
 fn valid_spec() -> serde_json::Value {
     json!({
-        "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+        "request": REAL_CSR_B64,
         "signerName": "kubernetes.io/kube-apiserver-client",
         "usages": ["client auth", "digital signature"]
     })
@@ -23,6 +27,30 @@ fn valid_spec() -> serde_json::Value {
 #[test]
 fn valid_csr_passes() {
     assert!(validate_certificate_signing_request_create(&csr(valid_spec())).is_empty());
+}
+
+#[test]
+fn malformed_request_rejected() {
+    // base64 of "-----BEGIN CERTIFICATE REQUEST-----\n" only — a PEM header
+    // with no body; parses as neither a PEM block nor a PKCS#10 request.
+    let mut s = valid_spec();
+    s["request"] = json!("LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K");
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("request")),
+        "malformed CSR request must be rejected: {errs:?}"
+    );
+}
+
+#[test]
+fn non_base64_request_rejected() {
+    let mut s = valid_spec();
+    s["request"] = json!("@@@not base64@@@");
+    let errs = validate_certificate_signing_request_create(&csr(s));
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("request")),
+        "{errs:?}"
+    );
 }
 
 #[test]

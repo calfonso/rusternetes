@@ -666,7 +666,7 @@ async fn csr_create_get_list_delete_round_trip() {
         "kind": "CertificateSigningRequest",
         "metadata": {"name": "e2e-csr-lifecycle"},
         "spec": {
-            "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+            "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIc01JR1RBZ0VBTURFeEdUQVhCZ05WQkFNTUVIUmxjM1F1WlhoaGJYQnNaUzVqYjIweEZEQVNCZ05WQkFvTQpDM0oxYzNSbGNtNWxkR1Z6TUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFL2k2cjBkem16d3dRCnFWTXhSTDlkK2MwOE5VNzNCVTRjNzRFVS9GazgxVGI0UVFJMWhHNVE3U3hocklaUjIzQ3NMTFFEaFNJUitweHgKODhiSkpaNzRJYUFBTUFvR0NDcUdTTTQ5QkFNQ0EwZ0FNRVVDSUgvbE5mWkdDOUtsTlgzRmh5M0tzTFhzVituSApZMlRybGRabWo5Zm5rTVVjQWlFQW4xRTM4S0hLb050NUl6aFVSVWZPRDdlNTB1aDBVcjVBNTdzcDU5b2gyQTA9Ci0tLS0tRU5EIENFUlRJRklDQVRFIFJFUVVFU1QtLS0tLQo=",
             "signerName": "kubernetes.io/kube-apiserver-client",
             "usages": ["client auth"]
         }
@@ -752,7 +752,7 @@ async fn csr_approval_condition_stored_via_status_subresource() {
         "kind": "CertificateSigningRequest",
         "metadata": {"name": "e2e-csr-approve"},
         "spec": {
-            "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+            "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIc01JR1RBZ0VBTURFeEdUQVhCZ05WQkFNTUVIUmxjM1F1WlhoaGJYQnNaUzVqYjIweEZEQVNCZ05WQkFvTQpDM0oxYzNSbGNtNWxkR1Z6TUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFL2k2cjBkem16d3dRCnFWTXhSTDlkK2MwOE5VNzNCVTRjNzRFVS9GazgxVGI0UVFJMWhHNVE3U3hocklaUjIzQ3NMTFFEaFNJUitweHgKODhiSkpaNzRJYUFBTUFvR0NDcUdTTTQ5QkFNQ0EwZ0FNRVVDSUgvbE5mWkdDOUtsTlgzRmh5M0tzTFhzVituSApZMlRybGRabWo5Zm5rTVVjQWlFQW4xRTM4S0hLb050NUl6aFVSVWZPRDdlNTB1aDBVcjVBNTdzcDU5b2gyQTA9Ci0tLS0tRU5EIENFUlRJRklDQVRFIFJFUVVFU1QtLS0tLQo=",
             "signerName": "kubernetes.io/kube-apiserver-client",
             "usages": ["client auth"]
         }
@@ -811,7 +811,7 @@ async fn csr_full_lifecycle_with_signer_issues_certificate() {
         "kind": "CertificateSigningRequest",
         "metadata": {"name": "e2e-csr-issued"},
         "spec": {
-            "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K",
+            "request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlIc01JR1RBZ0VBTURFeEdUQVhCZ05WQkFNTUVIUmxjM1F1WlhoaGJYQnNaUzVqYjIweEZEQVNCZ05WQkFvTQpDM0oxYzNSbGNtNWxkR1Z6TUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFL2k2cjBkem16d3dRCnFWTXhSTDlkK2MwOE5VNzNCVTRjNzRFVS9GazgxVGI0UVFJMWhHNVE3U3hocklaUjIzQ3NMTFFEaFNJUitweHgKODhiSkpaNzRJYUFBTUFvR0NDcUdTTTQ5QkFNQ0EwZ0FNRVVDSUgvbE5mWkdDOUtsTlgzRmh5M0tzTFhzVituSApZMlRybGRabWo5Zm5rTVVjQWlFQW4xRTM4S0hLb050NUl6aFVSVWZPRDdlNTB1aDBVcjVBNTdzcDU5b2gyQTA9Ci0tLS0tRU5EIENFUlRJRklDQVRFIFJFUVVFU1QtLS0tLQo=",
             "signerName": "kubernetes.io/kube-apiserver-client",
             "usages": ["client auth"]
         }

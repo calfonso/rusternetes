@@ -3,19 +3,53 @@
 //! (`ValidateCertificateSigningRequestCreate`) and the shared
 //! `ValidateSignerName` from `pkg/apis/core/validation/names.go`.
 //!
-//! Scope: the crypto-free create-time field checks — `request` non-empty,
+//! Scope: the create-time field checks — `request` is parsed as a PEM-encoded
+//! PKCS#10 certificate request (upstream `validateCSR`'s `ParseCSR` step),
 //! `usages` required + no duplicates, `signerName` format (incl. the v1
 //! rejection of the legacy signer), and `expirationSeconds >= 600`.
 //!
 //! `usages` is a typed enum in the resource model, so an unrecognized usage
 //! *string* is already rejected at decode time (upstream's `allValidUsages`
-//! `NotSupported` check). The full upstream `validateCSR` — PKCS#10 PEM parse
-//! plus `CheckSignature` — is **not** ported here (needs x509/PKCS#10 parsing
-//! + signature verification); we only enforce that `request` is present.
+//! `NotSupported` check). The `request` self-signature verification
+//! (`CheckSignature`) is the one remaining piece of upstream `validateCSR`
+//! not yet ported — the structural PKCS#10 parse is done here.
 
 use crate::resources::certificates::{CertificateSigningRequest, KeyUsage};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+use base64::Engine;
+use x509_parser::prelude::FromDer;
+
+/// Structurally validate `csr.spec.request` — upstream `validateCSR`'s
+/// `certificates.ParseCSR` step. The field carries the base64 of a
+/// PEM-encoded PKCS#10 certificate request. Returns `Some(detail)` describing
+/// the first parse failure, or `None` when the request parses.
+///
+/// Self-signature verification (`CheckSignature`) is not performed here.
+fn parse_csr_request_error(request: &str) -> Option<String> {
+    if request.is_empty() {
+        return Some("must contain a PEM-encoded PKCS#10 certificate signing request".to_string());
+    }
+    let pem_bytes = match base64::engine::general_purpose::STANDARD.decode(request) {
+        Ok(b) => b,
+        Err(e) => return Some(format!("error parsing request: invalid base64: {e}")),
+    };
+    let parsed = match pem::parse(&pem_bytes) {
+        Ok(p) => p,
+        Err(e) => return Some(format!("error parsing request: invalid PEM block: {e}")),
+    };
+    if parsed.tag() != "CERTIFICATE REQUEST" {
+        return Some(format!(
+            "error parsing request: PEM block type must be CERTIFICATE REQUEST, got {:?}",
+            parsed.tag()
+        ));
+    }
+    match x509_parser::certification_request::X509CertificationRequest::from_der(parsed.contents())
+    {
+        Ok(_) => None,
+        Err(e) => Some(format!("error parsing request: {e}")),
+    }
+}
 
 // Mirror upstream apimachinery length constants.
 const DNS1123_SUBDOMAIN_MAX_LENGTH: usize = 253;
@@ -108,14 +142,15 @@ pub fn validate_certificate_signing_request_create(csr: &CertificateSigningReque
     let mut errs = ErrorList::new();
     let spec = Path::new("spec");
 
-    // request: full PKCS#10 parse + signature check (upstream validateCSR) is
-    // deferred; enforce presence so an empty request is rejected as upstream's
-    // parse would.
-    if csr.spec.request.is_empty() {
+    // request: upstream validateCSR parses the PEM-encoded PKCS#10 request.
+    // We perform the structural parse (base64 → PEM "CERTIFICATE REQUEST" block
+    // → PKCS#10 DER). Self-signature verification (CheckSignature) is not yet
+    // performed.
+    if let Some(detail) = parse_csr_request_error(&csr.spec.request) {
         errs.push(Error::invalid(
             &spec.child("request"),
-            String::new(),
-            "must contain a PEM-encoded PKCS#10 certificate signing request",
+            "<csr request>".to_string(),
+            detail,
         ));
     }
 
