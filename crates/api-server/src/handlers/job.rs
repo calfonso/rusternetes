@@ -80,6 +80,14 @@ pub async fn create(
         template_labels.insert("job-name".to_string(), job.metadata.name.clone());
     }
 
+    // Validate the (now defaulted + selector-generated) Job spec, mirroring
+    // upstream batch ValidateJob ordering. Rejects bad completionMode/Indexed
+    // combinations, negative counts, invalid restartPolicy, selector mismatch.
+    let errs = rusternetes_common::validation::job::validate_job(&job);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(

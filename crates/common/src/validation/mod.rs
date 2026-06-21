@@ -15,6 +15,7 @@ pub mod events;
 pub mod field;
 pub mod hpa;
 pub mod ingress;
+pub mod job;
 pub mod lease;
 pub mod limitrange;
 pub mod metav1;
