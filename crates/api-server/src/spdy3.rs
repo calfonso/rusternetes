@@ -944,4 +944,57 @@ mod tests {
             "stream types: {syn:?}"
         );
     }
+
+    /// End-to-end exercise of the async multiplexer: drive real SYN_STREAM +
+    /// DATA frames through `serve()` over an in-memory duplex and assert
+    /// `accept()` surfaces each stream (demuxed by id) with its `streamType`
+    /// header and that inbound DATA payloads reach the per-stream channel,
+    /// FLAG_FIN closing it. This pins the foundation the remotecommand handler
+    /// wiring (#1264) builds on, with no live SPDY client.
+    #[tokio::test]
+    async fn serve_accepts_streams_demuxes_and_pipes_data() {
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let mut server = serve(server_io).await.unwrap();
+
+        // The client compresses its SYN_STREAM headers with its own deflate
+        // state, paired with the server read-loop's fresh inflate state.
+        let mut nv = NvCodec::new();
+        let mut out = Vec::new();
+        let syn = |id: u32, ty: &str| Frame::SynStream {
+            stream_id: id,
+            flags: 0,
+            headers: vec![(HEADER_STREAM_TYPE.to_string(), ty.to_string())],
+        };
+        let data = |id: u32, fin: bool, p: &[u8]| Frame::Data {
+            stream_id: id,
+            flags: if fin { FLAG_FIN } else { 0 },
+            payload: p.to_vec(),
+        };
+        write_frame(&mut out, &syn(1, "stdin"), &mut nv).unwrap();
+        write_frame(&mut out, &syn(3, "resize"), &mut nv).unwrap();
+        write_frame(&mut out, &data(1, false, b"hello "), &mut nv).unwrap();
+        write_frame(&mut out, &data(1, true, b"world"), &mut nv).unwrap();
+        write_frame(&mut out, &data(3, true, b"{\"Width\":80}"), &mut nv).unwrap();
+        client.write_all(&out).await.unwrap();
+
+        // Streams arrive in SYN order; ids and streamType demuxed correctly.
+        let mut s1 = server.accept().await.expect("stream 1");
+        assert_eq!(s1.id, 1);
+        assert_eq!(s1.stream_type(), Some("stdin"));
+        let mut s3 = server.accept().await.expect("stream 3");
+        assert_eq!(s3.id, 3);
+        assert_eq!(s3.stream_type(), Some("resize"));
+
+        // Inbound DATA reaches the right per-stream channel; FLAG_FIN closes it.
+        let mut got1 = Vec::new();
+        while let Some(chunk) = s1.data.recv().await {
+            got1.extend_from_slice(&chunk);
+        }
+        assert_eq!(got1, b"hello world");
+        let mut got3 = Vec::new();
+        while let Some(chunk) = s3.data.recv().await {
+            got3.extend_from_slice(&chunk);
+        }
+        assert_eq!(got3, b"{\"Width\":80}");
+    }
 }
