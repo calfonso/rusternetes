@@ -453,11 +453,8 @@ pub fn validate_env_key_refs(
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
 ) -> Result<(), String> {
-    let Some(env) = container.env.as_ref() else {
-        return Ok(());
-    };
     let ns = namespace(pod);
-    for e in env {
+    for e in container.env.iter().flatten() {
         let Some(src) = e.value_from.as_ref() else {
             continue;
         };
@@ -494,6 +491,24 @@ pub fn validate_env_key_refs(
             }
         }
     }
+
+    // `envFrom`: a non-optional configMapRef/secretRef that didn't resolve fails
+    // container creation too, mirroring upstream `makeEnvironmentVariables`
+    // (a missing required bulk source is `CreateContainerConfigError`, not a
+    // silent skip). Optional sources are tolerated.
+    for ef in container.env_from.iter().flatten() {
+        if let Some(cmr) = ef.config_map_ref.as_ref() {
+            if !cmr.optional.unwrap_or(false) && !config_maps.contains_key(&cmr.name) {
+                return Err(format!("couldn't get ConfigMap {ns}/{}", cmr.name));
+            }
+        }
+        if let Some(skr) = ef.secret_ref.as_ref() {
+            if !skr.optional.unwrap_or(false) && !secrets.contains_key(&skr.name) {
+                return Err(format!("couldn't get Secret {ns}/{}", skr.name));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1441,6 +1456,81 @@ mod tests {
         let mut s = Secret::new("creds", "prod");
         s.data = Some(HashMap::from([("password".to_string(), b"x".to_vec())]));
         let secrets = HashMap::from([("creds".to_string(), s)]);
+        assert!(validate_env_key_refs(&pod, &c, &HashMap::new(), &secrets).is_ok());
+    }
+
+    fn container_with_env_from(
+        env_from: Vec<rusternetes_common::resources::pod::EnvFromSource>,
+    ) -> (Pod, Container) {
+        let c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            env_from: Some(env_from),
+            ..Default::default()
+        };
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        (pod, c)
+    }
+
+    #[test]
+    fn validate_rejects_nonoptional_missing_envfrom_configmap() {
+        use rusternetes_common::resources::pod::{ConfigMapEnvSource, EnvFromSource};
+        let (pod, c) = container_with_env_from(vec![EnvFromSource {
+            prefix: None,
+            config_map_ref: Some(ConfigMapEnvSource {
+                name: "bulk".to_string(),
+                optional: None,
+            }),
+            secret_ref: None,
+        }]);
+        let err = validate_env_key_refs(&pod, &c, &HashMap::new(), &HashMap::new()).unwrap_err();
+        assert_eq!(err, "couldn't get ConfigMap prod/bulk");
+    }
+
+    #[test]
+    fn validate_rejects_nonoptional_missing_envfrom_secret() {
+        use rusternetes_common::resources::pod::{EnvFromSource, SecretEnvSource};
+        let (pod, c) = container_with_env_from(vec![EnvFromSource {
+            prefix: None,
+            config_map_ref: None,
+            secret_ref: Some(SecretEnvSource {
+                name: "bulk-creds".to_string(),
+                optional: None,
+            }),
+        }]);
+        let err = validate_env_key_refs(&pod, &c, &HashMap::new(), &HashMap::new()).unwrap_err();
+        assert_eq!(err, "couldn't get Secret prod/bulk-creds");
+    }
+
+    #[test]
+    fn validate_allows_optional_missing_and_present_envfrom() {
+        use rusternetes_common::resources::pod::{
+            ConfigMapEnvSource, EnvFromSource, SecretEnvSource,
+        };
+        let (pod, c) = container_with_env_from(vec![
+            // optional + missing -> ok
+            EnvFromSource {
+                prefix: None,
+                config_map_ref: Some(ConfigMapEnvSource {
+                    name: "gone".to_string(),
+                    optional: Some(true),
+                }),
+                secret_ref: None,
+            },
+            // non-optional + present -> ok
+            EnvFromSource {
+                prefix: None,
+                config_map_ref: None,
+                secret_ref: Some(SecretEnvSource {
+                    name: "creds".to_string(),
+                    optional: None,
+                }),
+            },
+        ]);
+        let secrets = HashMap::from([("creds".to_string(), Secret::new("creds", "prod"))]);
         assert!(validate_env_key_refs(&pod, &c, &HashMap::new(), &secrets).is_ok());
     }
 }
