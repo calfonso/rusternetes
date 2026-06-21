@@ -1245,6 +1245,21 @@ pub async fn create_eviction(
         .and_then(|opts| opts.get("gracePeriodSeconds"))
         .and_then(|gp| gp.as_i64());
 
+    // deleteOptions.gracePeriodSeconds must be non-negative (upstream
+    // ValidateDeleteOptions).
+    if let Some(g) = grace_period_seconds {
+        if g < 0 {
+            return Err(Error::Invalid(vec![
+                rusternetes_common::validation::field::Error::invalid(
+                    &rusternetes_common::validation::field::Path::new("deleteOptions")
+                        .child("gracePeriodSeconds"),
+                    g,
+                    "must be greater than or equal to 0",
+                ),
+            ]));
+        }
+    }
+
     // ----------------------------------------------------------------- fetch
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
