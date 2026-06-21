@@ -44,6 +44,12 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream ValidateNode): taints + podCIDRs.
+    let errs = rusternetes_common::validation::node::validate_node(&node);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     node.metadata.ensure_uid();
     node.metadata.ensure_creation_timestamp();

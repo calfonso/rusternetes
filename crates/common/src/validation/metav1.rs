@@ -211,7 +211,7 @@ pub fn is_qualified_name(value: &str) -> Vec<String> {
 }
 
 /// Upstream `content.IsLabelValue`.
-fn is_valid_label_value(value: &str) -> Vec<String> {
+pub fn is_valid_label_value(value: &str) -> Vec<String> {
     let mut errs = Vec::new();
     if value.len() > LABEL_VALUE_MAX_LENGTH {
         errs.push(max_len_error(LABEL_VALUE_MAX_LENGTH));
