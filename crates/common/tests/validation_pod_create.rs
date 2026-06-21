@@ -1207,3 +1207,49 @@ fn test_validate_tolerations_error_toleration_seconds_without_no_execute() {
         errs
     );
 }
+
+#[test]
+fn host_network_requires_hostport_matches_containerport() {
+    let make = |host_network: Option<bool>, host_port: Option<u16>| {
+        let mut c = minimal_container("app", "busybox");
+        c.ports = Some(vec![ContainerPort {
+            container_port: 80,
+            name: None,
+            protocol: None,
+            host_port,
+            host_ip: None,
+        }]);
+        let mut spec = minimal_spec(vec![c]);
+        spec.host_network = host_network;
+        pod_with_spec(spec)
+    };
+
+    // hostNetwork=true + unset (0) hostPort != containerPort 80 -> rejected on
+    // the hostPort field with the upstream message.
+    let pod = make(Some(true), None);
+    let errs = validate_pod_create(&pod, true);
+    assert!(
+        errs.iter()
+            .any(|e| e.field == "spec.containers[0].ports[0].hostPort"
+                && e.detail
+                    .contains("must match `containerPort` when `hostNetwork` is true")),
+        "expected hostPort-mismatch error, got: {errs:?}"
+    );
+
+    // hostNetwork=true + matching hostPort -> accepted.
+    check(
+        &make(Some(true), Some(80)),
+        true,
+        "hostNetwork with matching hostPort",
+    );
+
+    // hostNetwork=true + mismatched non-zero hostPort -> rejected.
+    check(
+        &make(Some(true), Some(8080)),
+        false,
+        "hostNetwork with mismatched hostPort",
+    );
+
+    // No hostNetwork -> the rule does not apply even with an unset hostPort.
+    check(&make(None, None), true, "no hostNetwork, unset hostPort");
+}

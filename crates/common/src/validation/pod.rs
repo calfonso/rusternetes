@@ -131,6 +131,31 @@ pub fn validate_pod_spec(
         }
     }
 
+    // hostNetwork: a container port's hostPort must match its containerPort.
+    // Upstream `validatePodHostNetworkDeps`: for a Pod (ResourceIsPod), the
+    // values must be equal — an unset hostPort (0) does not match a non-zero
+    // containerPort. Only regular containers are checked, matching upstream.
+    if spec.host_network.unwrap_or(false) {
+        for (i, c) in spec.containers.iter().enumerate() {
+            if let Some(ports) = c.ports.as_ref() {
+                for (j, p) in ports.iter().enumerate() {
+                    let hp = p.host_port.unwrap_or(0);
+                    if hp != p.container_port {
+                        errs.push(Error::invalid(
+                            &containers_path
+                                .index(i)
+                                .child("ports")
+                                .index(j)
+                                .child("hostPort"),
+                            hp as i64,
+                            "must match `containerPort` when `hostNetwork` is true",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // restartPolicy enum.
     errs.extend(validate_restart_policy(
         spec.restart_policy.as_deref(),
