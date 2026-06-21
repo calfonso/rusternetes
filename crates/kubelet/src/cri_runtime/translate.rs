@@ -622,15 +622,78 @@ fn seccomp_security_profile(pod: &Pod, container: &Container) -> Option<v1::Secu
     Some(profile)
 }
 
+/// Resolve the effective AppArmor profile to a CRI [`SecurityProfile`].
+///
+/// Ports upstream `getAppArmorProfile`/`apparmor.GetProfile`
+/// (`pkg/kubelet/kuberuntime/helpers.go`): container `appArmorProfile` wins over
+/// the pod's; `RuntimeDefault`/`Unconfined`/`Localhost` map to the CRI profile
+/// (Localhost carries `localhost_ref`). We set only the modern `apparmor`
+/// `SecurityProfile`, not the deprecated `apparmor_profile` string (that exists
+/// solely for runtimes older than the CRI-v1 containerd we target).
+fn apparmor_security_profile(pod: &Pod, container: &Container) -> Option<v1::SecurityProfile> {
+    use rusternetes_common::resources::pod::AppArmorProfile;
+    let profile: &AppArmorProfile = container
+        .security_context
+        .as_ref()
+        .and_then(|c| c.app_armor_profile.as_ref())
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|p| p.app_armor_profile.as_ref())
+        })?;
+    use v1::security_profile::ProfileType;
+    let profile = match profile.type_.as_str() {
+        "RuntimeDefault" => v1::SecurityProfile {
+            profile_type: ProfileType::RuntimeDefault as i32,
+            localhost_ref: String::new(),
+        },
+        "Localhost" => v1::SecurityProfile {
+            profile_type: ProfileType::Localhost as i32,
+            localhost_ref: profile.localhost_profile.clone().unwrap_or_default(),
+        },
+        // "Unconfined" and any unknown value → Unconfined.
+        _ => v1::SecurityProfile {
+            profile_type: ProfileType::Unconfined as i32,
+            localhost_ref: String::new(),
+        },
+    };
+    Some(profile)
+}
+
+/// Effective SELinux options for the container (container `seLinuxOptions` wins
+/// over the pod's), mapped to the CRI [`SeLinuxOption`] (upstream
+/// `convertToRuntimeSELinuxOption`).
+fn selinux_options(pod: &Pod, container: &Container) -> Option<v1::SeLinuxOption> {
+    let opts = container
+        .security_context
+        .as_ref()
+        .and_then(|c| c.se_linux_options.as_ref())
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|p| p.se_linux_options.as_ref())
+        })?;
+    Some(v1::SeLinuxOption {
+        user: opts.user.clone().unwrap_or_default(),
+        role: opts.role.clone().unwrap_or_default(),
+        r#type: opts.type_.clone().unwrap_or_default(),
+        level: opts.level.clone().unwrap_or_default(),
+    })
+}
+
 fn linux_security_context(
     pod: &Pod,
     container: &Container,
 ) -> Option<v1::LinuxContainerSecurityContext> {
-    // seccomp may come from the pod even when the container has no security
-    // context of its own, so resolve it before the early-out.
+    // seccomp/apparmor/selinux may come from the pod even when the container has
+    // no security context of its own, so resolve them before the early-out.
     let seccomp = seccomp_security_profile(pod, container);
+    let apparmor = apparmor_security_profile(pod, container);
+    let selinux_options = selinux_options(pod, container);
     let sc = container.security_context.as_ref();
-    if sc.is_none() && seccomp.is_none() {
+    if sc.is_none() && seccomp.is_none() && apparmor.is_none() && selinux_options.is_none() {
         return None;
     }
     // Translate requested Linux capabilities. Names are passed through verbatim
@@ -665,6 +728,8 @@ fn linux_security_context(
         // `allowPrivilegeEscalation: false` could still escalate.
         no_new_privs: sc.and_then(|s| s.allow_privilege_escalation) == Some(false),
         seccomp,
+        apparmor,
+        selinux_options,
         ..Default::default()
     })
 }
@@ -1254,6 +1319,104 @@ mod tests {
         // No seccomp anywhere → unset.
         assert_eq!(
             seccomp(json!({"containers": [{"name": "app", "image": "busybox"}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn apparmor_profile_container_pod_fallback_and_types() {
+        use serde_json::json;
+        use v1::security_profile::ProfileType;
+        let apparmor = |spec: serde_json::Value| -> Option<(i32, String)> {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default"}, "spec": spec
+            }))
+            .unwrap();
+            let c = pod.spec.as_ref().unwrap().containers[0].clone();
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .and_then(|l| l.security_context)
+            .and_then(|s| s.apparmor)
+            .map(|p| (p.profile_type, p.localhost_ref))
+        };
+        assert_eq!(
+            apparmor(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"appArmorProfile": {"type": "Localhost", "localhostProfile": "k8s-audit"}}
+            }]})),
+            Some((ProfileType::Localhost as i32, "k8s-audit".to_string()))
+        );
+        // Pod-level applies when the container has none.
+        assert_eq!(
+            apparmor(json!({
+                "securityContext": {"appArmorProfile": {"type": "RuntimeDefault"}},
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            Some((ProfileType::RuntimeDefault as i32, String::new()))
+        );
+        assert_eq!(
+            apparmor(json!({"containers": [{"name": "app", "image": "busybox"}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn selinux_options_mapped_with_pod_fallback() {
+        use serde_json::json;
+        let selinux = |spec: serde_json::Value| -> Option<(String, String, String, String)> {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default"}, "spec": spec
+            }))
+            .unwrap();
+            let c = pod.spec.as_ref().unwrap().containers[0].clone();
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .and_then(|l| l.security_context)
+            .and_then(|s| s.selinux_options)
+            .map(|o| (o.user, o.role, o.r#type, o.level))
+        };
+        // Container options win.
+        assert_eq!(
+            selinux(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"seLinuxOptions": {"level": "s0:c1,c2", "type": "spc_t"}}
+            }]})),
+            Some((
+                String::new(),
+                String::new(),
+                "spc_t".to_string(),
+                "s0:c1,c2".to_string()
+            ))
+        );
+        // Pod-level applies when the container has none.
+        assert_eq!(
+            selinux(json!({
+                "securityContext": {"seLinuxOptions": {"user": "system_u"}},
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            Some((
+                "system_u".to_string(),
+                String::new(),
+                String::new(),
+                String::new()
+            ))
+        );
+        assert_eq!(
+            selinux(json!({"containers": [{"name": "app", "image": "busybox"}]})),
             None
         );
     }
