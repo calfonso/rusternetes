@@ -41,6 +41,44 @@ pub async fn create_csidriver(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // SetDefaults_CSIDriver (pkg/apis/storage/v1/defaults.go): fill in the
+    // optional bool/enum fields before validation, matching upstream's
+    // default-then-validate ordering.
+    {
+        use rusternetes_common::resources::csi::{FSGroupPolicy, VolumeLifecycleMode};
+        let s = &mut driver.spec;
+        if s.attach_required.is_none() {
+            s.attach_required = Some(true);
+        }
+        if s.pod_info_on_mount.is_none() {
+            s.pod_info_on_mount = Some(false);
+        }
+        if s.storage_capacity.is_none() {
+            s.storage_capacity = Some(false);
+        }
+        if s.fs_group_policy.is_none() {
+            s.fs_group_policy = Some(FSGroupPolicy::ReadWriteOnceWithFSType);
+        }
+        if s.volume_lifecycle_modes
+            .as_ref()
+            .is_none_or(|v| v.is_empty())
+        {
+            s.volume_lifecycle_modes = Some(vec![VolumeLifecycleMode::Persistent]);
+        }
+        if s.requires_republish.is_none() {
+            s.requires_republish = Some(false);
+        }
+        if s.se_linux_mount.is_none() {
+            s.se_linux_mount = Some(false);
+        }
+    }
+
+    // Validate the (defaulted) CSIDriver — upstream ValidateCSIDriver.
+    let errs = rusternetes_common::validation::csidriver::validate_csi_driver(&driver);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     driver.metadata.ensure_uid();
     driver.metadata.ensure_creation_timestamp();
 
