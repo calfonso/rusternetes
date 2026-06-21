@@ -66,6 +66,14 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate the PriorityClass (upstream scheduling ValidatePriorityClass):
+    // system-prefix reservation, user-priority cap, preemptionPolicy enum.
+    let errs =
+        rusternetes_common::validation::priorityclass::validate_priority_class(&priority_class);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     priority_class.metadata.ensure_uid();
     priority_class.metadata.ensure_creation_timestamp();
