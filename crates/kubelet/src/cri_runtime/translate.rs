@@ -821,19 +821,71 @@ fn selinux_options(pod: &Pod, container: &Container) -> Option<v1::SeLinuxOption
     })
 }
 
+/// Upstream `securitycontext.defaultMaskedPaths` (pkg/securitycontext/util.go).
+/// The per-CPU `/sys/devices/system/cpu/cpuN/thermal_throttle` paths upstream
+/// appends after a host `os.Stat` are omitted here — that host-FS scan is
+/// runtime-side work; this static set is the contract-significant base.
+const DEFAULT_MASKED_PATHS: &[&str] = &[
+    "/proc/asound",
+    "/proc/acpi",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/sys/firmware",
+    "/sys/devices/virtual/powercap",
+];
+
+/// Upstream `securitycontext.defaultReadonlyPaths`.
+const DEFAULT_READONLY_PATHS: &[&str] = &[
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+];
+
+/// Port of upstream `securitycontext.ConvertToRuntimeMaskedPaths`: the default
+/// masked paths unless `procMount: Unmasked`, in which case nothing is masked.
+///
+/// The kubelet must send these explicitly: containerd's CRI resets masked paths
+/// to empty and only re-applies what the security context carries, so an unset
+/// field leaves `/proc` unmasked.
+fn convert_masked_paths(proc_mount: Option<&str>) -> Vec<String> {
+    if proc_mount == Some("Unmasked") {
+        return Vec::new();
+    }
+    DEFAULT_MASKED_PATHS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Port of upstream `securitycontext.ConvertToRuntimeReadonlyPaths`.
+fn convert_readonly_paths(proc_mount: Option<&str>) -> Vec<String> {
+    if proc_mount == Some("Unmasked") {
+        return Vec::new();
+    }
+    DEFAULT_READONLY_PATHS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn linux_security_context(
     pod: &Pod,
     container: &Container,
 ) -> Option<v1::LinuxContainerSecurityContext> {
     // seccomp/apparmor/selinux may come from the pod even when the container has
-    // no security context of its own, so resolve them before the early-out.
+    // no security context of its own.
     let seccomp = seccomp_security_profile(pod, container);
     let apparmor = apparmor_security_profile(pod, container);
     let selinux_options = selinux_options(pod, container);
     let sc = container.security_context.as_ref();
-    if sc.is_none() && seccomp.is_none() && apparmor.is_none() && selinux_options.is_none() {
-        return None;
-    }
+    // Always build a security context: the masked/readonly proc paths must be
+    // sent for every container (upstream sets them unconditionally), so there is
+    // no early-out.
     // Translate requested Linux capabilities. Names are passed through verbatim
     // (e.g. "NET_ADMIN"), matching upstream — the kubelet does not add the
     // "CAP_" prefix; the runtime (containerd) does when building the OCI spec.
@@ -868,6 +920,9 @@ fn linux_security_context(
         seccomp,
         apparmor,
         selinux_options,
+        // procMount → masked/readonly proc paths (upstream ConvertToRuntime*Paths).
+        masked_paths: convert_masked_paths(sc.and_then(|s| s.proc_mount.as_deref())),
+        readonly_paths: convert_readonly_paths(sc.and_then(|s| s.proc_mount.as_deref())),
         ..Default::default()
     })
 }
@@ -2136,5 +2191,84 @@ mod tests {
         ]);
         let secrets = HashMap::from([("creds".to_string(), Secret::new("creds", "prod"))]);
         assert!(validate_env_key_refs(&pod, &c, &HashMap::new(), &secrets).is_ok());
+    }
+
+    fn sec_ctx_for(sec_ctx: serde_json::Value) -> v1::LinuxContainerSecurityContext {
+        let mut c: Container = serde_json::from_value(serde_json::json!({
+            "name": "app",
+            "image": "busybox",
+        }))
+        .unwrap();
+        if !sec_ctx.is_null() {
+            c.security_context = Some(serde_json::from_value(sec_ctx).unwrap());
+        }
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        container_config(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .linux
+        .unwrap()
+        .security_context
+        .unwrap()
+    }
+
+    #[test]
+    fn default_procmount_sends_default_masked_and_readonly_paths() {
+        // Unset procMount → upstream default masked/readonly paths.
+        let sc = sec_ctx_for(serde_json::Value::Null);
+        assert_eq!(sc.masked_paths, DEFAULT_MASKED_PATHS);
+        assert_eq!(sc.readonly_paths, DEFAULT_READONLY_PATHS);
+    }
+
+    #[test]
+    fn explicit_default_procmount_sends_defaults() {
+        let sc = sec_ctx_for(serde_json::json!({"procMount": "Default"}));
+        assert_eq!(sc.masked_paths, DEFAULT_MASKED_PATHS);
+        assert_eq!(sc.readonly_paths, DEFAULT_READONLY_PATHS);
+    }
+
+    #[test]
+    fn unmasked_procmount_sends_empty_paths() {
+        // procMount: Unmasked → nothing masked/readonly (upstream returns []).
+        let sc = sec_ctx_for(serde_json::json!({"procMount": "Unmasked"}));
+        assert!(sc.masked_paths.is_empty());
+        assert!(sc.readonly_paths.is_empty());
+    }
+
+    #[test]
+    fn bare_container_still_gets_masked_paths() {
+        // A container with no securityContext must still receive the default
+        // masked paths — containerd resets them to empty otherwise, leaving
+        // /proc exposed.
+        let c: Container = serde_json::from_value(serde_json::json!({
+            "name": "app",
+            "image": "busybox",
+        }))
+        .unwrap();
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        let sc = container_config(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .linux
+        .unwrap()
+        .security_context
+        .unwrap();
+        assert_eq!(sc.masked_paths, DEFAULT_MASKED_PATHS);
     }
 }
