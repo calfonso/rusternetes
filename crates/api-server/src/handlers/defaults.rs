@@ -63,6 +63,32 @@ pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
             apply_ephemeral_container_defaults(ec);
         }
     }
+
+    // K8s: SetDefaults_{Secret,ConfigMap,DownwardAPI,Projected}VolumeSource —
+    // defaultMode defaults to 0644 when unset.
+    if let Some(ref mut volumes) = spec.volumes {
+        for vol in volumes {
+            apply_volume_default_mode(vol);
+        }
+    }
+}
+
+/// Default `defaultMode` (0644) on the volume sources that carry it, mirroring
+/// the per-source `SetDefaults_*VolumeSource` functions (pkg/apis/core/v1).
+fn apply_volume_default_mode(vol: &mut rusternetes_common::resources::pod::Volume) {
+    const DEFAULT_MODE: i32 = 0o644;
+    if let Some(s) = vol.secret.as_mut() {
+        s.default_mode.get_or_insert(DEFAULT_MODE);
+    }
+    if let Some(cm) = vol.config_map.as_mut() {
+        cm.default_mode.get_or_insert(DEFAULT_MODE);
+    }
+    if let Some(d) = vol.downward_api.as_mut() {
+        d.default_mode.get_or_insert(DEFAULT_MODE);
+    }
+    if let Some(p) = vol.projected.as_mut() {
+        p.default_mode.get_or_insert(DEFAULT_MODE);
+    }
 }
 
 /// Apply K8s defaults to an EphemeralContainer. Mirrors the
@@ -627,6 +653,37 @@ mod tests {
         assert_eq!(
             template.spec.containers[0].image_pull_policy.as_deref(),
             Some("Always")
+        );
+    }
+
+    #[test]
+    fn test_volume_default_mode_applied() {
+        use rusternetes_common::resources::pod::Volume;
+        let mut spec = PodSpec {
+            containers: vec![],
+            volumes: Some(vec![
+                serde_json::from_value(serde_json::json!({"name": "s", "secret": {"secretName": "x"}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "cm", "configMap": {"name": "y"}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "p", "projected": {"sources": []}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"name": "d", "downwardAPI": {}})).unwrap(),
+                // explicit mode preserved
+                serde_json::from_value(serde_json::json!({"name": "s2", "secret": {"secretName": "z", "defaultMode": 0o600}})).unwrap(),
+            ]),
+            ..Default::default()
+        };
+        apply_pod_spec_defaults(&mut spec);
+        let v: &[Volume] = spec.volumes.as_deref().unwrap();
+        assert_eq!(v[0].secret.as_ref().unwrap().default_mode, Some(0o644));
+        assert_eq!(v[1].config_map.as_ref().unwrap().default_mode, Some(0o644));
+        assert_eq!(v[2].projected.as_ref().unwrap().default_mode, Some(0o644));
+        assert_eq!(
+            v[3].downward_api.as_ref().unwrap().default_mode,
+            Some(0o644)
+        );
+        assert_eq!(
+            v[4].secret.as_ref().unwrap().default_mode,
+            Some(0o600),
+            "explicit mode preserved"
         );
     }
 }
