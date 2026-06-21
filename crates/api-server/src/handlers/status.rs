@@ -22,6 +22,23 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Run resource-type-specific status validation before persisting a status
+/// update. Currently covers Node `/status` (upstream `ValidateNodeUpdate`
+/// status-field checks: addresses, declaredFeatures, capacity/allocatable).
+fn validate_status_subresource(resource_type: &str, resource: &Value) -> Result<()> {
+    if resource_type == "nodes" {
+        let node: rusternetes_common::resources::Node = serde_json::from_value(resource.clone())
+            .map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!("invalid Node: {e}"))
+            })?;
+        let errs = rusternetes_common::validation::node::validate_node_status_update(&node);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+    Ok(())
+}
+
 /// Extract the resource type from the request URI.
 ///
 /// For namespaced resources, the URI looks like:
@@ -293,6 +310,8 @@ pub async fn update_status(
             }
         }
 
+        validate_status_subresource(&resource_type, &result)?;
+
         let mut saved: Value = state.storage.update(&key, &result).await?;
         // Ensure kind/apiVersion in response
         if let Some(obj) = saved.as_object_mut() {
@@ -459,6 +478,8 @@ pub async fn update_cluster_status(
             }
         }
 
+        validate_status_subresource(&resource_type, &result)?;
+
         let mut saved: Value = state.storage.update(&key, &result).await?;
         // Ensure kind/apiVersion in response
         if let Some(obj) = saved.as_object_mut() {
@@ -605,6 +626,8 @@ pub async fn update_cluster_status(
                 .or_insert_with(|| Value::String(api_version));
         }
     }
+
+    validate_status_subresource(&resource_type, &updated_resource)?;
 
     // Save the updated resource
     let mut saved: Value = state.storage.update(&key, &updated_resource).await?;
