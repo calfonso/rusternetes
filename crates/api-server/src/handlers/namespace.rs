@@ -47,6 +47,12 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsLabel,
     )?;
 
+    // Validate spec.finalizers (upstream ValidateNamespace).
+    let errs = rusternetes_common::validation::namespace::validate_namespace(&namespace);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields. `ensure_uid()` also resolves
     // `generateName` -> `metadata.name` (via `ensure_name()`).
     namespace.metadata.ensure_uid();
