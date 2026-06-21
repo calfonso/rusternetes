@@ -49,6 +49,13 @@ pub async fn create_controllerrevision(
     // Ensure namespace is set from the URL path
     cr.metadata.namespace = Some(namespace.clone());
 
+    // Validate (upstream apps ValidateControllerRevisionCreate): data mandatory.
+    let errs =
+        rusternetes_common::validation::controllerrevision::validate_controller_revision(&cr);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     cr.metadata.ensure_uid();
     cr.metadata.ensure_creation_timestamp();

@@ -527,10 +527,14 @@ async fn test_controller_revision_without_metadata_decodes() {
     let router = spawn_router();
 
     // ControllerRevision with empty metadata — the shape that previously 422'd.
+    // `data` is mandatory and must be a JSON object (upstream
+    // ValidateControllerRevisionCreate), so supply a valid one; the regression
+    // under test is the metadata decode, not the data check.
     let cr = json!({
         "apiVersion": "apps/v1",
         "kind": "ControllerRevision",
         "metadata": {"name": "rev-1", "namespace": "default"},
+        "data": {"spec": {"replicas": 1}},
         "revision": 1
     });
 
