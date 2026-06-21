@@ -20,7 +20,9 @@ const MAX_PROVISIONER_PARAMETER_SIZE: usize = 256 * 1024;
 
 /// Port of upstream `validateProvisioner`: required, and (lowercased) a valid
 /// qualified name.
-fn validate_provisioner(provisioner: &str, fld_path: &Path) -> ErrorList {
+/// Port of upstream `validateProvisioner`: required, and (lowercased) a valid
+/// qualified name. Shared with VolumeAttributesClass's `driverName`.
+pub fn validate_provisioner(provisioner: &str, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if provisioner.is_empty() {
         errs.push(Error::required(fld_path, provisioner.to_string()));
@@ -32,15 +34,16 @@ fn validate_provisioner(provisioner: &str, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Port of upstream `validateParameters` with `allowEmpty = true`.
-fn validate_parameters(
+/// Port of upstream `validateParameters`. `allow_empty=false` (used by
+/// VolumeAttributesClass) additionally requires at least one key/value pair.
+pub fn validate_parameters(
     params: Option<&std::collections::HashMap<String, String>>,
+    allow_empty: bool,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    let Some(params) = params else {
-        return errs;
-    };
+    let empty = std::collections::HashMap::new();
+    let params = params.unwrap_or(&empty);
     if params.len() > MAX_PROVISIONER_PARAMETER_LEN {
         errs.push(Error::too_long(fld_path, MAX_PROVISIONER_PARAMETER_LEN));
         return errs;
@@ -58,6 +61,12 @@ fn validate_parameters(
     }
     if total_size > MAX_PROVISIONER_PARAMETER_SIZE {
         errs.push(Error::too_long(fld_path, MAX_PROVISIONER_PARAMETER_SIZE));
+    }
+    if !allow_empty && params.is_empty() {
+        errs.push(Error::required(
+            fld_path,
+            "must contain at least one key/value pair",
+        ));
     }
     errs
 }
@@ -107,6 +116,7 @@ pub fn validate_storage_class(sc: &StorageClass) -> ErrorList {
     let mut errs = validate_provisioner(&sc.provisioner, &Path::new("provisioner"));
     errs.extend(validate_parameters(
         sc.parameters.as_ref(),
+        true,
         &Path::new("parameters"),
     ));
 

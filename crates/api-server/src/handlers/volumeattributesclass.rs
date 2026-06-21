@@ -41,6 +41,16 @@ pub async fn create_volumeattributesclass(
         }
     }
 
+    // Validate spec (upstream storage ValidateVolumeAttributesClass): driverName
+    // + parameters (at least one entry required).
+    let errs =
+        rusternetes_common::validation::volumeattributesclass::validate_volume_attributes_class(
+            &vac,
+        );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     vac.metadata.ensure_uid();
     vac.metadata.ensure_creation_timestamp();
 
