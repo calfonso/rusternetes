@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
     Container, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate,
-    PodSecurityContext, PodSpec, Probe, Toleration, Volume,
+    PodSecurityContext, PodSpec, Probe, Toleration, Volume, VolumeMount,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
@@ -76,6 +76,16 @@ pub fn validate_pod_spec(
     let mut errs: ErrorList = Vec::new();
     let containers_path = fld_path.child("containers");
 
+    // Declared volume names, for the volumeMount existence check
+    // (upstream `IsMatchedVolume`).
+    let volume_names: HashSet<&str> = spec
+        .volumes
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|v| v.name.as_str())
+        .collect();
+
     // Containers must be non-empty.
     if spec.containers.is_empty() {
         errs.push(Error::required(
@@ -87,7 +97,12 @@ pub fn validate_pod_spec(
     // Validate containers and collect names for uniqueness check.
     let mut all_names: HashSet<String> = HashSet::new();
     for (i, c) in spec.containers.iter().enumerate() {
-        errs.extend(validate_container(c, false, &containers_path.index(i)));
+        errs.extend(validate_container(
+            c,
+            false,
+            &volume_names,
+            &containers_path.index(i),
+        ));
         if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
             errs.push(Error::duplicate(
                 &containers_path.index(i).child("name"),
@@ -100,7 +115,12 @@ pub fn validate_pod_spec(
     if let Some(ref inits) = spec.init_containers {
         let init_path = fld_path.child("initContainers");
         for (i, c) in inits.iter().enumerate() {
-            errs.extend(validate_container(c, true, &init_path.index(i)));
+            errs.extend(validate_container(
+                c,
+                true,
+                &volume_names,
+                &init_path.index(i),
+            ));
             if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
                 errs.push(Error::duplicate(
                     &init_path.index(i).child("name"),
@@ -284,7 +304,12 @@ fn validate_sysctls(sc: &PodSecurityContext, fld_path: &Path) -> ErrorList {
 ///
 /// Mirrors upstream `validateContainer` / `validateInitContainer`
 /// (`pkg/apis/core/validation/validation.go`, release-1.35).
-fn validate_container(c: &Container, is_init: bool, fld_path: &Path) -> ErrorList {
+fn validate_container(
+    c: &Container,
+    is_init: bool,
+    volume_names: &HashSet<&str>,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // name — DNS-1123 label.
@@ -347,6 +372,95 @@ fn validate_container(c: &Container, is_init: bool, fld_path: &Path) -> ErrorLis
         ));
     }
 
+    // volumeMounts.
+    if let Some(ref mounts) = c.volume_mounts {
+        errs.extend(validate_volume_mounts(
+            mounts,
+            volume_names,
+            &fld_path.child("volumeMounts"),
+        ));
+    }
+
+    errs
+}
+
+/// Port of upstream `validateLocalDescendingPath`: a `subPath`/`subPathExpr`
+/// must be relative and contain no `..` component.
+fn validate_local_descending_path(target: &str, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if target.starts_with('/') {
+        errs.push(Error::invalid(
+            fld_path,
+            target.to_string(),
+            "must be a relative path",
+        ));
+    }
+    if target.split('/').any(|seg| seg == "..") {
+        errs.push(Error::invalid(
+            fld_path,
+            target.to_string(),
+            "must not contain '..'",
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `ValidateVolumeMounts` (the volume-context subset): each
+/// mount needs a name that matches a declared volume, a unique non-empty
+/// `mountPath`, and `subPath`/`subPathExpr` that are mutually exclusive
+/// relative non-backstepping paths.
+///
+/// `mountPropagation`, `recursiveReadOnly`, and the `volumeDevices` overlap
+/// checks need extra container/device context and are not covered here.
+fn validate_volume_mounts(
+    mounts: &[VolumeMount],
+    volume_names: &HashSet<&str>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut mountpoints: HashSet<&str> = HashSet::new();
+
+    for (i, mnt) in mounts.iter().enumerate() {
+        let idx = fld_path.index(i);
+
+        if mnt.name.is_empty() {
+            errs.push(Error::required(&idx.child("name"), ""));
+        } else if !volume_names.contains(mnt.name.as_str()) {
+            errs.push(Error::not_found(&idx.child("name"), mnt.name.clone()));
+        }
+
+        if mnt.mount_path.is_empty() {
+            errs.push(Error::required(&idx.child("mountPath"), ""));
+        }
+        if !mnt.mount_path.is_empty() && !mountpoints.insert(mnt.mount_path.as_str()) {
+            errs.push(Error::invalid(
+                &idx.child("mountPath"),
+                mnt.mount_path.clone(),
+                "must be unique",
+            ));
+        }
+
+        if let Some(sub_path) = mnt.sub_path.as_deref().filter(|s| !s.is_empty()) {
+            errs.extend(validate_local_descending_path(
+                sub_path,
+                &fld_path.child("subPath"),
+            ));
+        }
+
+        if let Some(sub_path_expr) = mnt.sub_path_expr.as_deref().filter(|s| !s.is_empty()) {
+            if mnt.sub_path.as_deref().is_some_and(|s| !s.is_empty()) {
+                errs.push(Error::invalid(
+                    &idx.child("subPathExpr"),
+                    sub_path_expr.to_string(),
+                    "subPathExpr and subPath are mutually exclusive",
+                ));
+            }
+            errs.extend(validate_local_descending_path(
+                sub_path_expr,
+                &fld_path.child("subPathExpr"),
+            ));
+        }
+    }
     errs
 }
 
@@ -1616,5 +1730,78 @@ mod tests {
         let errs = validate_node_affinity_mutation(&p, Some(&new), Some(&old));
         assert_eq!(errs.len(), 1);
         assert!(errs[0].to_string().contains("only additions are allowed"));
+    }
+
+    fn mounts_from(json: serde_json::Value) -> Vec<VolumeMount> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn volume_mount_must_reference_declared_volume() {
+        let vols: HashSet<&str> = ["data"].into_iter().collect();
+        let mounts = mounts_from(serde_json::json!([
+            {"name": "data", "mountPath": "/data"},
+            {"name": "missing", "mountPath": "/other"}
+        ]));
+        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].to_string().contains("missing"));
+    }
+
+    #[test]
+    fn duplicate_mount_path_rejected() {
+        let vols: HashSet<&str> = ["a", "b"].into_iter().collect();
+        let mounts = mounts_from(serde_json::json!([
+            {"name": "a", "mountPath": "/x"},
+            {"name": "b", "mountPath": "/x"}
+        ]));
+        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("must be unique")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn empty_name_and_mount_path_required() {
+        let vols: HashSet<&str> = HashSet::new();
+        let mounts = mounts_from(serde_json::json!([{"name": "", "mountPath": ""}]));
+        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        assert!(errs.iter().any(|e| e.field.ends_with("name")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("mountPath")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn subpath_must_be_relative_and_no_backsteps() {
+        assert!(validate_local_descending_path("data/sub", &Path::new("subPath")).is_empty());
+        let abs = validate_local_descending_path("/etc", &Path::new("subPath"));
+        assert!(
+            abs.iter().any(|e| e.to_string().contains("relative path")),
+            "{abs:?}"
+        );
+        let back = validate_local_descending_path("../../etc", &Path::new("subPath"));
+        assert!(
+            back.iter()
+                .any(|e| e.to_string().contains("must not contain '..'")),
+            "{back:?}"
+        );
+    }
+
+    #[test]
+    fn subpath_and_subpathexpr_mutually_exclusive() {
+        let vols: HashSet<&str> = ["v"].into_iter().collect();
+        let mounts = mounts_from(serde_json::json!([
+            {"name": "v", "mountPath": "/m", "subPath": "a", "subPathExpr": "$(POD_NAME)"}
+        ]));
+        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("mutually exclusive")),
+            "{errs:?}"
+        );
     }
 }
