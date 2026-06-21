@@ -15,7 +15,9 @@
 //! <https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/apis/apps/validation/validation.go>
 
 use crate::resources::deployment::{Deployment, DeploymentStrategy, RollingUpdateDeployment};
-use crate::resources::workloads::{ReplicaSet, ReplicaSetSpec, StatefulSet, StatefulSetSpec};
+use crate::resources::workloads::{
+    DaemonSet, DaemonSetSpec, ReplicaSet, ReplicaSetSpec, StatefulSet, StatefulSetSpec,
+};
 use crate::types::LabelSelector;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
@@ -541,6 +543,114 @@ fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorLi
 /// Run after defaulting (see [`validate_statefulset_spec`]).
 pub fn validate_statefulset(ss: &StatefulSet) -> ErrorList {
     validate_statefulset_spec(&ss.spec, &Path::new("spec"))
+}
+
+/// Validate a `DaemonSetSpec`. Mirrors upstream `ValidateDaemonSetSpec`
+/// (`pkg/apis/apps/validation/validation.go`): a required + valid `selector`
+/// whose template labels match, non-negative `minReadySeconds` /
+/// `revisionHistoryLimit`, and an `updateStrategy` of `RollingUpdate`
+/// (`rollingUpdate` required, with in-range `maxUnavailable`/`maxSurge`) or
+/// `OnDelete`. Run after defaulting (the api-server defaults `updateStrategy`).
+fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // selector required + valid + non-empty; template labels must match.
+    if selector_is_empty(&spec.selector) {
+        errs.push(Error::required(
+            &fld_path.child("selector"),
+            "must be specified",
+        ));
+    } else {
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
+            &fld_path.child("selector"),
+        ));
+        let template_labels = spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.labels.clone())
+            .unwrap_or_default();
+        errs.extend(template_labels_match_selector(
+            &spec.selector,
+            &template_labels,
+            &fld_path.child("template").child("metadata").child("labels"),
+        ));
+    }
+
+    // minReadySeconds >= 0
+    if let Some(mrs) = spec.min_ready_seconds {
+        if mrs < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("minReadySeconds"),
+                mrs,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // revisionHistoryLimit >= 0
+    if let Some(rhl) = spec.revision_history_limit {
+        if rhl < 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("revisionHistoryLimit"),
+                rhl,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+
+    // updateStrategy: RollingUpdate | OnDelete.
+    let us_path = fld_path.child("updateStrategy");
+    match spec
+        .update_strategy
+        .as_ref()
+        .and_then(|u| u.strategy_type.as_deref())
+    {
+        Some("OnDelete") => {}
+        Some("RollingUpdate") => {
+            // rollingUpdate must be present; validate its int-or-percent fields.
+            match spec
+                .update_strategy
+                .as_ref()
+                .and_then(|u| u.rolling_update.as_ref())
+            {
+                None => errs.push(Error::required(&us_path.child("rollingUpdate"), "")),
+                Some(ru) => {
+                    let ru_path = us_path.child("rollingUpdate");
+                    if let Some(mu) = &ru.max_unavailable {
+                        let (_, sub) = validate_int_or_string_field(
+                            &serde_json::Value::String(mu.clone()),
+                            &ru_path.child("maxUnavailable"),
+                        );
+                        errs.extend(sub);
+                    }
+                    if let Some(ms) = &ru.max_surge {
+                        let (_, sub) = validate_int_or_string_field(
+                            &serde_json::Value::String(ms.clone()),
+                            &ru_path.child("maxSurge"),
+                        );
+                        errs.extend(sub);
+                    }
+                }
+            }
+        }
+        // Unset/empty/unknown — upstream's default arm is NotSupported.
+        other => errs.push(Error::not_supported(
+            &us_path,
+            other.unwrap_or("").to_string(),
+            &["RollingUpdate", "OnDelete"],
+        )),
+    }
+
+    errs
+}
+
+/// Validate a new `DaemonSet`. Mirrors upstream `ValidateDaemonSet`.
+/// Run after defaulting (see [`validate_daemonset_spec`]).
+pub fn validate_daemonset(ds: &DaemonSet) -> ErrorList {
+    validate_daemonset_spec(&ds.spec, &Path::new("spec"))
 }
 
 /// Validate a `Deployment` update (`new` replaces `old`). Mirrors upstream

@@ -57,6 +57,15 @@ pub async fn create(
     // Apply K8s defaults (SetDefaults_DaemonSet + SetDefaults_PodSpec + SetDefaults_Container)
     crate::handlers::defaults::apply_daemonset_defaults(&mut daemonset);
 
+    // Field validation (mirrors upstream ValidateDaemonSet). Runs after
+    // defaulting so updateStrategy is populated.
+    {
+        let errs = rusternetes_common::validation::apps::validate_daemonset(&daemonset);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
