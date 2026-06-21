@@ -29,6 +29,7 @@ pub mod pdb;
 pub mod pod;
 pub mod podtemplate;
 pub mod priorityclass;
+pub mod prioritylevelconfiguration;
 pub mod pvc;
 pub mod replicationcontroller;
 pub mod resourcequota;

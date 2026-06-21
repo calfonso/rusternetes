@@ -41,6 +41,13 @@ pub async fn create_priority_level_configuration(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream APF ValidatePriorityLevelConfigurationSpec):
+    // type/name coupling, exempt/limited coupling, limited + queuing config.
+    let errs = rusternetes_common::validation::prioritylevelconfiguration::validate_priority_level_configuration(&plc);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     plc.metadata.ensure_uid();
     plc.metadata.ensure_creation_timestamp();
