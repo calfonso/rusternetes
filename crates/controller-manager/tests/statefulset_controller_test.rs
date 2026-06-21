@@ -451,3 +451,78 @@ async fn test_statefulset_rolling_update_changes_image() {
         "Recreated pod should have new revision hash"
     );
 }
+
+/// Force a pod into the `Failed` phase, simulating a Node eviction/rejection.
+async fn mark_pod_failed(storage: &Arc<MemoryStorage>, namespace: &str, pod_name: &str) {
+    let pod_key = build_key("pods", Some(namespace), pod_name);
+    let mut pod: Pod = storage.get(&pod_key).await.unwrap();
+    pod.status = Some(PodStatus {
+        phase: Some(Phase::Failed),
+        reason: Some("Evicted".to_string()),
+        ..pod.status.unwrap_or_default()
+    });
+    storage.update(&pod_key, &pod).await.unwrap();
+}
+
+/// #346: "StatefulSet MUST delete and recreate Pods it owns that go into a
+/// Failed state, such as when they are rejected or evicted by a Node."
+///
+/// Mirrors upstream `stateful_set_control.go`: a Failed replica is deleted
+/// (`isFailed` -> DeleteStatefulPod) and recreated at the same ordinal on a
+/// later sync, once the old pod is actually gone from storage.
+#[tokio::test]
+async fn test_statefulset_recreates_evicted_pod() {
+    let storage = setup_test().await;
+    let ns = "default";
+    let ss = create_test_statefulset("web", ns, 1);
+    let ss_key = build_key("statefulsets", Some(ns), "web");
+    storage.create(&ss_key, &ss).await.unwrap();
+
+    let controller = StatefulSetController::new(storage.clone());
+
+    // Initial sync brings up web-0.
+    controller.reconcile_all().await.unwrap();
+    let pod_key = build_key("pods", Some(ns), "web-0");
+    let original: Pod = storage.get(&pod_key).await.unwrap();
+    mark_pod_ready(&storage, ns, "web-0").await;
+
+    // The Node evicts web-0 -> it goes Failed.
+    mark_pod_failed(&storage, ns, "web-0").await;
+
+    // Reconcile: the controller must mark the Failed pod for deletion.
+    controller.reconcile_all().await.unwrap();
+    let after_evict: Pod = storage.get(&pod_key).await.unwrap();
+    assert!(
+        after_evict.metadata.deletion_timestamp.is_some(),
+        "Failed pod must be marked for deletion so it gets recreated"
+    );
+
+    // Kubelet finalizes the delete (removes it from storage).
+    simulate_kubelet_cleanup(&storage, ns).await;
+    assert!(
+        storage.get::<Pod>(&pod_key).await.is_err(),
+        "evicted pod should be gone from storage before recreate"
+    );
+
+    // Next reconcile recreates web-0 at the same ordinal, fresh (not Failed).
+    controller.reconcile_all().await.unwrap();
+    let recreated: Pod = storage
+        .get(&pod_key)
+        .await
+        .expect("StatefulSet must recreate the evicted pod");
+    assert!(
+        recreated.metadata.deletion_timestamp.is_none(),
+        "recreated pod must not carry a deletionTimestamp"
+    );
+    assert_ne!(
+        recreated.metadata.uid, original.metadata.uid,
+        "recreated pod must be a new object, not the evicted one"
+    );
+    assert!(
+        !matches!(
+            recreated.status.as_ref().and_then(|s| s.phase.as_ref()),
+            Some(Phase::Failed)
+        ),
+        "recreated pod must not be in the Failed phase"
+    );
+}
