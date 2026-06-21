@@ -124,6 +124,16 @@ pub async fn update_podtemplate(
     podtemplate.metadata.name = name.clone();
     podtemplate.metadata.namespace = Some(namespace.clone());
 
+    // Field validation on update (upstream ValidatePodTemplateUpdate re-runs
+    // ValidatePodTemplateSpec on the new object). The create path validated but
+    // the update path previously persisted PUTs unchecked.
+    {
+        let errs = rusternetes_common::validation::podtemplate::validate_pod_template(&podtemplate);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {

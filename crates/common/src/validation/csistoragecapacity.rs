@@ -73,3 +73,31 @@ pub fn validate_csi_storage_capacity(csc: &CSIStorageCapacity) -> ErrorList {
 
     errs
 }
+
+/// Validate a CSIStorageCapacity update — upstream
+/// `ValidateCSIStorageCapacityUpdate` (pkg/apis/storage/validation). The CSI
+/// `GetCapacity` input fields `nodeTopology` and `storageClassName` are
+/// immutable.
+pub fn validate_csi_storage_capacity_update(
+    new_csc: &CSIStorageCapacity,
+    old_csc: &CSIStorageCapacity,
+) -> ErrorList {
+    let mut errs = ErrorList::new();
+    if serde_json::to_value(&new_csc.node_topology).ok()
+        != serde_json::to_value(&old_csc.node_topology).ok()
+    {
+        errs.push(Error::invalid(
+            &Path::new("nodeTopology"),
+            "<node topology>".to_string(),
+            "field is immutable",
+        ));
+    }
+    if new_csc.storage_class_name != old_csc.storage_class_name {
+        errs.push(Error::invalid(
+            &Path::new("storageClassName"),
+            new_csc.storage_class_name.clone(),
+            "field is immutable",
+        ));
+    }
+    errs
+}

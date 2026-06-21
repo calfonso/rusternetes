@@ -255,13 +255,24 @@ pub async fn update_csistoragecapacity(
     csc.metadata.name = name.clone();
     csc.metadata.namespace = Some(namespace.clone());
 
+    let key = build_key("csistoragecapacities", Some(&namespace), &name);
+
+    // Immutability validation (upstream ValidateCSIStorageCapacityUpdate):
+    // nodeTopology and storageClassName are immutable.
+    {
+        let old_csc: CSIStorageCapacity = state.storage.get(&key).await?;
+        let errs = rusternetes_common::validation::csistoragecapacity::validate_csi_storage_capacity_update(&csc, &old_csc);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: CSIStorageCapacity validated successfully (not updated)");
         return Ok(Json(csc));
     }
 
-    let key = build_key("csistoragecapacities", Some(&namespace), &name);
     let updated = state.storage.update(&key, &csc).await?;
 
     Ok(Json(updated))
