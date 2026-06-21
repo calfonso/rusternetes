@@ -152,6 +152,29 @@ pub async fn create_token_request(
     // Calculate expiration time
     let expiration_seconds = token_request.spec.expiration_seconds.unwrap_or(3600);
 
+    // TokenRequest.spec.expirationSeconds bounds (upstream ValidateTokenRequest):
+    // >= 10 minutes and <= 2^32 seconds.
+    if expiration_seconds < 600 {
+        return Err(rusternetes_common::Error::Invalid(vec![
+            rusternetes_common::validation::field::Error::invalid(
+                &rusternetes_common::validation::field::Path::new("spec")
+                    .child("expirationSeconds"),
+                expiration_seconds,
+                "may not specify a duration less than 10 minutes",
+            ),
+        ]));
+    }
+    if expiration_seconds > (1_i64 << 32) {
+        return Err(rusternetes_common::Error::Invalid(vec![
+            rusternetes_common::validation::field::Error::invalid(
+                &rusternetes_common::validation::field::Path::new("spec")
+                    .child("expirationSeconds"),
+                expiration_seconds,
+                "may not specify a duration larger than 2^32 seconds",
+            ),
+        ]));
+    }
+
     let now = chrono::Utc::now();
     let expiration_timestamp = now
         .checked_add_signed(chrono::Duration::seconds(expiration_seconds))
