@@ -296,7 +296,8 @@ fn cases() -> Vec<Case> {
             collection: format!("/apis/networking.k8s.io/v1/namespaces/{n}/ingresses"),
             namespaced: true,
             stub: json!({"apiVersion":"networking.k8s.io/v1","kind":"Ingress",
-                "metadata":{"name":OBJ,"namespace":n},"spec":{}}),
+                "metadata":{"name":OBJ,"namespace":n},
+                "spec":{"defaultBackend":{"service":{"name":"svc","port":{"number":80}}}}}),
         },
         // ---- cluster-scoped ----
         Case {
