@@ -45,6 +45,14 @@ pub async fn create_pvc(
     // Reject create with neither name nor generateName (#1065).
     crate::handlers::validation::require_object_name(&pvc.metadata)?;
 
+    // Field validation (mirrors upstream ValidatePersistentVolumeClaim).
+    {
+        let errs = rusternetes_common::validation::pvc::validate_persistent_volume_claim(&pvc);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     pvc.metadata.namespace = Some(namespace.clone());
 
     // Apply DefaultStorageClass admission (sets default storage class if not specified)
