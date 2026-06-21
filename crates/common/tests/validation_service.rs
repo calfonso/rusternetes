@@ -10,8 +10,10 @@
 
 use rusternetes_common::resources::policy::IntOrString;
 use rusternetes_common::resources::service::{
-    ClientIPConfig, Service, ServicePort, ServiceSpec, ServiceType, SessionAffinityConfig,
+    ClientIPConfig, Service, ServiceExternalTrafficPolicy, ServicePort, ServiceSpec, ServiceType,
+    SessionAffinityConfig,
 };
+use rusternetes_common::validation::field::ErrorType;
 use rusternetes_common::validation::service::validate_service;
 
 // ---------------------------------------------------------------------------
@@ -203,6 +205,9 @@ fn test_validate_service_valid_headless() {
 fn test_validate_service_valid_cluster_ip() {
     let svc = make_service(ServiceSpec {
         cluster_ip: Some("10.96.0.10".to_string()),
+        // A non-headless ClusterIP service must declare at least one port
+        // (upstream `ValidateService`).
+        ports: single_port(80, "TCP"),
         ..ServiceSpec::default()
     });
     let errs = validate_service(&svc);
@@ -915,5 +920,108 @@ fn test_validate_service_string_targetport_keeps_15_char_limit() {
     assert!(
         !errs.is_empty(),
         "29-char string targetPort should still be rejected (IANA_SVC_NAME)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ports-required + externalTrafficPolicy field restrictions
+// ---------------------------------------------------------------------------
+
+/// A non-headless ClusterIP service with no ports is rejected.
+#[test]
+fn test_clusterip_requires_ports() {
+    let svc = make_service(ServiceSpec {
+        cluster_ip: Some("10.96.0.10".to_string()),
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        errs.iter()
+            .any(|e| e.field == "spec.ports" && e.error_type == ErrorType::Required),
+        "expected spec.ports Required, got: {errs:?}"
+    );
+}
+
+/// A headless service (clusterIP "None") may legitimately have no ports.
+#[test]
+fn test_headless_allows_no_ports() {
+    let svc = make_service(ServiceSpec {
+        cluster_ip: Some("None".to_string()),
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        !errs
+            .iter()
+            .any(|e| e.field == "spec.ports" && e.error_type == ErrorType::Required),
+        "headless service should not require ports, got: {errs:?}"
+    );
+}
+
+/// An ExternalName service may have no ports.
+#[test]
+fn test_externalname_allows_no_ports() {
+    let svc = make_service(ServiceSpec {
+        service_type: Some(ServiceType::ExternalName),
+        external_name: Some("example.com".to_string()),
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        !errs
+            .iter()
+            .any(|e| e.field == "spec.ports" && e.error_type == ErrorType::Required),
+        "ExternalName service should not require ports, got: {errs:?}"
+    );
+}
+
+/// externalTrafficPolicy on a plain ClusterIP service (no externalIPs) is
+/// rejected — it may only be set for externally-accessible services.
+#[test]
+fn test_etp_forbidden_on_clusterip() {
+    let svc = make_service(ServiceSpec {
+        cluster_ip: Some("10.96.0.10".to_string()),
+        ports: single_port(80, "TCP"),
+        external_traffic_policy: Some(ServiceExternalTrafficPolicy::Local),
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        errs.iter()
+            .any(|e| e.field == "spec.externalTrafficPolicy" && e.error_type == ErrorType::Invalid),
+        "expected externalTrafficPolicy Invalid on ClusterIP, got: {errs:?}"
+    );
+}
+
+/// externalTrafficPolicy is allowed on a NodePort service.
+#[test]
+fn test_etp_allowed_on_nodeport() {
+    let svc = make_service(ServiceSpec {
+        service_type: Some(ServiceType::NodePort),
+        ports: single_port(80, "TCP"),
+        external_traffic_policy: Some(ServiceExternalTrafficPolicy::Local),
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        !errs.iter().any(|e| e.field == "spec.externalTrafficPolicy"),
+        "externalTrafficPolicy should be allowed on NodePort, got: {errs:?}"
+    );
+}
+
+/// externalTrafficPolicy is allowed on a ClusterIP service that has externalIPs.
+#[test]
+fn test_etp_allowed_on_clusterip_with_external_ips() {
+    let svc = make_service(ServiceSpec {
+        cluster_ip: Some("10.96.0.10".to_string()),
+        ports: single_port(80, "TCP"),
+        external_ips: Some(vec!["1.2.3.4".to_string()]),
+        external_traffic_policy: Some(ServiceExternalTrafficPolicy::Cluster),
+        ..ServiceSpec::default()
+    });
+    let errs = validate_service(&svc);
+    assert!(
+        !errs.iter().any(|e| e.field == "spec.externalTrafficPolicy"),
+        "externalTrafficPolicy should be allowed on ClusterIP+externalIPs, got: {errs:?}"
     );
 }

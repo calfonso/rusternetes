@@ -15,7 +15,9 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use crate::resources::policy::IntOrString;
-use crate::resources::service::{Service, ServicePort, ServiceSpec, ServiceType};
+use crate::resources::service::{
+    Service, ServiceExternalTrafficPolicy, ServicePort, ServiceSpec, ServiceType,
+};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_label;
 
@@ -408,6 +410,36 @@ pub fn validate_service_spec(spec: &ServiceSpec, fld: &Path) -> ErrorList {
                     ));
                 }
             }
+        }
+    }
+
+    // ports must be non-empty unless the service is headless (clusterIP "None")
+    // or ExternalName. Upstream `ValidateService`.
+    if spec.ports.is_empty() && !is_headless && !matches!(svc_type, ServiceType::ExternalName) {
+        errs.push(Error::required(&fld.child("ports"), ""));
+    }
+
+    // externalTrafficPolicy may only be set on externally-accessible services:
+    // LoadBalancer, NodePort, or ClusterIP with externalIPs. Upstream
+    // `validateServiceExternalTrafficPolicy`. (The complementary "required when
+    // accessible" rule is intentionally omitted — rusternetes does not default
+    // externalTrafficPolicy, so requiring it would reject valid NodePort/
+    // LoadBalancer services that simply left it unset.)
+    let externally_accessible =
+        matches!(svc_type, ServiceType::LoadBalancer | ServiceType::NodePort)
+            || (matches!(svc_type, ServiceType::ClusterIP)
+                && spec.external_ips.as_ref().is_some_and(|v| !v.is_empty()));
+    if !externally_accessible {
+        if let Some(etp) = spec.external_traffic_policy.as_ref() {
+            let value = match etp {
+                ServiceExternalTrafficPolicy::Cluster => "Cluster",
+                ServiceExternalTrafficPolicy::Local => "Local",
+            };
+            errs.push(Error::invalid(
+                &fld.child("externalTrafficPolicy"),
+                value.to_string(),
+                "may only be set for externally-accessible services",
+            ));
         }
     }
 
