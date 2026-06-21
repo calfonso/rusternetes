@@ -69,9 +69,21 @@ For the musl static binary:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
-cargo build --release -p rusternetes --target x86_64-unknown-linux-musl
-strip target/x86_64-unknown-linux-musl/release/rusternetes
+# A musl C toolchain is required for the cc-based deps (aws-lc-sys, ring,
+# libsqlite3-sys): apt-get install musl-tools, then point cc at it.
+CC_x86_64_unknown_linux_musl=musl-gcc \
+  cargo build --release -p rusternetes --target x86_64-unknown-linux-musl
+# (release profile already strips; no separate `strip` step needed)
 ```
+
+> Prereq: the build must be **OpenSSL-free**. Until #1041's rustls-only change,
+> `prometheus-http-query`/`reqwest` default features pulled `openssl-sys`, whose
+> build script has no musl cross-build — the musl build failed there. With
+> OpenSSL dropped the static build proceeds.
+>
+> **arm64 (`aarch64-unknown-linux-musl`)** additionally needs an aarch64 musl
+> cross C toolchain (`aarch64-linux-musl-gcc`) for those same cc-based deps; the
+> Rust target alone is not enough.
 
 ## Results
 
