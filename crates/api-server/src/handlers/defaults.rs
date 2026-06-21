@@ -301,13 +301,24 @@ fn apply_job_defaults_to_spec(spec: &mut rusternetes_common::resources::JobSpec)
         spec.parallelism = Some(1);
     }
     if spec.backoff_limit.is_none() {
-        spec.backoff_limit = Some(6);
+        // Upstream SetDefaults_Job: when backoffLimitPerIndex is set, the
+        // overall backoffLimit defaults to MaxInt32 (per-index limits govern
+        // instead); otherwise it defaults to 6.
+        spec.backoff_limit = Some(if spec.backoff_limit_per_index.is_some() {
+            i32::MAX
+        } else {
+            6
+        });
     }
     if spec.completion_mode.is_none() {
         spec.completion_mode = Some("NonIndexed".to_string());
     }
     if spec.suspend.is_none() {
         spec.suspend = Some(false);
+    }
+    // Upstream SetDefaults_Job: manualSelector defaults to false.
+    if spec.manual_selector.is_none() {
+        spec.manual_selector = Some(false);
     }
     apply_pod_template_defaults(&mut spec.template);
 }
