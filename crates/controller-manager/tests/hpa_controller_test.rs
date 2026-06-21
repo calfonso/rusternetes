@@ -725,7 +725,6 @@ fn create_test_hpa_with_behavior(
 /// history — every reconcile is stateless. The controller has no in-memory
 /// recommendation buffer.
 #[tokio::test]
-#[ignore = "RED-state: stabilization window not implemented (hpa.rs has no recommendation history)"]
 async fn test_hpa_scale_down_stabilization_window() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = HorizontalPodAutoscalerController::new(storage.clone());
@@ -1011,7 +1010,6 @@ async fn test_hpa_average_utilization_per_pod_calculation() {
 /// RED-state: the rusternetes HPA controller has no concept of pod
 /// readiness; it operates entirely from the workload's `.spec.replicas`.
 #[tokio::test]
-#[ignore = "RED-state: initial readiness delay not honored (no pod-state inspection in hpa.rs)"]
 async fn test_hpa_initial_readiness_delay() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = HorizontalPodAutoscalerController::new(storage.clone());
@@ -1058,7 +1056,6 @@ async fn test_hpa_initial_readiness_delay() {
 /// mocked utilization (85 vs target 80, ratio=1.0625) tiny drifts trigger
 /// rescales they should not.
 #[tokio::test]
-#[ignore = "RED-state: tolerance band not applied (hpa.rs:436-444 lacks the |ratio-1| < tolerance check)"]
 async fn test_hpa_tolerance_threshold() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = HorizontalPodAutoscalerController::new(storage.clone());
