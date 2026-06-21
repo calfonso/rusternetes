@@ -579,31 +579,92 @@ fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources>
     any.then_some(r)
 }
 
-fn linux_security_context(container: &Container) -> Option<v1::LinuxContainerSecurityContext> {
-    let sc = container.security_context.as_ref()?;
+/// Resolve the effective container seccomp profile to a CRI [`SecurityProfile`].
+///
+/// Ports upstream `getSeccompProfile`/`fieldSeccompProfile`
+/// (`pkg/kubelet/kuberuntime/helpers.go`): the container's
+/// `securityContext.seccompProfile` wins, falling back to the pod's. `None` when
+/// neither is set (the runtime then applies its own default; upstream's
+/// `fallbackToRuntimeDefault` is off by default, so we don't force RuntimeDefault).
+///
+/// Note: for `Localhost`, upstream sets `localhost_ref` to
+/// `join(seccompProfileRoot, localhostProfile)`. We pass the `localhostProfile`
+/// through as-is (the translate layer is path-pure and has no kubelet root);
+/// RuntimeDefault/Unconfined — the common cases — need no path.
+fn seccomp_security_profile(pod: &Pod, container: &Container) -> Option<v1::SecurityProfile> {
+    use rusternetes_common::resources::pod::SeccompProfile;
+    let scmp: &SeccompProfile = container
+        .security_context
+        .as_ref()
+        .and_then(|c| c.seccomp_profile.as_ref())
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|p| p.seccomp_profile.as_ref())
+        })?;
+    use v1::security_profile::ProfileType;
+    let profile = match scmp.r#type.as_str() {
+        "RuntimeDefault" => v1::SecurityProfile {
+            profile_type: ProfileType::RuntimeDefault as i32,
+            localhost_ref: String::new(),
+        },
+        "Localhost" => v1::SecurityProfile {
+            profile_type: ProfileType::Localhost as i32,
+            localhost_ref: scmp.localhost_profile.clone().unwrap_or_default(),
+        },
+        // "Unconfined" and any unknown value → Unconfined (upstream default arm).
+        _ => v1::SecurityProfile {
+            profile_type: ProfileType::Unconfined as i32,
+            localhost_ref: String::new(),
+        },
+    };
+    Some(profile)
+}
+
+fn linux_security_context(
+    pod: &Pod,
+    container: &Container,
+) -> Option<v1::LinuxContainerSecurityContext> {
+    // seccomp may come from the pod even when the container has no security
+    // context of its own, so resolve it before the early-out.
+    let seccomp = seccomp_security_profile(pod, container);
+    let sc = container.security_context.as_ref();
+    if sc.is_none() && seccomp.is_none() {
+        return None;
+    }
     // Translate requested Linux capabilities. Names are passed through verbatim
     // (e.g. "NET_ADMIN"), matching upstream — the kubelet does not add the
     // "CAP_" prefix; the runtime (containerd) does when building the OCI spec.
     // Without this, NET_ADMIN/NET_RAW never reach the container and capability-
     // dependent workloads fail, e.g. flannel's vxlan link creation returns
     // netlink EPERM ("Operation not permitted") and never writes subnet.env.
-    let capabilities = sc.capabilities.as_ref().map(|caps| v1::Capability {
-        add_capabilities: caps.add.clone().unwrap_or_default(),
-        drop_capabilities: caps.drop.clone().unwrap_or_default(),
-        add_ambient_capabilities: Vec::new(),
-    });
+    let capabilities = sc
+        .and_then(|sc| sc.capabilities.as_ref())
+        .map(|caps| v1::Capability {
+            add_capabilities: caps.add.clone().unwrap_or_default(),
+            drop_capabilities: caps.drop.clone().unwrap_or_default(),
+            add_ambient_capabilities: Vec::new(),
+        });
     Some(v1::LinuxContainerSecurityContext {
-        privileged: sc.privileged.unwrap_or(false),
+        privileged: sc.and_then(|s| s.privileged).unwrap_or(false),
         capabilities,
-        run_as_user: sc.run_as_user.map(|v| v1::Int64Value { value: v }),
-        run_as_group: sc.run_as_group.map(|v| v1::Int64Value { value: v }),
-        readonly_rootfs: sc.read_only_root_filesystem.unwrap_or(false),
+        run_as_user: sc
+            .and_then(|s| s.run_as_user)
+            .map(|v| v1::Int64Value { value: v }),
+        run_as_group: sc
+            .and_then(|s| s.run_as_group)
+            .map(|v| v1::Int64Value { value: v }),
+        readonly_rootfs: sc
+            .and_then(|s| s.read_only_root_filesystem)
+            .unwrap_or(false),
         // `allowPrivilegeEscalation: false` → `no_new_privs`, blocking setuid/
         // file-capability escalation in the container. Upstream
         // `securitycontext.AddNoNewPrivileges`: true *only* when the field is
         // explicitly false (unset/true → false). Without this a pod that set
         // `allowPrivilegeEscalation: false` could still escalate.
-        no_new_privs: sc.allow_privilege_escalation == Some(false),
+        no_new_privs: sc.and_then(|s| s.allow_privilege_escalation) == Some(false),
+        seccomp,
         ..Default::default()
     })
 }
@@ -628,7 +689,7 @@ pub fn container_config(
 
     let linux = {
         let resources = linux_resources(container);
-        let security_context = linux_security_context(container);
+        let security_context = linux_security_context(pod, container);
         if resources.is_some() || security_context.is_some() {
             Some(v1::LinuxContainerConfig {
                 resources,
@@ -1118,6 +1179,83 @@ mod tests {
             "explicit true must not set no_new_privs"
         );
         assert!(!no_new_privs(json!({})), "unset must not set no_new_privs");
+    }
+
+    #[test]
+    fn seccomp_profile_container_pod_fallback_and_types() {
+        use serde_json::json;
+        use v1::security_profile::ProfileType;
+
+        // Returns (profile_type, localhost_ref) of the container's seccomp, or
+        // None if unset, from a pod spec JSON.
+        let seccomp = |spec: serde_json::Value| -> Option<(i32, String)> {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "p", "namespace": "default"},
+                "spec": spec
+            }))
+            .unwrap();
+            let c = pod.spec.as_ref().unwrap().containers[0].clone();
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .and_then(|l| l.security_context)
+            .and_then(|s| s.seccomp)
+            .map(|sp| (sp.profile_type, sp.localhost_ref))
+        };
+
+        // Container RuntimeDefault.
+        assert_eq!(
+            seccomp(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}}
+            }]})),
+            Some((ProfileType::RuntimeDefault as i32, String::new()))
+        );
+
+        // Container Localhost carries the profile ref.
+        assert_eq!(
+            seccomp(json!({"containers": [{
+                "name": "app", "image": "busybox",
+                "securityContext": {"seccompProfile": {"type": "Localhost", "localhostProfile": "profiles/audit.json"}}
+            }]})),
+            Some((
+                ProfileType::Localhost as i32,
+                "profiles/audit.json".to_string()
+            ))
+        );
+
+        // Pod-level profile applies when the container has none.
+        assert_eq!(
+            seccomp(json!({
+                "securityContext": {"seccompProfile": {"type": "Unconfined"}},
+                "containers": [{"name": "app", "image": "busybox"}]
+            })),
+            Some((ProfileType::Unconfined as i32, String::new()))
+        );
+
+        // Container profile overrides the pod's.
+        assert_eq!(
+            seccomp(json!({
+                "securityContext": {"seccompProfile": {"type": "Unconfined"}},
+                "containers": [{
+                    "name": "app", "image": "busybox",
+                    "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}}
+                }]
+            })),
+            Some((ProfileType::RuntimeDefault as i32, String::new()))
+        );
+
+        // No seccomp anywhere → unset.
+        assert_eq!(
+            seccomp(json!({"containers": [{"name": "app", "image": "busybox"}]})),
+            None
+        );
     }
 
     fn env_from(
