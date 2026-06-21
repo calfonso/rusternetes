@@ -725,6 +725,9 @@ fn create_test_hpa_with_behavior(
 /// history — every reconcile is stateless. The controller has no in-memory
 /// recommendation buffer.
 #[tokio::test]
+#[ignore = "RED-state: behavior stabilizationWindowSeconds not implemented; \
+            test also needs a high→low load sequence + real metrics (it currently \
+            passes only vacuously via the empty-metrics error path)"]
 async fn test_hpa_scale_down_stabilization_window() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = HorizontalPodAutoscalerController::new(storage.clone());
@@ -1010,6 +1013,9 @@ async fn test_hpa_average_utilization_per_pod_calculation() {
 /// RED-state: the rusternetes HPA controller has no concept of pod
 /// readiness; it operates entirely from the workload's `.spec.replicas`.
 #[tokio::test]
+#[ignore = "RED-state: initial-readiness-delay (CPUInitializationPeriod / pod-state \
+            inspection) not implemented; test also needs real metrics (it currently \
+            passes only vacuously via the empty-metrics error path)"]
 async fn test_hpa_initial_readiness_delay() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = HorizontalPodAutoscalerController::new(storage.clone());
@@ -1058,7 +1064,16 @@ async fn test_hpa_initial_readiness_delay() {
 #[tokio::test]
 async fn test_hpa_tolerance_threshold() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu @ 85% vs target 80% → ratio 1.0625, a 6.25% drift inside the default
+    // ±10% band. A real reading is required: with no metric the fetch errors
+    // and the test would pass vacuously (no scale on error, not on tolerance).
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(85))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("tolerance-app", "default", 10);
     let deploy_key = build_key("deployments", Some("default"), "tolerance-app");
