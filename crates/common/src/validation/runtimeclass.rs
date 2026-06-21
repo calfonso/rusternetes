@@ -84,3 +84,17 @@ pub fn validate_runtime_class(rc: &RuntimeClass) -> ErrorList {
 
     errs
 }
+
+/// Validate a RuntimeClass update — upstream `ValidateRuntimeClassUpdate`
+/// (pkg/apis/node/validation): `handler` is immutable.
+pub fn validate_runtime_class_update(new_rc: &RuntimeClass, old_rc: &RuntimeClass) -> ErrorList {
+    let mut errs = ErrorList::new();
+    if new_rc.handler != old_rc.handler {
+        errs.push(Error::invalid(
+            &Path::new("handler"),
+            new_rc.handler.clone(),
+            "field is immutable",
+        ));
+    }
+    errs
+}

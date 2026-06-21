@@ -131,6 +131,24 @@ pub async fn update_servicecidr(
 
     servicecidr.metadata.name = name.clone();
 
+    let key = build_key("servicecidrs", None, &name);
+
+    // Immutability on update (upstream ValidateServiceCIDRUpdate): spec.cidrs is
+    // immutable, except single→dual-stack expansion (append one CIDR).
+    if let Ok(old) = state
+        .storage
+        .get::<rusternetes_common::resources::ServiceCIDR>(&key)
+        .await
+    {
+        let errs = rusternetes_common::validation::servicecidr::validate_service_cidr_update(
+            &servicecidr,
+            &old,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
@@ -138,7 +156,6 @@ pub async fn update_servicecidr(
         return Ok(Json(servicecidr));
     }
 
-    let key = build_key("servicecidrs", None, &name);
     let updated = state.storage.update(&key, &servicecidr).await?;
 
     Ok(Json(updated))

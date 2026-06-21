@@ -125,6 +125,22 @@ pub async fn update_runtimeclass(
 
     let key = build_key("runtimeclasses", None, &name);
 
+    // Immutability on update (upstream ValidateRuntimeClassUpdate): handler is
+    // immutable. Validates before the dry-run short-circuit.
+    if let Ok(old) = state
+        .storage
+        .get::<rusternetes_common::resources::RuntimeClass>(&key)
+        .await
+    {
+        let errs = rusternetes_common::validation::runtimeclass::validate_runtime_class_update(
+            &runtime_class,
+            &old,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(

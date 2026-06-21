@@ -82,3 +82,39 @@ pub fn validate_service_cidr(sc: &ServiceCIDR) -> ErrorList {
 
     errs
 }
+
+/// Validate a ServiceCIDR update — upstream `ValidateServiceCIDRUpdate`
+/// (pkg/apis/networking/validation): `spec.cidrs` is immutable, except a
+/// single-stack CIDR may be expanded to dual-stack by appending one CIDR (the
+/// existing entry must not change; the new entry is fully validated).
+pub fn validate_service_cidr_update(new_sc: &ServiceCIDR, old_sc: &ServiceCIDR) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let p = Path::new("spec").child("cidrs");
+    let empty: Vec<String> = Vec::new();
+    let old = old_sc.spec.as_ref().map(|s| &s.cidrs).unwrap_or(&empty);
+    let new = new_sc.spec.as_ref().map(|s| &s.cidrs).unwrap_or(&empty);
+    if old.len() == new.len() {
+        for (i, ip) in old.iter().enumerate() {
+            if *ip != new[i] {
+                errs.push(Error::invalid(
+                    &p.index(i),
+                    new[i].clone(),
+                    "field is immutable",
+                ));
+            }
+        }
+    } else if old.len() == 1 && new.len() == 2 {
+        if new[0] != old[0] {
+            errs.push(Error::invalid(
+                &p.index(0),
+                new[0].clone(),
+                "field is immutable",
+            ));
+        }
+        // Validate the (now dual-stack) cidrs set.
+        errs.extend(validate_service_cidr(new_sc));
+    } else {
+        errs.push(Error::invalid(&p, new.join(","), "field is immutable"));
+    }
+    errs
+}
