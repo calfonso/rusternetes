@@ -14,11 +14,13 @@ name = "scheduler"
 path = "src/main.rs"
 
 [features]
+mimalloc = ["dep:mimalloc"]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage" }
 rusternetes-client = { path = "../client" }

@@ -21,6 +21,15 @@ use tracing::{error, info};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// mimalloc as the global allocator (off by default; `--features mimalloc`).
+// Required for the musl static builds — musl's default allocator is ~10x slower
+// under multi-threaded lock contention — and lowers idle RSS (#1041). Gated so
+// it never collides with dhat's allocator: when both features are on, dhat wins
+// (heap profiling keeps working).
+#[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes")]
 #[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]

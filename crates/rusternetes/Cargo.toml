@@ -35,6 +35,13 @@ redis = [
 # (SIGINT) it writes `dhat-heap.json` with per-backtrace allocation sizes,
 # used to attribute the all-in-one's idle RAM (#1138). Pure Rust — no jeprof.
 dhat-heap = ["dep:dhat"]
+# Link mimalloc as the global allocator (off by default). Critical for the musl
+# static builds: musl's default allocator is ~10x slower under multi-threaded
+# lock contention, which would regress the all-in-one's throughput; mimalloc
+# also tends to lower idle RSS (the footprint north-star, #1041). Mutually
+# exclusive with `dhat-heap` — only one #[global_allocator] per binary; dhat
+# wins when both are set so heap profiling still works.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }
@@ -53,3 +60,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 dhat = { version = "0.3", optional = true }
+mimalloc = { version = "0.1", optional = true }

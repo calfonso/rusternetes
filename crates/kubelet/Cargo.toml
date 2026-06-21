@@ -14,11 +14,13 @@ name = "rusternetes_kubelet"
 path = "src/lib.rs"
 
 [features]
+mimalloc = ["dep:mimalloc"]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 rusternetes-common = { path = "../common" }
 # api-client: StorageBackend::Api lets the in-cluster kubelet read/write via
 # the api-server while keeping its Arc<StorageBackend> handle unchanged.

@@ -1,3 +1,10 @@
+// mimalloc as the global allocator (off by default; `--features mimalloc`).
+// Required for the musl static builds — musl's default allocator is ~10x
+// slower under multi-threaded lock contention — and lowers idle RSS (#1041).
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod commands;
 mod discovery;
 mod manifest;

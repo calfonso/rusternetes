@@ -9,7 +9,12 @@ license.workspace = true
 name = "kubectl"
 path = "src/main.rs"
 
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 rusternetes-common = { path = "../common" }
 rusternetes-client = { path = "../client" }
 tokio = { workspace = true, features = ["full", "io-util", "io-std"] }
