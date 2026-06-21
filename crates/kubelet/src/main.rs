@@ -26,6 +26,7 @@ mod lifecycle;
 mod runtime;
 mod server;
 mod static_pods;
+mod sync_locks;
 #[allow(dead_code)]
 mod volumes;
 
