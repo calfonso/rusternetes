@@ -11,13 +11,18 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::controllers::hpa_metrics_client::{
-    FakeMetricsClient, HttpMetricsClient, HttpMetricsConfig, MetricsClient,
+    FakeMetricsClient, HttpMetricsClient, HttpMetricsConfig, MetricsClient, PodMetricsInfo,
 };
 use crate::controllers::hpa_replica_calculator as calc;
 
 pub struct HorizontalPodAutoscalerController<S: Storage> {
     storage: Arc<S>,
     metrics_client: Arc<dyn MetricsClient>,
+    /// Per-HPA scale-event history feeding `spec.behavior` rate policies.
+    scale_events: crate::controllers::hpa_behavior::ScaleEventStore,
+    /// Per-HPA recommendation history feeding `spec.behavior`
+    /// stabilizationWindowSeconds.
+    recommendations: crate::controllers::hpa_behavior::RecommendationStore,
 }
 
 impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
@@ -40,6 +45,8 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         Self {
             storage,
             metrics_client,
+            scale_events: Default::default(),
+            recommendations: Default::default(),
         }
     }
 
@@ -49,6 +56,8 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         Self {
             storage,
             metrics_client,
+            scale_events: Default::default(),
+            recommendations: Default::default(),
         }
     }
 
@@ -262,6 +271,19 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .await?;
                 return Ok(());
             }
+
+            // Record the scale event so spec.behavior period windows rate-limit
+            // subsequent reconciles (upstream storeScaleEvent).
+            if let Some(behavior) = hpa.spec.behavior.as_ref() {
+                let key = format!("{}/{}", namespace, hpa.metadata.name);
+                self.scale_events.record(
+                    &key,
+                    behavior,
+                    current_replicas,
+                    desired_replicas,
+                    Utc::now(),
+                );
+            }
         }
 
         // 4. Update HPA status
@@ -349,6 +371,54 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     }
 
     /// Resolve the label selector of the HPA's scale target (for pod metrics).
+    /// List pods in `namespace` whose labels match every entry of the target's
+    /// `matchLabels` (the HPA target's pods).
+    async fn list_pods_for_selector(
+        &self,
+        namespace: &str,
+        selector: &rusternetes_common::types::LabelSelector,
+    ) -> Vec<rusternetes_common::resources::pod::Pod> {
+        let prefix = build_prefix("pods", Some(namespace));
+        let pods: Vec<rusternetes_common::resources::pod::Pod> =
+            self.storage.list(&prefix).await.unwrap_or_default();
+        let want = selector.match_labels.clone().unwrap_or_default();
+        pods.into_iter()
+            .filter(|p| {
+                let labels = p.metadata.labels.as_ref();
+                want.iter()
+                    .all(|(k, v)| labels.and_then(|l| l.get(k)) == Some(v))
+            })
+            .collect()
+    }
+
+    /// Restrict a cpu `PodMetricsInfo` to pods that are ready/measurable per the
+    /// initial-readiness / cpu-initialization windows (upstream `groupPods`).
+    /// If no pods can be listed (no pod state available) the metrics are left
+    /// unfiltered, preserving prior behaviour.
+    async fn filter_ready_cpu_pods(
+        &self,
+        namespace: &str,
+        selector: &rusternetes_common::types::LabelSelector,
+        info: PodMetricsInfo,
+    ) -> PodMetricsInfo {
+        use crate::controllers::hpa_pod_grouping as grp;
+        let pods = self.list_pods_for_selector(namespace, selector).await;
+        if pods.is_empty() {
+            return info;
+        }
+        let ready = grp::ready_cpu_pods(
+            &pods,
+            &info,
+            Utc::now(),
+            grp::cpu_initialization_period(),
+            grp::initial_readiness_delay(),
+            grp::metric_window(),
+        );
+        info.into_iter()
+            .filter(|(k, _)| ready.contains(k))
+            .collect()
+    }
+
     async fn target_selector(
         &self,
         namespace: &str,
@@ -414,7 +484,56 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         let min_replicas = hpa.spec.min_replicas.unwrap_or(1);
         let max_replicas = hpa.spec.max_replicas;
-        let bounded = max_desired.max(min_replicas).min(max_replicas);
+        // Apply spec.behavior scale-rate policies (Pods/Percent, selectPolicy,
+        // periodSeconds history) before the final min/max clamp; mirrors
+        // upstream normalizeDesiredReplicasWithBehaviors. Without behavior, the
+        // plain clamp is unchanged.
+        let rated = if let Some(behavior) = hpa.spec.behavior.as_ref() {
+            use crate::controllers::hpa_behavior as bhv;
+            let key = format!("{}/{}", namespace, hpa.metadata.name);
+            let now = Utc::now();
+
+            // 1. Stabilize against the recommendation history (upstream
+            // stabilizeRecommendationWithBehaviors): hold at a recent high
+            // during a transient dip / recent low during a spike. Record the
+            // *unstabilized* recommendation, then prune to the longer window.
+            let up_w = behavior
+                .scale_up
+                .as_ref()
+                .and_then(|r| r.stabilization_window_seconds)
+                .unwrap_or(0);
+            let down_w = behavior
+                .scale_down
+                .as_ref()
+                .and_then(|r| r.stabilization_window_seconds)
+                .unwrap_or(0);
+            let recs = self.recommendations.snapshot(&key);
+            let stabilized = bhv::stabilize_recommendation(
+                current_replicas,
+                max_desired,
+                up_w,
+                down_w,
+                &recs,
+                now,
+            );
+            self.recommendations
+                .record(&key, max_desired, up_w.max(down_w), now);
+
+            // 2. Rate-limit the stabilized recommendation per the scale policies.
+            let events = self.scale_events.snapshot(&key);
+            bhv::convert_with_behavior_rate(
+                current_replicas,
+                stabilized,
+                min_replicas,
+                max_replicas,
+                behavior,
+                &events,
+                now,
+            )
+        } else {
+            max_desired
+        };
+        let bounded = rated.max(min_replicas).min(max_replicas);
         Ok((bounded, statuses))
     }
 
@@ -440,6 +559,15 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .metrics_client
                     .get_resource_metric(&r.name, namespace, &selector)
                     .await?;
+                // For cpu, drop not-yet-ready / just-initializing pods so a
+                // cold-start spike doesn't trigger a scale-up (upstream
+                // groupPods CPU branch). When all pods are excluded the metric
+                // set is empty and get_resource_replicas errors → no scale.
+                let info = if r.name == "cpu" {
+                    self.filter_ready_cpu_pods(namespace, &selector, info).await
+                } else {
+                    info
+                };
                 let (replicas, avg) = calc::get_resource_replicas(&info, current_replicas, target)?;
                 let status = MetricStatus {
                     metric_type: "Resource".into(),

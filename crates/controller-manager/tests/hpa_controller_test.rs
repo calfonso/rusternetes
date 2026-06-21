@@ -1,16 +1,112 @@
-use rusternetes_common::resources::pod::PodSpec;
+use rusternetes_common::resources::pod::{Pod, PodCondition, PodSpec, PodStatus};
 use rusternetes_common::resources::{
     Container, CrossVersionObjectReference, Deployment, DeploymentSpec, ExternalMetricSource,
     HPAScalingPolicy, HPAScalingRules, HorizontalPodAutoscaler, HorizontalPodAutoscalerBehavior,
     HorizontalPodAutoscalerSpec, MetricIdentifier, MetricSpec, MetricTarget, ObjectMetricSource,
     PodTemplateSpec, PodsMetricSource, ResourceMetricSource,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
 use rusternetes_controller_manager::controllers::hpa::HorizontalPodAutoscalerController;
-use rusternetes_controller_manager::controllers::hpa_metrics_client::FakeMetricsClient;
+use rusternetes_controller_manager::controllers::hpa_metrics_client::{
+    FakeMetricsClient, MetricsClient, PodMetricsInfo,
+};
 use rusternetes_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// A `MetricsClient` whose resource (cpu) reading changes per call — pops the
+/// next configured utilization. Used to drive a high→low load sequence across
+/// reconciles (the stabilization test); all other metric types are unused.
+struct SeqCpuMetrics {
+    utils: std::sync::Mutex<std::collections::VecDeque<i32>>,
+}
+
+impl SeqCpuMetrics {
+    fn new(utils: &[i32]) -> Self {
+        Self {
+            utils: std::sync::Mutex::new(utils.iter().copied().collect()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MetricsClient for SeqCpuMetrics {
+    async fn get_resource_metric(
+        &self,
+        _resource: &str,
+        _namespace: &str,
+        _selector: &LabelSelector,
+    ) -> anyhow::Result<PodMetricsInfo> {
+        // Hold the last value once the sequence is exhausted.
+        let mut q = self.utils.lock().unwrap();
+        let u = if q.len() > 1 {
+            q.pop_front().unwrap()
+        } else {
+            *q.front().unwrap_or(&0)
+        };
+        Ok(FakeMetricsClient::pods_info(&[("p", 0, Some(u))]))
+    }
+    async fn get_container_resource_metric(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &LabelSelector,
+    ) -> anyhow::Result<PodMetricsInfo> {
+        anyhow::bail!("not used")
+    }
+    async fn get_raw_metric(
+        &self,
+        _: &str,
+        _: &str,
+        _: &LabelSelector,
+    ) -> anyhow::Result<PodMetricsInfo> {
+        anyhow::bail!("not used")
+    }
+    async fn get_object_metric(
+        &self,
+        _: &str,
+        _: &str,
+        _: &CrossVersionObjectReference,
+    ) -> anyhow::Result<(i64, chrono::DateTime<chrono::Utc>)> {
+        anyhow::bail!("not used")
+    }
+    async fn get_external_metric(
+        &self,
+        _: &str,
+        _: &str,
+        _: &LabelSelector,
+    ) -> anyhow::Result<(Vec<i64>, chrono::DateTime<chrono::Utc>)> {
+        anyhow::bail!("not used")
+    }
+}
+
+/// Create a Running-but-unready pod (Ready=False) that started "now" — i.e.
+/// still inside the cpu-initialization window — labelled `app=<app>`.
+async fn create_unready_pod(storage: &Arc<MemoryStorage>, ns: &str, name: &str, app: &str) {
+    let now = chrono::Utc::now();
+    let mut pod = Pod::new(name, PodSpec::default());
+    let mut meta = ObjectMeta::new(name);
+    meta.namespace = Some(ns.to_string());
+    meta.labels = Some(HashMap::from([("app".to_string(), app.to_string())]));
+    pod.metadata = meta;
+    pod.status = Some(PodStatus {
+        phase: Some(Phase::Running),
+        start_time: Some(now),
+        conditions: Some(vec![PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: Some(now),
+            observed_generation: None,
+        }]),
+        ..Default::default()
+    });
+    let key = build_key("pods", Some(ns), name);
+    storage.create(&key, &pod).await.unwrap();
+}
 
 fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Deployment {
     let mut labels = HashMap::new();
@@ -721,21 +817,23 @@ fn create_test_hpa_with_behavior(
 /// `behavior.scaleDown.stabilizationWindowSeconds` and uses it as a floor
 /// for the next decision.
 ///
-/// RED-state: rusternetes `calculate_desired_replicas` does NOT consult
-/// history — every reconcile is stateless. The controller has no in-memory
-/// recommendation buffer.
+/// Upstream stabilizeRecommendationWithBehaviors records the *unstabilized*
+/// recommendation each reconcile and uses the max within
+/// `scaleDown.stabilizationWindowSeconds` as a floor — so a load spike that
+/// scales up, immediately followed by a dip, must NOT collapse: the recent high
+/// is held until the window elapses.
 #[tokio::test]
-#[ignore = "RED-state: stabilization window not implemented (hpa.rs has no recommendation history)"]
 async fn test_hpa_scale_down_stabilization_window() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // Reconcile 1 sees high cpu (95%), reconcile 2 sees a dip (10%); same
+    // controller instance so its recommendation history carries across.
+    let fake = Arc::new(SeqCpuMetrics::new(&[95, 10]));
+    let controller = HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), fake);
 
-    // Workload currently sitting at 8 replicas (post a previous scale-up).
-    let deployment = create_test_deployment("cooldown-app", "default", 8);
+    let deployment = create_test_deployment("cooldown-app", "default", 4);
     let deploy_key = build_key("deployments", Some("default"), "cooldown-app");
     storage.create(&deploy_key, &deployment).await.unwrap();
 
-    // 300s stabilization window for scale-down, matching upstream default.
     let behavior = HorizontalPodAutoscalerBehavior {
         scale_up: None,
         scale_down: Some(HPAScalingRules {
@@ -750,34 +848,40 @@ async fn test_hpa_scale_down_stabilization_window() {
         }),
     };
 
-    // Target=200%, mock cpu=85% ⇒ ratio≈0.425 ⇒ unbounded math wants
-    // ceil(8*0.425) = 4 replicas. With the stabilization window honoured
-    // the controller must NOT collapse from 8 → 4 in a single reconcile.
+    // target=50%. R1: cpu 95% on 4 replicas → ceil(4*1.9)=8 → scale up to 8,
+    // recording rec=8. R2: cpu 10% on 8 → wants 2, but the 300s down-window
+    // still holds the recent high (8) → must stay at 8.
     let hpa = create_test_hpa_with_behavior(
         "cooldown-hpa",
         "default",
         "cooldown-app",
         Some(2),
         20,
-        200,
+        50,
         behavior,
     );
     let hpa_key = build_key("horizontalpodautoscalers", Some("default"), "cooldown-hpa");
     storage.create(&hpa_key, &hpa).await.unwrap();
 
-    // First reconcile records the "recent high" of 8 replicas.
+    // R1: scales up to 8 under the load spike.
     controller.reconcile_all().await.unwrap();
-    // Second reconcile, immediately after, must NOT scale down even though
-    // metrics now recommend 4 replicas.
-    controller.reconcile_all().await.unwrap();
-
-    let updated_deployment: Deployment = storage.get(&deploy_key).await.unwrap();
+    let after_up: Deployment = storage.get(&deploy_key).await.unwrap();
     assert_eq!(
-        updated_deployment.spec.replicas,
+        after_up.spec.replicas,
         Some(8),
-        "Within the scale-down stabilization window the replica count must \
-         hold at the recent high (8); got {}",
-        updated_deployment.spec.replicas.unwrap_or(0),
+        "load spike must scale up to 8 first; got {:?}",
+        after_up.spec.replicas
+    );
+
+    // R2: the dip must be absorbed by the stabilization window — hold at 8.
+    controller.reconcile_all().await.unwrap();
+    let after_dip: Deployment = storage.get(&deploy_key).await.unwrap();
+    assert_eq!(
+        after_dip.spec.replicas,
+        Some(8),
+        "within the scale-down stabilization window the count must hold at the \
+         recent high (8); got {:?}",
+        after_dip.spec.replicas
     );
 }
 
@@ -1008,19 +1112,36 @@ async fn test_hpa_average_utilization_per_pod_calculation() {
 /// must be excluded from utilization calculations to avoid scale-up storms
 /// caused by cold-start CPU spikes.
 ///
-/// RED-state: the rusternetes HPA controller has no concept of pod
-/// readiness; it operates entirely from the workload's `.spec.replicas`.
+/// The pods are unready and just-started, so even a 95% cpu reading (well above
+/// the 80% target) must NOT scale up — upstream groupPods excludes pods within
+/// the cpu-initialization window from the utilization calc.
 #[tokio::test]
-#[ignore = "RED-state: initial readiness delay not honored (no pod-state inspection in hpa.rs)"]
 async fn test_hpa_initial_readiness_delay() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
 
-    // Fresh Deployment (creationTimestamp = now) — pods would still be
-    // within the readiness delay window.
     let deployment = create_test_deployment("startup-app", "default", 3);
     let deploy_key = build_key("deployments", Some("default"), "startup-app");
     storage.create(&deploy_key, &deployment).await.unwrap();
+
+    // Three Running-but-unready pods that started "now" (inside the cpu-init
+    // window), each reporting a hot 95% cpu. matchLabels = {app: startup-app}.
+    let mut fake = FakeMetricsClient::new();
+    let mut readings = Vec::new();
+    for i in 0..3 {
+        let name = format!("startup-app-{i}");
+        create_unready_pod(&storage, "default", &name, "startup-app").await;
+        readings.push((name, 0i64, Some(95)));
+    }
+    let readings_ref: Vec<(&str, i64, Option<i32>)> = readings
+        .iter()
+        .map(|(n, v, u)| (n.as_str(), *v, *u))
+        .collect();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&readings_ref),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let hpa = create_test_hpa(
         "startup-hpa",
@@ -1036,14 +1157,13 @@ async fn test_hpa_initial_readiness_delay() {
 
     controller.reconcile_all().await.unwrap();
 
-    // Within the readiness delay the controller should hold replicas
-    // steady (no scale-up triggered by cold-start CPU spikes).
+    // All pods are excluded as not-yet-ready → no usable metric → hold at 3,
+    // despite the 95% reading that would otherwise scale to ceil(3*95/80)=4.
     let updated_deployment: Deployment = storage.get(&deploy_key).await.unwrap();
     assert_eq!(
         updated_deployment.spec.replicas,
         Some(3),
-        "During the initial readiness delay HPA must not scale on noisy \
-         startup metrics; expected 3, got {}",
+        "cold-start unready pods must be excluded; expected 3, got {}",
         updated_deployment.spec.replicas.unwrap_or(0),
     );
 }
@@ -1058,10 +1178,18 @@ async fn test_hpa_initial_readiness_delay() {
 /// mocked utilization (85 vs target 80, ratio=1.0625) tiny drifts trigger
 /// rescales they should not.
 #[tokio::test]
-#[ignore = "RED-state: tolerance band not applied (hpa.rs:436-444 lacks the |ratio-1| < tolerance check)"]
 async fn test_hpa_tolerance_threshold() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu @ 85% vs target 80% → ratio 1.0625, a 6.25% drift inside the default
+    // ±10% band. A real reading is required: with no metric the fetch errors
+    // and the test would pass vacuously (no scale on error, not on tolerance).
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(85))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let deployment = create_test_deployment("tolerance-app", "default", 10);
     let deploy_key = build_key("deployments", Some("default"), "tolerance-app");
@@ -1102,12 +1230,18 @@ async fn test_hpa_tolerance_threshold() {
 /// accepted on the spec but never consulted in
 /// `calculate_desired_replicas`.
 #[tokio::test]
-#[ignore = "RED-state: behavior policies not enforced (hpa.rs does not read hpa.spec.behavior)"]
 async fn test_hpa_behavior_scale_up_policy() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu at 85% vs a 10% target → ratio 8.5 → unbounded desire ceil(2*8.5)=17.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(85))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
-    // Currently 2 replicas; metrics would push to ~10. Policy: max +2 per
+    // Currently 2 replicas; metrics would push to ~17. Policy: max +2 per
     // 60s window. Expected outcome on a single reconcile: 2 → 4.
     let deployment = create_test_deployment("rate-limited-app", "default", 2);
     let deploy_key = build_key("deployments", Some("default"), "rate-limited-app");
