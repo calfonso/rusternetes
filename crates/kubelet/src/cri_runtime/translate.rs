@@ -638,29 +638,69 @@ fn parse_memory_bytes(q: &str) -> Option<i64> {
 
 /// Build CRI linux resources from a container's limits/requests. CPU limit →
 /// cfs quota (100ms period); CPU request → shares; memory limit → byte cap.
-fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources> {
-    let req = container.resources.as_ref()?;
-    let mut r = v1::LinuxContainerResources::default();
-    let mut any = false;
+// CFS scheduling constants (upstream `pkg/kubelet/cm/helpers_linux.go`).
+const MIN_SHARES: i64 = 2;
+const MAX_SHARES: i64 = 262_144;
+const SHARES_PER_CPU: i64 = 1024;
+const MILLI_CPU_TO_CPU: i64 = 1000;
+const QUOTA_PERIOD: i64 = 100_000;
+const MIN_QUOTA_PERIOD: i64 = 1000;
 
-    if let Some(limits) = req.limits.as_ref() {
-        if let Some(cpu) = limits.get("cpu").and_then(|q| parse_cpu_millicores(q)) {
-            r.cpu_period = 100_000;
-            r.cpu_quota = cpu * 100; // millicores * (period/1000)
-            any = true;
-        }
-        if let Some(mem) = limits.get("memory").and_then(|q| parse_memory_bytes(q)) {
-            r.memory_limit_in_bytes = mem;
-            any = true;
-        }
+/// Port of upstream `cm.MilliCPUToShares`: convert milliCPU to CFS shares,
+/// clamped to `[MinShares, MaxShares]`. 0 milliCPU → `MinShares` (the kernel
+/// default for "unset").
+fn milli_cpu_to_shares(milli_cpu: i64) -> i64 {
+    if milli_cpu == 0 {
+        return MIN_SHARES;
     }
-    if let Some(requests) = req.requests.as_ref() {
-        if let Some(cpu) = requests.get("cpu").and_then(|q| parse_cpu_millicores(q)) {
-            r.cpu_shares = cpu * 1024 / 1000;
-            any = true;
-        }
+    ((milli_cpu * SHARES_PER_CPU) / MILLI_CPU_TO_CPU).clamp(MIN_SHARES, MAX_SHARES)
+}
+
+/// Port of upstream `cm.MilliCPUToQuota`: convert a milliCPU limit to a CFS
+/// quota over `period` microseconds, with a 1ms (`MinQuotaPeriod`) floor.
+fn milli_cpu_to_quota(milli_cpu: i64, period: i64) -> i64 {
+    if milli_cpu == 0 {
+        return 0;
     }
-    any.then_some(r)
+    ((milli_cpu * period) / MILLI_CPU_TO_CPU).max(MIN_QUOTA_PERIOD)
+}
+
+/// Port of upstream `calculateLinuxResources`
+/// (`pkg/kubelet/kuberuntime/kuberuntime_container_linux.go`).
+///
+/// `cpu_shares` is **always** set — from the CPU request, else the CPU limit
+/// (the api-server defaults request→limit, but controller-created pods written
+/// straight to storage may lack it), else `MinShares`. A CPU limit additionally
+/// sets the CFS quota/period; a memory limit sets `memory_limit_in_bytes`.
+fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources> {
+    let req = container.resources.as_ref();
+    let cpu_of = |which: fn(
+        &rusternetes_common::types::ResourceRequirements,
+    ) -> &Option<HashMap<String, String>>| {
+        req.and_then(|r| which(r).as_ref())
+            .and_then(|m| m.get("cpu"))
+            .and_then(|q| parse_cpu_millicores(q))
+    };
+    let cpu_request = cpu_of(|r| &r.requests);
+    let cpu_limit = cpu_of(|r| &r.limits);
+    let mem_limit = req
+        .and_then(|r| r.limits.as_ref())
+        .and_then(|m| m.get("memory"))
+        .and_then(|q| parse_memory_bytes(q));
+
+    let mut r = v1::LinuxContainerResources {
+        // request, else limit, else 0 → MinShares.
+        cpu_shares: milli_cpu_to_shares(cpu_request.or(cpu_limit).unwrap_or(0)),
+        ..Default::default()
+    };
+    if let Some(limit) = cpu_limit {
+        r.cpu_period = QUOTA_PERIOD;
+        r.cpu_quota = milli_cpu_to_quota(limit, QUOTA_PERIOD);
+    }
+    if let Some(mem) = mem_limit {
+        r.memory_limit_in_bytes = mem;
+    }
+    Some(r)
 }
 
 /// Resolve the effective container seccomp profile to a CRI [`SecurityProfile`].
@@ -1003,8 +1043,53 @@ mod tests {
         assert_eq!(cfg.envs[0].value, "bar");
         let res = cfg.linux.unwrap().resources.unwrap();
         assert_eq!(res.cpu_quota, 50_000); // 500m -> quota 50000 @ 100ms period
+                                           // No CPU request, so shares fall back to the limit: 500m -> 512 shares.
+        assert_eq!(res.cpu_shares, 512);
         assert_eq!(res.memory_limit_in_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.labels.get(labels::CONTAINER_NAME).unwrap(), "app");
+    }
+
+    #[test]
+    fn linux_resources_shares_quota_and_floors() {
+        use rusternetes_common::types::ResourceRequirements;
+        let res = |limits: Option<Vec<(&str, &str)>>, requests: Option<Vec<(&str, &str)>>| {
+            let mut c = Container {
+                name: "app".to_string(),
+                image: "busybox".to_string(),
+                ..Default::default()
+            };
+            let map = |v: Vec<(&str, &str)>| {
+                v.into_iter()
+                    .map(|(k, val)| (k.to_string(), val.to_string()))
+                    .collect::<HashMap<_, _>>()
+            };
+            c.resources = Some(ResourceRequirements {
+                limits: limits.map(map),
+                requests: requests.map(map),
+                claims: None,
+            });
+            linux_resources(&c).unwrap()
+        };
+
+        // CPU request drives shares; limit drives quota/period.
+        let r = res(Some(vec![("cpu", "1")]), Some(vec![("cpu", "250m")]));
+        assert_eq!(r.cpu_shares, 256); // 250m
+        assert_eq!(r.cpu_quota, 100_000); // 1 CPU @ 100ms
+        assert_eq!(r.cpu_period, 100_000);
+
+        // No resources at all → MinShares, no quota.
+        let r = res(None, None);
+        assert_eq!(r.cpu_shares, MIN_SHARES);
+        assert_eq!(r.cpu_quota, 0);
+
+        // Tiny CPU limit floors the quota at MinQuotaPeriod (1ms).
+        let r = res(Some(vec![("cpu", "5m")]), None);
+        assert_eq!(r.cpu_quota, MIN_QUOTA_PERIOD); // 5m -> 500, floored to 1000
+        assert_eq!(r.cpu_shares, 5); // 5m -> 5 shares (already >= MinShares)
+
+        // 1m floors shares at MinShares (1m -> 1 share -> 2).
+        let r = res(Some(vec![("cpu", "1m")]), None);
+        assert_eq!(r.cpu_shares, MIN_SHARES);
     }
 
     #[test]
