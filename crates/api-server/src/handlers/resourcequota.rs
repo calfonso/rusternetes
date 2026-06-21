@@ -50,6 +50,14 @@ pub async fn create(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Field validation (mirrors upstream ValidateResourceQuota).
+    {
+        let errs = rusternetes_common::validation::resourcequota::validate_resource_quota(&quota);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     quota.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields

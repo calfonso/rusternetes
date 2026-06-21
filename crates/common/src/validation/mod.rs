@@ -17,5 +17,6 @@ pub mod objectmeta;
 pub mod pdb;
 pub mod pod;
 pub mod pvc;
+pub mod resourcequota;
 pub mod service;
 pub mod storageclass;
