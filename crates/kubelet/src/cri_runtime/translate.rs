@@ -223,6 +223,78 @@ pub fn dns_config(
     Some(cfg)
 }
 
+/// Whether any container in the pod requests `privileged` (upstream
+/// `kubecontainer.HasPrivilegedContainer`). Covers regular + init containers.
+fn pod_has_privileged_container(pod: &Pod) -> bool {
+    let Some(spec) = pod.spec.as_ref() else {
+        return false;
+    };
+    let any_priv = |cs: &[Container]| {
+        cs.iter().any(|c| {
+            c.security_context
+                .as_ref()
+                .and_then(|s| s.privileged)
+                .unwrap_or(false)
+        })
+    };
+    any_priv(&spec.containers)
+        || spec
+            .init_containers
+            .as_deref()
+            .map(any_priv)
+            .unwrap_or(false)
+}
+
+/// Build the pod sandbox's [`LinuxSandboxSecurityContext`], porting upstream
+/// `generatePodSandboxLinuxConfig` (`pkg/kubelet/kuberuntime/kuberuntime_sandbox.go`).
+///
+/// Beyond the namespace options we already set, this carries the pod-level
+/// security context onto the sandbox: `privileged` (if any container is),
+/// `runAsUser`/`runAsGroup`, `supplementalGroups` (`fsGroup` first, then the
+/// pod's `supplementalGroups`) + its policy, and `seLinuxOptions`. The sandbox
+/// seccomp is forced to `RuntimeDefault` so pods can still pick least-privileged
+/// seccomp at the container level (upstream issue #84623).
+fn sandbox_security_context(pod: &Pod) -> v1::LinuxSandboxSecurityContext {
+    use v1::security_profile::ProfileType;
+    let mut sc = v1::LinuxSandboxSecurityContext {
+        namespace_options: Some(namespace_options(pod)),
+        privileged: pod_has_privileged_container(pod),
+        seccomp: Some(v1::SecurityProfile {
+            profile_type: ProfileType::RuntimeDefault as i32,
+            localhost_ref: String::new(),
+        }),
+        ..Default::default()
+    };
+    if let Some(psc) = pod.spec.as_ref().and_then(|s| s.security_context.as_ref()) {
+        sc.run_as_user = psc.run_as_user.map(|v| v1::Int64Value { value: v });
+        sc.run_as_group = psc.run_as_group.map(|v| v1::Int64Value { value: v });
+        let mut groups: Vec<i64> = Vec::new();
+        if let Some(fsg) = psc.fs_group {
+            groups.push(fsg);
+        }
+        if let Some(sg) = psc.supplemental_groups.as_ref() {
+            groups.extend(sg.iter().copied());
+        }
+        sc.supplemental_groups = groups;
+        if let Some(policy) = psc.supplemental_groups_policy.as_deref() {
+            sc.supplemental_groups_policy = match policy {
+                "Strict" => v1::SupplementalGroupsPolicy::Strict as i32,
+                // "Merge" (default) and any unknown value.
+                _ => v1::SupplementalGroupsPolicy::Merge as i32,
+            };
+        }
+        if let Some(opts) = psc.se_linux_options.as_ref() {
+            sc.selinux_options = Some(v1::SeLinuxOption {
+                user: opts.user.clone().unwrap_or_default(),
+                role: opts.role.clone().unwrap_or_default(),
+                r#type: opts.type_.clone().unwrap_or_default(),
+                level: opts.level.clone().unwrap_or_default(),
+            });
+        }
+    }
+    sc
+}
+
 /// Translate the pod into a CRI [`PodSandboxConfig`](v1::PodSandboxConfig).
 ///
 /// `log_directory` is the kubelet-owned dir the runtime writes container logs
@@ -246,10 +318,7 @@ pub fn sandbox_config(pod: &Pod, log_directory: &str) -> v1::PodSandboxConfig {
         labels: pod_labels(pod),
         port_mappings: port_mappings(pod),
         linux: Some(v1::LinuxPodSandboxConfig {
-            security_context: Some(v1::LinuxSandboxSecurityContext {
-                namespace_options: Some(namespace_options(pod)),
-                ..Default::default()
-            }),
+            security_context: Some(sandbox_security_context(pod)),
             sysctls: sysctls(pod),
             ..Default::default()
         }),
@@ -1320,6 +1389,50 @@ mod tests {
         assert_eq!(
             seccomp(json!({"containers": [{"name": "app", "image": "busybox"}]})),
             None
+        );
+    }
+
+    #[test]
+    fn sandbox_security_context_carries_pod_fields() {
+        use serde_json::json;
+        use v1::security_profile::ProfileType;
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {
+                "securityContext": {
+                    "runAsUser": 1000,
+                    "runAsGroup": 3000,
+                    "fsGroup": 2000,
+                    "supplementalGroups": [5, 6],
+                    "supplementalGroupsPolicy": "Strict",
+                    "seLinuxOptions": {"level": "s0:c1,c2"}
+                },
+                "containers": [{
+                    "name": "app", "image": "busybox",
+                    "securityContext": {"privileged": true}
+                }]
+            }
+        }))
+        .unwrap();
+        let sc = sandbox_config(&pod, "/log")
+            .linux
+            .unwrap()
+            .security_context
+            .unwrap();
+        assert!(sc.privileged, "sandbox privileged when a container is");
+        assert_eq!(sc.run_as_user.unwrap().value, 1000);
+        assert_eq!(sc.run_as_group.unwrap().value, 3000);
+        // fsGroup first, then supplementalGroups.
+        assert_eq!(sc.supplemental_groups, vec![2000, 5, 6]);
+        assert_eq!(
+            sc.supplemental_groups_policy,
+            v1::SupplementalGroupsPolicy::Strict as i32
+        );
+        assert_eq!(sc.selinux_options.unwrap().level, "s0:c1,c2");
+        // Sandbox seccomp is always forced to RuntimeDefault (#84623).
+        assert_eq!(
+            sc.seccomp.unwrap().profile_type,
+            ProfileType::RuntimeDefault as i32
         );
     }
 
