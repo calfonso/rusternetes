@@ -1,11 +1,11 @@
-use rusternetes_common::resources::pod::PodSpec;
+use rusternetes_common::resources::pod::{Pod, PodCondition, PodSpec, PodStatus};
 use rusternetes_common::resources::{
     Container, CrossVersionObjectReference, Deployment, DeploymentSpec, ExternalMetricSource,
     HPAScalingPolicy, HPAScalingRules, HorizontalPodAutoscaler, HorizontalPodAutoscalerBehavior,
     HorizontalPodAutoscalerSpec, MetricIdentifier, MetricSpec, MetricTarget, ObjectMetricSource,
     PodTemplateSpec, PodsMetricSource, ResourceMetricSource,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
 use rusternetes_controller_manager::controllers::hpa::HorizontalPodAutoscalerController;
 use rusternetes_controller_manager::controllers::hpa_metrics_client::{
     FakeMetricsClient, MetricsClient, PodMetricsInfo,
@@ -79,6 +79,33 @@ impl MetricsClient for SeqCpuMetrics {
     ) -> anyhow::Result<(Vec<i64>, chrono::DateTime<chrono::Utc>)> {
         anyhow::bail!("not used")
     }
+}
+
+/// Create a Running-but-unready pod (Ready=False) that started "now" — i.e.
+/// still inside the cpu-initialization window — labelled `app=<app>`.
+async fn create_unready_pod(storage: &Arc<MemoryStorage>, ns: &str, name: &str, app: &str) {
+    let now = chrono::Utc::now();
+    let mut pod = Pod::new(name, PodSpec::default());
+    let mut meta = ObjectMeta::new(name);
+    meta.namespace = Some(ns.to_string());
+    meta.labels = Some(HashMap::from([("app".to_string(), app.to_string())]));
+    pod.metadata = meta;
+    pod.status = Some(PodStatus {
+        phase: Some(Phase::Running),
+        start_time: Some(now),
+        conditions: Some(vec![PodCondition {
+            condition_type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: None,
+            message: None,
+            last_probe_time: None,
+            last_transition_time: Some(now),
+            observed_generation: None,
+        }]),
+        ..Default::default()
+    });
+    let key = build_key("pods", Some(ns), name);
+    storage.create(&key, &pod).await.unwrap();
 }
 
 fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Deployment {
@@ -1085,21 +1112,36 @@ async fn test_hpa_average_utilization_per_pod_calculation() {
 /// must be excluded from utilization calculations to avoid scale-up storms
 /// caused by cold-start CPU spikes.
 ///
-/// RED-state: the rusternetes HPA controller has no concept of pod
-/// readiness; it operates entirely from the workload's `.spec.replicas`.
+/// The pods are unready and just-started, so even a 95% cpu reading (well above
+/// the 80% target) must NOT scale up — upstream groupPods excludes pods within
+/// the cpu-initialization window from the utilization calc.
 #[tokio::test]
-#[ignore = "RED-state: initial-readiness-delay (CPUInitializationPeriod / pod-state \
-            inspection) not implemented; test also needs real metrics (it currently \
-            passes only vacuously via the empty-metrics error path)"]
 async fn test_hpa_initial_readiness_delay() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
 
-    // Fresh Deployment (creationTimestamp = now) — pods would still be
-    // within the readiness delay window.
     let deployment = create_test_deployment("startup-app", "default", 3);
     let deploy_key = build_key("deployments", Some("default"), "startup-app");
     storage.create(&deploy_key, &deployment).await.unwrap();
+
+    // Three Running-but-unready pods that started "now" (inside the cpu-init
+    // window), each reporting a hot 95% cpu. matchLabels = {app: startup-app}.
+    let mut fake = FakeMetricsClient::new();
+    let mut readings = Vec::new();
+    for i in 0..3 {
+        let name = format!("startup-app-{i}");
+        create_unready_pod(&storage, "default", &name, "startup-app").await;
+        readings.push((name, 0i64, Some(95)));
+    }
+    let readings_ref: Vec<(&str, i64, Option<i32>)> = readings
+        .iter()
+        .map(|(n, v, u)| (n.as_str(), *v, *u))
+        .collect();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&readings_ref),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
     let hpa = create_test_hpa(
         "startup-hpa",
@@ -1115,14 +1157,13 @@ async fn test_hpa_initial_readiness_delay() {
 
     controller.reconcile_all().await.unwrap();
 
-    // Within the readiness delay the controller should hold replicas
-    // steady (no scale-up triggered by cold-start CPU spikes).
+    // All pods are excluded as not-yet-ready → no usable metric → hold at 3,
+    // despite the 95% reading that would otherwise scale to ceil(3*95/80)=4.
     let updated_deployment: Deployment = storage.get(&deploy_key).await.unwrap();
     assert_eq!(
         updated_deployment.spec.replicas,
         Some(3),
-        "During the initial readiness delay HPA must not scale on noisy \
-         startup metrics; expected 3, got {}",
+        "cold-start unready pods must be excluded; expected 3, got {}",
         updated_deployment.spec.replicas.unwrap_or(0),
     );
 }

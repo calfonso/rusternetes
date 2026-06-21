@@ -14,6 +14,7 @@ pub mod garbage_collector;
 pub mod hpa;
 pub mod hpa_behavior;
 pub mod hpa_metrics_client;
+pub mod hpa_pod_grouping;
 pub mod hpa_replica_calculator;
 pub mod ingress;
 pub mod job;
