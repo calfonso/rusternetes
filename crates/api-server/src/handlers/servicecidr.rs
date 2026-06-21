@@ -31,6 +31,13 @@ pub async fn create_servicecidr(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream networking ValidateServiceCIDR): cidrs 1..=2,
+    // each a valid CIDR, dual-stack one-per-family.
+    let errs = rusternetes_common::validation::servicecidr::validate_service_cidr(&servicecidr);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "servicecidrs")
         .with_api_group("networking.k8s.io");
