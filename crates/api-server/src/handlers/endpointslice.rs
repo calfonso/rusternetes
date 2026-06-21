@@ -240,12 +240,26 @@ pub async fn update_endpointslice(
     endpointslice.metadata.name = name.clone();
     endpointslice.metadata.namespace = Some(namespace.clone());
 
+    let key = build_key("endpointslices", Some(&namespace), &name);
+
+    // Field validation + addressType immutability (upstream
+    // ValidateEndpointSliceUpdate). addressType (IPv4/IPv6/FQDN) cannot change.
+    {
+        let old_slice: EndpointSlice = state.storage.get(&key).await?;
+        let errs = rusternetes_common::validation::endpointslice::validate_endpoint_slice_update(
+            &endpointslice,
+            &old_slice,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Check for dry-run
     if crate::handlers::dryrun::is_dry_run(&params) {
         return Ok(Json(endpointslice));
     }
 
-    let key = build_key("endpointslices", Some(&namespace), &name);
     let updated = state.storage.update(&key, &endpointslice).await?;
 
     Ok(Json(updated))

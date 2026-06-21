@@ -101,3 +101,21 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
 
     errs
 }
+
+/// Validate an `EndpointSlice` update — upstream `ValidateEndpointSliceUpdate`
+/// (pkg/apis/discovery/validation): full field validation of the new slice,
+/// plus `addressType` is immutable.
+pub fn validate_endpoint_slice_update(
+    new_slice: &EndpointSlice,
+    old_slice: &EndpointSlice,
+) -> ErrorList {
+    let mut errs = validate_endpoint_slice(new_slice);
+    if new_slice.address_type != old_slice.address_type {
+        errs.push(Error::invalid(
+            &Path::new("addressType"),
+            new_slice.address_type.clone(),
+            "field is immutable",
+        ));
+    }
+    errs
+}
