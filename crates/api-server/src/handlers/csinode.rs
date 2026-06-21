@@ -154,13 +154,20 @@ pub async fn update_csinode(
 
     node.metadata.name = name.clone();
 
+    let key = build_key("csinodes", None, &name);
+    let old: CSINode = state.storage.get(&key).await?;
+
+    let errs = rusternetes_common::validation::csinode::validate_csi_node_update(&node, &old);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: CSINode validated successfully (not updated)");
         return Ok(Json(node));
     }
 
-    let key = build_key("csinodes", None, &name);
     let updated = state.storage.update(&key, &node).await?;
 
     Ok(Json(updated))
