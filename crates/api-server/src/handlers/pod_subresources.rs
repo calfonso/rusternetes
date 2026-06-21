@@ -1063,6 +1063,20 @@ pub async fn create_binding(
     let binding: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| Error::InvalidResource(format!("Invalid binding format: {}", e)))?;
 
+    // target.kind, when set, must be "Node" (upstream ValidatePodBinding).
+    if let Some(kind) = binding
+        .get("target")
+        .and_then(|t| t.get("kind"))
+        .and_then(|k| k.as_str())
+    {
+        if !kind.is_empty() && kind != "Node" {
+            return Err(Error::InvalidResource(format!(
+                "Unsupported value: target.kind: \"{}\": supported values: \"Node\", \"<empty>\"",
+                kind
+            )));
+        }
+    }
+
     // Extract target node from binding
     let node_name = binding
         .get("target")
