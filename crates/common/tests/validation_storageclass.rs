@@ -110,3 +110,69 @@ fn oversize_parameters_rejected() {
         .iter()
         .any(|e| e.field == "parameters" && e.error_type == ErrorType::TooLong));
 }
+
+// --- allowedTopologies (#1330) ---
+use rusternetes_common::resources::volume::{
+    TopologySelectorLabelRequirement, TopologySelectorTerm,
+};
+
+fn term(key: &str, values: &[&str]) -> TopologySelectorTerm {
+    TopologySelectorTerm {
+        match_label_expressions: Some(vec![TopologySelectorLabelRequirement {
+            key: key.to_string(),
+            values: values.iter().map(|s| s.to_string()).collect(),
+        }]),
+    }
+}
+
+#[test]
+fn valid_allowed_topologies_pass() {
+    let mut sc = valid_sc();
+    sc.allowed_topologies = Some(vec![term("topology.kubernetes.io/zone", &["us-east-1a"])]);
+    assert!(
+        validate_storage_class(&sc).is_empty(),
+        "{:?}",
+        validate_storage_class(&sc)
+    );
+}
+
+#[test]
+fn topology_empty_values_rejected() {
+    let mut sc = valid_sc();
+    sc.allowed_topologies = Some(vec![term("topology.kubernetes.io/zone", &[])]);
+    let errs = validate_storage_class(&sc);
+    assert!(errs
+        .iter()
+        .any(|e| e.field.contains("matchLabelExpressions[0].values")
+            && e.error_type == ErrorType::Required));
+}
+
+#[test]
+fn topology_bad_key_rejected() {
+    let mut sc = valid_sc();
+    sc.allowed_topologies = Some(vec![term("bad key!", &["v"])]);
+    let errs = validate_storage_class(&sc);
+    assert!(errs
+        .iter()
+        .any(|e| e.field.contains("matchLabelExpressions[0].key")));
+}
+
+#[test]
+fn topology_duplicate_values_rejected() {
+    let mut sc = valid_sc();
+    sc.allowed_topologies = Some(vec![term("topology.kubernetes.io/zone", &["a", "a"])]);
+    let errs = validate_storage_class(&sc);
+    assert!(errs.iter().any(|e| e.error_type == ErrorType::Duplicate));
+}
+
+#[test]
+fn topology_duplicate_terms_rejected() {
+    let mut sc = valid_sc();
+    let t = term("topology.kubernetes.io/zone", &["us-east-1a"]);
+    sc.allowed_topologies = Some(vec![t.clone(), t]);
+    let errs = validate_storage_class(&sc);
+    assert!(errs.iter().any(|e| e
+        .field
+        .contains("allowedTopologies[1].matchLabelExpressions")
+        && e.error_type == ErrorType::Duplicate));
+}
