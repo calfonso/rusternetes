@@ -62,6 +62,17 @@ pub async fn create_pv(
         });
     }
 
+    // SetDefaults_PersistentVolume (pkg/apis/core/v1/defaults.go): reclaimPolicy
+    // defaults to Retain and volumeMode defaults to Filesystem when unset.
+    if pv.spec.persistent_volume_reclaim_policy.is_none() {
+        pv.spec.persistent_volume_reclaim_policy =
+            Some(rusternetes_common::resources::volume::PersistentVolumeReclaimPolicy::Retain);
+    }
+    if pv.spec.volume_mode.is_none() {
+        pv.spec.volume_mode =
+            Some(rusternetes_common::resources::volume::PersistentVolumeMode::Filesystem);
+    }
+
     let key = build_key("persistentvolumes", None, &pv.metadata.name);
 
     // If dry-run, skip storage operation but return the validated resource
