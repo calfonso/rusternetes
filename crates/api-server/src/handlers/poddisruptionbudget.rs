@@ -134,6 +134,17 @@ pub async fn update(
 
     let key = build_key("poddisruptionbudgets", Some(&namespace), &name);
 
+    // Field validation on update (upstream PDB update strategy re-runs
+    // ValidatePodDisruptionBudget on the new object — no spec immutability).
+    // The create path validated but the update path previously persisted PUTs
+    // unchecked.
+    {
+        let errs = rusternetes_common::validation::pdb::validate_pod_disruption_budget(&pdb);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(

@@ -136,6 +136,16 @@ pub async fn update(
 
     let key = build_key("limitranges", Some(&namespace), &name);
 
+    // Field validation on update (upstream LimitRange update strategy re-runs
+    // ValidateLimitRange on the new object). The create path validated but the
+    // update path previously persisted PUTs unchecked.
+    {
+        let errs = rusternetes_common::validation::limitrange::validate_limit_range(&limit_range);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
