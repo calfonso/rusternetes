@@ -16,6 +16,41 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// SetDefaults_NetworkPolicy (pkg/apis/networking/v1/defaults.go): a policy
+/// that omits `policyTypes` implies "Ingress" (plus "Egress" when egress rules
+/// are present), and each `NetworkPolicyPort.protocol` defaults to TCP. Runs on
+/// both create and update before validation.
+fn apply_networkpolicy_defaults(np: &mut rusternetes_common::resources::NetworkPolicy) {
+    let spec = &mut np.spec;
+    if spec.policy_types.as_ref().is_none_or(|t| t.is_empty()) {
+        let mut types = vec!["Ingress".to_string()];
+        if spec.egress.as_ref().is_some_and(|e| !e.is_empty()) {
+            types.push("Egress".to_string());
+        }
+        spec.policy_types = Some(types);
+    }
+    let default_port_protocols =
+        |ports: &mut Option<Vec<rusternetes_common::resources::NetworkPolicyPort>>| {
+            if let Some(ports) = ports {
+                for p in ports.iter_mut() {
+                    if p.protocol.is_none() {
+                        p.protocol = Some("TCP".to_string());
+                    }
+                }
+            }
+        };
+    if let Some(ingress) = spec.ingress.as_mut() {
+        for rule in ingress.iter_mut() {
+            default_port_protocols(&mut rule.ports);
+        }
+    }
+    if let Some(egress) = spec.egress.as_mut() {
+        for rule in egress.iter_mut() {
+            default_port_protocols(&mut rule.ports);
+        }
+    }
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -48,6 +83,10 @@ pub async fn create(
         Some(&namespace),
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
+
+    // SetDefaults_NetworkPolicy: derive policyTypes + default port protocols
+    // before validation.
+    apply_networkpolicy_defaults(&mut network_policy);
 
     // Field validation (mirrors upstream ValidateNetworkPolicy).
     {
@@ -133,6 +172,10 @@ pub async fn update(
 
     network_policy.metadata.name = name.clone();
     network_policy.metadata.namespace = Some(namespace.clone());
+
+    // SetDefaults_NetworkPolicy runs on update too (derive policyTypes + default
+    // port protocols) before validation.
+    apply_networkpolicy_defaults(&mut network_policy);
 
     let key = build_key("networkpolicies", Some(&namespace), &name);
 
