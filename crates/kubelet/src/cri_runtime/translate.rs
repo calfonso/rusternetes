@@ -598,6 +598,12 @@ fn linux_security_context(container: &Container) -> Option<v1::LinuxContainerSec
         run_as_user: sc.run_as_user.map(|v| v1::Int64Value { value: v }),
         run_as_group: sc.run_as_group.map(|v| v1::Int64Value { value: v }),
         readonly_rootfs: sc.read_only_root_filesystem.unwrap_or(false),
+        // `allowPrivilegeEscalation: false` → `no_new_privs`, blocking setuid/
+        // file-capability escalation in the container. Upstream
+        // `securitycontext.AddNoNewPrivileges`: true *only* when the field is
+        // explicitly false (unset/true → false). Without this a pod that set
+        // `allowPrivilegeEscalation: false` could still escalate.
+        no_new_privs: sc.allow_privilege_escalation == Some(false),
         ..Default::default()
     })
 }
@@ -1070,6 +1076,48 @@ mod tests {
         assert!(sc.readonly_rootfs);
         assert_eq!(sc.run_as_user.unwrap().value, 1000);
         assert_eq!(sc.run_as_group.unwrap().value, 2000);
+        // allowPrivilegeEscalation unset -> no_new_privs stays false.
+        assert!(!sc.no_new_privs);
+    }
+
+    #[test]
+    fn no_new_privs_only_when_allow_priv_esc_false() {
+        use serde_json::json;
+        let no_new_privs = |sec_ctx: serde_json::Value| -> bool {
+            let c: Container = serde_json::from_value(json!({
+                "name": "app",
+                "image": "busybox",
+                "securityContext": sec_ctx
+            }))
+            .unwrap();
+            let pod = pod_with(PodSpec {
+                containers: vec![c.clone()],
+                ..Default::default()
+            });
+            container_config(
+                &pod,
+                &c,
+                "img",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .linux
+            .unwrap()
+            .security_context
+            .unwrap()
+            .no_new_privs
+        };
+        // Upstream AddNoNewPrivileges: true only when explicitly false.
+        assert!(
+            no_new_privs(json!({"allowPrivilegeEscalation": false})),
+            "explicit false must set no_new_privs"
+        );
+        assert!(
+            !no_new_privs(json!({"allowPrivilegeEscalation": true})),
+            "explicit true must not set no_new_privs"
+        );
+        assert!(!no_new_privs(json!({})), "unset must not set no_new_privs");
     }
 
     fn env_from(
