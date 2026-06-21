@@ -6,6 +6,7 @@
 //! [`metav1`] for the metav1 validators.
 
 pub mod apps;
+pub mod endpointslice;
 pub mod events;
 pub mod field;
 pub mod limitrange;
