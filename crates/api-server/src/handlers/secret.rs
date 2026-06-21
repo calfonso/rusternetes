@@ -300,6 +300,17 @@ pub async fn update(
         }
     }
 
+    // Re-validate the type-specific required keys on update (upstream
+    // ValidateSecretUpdate -> ValidateSecret). Runs after normalize() so keys
+    // supplied via stringData count; catches e.g. a TLS secret losing tls.key
+    // on a non-immutable update.
+    {
+        let errs = rusternetes_common::validation::secret::validate_secret_type(&secret);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
