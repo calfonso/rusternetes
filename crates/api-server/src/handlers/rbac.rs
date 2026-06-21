@@ -354,6 +354,12 @@ pub async fn create_role(
         crate::handlers::validation::NameKind::PathSegment,
     )?;
 
+    // Validate policy rules (upstream rbac ValidateRole).
+    let errs = rusternetes_common::validation::rbac::validate_role(&role);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     role.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields
@@ -639,6 +645,16 @@ pub async fn create_rolebinding(
         Some(&namespace),
         crate::handlers::validation::NameKind::PathSegment,
     )?;
+
+    // Default roleRef/subject apiGroups before validating (upstream rbac
+    // SetDefaults_RoleBinding): an omitted roleRef.apiGroup is the RBAC group.
+    rusternetes_common::validation::rbac::default_role_binding(&mut rolebinding);
+
+    // Validate roleRef + subjects (upstream rbac ValidateRoleBinding).
+    let errs = rusternetes_common::validation::rbac::validate_role_binding(&rolebinding);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     rolebinding.metadata.namespace = Some(namespace.clone());
 
@@ -940,6 +956,12 @@ pub async fn create_clusterrole(
         crate::handlers::validation::NameKind::PathSegment,
     )?;
 
+    // Validate policy rules + aggregationRule (upstream rbac ValidateClusterRole).
+    let errs = rusternetes_common::validation::rbac::validate_cluster_role(&clusterrole);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     clusterrole.metadata.ensure_uid();
     clusterrole.metadata.ensure_creation_timestamp();
@@ -1197,6 +1219,18 @@ pub async fn create_clusterrolebinding(
         None,
         crate::handlers::validation::NameKind::PathSegment,
     )?;
+
+    // Default roleRef/subject apiGroups before validating (upstream rbac
+    // SetDefaults_ClusterRoleBinding): an omitted roleRef.apiGroup is the RBAC
+    // group.
+    rusternetes_common::validation::rbac::default_cluster_role_binding(&mut clusterrolebinding);
+
+    // Validate roleRef + subjects (upstream rbac ValidateClusterRoleBinding).
+    let errs =
+        rusternetes_common::validation::rbac::validate_cluster_role_binding(&clusterrolebinding);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
 
     // Enrich metadata with system fields
     clusterrolebinding.metadata.ensure_uid();
