@@ -44,6 +44,15 @@ pub async fn create_endpointslice(
     // Reject create with neither name nor generateName (#1065).
     crate::handlers::validation::require_object_name(&endpointslice.metadata)?;
 
+    // Field validation (mirrors upstream ValidateEndpointSlice).
+    {
+        let errs =
+            rusternetes_common::validation::endpointslice::validate_endpoint_slice(&endpointslice);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     endpointslice.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields
