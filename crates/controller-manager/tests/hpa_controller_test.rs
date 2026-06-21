@@ -1099,12 +1099,18 @@ async fn test_hpa_tolerance_threshold() {
 /// accepted on the spec but never consulted in
 /// `calculate_desired_replicas`.
 #[tokio::test]
-#[ignore = "RED-state: behavior policies not enforced (hpa.rs does not read hpa.spec.behavior)"]
 async fn test_hpa_behavior_scale_up_policy() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = HorizontalPodAutoscalerController::new(storage.clone());
+    // cpu at 85% vs a 10% target → ratio 8.5 → unbounded desire ceil(2*8.5)=17.
+    let mut fake = FakeMetricsClient::new();
+    fake.resource.insert(
+        "cpu".to_string(),
+        FakeMetricsClient::pods_info(&[("p", 0, Some(85))]),
+    );
+    let controller =
+        HorizontalPodAutoscalerController::with_metrics_client(storage.clone(), Arc::new(fake));
 
-    // Currently 2 replicas; metrics would push to ~10. Policy: max +2 per
+    // Currently 2 replicas; metrics would push to ~17. Policy: max +2 per
     // 60s window. Expected outcome on a single reconcile: 2 → 4.
     let deployment = create_test_deployment("rate-limited-app", "default", 2);
     let deploy_key = build_key("deployments", Some("default"), "rate-limited-app");

@@ -18,6 +18,8 @@ use crate::controllers::hpa_replica_calculator as calc;
 pub struct HorizontalPodAutoscalerController<S: Storage> {
     storage: Arc<S>,
     metrics_client: Arc<dyn MetricsClient>,
+    /// Per-HPA scale-event history feeding `spec.behavior` rate policies.
+    scale_events: crate::controllers::hpa_behavior::ScaleEventStore,
 }
 
 impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
@@ -40,6 +42,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         Self {
             storage,
             metrics_client,
+            scale_events: Default::default(),
         }
     }
 
@@ -49,6 +52,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         Self {
             storage,
             metrics_client,
+            scale_events: Default::default(),
         }
     }
 
@@ -262,6 +266,19 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .await?;
                 return Ok(());
             }
+
+            // Record the scale event so spec.behavior period windows rate-limit
+            // subsequent reconciles (upstream storeScaleEvent).
+            if let Some(behavior) = hpa.spec.behavior.as_ref() {
+                let key = format!("{}/{}", namespace, hpa.metadata.name);
+                self.scale_events.record(
+                    &key,
+                    behavior,
+                    current_replicas,
+                    desired_replicas,
+                    Utc::now(),
+                );
+            }
         }
 
         // 4. Update HPA status
@@ -414,7 +431,26 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         let min_replicas = hpa.spec.min_replicas.unwrap_or(1);
         let max_replicas = hpa.spec.max_replicas;
-        let bounded = max_desired.max(min_replicas).min(max_replicas);
+        // Apply spec.behavior scale-rate policies (Pods/Percent, selectPolicy,
+        // periodSeconds history) before the final min/max clamp; mirrors
+        // upstream normalizeDesiredReplicasWithBehaviors. Without behavior, the
+        // plain clamp is unchanged.
+        let rated = if let Some(behavior) = hpa.spec.behavior.as_ref() {
+            let key = format!("{}/{}", namespace, hpa.metadata.name);
+            let events = self.scale_events.snapshot(&key);
+            crate::controllers::hpa_behavior::convert_with_behavior_rate(
+                current_replicas,
+                max_desired,
+                min_replicas,
+                max_replicas,
+                behavior,
+                &events,
+                Utc::now(),
+            )
+        } else {
+            max_desired
+        };
+        let bounded = rated.max(min_replicas).min(max_replicas);
         Ok((bounded, statuses))
     }
 
