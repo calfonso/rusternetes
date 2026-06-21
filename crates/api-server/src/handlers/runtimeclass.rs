@@ -31,6 +31,13 @@ pub async fn create_runtimeclass(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate the RuntimeClass (upstream node ValidateRuntimeClass): handler
+    // DNS label, overhead.podFixed quantities, scheduling selector/tolerations.
+    let errs = rusternetes_common::validation::runtimeclass::validate_runtime_class(&runtime_class);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 

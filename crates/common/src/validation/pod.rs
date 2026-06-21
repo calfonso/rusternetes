@@ -571,7 +571,7 @@ fn validate_dns_policy(policy: Option<&str>, fld_path: &Path) -> ErrorList {
 /// - When `operator` is Exists and a `value` is set, that is invalid.
 /// - When `effect` is NoExecute, `tolerationSeconds` may be set; for other
 ///   effects it must be absent.
-fn validate_tolerations(tolerations: &[Toleration], fld_path: &Path) -> ErrorList {
+pub fn validate_tolerations(tolerations: &[Toleration], fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     for (i, tol) in tolerations.iter().enumerate() {

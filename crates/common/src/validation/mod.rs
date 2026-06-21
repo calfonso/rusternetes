@@ -30,6 +30,7 @@ pub mod priorityclass;
 pub mod pvc;
 pub mod replicationcontroller;
 pub mod resourcequota;
+pub mod runtimeclass;
 pub mod service;
 pub mod storageclass;
 pub mod volumeattributesclass;
