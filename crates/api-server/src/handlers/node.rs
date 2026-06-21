@@ -123,6 +123,16 @@ pub async fn update(
 
     let key = build_key("nodes", None, &name);
 
+    // Spec-immutability validation on update (upstream ValidateNodeUpdate):
+    // podCIDRs and providerID are immutable once set.
+    {
+        let old_node: rusternetes_common::resources::Node = state.storage.get(&key).await?;
+        let errs = rusternetes_common::validation::node::validate_node_update(&node, &old_node);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(

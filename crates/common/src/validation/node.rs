@@ -96,3 +96,51 @@ pub fn validate_node(node: &Node) -> ErrorList {
 
     errs
 }
+
+/// Validate a Node update — the spec-immutability subset of upstream
+/// `ValidateNodeUpdate` (pkg/apis/core/validation): `podCIDRs` and `providerID`
+/// are immutable once set (they may only go from empty to a value, as the
+/// controller-manager assigns them). `unschedulable`, `taints` and
+/// `configSource` remain mutable. Status-field checks (address dedup,
+/// declaredFeatures, config) are not covered here.
+pub fn validate_node_update(new_node: &Node, old_node: &Node) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let spec = Path::new("spec");
+
+    let empty: Vec<String> = Vec::new();
+    let old_cidrs = old_node
+        .spec
+        .as_ref()
+        .and_then(|s| s.pod_cidrs.as_ref())
+        .unwrap_or(&empty);
+    let new_cidrs = new_node
+        .spec
+        .as_ref()
+        .and_then(|s| s.pod_cidrs.as_ref())
+        .unwrap_or(&empty);
+    if !old_cidrs.is_empty() && old_cidrs != new_cidrs {
+        errs.push(Error::forbidden(
+            &spec.child("podCIDRs"),
+            "node updates may not change podCIDR except from \"\" to valid",
+        ));
+    }
+
+    let old_pid = old_node
+        .spec
+        .as_ref()
+        .and_then(|s| s.provider_id.as_deref())
+        .unwrap_or("");
+    let new_pid = new_node
+        .spec
+        .as_ref()
+        .and_then(|s| s.provider_id.as_deref())
+        .unwrap_or("");
+    if !old_pid.is_empty() && old_pid != new_pid {
+        errs.push(Error::forbidden(
+            &spec.child("providerID"),
+            "node updates may not change providerID except from \"\" to valid",
+        ));
+    }
+
+    errs
+}
