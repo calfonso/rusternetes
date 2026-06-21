@@ -46,6 +46,14 @@ pub async fn create(
     // Reject create with neither name nor generateName (#1065).
     crate::handlers::validation::require_object_name(&limit_range.metadata)?;
 
+    // Field validation (mirrors upstream ValidateLimitRange).
+    {
+        let errs = rusternetes_common::validation::limitrange::validate_limit_range(&limit_range);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     limit_range.metadata.namespace = Some(namespace.clone());
 
     // Enrich metadata with system fields
