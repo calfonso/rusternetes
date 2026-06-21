@@ -282,6 +282,20 @@ pub async fn update_certificate_signing_request_status(
 
     // Update status and metadata (K8s allows metadata changes via status subresource)
     existing_csr.status = updated_csr.status;
+
+    // Validate status.conditions (upstream validateConditions): valid type/status
+    // and Approved/Denied mutual exclusion. Covers the /status and /approval paths.
+    if let Some(conditions) = existing_csr
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+    {
+        let errs = rusternetes_common::validation::certificatesigningrequest::validate_csr_status_conditions(conditions);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Merge annotations from the patch into existing (don't replace entirely)
     if let Some(new_annotations) = updated_csr.metadata.annotations {
         let annotations = existing_csr

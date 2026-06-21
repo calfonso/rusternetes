@@ -197,3 +197,65 @@ pub fn validate_certificate_signing_request_create(csr: &CertificateSigningReque
 
     errs
 }
+
+/// Validate CSR `status.conditions` — the self-contained `validateConditions`
+/// rules from upstream (pkg/apis/certificates/validation): a condition `type`
+/// must be non-empty; `status` must be one of True/False/Unknown, and for the
+/// Approved/Denied/Failed types only `True`; and a CSR may not carry both an
+/// Approved and a Denied condition.
+///
+/// The diff-based rules (may-not-remove/modify existing Approved/Denied/Failed)
+/// are not covered here — those need the stored object.
+pub fn validate_csr_status_conditions(
+    conditions: &[crate::resources::certificates::CertificateSigningRequestCondition],
+) -> ErrorList {
+    let mut errs = ErrorList::new();
+    let path = Path::new("status").child("conditions");
+    let mut has_approved = false;
+    let mut has_denied = false;
+    for (i, c) in conditions.iter().enumerate() {
+        let cp = path.index(i);
+        if c.type_.is_empty() {
+            errs.push(Error::required(&cp.child("type"), ""));
+        }
+        let true_only = matches!(c.type_.as_str(), "Approved" | "Denied" | "Failed");
+        let allowed: &[&str] = if true_only {
+            &["True"]
+        } else {
+            &["True", "False", "Unknown"]
+        };
+        if c.status.is_empty() {
+            errs.push(Error::required(&cp.child("status"), ""));
+        } else if !allowed.contains(&c.status.as_str()) {
+            errs.push(Error::not_supported(
+                &cp.child("status"),
+                c.status.clone(),
+                allowed,
+            ));
+        }
+        match c.type_.as_str() {
+            "Approved" => {
+                has_approved = true;
+                if has_denied {
+                    errs.push(Error::invalid(
+                        &path,
+                        "Approved".to_string(),
+                        "Approved and Denied conditions are mutually exclusive",
+                    ));
+                }
+            }
+            "Denied" => {
+                has_denied = true;
+                if has_approved {
+                    errs.push(Error::invalid(
+                        &path,
+                        "Denied".to_string(),
+                        "Approved and Denied conditions are mutually exclusive",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    errs
+}
