@@ -8,6 +8,7 @@
 pub mod apps;
 pub mod certificatesigningrequest;
 pub mod configmap;
+pub mod cronjob;
 pub mod csidriver;
 pub mod csinode;
 pub mod csistoragecapacity;

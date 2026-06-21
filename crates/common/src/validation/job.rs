@@ -15,7 +15,9 @@
 //! `podReplacementPolicy` and `managedBy` (#1326). The `succeededIndexes`
 //! interval-format parser (`validateIndexesFormat`) is the one remaining gap.
 
-use crate::resources::workloads::{Job, JobSpec, PodFailurePolicyRule, SuccessPolicyRule};
+use crate::resources::workloads::{
+    Job, JobSpec, JobTemplateSpec, PodFailurePolicyRule, SuccessPolicyRule,
+};
 use crate::types::LabelSelector;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
@@ -49,8 +51,11 @@ fn selector_is_empty(sel: &LabelSelector) -> bool {
         && sel.match_expressions.as_ref().is_none_or(|m| m.is_empty())
 }
 
-/// Port of upstream `validateJobSpec` + the selector half of `ValidateJobSpec`.
-fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
+/// Port of upstream `validateJobSpec` (the inner validator, WITHOUT the
+/// selector-required / selector-match checks that `ValidateJobSpec` adds). This
+/// is the part shared with CronJob's `ValidateJobTemplateSpec`, whose template
+/// must NOT carry a selector.
+fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     if let Some(p) = spec.parallelism {
@@ -267,6 +272,14 @@ fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
         &fld_path.child("podReplacementPolicy"),
     ));
 
+    errs
+}
+
+/// Port of upstream `ValidateJobSpec`: the core spec checks plus the
+/// selector-required / selector validity / selector-matches-template checks.
+fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_job_spec_core(spec, fld_path);
+
     // Selector: required, valid, and matching the template labels.
     match &spec.selector {
         None => errs.push(Error::required(&fld_path.child("selector"), "")),
@@ -306,6 +319,30 @@ fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
         }
     }
 
+    errs
+}
+
+/// Port of upstream `ValidateJobTemplateSpec` — validates the embedded job spec
+/// of a CronJob's `jobTemplate`. The template must NOT carry a selector (it is
+/// auto-generated) and must not set `manualSelector: true`.
+pub fn validate_job_template_spec(template: &JobTemplateSpec, fld_path: &Path) -> ErrorList {
+    let spec_path = fld_path.child("spec");
+    let mut errs = validate_job_spec_core(&template.spec, &spec_path);
+
+    if template.spec.selector.is_some() {
+        errs.push(Error::invalid(
+            &spec_path.child("selector"),
+            String::new(),
+            "`selector` will be auto-generated",
+        ));
+    }
+    if template.spec.manual_selector == Some(true) {
+        errs.push(Error::not_supported(
+            &spec_path.child("manualSelector"),
+            "true",
+            &["nil", "false"],
+        ));
+    }
     errs
 }
 

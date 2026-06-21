@@ -4432,6 +4432,7 @@ dependencies = [
  "cel",
  "chrono",
  "criterion",
+ "cron",
  "etcd-client",
  "futures",
  "jsonwebtoken",

@@ -55,6 +55,14 @@ pub async fn create(
     // Apply K8s defaults (SetDefaults_PodSpec + SetDefaults_Container for job template)
     crate::handlers::defaults::apply_cronjob_defaults(&mut cronjob);
 
+    // Validate the (defaulted) CronJob spec, mirroring upstream batch
+    // ValidateCronJobCreate: schedule syntax, concurrencyPolicy, timeZone,
+    // jobTemplate, history limits, and the 52-char name cap.
+    let errs = rusternetes_common::validation::cronjob::validate_cron_job(&cronjob);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
