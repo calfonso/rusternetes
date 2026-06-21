@@ -68,12 +68,47 @@ impl<S: Storage + 'static> StorageClassController<S> {
     /// pass are intentionally swallowed — the controller will retry on
     /// the next tick.
     pub async fn run(&self) -> Result<()> {
+        use futures::StreamExt;
         info!("Starting StorageClass Controller");
         loop {
+            // Reconcile once, then wake on StorageClass writes instead of
+            // busy-polling (idle CPU → ~0 between changes). The periodic resync
+            // is the wedge-safe fallback — informer+resync model, #1040.
             if let Err(e) = self.reconcile_all().await {
                 tracing::error!("StorageClass reconcile failed: {}", e);
             }
-            time::sleep(self.interval).await;
+
+            let mut watch = match self.storage.watch("/registry/storageclasses/").await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(
+                        "StorageClass watch failed: {e}; retrying in {:?}",
+                        self.interval
+                    );
+                    time::sleep(self.interval).await;
+                    continue;
+                }
+            };
+            let mut resync = time::interval(self.interval);
+            resync.tick().await; // drop the immediate first tick
+
+            loop {
+                tokio::select! {
+                    ev = watch.next() => match ev {
+                        Some(Ok(_)) => {
+                            if let Err(e) = self.reconcile_all().await {
+                                tracing::error!("StorageClass reconcile failed: {}", e);
+                            }
+                        }
+                        _ => break,
+                    },
+                    _ = resync.tick() => {
+                        if let Err(e) = self.reconcile_all().await {
+                            tracing::error!("StorageClass reconcile failed: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 
