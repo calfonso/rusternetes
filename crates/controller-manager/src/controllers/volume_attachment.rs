@@ -44,12 +44,50 @@ impl<S: Storage + 'static> VolumeAttachmentController<S> {
     /// sleeps on the reconcile interval. Real implementation should watch
     /// `/registry/volumeattachments/` and invoke the CSI driver.
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        use futures::StreamExt;
         info!("Starting VolumeAttachment Controller (stub: CSI attach/detach not yet implemented)");
+
+        // The reconcile is currently a no-op stub, so the old fixed-interval
+        // loop just burned a wake-up every interval forever. Block on
+        // VolumeAttachment writes instead (idle CPU → ~0); the periodic resync
+        // is the wedge-safe fallback and keeps the loop event-driven for when
+        // the CSI attach/detach reconcile is implemented (#1040).
         loop {
             if let Err(e) = self.reconcile_all().await {
                 tracing::error!("VolumeAttachment reconcile_all failed: {}", e);
             }
-            time::sleep(self.interval).await;
+
+            let mut watch = match self.storage.watch("/registry/volumeattachments/").await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(
+                        "VolumeAttachment watch failed: {e}; retrying in {:?}",
+                        self.interval
+                    );
+                    time::sleep(self.interval).await;
+                    continue;
+                }
+            };
+            let mut resync = time::interval(self.interval);
+            resync.tick().await; // drop the immediate first tick
+
+            loop {
+                tokio::select! {
+                    ev = watch.next() => match ev {
+                        Some(Ok(_)) => {
+                            if let Err(e) = self.reconcile_all().await {
+                                tracing::error!("VolumeAttachment reconcile_all failed: {}", e);
+                            }
+                        }
+                        _ => break,
+                    },
+                    _ = resync.tick() => {
+                        if let Err(e) = self.reconcile_all().await {
+                            tracing::error!("VolumeAttachment reconcile_all failed: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 
