@@ -163,3 +163,39 @@ pub fn validate_storage_class(sc: &StorageClass) -> ErrorList {
 
     errs
 }
+
+/// Validate a `StorageClass` update. Mirrors upstream `ValidateStorageClassUpdate`
+/// (minus ObjectMeta): `parameters`, `provisioner`, `reclaimPolicy` and
+/// `volumeBindingMode` are immutable (only `allowVolumeExpansion` may change).
+///
+/// Callers should apply `SetDefaults_StorageClass` to the incoming object first
+/// (as the create handler does), so an omitted-but-defaulted field doesn't read
+/// as a forbidden change.
+pub fn validate_storage_class_update(new_sc: &StorageClass, old_sc: &StorageClass) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if new_sc.parameters != old_sc.parameters {
+        errs.push(Error::forbidden(
+            &Path::new("parameters"),
+            "updates to parameters are forbidden.",
+        ));
+    }
+    if new_sc.provisioner != old_sc.provisioner {
+        errs.push(Error::forbidden(
+            &Path::new("provisioner"),
+            "updates to provisioner are forbidden.",
+        ));
+    }
+    if new_sc.reclaim_policy != old_sc.reclaim_policy {
+        errs.push(Error::forbidden(
+            &Path::new("reclaimPolicy"),
+            "updates to reclaimPolicy are forbidden.",
+        ));
+    }
+    if new_sc.volume_binding_mode != old_sc.volume_binding_mode {
+        errs.push(Error::forbidden(
+            &Path::new("volumeBindingMode"),
+            "field is immutable",
+        ));
+    }
+    errs
+}

@@ -161,13 +161,36 @@ pub async fn update_storageclass(
 
     sc.metadata.name = name.clone();
 
+    // SetDefaults_StorageClass on the incoming object so an omitted-but-defaulted
+    // field isn't read as a forbidden change against the stored (defaulted) one.
+    if sc.reclaim_policy.is_none() {
+        sc.reclaim_policy =
+            Some(rusternetes_common::resources::volume::PersistentVolumeReclaimPolicy::Delete);
+    }
+    if sc.volume_binding_mode.is_none() {
+        sc.volume_binding_mode =
+            Some(rusternetes_common::resources::volume::VolumeBindingMode::Immediate);
+    }
+
+    let key = build_key("storageclasses", None, &name);
+
+    // Enforce update immutability (upstream ValidateStorageClassUpdate):
+    // parameters / provisioner / reclaimPolicy / volumeBindingMode are immutable.
+    if let Ok(existing) = state.storage.get::<StorageClass>(&key).await {
+        let errs = rusternetes_common::validation::storageclass::validate_storage_class_update(
+            &sc, &existing,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: StorageClass validated successfully (not updated)");
         return Ok(Json(sc));
     }
 
-    let key = build_key("storageclasses", None, &name);
     let updated = state.storage.update(&key, &sc).await?;
 
     Ok(Json(updated))
