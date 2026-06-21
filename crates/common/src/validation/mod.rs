@@ -33,4 +33,5 @@ pub mod resourcequota;
 pub mod runtimeclass;
 pub mod service;
 pub mod storageclass;
+pub mod volumeattachment;
 pub mod volumeattributesclass;

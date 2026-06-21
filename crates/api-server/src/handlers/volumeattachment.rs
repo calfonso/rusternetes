@@ -30,6 +30,13 @@ pub async fn create_volumeattachment(
         crate::handlers::validation::NameKind::DnsSubdomain,
     )?;
 
+    // Validate spec (upstream storage ValidateVolumeAttachment): attacher,
+    // source exactly-one, nodeName.
+    let errs = rusternetes_common::validation::volumeattachment::validate_volume_attachment(&va);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "volumeattachments")
         .with_api_group("storage.k8s.io");
