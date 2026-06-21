@@ -169,6 +169,16 @@ pub async fn update(
         "DaemonSet",
     )?;
 
+    // Full spec validation on update (upstream ValidateDaemonSetUpdate re-runs
+    // ValidateDaemonSetSpec on the new object). Only selector immutability was
+    // checked before, so an otherwise-invalid spec slipped through on update.
+    {
+        let errs = rusternetes_common::validation::apps::validate_daemonset(&daemonset);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Status only mutates via /status; mirror upstream PrepareForUpdate.
     daemonset.status = old_daemonset.status.clone();
 

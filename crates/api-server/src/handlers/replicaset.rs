@@ -181,6 +181,16 @@ pub async fn update(
         "ReplicaSet",
     )?;
 
+    // Full spec validation on update (upstream ValidateReplicaSetUpdate re-runs
+    // ValidateReplicaSetSpec on the new object). Only selector immutability was
+    // checked before, so an otherwise-invalid spec slipped through on update.
+    {
+        let errs = rusternetes_common::validation::apps::validate_replicaset(&replicaset);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Status only mutates via /status; mirror upstream PrepareForUpdate.
     replicaset.status = old_replicaset.status.clone();
 
