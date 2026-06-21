@@ -84,6 +84,36 @@ impl ApiStorage {
         }
     }
 
+    /// Gracefully evict a pod through the api-server (#1284). The api-server
+    /// owns `deletionTimestamp` on a PUT, so the storage-mode "set
+    /// deletionTimestamp + update" path won't terminate the victim in API
+    /// mode. Stamp the eviction status via the `/status` subresource
+    /// (best-effort — a status hiccup must not abort the eviction), then issue
+    /// a real DELETE with `gracePeriodSeconds` so the api-server marks the pod
+    /// for deletion and the kubelet shuts it down. Mirrors the scheduler's
+    /// `DataPlane::evict_pod_for_preemption`.
+    pub async fn evict_pod_graceful<T: Serialize>(
+        &self,
+        key: &str,
+        mutated_pod: &T,
+        grace_seconds: i64,
+    ) -> Result<()> {
+        let path = self.object_path(key).await?;
+        let status_path = format!("{path}/status");
+        let _: std::result::Result<Value, _> = self.client.put(&status_path, mutated_pod).await;
+        let query = vec![("gracePeriodSeconds".to_string(), grace_seconds.to_string())];
+        let status = self
+            .client
+            .delete_with_options(&path, &query, None)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if status.is_success() || status.as_u16() == 404 {
+            Ok(())
+        } else {
+            Err(Error::Storage(format!("evict {key} failed: HTTP {status}")))
+        }
+    }
+
     /// Resolve a plural to `(api_root, namespaced)`. Built-in types hit the
     /// static table with no network; on a miss, the api-server's discovery is
     /// loaded once and cached, then retried, so CRD/aggregated types map too.

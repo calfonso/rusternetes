@@ -436,6 +436,29 @@ impl StorageBackend {
         StorageBackend::Api(api_storage::ApiStorage::new(client))
     }
 
+    /// Gracefully evict a pod, in a mode-aware way (#1284). `mutated_pod` is the
+    /// victim with `deletionTimestamp` + eviction status already applied.
+    ///
+    /// Storage-direct backends persist it whole (a single PUT) — the kubelet's
+    /// own loop then observes `deletionTimestamp` and terminates it, exactly as
+    /// before. The `Api` backend can't (the api-server owns `deletionTimestamp`
+    /// on a PUT), so it stamps the status via `/status` then issues a real
+    /// graceful `DELETE` with `grace_seconds`. Mirrors the scheduler's
+    /// `DataPlane::evict_pod_for_preemption`.
+    pub async fn evict_pod<T>(&self, key: &str, mutated_pod: &T, grace_seconds: i64) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "api-client")]
+            StorageBackend::Api(s) => s.evict_pod_graceful(key, mutated_pod, grace_seconds).await,
+            _ => {
+                Storage::update(self, key, mutated_pod).await?;
+                Ok(())
+            }
+        }
+    }
+
     /// Attach an in-process event bus to the backend so internal `watch()`
     /// consumers get the in-process fast path. Only valid in a single-writer
     /// (all-in-one) process. No-op for etcd/memory: memory already has an
@@ -750,5 +773,41 @@ pub fn build_prefix(resource_type: &str, namespace: Option<&str>) -> String {
     match namespace {
         Some(ns) => format!("/registry/{}/{}/", resource_type, ns),
         None => format!("/registry/{}/", resource_type),
+    }
+}
+
+#[cfg(test)]
+mod evict_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Storage-mode eviction must behaviour-preservingly persist the mutated pod
+    /// (deletionTimestamp + Evicted status) via a whole-object write — i.e.
+    /// identical to the prior `update` path. #1284.
+    #[tokio::test]
+    async fn evict_pod_storage_mode_persists_mutated_pod() {
+        let backend = StorageBackend::new_memory();
+        let key = "/registry/pods/default/victim";
+        let pod = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "victim", "namespace": "default" },
+            "status": { "phase": "Running" }
+        });
+        let _: serde_json::Value = Storage::create(&backend, key, &pod).await.unwrap();
+
+        let mut evicted = pod.clone();
+        evicted["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        evicted["status"]["phase"] = json!("Failed");
+        evicted["status"]["reason"] = json!("Evicted");
+
+        backend.evict_pod(key, &evicted, 30).await.unwrap();
+
+        let stored: serde_json::Value = Storage::get(&backend, key).await.unwrap();
+        assert_eq!(stored["status"]["phase"], "Failed");
+        assert_eq!(stored["status"]["reason"], "Evicted");
+        assert!(
+            stored["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must persist in storage mode: {stored}"
+        );
     }
 }
