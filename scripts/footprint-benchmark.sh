@@ -23,7 +23,8 @@ set -euo pipefail
 SECONDS_TO_SAMPLE=30
 SIZE_ONLY=0
 BUILD=1
-BIN="target/release/rusternetes"
+# Honour CARGO_TARGET_DIR (dev boxes often share one target dir across worktrees).
+BIN="${CARGO_TARGET_DIR:-target}/release/rusternetes"
 COMPOSE_FILE="compose.all-in-one.yml"
 CONTAINER="rusternetes"
 

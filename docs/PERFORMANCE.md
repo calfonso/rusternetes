@@ -3,10 +3,10 @@
 The "k3s without melting your laptop" thesis rests on a number nobody had
 measured. This page is the home for those numbers and how to reproduce them.
 
-> Status: harness landed (`scripts/footprint-benchmark.sh`). Binary-size numbers
-> below are real (host target); the idle RSS / CPU / time-to-cluster cells are
-> placeholders until run on reference hardware and head-to-head against k3s.
-> Run the harness and replace the `TBD` cells.
+> Status: harness landed (`scripts/footprint-benchmark.sh`). The binary-size row
+> below is a **real measurement** (release host target, glibc). The idle RSS /
+> CPU / time-to-cluster cells are placeholders until run on reference hardware
+> head-to-head against k3s — run the harness and replace the `TBD` cells.
 
 ## Why this matters
 
@@ -79,13 +79,17 @@ Reference hardware: _TBD (record CPU/RAM/OS when filling this in)_.
 
 | Metric | rusternetes | k3s | Notes |
 |---|---|---|---|
-| Binary size (raw) | TBD | — | release host target |
-| Binary size (stripped) | TBD | — | `strip` |
+| Binary size (release, glibc) | **75.1 MiB** | — | dynamically linked; the release profile already strips symbols, so raw == stripped |
 | Binary size (musl+strip) | TBD | ~70 MB | static |
 | Time-to-cluster | TBD | TBD | `up` → first node Ready |
 | Idle RSS (avg) | TBD | ~535–750 MB | all-in-one container |
 | Idle RSS (max) | TBD | — | |
 | Idle CPU (avg) | TBD | TBD | |
 
-_Fill the `TBD` cells from a `scripts/footprint-benchmark.sh` run plus a k3s run
-on the same box._
+The 75 MiB all-in-one binary is in the same ballpark as k3s's static binary
+(~70 MB) — but binary size is the *easy* dimension. The thesis lives or dies on
+**idle RSS** (the `TBD` rows), which is why #1039/#1040 target it; measure those
+before claiming the niche.
+
+_Fill the remaining `TBD` cells from a `scripts/footprint-benchmark.sh` run plus
+a k3s run on the same box._
