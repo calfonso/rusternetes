@@ -49,6 +49,13 @@ pub async fn create_podtemplate(
     // Ensure namespace is set from the URL path
     podtemplate.metadata.namespace = Some(namespace.clone());
 
+    // Validate the embedded template (upstream ValidatePodTemplateSpec): labels,
+    // annotations, and the pod spec.
+    let errs = rusternetes_common::validation::podtemplate::validate_pod_template(&podtemplate);
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     // Enrich metadata with system fields
     podtemplate.metadata.ensure_uid();
     podtemplate.metadata.ensure_creation_timestamp();

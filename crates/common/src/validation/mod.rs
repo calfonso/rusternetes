@@ -17,6 +17,7 @@ pub mod networkpolicy;
 pub mod objectmeta;
 pub mod pdb;
 pub mod pod;
+pub mod podtemplate;
 pub mod pvc;
 pub mod service;
 pub mod storageclass;
