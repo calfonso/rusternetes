@@ -2,10 +2,10 @@
 //! `pkg/apis/discovery/validation/validation.go::ValidateEndpointSlice`
 //! (release-1.35).
 //!
-//! Scope: `addressType`, each endpoint's addresses (≥1, valid for the address
-//! type) and each port (protocol/number/name). The size caps (max endpoints/
-//! addresses/ports), nodeName/hostname/topology/hints detail are left as a
-//! follow-up.
+//! Scope: `addressType`, each endpoint's addresses (≥1, ≤100, valid for the
+//! address type), each port (protocol/number/name), and the slice-level size
+//! caps (≤1000 endpoints, ≤20000 ports). nodeName/hostname/topology/hints
+//! detail is left as a follow-up.
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -13,6 +13,11 @@ use std::str::FromStr;
 use crate::resources::endpointslice::{EndpointPort, EndpointSlice};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+
+// Upstream `pkg/apis/discovery/validation` size limits.
+const MAX_ENDPOINTS: usize = 1000;
+const MAX_ADDRESSES: usize = 100;
+const MAX_PORTS: usize = 20000;
 
 /// Upstream `IsValidPortName`: IANA_SVC_NAME (DNS-1123 label ≤15 chars w/ a letter).
 fn is_valid_port_name(s: &str) -> bool {
@@ -65,6 +70,10 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
     }
 
     let eps_path = Path::new("endpoints");
+    // Upstream caps the number of endpoints per slice (maxEndpoints).
+    if slice.endpoints.len() > MAX_ENDPOINTS {
+        errs.push(Error::too_many(&eps_path, MAX_ENDPOINTS));
+    }
     for (i, ep) in slice.endpoints.iter().enumerate() {
         let addr_path = eps_path.index(i).child("addresses");
         if ep.addresses.is_empty() {
@@ -72,6 +81,8 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
                 &addr_path,
                 "must contain at least 1 address",
             ));
+        } else if ep.addresses.len() > MAX_ADDRESSES {
+            errs.push(Error::too_many(&addr_path, MAX_ADDRESSES));
         }
         for (j, addr) in ep.addresses.iter().enumerate() {
             let p = addr_path.index(j);
@@ -95,6 +106,10 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
     }
 
     let ports_path = Path::new("ports");
+    // Upstream caps the number of ports per slice (maxPorts).
+    if slice.ports.len() > MAX_PORTS {
+        errs.push(Error::too_many(&ports_path, MAX_PORTS));
+    }
     for (i, port) in slice.ports.iter().enumerate() {
         errs.extend(validate_port(port, &ports_path.index(i)));
     }
@@ -118,4 +133,66 @@ pub fn validate_endpoint_slice_update(
         ));
     }
     errs
+}
+
+#[cfg(test)]
+mod size_cap_tests {
+    use super::*;
+
+    fn slice_with(endpoints: usize, addrs_per: usize, ports: usize) -> EndpointSlice {
+        let eps: Vec<_> = (0..endpoints)
+            .map(|_| serde_json::json!({"addresses": vec!["10.0.0.1"; addrs_per.max(1)]}))
+            .collect();
+        let ps: Vec<_> = (0..ports)
+            .map(|_| serde_json::json!({"port": 80}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "es"},
+            "addressType": "IPv4",
+            "endpoints": eps,
+            "ports": ps
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn within_caps_passes() {
+        let s = slice_with(2, 1, 2);
+        assert!(validate_endpoint_slice(&s)
+            .iter()
+            .all(|e| !e.to_string().contains("at most")));
+    }
+
+    #[test]
+    fn too_many_endpoints_rejected() {
+        let s = slice_with(MAX_ENDPOINTS + 1, 1, 1);
+        let errs = validate_endpoint_slice(&s);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "endpoints" && e.to_string().contains("at most")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_addresses_rejected() {
+        let s = slice_with(1, MAX_ADDRESSES + 1, 1);
+        let errs = validate_endpoint_slice(&s);
+        assert!(
+            errs.iter()
+                .any(|e| e.field.contains("addresses") && e.to_string().contains("at most")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_ports_rejected() {
+        let s = slice_with(1, 1, MAX_PORTS + 1);
+        let errs = validate_endpoint_slice(&s);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "ports" && e.to_string().contains("at most")),
+            "{errs:?}"
+        );
+    }
 }
