@@ -5,9 +5,11 @@
 //! plus dual-stack one-per-family). ObjectMeta is validated separately by the
 //! handler (see #1087 / #1277); node status, resources and swap are out of scope.
 
-use crate::resources::node::Node;
+use crate::resources::node::{ConfigMapNodeConfigSource, Node, NodeConfigSource, NodeConfigStatus};
 use crate::validation::field::{Error, ErrorList, Path};
-use crate::validation::metav1::{is_valid_label_value, validate_label_name};
+use crate::validation::metav1::{
+    is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_label_name,
+};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
@@ -235,9 +237,13 @@ fn validate_node_resources(
 /// - `status.capacity` / `status.allocatable` — `ValidateNodeResources`
 ///   (non-negative quantities).
 ///
+/// - `status.config` — `validateNodeConfigStatus` (the assigned/active/
+///   lastKnownGood ConfigMap references). This targets the removed
+///   DynamicKubeletConfig feature and is never populated by a current kubelet,
+///   but is ported for parity with upstream `ValidateNodeUpdate`.
+///
 /// These checks compare only against the new object (upstream's status portion
-/// does not consult the old object). `status.config` (`validateNodeConfigStatus`)
-/// targets the removed DynamicKubeletConfig feature and is tracked separately.
+/// does not consult the old object).
 pub fn validate_node_status_update(new_node: &Node) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let Some(status) = new_node.status.as_ref() else {
@@ -274,6 +280,144 @@ pub fn validate_node_status_update(new_node: &Node) -> ErrorList {
         &status_path.child("allocatable"),
     ));
 
+    if let Some(config) = &status.config {
+        errs.extend(validate_node_config_status(
+            config,
+            &status_path.child("config"),
+        ));
+    }
+
+    errs
+}
+
+/// Port of upstream `IsConfigMapKey`: ≤253 chars, `[-._a-zA-Z0-9]+`, not `.`/`..`.
+fn is_config_map_key(value: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    if value.len() > 253 {
+        errs.push("must be no more than 253 characters".to_string());
+    }
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        errs.push(
+            "a valid config key must consist of alphanumeric characters, '-', '_' or '.'"
+                .to_string(),
+        );
+    }
+    if value == "." || value == ".." {
+        errs.push("must not be '.' or '..'".to_string());
+    }
+    errs
+}
+
+/// Port of upstream `validateConfigMapNodeConfigSource`: target ConfigMap
+/// namespace (DNS-1123 label), name (DNS-1123 subdomain), and `kubeletConfigKey`
+/// (a valid ConfigMap key) are all required and well-formed.
+fn validate_config_map_node_config_source(
+    source: &ConfigMapNodeConfigSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if source.namespace.is_empty() {
+        errs.push(Error::required(&fld_path.child("namespace"), ""));
+    } else {
+        for msg in is_dns1123_label(&source.namespace) {
+            errs.push(Error::invalid(
+                &fld_path.child("namespace"),
+                source.namespace.clone(),
+                msg,
+            ));
+        }
+    }
+    if source.name.is_empty() {
+        errs.push(Error::required(&fld_path.child("name"), ""));
+    } else {
+        for msg in is_dns1123_subdomain(&source.name) {
+            errs.push(Error::invalid(
+                &fld_path.child("name"),
+                source.name.clone(),
+                msg,
+            ));
+        }
+    }
+    let key = source.kubelet_config_key.as_deref().unwrap_or("");
+    if key.is_empty() {
+        errs.push(Error::required(&fld_path.child("kubeletConfigKey"), ""));
+    } else {
+        for msg in is_config_map_key(key) {
+            errs.push(Error::invalid(
+                &fld_path.child("kubeletConfigKey"),
+                key.to_string(),
+                msg,
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateConfigMapNodeConfigSourceStatus`: a status source
+/// additionally requires `uid` and `resourceVersion`.
+fn validate_config_map_node_config_source_status(
+    source: &ConfigMapNodeConfigSource,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if source.uid.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("uid"), ""));
+    }
+    if source.resource_version.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("resourceVersion"), ""));
+    }
+    errs.extend(validate_config_map_node_config_source(source, fld_path));
+    errs
+}
+
+/// Port of upstream `validateNodeConfigSourceStatus`: exactly one reference
+/// subfield (currently only `configMap`) must be set.
+fn validate_node_config_source_status(source: &NodeConfigSource, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut count = 0;
+    if let Some(cm) = &source.config_map {
+        count += 1;
+        errs.extend(validate_config_map_node_config_source_status(
+            cm,
+            &fld_path.child("configMap"),
+        ));
+    }
+    if count != 1 {
+        errs.push(Error::invalid(
+            fld_path,
+            "<configSource>".to_string(),
+            "exactly one reference subfield must be non-nil",
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `validateNodeConfigStatus`: validate the assigned / active /
+/// lastKnownGood config sources when set.
+fn validate_node_config_status(config: &NodeConfigStatus, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(assigned) = &config.assigned {
+        errs.extend(validate_node_config_source_status(
+            assigned,
+            &fld_path.child("assigned"),
+        ));
+    }
+    if let Some(active) = &config.active {
+        errs.extend(validate_node_config_source_status(
+            active,
+            &fld_path.child("active"),
+        ));
+    }
+    if let Some(lkg) = &config.last_known_good {
+        errs.extend(validate_node_config_source_status(
+            lkg,
+            &fld_path.child("lastKnownGood"),
+        ));
+    }
     errs
 }
 
@@ -360,5 +504,68 @@ mod status_update_tests {
     fn empty_status_passes() {
         let node = node_with_status(serde_json::json!({}));
         assert!(validate_node_status_update(&node).is_empty());
+    }
+
+    #[test]
+    fn config_status_valid_assigned_passes() {
+        let node = node_with_status(serde_json::json!({
+            "config": {"assigned": {"configMap": {
+                "namespace": "kube-system", "name": "my-config",
+                "uid": "abc-123", "resourceVersion": "42", "kubeletConfigKey": "kubelet"
+            }}}
+        }));
+        assert!(
+            validate_node_status_update(&node).is_empty(),
+            "{:?}",
+            validate_node_status_update(&node)
+        );
+    }
+
+    #[test]
+    fn config_status_requires_uid_and_resource_version() {
+        let node = node_with_status(serde_json::json!({
+            "config": {"active": {"configMap": {
+                "namespace": "kube-system", "name": "my-config", "kubeletConfigKey": "kubelet"
+            }}}
+        }));
+        let errs = validate_node_status_update(&node);
+        assert!(errs.iter().any(|e| e.field.ends_with("uid")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("resourceVersion")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn config_status_empty_source_rejected() {
+        // a NodeConfigSource with no subfield set -> "exactly one reference subfield"
+        let node = node_with_status(serde_json::json!({
+            "config": {"assigned": {}}
+        }));
+        let errs = validate_node_status_update(&node);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("exactly one reference subfield")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn config_status_bad_namespace_and_key_rejected() {
+        let node = node_with_status(serde_json::json!({
+            "config": {"assigned": {"configMap": {
+                "namespace": "Bad_NS", "name": "cfg", "uid": "u", "resourceVersion": "1",
+                "kubeletConfigKey": "bad key!"
+            }}}
+        }));
+        let errs = validate_node_status_update(&node);
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("namespace")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("kubeletConfigKey")),
+            "{errs:?}"
+        );
     }
 }
