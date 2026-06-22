@@ -181,10 +181,18 @@ impl<S: Storage + 'static> TTLController<S> {
         Ok(())
     }
 
-    /// Get TTL seconds from Job spec
+    /// Get the effective `ttlSecondsAfterFinished` for a Job.
+    ///
+    /// Upstream's ttl-after-finished controller reads the typed
+    /// `JobSpec.TTLSecondsAfterFinished` field
+    /// (`pkg/controller/ttlafterfinished`: `needsCleanup` /
+    /// `getFinishAndExpireTime`). We prefer that field, falling back to the
+    /// legacy `ttlSecondsAfterFinished` annotation for objects that only carry
+    /// it there.
     pub fn get_ttl_seconds_after_finished(&self, job: &Job) -> Option<i32> {
-        // Check if the job spec has ttlSecondsAfterFinished annotation
-        // Since we don't have it in the spec yet, check annotations
+        if let Some(ttl) = job.spec.ttl_seconds_after_finished {
+            return Some(ttl);
+        }
         job.metadata
             .annotations
             .as_ref()

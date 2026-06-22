@@ -623,12 +623,10 @@ async fn test_ttl_controller_cleans_jobs_across_namespaces() {
 }
 
 /// Upstream ttl-after-finished reads `spec.ttlSecondsAfterFinished` (a typed
-/// `*int32` on JobSpec). The rusternetes controller currently only reads the
-/// `ttlSecondsAfterFinished` annotation. This test pins that gap as
-/// RED-state: when the field is set on the spec but not duplicated as an
-/// annotation, the controller leaves the job alone.
+/// `*int32` on JobSpec). `TTLController::get_ttl_seconds_after_finished` now
+/// prefers that typed field (falling back to the legacy annotation), so a Job
+/// that sets only the spec field is cleaned up once expired.
 #[tokio::test]
-#[ignore = "RED-state: TTLController only reads annotations, not JobSpec.ttl_seconds_after_finished"]
 async fn test_ttl_controller_reads_ttl_from_job_spec_field() {
     let storage = setup_test().await;
 
