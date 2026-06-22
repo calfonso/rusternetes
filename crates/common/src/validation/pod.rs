@@ -24,12 +24,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
     Container, EnvVar, Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod,
-    PodDNSConfig, PodSchedulingGate, PodSecurityContext, PodSpec, Probe, Toleration, Volume,
-    VolumeMount,
+    PodDNSConfig, PodSchedulingGate, PodSecurityContext, PodSpec, Probe, Toleration,
+    TopologySpreadConstraint, Volume, VolumeMount,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
+    validate_label_name, validate_label_selector, LabelSelectorValidationOptions,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -222,6 +223,14 @@ pub fn validate_pod_spec(
     // Tolerations.
     if let Some(ref tols) = spec.tolerations {
         errs.extend(validate_tolerations(tols, &fld_path.child("tolerations")));
+    }
+
+    // topologySpreadConstraints.
+    if let Some(ref tscs) = spec.topology_spread_constraints {
+        errs.extend(validate_topology_spread_constraints(
+            tscs,
+            &fld_path.child("topologySpreadConstraints"),
+        ));
     }
 
     // dnsPolicy + dnsConfig consistency.
@@ -768,6 +777,151 @@ fn validate_lifecycle_handler(handler: &LifecycleHandler, fld_path: &Path) -> Er
     check(handler.sleep.is_some(), "sleep");
     if num_handlers == 0 {
         errs.push(Error::required(fld_path, "must specify a handler type"));
+    }
+    errs
+}
+
+const SCHEDULE_ACTIONS: &[&str] = &["DoNotSchedule", "ScheduleAnyway"];
+const NODE_INCLUSION_POLICIES: &[&str] = &["Honor", "Ignore"];
+
+/// Port of upstream `validateTopologySpreadConstraints`: per constraint —
+/// `maxSkew > 0`, `topologyKey` required, `whenUnsatisfiable` enum, no repeated
+/// `{topologyKey, whenUnsatisfiable}` tuple, `minDomains > 0` only with
+/// `DoNotSchedule`, `nodeAffinityPolicy`/`nodeTaintsPolicy` enums,
+/// `matchLabelKeys` (valid label names, disjoint from the selector), and the
+/// `labelSelector` itself.
+fn validate_topology_spread_constraints(
+    constraints: &[TopologySpreadConstraint],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, c) in constraints.iter().enumerate() {
+        let sub = fld_path.index(i);
+
+        if c.max_skew <= 0 {
+            errs.push(Error::invalid(
+                &sub.child("maxSkew"),
+                c.max_skew as i64,
+                "must be greater than 0",
+            ));
+        }
+        if c.topology_key.is_empty() {
+            errs.push(Error::required(
+                &sub.child("topologyKey"),
+                "can not be empty",
+            ));
+        }
+        if !SCHEDULE_ACTIONS.contains(&c.when_unsatisfiable.as_str()) {
+            errs.push(Error::not_supported(
+                &sub.child("whenUnsatisfiable"),
+                c.when_unsatisfiable.clone(),
+                SCHEDULE_ACTIONS,
+            ));
+        }
+        // {topologyKey, whenUnsatisfiable} must not repeat across constraints.
+        for other in &constraints[i + 1..] {
+            if c.topology_key == other.topology_key
+                && c.when_unsatisfiable == other.when_unsatisfiable
+            {
+                errs.push(Error::duplicate(
+                    &sub.child("{topologyKey, whenUnsatisfiable}"),
+                    format!("{{{}, {}}}", c.topology_key, c.when_unsatisfiable),
+                ));
+                break;
+            }
+        }
+        // minDomains: positive, and only with DoNotSchedule.
+        if let Some(md) = c.min_domains {
+            let md_path = sub.child("minDomains");
+            if md <= 0 {
+                errs.push(Error::invalid(
+                    &md_path,
+                    md as i64,
+                    "must be greater than 0",
+                ));
+            }
+            if c.when_unsatisfiable != "DoNotSchedule" {
+                errs.push(Error::invalid(
+                    &md_path,
+                    md as i64,
+                    format!(
+                        "can only use minDomains if whenUnsatisfiable=DoNotSchedule, not {}",
+                        c.when_unsatisfiable
+                    ),
+                ));
+            }
+        }
+        // nodeAffinityPolicy / nodeTaintsPolicy enums.
+        for (policy, child) in [
+            (&c.node_affinity_policy, "nodeAffinityPolicy"),
+            (&c.node_taints_policy, "nodeTaintsPolicy"),
+        ] {
+            if let Some(p) = policy.as_deref() {
+                if !NODE_INCLUSION_POLICIES.contains(&p) {
+                    errs.push(Error::not_supported(
+                        &sub.child(child),
+                        p.to_string(),
+                        NODE_INCLUSION_POLICIES,
+                    ));
+                }
+            }
+        }
+        // matchLabelKeys: valid label names, disjoint from the selector keys.
+        errs.extend(validate_match_label_keys(
+            c.match_label_keys.as_deref(),
+            c.label_selector.as_ref(),
+            &sub.child("matchLabelKeys"),
+        ));
+        // labelSelector.
+        if let Some(sel) = &c.label_selector {
+            errs.extend(validate_label_selector(
+                sel,
+                LabelSelectorValidationOptions::default(),
+                &sub.child("labelSelector"),
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `ValidateMatchLabelKeysInTopologySpread`.
+fn validate_match_label_keys(
+    match_label_keys: Option<&[String]>,
+    label_selector: Option<&crate::types::LabelSelector>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(keys) = match_label_keys.filter(|k| !k.is_empty()) else {
+        return errs;
+    };
+
+    let mut selector_keys: HashSet<&str> = HashSet::new();
+    match label_selector {
+        Some(sel) => {
+            if let Some(ml) = &sel.match_labels {
+                selector_keys.extend(ml.keys().map(|k| k.as_str()));
+            }
+            if let Some(me) = &sel.match_expressions {
+                selector_keys.extend(me.iter().map(|e| e.key.as_str()));
+            }
+        }
+        None => {
+            errs.push(Error::forbidden(
+                fld_path,
+                "must not be specified when labelSelector is not set",
+            ));
+        }
+    }
+
+    for (i, key) in keys.iter().enumerate() {
+        errs.extend(validate_label_name(key, &fld_path.index(i)));
+        if selector_keys.contains(key.as_str()) {
+            errs.push(Error::invalid(
+                &fld_path.index(i),
+                key.clone(),
+                "exists in both matchLabelKeys and labelSelector",
+            ));
+        }
     }
     errs
 }
@@ -2327,6 +2481,17 @@ mod tests {
         .collect()
     }
 
+    fn tsc_errs(json: serde_json::Value) -> Vec<String> {
+        let tscs: Vec<TopologySpreadConstraint> = serde_json::from_value(json).unwrap();
+        validate_topology_spread_constraints(
+            &tscs,
+            &Path::new("spec").child("topologySpreadConstraints"),
+        )
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect()
+    }
+
     #[test]
     fn image_pull_policy_enum() {
         assert!(cerrs(
@@ -2382,5 +2547,71 @@ mod tests {
             "name": "c", "image": "i", "lifecycle": {"preStop": {"exec": {"command": ["x"]}}}
         }));
         assert!(!ok.iter().any(|e| e.contains("handler type")), "{ok:?}");
+    }
+
+    #[test]
+    fn topology_spread_valid_passes() {
+        assert!(tsc_errs(serde_json::json!([
+            {"maxSkew": 1, "topologyKey": "zone", "whenUnsatisfiable": "DoNotSchedule",
+             "labelSelector": {"matchLabels": {"app": "x"}}}
+        ]))
+        .is_empty());
+    }
+
+    #[test]
+    fn topology_spread_field_checks() {
+        let e = tsc_errs(serde_json::json!([
+            {"maxSkew": 0, "topologyKey": "", "whenUnsatisfiable": "Maybe"}
+        ]));
+        assert!(e.iter().any(|m| m.contains("maxSkew")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("topologyKey")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("whenUnsatisfiable")), "{e:?}");
+    }
+
+    #[test]
+    fn topology_spread_duplicate_tuple_rejected() {
+        let e = tsc_errs(serde_json::json!([
+            {"maxSkew": 1, "topologyKey": "zone", "whenUnsatisfiable": "DoNotSchedule"},
+            {"maxSkew": 2, "topologyKey": "zone", "whenUnsatisfiable": "DoNotSchedule"}
+        ]));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("topologyKey, whenUnsatisfiable")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn topology_spread_min_domains_requires_donotschedule() {
+        let e = tsc_errs(serde_json::json!([
+            {"maxSkew": 1, "topologyKey": "zone", "whenUnsatisfiable": "ScheduleAnyway", "minDomains": 2}
+        ]));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("can only use minDomains if whenUnsatisfiable=DoNotSchedule")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn topology_spread_node_policy_and_match_label_keys() {
+        let bad_policy = tsc_errs(serde_json::json!([
+            {"maxSkew": 1, "topologyKey": "z", "whenUnsatisfiable": "DoNotSchedule", "nodeAffinityPolicy": "Bogus"}
+        ]));
+        assert!(
+            bad_policy.iter().any(|m| m.contains("nodeAffinityPolicy")),
+            "{bad_policy:?}"
+        );
+        // matchLabelKeys overlapping the selector is rejected.
+        let overlap = tsc_errs(serde_json::json!([
+            {"maxSkew": 1, "topologyKey": "z", "whenUnsatisfiable": "DoNotSchedule",
+             "labelSelector": {"matchLabels": {"app": "x"}}, "matchLabelKeys": ["app"]}
+        ]));
+        assert!(
+            overlap
+                .iter()
+                .any(|m| m.contains("exists in both matchLabelKeys and labelSelector")),
+            "{overlap:?}"
+        );
     }
 }
