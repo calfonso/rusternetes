@@ -130,14 +130,26 @@ pub async fn update_controllerrevision(
     cr.metadata.name = name.clone();
     cr.metadata.namespace = Some(namespace.clone());
 
+    let key = build_key("controllerrevisions", Some(&namespace), &name);
+
+    // Update validation (upstream ValidateControllerRevisionUpdate): re-run the
+    // create checks and enforce that `data` is immutable.
+    if let Ok(old) = state.storage.get::<ControllerRevision>(&key).await {
+        let errs =
+            rusternetes_common::validation::controllerrevision::validate_controller_revision_update(
+                &cr, &old,
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Handle dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: ControllerRevision validated successfully (not updated)");
         return Ok(Json(cr));
     }
-
-    let key = build_key("controllerrevisions", Some(&namespace), &name);
 
     // Try to update first, if not found then create (upsert behavior)
     let result = match state.storage.update(&key, &cr).await {

@@ -27,3 +27,51 @@ pub fn validate_controller_revision(cr: &ControllerRevision) -> ErrorList {
     }
     errs
 }
+
+/// Validate a `ControllerRevision` on update. Mirrors upstream
+/// `ValidateControllerRevisionUpdate`: re-run the create validation and enforce
+/// that `data` is immutable (only `revision` and metadata may change).
+pub fn validate_controller_revision_update(
+    new: &ControllerRevision,
+    old: &ControllerRevision,
+) -> ErrorList {
+    let mut errs = validate_controller_revision(new);
+    if new.data != old.data {
+        errs.push(Error::invalid(
+            &Path::new("data"),
+            "<data>".to_string(),
+            "field is immutable",
+        ));
+    }
+    errs
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn cr(rev: i64, data: serde_json::Value) -> ControllerRevision {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "rev1"},
+            "revision": rev,
+            "data": data,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn revision_may_change_data_may_not() {
+        let old = cr(1, serde_json::json!({"k": "v"}));
+        // Only revision changes -> allowed.
+        let bumped = cr(2, serde_json::json!({"k": "v"}));
+        assert!(validate_controller_revision_update(&bumped, &old).is_empty());
+        // data changes -> immutable error.
+        let changed = cr(1, serde_json::json!({"k": "w"}));
+        let errs = validate_controller_revision_update(&changed, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "data" && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+    }
+}
