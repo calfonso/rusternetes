@@ -102,3 +102,222 @@ pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &P
 pub fn validate_persistent_volume(pv: &PersistentVolume) -> ErrorList {
     validate_persistent_volume_spec(&pv.spec, &Path::new("spec"))
 }
+
+/// JSON view of just the volume-source union of a `PersistentVolumeSpec`
+/// (`PersistentVolumeSource` upstream) — the fields that are immutable after
+/// creation. Capacity / accessModes / reclaimPolicy etc. are intentionally
+/// excluded.
+fn persistent_volume_source(spec: &PersistentVolumeSpec) -> serde_json::Value {
+    serde_json::json!({
+        "hostPath": spec.host_path,
+        "nfs": spec.nfs,
+        "iscsi": spec.iscsi,
+        "local": spec.local,
+        "csi": spec.csi,
+    })
+}
+
+/// Validate a `PersistentVolume` on update. Mirrors upstream
+/// `ValidatePersistentVolumeUpdate`: re-run create validation, then enforce that
+/// the volume source and `volumeMode` are immutable. The CSI
+/// `controllerExpandSecretRef` may be set when it was previously unset (allowed
+/// for volume expansion), so it is excluded from the source-immutability diff in
+/// that case.
+pub fn validate_persistent_volume_update(
+    new: &PersistentVolume,
+    old: &PersistentVolume,
+) -> ErrorList {
+    let mut errs = validate_persistent_volume(new);
+
+    // Allow first-time setting of csi.controllerExpandSecretRef: normalise the
+    // new spec to drop it before the source diff when old had none.
+    let mut new_spec = new.spec.clone();
+    let old_had_expand_ref = old
+        .spec
+        .csi
+        .as_ref()
+        .map(|c| c.controller_expand_secret_ref.is_some())
+        .unwrap_or(false);
+    if !old_had_expand_ref {
+        if let Some(csi) = new_spec.csi.as_mut() {
+            csi.controller_expand_secret_ref = None;
+        }
+    }
+
+    if persistent_volume_source(&new_spec) != persistent_volume_source(&old.spec) {
+        errs.push(Error::forbidden(
+            &Path::new("spec").child("persistentvolumesource"),
+            "spec.persistentvolumesource is immutable after creation",
+        ));
+    }
+
+    if new.spec.volume_mode != old.spec.volume_mode {
+        errs.push(Error::invalid(
+            &Path::new("spec").child("volumeMode"),
+            format!("{:?}", new.spec.volume_mode),
+            "field is immutable",
+        ));
+    }
+
+    // nodeAffinity: immutable once set (upstream validatePvNodeAffinity, with the
+    // default-off MutablePVNodeAffinity gate). A nil → set transition is allowed.
+    // The beta→GA topology-label masking carve-out is not modelled.
+    if old.spec.node_affinity.is_some() {
+        let na_eq = serde_json::to_value(&new.spec.node_affinity).ok()
+            == serde_json::to_value(&old.spec.node_affinity).ok();
+        if !na_eq {
+            errs.push(Error::invalid(
+                &Path::new("spec").child("nodeAffinity"),
+                "<nodeAffinity>".to_string(),
+                "field is immutable",
+            ));
+        }
+    }
+
+    // volumeAttributesClassName: with the VolumeAttributesClass feature enabled
+    // (beta-on by 1.35), an existing class may be changed but not cleared.
+    if old.spec.volume_attributes_class_name.is_some()
+        && new.spec.volume_attributes_class_name.is_none()
+    {
+        errs.push(Error::forbidden(
+            &Path::new("spec").child("volumeAttributesClassName"),
+            "update from non-nil value to nil is forbidden",
+        ));
+    }
+
+    errs
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn pv(json: serde_json::Value) -> PersistentVolume {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn hostpath_pv(path: &str) -> PersistentVolume {
+        pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Retain",
+                "hostPath": {"path": path}
+            }
+        }))
+    }
+
+    #[test]
+    fn unchanged_passes() {
+        let old = hostpath_pv("/data");
+        let new = hostpath_pv("/data");
+        assert!(validate_persistent_volume_update(&new, &old).is_empty());
+    }
+
+    #[test]
+    fn changed_source_rejected() {
+        let old = hostpath_pv("/data");
+        let new = hostpath_pv("/other");
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("persistentvolumesource is immutable")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn changed_volume_mode_rejected() {
+        let mut old = hostpath_pv("/data");
+        old.spec.volume_mode = Some(crate::resources::volume::PersistentVolumeMode::Filesystem);
+        let mut new = hostpath_pv("/data");
+        new.spec.volume_mode = Some(crate::resources::volume::PersistentVolumeMode::Block);
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field.ends_with("volumeMode") && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn first_time_csi_expand_secret_ref_allowed() {
+        let old = pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "csi": {"driver": "csi.example.com", "volumeHandle": "vol-1"}}
+        }));
+        let new = pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "csi": {"driver": "csi.example.com", "volumeHandle": "vol-1",
+                    "controllerExpandSecretRef": {"name": "s", "namespace": "ns"}}}
+        }));
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.to_string().contains("persistentvolumesource")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn node_affinity_immutable_once_set() {
+        let na = serde_json::json!({"required": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["n1"]}]}
+        ]}});
+        let mut old = hostpath_pv("/data");
+        old.spec.node_affinity = serde_json::from_value(na.clone()).unwrap();
+        // unchanged -> ok
+        let mut same = hostpath_pv("/data");
+        same.spec.node_affinity = serde_json::from_value(na).unwrap();
+        assert!(validate_persistent_volume_update(&same, &old).is_empty());
+        // changed -> immutable
+        let mut changed = hostpath_pv("/data");
+        changed.spec.node_affinity = serde_json::from_value(serde_json::json!({"required": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["n2"]}]}
+        ]}})).unwrap();
+        let errs = validate_persistent_volume_update(&changed, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.field.ends_with("nodeAffinity") && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn node_affinity_may_be_set_when_old_nil() {
+        let old = hostpath_pv("/data"); // no nodeAffinity
+        let mut new = hostpath_pv("/data");
+        new.spec.node_affinity =
+            serde_json::from_value(serde_json::json!({"required": {"nodeSelectorTerms": [
+                {"matchExpressions": [{"key": "k", "operator": "Exists"}]}
+            ]}}))
+            .unwrap();
+        assert!(validate_persistent_volume_update(&new, &old).is_empty());
+    }
+
+    #[test]
+    fn vac_name_may_not_be_cleared() {
+        let mut old = hostpath_pv("/data");
+        old.spec.volume_attributes_class_name = Some("gold".to_string());
+        let new = hostpath_pv("/data"); // VAC cleared
+        let errs = validate_persistent_volume_update(&new, &old);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("non-nil value to nil is forbidden")),
+            "{errs:?}"
+        );
+        // changing to another class is allowed
+        let mut changed = hostpath_pv("/data");
+        changed.spec.volume_attributes_class_name = Some("silver".to_string());
+        assert!(!validate_persistent_volume_update(&changed, &old)
+            .iter()
+            .any(|e| e.field.ends_with("volumeAttributesClassName")));
+    }
+}

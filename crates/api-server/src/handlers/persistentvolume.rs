@@ -211,6 +211,18 @@ pub async fn update_pv(
 
     let key = build_key("persistentvolumes", None, &name);
 
+    // Update validation (upstream ValidatePersistentVolumeUpdate): re-run the
+    // create checks and enforce volume-source / volumeMode immutability.
+    if let Ok(old) = state.storage.get::<PersistentVolume>(&key).await {
+        let errs =
+            rusternetes_common::validation::persistentvolume::validate_persistent_volume_update(
+                &pv, &old,
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
         info!(
