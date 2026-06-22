@@ -570,57 +570,14 @@ async fn test_serviceaccount_reconcile_fans_out_to_all_namespaces() {
     }
 }
 
-/// RED-state: the ServiceAccount controller does not issue bound, audience-
-/// scoped tokens with caller-supplied `expirationSeconds`. Upstream this is
-/// served by the `TokenRequest` subresource on the api-server
-/// (`crates/api-server/src/handlers/service_account.rs::create_token`), not by
-/// the controller. The controller still owns the legacy long-lived token in
-/// the Secret. This test pins the eventual contract: a per-namespace SA should
-/// be able to request a projected token with a specific audience that ends up
-/// in a Secret reachable by the SA controller (or a successor projection path).
-#[tokio::test]
-#[ignore = "RED-state: bound SA token projection (audience + expirationSeconds) lives in api-server TokenRequest, not yet wired to the controller"]
-async fn test_serviceaccount_bound_token_projection_audience_and_expiry() {
-    let storage = Arc::new(MemoryStorage::new());
-    let controller = ServiceAccountController::new(storage.clone());
-
-    let ns_name = "test-sa-bound-token";
-    storage
-        .create(
-            &build_key("namespaces", None, ns_name),
-            &active_namespace(ns_name),
-        )
-        .await
-        .unwrap();
-
-    controller.reconcile_all().await.unwrap();
-
-    // The contract we want once bound-token projection is wired through the
-    // controller: a projected token Secret carrying the requested audience and
-    // a non-default expirationSeconds annotation. The current implementation
-    // only writes the legacy `default-token` Secret with no audience metadata,
-    // so this test deliberately fails until the feature lands.
-    let secret_key = build_key("secrets", Some(ns_name), "default-token-bound");
-    let secret: Secret = storage
-        .get(&secret_key)
-        .await
-        .expect("bound token Secret should be projected by controller");
-
-    let annotations = secret
-        .metadata
-        .annotations
-        .as_ref()
-        .expect("bound token Secret must carry audience/expiration annotations");
-    assert_eq!(
-        annotations
-            .get("kubernetes.io/service-account.token-audience")
-            .map(String::as_str),
-        Some("https://kubernetes.default.svc")
-    );
-    assert_eq!(
-        annotations
-            .get("kubernetes.io/service-account.token-expiration-seconds")
-            .map(String::as_str),
-        Some("3600")
-    );
-}
+// NOTE: Bound, audience-scoped tokens with caller-supplied `expirationSeconds`
+// are an **api-server** concern served on-demand by the `TokenRequest`
+// subresource (`handlers::authentication::create_token_request`), which sets the
+// token's `exp` from `spec.expirationSeconds` and `aud` from `spec.audiences`.
+// Upstream has no controller that writes a "bound token" Secret — bound tokens
+// are minted per request and projected into pods via projected volumes. So
+// there is no controller behaviour to test here; the TokenRequest contract is
+// covered by `api-server/tests/tokenrequest_expiration_test.rs` and
+// `api-server/tests/conformance_auth_rbac_serviceaccount.rs` (audiences). The
+// previous `#[ignore]`d test asserted a non-upstream controller-written Secret
+// and has been removed.
