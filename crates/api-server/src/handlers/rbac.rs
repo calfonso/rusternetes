@@ -736,14 +736,15 @@ pub async fn update_rolebinding(
 
     let key = build_key("rolebindings", Some(&namespace), &name);
 
-    // Validate immutable roleRef — mirrors upstream
-    // `pkg/registry/rbac/rolebinding/strategy.go::ValidateUpdate` which calls
-    // `apivalidation.ValidateImmutableField(newRoleBinding.RoleRef, …)`.
+    // Full update validation (upstream ValidateRoleBindingUpdate): re-run the
+    // create checks on the new object and forbid changing roleRef.
     if let Ok(existing) = state.storage.get::<RoleBinding>(&key).await {
-        if existing.role_ref != rolebinding.role_ref {
-            return Err(rusternetes_common::Error::InvalidResource(
-                "RoleBinding.roleRef: Invalid value: field is immutable".to_string(),
-            ));
+        let errs = rusternetes_common::validation::rbac::validate_role_binding_update(
+            &rolebinding,
+            &existing,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
@@ -1319,14 +1320,15 @@ pub async fn update_clusterrolebinding(
 
     let key = build_key("clusterrolebindings", None, &name);
 
-    // Validate immutable roleRef — mirrors upstream
-    // `pkg/registry/rbac/clusterrolebinding/strategy.go::ValidateUpdate` which
-    // calls `apivalidation.ValidateImmutableField(newCRB.RoleRef, …)`.
+    // Full update validation (upstream ValidateClusterRoleBindingUpdate): re-run
+    // the create checks on the new object and forbid changing roleRef.
     if let Ok(existing) = state.storage.get::<ClusterRoleBinding>(&key).await {
-        if existing.role_ref != clusterrolebinding.role_ref {
-            return Err(rusternetes_common::Error::InvalidResource(
-                "ClusterRoleBinding.roleRef: Invalid value: field is immutable".to_string(),
-            ));
+        let errs = rusternetes_common::validation::rbac::validate_cluster_role_binding_update(
+            &clusterrolebinding,
+            &existing,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 

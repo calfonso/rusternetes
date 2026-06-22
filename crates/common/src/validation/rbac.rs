@@ -244,6 +244,38 @@ pub fn validate_cluster_role_binding(crb: &ClusterRoleBinding) -> ErrorList {
     validate_binding(&crb.role_ref, &crb.subjects, &["ClusterRole"], false)
 }
 
+/// Validate a `RoleBinding` on update (upstream `ValidateRoleBindingUpdate`):
+/// the create checks plus `roleRef` immutability.
+pub fn validate_role_binding_update(new: &RoleBinding, old: &RoleBinding) -> ErrorList {
+    let mut errs = validate_role_binding(new);
+    if new.role_ref != old.role_ref {
+        errs.push(Error::invalid(
+            &Path::new("roleRef"),
+            new.role_ref.name.clone(),
+            "cannot change roleRef",
+        ));
+    }
+    errs
+}
+
+/// Validate a `ClusterRoleBinding` on update (upstream
+/// `ValidateClusterRoleBindingUpdate`): the create checks plus `roleRef`
+/// immutability.
+pub fn validate_cluster_role_binding_update(
+    new: &ClusterRoleBinding,
+    old: &ClusterRoleBinding,
+) -> ErrorList {
+    let mut errs = validate_cluster_role_binding(new);
+    if new.role_ref != old.role_ref {
+        errs.push(Error::invalid(
+            &Path::new("roleRef"),
+            new.role_ref.name.clone(),
+            "cannot change roleRef",
+        ));
+    }
+    errs
+}
+
 /// Port of upstream `SetDefaults_Subject` (`pkg/apis/rbac/v1/defaults.go`): an
 /// omitted `apiGroup` defaults by kind — User/Group → the RBAC group,
 /// ServiceAccount (and unknown kinds) keep the empty/core group.
@@ -276,5 +308,48 @@ pub fn default_cluster_role_binding(crb: &mut ClusterRoleBinding) {
     }
     for subject in &mut crb.subjects {
         default_subject(subject);
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn rb(role_ref_name: &str) -> RoleBinding {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "rb", "namespace": "default"},
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": role_ref_name},
+            "subjects": [{"kind": "User", "name": "alice", "apiGroup": "rbac.authorization.k8s.io"}]
+        }))
+        .unwrap()
+    }
+
+    fn crb(role_ref_name: &str) -> ClusterRoleBinding {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "crb"},
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": role_ref_name},
+            "subjects": [{"kind": "User", "name": "alice", "apiGroup": "rbac.authorization.k8s.io"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unchanged_role_ref_passes() {
+        assert!(validate_role_binding_update(&rb("admin"), &rb("admin")).is_empty());
+        assert!(validate_cluster_role_binding_update(&crb("admin"), &crb("admin")).is_empty());
+    }
+
+    #[test]
+    fn changing_role_ref_rejected() {
+        let e = validate_role_binding_update(&rb("editor"), &rb("admin"));
+        assert!(
+            e.iter().any(|x| x.detail == "cannot change roleRef"),
+            "{e:?}"
+        );
+        let ce = validate_cluster_role_binding_update(&crb("editor"), &crb("admin"));
+        assert!(
+            ce.iter().any(|x| x.detail == "cannot change roleRef"),
+            "{ce:?}"
+        );
     }
 }
