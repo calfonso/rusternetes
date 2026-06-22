@@ -705,7 +705,12 @@ pub fn validate_deployment_update(new: &Deployment, old: &Deployment) -> ErrorLi
 /// `selector` immutability is enforced by the handler's
 /// `validate_selector_immutable` call.
 pub fn validate_statefulset_update(new: &StatefulSet, old: &StatefulSet) -> ErrorList {
-    let mut errs: ErrorList = Vec::new();
+    // Upstream `ValidateStatefulSetUpdate` first re-validates the whole new spec
+    // via `ValidateStatefulSetSpec` (it deliberately skips `ValidateStatefulSet`
+    // only to avoid revalidating the immutable name). `validate_statefulset` here
+    // already validates the spec alone (no name check), so we reuse it to catch
+    // updates that would otherwise introduce an invalid selector/template/replicas.
+    let mut errs: ErrorList = validate_statefulset(new);
     let immutable_changed = new.spec.service_name != old.spec.service_name
         || new.spec.pod_management_policy != old.spec.pod_management_policy
         || serde_json::to_value(&new.spec.volume_claim_templates).ok()

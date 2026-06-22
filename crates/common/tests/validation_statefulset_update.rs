@@ -6,6 +6,8 @@ fn base() -> StatefulSet {
         "metadata": {"name": "web"},
         "spec": {
             "serviceName": "svc",
+            "podManagementPolicy": "OrderedReady",
+            "updateStrategy": {"type": "RollingUpdate"},
             "selector": {"matchLabels": {"app": "web"}},
             "template": {
                 "metadata": {"labels": {"app": "web"}},
@@ -40,6 +42,8 @@ fn volume_claim_templates_immutable() {
         "metadata": {"name": "web"},
         "spec": {
             "serviceName": "svc",
+            "podManagementPolicy": "OrderedReady",
+            "updateStrategy": {"type": "RollingUpdate"},
             "selector": {"matchLabels": {"app": "web"}},
             "template": {
                 "metadata": {"labels": {"app": "web"}},
@@ -52,6 +56,17 @@ fn volume_claim_templates_immutable() {
     assert_eq!(validate_statefulset_update(&new, &old).len(), 1);
     new.spec.volume_claim_templates = None;
     assert!(validate_statefulset_update(&new, &old).is_empty());
+}
+
+#[test]
+fn full_spec_revalidated_on_update() {
+    // Upstream ValidateStatefulSetUpdate re-runs ValidateStatefulSetSpec on the
+    // new object, so an update that introduces an invalid spec (here a negative
+    // replica count) must be rejected even though no immutable field changed.
+    let old = base();
+    let mut new = base();
+    new.spec.replicas = Some(-1);
+    assert!(!validate_statefulset_update(&new, &old).is_empty());
 }
 
 #[test]
