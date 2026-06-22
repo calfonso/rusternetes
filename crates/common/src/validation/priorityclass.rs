@@ -90,3 +90,72 @@ pub fn validate_priority_class(pc: &PriorityClass) -> ErrorList {
 
     errs
 }
+
+/// Validate a `PriorityClass` on update. Mirrors upstream
+/// `ValidatePriorityClassUpdate`: `value` and `preemptionPolicy` are immutable.
+/// (Upstream does NOT re-run the create validation here — only the metadata
+/// update + these two immutability checks.)
+pub fn validate_priority_class_update(new: &PriorityClass, old: &PriorityClass) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if new.value != old.value {
+        errs.push(Error::forbidden(
+            &Path::new("value"),
+            "may not be changed in an update.",
+        ));
+    }
+    if new.preemption_policy != old.preemption_policy {
+        errs.push(Error::invalid(
+            &Path::new("preemptionPolicy"),
+            new.preemption_policy.clone().unwrap_or_default(),
+            "field is immutable",
+        ));
+    }
+    errs
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn pc(value: i32, preemption: Option<&str>) -> PriorityClass {
+        let mut v = serde_json::json!({
+            "metadata": {"name": "high"},
+            "value": value,
+        });
+        if let Some(p) = preemption {
+            v["preemptionPolicy"] = serde_json::json!(p);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn unchanged_passes() {
+        assert!(
+            validate_priority_class_update(&pc(100, Some("Never")), &pc(100, Some("Never")))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn value_immutable() {
+        let errs = validate_priority_class_update(&pc(200, None), &pc(100, None));
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "value" && e.detail.contains("may not be changed")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn preemption_policy_immutable() {
+        let errs = validate_priority_class_update(
+            &pc(100, Some("Never")),
+            &pc(100, Some("PreemptLowerPriority")),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "preemptionPolicy" && e.detail == "field is immutable"),
+            "{errs:?}"
+        );
+    }
+}

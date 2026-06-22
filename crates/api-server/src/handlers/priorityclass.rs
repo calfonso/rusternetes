@@ -157,13 +157,15 @@ pub async fn update(
 
     let key = build_key("priorityclasses", None, &name);
 
-    // Validate immutable fields — value cannot be changed after creation
+    // Update validation (upstream ValidatePriorityClassUpdate): value and
+    // preemptionPolicy are immutable.
     if let Ok(existing) = state.storage.get::<PriorityClass>(&key).await {
-        if existing.value != priority_class.value {
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "PriorityClass.value: Invalid value: \"{}\": field is immutable",
-                priority_class.value
-            )));
+        let errs = rusternetes_common::validation::priorityclass::validate_priority_class_update(
+            &priority_class,
+            &existing,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
