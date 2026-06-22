@@ -68,6 +68,24 @@ fn is_valid_ip(value: &str) -> bool {
     IpAddr::from_str(value).is_ok()
 }
 
+/// Returns true iff `value` is a valid CIDR (`ip/prefix`), with the prefix in
+/// range for the address family. Mirrors the create-path of upstream
+/// `IsValidCIDRForLegacyField` (strict, no legacy-tolerance when there is no
+/// prior value).
+fn is_valid_cidr(value: &str) -> bool {
+    let Some((ip, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match IpAddr::from_str(ip) {
+        Ok(IpAddr::V4(_)) => prefix <= 32,
+        Ok(IpAddr::V6(_)) => prefix <= 128,
+        Err(_) => false,
+    }
+}
+
 /// Returns true iff `value` is a valid IANA IANA-registered FQDN. Mirrors upstream
 /// `utilvalidation.IsDNS1123Subdomain`. We reuse our own helper which returns
 /// an empty slice on success.
@@ -443,6 +461,31 @@ pub fn validate_service_spec(spec: &ServiceSpec, fld: &Path) -> ErrorList {
         }
     }
 
+    // loadBalancerSourceRanges: only valid for type LoadBalancer, and each
+    // (whitespace-padding-tolerant) entry must be a valid CIDR. Upstream
+    // `ValidateService` LoadBalancerSourceRanges block. The legacy annotation
+    // form is not covered here.
+    if let Some(ranges) = spec.load_balancer_source_ranges.as_ref() {
+        if !ranges.is_empty() {
+            let ranges_path = fld.child("loadBalancerSourceRanges");
+            if !matches!(svc_type, ServiceType::LoadBalancer) {
+                errs.push(Error::forbidden(
+                    &ranges_path,
+                    "may only be used when `type` is 'LoadBalancer'",
+                ));
+            }
+            for (i, value) in ranges.iter().enumerate() {
+                if !is_valid_cidr(value.trim()) {
+                    errs.push(Error::invalid(
+                        &ranges_path.index(i),
+                        value.clone(),
+                        "must be a valid CIDR",
+                    ));
+                }
+            }
+        }
+    }
+
     errs
 }
 
@@ -459,4 +502,62 @@ pub fn validate_service(svc: &Service) -> ErrorList {
     let spec_path = Path::new("spec");
     errs.extend(validate_service_spec(&svc.spec, &spec_path));
     errs
+}
+
+#[cfg(test)]
+mod lb_source_ranges_tests {
+    use super::*;
+
+    fn spec_errs(json: serde_json::Value) -> Vec<String> {
+        let spec: ServiceSpec = serde_json::from_value(json).unwrap();
+        validate_service_spec(&spec, &Path::new("spec"))
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn valid_cidrs_on_loadbalancer_pass() {
+        let e = spec_errs(serde_json::json!({
+            "type": "LoadBalancer",
+            "ports": [{"port": 80}],
+            "loadBalancerSourceRanges": ["10.0.0.0/8", " 192.168.1.0/24 ", "2001:db8::/64"]
+        }));
+        assert!(
+            !e.iter()
+                .any(|m| m.contains("loadBalancerSourceRanges") || m.contains("CIDR")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_cidr_rejected() {
+        let e = spec_errs(serde_json::json!({
+            "type": "LoadBalancer",
+            "ports": [{"port": 80}],
+            "loadBalancerSourceRanges": ["10.0.0.0/8", "notacidr", "10.0.0.1"]
+        }));
+        // "notacidr" and bare IP "10.0.0.1" (no prefix) are both invalid CIDRs.
+        assert_eq!(
+            e.iter()
+                .filter(|m| m.contains("must be a valid CIDR"))
+                .count(),
+            2,
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn source_ranges_forbidden_on_non_loadbalancer() {
+        let e = spec_errs(serde_json::json!({
+            "type": "ClusterIP",
+            "ports": [{"port": 80}],
+            "loadBalancerSourceRanges": ["10.0.0.0/8"]
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("may only be used when `type` is 'LoadBalancer'")),
+            "{e:?}"
+        );
+    }
 }
