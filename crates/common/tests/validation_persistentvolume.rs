@@ -39,8 +39,15 @@ fn missing_storage_capacity_required() {
         "accessModes": ["ReadWriteOnce"],
         "hostPath": {"path": "/data"}
     })));
+    // Upstream (core/validation/validation.go ~2001-2007) reports the missing
+    // capacity at the `capacity` level: Required when empty, plus NotSupported
+    // because the `storage` resource is absent — not a `capacity.storage` path.
     assert!(
-        has(&errs, "spec.capacity.storage", ErrorType::Required),
+        has(&errs, "spec.capacity", ErrorType::Required),
+        "got: {errs:?}"
+    );
+    assert!(
+        has(&errs, "spec.capacity", ErrorType::NotSupported),
         "got: {errs:?}"
     );
 }

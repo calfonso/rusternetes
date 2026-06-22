@@ -1,43 +1,101 @@
 //! PersistentVolume validation — port of upstream Kubernetes
 //! `pkg/apis/core/validation/validation.go::ValidatePersistentVolume` (release-1.35).
 //!
-//! Scope: capacity (storage required + non-negative), access modes (≥1 +
-//! ReadWriteOncePod exclusivity), exactly one volume source, and
-//! storageClassName. The per-source field validation, nodeAffinity-for-Local
-//! requirement, and reclaim-policy/source compatibility are left as a follow-up.
+//! Scope: capacity (storage required, storage-only, non-negative), access modes
+//! (≥1 + ReadWriteOncePod exclusivity), exactly one volume source,
+//! nodeAffinity-required-for-Local, the hostPath-'/'-with-Recycle prohibition,
+//! and storageClassName. The exhaustive per-source field validation (each
+//! `validate*VolumeSource`) is left as a follow-up.
+//!
+//! reclaimPolicy / volumeMode / accessModes enum-membership (upstream
+//! `supportedReclaimPolicy` / `supportedVolumeModes` / `supportedAccessModes`)
+//! is enforced upstream-of-validation by Rusternetes' typed enums: an unknown
+//! string fails to deserialize before this validator runs, so no explicit
+//! `NotSupported` check is reproduced here.
 
 use crate::quantity::Quantity;
 use crate::resources::volume::{
-    PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeSpec,
+    PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSpec,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_subdomain;
+
+/// Lexically normalise a path, mirroring Go's `path.Clean` for the cases that
+/// matter to the hostPath-root check: collapse repeated slashes and resolve
+/// `.` / `..` elements, returning "/" for any path that reduces to the root.
+fn clean_path(p: &str) -> String {
+    if p.is_empty() {
+        return ".".to_string();
+    }
+    let rooted = p.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if let Some(&last) = out.last() {
+                    if last != ".." {
+                        out.pop();
+                        continue;
+                    }
+                }
+                if !rooted {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let joined = out.join("/");
+    match (rooted, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".to_string(),
+        (false, false) => joined,
+    }
+}
 
 /// Validate a `PersistentVolumeSpec`. Mirrors the core of upstream
 /// `ValidatePersistentVolume`.
 pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    // capacity.storage is required and must be a non-negative quantity.
-    let cap_path = fld_path.child("capacity").child("storage");
-    match spec.capacity.get("storage") {
-        None => errs.push(Error::required(&cap_path, "")),
-        Some(v) => match Quantity::parse(v) {
+    // capacity is required (upstream line ~2002). Then it must hold exactly the
+    // `storage` resource and nothing else (upstream line ~2005-2007).
+    // Upstream uses two independent `if`s (not else-if): an empty capacity is
+    // both Required AND NotSupported (storage absent). Match that exactly.
+    let capacity_path = fld_path.child("capacity");
+    if spec.capacity.is_empty() {
+        errs.push(Error::required(&capacity_path, ""));
+    }
+    if !spec.capacity.contains_key("storage") || spec.capacity.len() > 1 {
+        errs.push(Error::not_supported(
+            &capacity_path,
+            "<capacity>",
+            &["storage"],
+        ));
+    }
+
+    // Every capacity quantity must parse and be a non-negative value
+    // (upstream validateBasicResource + ValidatePositiveQuantityValue, ~2009-2012).
+    for (resource, value) in &spec.capacity {
+        let key_path = capacity_path.key(resource.clone());
+        match Quantity::parse(value) {
             Err(_) => errs.push(Error::invalid(
-                &cap_path,
-                v.clone(),
+                &key_path,
+                value.clone(),
                 "must be a valid resource quantity",
             )),
             Ok(q) => {
                 if q.is_negative() {
                     errs.push(Error::invalid(
-                        &cap_path,
-                        v.clone(),
+                        &key_path,
+                        value.clone(),
                         "must be greater than or equal to 0",
                     ));
                 }
             }
-        },
+        }
     }
 
     // accessModes: at least one; ReadWriteOncePod may not combine with others.
@@ -80,6 +138,27 @@ pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &P
             fld_path,
             "may not specify more than 1 volume type",
         ));
+    }
+
+    // A Local volume requires node affinity (upstream line ~2194-2197).
+    if spec.local.is_some() && spec.node_affinity.is_none() {
+        errs.push(Error::required(
+            &fld_path.child("nodeAffinity"),
+            "Local volume requires node affinity",
+        ));
+    }
+
+    // A hostPath mount of '/' may not use the Recycle reclaim policy
+    // (upstream line ~2222-2225).
+    if let Some(hp) = &spec.host_path {
+        if clean_path(&hp.path) == "/"
+            && spec.persistent_volume_reclaim_policy == Some(PersistentVolumeReclaimPolicy::Recycle)
+        {
+            errs.push(Error::forbidden(
+                &fld_path.child("persistentVolumeReclaimPolicy"),
+                "may not be 'recycle' for a hostPath mount of '/'",
+            ));
+        }
     }
 
     // storageClassName, when set, must be a DNS-1123 subdomain.
@@ -186,6 +265,205 @@ pub fn validate_persistent_volume_update(
     }
 
     errs
+}
+
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+
+    fn pv(json: serde_json::Value) -> PersistentVolume {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn valid_hostpath() -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Retain",
+                "hostPath": {"path": "/data"}
+            }
+        })
+    }
+
+    #[test]
+    fn clean_path_resolves_root() {
+        assert_eq!(clean_path("/"), "/");
+        assert_eq!(clean_path("//"), "/");
+        assert_eq!(clean_path("/."), "/");
+        assert_eq!(clean_path("/foo/.."), "/");
+        assert_eq!(clean_path("/foo/../bar"), "/bar");
+        assert_eq!(clean_path("/data"), "/data");
+    }
+
+    #[test]
+    fn valid_pv_passes() {
+        assert!(validate_persistent_volume(&pv(valid_hostpath())).is_empty());
+    }
+
+    #[test]
+    fn capacity_required() {
+        let mut v = valid_hostpath();
+        v["spec"]["capacity"] = serde_json::json!({});
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("capacity")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_must_be_storage_only() {
+        let mut v = valid_hostpath();
+        v["spec"]["capacity"] = serde_json::json!({"storage": "1Gi", "cpu": "1"});
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter()
+                .any(|e| e.field.ends_with("capacity") && e.detail.contains("supported values")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_missing_storage_key_rejected() {
+        let mut v = valid_hostpath();
+        v["spec"]["capacity"] = serde_json::json!({"cpu": "1"});
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("capacity")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn negative_capacity_rejected() {
+        let mut v = valid_hostpath();
+        v["spec"]["capacity"] = serde_json::json!({"storage": "-1Gi"});
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter()
+                .any(|e| e.detail.contains("greater than or equal to 0")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn access_modes_required() {
+        let mut v = valid_hostpath();
+        v["spec"]["accessModes"] = serde_json::json!([]);
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("accessModes")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rwop_with_other_modes_forbidden() {
+        let mut v = valid_hostpath();
+        v["spec"]["accessModes"] = serde_json::json!(["ReadWriteOncePod", "ReadWriteOnce"]);
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("may not use ReadWriteOncePod with other access modes")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn no_volume_source_rejected() {
+        let mut v = valid_hostpath();
+        v["spec"].as_object_mut().unwrap().remove("hostPath");
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("must specify a volume type")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn more_than_one_volume_source_rejected() {
+        let mut v = valid_hostpath();
+        v["spec"]["nfs"] = serde_json::json!({"server": "1.2.3.4", "path": "/exports"});
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("may not specify more than 1 volume type")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn local_requires_node_affinity() {
+        let v = pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "local": {"path": "/mnt/disk"}
+            }
+        }));
+        let errs = validate_persistent_volume(&v);
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("nodeAffinity")
+                && e.to_string()
+                    .contains("Local volume requires node affinity")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn local_with_node_affinity_passes() {
+        let v = pv(serde_json::json!({
+            "metadata": {"name": "pv"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "local": {"path": "/mnt/disk"},
+                "nodeAffinity": {"required": {"nodeSelectorTerms": [
+                    {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["n1"]}]}
+                ]}}
+            }
+        }));
+        assert!(validate_persistent_volume(&v).is_empty());
+    }
+
+    #[test]
+    fn hostpath_root_with_recycle_forbidden() {
+        let mut v = valid_hostpath();
+        v["spec"]["hostPath"]["path"] = serde_json::json!("/");
+        v["spec"]["persistentVolumeReclaimPolicy"] = serde_json::json!("Recycle");
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("may not be 'recycle' for a hostPath mount of '/'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn hostpath_nonroot_with_recycle_ok() {
+        let mut v = valid_hostpath();
+        v["spec"]["persistentVolumeReclaimPolicy"] = serde_json::json!("Recycle");
+        // path is /data, not '/', so Recycle is allowed
+        assert!(validate_persistent_volume(&pv(v)).is_empty());
+    }
+
+    #[test]
+    fn invalid_storage_class_name_rejected() {
+        let mut v = valid_hostpath();
+        v["spec"]["storageClassName"] = serde_json::json!("Bad_Name");
+        let errs = validate_persistent_volume(&pv(v));
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("storageClassName")),
+            "{errs:?}"
+        );
+    }
 }
 
 #[cfg(test)]
