@@ -82,3 +82,72 @@ fn negative_min_ready_seconds_rejected() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn absent_replicas_required() {
+    // Upstream `ValidateReplicationControllerSpec` (validation.go:7056-7057):
+    // `replicas == nil` -> Required.
+    let errs = validate_replication_controller(&rc(json!({
+        "selector": {"app": "web"},
+        "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": []}}
+    })));
+    assert!(
+        has(&errs, "spec.replicas", ErrorType::Required),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn non_always_restart_policy_not_supported() {
+    // Upstream `ValidatePodTemplateSpecForRC` (validation.go:7041-7042).
+    let errs = validate_replication_controller(&rc(json!({
+        "replicas": 1,
+        "selector": {"app": "web"},
+        "template": {
+            "metadata": {"labels": {"app": "web"}},
+            "spec": {"containers": [], "restartPolicy": "Never"}
+        }
+    })));
+    assert!(
+        has(
+            &errs,
+            "spec.template.spec.restartPolicy",
+            ErrorType::NotSupported
+        ),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn always_restart_policy_ok() {
+    let errs = validate_replication_controller(&rc(json!({
+        "replicas": 1,
+        "selector": {"app": "web"},
+        "template": {
+            "metadata": {"labels": {"app": "web"}},
+            "spec": {"containers": [], "restartPolicy": "Always"}
+        }
+    })));
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+}
+
+#[test]
+fn active_deadline_seconds_forbidden() {
+    // Upstream `ValidatePodTemplateSpecForRC` (validation.go:7044-7046).
+    let errs = validate_replication_controller(&rc(json!({
+        "replicas": 1,
+        "selector": {"app": "web"},
+        "template": {
+            "metadata": {"labels": {"app": "web"}},
+            "spec": {"containers": [], "activeDeadlineSeconds": 30}
+        }
+    })));
+    assert!(
+        has(
+            &errs,
+            "spec.template.spec.activeDeadlineSeconds",
+            ErrorType::Forbidden
+        ),
+        "got: {errs:?}"
+    );
+}

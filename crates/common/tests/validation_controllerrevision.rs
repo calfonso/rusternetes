@@ -47,3 +47,24 @@ fn non_object_data_rejected() {
     let errs2 = validate_controller_revision(&cr(Some(json!("a string"))));
     assert!(errs2.iter().any(|e| e.field == "data"));
 }
+
+#[test]
+fn negative_revision_rejected() {
+    // Upstream `validateControllerRevision` (apps validation.go:336):
+    // ValidateNonnegativeField(revision.Revision, ...).
+    let mut c = cr(Some(json!({"spec": {"replicas": 3}})));
+    c.revision = -1;
+    let errs = validate_controller_revision(&c);
+    assert!(
+        errs.iter()
+            .any(|e| e.field == "revision" && e.error_type == ErrorType::Invalid),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn zero_revision_ok() {
+    let mut c = cr(Some(json!({"spec": {"replicas": 3}})));
+    c.revision = 0;
+    assert!(validate_controller_revision(&c).is_empty());
+}

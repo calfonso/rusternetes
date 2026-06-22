@@ -12,6 +12,17 @@ use crate::validation::field::{Error, ErrorList, Path};
 /// upstream `ValidateControllerRevisionCreate`.
 pub fn validate_controller_revision(cr: &ControllerRevision) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
+
+    // Upstream `validateControllerRevision` (apps validation.go:336):
+    // `ValidateNonnegativeField(revision.Revision, ...)`.
+    if cr.revision < 0 {
+        errs.push(Error::invalid(
+            &Path::new("revision"),
+            cr.revision,
+            "must be greater than or equal to 0",
+        ));
+    }
+
     let data_path = Path::new("data");
     match &cr.data {
         None | Some(serde_json::Value::Null) => {

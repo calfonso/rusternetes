@@ -19,14 +19,20 @@ pub fn validate_replication_controller_spec(
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    if let Some(r) = spec.replicas {
-        if r < 0 {
+    // Upstream `ValidateReplicationControllerSpec` (validation.go:7056-7060):
+    // `replicas` is required, then must be non-negative.
+    match spec.replicas {
+        None => {
+            errs.push(Error::required(&fld_path.child("replicas"), ""));
+        }
+        Some(r) if r < 0 => {
             errs.push(Error::invalid(
                 &fld_path.child("replicas"),
                 r,
                 "must be greater than or equal to 0",
             ));
         }
+        Some(_) => {}
     }
     if let Some(mrs) = spec.min_ready_seconds {
         if mrs < 0 {
@@ -63,6 +69,29 @@ pub fn validate_replication_controller_spec(
                 "`selector` does not match template `labels`",
             ));
         }
+    }
+
+    // Upstream `ValidatePodTemplateSpecForRC` (validation.go:7041-7046): the RC
+    // pod template must use `restartPolicy: Always`, and `activeDeadlineSeconds`
+    // is forbidden.
+    let template_path = fld_path.child("template").child("spec");
+    let restart_policy = spec.template.spec.restart_policy.as_deref();
+    // An absent restartPolicy defaults to Always upstream; only a present,
+    // non-Always value is rejected here (defaulting runs before validation).
+    if let Some(rp) = restart_policy {
+        if rp != "Always" {
+            errs.push(Error::not_supported(
+                &template_path.child("restartPolicy"),
+                rp.to_string(),
+                &["Always"],
+            ));
+        }
+    }
+    if spec.template.spec.active_deadline_seconds.is_some() {
+        errs.push(Error::forbidden(
+            &template_path.child("activeDeadlineSeconds"),
+            "activeDeadlineSeconds in ReplicationController is not Supported",
+        ));
     }
 
     errs
