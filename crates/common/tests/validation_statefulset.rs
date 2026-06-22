@@ -121,8 +121,12 @@ fn empty_selector_required() {
     let mut spec = valid_spec();
     spec["selector"] = json!({});
     let errs = validate_statefulset(&ss(spec));
+    // Upstream emits Invalid("empty selector is invalid for statefulset"), not Required.
     assert!(
-        has(&errs, "spec.selector", ErrorType::Required),
+        errs.iter().any(|e| e.field == "spec.selector"
+            && e.error_type == ErrorType::Invalid
+            && e.detail
+                .contains("empty selector is invalid for statefulset")),
         "got: {errs:?}"
     );
 }

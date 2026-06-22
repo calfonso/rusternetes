@@ -95,6 +95,48 @@ fn template_labels_match_selector(
     errs
 }
 
+/// Validate a workload pod template's `restartPolicy` / `activeDeadlineSeconds`
+/// constraints shared by StatefulSet, DaemonSet and ReplicaSet. Mirrors upstream
+/// (e.g. `ValidatePodTemplateSpecForReplicaSet` lines 847-852,
+/// `ValidateStatefulSetSpec` lines 217-222, `ValidateDaemonSetSpec` 456-461):
+///
+/// * `restartPolicy` must be `Always` → otherwise `NotSupported` on
+///   `<path>/restartPolicy`. `None`/empty is treated as `Always` because the
+///   api-server defaults it before validation runs (these workloads default to
+///   `Always`).
+/// * `activeDeadlineSeconds` set → `Forbidden` "activeDeadlineSeconds in <Kind>
+///   is not Supported".
+///
+/// `fld_path` is the `template/spec` path; `kind` is the workload kind used in
+/// the Forbidden message (`StatefulSet` / `DaemonSet` / `ReplicaSet`).
+fn validate_workload_pod_template_restart_policy(
+    pod_spec: &crate::resources::pod::PodSpec,
+    fld_path: &Path,
+    kind: &str,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    // restartPolicy must be Always (treat unset/empty as the defaulted Always).
+    match pod_spec.restart_policy.as_deref() {
+        None | Some("") | Some("Always") => {}
+        Some(other) => errs.push(Error::not_supported(
+            &fld_path.child("restartPolicy"),
+            other.to_string(),
+            &["Always"],
+        )),
+    }
+
+    // activeDeadlineSeconds is not supported for these workloads.
+    if pod_spec.active_deadline_seconds.is_some() {
+        errs.push(Error::forbidden(
+            &fld_path.child("activeDeadlineSeconds"),
+            format!("activeDeadlineSeconds in {kind} is not Supported"),
+        ));
+    }
+
+    errs
+}
+
 /// Parse an IntOrString value (serde_json::Value that is either a number or a
 /// percent string like "25%"). Returns `(is_percent, value)` or an error
 /// message.
@@ -121,26 +163,27 @@ fn parse_int_or_string(v: &serde_json::Value) -> Result<(bool, i64), String> {
     }
 }
 
-/// Validate a single IntOrString field (maxSurge or maxUnavailable).
-/// Returns `(is_zero, errors)`.
-fn validate_int_or_string_field(v: &serde_json::Value, fld_path: &Path) -> (bool, ErrorList) {
+/// Validate that an IntOrString value is a non-negative int or a valid percent
+/// string. Mirrors upstream `ValidatePositiveIntOrPercent`
+/// (`pkg/apis/apps/validation/validation.go` lines 545-559): integers must be
+/// `>= 0`; percent strings must parse, but their magnitude (e.g. `200%`) is
+/// **not** bounded here — the upstream `IsNotMoreThan100Percent` check is
+/// applied separately, and only to the fields upstream actually bounds.
+///
+/// Returns `(is_zero, errors)`, where `is_zero` reflects the int/percent value
+/// being `0` (used for the "both maxSurge and maxUnavailable are 0" rule).
+fn validate_positive_int_or_percent(v: &serde_json::Value, fld_path: &Path) -> (bool, ErrorList) {
     let mut errs: ErrorList = Vec::new();
     match parse_int_or_string(v) {
         Err(msg) => {
             errs.push(Error::invalid(fld_path, format!("{v}"), msg));
             (false, errs)
         }
-        Ok((is_pct, val)) => {
-            if is_pct {
-                if !(0..=100).contains(&val) {
-                    errs.push(Error::invalid(
-                        fld_path,
-                        format!("{v}"),
-                        "must be between 0% and 100%",
-                    ));
-                    return (false, errs);
-                }
-            } else if val < 0 {
+        Ok((_is_pct, val)) => {
+            // Only integers are bounded below; percent strings of any size are
+            // accepted here (upstream defers the upper bound to
+            // IsNotMoreThan100Percent, applied per-field by the caller).
+            if !_is_pct && val < 0 {
                 errs.push(Error::invalid(
                     fld_path,
                     val,
@@ -151,6 +194,23 @@ fn validate_int_or_string_field(v: &serde_json::Value, fld_path: &Path) -> (bool
             (val == 0, errs)
         }
     }
+}
+
+/// Mirrors upstream `IsNotMoreThan100Percent` (lines 581-591): if the value is
+/// a percent string greater than 100%, emit `Invalid(... "must not be greater
+/// than 100%")`. Integers and percents `<= 100` are accepted.
+fn is_not_more_than_100_percent(v: &serde_json::Value, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Ok((true, val)) = parse_int_or_string(v) {
+        if val > 100 {
+            errs.push(Error::invalid(
+                fld_path,
+                format!("{v}"),
+                "must not be greater than 100%",
+            ));
+        }
+    }
+    errs
 }
 
 // ---------------------------------------------------------------------------
@@ -213,31 +273,42 @@ fn validate_rolling_update_deployment(
             max_unavailable_zero = true; // treat absent as 0 for the both-zero check
         }
         Some(v) => {
-            let (is_zero, sub_errs) =
-                validate_int_or_string_field(v, &fld_path.child("maxUnavailable"));
+            let mu_path = fld_path.child("maxUnavailable");
+            let (is_zero, sub_errs) = validate_positive_int_or_percent(v, &mu_path);
             max_unavailable_zero = is_zero;
             errs.extend(sub_errs);
         }
     }
 
-    // maxSurge
+    // maxSurge — upstream `ValidatePositiveIntOrPercent` only; NO 100% bound
+    // (lines 596-597), so `maxSurge: 200%` is valid for a Deployment.
     match &ru.max_surge {
         None => {
             max_surge_zero = true; // treat absent as 0 for the both-zero check
         }
         Some(v) => {
-            let (is_zero, sub_errs) = validate_int_or_string_field(v, &fld_path.child("maxSurge"));
+            let (is_zero, sub_errs) =
+                validate_positive_int_or_percent(v, &fld_path.child("maxSurge"));
             max_surge_zero = is_zero;
             errs.extend(sub_errs);
         }
     }
 
-    // Both cannot be zero simultaneously
+    // Both cannot be zero simultaneously (upstream reports on maxUnavailable).
     if max_unavailable_zero && max_surge_zero {
         errs.push(Error::invalid(
-            fld_path,
+            &fld_path.child("maxUnavailable"),
             "".to_string(),
             "may not be 0 when `maxSurge` is 0",
+        ));
+    }
+
+    // Validate that maxUnavailable is not more than 100% (upstream line 603).
+    // maxSurge is intentionally NOT bounded here for Deployments.
+    if let Some(v) = &ru.max_unavailable {
+        errs.extend(is_not_more_than_100_percent(
+            v,
+            &fld_path.child("maxUnavailable"),
         ));
     }
 
@@ -266,11 +337,21 @@ fn validate_deployment_spec(
         }
     }
 
-    // selector is required and must be non-empty
+    // selector is required and must be non-empty. Upstream (lines 642-649)
+    // first validates the selector structure, then emits
+    // Invalid("empty selector is invalid for deployment") when both matchLabels
+    // and matchExpressions are empty. (The `Required` "nil selector" arm cannot
+    // happen here — `LabelSelector` is non-optional in rusternetes.)
     if selector_is_empty(&spec.selector) {
-        errs.push(Error::required(
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
             &fld_path.child("selector"),
-            "must be specified",
+        ));
+        errs.push(Error::invalid(
+            &fld_path.child("selector"),
+            "{}".to_string(),
+            "empty selector is invalid for deployment",
         ));
     } else {
         // validate selector structure
@@ -393,11 +474,19 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
     }
 
     // selector is required and must be non-empty + structurally valid; the
-    // template's labels must satisfy it.
+    // template's labels must satisfy it. Upstream (lines 813-820) emits
+    // Invalid("empty selector is invalid for deployment") — note ReplicaSet
+    // reuses the "deployment" string verbatim.
     if selector_is_empty(&spec.selector) {
-        errs.push(Error::required(
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
             &fld_path.child("selector"),
-            "must be specified",
+        ));
+        errs.push(Error::invalid(
+            &fld_path.child("selector"),
+            "{}".to_string(),
+            "empty selector is invalid for deployment",
         ));
     } else {
         errs.extend(validate_label_selector(
@@ -417,6 +506,14 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
             &fld_path.child("template").child("metadata").child("labels"),
         ));
     }
+
+    // template.spec.restartPolicy must be Always; activeDeadlineSeconds
+    // forbidden (upstream `ValidatePodTemplateSpecForReplicaSet`, lines 847-852).
+    errs.extend(validate_workload_pod_template_restart_policy(
+        &spec.template.spec,
+        &fld_path.child("template").child("spec"),
+        "ReplicaSet",
+    ));
 
     errs
 }
@@ -528,11 +625,18 @@ fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorLi
     }
 
     // selector is required and must be non-empty + valid; template labels must
-    // satisfy it.
+    // satisfy it. Upstream (lines 179-187) emits
+    // Invalid("empty selector is invalid for statefulset") when present-but-empty.
     if selector_is_empty(&spec.selector) {
-        errs.push(Error::required(
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
             &fld_path.child("selector"),
-            "must be specified",
+        ));
+        errs.push(Error::invalid(
+            &fld_path.child("selector"),
+            "{}".to_string(),
+            "empty selector is invalid for statefulset",
         ));
     } else {
         errs.extend(validate_label_selector(
@@ -552,6 +656,14 @@ fn validate_statefulset_spec(spec: &StatefulSetSpec, fld_path: &Path) -> ErrorLi
             &fld_path.child("template").child("metadata").child("labels"),
         ));
     }
+
+    // template.spec.restartPolicy must be Always; activeDeadlineSeconds
+    // forbidden (upstream lines 217-222).
+    errs.extend(validate_workload_pod_template_restart_policy(
+        &spec.template.spec,
+        &fld_path.child("template").child("spec"),
+        "StatefulSet",
+    ));
 
     errs
 }
@@ -572,10 +684,18 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // selector required + valid + non-empty; template labels must match.
+    // Upstream (lines 450-452) emits Invalid("empty selector is invalid for
+    // daemonset") when present-but-empty.
     if selector_is_empty(&spec.selector) {
-        errs.push(Error::required(
+        errs.extend(validate_label_selector(
+            &spec.selector,
+            LabelSelectorValidationOptions::default(),
             &fld_path.child("selector"),
-            "must be specified",
+        ));
+        errs.push(Error::invalid(
+            &fld_path.child("selector"),
+            "{}".to_string(),
+            "empty selector is invalid for daemonset",
         ));
     } else {
         errs.extend(validate_label_selector(
@@ -595,6 +715,14 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
             &fld_path.child("template").child("metadata").child("labels"),
         ));
     }
+
+    // template.spec.restartPolicy must be Always; activeDeadlineSeconds
+    // forbidden (upstream lines 456-461).
+    errs.extend(validate_workload_pod_template_restart_policy(
+        &spec.template.spec,
+        &fld_path.child("template").child("spec"),
+        "DaemonSet",
+    ));
 
     // minReadySeconds >= 0
     if let Some(mrs) = spec.min_ready_seconds {
@@ -635,20 +763,48 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
             {
                 None => errs.push(Error::required(&us_path.child("rollingUpdate"), "")),
                 Some(ru) => {
+                    // Mirrors upstream `ValidateRollingUpdateDaemonSet`
+                    // (lines 474-496): both fields are positive-int-or-percent,
+                    // both are bounded to 100%, and exactly one of
+                    // maxUnavailable/maxSurge must be non-zero. Absent fields
+                    // count as 0 for the mutual-exclusion switch.
                     let ru_path = us_path.child("rollingUpdate");
+
+                    let mut max_unavailable_zero = true;
                     if let Some(mu) = &ru.max_unavailable {
-                        let (_, sub) = validate_int_or_string_field(
-                            &serde_json::Value::String(mu.clone()),
+                        let v = serde_json::Value::String(mu.clone());
+                        let (is_zero, sub) =
+                            validate_positive_int_or_percent(&v, &ru_path.child("maxUnavailable"));
+                        max_unavailable_zero = is_zero;
+                        errs.extend(sub);
+                        errs.extend(is_not_more_than_100_percent(
+                            &v,
                             &ru_path.child("maxUnavailable"),
-                        );
-                        errs.extend(sub);
+                        ));
                     }
+
+                    let mut max_surge_zero = true;
                     if let Some(ms) = &ru.max_surge {
-                        let (_, sub) = validate_int_or_string_field(
-                            &serde_json::Value::String(ms.clone()),
-                            &ru_path.child("maxSurge"),
-                        );
+                        let v = serde_json::Value::String(ms.clone());
+                        let (is_zero, sub) =
+                            validate_positive_int_or_percent(&v, &ru_path.child("maxSurge"));
+                        max_surge_zero = is_zero;
                         errs.extend(sub);
+                        errs.extend(is_not_more_than_100_percent(&v, &ru_path.child("maxSurge")));
+                    }
+
+                    // Exactly one of maxSurge / maxUnavailable must be non-zero.
+                    if !max_unavailable_zero && !max_surge_zero {
+                        errs.push(Error::invalid(
+                            &ru_path.child("maxSurge"),
+                            ru.max_surge.clone().unwrap_or_default(),
+                            "may not be set when maxUnavailable is non-zero",
+                        ));
+                    } else if max_unavailable_zero && max_surge_zero {
+                        errs.push(Error::required(
+                            &ru_path.child("maxUnavailable"),
+                            "cannot be 0 when maxSurge is 0",
+                        ));
                     }
                 }
             }
@@ -805,6 +961,339 @@ mod selector_match_tests {
         assert!(
             template_labels_match_selector(&s, &labels(&[("tier", "fe")]), &Path::new("spec"))
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod workload_parity_tests {
+    use super::*;
+
+    fn agg(errs: &ErrorList) -> String {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn deployment(json: serde_json::Value) -> Deployment {
+        serde_json::from_value(json).unwrap()
+    }
+    fn statefulset(json: serde_json::Value) -> StatefulSet {
+        serde_json::from_value(json).unwrap()
+    }
+    fn daemonset(json: serde_json::Value) -> DaemonSet {
+        serde_json::from_value(json).unwrap()
+    }
+    fn replicaset(json: serde_json::Value) -> ReplicaSet {
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A pod template whose labels match `{app: x}` and (optionally) carries an
+    /// explicit restartPolicy / activeDeadlineSeconds.
+    fn template(restart_policy: Option<&str>, ads: Option<i64>) -> serde_json::Value {
+        let mut spec = serde_json::json!({
+            "containers": [{"name": "c", "image": "nginx"}]
+        });
+        if let Some(rp) = restart_policy {
+            spec["restartPolicy"] = serde_json::json!(rp);
+        }
+        if let Some(a) = ads {
+            spec["activeDeadlineSeconds"] = serde_json::json!(a);
+        }
+        serde_json::json!({
+            "metadata": {"labels": {"app": "x"}},
+            "spec": spec,
+        })
+    }
+
+    fn matching_selector() -> serde_json::Value {
+        serde_json::json!({"matchLabels": {"app": "x"}})
+    }
+
+    // --- maxSurge > 100% is valid for a Deployment (upstream line 603 only
+    //     bounds maxUnavailable) ----------------------------------------------
+
+    #[test]
+    fn deployment_max_surge_over_100_percent_is_valid() {
+        let d = deployment(serde_json::json!({
+            "metadata": {"name": "d"},
+            "spec": {
+                "replicas": 3,
+                "selector": matching_selector(),
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {"maxUnavailable": "25%", "maxSurge": "200%"}
+                },
+                "template": template(Some("Always"), None),
+            }
+        }));
+        let errs = validate_deployment(&d);
+        assert!(
+            errs.is_empty(),
+            "maxSurge: 200% must be accepted for a Deployment, got: {}",
+            agg(&errs)
+        );
+    }
+
+    #[test]
+    fn deployment_max_unavailable_over_100_percent_rejected() {
+        let d = deployment(serde_json::json!({
+            "metadata": {"name": "d"},
+            "spec": {
+                "replicas": 3,
+                "selector": matching_selector(),
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {"maxUnavailable": "200%", "maxSurge": "25%"}
+                },
+                "template": template(Some("Always"), None),
+            }
+        }));
+        let errs = validate_deployment(&d);
+        let a = agg(&errs);
+        assert!(
+            a.contains("maxUnavailable") && a.contains("100%"),
+            "maxUnavailable: 200% must be rejected, got: {a}"
+        );
+    }
+
+    // --- Deployment empty-selector wording -----------------------------------
+
+    #[test]
+    fn deployment_empty_selector_wording() {
+        let d = deployment(serde_json::json!({
+            "metadata": {"name": "d"},
+            "spec": {
+                "selector": {},
+                "template": template(Some("Always"), None),
+            }
+        }));
+        let errs = validate_deployment(&d);
+        assert!(
+            agg(&errs).contains("empty selector is invalid for deployment"),
+            "got: {}",
+            agg(&errs)
+        );
+    }
+
+    // --- StatefulSet restartPolicy / activeDeadlineSeconds -------------------
+
+    fn base_statefulset(template: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": "s"},
+            "spec": {
+                "serviceName": "svc",
+                "selector": matching_selector(),
+                "podManagementPolicy": "OrderedReady",
+                "updateStrategy": {"type": "RollingUpdate"},
+                "template": template,
+            }
+        })
+    }
+
+    #[test]
+    fn statefulset_restart_policy_always_ok() {
+        let s = statefulset(base_statefulset(template(Some("Always"), None)));
+        assert!(
+            validate_statefulset(&s).is_empty(),
+            "got: {}",
+            agg(&validate_statefulset(&s))
+        );
+        // unset restartPolicy also OK (defaulted to Always)
+        let s2 = statefulset(base_statefulset(template(None, None)));
+        assert!(validate_statefulset(&s2).is_empty());
+    }
+
+    #[test]
+    fn statefulset_restart_policy_never_rejected() {
+        let s = statefulset(base_statefulset(template(Some("Never"), None)));
+        let a = agg(&validate_statefulset(&s));
+        assert!(
+            a.contains("template.spec.restartPolicy") && a.contains("supported values"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn statefulset_active_deadline_seconds_forbidden() {
+        let s = statefulset(base_statefulset(template(Some("Always"), Some(30))));
+        let a = agg(&validate_statefulset(&s));
+        assert!(
+            a.contains("template.spec.activeDeadlineSeconds")
+                && a.contains("activeDeadlineSeconds in StatefulSet is not Supported"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn statefulset_empty_selector_wording() {
+        let s = statefulset(serde_json::json!({
+            "metadata": {"name": "s"},
+            "spec": {
+                "serviceName": "svc",
+                "selector": {},
+                "podManagementPolicy": "OrderedReady",
+                "updateStrategy": {"type": "RollingUpdate"},
+                "template": template(Some("Always"), None),
+            }
+        }));
+        assert!(
+            agg(&validate_statefulset(&s)).contains("empty selector is invalid for statefulset"),
+            "got: {}",
+            agg(&validate_statefulset(&s))
+        );
+    }
+
+    // --- ReplicaSet restartPolicy / activeDeadlineSeconds --------------------
+
+    fn base_replicaset(template: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": "r"},
+            "spec": {"replicas": 1, "selector": matching_selector(), "template": template}
+        })
+    }
+
+    #[test]
+    fn replicaset_restart_policy_always_ok() {
+        let r = replicaset(base_replicaset(template(Some("Always"), None)));
+        assert!(
+            validate_replicaset(&r).is_empty(),
+            "got: {}",
+            agg(&validate_replicaset(&r))
+        );
+    }
+
+    #[test]
+    fn replicaset_restart_policy_onfailure_rejected() {
+        let r = replicaset(base_replicaset(template(Some("OnFailure"), None)));
+        let a = agg(&validate_replicaset(&r));
+        assert!(
+            a.contains("template.spec.restartPolicy") && a.contains("supported values"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn replicaset_active_deadline_seconds_forbidden() {
+        let r = replicaset(base_replicaset(template(Some("Always"), Some(10))));
+        let a = agg(&validate_replicaset(&r));
+        assert!(
+            a.contains("activeDeadlineSeconds in ReplicaSet is not Supported"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn replicaset_empty_selector_wording() {
+        let r = replicaset(serde_json::json!({
+            "metadata": {"name": "r"},
+            "spec": {"replicas": 1, "selector": {}, "template": template(Some("Always"), None)}
+        }));
+        assert!(
+            agg(&validate_replicaset(&r)).contains("empty selector is invalid for deployment"),
+            "got: {}",
+            agg(&validate_replicaset(&r))
+        );
+    }
+
+    // --- DaemonSet restartPolicy / ADS / rollingUpdate mutual-exclusion ------
+
+    fn daemonset_with(
+        template: serde_json::Value,
+        rolling_update: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": "ds"},
+            "spec": {
+                "selector": matching_selector(),
+                "updateStrategy": {"type": "RollingUpdate", "rollingUpdate": rolling_update},
+                "template": template,
+            }
+        })
+    }
+
+    #[test]
+    fn daemonset_restart_policy_never_rejected_ads_forbidden() {
+        let ds = daemonset(daemonset_with(
+            template(Some("Never"), Some(5)),
+            serde_json::json!({"maxUnavailable": "1", "maxSurge": "0"}),
+        ));
+        let a = agg(&validate_daemonset(&ds));
+        assert!(a.contains("template.spec.restartPolicy"), "got: {a}");
+        assert!(
+            a.contains("activeDeadlineSeconds in DaemonSet is not Supported"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn daemonset_rolling_update_both_nonzero_rejected() {
+        let ds = daemonset(daemonset_with(
+            template(Some("Always"), None),
+            serde_json::json!({"maxUnavailable": "1", "maxSurge": "1"}),
+        ));
+        let a = agg(&validate_daemonset(&ds));
+        assert!(
+            a.contains("maxSurge") && a.contains("may not be set when maxUnavailable is non-zero"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn daemonset_rolling_update_both_zero_rejected() {
+        let ds = daemonset(daemonset_with(
+            template(Some("Always"), None),
+            serde_json::json!({"maxUnavailable": "0", "maxSurge": "0"}),
+        ));
+        let a = agg(&validate_daemonset(&ds));
+        assert!(
+            a.contains("maxUnavailable") && a.contains("cannot be 0 when maxSurge is 0"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn daemonset_rolling_update_surge_only_ok() {
+        let ds = daemonset(daemonset_with(
+            template(Some("Always"), None),
+            serde_json::json!({"maxUnavailable": "0", "maxSurge": "1"}),
+        ));
+        assert!(
+            validate_daemonset(&ds).is_empty(),
+            "got: {}",
+            agg(&validate_daemonset(&ds))
+        );
+    }
+
+    #[test]
+    fn daemonset_rolling_update_surge_over_100_percent_rejected() {
+        // unlike Deployment, DaemonSet bounds BOTH fields to 100% (upstream 483)
+        let ds = daemonset(daemonset_with(
+            template(Some("Always"), None),
+            serde_json::json!({"maxUnavailable": "0", "maxSurge": "200%"}),
+        ));
+        let a = agg(&validate_daemonset(&ds));
+        assert!(
+            a.contains("maxSurge") && a.contains("must not be greater than 100%"),
+            "got: {a}"
+        );
+    }
+
+    #[test]
+    fn daemonset_empty_selector_wording() {
+        let ds = daemonset(serde_json::json!({
+            "metadata": {"name": "ds"},
+            "spec": {
+                "selector": {},
+                "updateStrategy": {"type": "OnDelete"},
+                "template": template(Some("Always"), None),
+            }
+        }));
+        assert!(
+            agg(&validate_daemonset(&ds)).contains("empty selector is invalid for daemonset"),
+            "got: {}",
+            agg(&validate_daemonset(&ds))
         );
     }
 }

@@ -68,10 +68,14 @@ fn empty_selector_rejected() {
         "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": []}}
     });
     let errs = validate_replicaset(&rs(spec));
+    // Upstream emits Invalid("empty selector is invalid for deployment") — ReplicaSet
+    // reuses the "deployment" string verbatim (validation.go line 819).
     assert!(
-        errs.iter()
-            .any(|e| e.field == "spec.selector" && e.error_type == ErrorType::Required),
-        "expected spec.selector Required, got: {errs:?}"
+        errs.iter().any(|e| e.field == "spec.selector"
+            && e.error_type == ErrorType::Invalid
+            && e.detail
+                .contains("empty selector is invalid for deployment")),
+        "expected spec.selector Invalid empty-selector, got: {errs:?}"
     );
 }
 
