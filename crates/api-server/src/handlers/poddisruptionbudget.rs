@@ -400,9 +400,23 @@ pub async fn update_status(
 
     // Get existing PDB to preserve spec
     let mut existing: PodDisruptionBudget = state.storage.get(&key).await?;
+    let old = existing.clone();
 
     // Update only the status field
     existing.status = pdb.status;
+
+    // Field validation on the status subresource (mirrors upstream
+    // ValidatePodDisruptionBudgetStatusUpdate): condition list + non-negative
+    // disruption counters.
+    {
+        let errs =
+            rusternetes_common::validation::pdb::validate_pod_disruption_budget_status_update(
+                &existing, &old,
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     let updated = state.storage.update(&key, &existing).await?;
 
