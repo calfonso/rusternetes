@@ -229,6 +229,46 @@ impl Quantity {
         self.mantissa < 0
     }
 
+    /// Value expressed in milli-units (10⁻³), rounding any fractional
+    /// remainder away from zero. Mirrors upstream `Quantity.MilliValue()`
+    /// (`ScaledValue(Milli)`), which rounds up so that e.g. `1.5m` reports
+    /// `2` and a non-integer number of whole units is detectable via
+    /// `milli_value() % 1000 != 0`.
+    ///
+    /// Returns `i64::MAX` / `i64::MIN` on overflow, matching upstream's
+    /// saturating `AsScaledInt64` behaviour for out-of-range values.
+    pub fn milli_value(&self) -> i64 {
+        // value * 1000 = mantissa * 10^(scale + 3)
+        let exp = self.scale + 3;
+        let scaled: i128 = if exp >= 0 {
+            match 10i128
+                .checked_pow(exp as u32)
+                .and_then(|p| self.mantissa.checked_mul(p))
+            {
+                Some(v) => v,
+                None => {
+                    return if self.mantissa < 0 {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }
+                }
+            }
+        } else {
+            // Divide by 10^(-exp), rounding away from zero (ceiling in
+            // magnitude) so any fractional milli-remainder is preserved.
+            let div = 10i128.pow((-exp) as u32);
+            let m = self.mantissa;
+            if m >= 0 {
+                m.div_euclid(div) + i128::from(m.rem_euclid(div) != 0)
+            } else {
+                // Round away from zero for negatives too.
+                -((-m).div_euclid(div) + i128::from((-m).rem_euclid(div) != 0))
+            }
+        };
+        scaled.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+
     /// Canonical-form string for this quantity. Matches upstream
     /// `Quantity.String()`.
     pub fn canonical_string(&self) -> String {

@@ -34,8 +34,9 @@ fn valid_quota_passes() {
 #[test]
 fn negative_hard_quantity_rejected() {
     let errs = validate_resource_quota(&rq(json!({"hard": {"cpu": "-1"}})));
+    // Upstream keys map entries with field.Key, rendering `spec.hard[cpu]`.
     assert!(
-        has(&errs, "spec.hard.cpu", ErrorType::Invalid),
+        has(&errs, "spec.hard[cpu]", ErrorType::Invalid),
         "got: {errs:?}"
     );
 }
