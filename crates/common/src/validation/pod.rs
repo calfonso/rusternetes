@@ -23,8 +23,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
-    Container, EnvVar, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate,
-    PodSecurityContext, PodSpec, Probe, Toleration, Volume, VolumeMount,
+    Container, EnvVar, Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod,
+    PodDNSConfig, PodSchedulingGate, PodSecurityContext, PodSpec, Probe, Toleration, Volume,
+    VolumeMount,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
@@ -370,6 +371,9 @@ fn validate_container(
             "must not be set for init containers",
         ));
     }
+    if let Some(ref lc) = c.lifecycle {
+        errs.extend(validate_lifecycle(lc, &fld_path.child("lifecycle")));
+    }
 
     // resources.
     if let Some(ref res) = c.resources {
@@ -394,8 +398,38 @@ fn validate_container(
         errs.extend(validate_env(env, &fld_path.child("env")));
     }
 
+    // imagePullPolicy enum (upstream validatePullPolicy). Unset/empty is
+    // defaulted at runtime, so only an explicit unsupported value is rejected.
+    if let Some(policy) = c.image_pull_policy.as_deref().filter(|p| !p.is_empty()) {
+        if !PULL_POLICIES.contains(&policy) {
+            errs.push(Error::not_supported(
+                &fld_path.child("imagePullPolicy"),
+                policy.to_string(),
+                PULL_POLICIES,
+            ));
+        }
+    }
+
+    // terminationMessagePolicy enum (upstream validateContainerCommon).
+    if let Some(tmp) = c
+        .termination_message_policy
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    {
+        if !TERMINATION_MESSAGE_POLICIES.contains(&tmp) {
+            errs.push(Error::not_supported(
+                &fld_path.child("terminationMessagePolicy"),
+                tmp.to_string(),
+                TERMINATION_MESSAGE_POLICIES,
+            ));
+        }
+    }
+
     errs
 }
+
+const PULL_POLICIES: &[&str] = &["Always", "Never", "IfNotPresent"];
+const TERMINATION_MESSAGE_POLICIES: &[&str] = &["File", "FallbackToLogsOnError"];
 
 /// Port of upstream `validateLocalDescendingPath`: a `subPath`/`subPathExpr`
 /// must be relative and contain no `..` component.
@@ -432,6 +466,19 @@ fn is_env_var_name(value: &str) -> Vec<String> {
         ".." => errs.push("must not be '..'".to_string()),
         v if v.starts_with("..") => errs.push("must not start with '..'".to_string()),
         _ => {}
+    }
+    errs
+}
+
+/// Port of upstream `validateLifecycle`: validates the `postStart`/`preStop`
+/// handlers (each must specify exactly one handler type).
+fn validate_lifecycle(lifecycle: &Lifecycle, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(ps) = &lifecycle.post_start {
+        errs.extend(validate_lifecycle_handler(ps, &fld_path.child("postStart")));
+    }
+    if let Some(pre) = &lifecycle.pre_stop {
+        errs.extend(validate_lifecycle_handler(pre, &fld_path.child("preStop")));
     }
     errs
 }
@@ -693,6 +740,34 @@ fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
             String::new(),
             "may not have more than one field specified at a time",
         ));
+    }
+    errs
+}
+
+/// Port of upstream `validateHandler` for lifecycle hooks: exactly one of
+/// `exec`/`httpGet`/`tcpSocket`/`sleep`; specifying a second is forbidden, and
+/// specifying none is required.
+fn validate_lifecycle_handler(handler: &LifecycleHandler, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut num_handlers = 0;
+    let mut check = |present: bool, child: &str| {
+        if present {
+            if num_handlers > 0 {
+                errs.push(Error::forbidden(
+                    &fld_path.child(child),
+                    "may not specify more than 1 handler type",
+                ));
+            } else {
+                num_handlers += 1;
+            }
+        }
+    };
+    check(handler.exec.is_some(), "exec");
+    check(handler.http_get.is_some(), "httpGet");
+    check(handler.tcp_socket.is_some(), "tcpSocket");
+    check(handler.sleep.is_some(), "sleep");
+    if num_handlers == 0 {
+        errs.push(Error::required(fld_path, "must specify a handler type"));
     }
     errs
 }
@@ -2237,5 +2312,75 @@ mod tests {
                 .any(|e| e.field.ends_with("configMapKeyRef.key")),
             "{errs:?}"
         );
+    }
+
+    fn cerrs(json: serde_json::Value) -> Vec<String> {
+        let vols: HashSet<&str> = HashSet::new();
+        validate_container(
+            &container_from(json),
+            false,
+            &vols,
+            &Path::new("spec").child("containers").index(0),
+        )
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn image_pull_policy_enum() {
+        assert!(cerrs(
+            serde_json::json!({"name": "c", "image": "i", "imagePullPolicy": "Sometimes"})
+        )
+        .iter()
+        .any(|e| e.contains("imagePullPolicy")));
+        // valid + unset both pass.
+        assert!(!cerrs(
+            serde_json::json!({"name": "c", "image": "i", "imagePullPolicy": "IfNotPresent"})
+        )
+        .iter()
+        .any(|e| e.contains("imagePullPolicy")));
+        assert!(!cerrs(serde_json::json!({"name": "c", "image": "i"}))
+            .iter()
+            .any(|e| e.contains("imagePullPolicy")));
+    }
+
+    #[test]
+    fn termination_message_policy_enum() {
+        assert!(cerrs(
+            serde_json::json!({"name": "c", "image": "i", "terminationMessagePolicy": "Bogus"})
+        )
+        .iter()
+        .any(|e| e.contains("terminationMessagePolicy")));
+        assert!(!cerrs(serde_json::json!({"name": "c", "image": "i", "terminationMessagePolicy": "FallbackToLogsOnError"}))
+            .iter().any(|e| e.contains("terminationMessagePolicy")));
+    }
+
+    #[test]
+    fn lifecycle_handler_requires_exactly_one() {
+        // empty handler -> required
+        let none = cerrs(serde_json::json!({
+            "name": "c", "image": "i", "lifecycle": {"preStop": {}}
+        }));
+        assert!(
+            none.iter()
+                .any(|e| e.contains("must specify a handler type")),
+            "{none:?}"
+        );
+        // two handlers -> forbidden
+        let two = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "lifecycle": {"postStart": {"exec": {"command": ["x"]}, "sleep": {"seconds": 1}}}
+        }));
+        assert!(
+            two.iter()
+                .any(|e| e.contains("may not specify more than 1 handler type")),
+            "{two:?}"
+        );
+        // single handler -> ok
+        let ok = cerrs(serde_json::json!({
+            "name": "c", "image": "i", "lifecycle": {"preStop": {"exec": {"command": ["x"]}}}
+        }));
+        assert!(!ok.iter().any(|e| e.contains("handler type")), "{ok:?}");
     }
 }
