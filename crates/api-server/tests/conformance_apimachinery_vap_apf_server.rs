@@ -888,7 +888,7 @@ async fn table_transformation_should_return_406_for_backend_without_metadata() {
 /// (the strict behaviour), not the lenient resume-from-last-key behaviour
 /// required by this conformance test.
 #[tokio::test]
-#[ignore = "GAP: chunking continue-from-last-key-after-compaction not implemented; server returns 410 instead of resuming; upstream chunking.go:214"]
+#[ignore = "GAP (tracked: indyjonesnl/rusternetes#1451): inconsistent continue token after compaction not implemented; server returns plain 410 without a resume token; upstream chunking.go:132-214"]
 async fn chunking_should_continue_from_last_key_after_compaction() {
     // This test body is a documentation stub only. The corresponding
     // GREEN (strict 410) test lives in conformance_apimachinery_watch_chunking_gc.rs
