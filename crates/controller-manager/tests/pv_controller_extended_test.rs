@@ -288,12 +288,9 @@ async fn test_dynamic_provisioning_skips_unsupported_provisioner() {
 /// must transition to phase `Released` and keep its `claim_ref` set so the
 /// admin can clean it up manually.
 ///
-/// RED-state: rusternetes does not yet have a release/reclaim controller
-/// (no controller in `crates/controller-manager/src/controllers/` watches for
-/// deleted PVCs and updates the bound PV). When that lands, drop the
-/// `#[ignore]` attribute and the assertions below will pass.
+/// `PVBinderController::reconcile_all` now runs a release pass mirroring the
+/// claim-not-found branch of upstream `pv_controller.syncVolume`.
 #[tokio::test]
-#[ignore = "RED-state: no PV release controller transitions Bound->Released on PVC delete"]
 async fn test_reclaim_policy_retain_releases_pv_on_pvc_delete() {
     let storage = setup_test().await;
 

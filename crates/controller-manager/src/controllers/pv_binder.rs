@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusternetes_common::resources::volume::{
     NodeSelectorTerm, PersistentVolumeClaimPhase, PersistentVolumeClaimStatus,
-    PersistentVolumePhase, VolumeNodeAffinity,
+    PersistentVolumePhase, PersistentVolumeReclaimPolicy, VolumeNodeAffinity,
 };
 use rusternetes_common::resources::{
     Node, PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus,
@@ -144,6 +144,79 @@ impl<S: Storage + 'static> PVBinderController<S> {
             }
         }
 
+        // Release pass: a Bound PV whose claim has been deleted must move on.
+        if let Err(e) = self.release_dangling_pvs().await {
+            error!("PV release pass failed: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Reclaim pass mirroring the claim-not-found branch of upstream
+    /// `pv_controller.syncVolume` + `reclaimVolume`
+    /// (`pkg/controller/volume/persistentvolume/pv_controller.go`).
+    ///
+    /// A `Bound` PV whose `claimRef` names a PVC that no longer exists (or was
+    /// recreated with a different UID) is transitioned to `Released`. Then the
+    /// reclaim policy is applied: `Retain` (and `Recycle`, deprecated) leave the
+    /// `Released` PV in place with its `claimRef` for manual recovery; `Delete`
+    /// removes the PV object.
+    async fn release_dangling_pvs(&self) -> Result<()> {
+        let pvs: Vec<PersistentVolume> = self.storage.list("/registry/persistentvolumes/").await?;
+        for mut pv in pvs {
+            // Only act on currently-Bound volumes — never re-touch a PV that is
+            // already Released/Failed/Available (upstream's same guard).
+            if pv.status.as_ref().map(|s| &s.phase) != Some(&PersistentVolumePhase::Bound) {
+                continue;
+            }
+            let Some(claim_ref) = pv.spec.claim_ref.clone() else {
+                continue;
+            };
+            let (Some(ns), Some(name)) =
+                (claim_ref.namespace.as_deref(), claim_ref.name.as_deref())
+            else {
+                continue;
+            };
+
+            // Is the bound claim still present with the same identity?
+            let pvc_key = build_key("persistentvolumeclaims", Some(ns), name);
+            let claim_present = match self.storage.get::<PersistentVolumeClaim>(&pvc_key).await {
+                Ok(pvc) => match claim_ref.uid.as_deref() {
+                    // A non-empty claimRef UID must match; a recreated PVC with a
+                    // new UID means the originally-bound claim is gone.
+                    Some(ref_uid) if !ref_uid.is_empty() => ref_uid == pvc.metadata.uid,
+                    _ => true,
+                },
+                Err(_) => false,
+            };
+            if claim_present {
+                continue;
+            }
+
+            pv.status = Some(PersistentVolumeStatus {
+                phase: PersistentVolumePhase::Released,
+                message: None,
+                reason: None,
+                last_phase_transition_time: None,
+            });
+            let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
+            match pv.spec.persistent_volume_reclaim_policy {
+                Some(PersistentVolumeReclaimPolicy::Delete) => {
+                    self.storage.delete(&pv_key).await?;
+                    info!(
+                        "Reclaim(Delete): deleted released PV {} (claim {}/{} gone)",
+                        pv.metadata.name, ns, name
+                    );
+                }
+                _ => {
+                    self.storage.update(&pv_key, &pv).await?;
+                    info!(
+                        "Released PV {} (claim {}/{} gone); reclaim policy retains it",
+                        pv.metadata.name, ns, name
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

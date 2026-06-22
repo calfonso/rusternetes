@@ -427,6 +427,58 @@ async fn test_skips_already_bound_pv() {
     let pv_key = build_key("persistentvolumes", None, "bound-pv");
     storage.create(&pv_key, &pv).await.unwrap();
 
+    // The claim the PV is bound to must actually exist (with the matching UID),
+    // otherwise the binder's release pass would correctly treat the PV as
+    // dangling. Create it, bound to `bound-pv`.
+    let bound_claim = PersistentVolumeClaim {
+        type_meta: TypeMeta {
+            kind: "PersistentVolumeClaim".to_string(),
+            api_version: "v1".to_string(),
+        },
+        metadata: {
+            let mut meta = ObjectMeta::new("existing-claim");
+            meta.namespace = Some("default".to_string());
+            meta.uid = "existing-uid".to_string();
+            meta
+        },
+        spec: PersistentVolumeClaimSpec {
+            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            resources: ResourceRequirements {
+                limits: None,
+                requests: Some({
+                    let mut r = HashMap::new();
+                    r.insert("storage".to_string(), "10Gi".to_string());
+                    r
+                }),
+            },
+            volume_name: Some("bound-pv".to_string()),
+            storage_class_name: Some("fast".to_string()),
+            volume_mode: Some(PersistentVolumeMode::Filesystem),
+            selector: None,
+            data_source: None,
+            data_source_ref: None,
+            volume_attributes_class_name: None,
+        },
+        status: Some(PersistentVolumeClaimStatus {
+            allocated_resources: None,
+            allocated_resource_statuses: None,
+            resize_status: None,
+            phase: PersistentVolumeClaimPhase::Bound,
+            access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
+            capacity: None,
+            conditions: None,
+            current_volume_attributes_class_name: None,
+            modify_volume_status: None,
+        }),
+    };
+    storage
+        .create(
+            &build_key("persistentvolumeclaims", Some("default"), "existing-claim"),
+            &bound_claim,
+        )
+        .await
+        .unwrap();
+
     // Create new PVC
     let _pvc = create_test_pvc(&storage, "new-pvc", "default", Some("fast".to_string()), 5).await;
 
