@@ -16,6 +16,33 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Port of upstream `SetDefaults_ReplicationController` (pkg/apis/core/v1) plus
+/// the declarative `spec.replicas` default:
+/// - `spec.replicas` defaults to 1;
+/// - when the pod template has labels, an unset `spec.selector` and an unset
+///   top-level `metadata.labels` both default to those template labels.
+fn apply_replicationcontroller_defaults(rc: &mut ReplicationController) {
+    if rc.spec.replicas.is_none() {
+        rc.spec.replicas = Some(1);
+    }
+    let template_labels = rc
+        .spec
+        .template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.labels.clone());
+    if let Some(labels) = template_labels {
+        if !labels.is_empty() {
+            if rc.spec.selector.is_none() {
+                rc.spec.selector = Some(labels.clone());
+            }
+            if rc.metadata.labels.as_ref().is_none_or(|l| l.is_empty()) {
+                rc.metadata.labels = Some(labels);
+            }
+        }
+    }
+}
+
 pub async fn create_replicationcontroller(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -67,21 +94,8 @@ pub async fn create_replicationcontroller(
     rc.metadata.ensure_uid();
     rc.metadata.ensure_creation_timestamp();
 
-    // K8s defaults RC.Spec.Replicas to 1 (declarative default on the v1 type).
-    if rc.spec.replicas.is_none() {
-        rc.spec.replicas = Some(1);
-    }
-
-    // K8s defaults RC.Spec.Selector from Template.Labels when not provided.
-    // See: pkg/registry/core/replicationcontroller/strategy.go
-    if rc.spec.selector.is_none() {
-        rc.spec.selector = rc
-            .spec
-            .template
-            .metadata
-            .as_ref()
-            .and_then(|m| m.labels.clone());
-    }
+    // Apply RC defaulting (replicas, selector + labels from the template).
+    apply_replicationcontroller_defaults(&mut rc);
 
     // Apply K8s defaults to pod template
     crate::handlers::defaults::apply_pod_template_defaults(&mut rc.spec.template);
@@ -528,4 +542,83 @@ pub async fn deletecollection_replicationcontrollers(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    fn rc(json: serde_json::Value) -> ReplicationController {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn defaults_replicas_selector_and_labels_from_template() {
+        let mut r = rc(serde_json::json!({
+            "metadata": {"name": "r"},
+            "spec": {
+                "template": {
+                    "metadata": {"labels": {"app": "web"}},
+                    "spec": {"containers": [{"name": "c", "image": "nginx"}]}
+                }
+            }
+        }));
+        apply_replicationcontroller_defaults(&mut r);
+        assert_eq!(r.spec.replicas, Some(1));
+        assert_eq!(
+            r.spec
+                .selector
+                .as_ref()
+                .unwrap()
+                .get("app")
+                .map(String::as_str),
+            Some("web")
+        );
+        assert_eq!(
+            r.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get("app")
+                .map(String::as_str),
+            Some("web")
+        );
+    }
+
+    #[test]
+    fn explicit_values_preserved() {
+        let mut r = rc(serde_json::json!({
+            "metadata": {"name": "r", "labels": {"team": "x"}},
+            "spec": {
+                "replicas": 3,
+                "selector": {"app": "explicit"},
+                "template": {
+                    "metadata": {"labels": {"app": "web"}},
+                    "spec": {"containers": [{"name": "c", "image": "nginx"}]}
+                }
+            }
+        }));
+        apply_replicationcontroller_defaults(&mut r);
+        assert_eq!(r.spec.replicas, Some(3));
+        assert_eq!(
+            r.spec
+                .selector
+                .as_ref()
+                .unwrap()
+                .get("app")
+                .map(String::as_str),
+            Some("explicit")
+        );
+        // top-level labels were already set -> not overwritten by template labels
+        assert_eq!(
+            r.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get("team")
+                .map(String::as_str),
+            Some("x")
+        );
+        assert!(!r.metadata.labels.as_ref().unwrap().contains_key("app"));
+    }
 }
