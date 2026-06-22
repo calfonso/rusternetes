@@ -3,10 +3,10 @@
 //! (release-1.35).
 //!
 //! Scope: the load-bearing field checks — rules-or-defaultBackend, host
-//! (DNS, not IP), HTTP paths (required, pathType, absolute path), backends
-//! (exactly one of service/resource; service name + port), and `spec.tls`
-//! (host (wildcard) DNS names + secretName). The invalid-path-sequence regex
-//! checks and rule-host wildcard specifics are left as a follow-up.
+//! (DNS, not IP, with wildcard support), HTTP paths (required, pathType,
+//! absolute path, invalid sequences/suffixes), backends (exactly one of
+//! service/resource; service name + port), `spec.tls` (host (wildcard) DNS
+//! names + secretName), and `spec.ingressClassName` (DNS-1123 subdomain).
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -18,6 +18,13 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 const DNS1123_SUBDOMAIN_MAX_LENGTH: usize = 253;
+
+/// Upstream `invalidPathSequences` — substrings forbidden anywhere in an
+/// Exact/Prefix path.
+const INVALID_PATH_SEQUENCES: &[&str] = &["//", "/./", "/../", "%2f", "%2F"];
+
+/// Upstream `invalidPathSuffixes` — suffixes forbidden on an Exact/Prefix path.
+const INVALID_PATH_SUFFIXES: &[&str] = &["/..", "/."];
 
 /// Upstream `wildcardDNS1123SubdomainFmt` = `\*\.` + `dns1123SubdomainFmt`.
 static WILDCARD_DNS1123_SUBDOMAIN_RE: Lazy<Regex> = Lazy::new(|| {
@@ -197,6 +204,26 @@ fn validate_http_path(path: &HTTPIngressPath, fld_path: &Path) -> ErrorList {
                     "must be an absolute path",
                 ));
             }
+            if !p.is_empty() {
+                for seq in INVALID_PATH_SEQUENCES {
+                    if p.contains(seq) {
+                        errs.push(Error::invalid(
+                            &fld_path.child("path"),
+                            p.to_string(),
+                            format!("must not contain '{seq}'"),
+                        ));
+                    }
+                }
+                for suff in INVALID_PATH_SUFFIXES {
+                    if p.ends_with(suff) {
+                        errs.push(Error::invalid(
+                            &fld_path.child("path"),
+                            p.to_string(),
+                            format!("cannot end with '{suff}'"),
+                        ));
+                    }
+                }
+            }
         }
         "ImplementationSpecific" => {
             if let Some(p) = path.path.as_deref() {
@@ -238,6 +265,19 @@ pub fn validate_ingress_spec(spec: &IngressSpec, fld_path: &Path) -> ErrorList {
 
     errs.extend(validate_ingress_tls(spec, &fld_path.child("tls")));
 
+    // spec.ingressClassName, when set, must be a DNS-1123 subdomain. Upstream
+    // `ValidateIngressClassName = apimachineryvalidation.NameIsDNSSubdomain`
+    // (prefix=false), which is exactly `IsDNS1123Subdomain`.
+    if let Some(class_name) = &spec.ingress_class_name {
+        for msg in is_dns1123_subdomain(class_name) {
+            errs.push(Error::invalid(
+                &fld_path.child("ingressClassName"),
+                class_name.clone(),
+                msg,
+            ));
+        }
+    }
+
     for (i, rule) in rules.iter().enumerate() {
         let rule_path = fld_path.child("rules").index(i);
         if let Some(host) = &rule.host {
@@ -248,10 +288,14 @@ pub fn validate_ingress_spec(spec: &IngressSpec, fld_path: &Path) -> ErrorList {
                         host.clone(),
                         "must be a DNS name, not an IP address",
                     ));
-                } else if !host.contains('*') {
-                    for msg in is_dns1123_subdomain(host) {
-                        errs.push(Error::invalid(&rule_path.child("host"), host.clone(), msg));
-                    }
+                }
+                let msgs = if host.contains('*') {
+                    is_wildcard_dns1123_subdomain(host)
+                } else {
+                    is_dns1123_subdomain(host)
+                };
+                for msg in msgs {
+                    errs.push(Error::invalid(&rule_path.child("host"), host.clone(), msg));
                 }
             }
         }
@@ -323,5 +367,169 @@ mod tls_tests {
             serde_json::json!([{"hosts": ["example.com"], "secretName": "Bad_Name"}]),
         ));
         assert!(e.iter().any(|m| m.contains("secretName")), "{e:?}");
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    fn spec_errs(json: serde_json::Value) -> Vec<String> {
+        let spec: IngressSpec = serde_json::from_value(json).unwrap();
+        validate_ingress_spec(&spec, &Path::new("spec"))
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    /// A spec with a single rule whose HTTP path uses the given pathType/path.
+    fn rule_with_path(path_type: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "rules": [{
+                "http": {
+                    "paths": [{
+                        "path": path,
+                        "pathType": path_type,
+                        "backend": {"service": {"name": "s", "port": {"number": 80}}}
+                    }]
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn valid_prefix_path_passes() {
+        assert!(
+            spec_errs(rule_with_path("Prefix", "/foo/bar")).is_empty(),
+            "{:?}",
+            spec_errs(rule_with_path("Prefix", "/foo/bar"))
+        );
+    }
+
+    #[test]
+    fn double_slash_sequence_rejected() {
+        let e = spec_errs(rule_with_path("Prefix", "/foo//bar"));
+        assert!(
+            e.iter().any(|m| m.contains("must not contain '//'")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn dot_dot_sequence_rejected() {
+        let e = spec_errs(rule_with_path("Exact", "/foo/../bar"));
+        assert!(
+            e.iter().any(|m| m.contains("must not contain '/../'")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_slash_rejected() {
+        let e = spec_errs(rule_with_path("Prefix", "/foo%2Fbar"));
+        assert!(
+            e.iter().any(|m| m.contains("must not contain '%2F'")),
+            "{e:?}"
+        );
+        let e2 = spec_errs(rule_with_path("Prefix", "/foo%2fbar"));
+        assert!(
+            e2.iter().any(|m| m.contains("must not contain '%2f'")),
+            "{e2:?}"
+        );
+    }
+
+    #[test]
+    fn dot_dot_suffix_rejected() {
+        let e = spec_errs(rule_with_path("Prefix", "/foo/.."));
+        assert!(
+            e.iter().any(|m| m.contains("cannot end with '/..'")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn dot_suffix_rejected() {
+        let e = spec_errs(rule_with_path("Prefix", "/foo/."));
+        assert!(
+            e.iter().any(|m| m.contains("cannot end with '/.'")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn implementation_specific_skips_sequence_checks() {
+        // ImplementationSpecific only checks the absolute-path prefix, not the
+        // invalid-sequence/suffix rules.
+        assert!(
+            spec_errs(rule_with_path("ImplementationSpecific", "/foo//bar")).is_empty(),
+            "{:?}",
+            spec_errs(rule_with_path("ImplementationSpecific", "/foo//bar"))
+        );
+    }
+
+    fn rule_with_host(host: &str) -> serde_json::Value {
+        serde_json::json!({
+            "rules": [{
+                "host": host,
+                "http": {
+                    "paths": [{
+                        "path": "/",
+                        "pathType": "Prefix",
+                        "backend": {"service": {"name": "s", "port": {"number": 80}}}
+                    }]
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn wildcard_host_accepted() {
+        assert!(
+            spec_errs(rule_with_host("*.example.com")).is_empty(),
+            "{:?}",
+            spec_errs(rule_with_host("*.example.com"))
+        );
+    }
+
+    #[test]
+    fn bad_wildcard_host_rejected() {
+        // bare "*" is not a valid wildcard subdomain (needs "*.")
+        let e = spec_errs(rule_with_host("*"));
+        assert!(e.iter().any(|m| m.contains("wildcard")), "{e:?}");
+    }
+
+    #[test]
+    fn wildcard_not_at_start_rejected() {
+        // "foo.*.example.com" does not match the wildcard format.
+        let e = spec_errs(rule_with_host("foo.*.example.com"));
+        assert!(e.iter().any(|m| m.contains("wildcard")), "{e:?}");
+    }
+
+    #[test]
+    fn plain_host_still_validated() {
+        let e = spec_errs(rule_with_host("Not_A_DNS_Name"));
+        assert!(e.iter().any(|m| m.contains("host")), "{e:?}");
+    }
+
+    fn spec_with_class(class_name: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "ingressClassName": class_name,
+            "defaultBackend": {"service": {"name": "s", "port": {"number": 80}}}
+        })
+    }
+
+    #[test]
+    fn valid_ingress_class_name_passes() {
+        assert!(
+            spec_errs(spec_with_class(serde_json::json!("nginx"))).is_empty(),
+            "{:?}",
+            spec_errs(spec_with_class(serde_json::json!("nginx")))
+        );
+    }
+
+    #[test]
+    fn invalid_ingress_class_name_rejected() {
+        let e = spec_errs(spec_with_class(serde_json::json!("Bad_Class")));
+        assert!(e.iter().any(|m| m.contains("ingressClassName")), "{e:?}");
     }
 }
