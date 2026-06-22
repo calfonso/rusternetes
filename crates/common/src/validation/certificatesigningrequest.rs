@@ -10,9 +10,9 @@
 //!
 //! `usages` is a typed enum in the resource model, so an unrecognized usage
 //! *string* is already rejected at decode time (upstream's `allValidUsages`
-//! `NotSupported` check). The `request` self-signature verification
-//! (`CheckSignature`) is the one remaining piece of upstream `validateCSR`
-//! not yet ported — the structural PKCS#10 parse is done here.
+//! `NotSupported` check). The `request` self-signature is verified
+//! (`CheckSignature`) after the structural PKCS#10 parse, mirroring upstream
+//! `validateCSR`.
 
 use crate::resources::certificates::{CertificateSigningRequest, KeyUsage};
 use crate::validation::field::{Error, ErrorList, Path};
@@ -23,9 +23,8 @@ use x509_parser::prelude::FromDer;
 /// Structurally validate `csr.spec.request` — upstream `validateCSR`'s
 /// `certificates.ParseCSR` step. The field carries the base64 of a
 /// PEM-encoded PKCS#10 certificate request. Returns `Some(detail)` describing
-/// the first parse failure, or `None` when the request parses.
-///
-/// Self-signature verification (`CheckSignature`) is not performed here.
+/// the first parse failure, or `None` when the request parses and its
+/// self-signature verifies.
 fn parse_csr_request_error(request: &str) -> Option<String> {
     if request.is_empty() {
         return Some("must contain a PEM-encoded PKCS#10 certificate signing request".to_string());
@@ -46,7 +45,15 @@ fn parse_csr_request_error(request: &str) -> Option<String> {
     }
     match x509_parser::certification_request::X509CertificationRequest::from_der(parsed.contents())
     {
-        Ok(_) => None,
+        // Upstream `validateCSR` parses the PKCS#10 request and then calls
+        // `csr.CheckSignature()` to confirm it is self-signed by the embedded
+        // public key. Parsing alone is not enough — verify the signature too.
+        Ok((_, csr)) => match csr.verify_signature() {
+            Ok(()) => None,
+            Err(e) => Some(format!(
+                "error parsing request: signature verification failed: {e}"
+            )),
+        },
         Err(e) => Some(format!("error parsing request: {e}")),
     }
 }
@@ -142,10 +149,9 @@ pub fn validate_certificate_signing_request_create(csr: &CertificateSigningReque
     let mut errs = ErrorList::new();
     let spec = Path::new("spec");
 
-    // request: upstream validateCSR parses the PEM-encoded PKCS#10 request.
-    // We perform the structural parse (base64 → PEM "CERTIFICATE REQUEST" block
-    // → PKCS#10 DER). Self-signature verification (CheckSignature) is not yet
-    // performed.
+    // request: upstream validateCSR parses the PEM-encoded PKCS#10 request and
+    // verifies its self-signature. We do the structural parse (base64 → PEM
+    // "CERTIFICATE REQUEST" block → PKCS#10 DER) and then CheckSignature.
     if let Some(detail) = parse_csr_request_error(&csr.spec.request) {
         errs.push(Error::invalid(
             &spec.child("request"),
@@ -372,6 +378,71 @@ mod status_certificate_tests {
         let err = status_certificate_error(Some(&data)).expect("err");
         assert!(
             err.contains("only CERTIFICATE PEM blocks are allowed"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_signature_tests {
+    use super::parse_csr_request_error;
+    use base64::Engine;
+
+    /// Generate a real PKCS#10 CSR PEM with a valid self-signature via rcgen.
+    fn valid_csr_pem() -> String {
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let params =
+            rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).expect("params");
+        params
+            .serialize_request(&key_pair)
+            .expect("csr")
+            .pem()
+            .expect("pem")
+    }
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
+
+    #[test]
+    fn valid_csr_passes() {
+        let request = b64(&valid_csr_pem());
+        assert_eq!(parse_csr_request_error(&request), None);
+    }
+
+    #[test]
+    fn empty_request_rejected() {
+        assert!(parse_csr_request_error("").is_some());
+    }
+
+    #[test]
+    fn garbage_base64_rejected() {
+        let err = parse_csr_request_error("not base64!!!").expect("err");
+        assert!(err.contains("error parsing request"), "{err}");
+    }
+
+    #[test]
+    fn non_csr_pem_rejected() {
+        let request = b64("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
+        let err = parse_csr_request_error(&request).expect("err");
+        assert!(err.contains("CERTIFICATE REQUEST"), "{err}");
+    }
+
+    #[test]
+    fn tampered_signature_rejected() {
+        // Decode a valid CSR to DER, flip the final signature byte (keeps the
+        // ASN.1 lengths intact so the structure still parses), re-PEM it.
+        let pem_str = valid_csr_pem();
+        let block = pem::parse(pem_str.as_bytes()).expect("pem");
+        let mut der = block.contents().to_vec();
+        let last = der.len() - 1;
+        der[last] ^= 0xff;
+        let tampered_pem = pem::encode(&pem::Pem::new("CERTIFICATE REQUEST", der));
+        let request = b64(&tampered_pem);
+
+        let err = parse_csr_request_error(&request).expect("tampered must fail");
+        assert!(
+            err.contains("signature verification failed") || err.contains("error parsing request"),
             "{err}"
         );
     }
