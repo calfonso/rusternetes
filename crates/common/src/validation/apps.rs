@@ -35,45 +35,62 @@ fn selector_is_empty(sel: &LabelSelector) -> bool {
         && sel.match_expressions.as_ref().is_none_or(|m| m.is_empty())
 }
 
-/// Check that template labels contain every key/value from the selector's
-/// `matchLabels`. This is the "template labels must match selector" check.
-/// Upstream in `ValidatePodTemplateSpecForRC` / `ValidateDeploymentSpec`.
+/// Evaluate a `LabelSelector` against a label set — the full `matchLabels` +
+/// `matchExpressions` semantics of `metav1.LabelSelectorAsSelector().Matches()`.
+/// An unrecognized operator is treated as matching here; its invalidity is
+/// reported separately by `validate_label_selector`.
+fn selector_matches_labels(
+    selector: &LabelSelector,
+    labels: &std::collections::HashMap<String, String>,
+) -> bool {
+    if let Some(match_labels) = &selector.match_labels {
+        for (k, v) in match_labels {
+            if labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+    }
+    if let Some(exprs) = &selector.match_expressions {
+        for req in exprs {
+            let present = labels.get(&req.key);
+            let value_in_set =
+                present.is_some_and(|val| req.values.as_ref().is_some_and(|vs| vs.contains(val)));
+            let matches = match req.operator.as_str() {
+                "In" => value_in_set,
+                "NotIn" => !value_in_set,
+                "Exists" => present.is_some(),
+                "DoesNotExist" => present.is_none(),
+                _ => true, // unknown operator: reported by validate_label_selector
+            };
+            if !matches {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Check that the template labels satisfy the selector — the full selector
+/// (`matchLabels` + `matchExpressions`), mirroring upstream's
+/// `LabelSelectorAsSelector(selector).Matches(template.Labels)` check in
+/// `ValidateDeploymentSpec` / `ValidatePodTemplateSpecForRC` / the StatefulSet
+/// and DaemonSet equivalents.
 fn template_labels_match_selector(
     selector: &LabelSelector,
     template_labels: &std::collections::HashMap<String, String>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    if let Some(match_labels) = &selector.match_labels {
-        for (k, v) in match_labels {
-            match template_labels.get(k) {
-                None => {
-                    errs.push(Error::invalid(
-                        fld_path,
-                        template_labels
-                            .iter()
-                            .map(|(k2, v2)| format!("{k2}={v2}"))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        "`selector` does not match template `labels`",
-                    ));
-                    return errs; // one error is enough to convey the mismatch
-                }
-                Some(tv) if tv != v => {
-                    errs.push(Error::invalid(
-                        fld_path,
-                        template_labels
-                            .iter()
-                            .map(|(k2, v2)| format!("{k2}={v2}"))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        "`selector` does not match template `labels`",
-                    ));
-                    return errs;
-                }
-                _ => {}
-            }
-        }
+    if !selector_matches_labels(selector, template_labels) {
+        errs.push(Error::invalid(
+            fld_path,
+            template_labels
+                .iter()
+                .map(|(k2, v2)| format!("{k2}={v2}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            "`selector` does not match template `labels`",
+        ));
     }
     errs
 }
@@ -700,4 +717,89 @@ pub fn validate_statefulset_update(new: &StatefulSet, old: &StatefulSet) -> Erro
         ));
     }
     errs
+}
+
+#[cfg(test)]
+mod selector_match_tests {
+    use super::*;
+
+    fn labels(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn sel(json: serde_json::Value) -> LabelSelector {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn match_labels_still_enforced() {
+        let s = sel(serde_json::json!({"matchLabels": {"app": "x"}}));
+        assert!(selector_matches_labels(&s, &labels(&[("app", "x")])));
+        assert!(!selector_matches_labels(&s, &labels(&[("app", "y")])));
+        assert!(!selector_matches_labels(&s, &labels(&[("other", "x")])));
+    }
+
+    #[test]
+    fn match_expressions_in_notin() {
+        let in_sel = sel(serde_json::json!({"matchExpressions": [
+            {"key": "tier", "operator": "In", "values": ["fe", "be"]}
+        ]}));
+        assert!(selector_matches_labels(&in_sel, &labels(&[("tier", "fe")])));
+        assert!(!selector_matches_labels(
+            &in_sel,
+            &labels(&[("tier", "db")])
+        ));
+        assert!(!selector_matches_labels(&in_sel, &labels(&[("x", "y")]))); // key absent
+
+        let notin = sel(serde_json::json!({"matchExpressions": [
+            {"key": "tier", "operator": "NotIn", "values": ["db"]}
+        ]}));
+        assert!(selector_matches_labels(&notin, &labels(&[("tier", "fe")])));
+        assert!(selector_matches_labels(&notin, &labels(&[("x", "y")]))); // absent => NotIn matches
+        assert!(!selector_matches_labels(&notin, &labels(&[("tier", "db")])));
+    }
+
+    #[test]
+    fn match_expressions_exists_doesnotexist() {
+        let exists = sel(serde_json::json!({"matchExpressions": [
+            {"key": "tier", "operator": "Exists"}
+        ]}));
+        assert!(selector_matches_labels(
+            &exists,
+            &labels(&[("tier", "anything")])
+        ));
+        assert!(!selector_matches_labels(&exists, &labels(&[("x", "y")])));
+
+        let dne = sel(serde_json::json!({"matchExpressions": [
+            {"key": "tier", "operator": "DoesNotExist"}
+        ]}));
+        assert!(selector_matches_labels(&dne, &labels(&[("x", "y")])));
+        assert!(!selector_matches_labels(&dne, &labels(&[("tier", "fe")])));
+    }
+
+    #[test]
+    fn template_mismatch_on_expressions_reports_error() {
+        // selector requires tier In [fe]; template labels have tier=db -> mismatch
+        let s = sel(serde_json::json!({"matchExpressions": [
+            {"key": "tier", "operator": "In", "values": ["fe"]}
+        ]}));
+        let errs = template_labels_match_selector(
+            &s,
+            &labels(&[("tier", "db")]),
+            &Path::new("spec").child("template"),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("does not match template")),
+            "{errs:?}"
+        );
+        // matching template -> no error
+        assert!(
+            template_labels_match_selector(&s, &labels(&[("tier", "fe")]), &Path::new("spec"))
+                .is_empty()
+        );
+    }
 }
