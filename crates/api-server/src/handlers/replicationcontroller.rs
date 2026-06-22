@@ -229,6 +229,36 @@ pub async fn update_replicationcontroller(
     rc.metadata.name = name.clone();
     rc.metadata.namespace = Some(namespace.clone());
 
+    // Mirror create-path defaulting so re-validation sees the same object the
+    // server persists: replicas defaults to 1, selector is populated from the
+    // template labels, and the pod template is defaulted.
+    if rc.spec.replicas.is_none() {
+        rc.spec.replicas = Some(1);
+    }
+    if rc.spec.selector.is_none() {
+        rc.spec.selector = rc
+            .spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.labels.clone());
+    }
+    crate::handlers::defaults::apply_pod_template_defaults(&mut rc.spec.template);
+
+    // Field validation on update. Upstream `ValidateReplicationControllerUpdate`
+    // re-runs `ValidateReplicationControllerSpec` on the new object, so an update
+    // cannot introduce an invalid spec (empty selector, mismatched template
+    // labels, negative replicas, …) that the create path would have rejected.
+    {
+        let errs =
+            rusternetes_common::validation::replicationcontroller::validate_replication_controller(
+                &rc,
+            );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     let key = build_key("replicationcontrollers", Some(&namespace), &name);
 
     // Try to update first, if not found then create (upsert behavior)
