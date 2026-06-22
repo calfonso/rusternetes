@@ -2,15 +2,18 @@
 //! `pkg/apis/flowcontrol/validation/validation.go` (release-1.35).
 //!
 //! Covers `matchingPrecedence` bounds + the `exempt`-name rule,
-//! `priorityLevelConfiguration.name`, and each rule's subjects +
-//! resourceRules/nonResourceRules. ObjectMeta is validated separately
-//! (#1087 / #1277). `kind` / `distinguisherMethod.type` are typed enums, so
-//! those upstream `NotSupported` checks are enforced by the type system.
-//! `ValidateNonResourceURLPath` is approximated (must start with `/`).
+//! `priorityLevelConfiguration.name`, each rule's subjects +
+//! resourceRules/nonResourceRules, and `status.conditions`. ObjectMeta is
+//! validated separately (#1087 / #1277). `kind` / `distinguisherMethod.type`
+//! are typed enums, so those upstream `NotSupported` checks are enforced by the
+//! type system. `ValidateNonResourceURLPath` is a full port of upstream
+//! (empty / leading-slash / whitespace / double-slash / suffix-only wildcard).
+
+use std::collections::HashSet;
 
 use crate::resources::flowcontrol::{
-    FlowSchema, FlowSchemaSubject, NonResourcePolicyRule, PolicyRulesWithSubjects,
-    ResourcePolicyRule, SubjectKind,
+    FlowSchema, FlowSchemaCondition, FlowSchemaStatus, FlowSchemaSubject, NonResourcePolicyRule,
+    PolicyRulesWithSubjects, ResourcePolicyRule, SubjectKind,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
@@ -229,16 +232,63 @@ fn validate_non_resource_rule(rule: &NonResourcePolicyRule, fld_path: &Path) -> 
         }
     } else {
         for (i, url) in rule.non_resource_urls.iter().enumerate() {
-            if !url.starts_with('/') {
-                errs.push(Error::invalid(
-                    &up.index(i),
-                    url.clone(),
-                    "must be an absolute path",
-                ));
+            if let Some(err) = validate_non_resource_url_path(url, &up.index(i)) {
+                errs.push(err);
             }
         }
     }
     errs
+}
+
+/// Port of upstream `ValidateNonResourceURLPath`. A non-resource URL path must:
+///  1. be non-empty,
+///  2. start with a slash,
+///  3. not contain white-space,
+///  4. not contain a double slash,
+///  5. use the wildcard `*` only for suffix matching (`.../*`).
+///
+/// The lone root path `/` is always valid.
+fn validate_non_resource_url_path(path: &str, fld_path: &Path) -> Option<Error> {
+    if path.is_empty() {
+        return Some(Error::invalid(
+            fld_path,
+            path.to_string(),
+            "must not be empty",
+        ));
+    }
+    if path == "/" {
+        return None;
+    }
+    if !path.starts_with('/') {
+        return Some(Error::invalid(
+            fld_path,
+            path.to_string(),
+            "must start with slash",
+        ));
+    }
+    if path.contains(' ') {
+        return Some(Error::invalid(
+            fld_path,
+            path.to_string(),
+            "must not contain white-space",
+        ));
+    }
+    if path.contains("//") {
+        return Some(Error::invalid(
+            fld_path,
+            path.to_string(),
+            "must not contain double slash",
+        ));
+    }
+    let wildcard_count = path.matches('*').count();
+    if wildcard_count > 1 || (wildcard_count == 1 && !path.ends_with("/*")) {
+        return Some(Error::invalid(
+            fld_path,
+            path.to_string(),
+            "wildcard can only do suffix matching",
+        ));
+    }
+    None
 }
 
 fn validate_rule(rule: &PolicyRulesWithSubjects, fld_path: &Path) -> ErrorList {
@@ -276,8 +326,38 @@ fn validate_rule(rule: &PolicyRulesWithSubjects, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Validate a `FlowSchema` on create. Mirrors upstream `ValidateFlowSchemaSpec`
-/// minus ObjectMeta.
+/// Validate a `FlowSchema`'s `status`. Mirrors upstream
+/// `ValidateFlowSchemaStatus`: each condition's `type` must be unique within the
+/// list and non-empty.
+fn validate_flow_schema_status(status: &FlowSchemaStatus, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let conditions = status.conditions.as_deref().unwrap_or(&[]);
+    let cp = fld_path.child("conditions");
+    let mut keys: HashSet<&str> = HashSet::new();
+    for (i, condition) in conditions.iter().enumerate() {
+        if keys.contains(condition.type_.as_str()) {
+            errs.push(Error::duplicate(
+                &cp.index(i).child("type"),
+                condition.type_.clone(),
+            ));
+        }
+        keys.insert(condition.type_.as_str());
+        errs.extend(validate_flow_schema_condition(condition, &cp.index(i)));
+    }
+    errs
+}
+
+/// Mirrors upstream `ValidateFlowSchemaCondition`: condition `type` is required.
+fn validate_flow_schema_condition(condition: &FlowSchemaCondition, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if condition.type_.is_empty() {
+        errs.push(Error::required(&fld_path.child("type"), ""));
+    }
+    errs
+}
+
+/// Validate a `FlowSchema` on create. Mirrors upstream `ValidateFlowSchema`
+/// (spec + status) minus ObjectMeta.
 pub fn validate_flow_schema(fs: &FlowSchema) -> ErrorList {
     let spec_path = Path::new("spec");
     let mut errs: ErrorList = Vec::new();
@@ -325,5 +405,98 @@ pub fn validate_flow_schema(fs: &FlowSchema) -> ErrorList {
         }
     }
 
+    if let Some(status) = &fs.status {
+        errs.extend(validate_flow_schema_status(status, &Path::new("status")));
+    }
+
     errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::validation::field::ErrorType;
+
+    fn cond(type_: &str) -> FlowSchemaCondition {
+        FlowSchemaCondition {
+            type_: type_.to_string(),
+            status: "True".to_string(),
+            last_transition_time: None,
+            reason: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn non_resource_url_path_accepts_valid() {
+        let p = Path::new("p");
+        assert!(validate_non_resource_url_path("/", &p).is_none());
+        assert!(validate_non_resource_url_path("/healthz", &p).is_none());
+        assert!(validate_non_resource_url_path("/api/*", &p).is_none());
+    }
+
+    #[test]
+    fn non_resource_url_path_rejects_empty() {
+        let e = validate_non_resource_url_path("", &Path::new("p")).expect("empty rejected");
+        assert_eq!(e.error_type, ErrorType::Invalid);
+        assert_eq!(e.detail, "must not be empty");
+    }
+
+    #[test]
+    fn non_resource_url_path_rejects_no_leading_slash() {
+        let e = validate_non_resource_url_path("healthz", &Path::new("p")).expect("rejected");
+        assert_eq!(e.detail, "must start with slash");
+    }
+
+    #[test]
+    fn non_resource_url_path_rejects_whitespace() {
+        let e = validate_non_resource_url_path("/health z", &Path::new("p")).expect("rejected");
+        assert_eq!(e.detail, "must not contain white-space");
+    }
+
+    #[test]
+    fn non_resource_url_path_rejects_double_slash() {
+        let e = validate_non_resource_url_path("/api//v1", &Path::new("p")).expect("rejected");
+        assert_eq!(e.detail, "must not contain double slash");
+    }
+
+    #[test]
+    fn non_resource_url_path_rejects_non_suffix_wildcard() {
+        // wildcard not at suffix
+        let e = validate_non_resource_url_path("/*/v1", &Path::new("p")).expect("rejected");
+        assert_eq!(e.detail, "wildcard can only do suffix matching");
+        // more than one wildcard
+        let e2 = validate_non_resource_url_path("/a/*/*", &Path::new("p")).expect("rejected");
+        assert_eq!(e2.detail, "wildcard can only do suffix matching");
+    }
+
+    #[test]
+    fn status_condition_type_required() {
+        let status = FlowSchemaStatus {
+            conditions: Some(vec![cond("")]),
+        };
+        let errs = validate_flow_schema_status(&status, &Path::new("status"));
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].error_type, ErrorType::Required);
+        assert_eq!(errs[0].field, "status.conditions[0].type");
+    }
+
+    #[test]
+    fn status_condition_duplicate_type() {
+        let status = FlowSchemaStatus {
+            conditions: Some(vec![cond("Dangling"), cond("Dangling")]),
+        };
+        let errs = validate_flow_schema_status(&status, &Path::new("status"));
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].error_type, ErrorType::Duplicate);
+        assert_eq!(errs[0].field, "status.conditions[1].type");
+    }
+
+    #[test]
+    fn status_conditions_unique_ok() {
+        let status = FlowSchemaStatus {
+            conditions: Some(vec![cond("Dangling"), cond("Ready")]),
+        };
+        assert!(validate_flow_schema_status(&status, &Path::new("status")).is_empty());
+    }
 }

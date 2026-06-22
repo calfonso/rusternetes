@@ -3,18 +3,22 @@
 //!
 //! Covers the `type` ↔ name(`exempt`) coupling, the exempt/limited field
 //! coupling, `limited` (nominalConcurrencyShares / borrowingLimitPercent /
-//! limitResponse + queuing), and `exempt` numeric bounds. ObjectMeta is
-//! validated separately (#1087 / #1277).
+//! limitResponse + queuing), `exempt` numeric bounds, and `status.conditions`.
+//! ObjectMeta is validated separately (#1087 / #1277).
 //!
 //! Note: the rusternetes type uses `lending_concurrency_limit` rather than
-//! upstream's `lendablePercent`, so the 0–100 lendable-percent check has no
-//! field to apply to and is omitted. The shuffle-sharding entropy-bits check on
-//! `handSize`/`queues` is also omitted (exotic); the positivity, max-queues, and
-//! `handSize <= queues` checks are ported.
+//! upstream's `lendablePercent`, so the 0–100 lendable-percent check (upstream
+//! lines 432-434 / 447-449) has no field to apply to and is omitted. The
+//! shuffle-sharding entropy-bits check on `handSize`/`queues` is also omitted
+//! (exotic); the positivity, max-queues, and `handSize <= queues` checks are
+//! ported.
+
+use std::collections::HashSet;
 
 use crate::resources::flowcontrol::{
     ExemptPriorityLevelConfiguration, LimitResponse, LimitResponseType,
-    LimitedPriorityLevelConfiguration, PriorityLevelConfiguration, PriorityLevelType,
+    LimitedPriorityLevelConfiguration, PriorityLevelConfiguration,
+    PriorityLevelConfigurationCondition, PriorityLevelConfigurationStatus, PriorityLevelType,
     QueuingConfiguration,
 };
 use crate::validation::field::{Error, ErrorList, Path};
@@ -124,8 +128,42 @@ fn validate_exempt(eplc: &ExemptPriorityLevelConfiguration, fld_path: &Path) -> 
     errs
 }
 
+/// Validate a `PriorityLevelConfiguration`'s `status`. Mirrors upstream
+/// `ValidatePriorityLevelConfigurationStatus`: each condition's `type` must be
+/// unique within the list and non-empty.
+fn validate_status(status: &PriorityLevelConfigurationStatus, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let conditions = status.conditions.as_deref().unwrap_or(&[]);
+    let cp = fld_path.child("conditions");
+    let mut keys: HashSet<&str> = HashSet::new();
+    for (i, condition) in conditions.iter().enumerate() {
+        if keys.contains(condition.type_.as_str()) {
+            errs.push(Error::duplicate(
+                &cp.index(i).child("type"),
+                condition.type_.clone(),
+            ));
+        }
+        keys.insert(condition.type_.as_str());
+        errs.extend(validate_condition(condition, &cp.index(i)));
+    }
+    errs
+}
+
+/// Mirrors upstream `ValidatePriorityLevelConfigurationCondition`: condition
+/// `type` is required.
+fn validate_condition(
+    condition: &PriorityLevelConfigurationCondition,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if condition.type_.is_empty() {
+        errs.push(Error::required(&fld_path.child("type"), ""));
+    }
+    errs
+}
+
 /// Validate a `PriorityLevelConfiguration` on create. Mirrors upstream
-/// `ValidatePriorityLevelConfigurationSpec` minus ObjectMeta.
+/// `ValidatePriorityLevelConfiguration` (spec + status) minus ObjectMeta.
 pub fn validate_priority_level_configuration(plc: &PriorityLevelConfiguration) -> ErrorList {
     let spec_path = Path::new("spec");
     let mut errs: ErrorList = Vec::new();
@@ -172,5 +210,55 @@ pub fn validate_priority_level_configuration(plc: &PriorityLevelConfiguration) -
         }
     }
 
+    if let Some(status) = &plc.status {
+        errs.extend(validate_status(status, &Path::new("status")));
+    }
+
     errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::validation::field::ErrorType;
+
+    fn cond(type_: &str) -> PriorityLevelConfigurationCondition {
+        PriorityLevelConfigurationCondition {
+            type_: type_.to_string(),
+            status: "True".to_string(),
+            last_transition_time: None,
+            reason: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn status_condition_type_required() {
+        let status = PriorityLevelConfigurationStatus {
+            conditions: Some(vec![cond("")]),
+        };
+        let errs = validate_status(&status, &Path::new("status"));
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].error_type, ErrorType::Required);
+        assert_eq!(errs[0].field, "status.conditions[0].type");
+    }
+
+    #[test]
+    fn status_condition_duplicate_type() {
+        let status = PriorityLevelConfigurationStatus {
+            conditions: Some(vec![cond("ConcurrencyShared"), cond("ConcurrencyShared")]),
+        };
+        let errs = validate_status(&status, &Path::new("status"));
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].error_type, ErrorType::Duplicate);
+        assert_eq!(errs[0].field, "status.conditions[1].type");
+    }
+
+    #[test]
+    fn status_conditions_unique_ok() {
+        let status = PriorityLevelConfigurationStatus {
+            conditions: Some(vec![cond("ConcurrencyShared"), cond("Ready")]),
+        };
+        assert!(validate_status(&status, &Path::new("status")).is_empty());
+    }
 }
