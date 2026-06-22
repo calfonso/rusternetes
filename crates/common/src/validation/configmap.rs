@@ -13,8 +13,9 @@ use crate::validation::field::{Error, ErrorList, Path};
 pub const MAX_SECRET_SIZE: usize = 1024 * 1024;
 
 /// Port of upstream `IsConfigMapKey`: ≤253 chars, matching `[-._a-zA-Z0-9]+`,
-/// and not `.`/`..`. Returns the upstream-style messages.
-fn config_map_key_errors(key: &str) -> Vec<String> {
+/// and not `.`/`..`. Returns the upstream-style messages. Shared with Secret
+/// data-key validation (the same `IsConfigMapKey` rule applies there).
+pub fn config_map_key_errors(key: &str) -> Vec<String> {
     let mut errs = Vec::new();
     if key.len() > 253 {
         errs.push("must be no more than 253 characters".to_string());

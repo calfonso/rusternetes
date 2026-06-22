@@ -109,35 +109,32 @@ pub async fn create(
     // Ensure namespace is set from the URL path
     secret.metadata.namespace = Some(namespace.clone());
 
-    // Validate secret data keys (must be valid path segments)
-    if let Some(ref data) = secret.data {
-        for key in data.keys() {
-            if key.is_empty()
-                || key == "."
-                || key == ".."
-                || key.contains('/')
-                || key.contains('\\')
-            {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "Invalid key name \"{}\": a valid config key must consist of alphanumeric characters, '-', '_' or '.'",
-                    key
-                )));
+    // Validate secret data / stringData keys with the upstream IsConfigMapKey
+    // rule (≤253 chars, `[-._a-zA-Z0-9]+`, not `.`/`..`) — the same constraint
+    // ValidateSecret applies. Errors are reported on the `data`/`stringData`
+    // field paths.
+    {
+        use rusternetes_common::validation::configmap::config_map_key_errors;
+        use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
+        let mut errs: ErrorList = Vec::new();
+        if let Some(ref data) = secret.data {
+            let p = Path::new("data");
+            for key in data.keys() {
+                for msg in config_map_key_errors(key) {
+                    errs.push(FieldError::invalid(&p.child(key), key.clone(), msg));
+                }
             }
         }
-    }
-    if let Some(ref string_data) = secret.string_data {
-        for key in string_data.keys() {
-            if key.is_empty()
-                || key == "."
-                || key == ".."
-                || key.contains('/')
-                || key.contains('\\')
-            {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "Invalid key name \"{}\": a valid config key must consist of alphanumeric characters, '-', '_' or '.'",
-                    key
-                )));
+        if let Some(ref string_data) = secret.string_data {
+            let p = Path::new("stringData");
+            for key in string_data.keys() {
+                for msg in config_map_key_errors(key) {
+                    errs.push(FieldError::invalid(&p.child(key), key.clone(), msg));
+                }
             }
+        }
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
