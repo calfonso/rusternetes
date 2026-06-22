@@ -17,8 +17,9 @@ const CSI_DRIVER_NAME_MAX_LENGTH: usize = 63;
 const CSI_NODE_ID_MAX_LENGTH: usize = 192;
 
 /// Port of upstream `ValidateCSIDriverName`: required, ≤63 chars, and a
-/// DNS-1123 subdomain when lowercased (caseless).
-fn validate_csi_driver_name(name: &str, fld_path: &Path) -> ErrorList {
+/// DNS-1123 subdomain when lowercased (caseless). Shared with ResourceSlice
+/// (`spec.driver`), which uses the same upstream validator.
+pub fn validate_csi_driver_name(name: &str, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if name.is_empty() {
         errs.push(Error::required(fld_path, ""));

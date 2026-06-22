@@ -2,17 +2,29 @@
 //! Kubernetes `pkg/apis/resource/validation/validation.go::ValidateResourceSlice`
 //! (release-1.35).
 //!
-//! Scope (create path): `driver` (DNS-1123 subdomain), `pool`
-//! (name segments + generation/resourceSliceCount bounds), the exactly-one
-//! node-selection rule (`nodeName`/`nodeSelector`/`allNodes`/
+//! Scope (create path): `driver` (CSI driver name, via
+//! `corevalidation.ValidateCSIDriverName`), `pool` (name segments +
+//! generation/resourceSliceCount bounds), the exactly-one node-selection rule
+//! (`nodeName` via `ValidateNodeName`/`nodeSelector`/`allNodes`/
 //! `perDeviceNodeSelection`), and the `devices` set (size cap + unique
 //! non-empty names). Deep `nodeSelector` term validation and per-device field
 //! validation are tracked in #1442. ObjectMeta is validated separately.
 
 use crate::resources::{ResourceSlice, ResourceSliceSpec};
+use crate::validation::csinode::validate_csi_driver_name;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_subdomain;
 use std::collections::HashSet;
+
+/// Port of upstream `validateNodeName` (resource/validation): node names use
+/// `corevalidation.ValidateNodeName`, which is `NameIsDNSSubdomain` — a
+/// DNS-1123 subdomain.
+fn validate_node_name(name: &str, fld_path: &Path) -> ErrorList {
+    is_dns1123_subdomain(name)
+        .into_iter()
+        .map(|msg| Error::invalid(fld_path, name.to_string(), msg))
+        .collect()
+}
 
 const POOL_NAME_MAX_LENGTH: usize = 253;
 const RESOURCE_SLICE_MAX_DEVICES: usize = 128;
@@ -57,15 +69,11 @@ pub fn validate_resource_slice_update(new: &ResourceSlice, old: &ResourceSlice) 
 fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    // driver — required, DNS-1123 subdomain.
+    // driver — CSI driver name (upstream `validateDriverName` =
+    // `corevalidation.ValidateCSIDriverName`): required, ≤63 chars, DNS-1123
+    // subdomain when lowercased.
     let driver_path = fld_path.child("driver");
-    if spec.driver.is_empty() {
-        errs.push(Error::required(&driver_path, ""));
-    } else {
-        for msg in is_dns1123_subdomain(&spec.driver) {
-            errs.push(Error::invalid(&driver_path, spec.driver.clone(), msg));
-        }
-    }
+    errs.extend(validate_csi_driver_name(&spec.driver, &driver_path));
 
     // pool.
     let pool_path = fld_path.child("pool");
@@ -108,13 +116,7 @@ fn validate_resource_slice_spec(spec: &ResourceSliceSpec, fld_path: &Path) -> Er
             ));
         } else {
             set_fields.push("`nodeName`");
-            for msg in is_dns1123_subdomain(node_name) {
-                errs.push(Error::invalid(
-                    &fld_path.child("nodeName"),
-                    node_name.clone(),
-                    msg,
-                ));
-            }
+            errs.extend(validate_node_name(node_name, &fld_path.child("nodeName")));
         }
     }
     if spec.node_selector.is_some() {
@@ -227,6 +229,59 @@ mod tests {
         }))
         .iter()
         .any(|m| m.contains("driver")));
+    }
+
+    #[test]
+    fn driver_uses_csi_driver_name_length_cap() {
+        // 64 chars: a valid DNS-1123 subdomain, but exceeds the CSI driver-name
+        // 63-char cap. DNS-1123-subdomain validation would accept it; the CSI
+        // validator must reject it.
+        let long = "a".repeat(64);
+        let e = errs(serde_json::json!({
+            "driver": long,
+            "pool": {"name": "p", "generation": 0, "resourceSliceCount": 1},
+            "allNodes": true, "devices": []
+        }));
+        assert!(
+            e.iter().any(|m| m.contains("driver") && m.contains("63")),
+            "expected CSI driver-name length error, got {e:?}"
+        );
+        // exactly 63 chars is accepted.
+        let ok = "a".repeat(63);
+        let e2 = errs(serde_json::json!({
+            "driver": ok,
+            "pool": {"name": "p", "generation": 0, "resourceSliceCount": 1},
+            "allNodes": true, "devices": []
+        }));
+        assert!(
+            !e2.iter().any(|m| m.contains("driver")),
+            "63-char driver should pass, got {e2:?}"
+        );
+    }
+
+    #[test]
+    fn node_name_uses_node_name_validator() {
+        // Invalid node name (uppercase / underscore) is rejected via the
+        // node-name (DNS-1123 subdomain) validator on the `nodeName` path.
+        let e = errs(serde_json::json!({
+            "driver": "d.example.com",
+            "pool": {"name": "p", "generation": 0, "resourceSliceCount": 1},
+            "nodeName": "Bad_Node", "devices": []
+        }));
+        assert!(
+            e.iter().any(|m| m.contains("nodeName")),
+            "expected nodeName validation error, got {e:?}"
+        );
+        // A valid node name passes.
+        let e2 = errs(serde_json::json!({
+            "driver": "d.example.com",
+            "pool": {"name": "p", "generation": 0, "resourceSliceCount": 1},
+            "nodeName": "node-1.example.com", "devices": []
+        }));
+        assert!(
+            !e2.iter().any(|m| m.contains("nodeName")),
+            "valid nodeName should pass, got {e2:?}"
+        );
     }
 
     #[test]
