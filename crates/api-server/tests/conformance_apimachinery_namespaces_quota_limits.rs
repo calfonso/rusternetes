@@ -291,6 +291,56 @@ async fn namespace_create_then_list_contains_it() {
     }
 }
 
+/// [sig-api-machinery] ResourceQuota should manage the lifecycle of a
+/// ResourceQuota [Conformance] — the early step: *"Attempt to list all
+/// namespaces with a label selector which MUST succeed. One list MUST be
+/// found."*
+///
+/// Upstream: test/e2e/apimachinery/resource_quota.go (the "manage the lifecycle"
+/// case). Tracked as issue #276. Pairs with
+/// `resource_quota_deletecollection_by_label_selector`.
+///
+/// Locks the `apply_selectors` filtering on the namespace LIST handler: only the
+/// label-matching namespace is returned.
+#[tokio::test]
+async fn namespace_list_by_label_selector_returns_only_matches() {
+    let (router, _mem) = spawn_router();
+
+    let labeled = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": { "name": "ns-rq-lifecycle", "labels": { "e2e-ns": "rq-lifecycle" } }
+    });
+    let (s, _) = send_json(router.clone(), "POST", "/api/v1/namespaces", Some(&labeled)).await;
+    assert_eq!(s, 201);
+    // A second namespace without the label must be filtered out.
+    let (s, _) = send_json(
+        router.clone(),
+        "POST",
+        "/api/v1/namespaces",
+        Some(&ns_body("ns-rq-other")),
+    )
+    .await;
+    assert_eq!(s, 201);
+
+    let (status, body) = send_json(
+        router,
+        "GET",
+        "/api/v1/namespaces?labelSelector=e2e-ns=rq-lifecycle",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "labelled namespace list MUST succeed");
+    assert_eq!(body["kind"], "NamespaceList");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["ns-rq-lifecycle"], "exactly one list MUST be found");
+}
+
 /// [sig-api-machinery] Namespaces creating namespaces should auto-create the
 /// default ServiceAccount [Conformance]
 ///
@@ -1021,6 +1071,104 @@ async fn resource_quota_delete_then_get_returns_not_found() {
     .await;
     assert_eq!(s, 404, "expected 404 after DELETE, got body={}", body);
     assert_eq!(body["reason"], "NotFound");
+}
+
+/// [sig-api-machinery] ResourceQuota should manage the lifecycle of a
+/// ResourceQuota [Conformance] — the final lifecycle step: *"It MUST succeed at
+/// deleting a collection of ResourceQuota via a label selector."*
+///
+/// Upstream: test/e2e/apimachinery/resource_quota.go (the "manage the lifecycle"
+/// case, promoted v1.25). Tracked as issue #276.
+///
+/// Mirrors the DELETE-collection-by-`labelSelector` contract: only the quotas
+/// whose labels match the selector are removed; non-matching quotas survive.
+/// This locks the `apply_selectors` filtering in `deletecollection_resourcequotas`.
+#[tokio::test]
+async fn resource_quota_deletecollection_by_label_selector() {
+    let (router, _mem) = spawn_router();
+
+    // Two quotas carrying the selector label, plus one without it.
+    let labeled = |name: &str| {
+        json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": name, "labels": { "e2e-rq": "manage-lifecycle" } },
+            "spec": { "hard": { "cpu": "1", "memory": "500Mi" } }
+        })
+    };
+    for body in [labeled("rq-sel-a"), labeled("rq-sel-b")] {
+        let (s, _) = send_json(
+            router.clone(),
+            "POST",
+            "/api/v1/namespaces/default/resourcequotas",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, 201);
+    }
+    let (s, _) = send_json(
+        router.clone(),
+        "POST",
+        "/api/v1/namespaces/default/resourcequotas",
+        Some(&quota_body("rq-keep", &[("pods", "3")])),
+    )
+    .await;
+    assert_eq!(s, 201);
+
+    // List filtered by the selector MUST return exactly the two labeled quotas.
+    let (s, list) = send_json(
+        router.clone(),
+        "GET",
+        "/api/v1/namespaces/default/resourcequotas?labelSelector=e2e-rq=manage-lifecycle",
+        None,
+    )
+    .await;
+    assert_eq!(s, 200);
+    let names: Vec<&str> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "label list should match 2 quotas, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"rq-keep"),
+        "unlabeled quota must not match"
+    );
+
+    // DeleteCollection scoped by the same label selector MUST succeed.
+    let (s, _) = send_json(
+        router.clone(),
+        "DELETE",
+        "/api/v1/namespaces/default/resourcequotas?labelSelector=e2e-rq=manage-lifecycle",
+        None,
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // The labeled quotas are gone; the non-matching one survives.
+    for gone in ["rq-sel-a", "rq-sel-b"] {
+        let (s, _) = send_json(
+            router.clone(),
+            "GET",
+            &format!("/api/v1/namespaces/default/resourcequotas/{gone}"),
+            None,
+        )
+        .await;
+        assert_eq!(s, 404, "{gone} should have been deleted by collection");
+    }
+    let (s, _) = send_json(
+        router,
+        "GET",
+        "/api/v1/namespaces/default/resourcequotas/rq-keep",
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "non-matching quota must survive deletecollection");
 }
 
 // ===========================================================================
