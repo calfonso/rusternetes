@@ -23,13 +23,20 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
-    Container, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate,
+    Container, EnvVar, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate,
     PodSecurityContext, PodSpec, Probe, Toleration, Volume, VolumeMount,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
 };
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+/// Upstream `envVarNameFmt` / `envVarNameRegexp`.
+static ENV_VAR_NAME_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$").expect("env var name regex"));
+const ENV_VAR_NAME_ERR_MSG: &str = "a valid environment variable name must consist of alphabetic characters, digits, '_', '-', or '.', and must not start with a digit";
 
 // ---------------------------------------------------------------------------
 // Create-side validation
@@ -382,6 +389,11 @@ fn validate_container(
         ));
     }
 
+    // env.
+    if let Some(ref env) = c.env {
+        errs.extend(validate_env(env, &fld_path.child("env")));
+    }
+
     errs
 }
 
@@ -402,6 +414,24 @@ fn validate_local_descending_path(target: &str, fld_path: &Path) -> ErrorList {
             target.to_string(),
             "must not contain '..'",
         ));
+    }
+    errs
+}
+
+/// Port of upstream `validation.IsEnvVarName`: the env-var name format plus the
+/// `hasChDirPrefix` guard (must not be `.`/`..` or start with `..`).
+fn is_env_var_name(value: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    if !ENV_VAR_NAME_RE.is_match(value) {
+        errs.push(format!(
+            "{ENV_VAR_NAME_ERR_MSG} (regex used for validation is '[-._a-zA-Z][-._a-zA-Z0-9]*')"
+        ));
+    }
+    match value {
+        "." => errs.push("must not be '.'".to_string()),
+        ".." => errs.push("must not be '..'".to_string()),
+        v if v.starts_with("..") => errs.push("must not start with '..'".to_string()),
+        _ => {}
     }
     errs
 }
@@ -570,6 +600,99 @@ fn validate_mount_recursive_read_only(mount: &VolumeMount, fld_path: &Path) -> E
                 &["Disabled", "IfPossible", "Enabled"],
             ));
         }
+    }
+    errs
+}
+
+/// Port of upstream `validateEnv`: each env var needs a valid name, and its
+/// `valueFrom` (when present) must reference exactly one source and not coexist
+/// with a non-empty `value`.
+fn validate_env(env: &[EnvVar], fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (i, ev) in env.iter().enumerate() {
+        let idx = fld_path.index(i);
+        if ev.name.is_empty() {
+            errs.push(Error::required(&idx.child("name"), ""));
+        } else {
+            for msg in is_env_var_name(&ev.name) {
+                errs.push(Error::invalid(&idx.child("name"), ev.name.clone(), msg));
+            }
+        }
+        errs.extend(validate_env_var_value_from(ev, &idx.child("valueFrom")));
+    }
+    errs
+}
+
+/// Port of upstream `validateEnvVarValueFrom`: exactly one source, mutually
+/// exclusive with a non-empty `value`, and the structural requireds of the
+/// chosen source.
+fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(vf) = ev.value_from.as_ref() else {
+        return errs;
+    };
+
+    let mut num_sources = 0;
+    if let Some(field_ref) = &vf.field_ref {
+        num_sources += 1;
+        if field_ref.field_path.is_empty() {
+            errs.push(Error::required(
+                &fld_path.child("fieldRef").child("fieldPath"),
+                "",
+            ));
+        }
+    }
+    if let Some(rfr) = &vf.resource_field_ref {
+        num_sources += 1;
+        if rfr.resource.is_empty() {
+            errs.push(Error::required(
+                &fld_path.child("resourceFieldRef").child("resource"),
+                "",
+            ));
+        }
+    }
+    if let Some(cm) = &vf.config_map_key_ref {
+        num_sources += 1;
+        if cm.key.is_empty() {
+            errs.push(Error::required(
+                &fld_path.child("configMapKeyRef").child("key"),
+                "",
+            ));
+        }
+    }
+    if let Some(sk) = &vf.secret_key_ref {
+        num_sources += 1;
+        if sk.key.is_empty() {
+            errs.push(Error::required(
+                &fld_path.child("secretKeyRef").child("key"),
+                "",
+            ));
+        }
+    }
+    // fileKeyRef (alpha, EnvFiles) still counts as a source so a fileKeyRef-only
+    // env var isn't wrongly flagged as specifying none.
+    if vf.file_key_ref.is_some() {
+        num_sources += 1;
+    }
+
+    if num_sources == 0 {
+        errs.push(Error::invalid(
+            fld_path,
+            String::new(),
+            "must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef` or `secretKeyRef`",
+        ));
+    } else if ev.value.as_deref().is_some_and(|v| !v.is_empty()) {
+        errs.push(Error::invalid(
+            fld_path,
+            String::new(),
+            "may not be specified when `value` is not empty",
+        ));
+    } else if num_sources > 1 {
+        errs.push(Error::invalid(
+            fld_path,
+            String::new(),
+            "may not have more than one field specified at a time",
+        ));
     }
     errs
 }
@@ -2034,6 +2157,84 @@ mod tests {
             errs.iter().any(|e| e
                 .to_string()
                 .contains("already exist as a path in volumeDevices")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn env_name_must_be_valid() {
+        let env: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
+            {"name": "MY_ENV.name-1", "value": "ok"},
+            {"name": "1bad", "value": "x"},
+            {"name": "", "value": "y"}
+        ]))
+        .unwrap();
+        let errs = validate_env(&env, &Path::new("env"));
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("[1].name")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("[2].name")),
+            "{errs:?}"
+        );
+        // index 0 is valid.
+        assert!(!errs.iter().any(|e| e.field.contains("[0]")), "{errs:?}");
+    }
+
+    #[test]
+    fn env_chdir_prefix_rejected() {
+        assert!(is_env_var_name("..").iter().any(|m| m.contains("'..'")));
+        assert!(is_env_var_name("..foo")
+            .iter()
+            .any(|m| m.contains("start with '..'")));
+        assert!(is_env_var_name(".").iter().any(|m| m.contains("'.'")));
+        assert!(is_env_var_name("GOOD.name-1").is_empty());
+    }
+
+    #[test]
+    fn env_value_and_valuefrom_mutually_exclusive() {
+        let env: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
+            {"name": "A", "value": "v", "valueFrom": {"configMapKeyRef": {"name": "cm", "key": "k"}}}
+        ])).unwrap();
+        let errs = validate_env(&env, &Path::new("env"));
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("may not be specified when `value` is not empty")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn env_valuefrom_requires_exactly_one_source() {
+        // zero sources
+        let none: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
+            {"name": "A", "valueFrom": {}}
+        ]))
+        .unwrap();
+        assert!(validate_env(&none, &Path::new("env"))
+            .iter()
+            .any(|e| e.to_string().contains("must specify one of")));
+        // two sources
+        let two: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
+            {"name": "A", "valueFrom": {"configMapKeyRef": {"name": "cm", "key": "k"}, "secretKeyRef": {"name": "s", "key": "k"}}}
+        ])).unwrap();
+        assert!(validate_env(&two, &Path::new("env"))
+            .iter()
+            .any(|e| e.to_string().contains("more than one field")));
+    }
+
+    #[test]
+    fn env_configmap_keyref_requires_key() {
+        let env: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
+            {"name": "A", "valueFrom": {"configMapKeyRef": {"name": "cm", "key": ""}}}
+        ]))
+        .unwrap();
+        let errs = validate_env(&env, &Path::new("env"));
+        assert!(
+            errs.iter()
+                .any(|e| e.field.ends_with("configMapKeyRef.key")),
             "{errs:?}"
         );
     }
