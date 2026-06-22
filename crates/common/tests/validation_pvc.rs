@@ -106,3 +106,124 @@ fn invalid_storage_class_name_rejected() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn invalid_selector_match_expression_rejected() {
+    let mut spec = valid_spec();
+    spec["selector"] = json!({
+        "matchExpressions": [{"key": "k", "operator": "BogusOp"}]
+    });
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(
+        has(
+            &errs,
+            "spec.selector.matchExpressions[0].operator",
+            ErrorType::Invalid
+        ),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn valid_selector_ok() {
+    let mut spec = valid_spec();
+    spec["selector"] = json!({"matchLabels": {"app": "db"}});
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+}
+
+#[test]
+fn data_source_default_apigroup_requires_pvc_kind() {
+    let mut spec = valid_spec();
+    // Empty apiGroup with a non-PVC kind is invalid.
+    spec["dataSource"] = json!({"kind": "Secret", "name": "src"});
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(
+        has(&errs, "spec.dataSource", ErrorType::Invalid),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn data_source_pvc_kind_ok() {
+    let mut spec = valid_spec();
+    spec["dataSource"] = json!({"kind": "PersistentVolumeClaim", "name": "src"});
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+}
+
+#[test]
+fn data_source_missing_name_required() {
+    let mut spec = valid_spec();
+    spec["dataSource"] = json!({"kind": "PersistentVolumeClaim", "name": ""});
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(
+        has(&errs, "spec.dataSource.name", ErrorType::Required),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn data_source_invalid_apigroup_rejected() {
+    let mut spec = valid_spec();
+    spec["dataSource"] = json!({"apiGroup": "Bad_Group", "kind": "Foo", "name": "src"});
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(
+        has(&errs, "spec.dataSource.apiGroup", ErrorType::Invalid),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn data_source_ref_namespace_forbids_data_source() {
+    let mut spec = valid_spec();
+    spec["dataSource"] = json!({"kind": "PersistentVolumeClaim", "name": "src"});
+    spec["dataSourceRef"] = json!({
+        "kind": "PersistentVolumeClaim", "name": "src", "namespace": "other"
+    });
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    // dataSource may not be set when dataSourceRef.namespace is specified.
+    assert!(has(&errs, "spec", ErrorType::Invalid), "got: {errs:?}");
+}
+
+#[test]
+fn data_source_must_match_data_source_ref() {
+    let mut spec = valid_spec();
+    spec["dataSource"] = json!({"kind": "PersistentVolumeClaim", "name": "a"});
+    spec["dataSourceRef"] = json!({"kind": "PersistentVolumeClaim", "name": "b"});
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(has(&errs, "spec", ErrorType::Invalid), "got: {errs:?}");
+}
+
+#[test]
+fn data_source_equal_data_source_ref_ok() {
+    let mut spec = valid_spec();
+    spec["dataSource"] = json!({"kind": "PersistentVolumeClaim", "name": "a"});
+    spec["dataSourceRef"] = json!({"kind": "PersistentVolumeClaim", "name": "a"});
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+}
+
+#[test]
+fn data_source_ref_invalid_namespace_rejected() {
+    let mut spec = valid_spec();
+    spec["dataSourceRef"] = json!({
+        "kind": "PersistentVolumeClaim", "name": "src", "namespace": "Bad_NS"
+    });
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(
+        has(&errs, "spec.dataSourceRef.namespace", ErrorType::Invalid),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn invalid_volume_attributes_class_name_rejected() {
+    let mut spec = valid_spec();
+    spec["volumeAttributesClassName"] = json!("Bad_Class");
+    let errs = validate_persistent_volume_claim(&pvc(spec));
+    assert!(
+        has(&errs, "spec.volumeAttributesClassName", ErrorType::Invalid),
+        "got: {errs:?}"
+    );
+}

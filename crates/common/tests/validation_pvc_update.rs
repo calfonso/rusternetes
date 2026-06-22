@@ -2,7 +2,8 @@
 //! ValidatePersistentVolumeClaimUpdate).
 
 use rusternetes_common::resources::volume::{
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeMode, ResourceRequirements,
+    PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeMode, ResourceRequirements,
 };
 use rusternetes_common::validation::field::ErrorType;
 use rusternetes_common::validation::pvc::validate_persistent_volume_claim_update;
@@ -15,7 +16,10 @@ fn pvc(storage: &str, mode: Option<PersistentVolumeMode>) -> PersistentVolumeCla
         type_meta: Default::default(),
         metadata: Default::default(),
         spec: PersistentVolumeClaimSpec {
-            access_modes: vec![],
+            // A real update target satisfies the create-time spec rules, which
+            // `validate_persistent_volume_claim_update` re-runs (upstream
+            // `ValidatePersistentVolumeClaimUpdate` calls `ValidatePersistentVolumeClaim`).
+            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
             resources: ResourceRequirements {
                 limits: None,
                 requests: Some(requests),
