@@ -373,19 +373,21 @@ async fn watch_bookmark_optin_is_query_parameter() {
 // =========================================================================
 //
 // Tracker: "Other (chunking compaction)" bucket in docs/CONFORMANCE.md.
-// The handler layer does not implement limit/continue paging today (the
-// `apply_selectors` path filters in place and returns a full List). The
-// ListMeta wire fields *do* exist, so we lock the serialization contract
-// here and mark the integration-level tests `#[ignore]` until the chunking
-// handler ships.
+// `?limit=`/`?continue=` paging is implemented: the storage layer exposes
+// `Storage::list_paginated` (see crates/storage/src/lib.rs) and the list
+// handlers parse the query params and emit `metadata.continue` /
+// `metadata.remainingItemCount` (see e.g. `handlers/configmap.rs`). The tests
+// below lock the storage-level pagination contract (deterministic order,
+// stable continue tokens, 410 Gone after compaction). The HTTP-surface
+// contract (`GET ...?limit=N&continue=<tok>`) is covered end-to-end in
+// `tests/list_pagination_test.rs` and `tests/chunking_podtemplate_ordering_test.rs`.
 
 /// [sig-api-machinery] Servers should return chunks of results for list
 /// calls [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
-/// Sonobuoy (Round 160): FAIL → PASS after implementing
-/// `Storage::list_paginated` and `?limit=`/`?continue=` parsing in the list
-/// handlers.
+/// Implemented via `Storage::list_paginated` + `?limit=`/`?continue=` parsing
+/// in the list handlers.
 ///
 /// Issues three list calls (limit=2 each) and asserts (a) the first two
 /// responses advertise a non-empty continue token, (b) the final response
@@ -449,8 +451,8 @@ async fn chunking_servers_should_return_chunks_of_results() {
 /// [Conformance]
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
-/// Sonobuoy (Round 160): FAIL → PASS — exercising the smallest non-zero
-/// chunk size guards against off-by-ones in the slice arithmetic.
+/// Exercising the smallest non-zero chunk size guards against off-by-ones in
+/// the slice arithmetic.
 #[tokio::test]
 async fn chunking_servers_should_support_limit_one() {
     let storage = Arc::new(MemoryStorage::new());
@@ -490,7 +492,7 @@ async fn chunking_servers_should_support_limit_one() {
 /// status 410 Gone with reason Expired.
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/chunking.go
-/// Sonobuoy (Round 160): FAIL → PASS — storage surfaces `Error::Gone` when
+/// Storage surfaces `Error::Gone` when
 /// the continue token references a revision older than the compaction
 /// watermark; the api-server error-to-Status mapping translates that to
 /// 410 Gone with reason `"Gone"` (the K8s wire contract for compacted
