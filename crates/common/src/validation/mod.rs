@@ -40,6 +40,7 @@ pub mod pvc;
 pub mod rbac;
 pub mod replicationcontroller;
 pub mod resourcequota;
+pub mod resourceslice;
 pub mod runtimeclass;
 pub mod secret;
 pub mod service;

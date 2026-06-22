@@ -46,6 +46,15 @@ pub async fn create_resourceslice(
     slice.kind = "ResourceSlice".to_string();
     slice.api_version = "resource.k8s.io/v1".to_string();
 
+    // Field validation (upstream resource ValidateResourceSlice): driver, pool,
+    // exactly-one node selection, device set caps + unique names.
+    {
+        let errs = rusternetes_common::validation::resourceslice::validate_resource_slice(&slice);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Ensure metadata exists and set defaults
     let metadata = slice.metadata.get_or_insert_with(Default::default);
 
@@ -188,8 +197,23 @@ pub async fn update_resourceslice(
     slice.api_version = "resource.k8s.io/v1".to_string();
 
     // Ensure metadata and set name
-    let metadata = slice.metadata.get_or_insert_with(Default::default);
-    metadata.name = Some(name.clone());
+    {
+        let metadata = slice.metadata.get_or_insert_with(Default::default);
+        metadata.name = Some(name.clone());
+    }
+
+    let key = build_key("resourceslices", None, &name);
+
+    // Update validation (upstream ValidateResourceSliceUpdate): re-run create
+    // checks and enforce driver/pool.name/nodeName immutability.
+    if let Ok(old) = state.storage.get::<ResourceSlice>(&key).await {
+        let errs = rusternetes_common::validation::resourceslice::validate_resource_slice_update(
+            &slice, &old,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -198,7 +222,6 @@ pub async fn update_resourceslice(
         return Ok(Json(slice));
     }
 
-    let key = build_key("resourceslices", None, &name);
     let updated = state.storage.update(&key, &slice).await?;
 
     Ok(Json(updated))
