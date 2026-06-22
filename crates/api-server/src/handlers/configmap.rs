@@ -223,6 +223,22 @@ pub async fn update(
     configmap.metadata.name = name.clone();
     configmap.metadata.namespace = Some(namespace.clone());
 
+    // Validate the new object + immutability against the stored object
+    // (upstream ValidateConfigMapUpdate: key/size/dup checks plus the
+    // immutable-field freeze). Falls back to create-time validation when the
+    // object does not yet exist (upsert path below).
+    let key = build_key("configmaps", Some(&namespace), &name);
+    let existing_for_validation = state.storage.get::<ConfigMap>(&key).await.ok();
+    let validation_errs = match &existing_for_validation {
+        Some(existing) => rusternetes_common::validation::configmap::validate_config_map_update(
+            existing, &configmap,
+        ),
+        None => rusternetes_common::validation::configmap::validate_config_map(&configmap),
+    };
+    if !validation_errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(validation_errs));
+    }
+
     // Run ValidatingAdmissionPolicy checks for UPDATE
     let gvk = GroupVersionKind {
         group: "".to_string(),
@@ -305,25 +321,8 @@ pub async fn update(
         }
     }
 
-    let key = build_key("configmaps", Some(&namespace), &name);
-
-    // Check if existing configmap is immutable — K8s only prevents changes to
-    // data, binaryData, and immutable fields. Metadata changes (labels, annotations)
-    // are still allowed.
-    if let Ok(existing) = state.storage.get::<ConfigMap>(&key).await {
-        if existing.immutable == Some(true) {
-            let data_changed = existing.data != configmap.data;
-            let binary_data_changed = existing.binary_data != configmap.binary_data;
-            let immutable_changed =
-                configmap.immutable != Some(true) && configmap.immutable != existing.immutable;
-            if data_changed || binary_data_changed || immutable_changed {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "ConfigMap \"{}/{}\" is immutable",
-                    namespace, name
-                )));
-            }
-        }
-    }
+    // Immutability + key/size/dup validation already ran above via
+    // validate_config_map_update.
 
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
