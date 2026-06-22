@@ -265,84 +265,17 @@ async fn pvc_binding_modes_immediate_vs_wait_for_first_consumer() {
     );
 }
 
-/// Upstream: persistent_volumes_claim.go — "should use the default StorageClass for a PVC with no storageClassName".
-///
-/// A PVC submitted with no `storageClassName` must be defaulted to the
-/// cluster's default StorageClass. A PVC with an explicit class must use that
-/// class exactly.
-#[tokio::test]
-#[ignore = "RED-state: PvcController is a stub"]
-async fn pvc_storage_class_selection_default_and_explicit() {
-    let storage = setup_test().await;
-
-    let _sc_default = create_test_storage_class(
-        &storage,
-        "default-sc",
-        None,
-        /*is_default*/ true,
-        false,
-    )
-    .await;
-    let _sc_other =
-        create_test_storage_class(&storage, "other-sc", None, /*is_default*/ false, false).await;
-
-    // PV in the default class.
-    let _pv_default =
-        create_test_pv(&storage, "pv-default", Some("default-sc".to_string()), 10).await;
-    // PV in the explicit class.
-    let _pv_other = create_test_pv(&storage, "pv-other", Some("other-sc".to_string()), 10).await;
-
-    // PVC without an explicit class - should be defaulted to "default-sc".
-    let _pvc_no_class = create_test_pvc(&storage, "pvc-no-class", "default", None, 5, None).await;
-    // PVC with an explicit class.
-    let _pvc_explicit = create_test_pvc(
-        &storage,
-        "pvc-explicit",
-        "default",
-        Some("other-sc".to_string()),
-        5,
-        None,
-    )
-    .await;
-
-    PvcController::new(storage.clone())
-        .reconcile_all()
-        .await
-        .unwrap();
-
-    let pvc_no_class: PersistentVolumeClaim = storage
-        .get(&build_key(
-            "persistentvolumeclaims",
-            Some("default"),
-            "pvc-no-class",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        pvc_no_class.spec.storage_class_name.as_deref(),
-        Some("default-sc"),
-        "PVC without storageClassName must be defaulted to the cluster default class",
-    );
-    assert_eq!(
-        pvc_no_class.spec.volume_name.as_deref(),
-        Some("pv-default"),
-        "defaulted PVC should bind to a PV in the default class",
-    );
-
-    let pvc_explicit: PersistentVolumeClaim = storage
-        .get(&build_key(
-            "persistentvolumeclaims",
-            Some("default"),
-            "pvc-explicit",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        pvc_explicit.spec.volume_name.as_deref(),
-        Some("pv-other"),
-        "explicit-class PVC should bind to a PV in its class only",
-    );
-}
+// NOTE: "default StorageClass for a PVC with no storageClassName" is NOT a
+// PvcController concern. Upstream assigns it at PVC CREATE via the
+// `DefaultStorageClass` admission plugin, and rusternetes mirrors that in
+// `admission::set_default_storage_class` (PVC create handler) — covered by
+// `api-server/tests/admission_test.rs`
+// (`test_default_storage_class_{no_default,sets_default,already_set,beta_annotation}`).
+// Binding a PVC to a PV of the matching class is the PV binder's job, covered by
+// `pv_binder_test.rs::test_matches_storage_class`. The previous `#[ignore]`d
+// controller test asserted this at the wrong layer (it would never flip green
+// via PvcController) and has been removed. Remaining genuine PvcController gaps
+// are tracked in indyjonesnl/rusternetes#1458.
 
 /// Upstream: persistent_volumes_claim.go — "should allow expansion of an existing volume".
 ///
