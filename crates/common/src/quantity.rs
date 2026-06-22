@@ -222,6 +222,27 @@ impl Quantity {
         })
     }
 
+    /// True when this quantity represents a whole-number value (no fractional
+    /// part). The internal value is `mantissa * 10^scale`, so a non-negative
+    /// scale is always integral; a negative scale is integral only when the
+    /// mantissa is divisible by `10^(-scale)`.
+    ///
+    /// Mirrors the integer-resource check in upstream
+    /// `ValidateResourceQuantityValue` (`value.MilliValue()%1000 == 0`):
+    /// extended (integer) resources must not carry a fractional quantity.
+    pub fn is_integer(&self) -> bool {
+        if self.scale >= 0 {
+            return true;
+        }
+        let divisor = 10i128.checked_pow((-self.scale) as u32);
+        match divisor {
+            Some(d) => self.mantissa % d == 0,
+            // Scale so negative that 10^(-scale) overflows i128: the magnitude
+            // is far below 1, so it cannot be a non-zero integer.
+            None => self.mantissa == 0,
+        }
+    }
+
     /// True when this quantity represents a negative value. Used to clamp
     /// `allocatable = capacity - reserved` to zero when a node reserves more
     /// than its capacity (upstream `getNodeAllocatableAbsolute` clamps to 0).
