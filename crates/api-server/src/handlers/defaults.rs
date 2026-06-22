@@ -429,6 +429,16 @@ fn apply_job_defaults_to_spec(spec: &mut rusternetes_common::resources::JobSpec)
     if spec.manual_selector.is_none() {
         spec.manual_selector = Some(false);
     }
+    // Upstream SetDefaults_Job (JobPodReplacementPolicy, GA in 1.35):
+    // podReplacementPolicy defaults to Failed when a podFailurePolicy is set,
+    // otherwise TerminatingOrFailed.
+    if spec.pod_replacement_policy.is_none() {
+        spec.pod_replacement_policy = Some(if spec.pod_failure_policy.is_some() {
+            "Failed".to_string()
+        } else {
+            "TerminatingOrFailed".to_string()
+        });
+    }
     apply_pod_template_defaults(&mut spec.template);
 }
 
@@ -755,5 +765,40 @@ mod tests {
             "explicit scheme preserved"
         );
         assert_eq!(phg.path.as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn test_job_pod_replacement_policy_default() {
+        use rusternetes_common::resources::Job;
+        // No podFailurePolicy -> TerminatingOrFailed.
+        let mut job: Job = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "j"},
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "busybox"}], "restartPolicy": "Never"}}}
+        })).unwrap();
+        apply_job_defaults(&mut job);
+        assert_eq!(
+            job.spec.pod_replacement_policy.as_deref(),
+            Some("TerminatingOrFailed")
+        );
+
+        // With podFailurePolicy -> Failed.
+        let mut job2: Job = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "j2"},
+            "spec": {
+                "podFailurePolicy": {"rules": []},
+                "template": {"spec": {"containers": [{"name": "c", "image": "busybox"}], "restartPolicy": "Never"}}
+            }
+        })).unwrap();
+        apply_job_defaults(&mut job2);
+        assert_eq!(job2.spec.pod_replacement_policy.as_deref(), Some("Failed"));
+
+        // Explicit value preserved.
+        let mut job3: Job = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "j3"},
+            "spec": {"podReplacementPolicy": "Failed",
+                "template": {"spec": {"containers": [{"name": "c", "image": "busybox"}], "restartPolicy": "Never"}}}
+        })).unwrap();
+        apply_job_defaults(&mut job3);
+        assert_eq!(job3.spec.pod_replacement_policy.as_deref(), Some("Failed"));
     }
 }
