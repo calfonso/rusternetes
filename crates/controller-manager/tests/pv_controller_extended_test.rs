@@ -677,10 +677,10 @@ async fn test_node_affinity_blocks_bind_when_no_matching_node() {
 /// options must be copied onto every PV the controller dynamically
 /// provisions for PVCs that select the class.
 ///
-/// RED-state: `DynamicProvisionerController::create_pv_for_pvc` hardcodes
-/// `mount_options: None`. When propagation is wired up, drop the `#[ignore]`.
+/// `DynamicProvisionerController::create_pv_for_pvc` copies
+/// `storage_class.mount_options` onto the provisioned PV, matching upstream
+/// (`pv_controller.go:1677`).
 #[tokio::test]
-#[ignore = "RED-state: DynamicProvisionerController does not propagate StorageClass.mountOptions"]
 async fn test_mount_options_propagated_from_storage_class() {
     let storage = setup_test().await;
 

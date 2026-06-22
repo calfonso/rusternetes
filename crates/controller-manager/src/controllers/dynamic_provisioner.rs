@@ -353,7 +353,10 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                 access_modes: pvc.spec.access_modes.clone(),
                 persistent_volume_reclaim_policy: Some(reclaim_policy),
                 storage_class_name: Some(storage_class.metadata.name.clone()),
-                mount_options: None,
+                // Upstream copies the StorageClass mount options onto every
+                // dynamically-provisioned PV (pv_controller.go:1677:
+                // `MountOptions: storageClass.MountOptions`).
+                mount_options: storage_class.mount_options.clone(),
                 volume_mode: pvc.spec.volume_mode.clone(),
                 node_affinity: None,
                 // Pre-bind the PV to the exact PVC it was provisioned for
