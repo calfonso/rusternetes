@@ -438,66 +438,17 @@ async fn test_serviceaccount_image_pull_secrets_persist_through_reconcile() {
     storage.delete(&sa_key).await.unwrap();
 }
 
-/// RED-state: the controller currently does not project SA-level
-/// `imagePullSecrets` onto pods that reference the SA. Upstream this is
-/// handled by the ServiceAccount admission plugin during pod creation; in
-/// rusternetes the plumbing belongs in api-server admission but is not yet
-/// hooked up for image-pull secrets (confirmed by absence of any
-/// `image_pull_secrets` propagation in `crates/api-server/src/admission.rs`).
-#[tokio::test]
-#[ignore = "RED-state: SA imagePullSecrets are not propagated onto pods (admission gap)"]
-async fn test_serviceaccount_image_pull_secrets_propagate_to_pods() {
-    use rusternetes_common::resources::{Container, Pod, PodSpec};
-
-    let storage = Arc::new(MemoryStorage::new());
-    let controller = ServiceAccountController::new(storage.clone());
-
-    let ns_name = "test-sa-pullsecrets-pod";
-    storage
-        .create(
-            &build_key("namespaces", None, ns_name),
-            &active_namespace(ns_name),
-        )
-        .await
-        .unwrap();
-
-    let mut sa = service_account(ns_name, "puller");
-    sa.image_pull_secrets = Some(vec![LocalObjectReference {
-        name: "private-registry".to_string(),
-    }]);
-    storage
-        .create(&build_key("serviceaccounts", Some(ns_name), "puller"), &sa)
-        .await
-        .unwrap();
-
-    // Pod that references the SA but declares no imagePullSecrets of its own.
-    let mut spec = PodSpec {
-        containers: vec![Container {
-            name: "app".to_string(),
-            image: "private-registry.example.com/app:1".to_string(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    spec.service_account_name = Some("puller".to_string());
-    let mut pod = Pod::new("consumer", spec);
-    pod.metadata.namespace = Some(ns_name.to_string());
-    let pod_key = build_key("pods", Some(ns_name), "consumer");
-    storage.create(&pod_key, &pod).await.unwrap();
-
-    controller.reconcile_all().await.unwrap();
-
-    let updated: Pod = storage.get(&pod_key).await.unwrap();
-    let pull = updated
-        .spec
-        .as_ref()
-        .and_then(|s| s.image_pull_secrets.as_ref())
-        .expect("pod should inherit SA imagePullSecrets");
-    assert!(
-        pull.iter().any(|r| r.name == "private-registry"),
-        "expected pod to inherit private-registry pull secret from SA"
-    );
-}
+// NOTE: SA `imagePullSecrets` propagation onto pods is an **admission** concern,
+// not a controller one — upstream does it in the ServiceAccount admission plugin
+// at pod CREATE (plugin/pkg/admission/serviceaccount/admission.go:167), not in a
+// reconcile loop. In rusternetes it runs in
+// `admission::inject_service_account_token` via
+// `serviceaccount::propagate_image_pull_secrets`, and is covered end-to-end by
+// `api-server/tests/integration_serviceaccount_token.rs::
+// test_service_account_image_pull_secrets_propagate_on_pod_create`. The previous
+// `#[ignore]`d controller test here asserted the wrong layer (controller doing
+// the propagation) against a stale "absent in admission.rs" claim, so it has
+// been removed.
 
 /// Every default SA created by the controller must have a companion legacy
 /// token Secret of type `kubernetes.io/service-account-token`, and that Secret

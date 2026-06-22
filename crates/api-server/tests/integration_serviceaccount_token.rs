@@ -298,6 +298,94 @@ async fn test_service_account_token_auto_mount() {
     );
 }
 
+/// [sig-auth] ServiceAccount admission must add the SA's `imagePullSecrets` to
+/// a pod that declares none, and must leave a pod's own `imagePullSecrets`
+/// untouched.
+///
+/// Upstream: plugin/pkg/admission/serviceaccount/admission.go:167 — *"If the
+/// pod does not contain any ImagePullSecrets, the ImagePullSecrets of the
+/// service account are added."* In rusternetes this runs in
+/// `admission::inject_service_account_token` via
+/// `serviceaccount::propagate_image_pull_secrets`. The helper has unit tests;
+/// this locks the end-to-end pod-create admission path.
+#[tokio::test]
+async fn test_service_account_image_pull_secrets_propagate_on_pod_create() {
+    let state = spawn_state();
+    let ns = "sa-pullsecrets-ns";
+    let (status, _) = create_namespace(&state, ns).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // ServiceAccount carrying an imagePullSecret.
+    let sa_body = json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {"name": "puller"},
+        "imagePullSecrets": [{"name": "private-registry"}],
+    });
+    let (status, _) = post_json(
+        &state,
+        &format!("/api/v1/namespaces/{ns}/serviceaccounts"),
+        &sa_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "SA create must succeed");
+
+    // (1) Pod referencing the SA with no imagePullSecrets of its own MUST
+    //     inherit the SA's.
+    let pod_body = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "consumer"},
+        "spec": {
+            "serviceAccountName": "puller",
+            "containers": [{"name": "app", "image": "private-registry.example.com/app:1"}],
+        },
+    });
+    let (status, created) =
+        post_json(&state, &format!("/api/v1/namespaces/{ns}/pods"), &pod_body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pod create must succeed: {created}"
+    );
+    let pulls = created["spec"]["imagePullSecrets"]
+        .as_array()
+        .expect("pod must inherit SA imagePullSecrets");
+    assert!(
+        pulls.iter().any(|r| r["name"] == "private-registry"),
+        "pod must inherit private-registry pull secret from SA: {created}"
+    );
+
+    // (2) Pod that declares its own imagePullSecrets MUST keep them unchanged
+    //     (upstream only fills when the pod has none).
+    let pod_own = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "consumer-own"},
+        "spec": {
+            "serviceAccountName": "puller",
+            "imagePullSecrets": [{"name": "pod-own-secret"}],
+            "containers": [{"name": "app", "image": "private-registry.example.com/app:1"}],
+        },
+    });
+    let (status, created) =
+        post_json(&state, &format!("/api/v1/namespaces/{ns}/pods"), &pod_own).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "pod create must succeed: {created}"
+    );
+    let pulls = created["spec"]["imagePullSecrets"]
+        .as_array()
+        .expect("pod's own imagePullSecrets must be preserved");
+    let names: Vec<&str> = pulls.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert_eq!(
+        names,
+        ["pod-own-secret"],
+        "pod's own imagePullSecrets must not be overwritten by the SA's: {created}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // TestServiceAccountTokenAuthentication
 // ---------------------------------------------------------------------------
