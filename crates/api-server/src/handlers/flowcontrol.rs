@@ -344,6 +344,15 @@ pub async fn update_flow_schema(
 
     fs.metadata.name = name.clone();
 
+    // Field validation on update (upstream ValidateFlowSchemaUpdate just re-runs
+    // ValidateFlowSchema on the new object — the spec has no immutable fields).
+    {
+        let errs = rusternetes_common::validation::flowschema::validate_flow_schema(&fs);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
