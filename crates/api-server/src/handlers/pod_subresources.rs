@@ -1291,20 +1291,10 @@ pub async fn create_eviction(
         let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
 
         for pdb in &pdbs {
-            let selector = &pdb.spec.selector;
-
-            let matches = if let Some(ref match_labels) = selector.match_labels {
-                match_labels
-                    .iter()
-                    .all(|(k, v)| pod_labels.get(k).map(|pv| pv == v).unwrap_or(false))
-            } else if selector.match_expressions.is_some() {
-                // TODO: Implement match_expressions support for more complex selectors
-                false
-            } else {
-                false
-            };
-
-            if !matches {
+            // Full label-selector match (matchLabels + matchExpressions).
+            // Upstream eviction skips PDBs whose selector is empty or does not
+            // match the pod (`selector.Empty() || !selector.Matches(...)`).
+            if !pdb.spec.selector.matches_labels(&pod_labels) {
                 continue;
             }
 

@@ -429,6 +429,60 @@ pub struct LabelSelectorRequirement {
     pub values: Option<Vec<String>>,
 }
 
+impl LabelSelector {
+    /// Whether `labels` satisfies this selector (both `matchLabels` and
+    /// `matchExpressions`). Mirrors upstream
+    /// `apimachinery/pkg/apis/meta/v1.LabelSelectorAsSelector` +
+    /// `Selector.Matches`.
+    ///
+    /// An *empty* selector (no `matchLabels` and no `matchExpressions`) matches
+    /// nothing here. This mirrors the call sites that treat an empty selector as
+    /// "does not apply" — e.g. eviction's PDB lookup and the ClusterRole
+    /// aggregation controller both skip empty selectors rather than selecting
+    /// everything (upstream's `selector.Empty()` guard).
+    pub fn matches_labels(&self, labels: &HashMap<String, String>) -> bool {
+        let has_match_labels = self.match_labels.as_ref().is_some_and(|m| !m.is_empty());
+        let has_match_exprs = self
+            .match_expressions
+            .as_ref()
+            .is_some_and(|e| !e.is_empty());
+        if !has_match_labels && !has_match_exprs {
+            return false;
+        }
+
+        if let Some(match_labels) = &self.match_labels {
+            for (k, v) in match_labels {
+                if labels.get(k) != Some(v) {
+                    return false;
+                }
+            }
+        }
+
+        if let Some(exprs) = &self.match_expressions {
+            for req in exprs {
+                let present = labels.contains_key(&req.key);
+                let matched =
+                    match req.operator.as_str() {
+                        "In" => req.values.as_ref().is_some_and(|vals| {
+                            labels.get(&req.key).is_some_and(|v| vals.contains(v))
+                        }),
+                        "NotIn" => !req.values.as_ref().is_some_and(|vals| {
+                            labels.get(&req.key).is_some_and(|v| vals.contains(v))
+                        }),
+                        "Exists" => present,
+                        "DoesNotExist" => !present,
+                        _ => false,
+                    };
+                if !matched {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+}
+
 /// Tolerant deserializer for `HashMap<String, String>` maps whose
 /// values represent Kubernetes `resource.Quantity` wire-form values.
 ///
@@ -933,6 +987,74 @@ pub struct ManagedFieldsEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sel(json: serde_json::Value) -> LabelSelector {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn matches_labels_empty_selector_matches_nothing() {
+        assert!(!LabelSelector::default().matches_labels(&labels(&[("a", "b")])));
+        assert!(!sel(serde_json::json!({})).matches_labels(&labels(&[("a", "b")])));
+    }
+
+    #[test]
+    fn matches_labels_match_labels() {
+        let s = sel(serde_json::json!({"matchLabels": {"app": "web"}}));
+        assert!(s.matches_labels(&labels(&[("app", "web"), ("x", "y")])));
+        assert!(!s.matches_labels(&labels(&[("app", "db")])));
+        assert!(!s.matches_labels(&labels(&[("x", "y")])));
+    }
+
+    #[test]
+    fn matches_labels_match_expressions() {
+        // In
+        let s = sel(serde_json::json!({
+            "matchExpressions": [{"key": "tier", "operator": "In", "values": ["fe", "be"]}]
+        }));
+        assert!(s.matches_labels(&labels(&[("tier", "fe")])));
+        assert!(!s.matches_labels(&labels(&[("tier", "cache")])));
+        assert!(!s.matches_labels(&labels(&[("other", "x")])));
+
+        // Exists / DoesNotExist
+        let exists = sel(serde_json::json!({
+            "matchExpressions": [{"key": "tier", "operator": "Exists"}]
+        }));
+        assert!(exists.matches_labels(&labels(&[("tier", "fe")])));
+        assert!(!exists.matches_labels(&labels(&[("other", "x")])));
+
+        let dne = sel(serde_json::json!({
+            "matchExpressions": [{"key": "tier", "operator": "DoesNotExist"}]
+        }));
+        assert!(dne.matches_labels(&labels(&[("other", "x")])));
+        assert!(!dne.matches_labels(&labels(&[("tier", "fe")])));
+
+        // NotIn (also matches when key absent)
+        let notin = sel(serde_json::json!({
+            "matchExpressions": [{"key": "tier", "operator": "NotIn", "values": ["fe"]}]
+        }));
+        assert!(notin.matches_labels(&labels(&[("tier", "be")])));
+        assert!(notin.matches_labels(&labels(&[("other", "x")])));
+        assert!(!notin.matches_labels(&labels(&[("tier", "fe")])));
+    }
+
+    #[test]
+    fn matches_labels_both_must_hold() {
+        let s = sel(serde_json::json!({
+            "matchLabels": {"app": "web"},
+            "matchExpressions": [{"key": "tier", "operator": "Exists"}]
+        }));
+        assert!(s.matches_labels(&labels(&[("app", "web"), ("tier", "fe")])));
+        assert!(!s.matches_labels(&labels(&[("app", "web")])));
+        assert!(!s.matches_labels(&labels(&[("tier", "fe")])));
+    }
 
     #[test]
     fn test_status_failure() {

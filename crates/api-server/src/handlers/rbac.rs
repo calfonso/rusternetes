@@ -18,55 +18,11 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Test whether `labels` satisfies a `types::LabelSelector` (matchLabels +
-/// matchExpressions). Mirrors upstream `apimachinery/pkg/apis/meta/v1`
-/// `LabelSelectorAsSelector` semantics used by the ClusterRole aggregation
-/// controller. An empty selector (no matchLabels, no matchExpressions) matches
-/// nothing here — upstream's aggregation controller skips empty selectors
-/// rather than selecting everything.
+/// matchExpressions). Delegates to [`LabelSelector::matches_labels`], whose
+/// "empty selector matches nothing" semantics mirror the ClusterRole
+/// aggregation controller's skip-empty-selectors behaviour.
 fn label_selector_matches(selector: &LabelSelector, labels: &HashMap<String, String>) -> bool {
-    let has_match_labels = selector
-        .match_labels
-        .as_ref()
-        .is_some_and(|m| !m.is_empty());
-    let has_match_exprs = selector
-        .match_expressions
-        .as_ref()
-        .is_some_and(|e| !e.is_empty());
-    if !has_match_labels && !has_match_exprs {
-        return false;
-    }
-
-    if let Some(match_labels) = &selector.match_labels {
-        for (k, v) in match_labels {
-            if labels.get(k) != Some(v) {
-                return false;
-            }
-        }
-    }
-
-    if let Some(exprs) = &selector.match_expressions {
-        for req in exprs {
-            let present = labels.contains_key(&req.key);
-            let matched = match req.operator.as_str() {
-                "In" => req
-                    .values
-                    .as_ref()
-                    .is_some_and(|vals| labels.get(&req.key).is_some_and(|v| vals.contains(v))),
-                "NotIn" => !req
-                    .values
-                    .as_ref()
-                    .is_some_and(|vals| labels.get(&req.key).is_some_and(|v| vals.contains(v))),
-                "Exists" => present,
-                "DoesNotExist" => !present,
-                _ => false,
-            };
-            if !matched {
-                return false;
-            }
-        }
-    }
-
-    true
+    selector.matches_labels(labels)
 }
 
 /// Whether `set` contains `ele`.
