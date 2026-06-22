@@ -170,14 +170,11 @@ pub struct VolumeAttachmentSource {
     pub inline_volume_spec: Option<InlineVolumeSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InlineVolumeSpec {
-    /// Standard Kubernetes inline volume specification
-    /// This is a simplified version - in production would include full PersistentVolumeSpec
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub csi: Option<CSIVolumeSource>,
-}
+/// A VolumeAttachment's `inlineVolumeSpec` is a full `PersistentVolumeSpec`
+/// upstream (`VolumeAttachmentSource.InlineVolumeSpec *v1.PersistentVolumeSpec`),
+/// so it carries capacity/accessModes/the volume source and is validated by
+/// `ValidatePersistentVolumeSpec`. Alias it to the real type rather than a stub.
+pub type InlineVolumeSpec = crate::resources::volume::PersistentVolumeSpec;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

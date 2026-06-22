@@ -4,8 +4,8 @@
 //! VolumeAttachment captures the intent to attach or detach volumes to/from nodes.
 
 use rusternetes_common::resources::csi::{
-    CSIVolumeSource, InlineVolumeSpec, VolumeAttachment, VolumeAttachmentSource,
-    VolumeAttachmentSpec, VolumeAttachmentStatus, VolumeError,
+    VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec, VolumeAttachmentStatus,
+    VolumeError,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
@@ -274,16 +274,18 @@ async fn test_volumeattachment_with_inline_volume() {
             node_name: "node1".to_string(),
             source: VolumeAttachmentSource {
                 persistent_volume_name: None,
-                inline_volume_spec: Some(InlineVolumeSpec {
-                    csi: Some(CSIVolumeSource {
-                        driver: "csi.example.com".to_string(),
-                        volume_handle: Some("vol-12345".to_string()),
-                        read_only: Some(false),
-                        fs_type: Some("ext4".to_string()),
-                        volume_attributes: Some(volume_attributes),
-                        node_publish_secret_ref: None,
-                    }),
-                }),
+                inline_volume_spec: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "csi": {
+                            "driver": "csi.example.com",
+                            "volumeHandle": "vol-12345",
+                            "readOnly": false,
+                            "fsType": "ext4",
+                            "volumeAttributes": volume_attributes,
+                        }
+                    }))
+                    .unwrap(),
+                ),
             },
         },
         status: None,
@@ -538,16 +540,18 @@ async fn test_volumeattachment_all_fields() {
             node_name: "node1".to_string(),
             source: VolumeAttachmentSource {
                 persistent_volume_name: None,
-                inline_volume_spec: Some(InlineVolumeSpec {
-                    csi: Some(CSIVolumeSource {
-                        driver: "csi.example.com".to_string(),
-                        volume_handle: Some("vol-abc123".to_string()),
-                        read_only: Some(false),
-                        fs_type: Some("ext4".to_string()),
-                        volume_attributes: Some(volume_attrs),
-                        node_publish_secret_ref: None,
-                    }),
-                }),
+                inline_volume_spec: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "csi": {
+                            "driver": "csi.example.com",
+                            "volumeHandle": "vol-abc123",
+                            "readOnly": false,
+                            "fsType": "ext4",
+                            "volumeAttributes": volume_attrs,
+                        }
+                    }))
+                    .unwrap(),
+                ),
             },
         },
         status: Some(VolumeAttachmentStatus {
@@ -612,16 +616,18 @@ async fn test_volumeattachment_csi_volume_source_fields() {
             node_name: "node1".to_string(),
             source: VolumeAttachmentSource {
                 persistent_volume_name: None,
-                inline_volume_spec: Some(InlineVolumeSpec {
-                    csi: Some(CSIVolumeSource {
-                        driver: "csi.example.com".to_string(),
-                        volume_handle: Some("vol-xyz789".to_string()),
-                        read_only: Some(true),
-                        fs_type: Some("xfs".to_string()),
-                        volume_attributes: Some(volume_attrs),
-                        node_publish_secret_ref: None,
-                    }),
-                }),
+                inline_volume_spec: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "csi": {
+                            "driver": "csi.example.com",
+                            "volumeHandle": "vol-xyz789",
+                            "readOnly": true,
+                            "fsType": "xfs",
+                            "volumeAttributes": volume_attrs,
+                        }
+                    }))
+                    .unwrap(),
+                ),
             },
         },
         status: None,

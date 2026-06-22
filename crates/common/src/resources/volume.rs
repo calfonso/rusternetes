@@ -17,7 +17,7 @@ pub struct PersistentVolume {
     pub status: Option<PersistentVolumeStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistentVolumeSpec {
     /// Storage capacity. Optional on the wire: upstream
