@@ -30,7 +30,8 @@ use crate::resources::pod::{
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
-    validate_label_name, validate_label_selector, LabelSelectorValidationOptions,
+    is_qualified_name, validate_label_name, validate_label_selector,
+    LabelSelectorValidationOptions,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -39,6 +40,10 @@ use regex::Regex;
 static ENV_VAR_NAME_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$").expect("env var name regex"));
 const ENV_VAR_NAME_ERR_MSG: &str = "a valid environment variable name must consist of alphabetic characters, digits, '_', '-', or '.', and must not start with a digit";
+
+/// Upstream `configMapKeyFmt` / `configMapKeyRegexp`.
+static CONFIG_MAP_KEY_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[-._a-zA-Z0-9]+$").expect("config map key regex"));
 
 // ---------------------------------------------------------------------------
 // Create-side validation
@@ -691,12 +696,11 @@ fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
     let mut num_sources = 0;
     if let Some(field_ref) = &vf.field_ref {
         num_sources += 1;
-        if field_ref.field_path.is_empty() {
-            errs.push(Error::required(
-                &fld_path.child("fieldRef").child("fieldPath"),
-                "",
-            ));
-        }
+        errs.extend(validate_object_field_selector(
+            field_ref,
+            &ENV_DOWNWARD_API_FIELD_PATHS,
+            &fld_path.child("fieldRef"),
+        ));
     }
     if let Some(rfr) = &vf.resource_field_ref {
         num_sources += 1;
@@ -706,24 +710,32 @@ fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
                 "",
             ));
         }
+        // divisor, when set, must be a valid quantity.
+        if let Some(div) = rfr.divisor.as_deref().filter(|d| !d.is_empty()) {
+            if crate::quantity::Quantity::parse(div).is_err() {
+                errs.push(Error::invalid(
+                    &fld_path.child("resourceFieldRef").child("divisor"),
+                    div.to_string(),
+                    "must be a valid resource quantity",
+                ));
+            }
+        }
     }
     if let Some(cm) = &vf.config_map_key_ref {
         num_sources += 1;
-        if cm.key.is_empty() {
-            errs.push(Error::required(
-                &fld_path.child("configMapKeyRef").child("key"),
-                "",
-            ));
-        }
+        errs.extend(validate_config_or_secret_key_selector(
+            &cm.name,
+            &cm.key,
+            &fld_path.child("configMapKeyRef"),
+        ));
     }
     if let Some(sk) = &vf.secret_key_ref {
         num_sources += 1;
-        if sk.key.is_empty() {
-            errs.push(Error::required(
-                &fld_path.child("secretKeyRef").child("key"),
-                "",
-            ));
-        }
+        errs.extend(validate_config_or_secret_key_selector(
+            &sk.name,
+            &sk.key,
+            &fld_path.child("secretKeyRef"),
+        ));
     }
     // fileKeyRef (alpha, EnvFiles) still counts as a source so a fileKeyRef-only
     // env var isn't wrongly flagged as specifying none.
@@ -884,6 +896,79 @@ fn validate_topology_spread_constraints(
     errs
 }
 
+/// Upstream `validEnvDownwardAPIFieldPathExpressions`.
+const ENV_DOWNWARD_API_FIELD_PATHS: [&str; 9] = [
+    "metadata.name",
+    "metadata.namespace",
+    "metadata.uid",
+    "spec.nodeName",
+    "spec.serviceAccountName",
+    "status.hostIP",
+    "status.hostIPs",
+    "status.podIP",
+    "status.podIPs",
+];
+
+/// Upstream `fieldpath.SplitMaybeSubscriptedPath`: detects the `path['key']`
+/// form, returning `(path, subscript)`.
+fn split_maybe_subscripted_path(field_path: &str) -> Option<(&str, &str)> {
+    let s = field_path.strip_suffix("']")?;
+    let (prefix, subscript) = s.split_once("['")?;
+    if prefix.is_empty() {
+        return None;
+    }
+    Some((prefix, subscript))
+}
+
+/// Port of upstream `validateObjectFieldSelector` for env `fieldRef`:
+/// `apiVersion` + `fieldPath` required, subscripted `metadata.annotations`/
+/// `metadata.labels` keys validated as qualified names (others reject the
+/// subscript), and non-subscripted paths checked against the allowlist.
+fn validate_object_field_selector(
+    fs: &crate::resources::pod::ObjectFieldSelector,
+    allowed: &[&str],
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if fs.api_version.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("apiVersion"), ""));
+        return errs;
+    }
+    if fs.field_path.is_empty() {
+        errs.push(Error::required(&fld_path.child("fieldPath"), ""));
+        return errs;
+    }
+
+    if let Some((path, subscript)) = split_maybe_subscripted_path(&fs.field_path) {
+        match path {
+            "metadata.annotations" => {
+                for msg in is_qualified_name(&subscript.to_lowercase()) {
+                    errs.push(Error::invalid(fld_path, subscript.to_string(), msg));
+                }
+            }
+            "metadata.labels" => {
+                for msg in is_qualified_name(subscript) {
+                    errs.push(Error::invalid(fld_path, subscript.to_string(), msg));
+                }
+            }
+            other => {
+                errs.push(Error::invalid(
+                    fld_path,
+                    other.to_string(),
+                    "does not support subscript",
+                ));
+            }
+        }
+    } else if !allowed.contains(&fs.field_path.as_str()) {
+        errs.push(Error::not_supported(
+            &fld_path.child("fieldPath"),
+            fs.field_path.clone(),
+            allowed,
+        ));
+    }
+    errs
+}
+
 /// Port of upstream `ValidateMatchLabelKeysInTopologySpread`.
 fn validate_match_label_keys(
     match_label_keys: Option<&[String]>,
@@ -921,6 +1006,51 @@ fn validate_match_label_keys(
                 key.clone(),
                 "exists in both matchLabelKeys and labelSelector",
             ));
+        }
+    }
+    errs
+}
+
+/// Upstream `validation.IsConfigMapKey`: ≤253 chars, `[-._a-zA-Z0-9]+`, and not
+/// `.`/`..`/`..`-prefixed.
+fn is_config_map_key(value: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    if value.len() > 253 {
+        errs.push("must be no more than 253 bytes".to_string());
+    }
+    if !CONFIG_MAP_KEY_RE.is_match(value) {
+        errs.push("a valid config key must consist of alphanumeric characters, '-', '_' or '.' (e.g. 'key.name', or 'KEY_NAME', or 'key-name', regex used for validation is '[-._a-zA-Z0-9]+')".to_string());
+    }
+    match value {
+        "." => errs.push("must not be '.'".to_string()),
+        ".." => errs.push("must not be '..'".to_string()),
+        v if v.starts_with("..") => errs.push("must not start with '..'".to_string()),
+        _ => {}
+    }
+    errs
+}
+
+/// Shared port of upstream `validateConfigMapKeySelector` /
+/// `validateSecretKeySelector`: `name` a DNS-1123 subdomain, `key` required and
+/// a valid config-map key.
+fn validate_config_or_secret_key_selector(name: &str, key: &str, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if name.is_empty() {
+        errs.push(Error::required(&fld_path.child("name"), ""));
+    } else {
+        for msg in is_dns1123_subdomain(name) {
+            errs.push(Error::invalid(
+                &fld_path.child("name"),
+                name.to_string(),
+                msg,
+            ));
+        }
+    }
+    if key.is_empty() {
+        errs.push(Error::required(&fld_path.child("key"), ""));
+    } else {
+        for msg in is_config_map_key(key) {
+            errs.push(Error::invalid(&fld_path.child("key"), key.to_string(), msg));
         }
     }
     errs
@@ -2613,5 +2743,69 @@ mod tests {
                 .any(|m| m.contains("exists in both matchLabelKeys and labelSelector")),
             "{overlap:?}"
         );
+    }
+
+    fn env_errs(json: serde_json::Value) -> Vec<String> {
+        let env: Vec<EnvVar> = serde_json::from_value(json).unwrap();
+        validate_env(&env, &Path::new("env"))
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn fieldref_allowlist_and_subscripts() {
+        // allowed path passes
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"}}}
+        ])).is_empty());
+        // disallowed path -> NotSupported
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "spec.containers"}}}
+        ])).iter().any(|e| e.contains("fieldPath")));
+        // annotations subscript with a valid key passes
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.annotations['my.key/x']"}}}
+        ])).is_empty());
+        // subscript on a non-subscriptable path -> rejected
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name['x']"}}}
+        ])).iter().any(|e| e.contains("does not support subscript")));
+    }
+
+    #[test]
+    fn fieldref_requires_apiversion() {
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}}
+        ]))
+        .iter()
+        .any(|e| e.contains("apiVersion")));
+    }
+
+    #[test]
+    fn configmap_keyref_name_and_key_format() {
+        // invalid name (uppercase not a DNS subdomain) + invalid key char
+        let e = env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"configMapKeyRef": {"name": "Bad_Name", "key": "good.key"}}}
+        ]));
+        assert!(e.iter().any(|m| m.contains("name")), "{e:?}");
+        // valid passes
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"configMapKeyRef": {"name": "cm", "key": "good.key-1"}}}
+        ]))
+        .is_empty());
+        // backstep key rejected
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"secretKeyRef": {"name": "s", "key": ".."}}}
+        ]))
+        .iter()
+        .any(|m| m.contains("'..'")));
+    }
+
+    #[test]
+    fn resourcefieldref_divisor_must_be_quantity() {
+        assert!(env_errs(serde_json::json!([
+            {"name": "A", "valueFrom": {"resourceFieldRef": {"resource": "limits.cpu", "divisor": "notaqty"}}}
+        ])).iter().any(|m| m.contains("divisor")));
     }
 }
