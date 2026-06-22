@@ -157,6 +157,31 @@ fn apply_container_defaults(container: &mut rusternetes_common::resources::Conta
     if let Some(ref mut probe) = container.startup_probe {
         apply_probe_defaults(probe);
     }
+
+    // K8s: SetDefaults_HTTPGetAction also runs on lifecycle hook httpGet actions.
+    if let Some(ref mut lc) = container.lifecycle {
+        if let Some(ref mut h) = lc.post_start {
+            if let Some(ref mut hg) = h.http_get {
+                apply_http_get_defaults(hg);
+            }
+        }
+        if let Some(ref mut h) = lc.pre_stop {
+            if let Some(ref mut hg) = h.http_get {
+                apply_http_get_defaults(hg);
+            }
+        }
+    }
+}
+
+/// Default an `HTTPGetAction`'s `path` (→ `/`) and `scheme` (→ `HTTP`).
+/// Matches SetDefaults_HTTPGetAction from pkg/apis/core/v1/defaults.go.
+fn apply_http_get_defaults(hg: &mut rusternetes_common::resources::pod::HTTPGetAction) {
+    if hg.path.as_deref().unwrap_or("").is_empty() {
+        hg.path = Some("/".to_string());
+    }
+    if hg.scheme.as_deref().unwrap_or("").is_empty() {
+        hg.scheme = Some("HTTP".to_string());
+    }
 }
 
 /// Apply K8s defaults to a Probe.
@@ -173,6 +198,10 @@ fn apply_probe_defaults(probe: &mut rusternetes_common::resources::pod::Probe) {
     }
     if probe.failure_threshold.is_none() || probe.failure_threshold == Some(0) {
         probe.failure_threshold = Some(3);
+    }
+    // SetDefaults_HTTPGetAction: default the probe's httpGet path/scheme.
+    if let Some(ref mut hg) = probe.http_get {
+        apply_http_get_defaults(hg);
     }
 }
 
@@ -700,5 +729,31 @@ mod tests {
             Some(0o600),
             "explicit mode preserved"
         );
+    }
+
+    #[test]
+    fn test_http_get_path_scheme_defaults() {
+        use rusternetes_common::resources::pod::{Container, Lifecycle, LifecycleHandler, Probe};
+        let mut c: Container = serde_json::from_value(serde_json::json!({
+            "name": "c", "image": "busybox",
+            "livenessProbe": {"httpGet": {"port": 8080}},
+            "lifecycle": {"preStop": {"httpGet": {"port": 8080, "scheme": "HTTPS"}}}
+        }))
+        .unwrap();
+        apply_container_defaults(&mut c);
+        let lp: &Probe = c.liveness_probe.as_ref().unwrap();
+        let hg = lp.http_get.as_ref().unwrap();
+        assert_eq!(hg.path.as_deref(), Some("/"));
+        assert_eq!(hg.scheme.as_deref(), Some("HTTP"));
+        // lifecycle preStop httpGet: explicit scheme preserved, path defaulted.
+        let lc: &Lifecycle = c.lifecycle.as_ref().unwrap();
+        let ph: &LifecycleHandler = lc.pre_stop.as_ref().unwrap();
+        let phg = ph.http_get.as_ref().unwrap();
+        assert_eq!(
+            phg.scheme.as_deref(),
+            Some("HTTPS"),
+            "explicit scheme preserved"
+        );
+        assert_eq!(phg.path.as_deref(), Some("/"));
     }
 }
