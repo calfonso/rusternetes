@@ -445,6 +445,13 @@ impl StorageBackend {
     /// on a PUT), so it stamps the status via `/status` then issues a real
     /// graceful `DELETE` with `grace_seconds`. Mirrors the scheduler's
     /// `DataPlane::evict_pod_for_preemption`.
+    ///
+    /// `grace_seconds` is only consumed by the `Api` backend's graceful
+    /// `DELETE`; the storage-direct backends carry the grace period inside
+    /// `mutated_pod`'s `deletionGracePeriodSeconds` and just persist it. When the
+    /// `api-client` feature is off the `Api` arm is compiled out, so the
+    /// parameter is legitimately unused — silence the lint only in that config.
+    #[cfg_attr(not(feature = "api-client"), allow(unused_variables))]
     pub async fn evict_pod<T>(&self, key: &str, mutated_pod: &T, grace_seconds: i64) -> Result<()>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
