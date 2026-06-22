@@ -49,6 +49,16 @@ pub async fn create_resourceclaim(
     claim.kind = "ResourceClaim".to_string();
     claim.api_version = "resource.k8s.io/v1".to_string();
 
+    // Field validation (upstream resource ValidateResourceClaim, structural
+    // subset): request count/uniqueness, exactly/firstAvailable coupling,
+    // deviceClassName + allocationMode/count.
+    {
+        let errs = rusternetes_common::validation::resourceclaim::validate_resource_claim(&claim);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Ensure metadata exists and set defaults
     let metadata = claim.metadata.get_or_insert_with(Default::default);
     metadata.namespace = Some(namespace.clone());
@@ -263,9 +273,24 @@ pub async fn update_resourceclaim(
     claim.api_version = "resource.k8s.io/v1".to_string();
 
     // Ensure metadata and set namespace/name
-    let metadata = claim.metadata.get_or_insert_with(Default::default);
-    metadata.namespace = Some(namespace.clone());
-    metadata.name = Some(name.clone());
+    {
+        let metadata = claim.metadata.get_or_insert_with(Default::default);
+        metadata.namespace = Some(namespace.clone());
+        metadata.name = Some(name.clone());
+    }
+
+    let key = build_key("resourceclaims", Some(&namespace), &name);
+
+    // Update validation (upstream ValidateResourceClaimUpdate): re-run create
+    // checks and enforce spec immutability.
+    if let Ok(old) = state.storage.get::<ResourceClaim>(&key).await {
+        let errs = rusternetes_common::validation::resourceclaim::validate_resource_claim_update(
+            &claim, &old,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -274,7 +299,6 @@ pub async fn update_resourceclaim(
         return Ok(Json(claim));
     }
 
-    let key = build_key("resourceclaims", Some(&namespace), &name);
     let updated = state.storage.update(&key, &claim).await?;
 
     Ok(Json(updated))

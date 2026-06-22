@@ -49,6 +49,17 @@ pub async fn create_resourceclaimtemplate(
     template.kind = "ResourceClaimTemplate".to_string();
     template.api_version = "resource.k8s.io/v1".to_string();
 
+    // Field validation (upstream ValidateResourceClaimTemplate: validate the
+    // embedded ResourceClaimSpec).
+    {
+        let errs = rusternetes_common::validation::resourceclaim::validate_resource_claim_template(
+            &template,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Ensure metadata exists and set defaults
     let metadata = template.metadata.get_or_insert_with(Default::default);
     metadata.namespace = Some(namespace.clone());
@@ -259,9 +270,22 @@ pub async fn update_resourceclaimtemplate(
     template.api_version = "resource.k8s.io/v1".to_string();
 
     // Ensure metadata and set namespace/name
-    let metadata = template.metadata.get_or_insert_with(Default::default);
-    metadata.namespace = Some(namespace.clone());
-    metadata.name = Some(name.clone());
+    {
+        let metadata = template.metadata.get_or_insert_with(Default::default);
+        metadata.namespace = Some(namespace.clone());
+        metadata.name = Some(name.clone());
+    }
+
+    // Field validation on update (upstream ValidateResourceClaimTemplateUpdate
+    // re-runs ValidateResourceClaimTemplate on the new object).
+    {
+        let errs = rusternetes_common::validation::resourceclaim::validate_resource_claim_template(
+            &template,
+        );
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
