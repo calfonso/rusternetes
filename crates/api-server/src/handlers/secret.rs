@@ -109,67 +109,21 @@ pub async fn create(
     // Ensure namespace is set from the URL path
     secret.metadata.namespace = Some(namespace.clone());
 
-    // Validate secret data / stringData keys with the upstream IsConfigMapKey
-    // rule (≤253 chars, `[-._a-zA-Z0-9]+`, not `.`/`..`) — the same constraint
-    // ValidateSecret applies. Errors are reported on the `data`/`stringData`
-    // field paths.
-    {
-        use rusternetes_common::validation::configmap::config_map_key_errors;
-        use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-        let mut errs: ErrorList = Vec::new();
-        if let Some(ref data) = secret.data {
-            let p = Path::new("data");
-            for key in data.keys() {
-                for msg in config_map_key_errors(key) {
-                    errs.push(FieldError::invalid(&p.child(key), key.clone(), msg));
-                }
-            }
-        }
-        if let Some(ref string_data) = secret.string_data {
-            let p = Path::new("stringData");
-            for key in string_data.keys() {
-                for msg in config_map_key_errors(key) {
-                    errs.push(FieldError::invalid(&p.child(key), key.clone(), msg));
-                }
-            }
-        }
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Enforce the MaxSecretSize (1 MiB) total-size cap (upstream ValidateSecret).
-    // stringData is merged into data before persistence, so it counts toward the
-    // same budget; sum both. Upstream attaches the error to the `data` path.
-    {
-        use rusternetes_common::validation::configmap::MAX_SECRET_SIZE;
-        let mut total_size: usize = 0;
-        if let Some(ref data) = secret.data {
-            total_size += data.values().map(|v| v.len()).sum::<usize>();
-        }
-        if let Some(ref string_data) = secret.string_data {
-            total_size += string_data.values().map(|v| v.len()).sum::<usize>();
-        }
-        if total_size > MAX_SECRET_SIZE {
-            use rusternetes_common::validation::field::{Error as FieldError, Path};
-            return Err(rusternetes_common::Error::Invalid(vec![
-                FieldError::too_long(&Path::new("data"), MAX_SECRET_SIZE),
-            ]));
-        }
-    }
-
     // Enrich metadata with system fields
     secret.metadata.ensure_uid();
     secret.metadata.ensure_creation_timestamp();
 
-    // Normalize: convert stringData to base64-encoded data
+    // Normalize: convert stringData to base64-encoded data. Upstream validates
+    // the post-conversion Data map only ("We don't validate StringData, as it
+    // was already converted back to Data before validation"), so normalize
+    // first and then run the full ValidateSecret.
     secret.normalize();
 
-    // Type-specific required-key validation (upstream ValidateSecret's
-    // `switch secret.Type`). Runs after normalize() so keys supplied via
-    // stringData are present in `data`.
+    // Full upstream ValidateSecret: object metadata, data key format
+    // (IsConfigMapKey), the MaxSecretSize (1 MiB) total-size cap, and the
+    // type-specific required-key constraints.
     {
-        let errs = rusternetes_common::validation::secret::validate_secret_type(&secret);
+        let errs = rusternetes_common::validation::secret::validate_secret(&secret);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }
@@ -297,12 +251,21 @@ pub async fn update(
         }
     }
 
-    // Re-validate the type-specific required keys on update (upstream
-    // ValidateSecretUpdate -> ValidateSecret). Runs after normalize() so keys
-    // supplied via stringData count; catches e.g. a TLS secret losing tls.key
-    // on a non-immutable update.
+    // Re-run the full ValidateSecret on update (upstream ValidateSecretUpdate
+    // ends with `append(allErrs, ValidateSecret(newSecret)...)`): metadata,
+    // data key format, the MaxSecretSize cap, and the type-specific required
+    // keys. Runs after normalize() so keys supplied via stringData count;
+    // catches e.g. a TLS secret losing tls.key on a non-immutable update.
+    //
+    // The update-only immutability rules from ValidateSecretUpdate (immutable
+    // `type`, and the `immutable: true` data/immutable-clear guards) are
+    // enforced above against the stored object; we don't route them through
+    // validate_secret_update here because that function also delegates to
+    // ValidateObjectMetaUpdate, which would impose upstream's
+    // resourceVersion-required gate that this upsert handler does not (yet)
+    // satisfy. Tracked as a follow-up.
     {
-        let errs = rusternetes_common::validation::secret::validate_secret_type(&secret);
+        let errs = rusternetes_common::validation::secret::validate_secret(&secret);
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }
