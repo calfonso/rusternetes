@@ -45,6 +45,15 @@ pub async fn create_deviceclass(
     dc.kind = "DeviceClass".to_string();
     dc.api_version = "resource.k8s.io/v1".to_string();
 
+    // Field validation (upstream resource ValidateDeviceClass, structural
+    // subset): selector/config caps + cel selector required.
+    {
+        let errs = rusternetes_common::validation::deviceclass::validate_device_class(&dc);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Ensure metadata exists and set defaults
     let metadata = dc.metadata.get_or_insert_with(Default::default);
 
@@ -185,6 +194,15 @@ pub async fn update_deviceclass(
     // Ensure kind and apiVersion are set
     dc.kind = "DeviceClass".to_string();
     dc.api_version = "resource.k8s.io/v1".to_string();
+
+    // Field validation on update (upstream ValidateDeviceClassUpdate re-runs
+    // ValidateDeviceClass on the new object — the spec is mutable).
+    {
+        let errs = rusternetes_common::validation::deviceclass::validate_device_class(&dc);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     // Ensure metadata and set name
     let metadata = dc.metadata.get_or_insert_with(Default::default);

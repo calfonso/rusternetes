@@ -13,6 +13,7 @@ pub mod cronjob;
 pub mod csidriver;
 pub mod csinode;
 pub mod csistoragecapacity;
+pub mod deviceclass;
 pub mod endpoints;
 pub mod endpointslice;
 pub mod events;
