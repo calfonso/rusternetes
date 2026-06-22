@@ -377,6 +377,7 @@ fn validate_container(
         errs.extend(validate_volume_mounts(
             mounts,
             volume_names,
+            c,
             &fld_path.child("volumeMounts"),
         ));
     }
@@ -405,20 +406,30 @@ fn validate_local_descending_path(target: &str, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Port of upstream `ValidateVolumeMounts` (the volume-context subset): each
-/// mount needs a name that matches a declared volume, a unique non-empty
-/// `mountPath`, and `subPath`/`subPathExpr` that are mutually exclusive
-/// relative non-backstepping paths.
-///
-/// `mountPropagation`, `recursiveReadOnly`, and the `volumeDevices` overlap
-/// checks need extra container/device context and are not covered here.
+/// Port of upstream `ValidateVolumeMounts`: each mount needs a name that matches
+/// a declared volume, a unique non-empty `mountPath` that does not collide with
+/// the container's `volumeDevices`, `subPath`/`subPathExpr` that are mutually
+/// exclusive relative non-backstepping paths, a supported `mountPropagation`
+/// (`Bidirectional` only on privileged containers), and a `recursiveReadOnly`
+/// consistent with `readOnly`/`mountPropagation`.
 fn validate_volume_mounts(
     mounts: &[VolumeMount],
     volume_names: &HashSet<&str>,
+    container: &Container,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let mut mountpoints: HashSet<&str> = HashSet::new();
+
+    // volumeDevices name/path sets for the overlap check (upstream
+    // `mountNameAlreadyExists` / `mountPathAlreadyExists`).
+    let (device_names, device_paths): (HashSet<&str>, HashSet<&str>) = container
+        .volume_devices
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|d| (d.name.as_str(), d.device_path.as_str()))
+        .unzip();
 
     for (i, mnt) in mounts.iter().enumerate() {
         let idx = fld_path.index(i);
@@ -440,6 +451,22 @@ fn validate_volume_mounts(
             ));
         }
 
+        // Overlap with volumeDevices.
+        if device_names.contains(mnt.name.as_str()) {
+            errs.push(Error::invalid(
+                &idx.child("name"),
+                mnt.name.clone(),
+                "must not already exist in volumeDevices",
+            ));
+        }
+        if device_paths.contains(mnt.mount_path.as_str()) {
+            errs.push(Error::invalid(
+                &idx.child("mountPath"),
+                mnt.mount_path.clone(),
+                "must not already exist as a path in volumeDevices",
+            ));
+        }
+
         if let Some(sub_path) = mnt.sub_path.as_deref().filter(|s| !s.is_empty()) {
             errs.extend(validate_local_descending_path(
                 sub_path,
@@ -458,6 +485,89 @@ fn validate_volume_mounts(
             errs.extend(validate_local_descending_path(
                 sub_path_expr,
                 &fld_path.child("subPathExpr"),
+            ));
+        }
+
+        errs.extend(validate_mount_propagation(
+            mnt.mount_propagation.as_deref(),
+            container,
+            &fld_path.child("mountPropagation"),
+        ));
+        errs.extend(validate_mount_recursive_read_only(
+            mnt,
+            &fld_path.child("recursiveReadOnly"),
+        ));
+    }
+    errs
+}
+
+const MOUNT_PROPAGATION_MODES: &[&str] = &["Bidirectional", "HostToContainer", "None"];
+
+/// Port of upstream `validateMountPropagation`: a supported enum value, and
+/// `Bidirectional` only on privileged containers.
+fn validate_mount_propagation(
+    mode: Option<&str>,
+    container: &Container,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(mode) = mode else {
+        return errs;
+    };
+    if !MOUNT_PROPAGATION_MODES.contains(&mode) {
+        errs.push(Error::not_supported(
+            fld_path,
+            mode.to_string(),
+            MOUNT_PROPAGATION_MODES,
+        ));
+    }
+    let privileged = container
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.privileged)
+        .unwrap_or(false);
+    if mode == "Bidirectional" && !privileged {
+        errs.push(Error::forbidden(
+            fld_path,
+            "Bidirectional mount propagation is available only to privileged containers",
+        ));
+    }
+    errs
+}
+
+/// Port of upstream `validateMountRecursiveReadOnly`: `Enabled`/`IfPossible`
+/// require `readOnly: true` and `mountPropagation` `None`/unset; an unrecognized
+/// value is rejected.
+fn validate_mount_recursive_read_only(mount: &VolumeMount, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let Some(rro) = mount.recursive_read_only.as_deref() else {
+        return errs;
+    };
+    match rro {
+        "Disabled" => {}
+        "Enabled" | "IfPossible" => {
+            if !mount.read_only.unwrap_or(false) {
+                errs.push(Error::forbidden(
+                    fld_path,
+                    "may only be specified when readOnly is true",
+                ));
+            }
+            if mount
+                .mount_propagation
+                .as_deref()
+                .is_some_and(|p| p != "None")
+            {
+                errs.push(Error::forbidden(
+                    fld_path,
+                    "may only be specified when mountPropagation is None or not specified",
+                ));
+            }
+        }
+        other => {
+            errs.push(Error::not_supported(
+                fld_path,
+                other.to_string(),
+                &["Disabled", "IfPossible", "Enabled"],
             ));
         }
     }
@@ -1736,6 +1846,14 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
+    fn bare_container() -> Container {
+        serde_json::from_value(serde_json::json!({"name": "c", "image": "busybox"})).unwrap()
+    }
+
+    fn container_from(json: serde_json::Value) -> Container {
+        serde_json::from_value(json).unwrap()
+    }
+
     #[test]
     fn volume_mount_must_reference_declared_volume() {
         let vols: HashSet<&str> = ["data"].into_iter().collect();
@@ -1743,7 +1861,12 @@ mod tests {
             {"name": "data", "mountPath": "/data"},
             {"name": "missing", "mountPath": "/other"}
         ]));
-        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        let errs = validate_volume_mounts(
+            &mounts,
+            &vols,
+            &bare_container(),
+            &Path::new("volumeMounts"),
+        );
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].to_string().contains("missing"));
     }
@@ -1755,7 +1878,12 @@ mod tests {
             {"name": "a", "mountPath": "/x"},
             {"name": "b", "mountPath": "/x"}
         ]));
-        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        let errs = validate_volume_mounts(
+            &mounts,
+            &vols,
+            &bare_container(),
+            &Path::new("volumeMounts"),
+        );
         assert!(
             errs.iter()
                 .any(|e| e.to_string().contains("must be unique")),
@@ -1767,7 +1895,12 @@ mod tests {
     fn empty_name_and_mount_path_required() {
         let vols: HashSet<&str> = HashSet::new();
         let mounts = mounts_from(serde_json::json!([{"name": "", "mountPath": ""}]));
-        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        let errs = validate_volume_mounts(
+            &mounts,
+            &vols,
+            &bare_container(),
+            &Path::new("volumeMounts"),
+        );
         assert!(errs.iter().any(|e| e.field.ends_with("name")), "{errs:?}");
         assert!(
             errs.iter().any(|e| e.field.ends_with("mountPath")),
@@ -1797,10 +1930,110 @@ mod tests {
         let mounts = mounts_from(serde_json::json!([
             {"name": "v", "mountPath": "/m", "subPath": "a", "subPathExpr": "$(POD_NAME)"}
         ]));
-        let errs = validate_volume_mounts(&mounts, &vols, &Path::new("volumeMounts"));
+        let errs = validate_volume_mounts(
+            &mounts,
+            &vols,
+            &bare_container(),
+            &Path::new("volumeMounts"),
+        );
         assert!(
             errs.iter()
                 .any(|e| e.to_string().contains("mutually exclusive")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn bidirectional_propagation_requires_privileged() {
+        let vols: HashSet<&str> = ["v"].into_iter().collect();
+        let mounts = mounts_from(
+            serde_json::json!([{"name": "v", "mountPath": "/m", "mountPropagation": "Bidirectional"}]),
+        );
+        // Non-privileged → forbidden.
+        let errs = validate_volume_mounts(
+            &mounts,
+            &vols,
+            &bare_container(),
+            &Path::new("volumeMounts"),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("privileged containers")),
+            "{errs:?}"
+        );
+        // Privileged → allowed.
+        let priv_c = container_from(
+            serde_json::json!({"name": "c", "image": "busybox", "securityContext": {"privileged": true}}),
+        );
+        assert!(
+            validate_volume_mounts(&mounts, &vols, &priv_c, &Path::new("volumeMounts")).is_empty()
+        );
+    }
+
+    #[test]
+    fn unsupported_mount_propagation_rejected() {
+        let vols: HashSet<&str> = ["v"].into_iter().collect();
+        let mounts = mounts_from(
+            serde_json::json!([{"name": "v", "mountPath": "/m", "mountPropagation": "Sideways"}]),
+        );
+        let errs = validate_volume_mounts(
+            &mounts,
+            &vols,
+            &bare_container(),
+            &Path::new("volumeMounts"),
+        );
+        assert!(
+            errs.iter().any(|e| e.field.ends_with("mountPropagation")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_read_only_requires_read_only() {
+        let vols: HashSet<&str> = ["v"].into_iter().collect();
+        // Enabled without readOnly → forbidden.
+        let mounts = mounts_from(
+            serde_json::json!([{"name": "v", "mountPath": "/m", "recursiveReadOnly": "Enabled"}]),
+        );
+        let errs = validate_volume_mounts(
+            &mounts,
+            &vols,
+            &bare_container(),
+            &Path::new("volumeMounts"),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("readOnly is true")),
+            "{errs:?}"
+        );
+        // Enabled with readOnly → ok.
+        let ok = mounts_from(
+            serde_json::json!([{"name": "v", "mountPath": "/m", "readOnly": true, "recursiveReadOnly": "Enabled"}]),
+        );
+        assert!(
+            validate_volume_mounts(&ok, &vols, &bare_container(), &Path::new("volumeMounts"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mount_overlapping_volume_device_rejected() {
+        let vols: HashSet<&str> = ["v"].into_iter().collect();
+        let c = container_from(serde_json::json!({
+            "name": "c", "image": "busybox",
+            "volumeDevices": [{"name": "v", "devicePath": "/dev/xvda"}]
+        }));
+        let mounts = mounts_from(serde_json::json!([{"name": "v", "mountPath": "/dev/xvda"}]));
+        let errs = validate_volume_mounts(&mounts, &vols, &c, &Path::new("volumeMounts"));
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("already exist in volumeDevices")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("already exist as a path in volumeDevices")),
             "{errs:?}"
         );
     }
