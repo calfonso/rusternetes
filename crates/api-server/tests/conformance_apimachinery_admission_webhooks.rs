@@ -880,7 +880,14 @@ async fn should_mutate_pod_and_apply_defaults_after_mutation() {
 #[tokio::test]
 async fn should_not_be_able_to_mutate_or_prevent_deletion_of_webhook_configuration_objects() {
     let (mem, router) = spawn_router();
-    let (url, _shutdown) = start_deny_validator("would deny everything".into()).await;
+    let (raw_url, _shutdown) = start_deny_validator("would deny everything".into()).await;
+    // clientConfig.url must use the https scheme (upstream validateWebhookURL,
+    // enforced on the update path here). This test updates the webhook config
+    // itself through the router, so the URL is validated. The deny server is
+    // only contacted if the self-targeting protection regressed and the webhook
+    // actually fired — where the scheme/transport mismatch still yields a
+    // non-200, keeping the assertion meaningful.
+    let url = raw_url.replacen("http://", "https://", 1);
 
     // Register a deny-all webhook directly in storage to skip the create
     // round-trip's CEL validation overhead.

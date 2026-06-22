@@ -219,6 +219,15 @@ pub async fn update_validating_webhook(
 
     config.metadata.name = name.clone();
 
+    // Field validation on update (upstream ValidateValidatingWebhookConfigurationUpdate
+    // re-runs the config validator on the new object).
+    {
+        let errs = rusternetes_common::validation::webhookconfiguration::validate_validating_webhook_configuration(&config);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
+
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
@@ -528,6 +537,15 @@ pub async fn update_mutating_webhook(
     }
 
     config.metadata.name = name.clone();
+
+    // Field validation on update (upstream ValidateMutatingWebhookConfigurationUpdate
+    // re-runs the config validator on the new object).
+    {
+        let errs = rusternetes_common::validation::webhookconfiguration::validate_mutating_webhook_configuration(&config);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
+        }
+    }
 
     // Check for dry-run
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);

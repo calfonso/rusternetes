@@ -34,6 +34,10 @@ const LABEL_VALUE_MAX_LENGTH: usize = 63;
 const DNS1123_LABEL_FMT: &str = "[a-z0-9]([-a-z0-9]*[a-z0-9])?";
 const DNS1123_LABEL_ERR_MSG: &str =
     "a lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character";
+
+const DNS1035_LABEL_FMT: &str = "[a-z]([-a-z0-9]*[a-z0-9])?";
+const DNS1035_LABEL_ERR_MSG: &str = "a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character";
+const DNS1035_LABEL_MAX_LENGTH: usize = 63;
 const DNS1123_LABEL_MAX_LENGTH: usize = 63;
 
 const DNS1123_SUBDOMAIN_FMT: &str =
@@ -61,6 +65,8 @@ static LABEL_VALUE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(&format!("^({LABEL_KEY_FMT})?$")).expect("label value regex"));
 static DNS1123_LABEL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(&format!("^{DNS1123_LABEL_FMT}$")).expect("dns1123 label regex"));
+static DNS1035_LABEL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(&format!("^{DNS1035_LABEL_FMT}$")).expect("dns1035 label regex"));
 static DNS1123_SUBDOMAIN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!("^{DNS1123_SUBDOMAIN_FMT}$")).expect("dns1123 subdomain regex")
 });
@@ -162,6 +168,24 @@ pub fn is_dns1123_label(value: &str) -> Vec<String> {
                 &["my-name", "123-abc"],
             ));
         }
+    }
+    errs
+}
+
+/// Port of upstream `validation.IsDNS1035Label`: a lowercase label that must
+/// start with an alphabetic character (unlike DNS-1123, which allows a leading
+/// digit), ≤63 characters.
+pub fn is_dns1035_label(value: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    if value.len() > DNS1035_LABEL_MAX_LENGTH {
+        errs.push(max_len_error(DNS1035_LABEL_MAX_LENGTH));
+    }
+    if !DNS1035_LABEL_RE.is_match(value) {
+        errs.push(regex_error(
+            DNS1035_LABEL_ERR_MSG,
+            DNS1035_LABEL_FMT,
+            &["my-name", "abc-123"],
+        ));
     }
     errs
 }
