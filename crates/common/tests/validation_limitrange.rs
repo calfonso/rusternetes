@@ -76,7 +76,7 @@ fn min_greater_than_max_rejected() {
         "max": {"cpu": "1"}
     }])));
     assert!(
-        has(&errs, "spec.limits[0].min.cpu", ErrorType::Invalid),
+        has(&errs, "spec.limits[0].min[cpu]", ErrorType::Invalid),
         "got: {errs:?}"
     );
 }
@@ -89,7 +89,7 @@ fn default_above_max_rejected() {
         "default": {"cpu": "2"}
     }])));
     assert!(
-        has(&errs, "spec.limits[0].default.cpu", ErrorType::Invalid),
+        has(&errs, "spec.limits[0].default[cpu]", ErrorType::Invalid),
         "got: {errs:?}"
     );
 }
@@ -104,7 +104,7 @@ fn default_request_above_default_rejected() {
     assert!(
         has(
             &errs,
-            "spec.limits[0].defaultRequest.cpu",
+            "spec.limits[0].defaultRequest[cpu]",
             ErrorType::Invalid
         ),
         "got: {errs:?}"
@@ -138,7 +138,7 @@ fn ratio_below_one_rejected() {
     assert!(
         has(
             &errs,
-            "spec.limits[0].maxLimitRequestRatio.cpu",
+            "spec.limits[0].maxLimitRequestRatio[cpu]",
             ErrorType::Invalid
         ),
         "got: {errs:?}"

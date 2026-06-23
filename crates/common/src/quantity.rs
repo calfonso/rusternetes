@@ -250,44 +250,50 @@ impl Quantity {
         self.mantissa < 0
     }
 
-    /// Value expressed in milli-units (10⁻³), rounding any fractional
-    /// remainder away from zero. Mirrors upstream `Quantity.MilliValue()`
-    /// (`ScaledValue(Milli)`), which rounds up so that e.g. `1.5m` reports
-    /// `2` and a non-integer number of whole units is detectable via
-    /// `milli_value() % 1000 != 0`.
-    ///
-    /// Returns `i64::MAX` / `i64::MIN` on overflow, matching upstream's
-    /// saturating `AsScaledInt64` behaviour for out-of-range values.
-    pub fn milli_value(&self) -> i64 {
-        // value * 1000 = mantissa * 10^(scale + 3)
-        let exp = self.scale + 3;
-        let scaled: i128 = if exp >= 0 {
-            match 10i128
-                .checked_pow(exp as u32)
-                .and_then(|p| self.mantissa.checked_mul(p))
-            {
-                Some(v) => v,
-                None => {
-                    return if self.mantissa < 0 {
-                        i64::MIN
+    /// Value of `ceil(self / 10^target_scale)` as `i128`. Mirrors upstream
+    /// `Quantity.ScaledValue(scale)` (rounding up, away from zero). The
+    /// internal representation is `mantissa * 10^self.scale`, so this is
+    /// `ceil(mantissa * 10^(self.scale - target_scale))`.
+    fn scaled_value(&self, target_scale: i32) -> i128 {
+        let delta = self.scale - target_scale;
+        match delta.cmp(&0) {
+            std::cmp::Ordering::Equal => self.mantissa,
+            std::cmp::Ordering::Greater => {
+                // Multiply up — exact, no rounding needed.
+                self.mantissa
+                    .checked_mul(10i128.pow(delta as u32))
+                    .unwrap_or(if self.mantissa < 0 {
+                        i128::MIN
                     } else {
-                        i64::MAX
-                    }
+                        i128::MAX
+                    })
+            }
+            std::cmp::Ordering::Less => {
+                // Divide by 10^(-delta), rounding up away from zero to match
+                // upstream `ScaledValue` ceiling semantics.
+                let divisor = 10i128.pow((-delta) as u32);
+                let q = self.mantissa / divisor;
+                let r = self.mantissa % divisor;
+                if r > 0 {
+                    q + 1
+                } else if r < 0 {
+                    q - 1
+                } else {
+                    q
                 }
             }
-        } else {
-            // Divide by 10^(-exp), rounding away from zero (ceiling in
-            // magnitude) so any fractional milli-remainder is preserved.
-            let div = 10i128.pow((-exp) as u32);
-            let m = self.mantissa;
-            if m >= 0 {
-                m.div_euclid(div) + i128::from(m.rem_euclid(div) != 0)
-            } else {
-                // Round away from zero for negatives too.
-                -((-m).div_euclid(div) + i128::from((-m).rem_euclid(div) != 0))
-            }
-        };
-        scaled.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        }
+    }
+
+    /// Unscaled value rounded up to the nearest integer away from zero.
+    /// Mirrors upstream `Quantity.Value()`.
+    pub fn value(&self) -> i128 {
+        self.scaled_value(0)
+    }
+
+    /// `ceil(self * 1000)`. Mirrors upstream `Quantity.MilliValue()`.
+    pub fn milli_value(&self) -> i128 {
+        self.scaled_value(-3)
     }
 
     /// Canonical-form string for this quantity. Matches upstream
