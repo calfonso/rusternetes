@@ -23,11 +23,17 @@ use crate::resources::workloads::{
 use crate::types::LabelSelector;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
-    is_dns1123_label, is_dns1123_subdomain, is_qualified_name, validate_label_selector,
-    LabelSelectorValidationOptions,
+    is_dns1123_label, is_dns1123_subdomain, is_qualified_name, label_selector_matches_labels,
+    validate_label_selector, LabelSelectorValidationOptions,
 };
 use crate::validation::objectmeta::validate_nonnegative_field;
 use std::collections::HashSet;
+
+// Upstream `pkg/apis/batch/types.go` label keys (prefix `batch.kubernetes.io/`).
+const LEGACY_JOB_NAME_LABEL: &str = "job-name";
+const LEGACY_CONTROLLER_UID_LABEL: &str = "controller-uid";
+const JOB_NAME_LABEL: &str = "batch.kubernetes.io/job-name";
+const CONTROLLER_UID_LABEL: &str = "batch.kubernetes.io/controller-uid";
 
 // Upstream constants (`pkg/apis/batch/validation/validation.go`).
 const MAX_PARALLELISM_FOR_INDEXED_JOB: i32 = 100_000;
@@ -111,11 +117,6 @@ const POD_FAILURE_POLICY_ACTIONS: [&str; 4] = ["FailJob", "FailIndex", "Ignore",
 const ON_EXIT_CODES_OPERATORS: [&str; 2] = ["In", "NotIn"];
 const ON_POD_CONDITIONS_STATUSES: [&str; 3] = ["True", "False", "Unknown"];
 const POD_REPLACEMENT_POLICIES: [&str; 2] = ["Failed", "TerminatingOrFailed"];
-
-fn selector_is_empty(sel: &LabelSelector) -> bool {
-    sel.match_labels.as_ref().is_none_or(|m| m.is_empty())
-        && sel.match_expressions.as_ref().is_none_or(|m| m.is_empty())
-}
 
 /// Port of upstream `validateJobSpec` (the inner validator, WITHOUT the
 /// selector-required / selector-match checks that `ValidateJobSpec` adds). This
@@ -281,7 +282,8 @@ fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
     }
 
     // template.spec.restartPolicy must be OnFailure or Never (upstream rejects
-    // the SetDefaults_PodSpec-defaulted "Always"/empty for Jobs).
+    // the SetDefaults_PodSpec-defaulted "Always"/empty for Jobs). With a
+    // podFailurePolicy, only "Never" is permitted (upstream validation.go:287).
     let rp_path = fld_path
         .child("template")
         .child("spec")
@@ -297,6 +299,12 @@ fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
             &rp_path,
             restart_policy.to_string(),
             &["OnFailure", "Never"],
+        ));
+    } else if spec.pod_failure_policy.is_some() && restart_policy != "Never" {
+        errs.push(Error::invalid(
+            &rp_path,
+            restart_policy.to_string(),
+            "only \"Never\" is supported when podFailurePolicy is specified",
         ));
     }
 
@@ -346,7 +354,8 @@ fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
 fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
     let mut errs = validate_job_spec_core(spec, fld_path);
 
-    // Selector: required, valid, and matching the template labels.
+    // Selector: required and valid. Upstream `ValidateJobSpec` only requires +
+    // validates the selector here; the match check below runs regardless.
     match &spec.selector {
         None => errs.push(Error::required(&fld_path.child("selector"), "")),
         Some(sel) => {
@@ -355,33 +364,30 @@ fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
                 LabelSelectorValidationOptions::default(),
                 &fld_path.child("selector"),
             ));
-            if let Some(match_labels) = &sel.match_labels {
-                if !selector_is_empty(sel) {
-                    let template_labels = spec
-                        .template
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.labels.as_ref());
-                    let matches = match template_labels {
-                        Some(tl) => match_labels.iter().all(|(k, v)| tl.get(k) == Some(v)),
-                        None => match_labels.is_empty(),
-                    };
-                    if !matches {
-                        errs.push(Error::invalid(
-                            &fld_path.child("template").child("metadata").child("labels"),
-                            template_labels
-                                .map(|tl| {
-                                    tl.iter()
-                                        .map(|(k, v)| format!("{k}={v}"))
-                                        .collect::<Vec<_>>()
-                                        .join(",")
-                                })
-                                .unwrap_or_default(),
-                            "`selector` does not match template `labels`",
-                        ));
-                    }
-                }
-            }
+        }
+    }
+
+    // Whether manually or automatically generated, the selector of the job must
+    // match the pods it will produce — honoring `matchExpressions`, not only
+    // `matchLabels` (upstream validation.go:182-187 via `LabelSelectorAsSelector`).
+    if let Some(sel) = &spec.selector {
+        let empty_labels = std::collections::HashMap::new();
+        let template_labels = spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.labels.as_ref())
+            .unwrap_or(&empty_labels);
+        if !label_selector_matches_labels(sel, template_labels) {
+            errs.push(Error::invalid(
+                &fld_path.child("template").child("metadata").child("labels"),
+                template_labels
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "`selector` does not match template `labels`",
+            ));
         }
     }
 
@@ -412,10 +418,136 @@ pub fn validate_job_template_spec(template: &JobTemplateSpec, fld_path: &Path) -
     errs
 }
 
+/// Port of upstream `apivalidation.ValidateHasLabel`: the label `key` must be
+/// present on `meta` and equal to `expected_value`.
+fn validate_has_label(
+    labels: Option<&std::collections::HashMap<String, String>>,
+    fld_path: &Path,
+    key: &str,
+    expected_value: &str,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    match labels.and_then(|l| l.get(key)) {
+        None => errs.push(Error::required(
+            &fld_path.child("labels").key(key),
+            format!("must be '{expected_value}'"),
+        )),
+        Some(actual) if actual != expected_value => errs.push(Error::invalid(
+            &fld_path.child("labels").key(key),
+            labels
+                .map(|l| {
+                    l.iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default(),
+            format!("must be '{expected_value}'"),
+        )),
+        _ => {}
+    }
+    errs
+}
+
+/// Port of upstream `validateGeneratedSelector`: when the selector is
+/// auto-generated (not `manualSelector`), the pod template must carry the
+/// generated `controller-uid` / `job-name` labels (prefixed + legacy) matching
+/// the Job's `uid` / `name`, the Job's `uid` must be set, and the selector must
+/// match those generated labels (else `selector` not auto-generated).
+///
+/// `validate_batch_labels` mirrors upstream `opts.RequirePrefixedLabels`; on the
+/// create path it is `true`.
+fn validate_generated_selector(job: &Job, validate_batch_labels: bool) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+
+    if job.spec.manual_selector == Some(true) {
+        return errs;
+    }
+    // Already reported as required by the caller when absent.
+    let Some(selector) = &job.spec.selector else {
+        return errs;
+    };
+
+    // An unset uid would yield "controller-uid=" as the selector, which is bad.
+    if job.metadata.uid.is_empty() {
+        errs.push(Error::required(&Path::new("metadata").child("uid"), ""));
+    }
+
+    let template_meta = job.spec.template.metadata.as_ref();
+    let template_labels = template_meta.and_then(|m| m.labels.as_ref());
+    let template_path = Path::new("spec").child("template").child("metadata");
+
+    // The expected (generated) labels the selector must match.
+    let mut expected_labels: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    errs.extend(validate_has_label(
+        template_labels,
+        &template_path,
+        LEGACY_CONTROLLER_UID_LABEL,
+        &job.metadata.uid,
+    ));
+    errs.extend(validate_has_label(
+        template_labels,
+        &template_path,
+        LEGACY_JOB_NAME_LABEL,
+        &job.metadata.name,
+    ));
+    if validate_batch_labels {
+        errs.extend(validate_has_label(
+            template_labels,
+            &template_path,
+            CONTROLLER_UID_LABEL,
+            &job.metadata.uid,
+        ));
+        errs.extend(validate_has_label(
+            template_labels,
+            &template_path,
+            JOB_NAME_LABEL,
+            &job.metadata.name,
+        ));
+        expected_labels.insert(CONTROLLER_UID_LABEL.to_string(), job.metadata.uid.clone());
+        expected_labels.insert(JOB_NAME_LABEL.to_string(), job.metadata.name.clone());
+    }
+    // Labels created by the Kubernetes project carry a prefix; the legacy
+    // (unprefixed) ones are set for backward compatibility.
+    expected_labels.insert(
+        LEGACY_CONTROLLER_UID_LABEL.to_string(),
+        job.metadata.uid.clone(),
+    );
+    expected_labels.insert(LEGACY_JOB_NAME_LABEL.to_string(), job.metadata.name.clone());
+
+    // The selector must match the generated labels.
+    if !label_selector_matches_labels(selector, &expected_labels) {
+        errs.push(Error::invalid(
+            &Path::new("spec").child("selector"),
+            selector_display(selector),
+            "`selector` not auto-generated",
+        ));
+    }
+
+    errs
+}
+
+/// Compact `key=value` rendering of a `LabelSelector` for error messages.
+fn selector_display(sel: &LabelSelector) -> String {
+    sel.match_labels
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 /// Validate a `Job` on create. Mirrors upstream `ValidateJob` (minus ObjectMeta,
-/// which the handler validates via `validate_create_object_meta`).
+/// which the handler validates via `validate_create_object_meta`). The create
+/// path uses `RequirePrefixedLabels: true`.
 pub fn validate_job(job: &Job) -> ErrorList {
-    let mut errs = validate_job_spec(&job.spec, &Path::new("spec"));
+    let mut errs = validate_generated_selector(job, true);
+    errs.extend(validate_job_spec(&job.spec, &Path::new("spec")));
 
     // Indexed job pods get a `-$INDEX` hostname suffix; the max index is
     // `completions-1`. Reject names that would yield an invalid DNS-1123 label.
@@ -753,5 +885,285 @@ mod success_policy_indexes_tests {
     #[test]
     fn three_part_interval_rejected() {
         assert!(parse_index_interval("1-2-3", 8).is_err());
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use crate::resources::pod::{Container, PodSpec};
+    use crate::resources::workloads::{
+        Job, JobSpec, PodFailurePolicy, PodFailurePolicyOnPodConditionsPattern,
+        PodFailurePolicyRule, PodTemplateSpec,
+    };
+    use crate::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta};
+    use std::collections::HashMap;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn container() -> Container {
+        Container {
+            name: "main".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A Job whose auto-generated selector + template labels are consistent,
+    /// as the api-server's `generateSelector` would produce: prefixed + legacy
+    /// controller-uid / job-name labels, selector on the prefixed controller-uid.
+    fn valid_generated_job() -> Job {
+        let uid = "abc-123".to_string();
+        let name = "myjob".to_string();
+        let template_labels = labels(&[
+            ("controller-uid", &uid),
+            ("job-name", &name),
+            ("batch.kubernetes.io/controller-uid", &uid),
+            ("batch.kubernetes.io/job-name", &name),
+        ]);
+        let mut meta = ObjectMeta::new(&name);
+        meta.uid = uid.clone();
+        Job {
+            type_meta: TypeMeta {
+                kind: "Job".to_string(),
+                api_version: "batch/v1".to_string(),
+            },
+            metadata: meta,
+            spec: JobSpec {
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta {
+                        labels: Some(template_labels),
+                        ..ObjectMeta::default()
+                    }),
+                    spec: PodSpec {
+                        containers: vec![container()],
+                        restart_policy: Some("Never".to_string()),
+                        ..PodSpec::default()
+                    },
+                },
+                completions: None,
+                parallelism: None,
+                backoff_limit: None,
+                active_deadline_seconds: None,
+                selector: Some(LabelSelector {
+                    match_labels: Some(labels(&[("batch.kubernetes.io/controller-uid", &uid)])),
+                    match_expressions: None,
+                }),
+                manual_selector: None,
+                suspend: None,
+                ttl_seconds_after_finished: None,
+                completion_mode: None,
+                backoff_limit_per_index: None,
+                max_failed_indexes: None,
+                pod_failure_policy: None,
+                pod_replacement_policy: None,
+                success_policy: None,
+                managed_by: None,
+            },
+            status: None,
+        }
+    }
+
+    fn has_error_containing(errs: &ErrorList, detail_needle: &str) -> bool {
+        errs.iter().any(|e| e.detail.contains(detail_needle))
+    }
+
+    fn has_error_on_field(errs: &ErrorList, field_needle: &str) -> bool {
+        errs.iter().any(|e| e.field.contains(field_needle))
+    }
+
+    // --- baseline -----------------------------------------------------------
+
+    #[test]
+    fn valid_generated_job_passes() {
+        let errs = validate_job(&valid_generated_job());
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    // --- rule 1: podFailurePolicy ⇒ restartPolicy must be Never --------------
+
+    #[test]
+    fn pod_failure_policy_requires_never_restart_policy() {
+        let mut job = valid_generated_job();
+        job.spec.template.spec.restart_policy = Some("OnFailure".to_string());
+        job.spec.pod_failure_policy = Some(PodFailurePolicy {
+            rules: vec![PodFailurePolicyRule {
+                action: "Ignore".to_string(),
+                on_exit_codes: None,
+                on_pod_conditions: vec![PodFailurePolicyOnPodConditionsPattern {
+                    condition_type: "DisruptionTarget".to_string(),
+                    status: Some("True".to_string()),
+                }],
+            }],
+        });
+        let errs = validate_job(&job);
+        assert!(
+            has_error_containing(
+                &errs,
+                "only \"Never\" is supported when podFailurePolicy is specified"
+            ),
+            "got: {errs:?}"
+        );
+        assert!(has_error_on_field(&errs, "template.spec.restartPolicy"));
+    }
+
+    #[test]
+    fn pod_failure_policy_with_never_restart_policy_ok() {
+        let mut job = valid_generated_job();
+        job.spec.template.spec.restart_policy = Some("Never".to_string());
+        job.spec.pod_failure_policy = Some(PodFailurePolicy {
+            rules: vec![PodFailurePolicyRule {
+                action: "Ignore".to_string(),
+                on_exit_codes: None,
+                on_pod_conditions: vec![PodFailurePolicyOnPodConditionsPattern {
+                    condition_type: "DisruptionTarget".to_string(),
+                    status: Some("True".to_string()),
+                }],
+            }],
+        });
+        let errs = validate_job(&job);
+        assert!(
+            !has_error_containing(
+                &errs,
+                "only \"Never\" is supported when podFailurePolicy is specified"
+            ),
+            "got: {errs:?}"
+        );
+    }
+
+    // --- rule 2: validateGeneratedSelector -----------------------------------
+
+    #[test]
+    fn generated_selector_missing_prefixed_labels_rejected() {
+        let mut job = valid_generated_job();
+        // Drop the prefixed labels, leaving only the legacy ones.
+        job.spec.template.metadata.as_mut().unwrap().labels = Some(labels(&[
+            ("controller-uid", "abc-123"),
+            ("job-name", "myjob"),
+        ]));
+        // Selector still references the prefixed key, so it won't match either.
+        let errs = validate_job(&job);
+        assert!(
+            has_error_containing(&errs, "must be 'abc-123'")
+                || has_error_containing(&errs, "must be 'myjob'"),
+            "expected ValidateHasLabel errors, got: {errs:?}"
+        );
+        assert!(has_error_on_field(
+            &errs,
+            "spec.template.metadata.labels[batch.kubernetes.io/controller-uid]"
+        ));
+    }
+
+    #[test]
+    fn generated_selector_wrong_uid_label_rejected() {
+        let mut job = valid_generated_job();
+        // controller-uid label disagrees with metadata.uid.
+        job.spec.template.metadata.as_mut().unwrap().labels = Some(labels(&[
+            ("controller-uid", "wrong"),
+            ("job-name", "myjob"),
+            ("batch.kubernetes.io/controller-uid", "wrong"),
+            ("batch.kubernetes.io/job-name", "myjob"),
+        ]));
+        let errs = validate_job(&job);
+        assert!(
+            has_error_containing(&errs, "must be 'abc-123'"),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn generated_selector_mismatch_reported() {
+        let mut job = valid_generated_job();
+        // Selector points at a uid that no generated label carries.
+        job.spec.selector = Some(LabelSelector {
+            match_labels: Some(labels(&[(
+                "batch.kubernetes.io/controller-uid",
+                "different-uid",
+            )])),
+            match_expressions: None,
+        });
+        let errs = validate_job(&job);
+        assert!(
+            has_error_containing(&errs, "`selector` not auto-generated"),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn generated_selector_missing_uid_rejected() {
+        let mut job = valid_generated_job();
+        job.metadata.uid = String::new();
+        // Keep labels matching the (now empty) uid so only the uid-required
+        // error is the headline; selector still references the old uid value.
+        let errs = validate_job(&job);
+        assert!(has_error_on_field(&errs, "metadata.uid"), "got: {errs:?}");
+    }
+
+    #[test]
+    fn manual_selector_skips_generated_checks() {
+        let mut job = valid_generated_job();
+        job.spec.manual_selector = Some(true);
+        // Only matchLabels that the template carries; no prefixed labels needed.
+        job.spec.selector = Some(LabelSelector {
+            match_labels: Some(labels(&[("app", "x")])),
+            match_expressions: None,
+        });
+        job.spec.template.metadata.as_mut().unwrap().labels = Some(labels(&[("app", "x")]));
+        let errs = validate_job(&job);
+        assert!(
+            !has_error_containing(&errs, "`selector` not auto-generated"),
+            "got: {errs:?}"
+        );
+        assert!(
+            !has_error_containing(&errs, "must be 'abc-123'"),
+            "manualSelector should skip generated-label checks, got: {errs:?}"
+        );
+    }
+
+    // --- rule 3: selector match honors matchExpressions ----------------------
+
+    #[test]
+    fn selector_match_expressions_satisfied_ok() {
+        let mut job = valid_generated_job();
+        job.spec.manual_selector = Some(true); // isolate the match check
+        job.spec.selector = Some(LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: "tier".to_string(),
+                operator: "In".to_string(),
+                values: Some(vec!["fe".to_string(), "be".to_string()]),
+            }]),
+        });
+        job.spec.template.metadata.as_mut().unwrap().labels = Some(labels(&[("tier", "fe")]));
+        let errs = validate_job(&job);
+        assert!(
+            !has_error_containing(&errs, "`selector` does not match template `labels`"),
+            "matchExpressions should be honored, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn selector_match_expressions_violated_rejected() {
+        let mut job = valid_generated_job();
+        job.spec.manual_selector = Some(true);
+        job.spec.selector = Some(LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: "tier".to_string(),
+                operator: "In".to_string(),
+                values: Some(vec!["fe".to_string()]),
+            }]),
+        });
+        // Template label value not in the In-set ⇒ no match.
+        job.spec.template.metadata.as_mut().unwrap().labels = Some(labels(&[("tier", "db")]));
+        let errs = validate_job(&job);
+        assert!(
+            has_error_containing(&errs, "`selector` does not match template `labels`"),
+            "matchExpressions mismatch must be caught, got: {errs:?}"
+        );
     }
 }

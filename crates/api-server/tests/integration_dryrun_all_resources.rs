@@ -272,13 +272,16 @@ fn statefulset_stub() -> Value {
 }
 
 fn job_stub() -> Value {
+    // No selector / template labels: the api-server auto-generates a consistent
+    // selector + controller-uid / job-name labels (matching upstream
+    // generateSelector). Pre-setting a stale controller-uid here would conflict
+    // with the generated uid and be rejected by validateGeneratedSelector.
     json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {"name": "job1", "namespace": TEST_NS},
         "spec": {
             "template": {
-                "metadata": {"labels": {"controller-uid": "uid1"}},
                 "spec": {
                     "containers": [{"image": "busybox", "name": "c"}],
                     "restartPolicy": "Never"

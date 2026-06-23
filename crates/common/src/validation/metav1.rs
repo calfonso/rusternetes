@@ -367,6 +367,41 @@ pub fn validate_label_selector_requirement(
     errs
 }
 
+/// Evaluate a `LabelSelector` against a label set — the full `matchLabels` +
+/// `matchExpressions` semantics of `metav1.LabelSelectorAsSelector().Matches()`.
+/// An unrecognized operator is treated as matching here; its invalidity is
+/// reported separately by [`validate_label_selector`].
+pub fn label_selector_matches_labels(
+    selector: &LabelSelector,
+    labels: &HashMap<String, String>,
+) -> bool {
+    if let Some(match_labels) = &selector.match_labels {
+        for (k, v) in match_labels {
+            if labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+    }
+    if let Some(exprs) = &selector.match_expressions {
+        for req in exprs {
+            let present = labels.get(&req.key);
+            let value_in_set =
+                present.is_some_and(|val| req.values.as_ref().is_some_and(|vs| vs.contains(val)));
+            let matches = match req.operator.as_str() {
+                "In" => value_in_set,
+                "NotIn" => !value_in_set,
+                "Exists" => present.is_some(),
+                "DoesNotExist" => present.is_none(),
+                _ => true, // unknown operator: reported by validate_label_selector
+            };
+            if !matches {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Allowed dry-run values. Upstream lives in
 /// `metav1.DryRunAll` = `"All"`.
 const ALLOWED_DRY_RUN_VALUES: &[&str] = &["All"];

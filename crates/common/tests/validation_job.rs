@@ -30,14 +30,30 @@ fn selector(labels: &[(&str, &str)]) -> LabelSelector {
 }
 
 /// A valid (already-defaulted, selector-generated) Job.
+///
+/// Mirrors what the api-server's `generateSelector` produces and what upstream
+/// `validateGeneratedSelector` requires: `metadata.uid` set, the template
+/// carrying both prefixed (`batch.kubernetes.io/...`) and legacy
+/// (`controller-uid` / `job-name`) labels matching the Job's uid/name, and the
+/// selector pinned to the prefixed `controller-uid`.
 fn valid_job() -> Job {
+    let uid = "abc";
+    let name = "my-job";
     let spec = JobSpec {
-        template: template_with_labels("OnFailure", &[("controller-uid", "abc")]),
+        template: template_with_labels(
+            "OnFailure",
+            &[
+                ("controller-uid", uid),
+                ("job-name", name),
+                ("batch.kubernetes.io/controller-uid", uid),
+                ("batch.kubernetes.io/job-name", name),
+            ],
+        ),
         completions: Some(3),
         parallelism: Some(1),
         backoff_limit: Some(6),
         active_deadline_seconds: None,
-        selector: Some(selector(&[("controller-uid", "abc")])),
+        selector: Some(selector(&[("batch.kubernetes.io/controller-uid", uid)])),
         manual_selector: None,
         suspend: None,
         ttl_seconds_after_finished: None,
@@ -49,8 +65,9 @@ fn valid_job() -> Job {
         success_policy: None,
         managed_by: None,
     };
-    let mut job = Job::new("my-job", "default", spec);
-    job.metadata.name = "my-job".to_string();
+    let mut job = Job::new(name, "default", spec);
+    job.metadata.name = name.to_string();
+    job.metadata.uid = uid.to_string();
     job
 }
 

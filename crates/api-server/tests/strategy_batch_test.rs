@@ -183,8 +183,9 @@ async fn test_job_strategy_create_applies_defaults() {
 // ---------------------------------------------------------------------------
 
 /// Upstream `TestJobStrategy_PrepareForCreate` (with `manualSelector` unset)
-/// auto-populates `spec.selector.matchLabels[controller-uid]` and the same
-/// label on the pod template plus a `job-name` template label.
+/// auto-populates `spec.selector.matchLabels[batch.kubernetes.io/controller-uid]`
+/// and adds BOTH the prefixed and legacy `controller-uid` / `job-name` labels to
+/// the pod template (matching `generateSelector`).
 #[tokio::test]
 async fn test_job_strategy_create_auto_generates_selector() {
     let (mem, router) = spawn_router();
@@ -207,27 +208,33 @@ async fn test_job_strategy_create_auto_generates_selector() {
         .to_string();
     assert!(!uid.is_empty(), "uid must be non-empty after create");
 
-    // selector must be populated
+    // selector must be populated on the prefixed controller-uid (upstream
+    // generateSelector selects on batch.kubernetes.io/controller-uid).
     let selector_uid = stored
-        .pointer("/spec/selector/matchLabels/controller-uid")
+        .pointer("/spec/selector/matchLabels/batch.kubernetes.io~1controller-uid")
         .and_then(Value::as_str)
-        .expect("auto-generated selector should set controller-uid");
+        .expect("auto-generated selector should set batch.kubernetes.io/controller-uid");
     assert_eq!(
         selector_uid, uid,
         "selector controller-uid matches metadata.uid"
     );
 
-    // template labels must include controller-uid and job-name
-    let tmpl_uid = stored
-        .pointer("/spec/template/metadata/labels/controller-uid")
-        .and_then(Value::as_str)
-        .expect("template labels must include controller-uid");
-    assert_eq!(tmpl_uid, uid);
-    let job_name_label = stored
-        .pointer("/spec/template/metadata/labels/job-name")
-        .and_then(Value::as_str)
-        .expect("template labels must include job-name");
-    assert_eq!(job_name_label, "auto-selector");
+    // template labels must include BOTH the prefixed and legacy
+    // controller-uid / job-name labels.
+    for key in ["controller-uid", "batch.kubernetes.io~1controller-uid"] {
+        let tmpl_uid = stored
+            .pointer(&format!("/spec/template/metadata/labels/{key}"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("template labels must include {key}"));
+        assert_eq!(tmpl_uid, uid, "{key} must equal uid");
+    }
+    for key in ["job-name", "batch.kubernetes.io~1job-name"] {
+        let job_name_label = stored
+            .pointer(&format!("/spec/template/metadata/labels/{key}"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("template labels must include {key}"));
+        assert_eq!(job_name_label, "auto-selector", "{key} must equal job name");
+    }
 }
 
 /// Upstream: when `spec.manualSelector` is true, the strategy does NOT

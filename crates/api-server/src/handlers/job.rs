@@ -60,14 +60,13 @@ pub async fn create(
     // and adds the controller-uid label to the pod template.
     if !job.spec.manual_selector.unwrap_or(false) && job.spec.selector.is_none() {
         let uid = job.metadata.uid.clone();
-        let mut match_labels = std::collections::HashMap::new();
-        match_labels.insert("controller-uid".to_string(), uid.clone());
-        job.spec.selector = Some(rusternetes_common::types::LabelSelector {
-            match_labels: Some(match_labels),
-            match_expressions: None,
-        });
+        let name = job.metadata.name.clone();
 
-        // Also ensure the pod template has the controller-uid label
+        // Mirror upstream `generateSelector` (pkg/registry/batch/job/strategy.go):
+        // add BOTH the legacy (unprefixed) and the prefixed
+        // `batch.kubernetes.io/...` job-name + controller-uid labels to the
+        // template, and select on the prefixed controller-uid (sufficient for
+        // uniqueness). validateGeneratedSelector then re-checks these.
         let template_labels = job
             .spec
             .template
@@ -75,9 +74,28 @@ pub async fn create(
             .get_or_insert_with(Default::default)
             .labels
             .get_or_insert_with(Default::default);
-        template_labels.insert("controller-uid".to_string(), uid.clone());
-        // Also add the standard job-name label
-        template_labels.insert("job-name".to_string(), job.metadata.name.clone());
+        template_labels
+            .entry("job-name".to_string())
+            .or_insert_with(|| name.clone());
+        template_labels
+            .entry("batch.kubernetes.io/job-name".to_string())
+            .or_insert_with(|| name.clone());
+        template_labels
+            .entry("controller-uid".to_string())
+            .or_insert_with(|| uid.clone());
+        template_labels
+            .entry("batch.kubernetes.io/controller-uid".to_string())
+            .or_insert_with(|| uid.clone());
+
+        let mut match_labels = std::collections::HashMap::new();
+        match_labels.insert(
+            "batch.kubernetes.io/controller-uid".to_string(),
+            uid.clone(),
+        );
+        job.spec.selector = Some(rusternetes_common::types::LabelSelector {
+            match_labels: Some(match_labels),
+            match_expressions: None,
+        });
     }
 
     // Validate the (now defaulted + selector-generated) Job spec, mirroring
