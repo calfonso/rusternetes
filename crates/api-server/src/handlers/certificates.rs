@@ -129,7 +129,16 @@ pub async fn update_certificate_signing_request(
         )?;
         // Preserve status if not provided
         if csr.status.is_none() {
-            csr.status = existing.status;
+            csr.status = existing.status.clone();
+        }
+        // Update validation (upstream ValidateCertificateSigningRequestUpdate):
+        // re-validates spec/conditions/cert against the new object and forbids
+        // removing existing Approved/Denied/Failed conditions, adding/modifying
+        // Approved/Denied conditions, or mutating status.certificate via the
+        // main resource endpoint.
+        let errs = rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_update_main(&csr, &existing);
+        if !errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(errs));
         }
     }
 
@@ -263,12 +272,37 @@ pub async fn update_certificate_signing_request_status(
     Path(name): Path<String>,
     DumpingJson(updated_csr): DumpingJson<CertificateSigningRequest>,
 ) -> Result<Json<CertificateSigningRequest>> {
+    update_csr_status_inner(
+        State(state),
+        Extension(auth_ctx),
+        Path(name),
+        updated_csr,
+        false,
+    )
+    .await
+}
+
+/// Shared body for the `/status` and `/approval` subresource updates. `approval`
+/// selects which upstream update validator runs:
+/// `ValidateCertificateSigningRequestApprovalUpdate` (allows setting
+/// Approved/Denied conditions) vs `…StatusUpdate` (allows setting the cert).
+async fn update_csr_status_inner(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+    updated_csr: CertificateSigningRequest,
+    approval: bool,
+) -> Result<Json<CertificateSigningRequest>> {
     info!("Updating CertificateSigningRequest status: {}", name);
 
-    let attrs =
-        RequestAttributes::new(auth_ctx.user, "update", "certificatesigningrequests/status")
-            .with_api_group("certificates.k8s.io")
-            .with_name(&name);
+    let subresource = if approval {
+        "certificatesigningrequests/approval"
+    } else {
+        "certificatesigningrequests/status"
+    };
+    let attrs = RequestAttributes::new(auth_ctx.user, "update", subresource)
+        .with_api_group("certificates.k8s.io")
+        .with_name(&name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -277,36 +311,27 @@ pub async fn update_certificate_signing_request_status(
 
     let key = build_key("certificatesigningrequests", None, &name);
 
-    // Get existing CSR
+    // Get existing CSR; keep the pre-update copy for the update-diff rules.
     let mut existing_csr: CertificateSigningRequest = state.storage.get(&key).await?;
+    let old_csr = existing_csr.clone();
 
     // Update status and metadata (K8s allows metadata changes via status subresource)
     existing_csr.status = updated_csr.status;
 
-    // Validate status.conditions (upstream validateConditions): valid type/status
-    // and Approved/Denied mutual exclusion. Covers the /status and /approval paths.
-    if let Some(conditions) = existing_csr
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-    {
-        let errs = rusternetes_common::validation::certificatesigningrequest::validate_csr_status_conditions(conditions);
-        if !errs.is_empty() {
-            return Err(rusternetes_common::Error::Invalid(errs));
-        }
-    }
-
-    // Validate status.certificate (upstream validateCertificate): when set it
-    // must be one or more PEM CERTIFICATE blocks, each a parseable X.509 cert.
-    let cert_errs =
-        rusternetes_common::validation::certificatesigningrequest::validate_csr_status_certificate(
-            existing_csr
-                .status
-                .as_ref()
-                .and_then(|s| s.certificate.as_deref()),
-        );
-    if !cert_errs.is_empty() {
-        return Err(rusternetes_common::Error::Invalid(cert_errs));
+    // Update validation against the stored object — upstream
+    // ValidateCertificateSigningRequest{Status,Approval}Update. Runs the
+    // create-style field checks (conditions valid type/status, Approved/Denied
+    // mutual exclusion, certificate PEM parse) plus the diff rules: existing
+    // Approved/Denied/Failed conditions may not be removed; the /status path
+    // may set (but not modify an existing) certificate; only the /approval path
+    // may add/modify Approved/Denied conditions.
+    let errs = if approval {
+        rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_approval_update(&existing_csr, &old_csr)
+    } else {
+        rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_status_update(&existing_csr, &old_csr)
+    };
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
     }
 
     // Merge annotations from the patch into existing (don't replace entirely)
@@ -335,14 +360,15 @@ pub async fn update_certificate_signing_request_status(
     Ok(Json(result))
 }
 
-// Approval subresource - simplified as update status
+// Approval subresource — same status-merge body, but runs the approval update
+// validator (may set Approved/Denied conditions; may not set the certificate).
 pub async fn approve_certificate_signing_request(
     state: State<Arc<ApiServerState>>,
     auth_ctx: Extension<AuthContext>,
     name: Path<String>,
-    csr: DumpingJson<CertificateSigningRequest>,
+    DumpingJson(csr): DumpingJson<CertificateSigningRequest>,
 ) -> Result<Json<CertificateSigningRequest>> {
-    update_certificate_signing_request_status(state, auth_ctx, name, csr).await
+    update_csr_status_inner(state, auth_ctx, name, csr, true).await
 }
 
 crate::patch_handler_cluster!(

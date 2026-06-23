@@ -824,23 +824,55 @@ async fn csr_full_lifecycle_with_signer_issues_certificate() {
     .await;
     assert_eq!(status, 201, "CSR create: {created}");
 
-    // The signing controller, after approving, writes the issued certificate
-    // into status.certificate via the /status subresource. Simulate that write.
-    // `certificate` is []byte upstream, i.e. base64-encoded PEM on the wire;
-    // validateCertificate base64-decodes then x509-parses each CERTIFICATE block,
-    // so this must be a real certificate's PEM, base64-encoded (a placeholder is
-    // correctly rejected). Self-signed leaf generated for the test.
-    let issued_pem =
-        "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJmRENDQVNHZ0F3SUJBZ0lVRmJPakN5UUNnWEMrL0ZvREFWWTgrT0FXSFM0d0NnWUlLb1pJemowRUF3SXcKRXpFUk1BOEdBMVVFQXd3SVpUSmxMV3hsWVdZd0hoY05Nall3TmpJeE1qSXlNRFV6V2hjTk16WXdOakU0TWpJeQpNRFV6V2pBVE1SRXdEd1lEVlFRRERBaGxNbVV0YkdWaFpqQlpNQk1HQnlxR1NNNDlBZ0VHQ0NxR1NNNDlBd0VICkEwSUFCTStKZ3M4elVMZHVlcHZSK2xFMEptVTRkK1Q4c3dndnUwK1FzU0sxM1hCNXE4ZXFjRlFTYkdPKzI2WnQKYjB6QkNsS0pqS2kxM2NabTY1QW5JL3h6OVIyalV6QlJNQjBHQTFVZERnUVdCQlF0YnFBRVozQklobVZkeldGeApwZXdQcEs4eUVqQWZCZ05WSFNNRUdEQVdnQlF0YnFBRVozQklobVZkeldGeHBld1BwSzh5RWpBUEJnTlZIUk1CCkFmOEVCVEFEQVFIL01Bb0dDQ3FHU000OUJBTUNBMGtBTUVZQ0lRRC9RVW85b1BBMGR0TVFta3VTTkN3Q25CUTAKN2gzSDFNQXdlM3pqSFk1ZWpBSWhBS2pMOGlsOUh6WU9VRXJHQk9aa1dSdkV1N21ISjdRM0VUWXRJZWhYRC9BcAotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==";
-    let mut status_body = created.clone();
-    status_body["status"] = json!({
+    // Approval and certificate issuance are two distinct subresource writes,
+    // exactly as upstream e2e does it (test/e2e/auth/certificates.go): the
+    // Approved condition is added via `UpdateApproval` (the /approval
+    // subresource, line ~139), and only later does the signer write the issued
+    // certificate via `UpdateStatus` (the /status subresource, line ~414).
+    //
+    // This split is enforced by the validators
+    // (ValidateCertificateSigningRequest{Approval,Status}Update): the /status
+    // path may set the certificate but may NOT add an Approved condition, and
+    // the /approval path may add the Approved condition but may NOT set the
+    // certificate. Cramming both into one /status PUT is correctly rejected
+    // (`updates may not add a condition of type "Approved"`).
+
+    // Step 1 — approve via the /approval subresource.
+    let mut approval_body = created.clone();
+    approval_body["status"] = json!({
         "conditions": [{
             "type": "Approved",
             "status": "True",
             "reason": "ApprovedByE2E"
-        }],
-        "certificate": issued_pem,
+        }]
     });
+    let (approval_status, approved) = state
+        .put(
+            "/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-issued/approval",
+            &approval_body,
+        )
+        .await;
+    assert_eq!(
+        approval_status.as_u16(),
+        200,
+        "CSR approval PUT must return 200: {approved}"
+    );
+
+    // Step 2 — the signing controller writes the issued certificate into
+    // status.certificate via the /status subresource. Simulate that write.
+    // `certificate` is []byte upstream, i.e. base64-encoded PEM on the wire;
+    // validateCertificate base64-decodes then x509-parses each CERTIFICATE block,
+    // so this must be a real certificate's PEM, base64-encoded (a placeholder is
+    // correctly rejected). Self-signed leaf generated for the test.
+    //
+    // The status body must carry the *unchanged* Approved condition the
+    // /approval step added: the status validator forbids modifying an existing
+    // Approved condition, so we round-trip the just-approved object's status and
+    // only add the certificate to it.
+    let issued_pem =
+        "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJmRENDQVNHZ0F3SUJBZ0lVRmJPakN5UUNnWEMrL0ZvREFWWTgrT0FXSFM0d0NnWUlLb1pJemowRUF3SXcKRXpFUk1BOEdBMVVFQXd3SVpUSmxMV3hsWVdZd0hoY05Nall3TmpJeE1qSXlNRFV6V2hjTk16WXdOakU0TWpJeQpNRFV6V2pBVE1SRXdEd1lEVlFRRERBaGxNbVV0YkdWaFpqQlpNQk1HQnlxR1NNNDlBZ0VHQ0NxR1NNNDlBd0VICkEwSUFCTStKZ3M4elVMZHVlcHZSK2xFMEptVTRkK1Q4c3dndnUwK1FzU0sxM1hCNXE4ZXFjRlFTYkdPKzI2WnQKYjB6QkNsS0pqS2kxM2NabTY1QW5JL3h6OVIyalV6QlJNQjBHQTFVZERnUVdCQlF0YnFBRVozQklobVZkeldGeApwZXdQcEs4eUVqQWZCZ05WSFNNRUdEQVdnQlF0YnFBRVozQklobVZkeldGeHBld1BwSzh5RWpBUEJnTlZIUk1CCkFmOEVCVEFEQVFIL01Bb0dDQ3FHU000OUJBTUNBMGtBTUVZQ0lRRC9RVW85b1BBMGR0TVFta3VTTkN3Q25CUTAKN2gzSDFNQXdlM3pqSFk1ZWpBSWhBS2pMOGlsOUh6WU9VRXJHQk9aa1dSdkV1N21ISjdRM0VUWXRJZWhYRC9BcAotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==";
+    let mut status_body = approved.clone();
+    status_body["status"]["certificate"] = json!(issued_pem);
     let (put_status, _) = state
         .put(
             "/apis/certificates.k8s.io/v1/certificatesigningrequests/e2e-csr-issued/status",
