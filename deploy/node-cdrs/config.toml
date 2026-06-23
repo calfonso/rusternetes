@@ -1,0 +1,28 @@
+# containerd-rs daemon config for a rusternetes node-cdrs image (M1 spike).
+#
+# This is the Rust CRI runtime (containerd-rs v0.1.1) the kubelet talks to over
+# CRI v1, replacing fork/main's containerd + youki. Schema mirrors
+# containerd-rs/crates/containerd-rs/src/config.rs (a flat top level + a [cri]
+# table), NOT upstream containerd's plugin-nested config.toml.
+#
+# Socket, CNI dirs and cgroup driver per the M1 brief:
+#   cri_socket    = /run/containerd-rs.sock   (kubelet CONTAINER_RUNTIME_ENDPOINT)
+#   cni_conf_dir  = /etc/cni/net.d            (flannel-rs DaemonSet installs here)
+#   cni_bin_dir   = /opt/cni/bin
+#   systemd_cgroup = false                    (kind-style container, no systemd)
+root = "/var/lib/containerd-rs"
+state = "/run/containerd-rs"
+cri_socket = "/run/containerd-rs.sock"
+stream_server_address = "0.0.0.0:10010"
+
+[cri]
+sandbox_image = "registry.k8s.io/pause:3.10"
+# containerd-rs invokes the OCI runtime as `runc` on PATH; the image symlinks
+# /usr/local/bin/runc -> crun, so this drives crun.
+default_runtime_name = "runc"
+runtime_type = "io.containerd.runc.v2"
+snapshotter = "overlayfs"
+systemd_cgroup = false
+registry_config_path = "/etc/containerd-rs/certs.d"
+cni_conf_dir = "/etc/cni/net.d"
+cni_bin_dir = "/opt/cni/bin"
