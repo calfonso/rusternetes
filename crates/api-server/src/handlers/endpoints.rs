@@ -250,6 +250,21 @@ pub async fn update_endpoints(
 
     let key = build_key("endpoints", Some(&namespace), &name);
 
+    // SetDefaults_Endpoints: each subset port protocol defaults to TCP.
+    // Upstream runs defaulting on every decode (create AND update) before
+    // validation, so the update path must default too — otherwise a PUT that
+    // omits protocol is rejected by the now-Required protocol check even
+    // though a real client relies on the server-side default.
+    for subset in endpoints.subsets.iter_mut() {
+        if let Some(ports) = subset.ports.as_mut() {
+            for p in ports.iter_mut() {
+                if p.protocol.is_none() {
+                    p.protocol = Some("TCP".to_string());
+                }
+            }
+        }
+    }
+
     // Field validation on update (upstream ValidateEndpointsUpdate re-runs
     // ValidateEndpoints on the new object). The create path validated but the
     // update path previously persisted PUTs unchecked.

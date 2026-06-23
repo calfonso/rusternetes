@@ -13,11 +13,6 @@ use crate::resources::endpoints::{EndpointPort, Endpoints};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_label;
 
-/// Upstream `IsValidPortName`: IANA_SVC_NAME (DNS-1123 label ≤15 chars w/ a letter).
-fn is_valid_port_name(s: &str) -> bool {
-    s.len() <= 15 && is_dns1123_label(s).is_empty() && s.chars().any(|c| c.is_ascii_alphabetic())
-}
-
 /// Mirrors upstream `ValidateEndpointIP`: a valid IP that is not unspecified,
 /// loopback, or link-local.
 fn validate_endpoint_ip(ip: &str, fld_path: &Path) -> ErrorList {
@@ -61,14 +56,15 @@ fn validate_endpoint_ip(ip: &str, fld_path: &Path) -> ErrorList {
 
 fn validate_port(port: &EndpointPort, require_name: bool, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
+    // name: required when multi-port; when present it must be a DNS-1123 label.
+    // Upstream `validateEndpointPort` (validation.go:8338-8342) validates the
+    // port name with `ValidateDNS1123Label` — NOT the 15-char IANA_SVC_NAME
+    // `IsValidPortName` rule (that one is reserved for ContainerPort names and
+    // string targetPorts).
     match &port.name {
         Some(n) if !n.is_empty() => {
-            if !is_valid_port_name(n) {
-                errs.push(Error::invalid(
-                    &fld_path.child("name"),
-                    n.clone(),
-                    "must be an IANA_SVC_NAME",
-                ));
+            for msg in is_dns1123_label(n) {
+                errs.push(Error::invalid(&fld_path.child("name"), n.clone(), msg));
             }
         }
         _ => {
@@ -84,11 +80,18 @@ fn validate_port(port: &EndpointPort, require_name: bool, fld_path: &Path) -> Er
             "must be between 1 and 65535, inclusive",
         ));
     }
-    if let Some(proto) = &port.protocol {
-        if !matches!(proto.as_str(), "TCP" | "UDP" | "SCTP") {
+    // protocol: required, then must be TCP/UDP/SCTP. Upstream
+    // `validateEndpointPort` (validation.go:8346-8350) emits Required when
+    // empty, NotSupported otherwise.
+    match port.protocol.as_deref() {
+        None | Some("") => {
+            errs.push(Error::required(&fld_path.child("protocol"), ""));
+        }
+        Some("TCP") | Some("UDP") | Some("SCTP") => {}
+        Some(other) => {
             errs.push(Error::not_supported(
                 &fld_path.child("protocol"),
-                proto.clone(),
+                other.to_string(),
                 &["TCP", "UDP", "SCTP"],
             ));
         }
@@ -132,4 +135,77 @@ pub fn validate_endpoints(endpoints: &Endpoints) -> ErrorList {
     }
 
     errs
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+    use crate::validation::field::ErrorType;
+
+    fn ep(subsets: serde_json::Value) -> Endpoints {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {"name": "ep", "namespace": "default"},
+            "subsets": subsets
+        }))
+        .unwrap()
+    }
+
+    fn has(errs: &ErrorList, field: &str, ty: ErrorType) -> bool {
+        errs.iter().any(|e| e.field == field && e.error_type == ty)
+    }
+
+    // Upstream validateEndpointPort: protocol empty → Required (validation.go:8346).
+    #[test]
+    fn missing_protocol_is_required() {
+        let errs = validate_endpoints(&ep(serde_json::json!([{
+            "addresses": [{"ip": "10.0.0.1"}],
+            "ports": [{"port": 80}]
+        }])));
+        assert!(
+            has(&errs, "subsets[0].ports[0].protocol", ErrorType::Required),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn tcp_protocol_passes() {
+        let errs = validate_endpoints(&ep(serde_json::json!([{
+            "addresses": [{"ip": "10.0.0.1"}],
+            "ports": [{"port": 80, "protocol": "TCP"}]
+        }])));
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.field == "subsets[0].ports[0].protocol"),
+            "{errs:?}"
+        );
+    }
+
+    // Upstream validates EndpointPort.Name as a DNS-1123 label (≤63 chars),
+    // NOT the 15-char IANA_SVC_NAME rule (validation.go:8341).
+    #[test]
+    fn long_dns_label_port_name_passes() {
+        let errs = validate_endpoints(&ep(serde_json::json!([{
+            "addresses": [{"ip": "10.0.0.1"}],
+            "ports": [{"name": "tcp-prometheus-servicemonitor", "port": 80, "protocol": "TCP"}]
+        }])));
+        assert!(
+            !errs.iter().any(|e| e.field == "subsets[0].ports[0].name"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn uppercase_port_name_rejected_as_invalid_label() {
+        let errs = validate_endpoints(&ep(serde_json::json!([{
+            "addresses": [{"ip": "10.0.0.1"}],
+            "ports": [{"name": "HTTP", "port": 80, "protocol": "TCP"}]
+        }])));
+        assert!(
+            has(&errs, "subsets[0].ports[0].name", ErrorType::Invalid),
+            "{errs:?}"
+        );
+    }
 }

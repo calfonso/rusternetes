@@ -154,11 +154,17 @@ fn validate_service_port(
         ));
     }
 
-    // protocol
-    let protocol = port.protocol.as_deref().unwrap_or("TCP");
-    match protocol {
-        "TCP" | "UDP" | "SCTP" => {}
-        other => {
+    // protocol: required, then must be one of TCP/UDP/SCTP. Upstream
+    // `validateServicePort` emits Required when protocol is empty, NotSupported
+    // otherwise — it does NOT default a missing protocol to TCP at validation
+    // time (defaulting happens earlier in the API machinery, on a separate
+    // path). validation.go:6798-6802.
+    match port.protocol.as_deref() {
+        None | Some("") => {
+            errs.push(Error::required(&fld.child("protocol"), ""));
+        }
+        Some("TCP") | Some("UDP") | Some("SCTP") => {}
+        Some(other) => {
             errs.push(Error::not_supported(
                 &fld.child("protocol"),
                 other.to_string(),
@@ -558,6 +564,73 @@ mod lb_source_ranges_tests {
             e.iter()
                 .any(|m| m.contains("may only be used when `type` is 'LoadBalancer'")),
             "{e:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod port_protocol_tests {
+    use super::*;
+    use crate::validation::field::ErrorType;
+
+    fn spec_errs(json: serde_json::Value) -> ErrorList {
+        let spec: ServiceSpec = serde_json::from_value(json).unwrap();
+        validate_service_spec(&spec, &Path::new("spec"))
+    }
+
+    fn has(errs: &ErrorList, field: &str, ty: ErrorType) -> bool {
+        errs.iter().any(|e| e.field == field && e.error_type == ty)
+    }
+
+    // Upstream validateServicePort emits Required when protocol is empty
+    // (validation.go:6798-6799). rusternetes no longer defaults a missing
+    // protocol to TCP inside the validator (the handler defaults before calling).
+    #[test]
+    fn missing_protocol_is_required() {
+        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80}]}));
+        assert!(
+            has(&errs, "spec.ports[0].protocol", ErrorType::Required),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn empty_protocol_is_required() {
+        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80, "protocol": ""}]}));
+        assert!(
+            has(&errs, "spec.ports[0].protocol", ErrorType::Required),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_tcp_protocol_passes() {
+        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80, "protocol": "TCP"}]}));
+        assert!(
+            !errs.iter().any(|e| e.field == "spec.ports[0].protocol"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_protocol_is_not_supported() {
+        let errs = spec_errs(serde_json::json!({"ports": [{"port": 80, "protocol": "ICMP"}]}));
+        assert!(
+            has(&errs, "spec.ports[0].protocol", ErrorType::NotSupported),
+            "{errs:?}"
+        );
+    }
+
+    // ServicePort.Name is a DNS-1123 label (≤63 chars), NOT the 15-char
+    // IANA_SVC_NAME rule (validation.go:6786).
+    #[test]
+    fn long_dns_label_port_name_passes() {
+        let errs = spec_errs(serde_json::json!({
+            "ports": [{"name": "tcp-prometheus-servicemonitor", "port": 80, "protocol": "TCP"}]
+        }));
+        assert!(
+            !errs.iter().any(|e| e.field == "spec.ports[0].name"),
+            "{errs:?}"
         );
     }
 }

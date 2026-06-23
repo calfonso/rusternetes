@@ -19,27 +19,32 @@ const MAX_ENDPOINTS: usize = 1000;
 const MAX_ADDRESSES: usize = 100;
 const MAX_PORTS: usize = 20000;
 
-/// Upstream `IsValidPortName`: IANA_SVC_NAME (DNS-1123 label ≤15 chars w/ a letter).
-fn is_valid_port_name(s: &str) -> bool {
-    s.len() <= 15 && is_dns1123_label(s).is_empty() && s.chars().any(|c| c.is_ascii_alphabetic())
-}
-
 fn validate_port(port: &EndpointPort, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
+    // name: when present it must be a DNS-1123 label. Upstream
+    // `validateEndpointSlicePorts` (discovery validation.go:183-185) validates
+    // the port name with `ValidateDNS1123Label` — NOT the 15-char
+    // IANA_SVC_NAME `IsValidPortName` rule. (Duplicate-name detection is done
+    // in the caller, where the port index is available — see line 187-191.)
     if let Some(name) = &port.name {
-        if !name.is_empty() && !is_valid_port_name(name) {
-            errs.push(Error::invalid(
-                &fld_path.child("name"),
-                name.clone(),
-                "must be an IANA_SVC_NAME",
-            ));
+        if !name.is_empty() {
+            for msg in is_dns1123_label(name) {
+                errs.push(Error::invalid(&fld_path.child("name"), name.clone(), msg));
+            }
         }
     }
-    if let Some(proto) = &port.protocol {
-        if !matches!(proto.as_str(), "TCP" | "UDP" | "SCTP") {
+    // protocol: required, then must be TCP/UDP/SCTP. Upstream
+    // `validateEndpointSlicePorts` (discovery validation.go:193-197) emits
+    // Required when protocol is nil, NotSupported otherwise.
+    match port.protocol.as_deref() {
+        None | Some("") => {
+            errs.push(Error::required(&fld_path.child("protocol"), ""));
+        }
+        Some("TCP") | Some("UDP") | Some("SCTP") => {}
+        Some(other) => {
             errs.push(Error::not_supported(
                 &fld_path.child("protocol"),
-                proto.clone(),
+                other.to_string(),
                 &["TCP", "UDP", "SCTP"],
             ));
         }
@@ -110,8 +115,21 @@ pub fn validate_endpoint_slice(slice: &EndpointSlice) -> ErrorList {
     if slice.ports.len() > MAX_PORTS {
         errs.push(Error::too_many(&ports_path, MAX_PORTS));
     }
+    // Track port names for duplicate detection. Upstream
+    // `validateEndpointSlicePorts` (discovery validation.go:187-191) dereferences
+    // the (defaulted-to-empty) port name unconditionally, so two ports that both
+    // omit a name — or share one — collide on the second occurrence.
+    let mut seen_names: Vec<&str> = Vec::with_capacity(slice.ports.len());
     for (i, port) in slice.ports.iter().enumerate() {
-        errs.extend(validate_port(port, &ports_path.index(i)));
+        let idx = ports_path.index(i);
+        errs.extend(validate_port(port, &idx));
+
+        let name = port.name.as_deref().unwrap_or("");
+        if seen_names.contains(&name) {
+            errs.push(Error::duplicate(&idx.child("name"), name.to_string()));
+        } else {
+            seen_names.push(name);
+        }
     }
 
     errs
@@ -192,6 +210,107 @@ mod size_cap_tests {
         assert!(
             errs.iter()
                 .any(|e| e.field == "ports" && e.to_string().contains("at most")),
+            "{errs:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+    use crate::validation::field::ErrorType;
+
+    fn es(ports: serde_json::Value) -> EndpointSlice {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {"name": "es", "namespace": "default"},
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["10.0.0.1"]}],
+            "ports": ports
+        }))
+        .unwrap()
+    }
+
+    fn has(errs: &ErrorList, field: &str, ty: ErrorType) -> bool {
+        errs.iter().any(|e| e.field == field && e.error_type == ty)
+    }
+
+    // Upstream: protocol nil → Required (discovery validation.go:193-194).
+    #[test]
+    fn missing_protocol_is_required() {
+        let errs = validate_endpoint_slice(&es(serde_json::json!([{"name": "a", "port": 80}])));
+        assert!(
+            has(&errs, "ports[0].protocol", ErrorType::Required),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn tcp_protocol_passes() {
+        let errs = validate_endpoint_slice(&es(
+            serde_json::json!([{"name": "a", "port": 80, "protocol": "TCP"}]),
+        ));
+        assert!(
+            !errs.iter().any(|e| e.field == "ports[0].protocol"),
+            "{errs:?}"
+        );
+    }
+
+    // Upstream: port name is a DNS-1123 label, not the 15-char IANA_SVC_NAME
+    // rule (discovery validation.go:183-185).
+    #[test]
+    fn long_dns_label_port_name_passes() {
+        let errs = validate_endpoint_slice(&es(serde_json::json!([{
+            "name": "tcp-prometheus-servicemonitor", "port": 80, "protocol": "TCP"
+        }])));
+        assert!(!errs.iter().any(|e| e.field == "ports[0].name"), "{errs:?}");
+    }
+
+    #[test]
+    fn uppercase_port_name_rejected_as_invalid_label() {
+        let errs = validate_endpoint_slice(&es(
+            serde_json::json!([{"name": "HTTP", "port": 80, "protocol": "TCP"}]),
+        ));
+        assert!(has(&errs, "ports[0].name", ErrorType::Invalid), "{errs:?}");
+    }
+
+    // Upstream: duplicate port names collide on the second occurrence
+    // (discovery validation.go:187-191).
+    #[test]
+    fn duplicate_named_ports_rejected() {
+        let errs = validate_endpoint_slice(&es(serde_json::json!([
+            {"name": "http", "port": 80, "protocol": "TCP"},
+            {"name": "http", "port": 81, "protocol": "TCP"}
+        ])));
+        assert!(
+            has(&errs, "ports[1].name", ErrorType::Duplicate),
+            "{errs:?}"
+        );
+    }
+
+    // Upstream dereferences the (defaulted-empty) name unconditionally, so two
+    // unnamed ports also collide.
+    #[test]
+    fn duplicate_unnamed_ports_rejected() {
+        let errs = validate_endpoint_slice(&es(serde_json::json!([
+            {"port": 80, "protocol": "TCP"},
+            {"port": 81, "protocol": "TCP"}
+        ])));
+        assert!(
+            has(&errs, "ports[1].name", ErrorType::Duplicate),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_named_ports_pass() {
+        let errs = validate_endpoint_slice(&es(serde_json::json!([
+            {"name": "http", "port": 80, "protocol": "TCP"},
+            {"name": "https", "port": 443, "protocol": "TCP"}
+        ])));
+        assert!(
+            !errs.iter().any(|e| e.error_type == ErrorType::Duplicate),
             "{errs:?}"
         );
     }
