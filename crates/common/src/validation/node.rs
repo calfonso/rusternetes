@@ -290,28 +290,6 @@ pub fn validate_node_status_update(new_node: &Node) -> ErrorList {
     errs
 }
 
-/// Port of upstream `IsConfigMapKey`: ≤253 chars, `[-._a-zA-Z0-9]+`, not `.`/`..`.
-fn is_config_map_key(value: &str) -> Vec<String> {
-    let mut errs = Vec::new();
-    if value.len() > 253 {
-        errs.push("must be no more than 253 characters".to_string());
-    }
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
-    {
-        errs.push(
-            "a valid config key must consist of alphanumeric characters, '-', '_' or '.'"
-                .to_string(),
-        );
-    }
-    if value == "." || value == ".." {
-        errs.push("must not be '.' or '..'".to_string());
-    }
-    errs
-}
-
 /// Port of upstream `validateConfigMapNodeConfigSource`: target ConfigMap
 /// namespace (DNS-1123 label), name (DNS-1123 subdomain), and `kubeletConfigKey`
 /// (a valid ConfigMap key) are all required and well-formed.
@@ -346,7 +324,7 @@ fn validate_config_map_node_config_source(
     if key.is_empty() {
         errs.push(Error::required(&fld_path.child("kubeletConfigKey"), ""));
     } else {
-        for msg in is_config_map_key(key) {
+        for msg in crate::validation::configmap::config_map_key_errors(key) {
             errs.push(Error::invalid(
                 &fld_path.child("kubeletConfigKey"),
                 key.to_string(),

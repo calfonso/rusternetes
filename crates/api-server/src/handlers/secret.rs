@@ -240,8 +240,10 @@ pub async fn update(
             // Compare data and stringData — reject if changed
             let data_changed = existing.data != secret.data;
             let string_data_changed = existing.string_data != secret.string_data;
-            // Also reject changing immutable from true to false
-            let immutable_changed = secret.immutable != Some(true) && secret.immutable.is_some();
+            // Upstream `ValidateSecretUpdate`: once `immutable` is true it may
+            // only stay true — reject if the new object's `immutable` is `nil`
+            // (dropped) OR `false` (`newSecret.Immutable == nil || !*newSecret.Immutable`).
+            let immutable_changed = secret.immutable != Some(true);
             if data_changed || string_data_changed || immutable_changed {
                 return Err(rusternetes_common::Error::InvalidResource(format!(
                     "Secret \"{}\" is immutable",
@@ -647,8 +649,9 @@ async fn apply_secret_ssa(
             // them as separate fields until `normalize()` runs below.
             let data_changed = existing.data != object.data;
             let string_data_changed = existing.string_data != object.string_data;
-            let immutable_changed =
-                object.immutable != Some(true) && object.immutable != existing.immutable;
+            // Upstream `ValidateSecretUpdate`: reject if the new `immutable` is
+            // `nil` (dropped) OR not true.
+            let immutable_changed = object.immutable != Some(true);
             if data_changed || string_data_changed || immutable_changed {
                 return Err(rusternetes_common::Error::InvalidResource(format!(
                     "Secret \"{}/{}\" is immutable",
