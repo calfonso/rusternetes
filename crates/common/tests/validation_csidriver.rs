@@ -14,9 +14,16 @@ fn driver(spec: CSIDriverSpec) -> CSIDriver {
     d
 }
 
+/// A post-default "valid" spec. The api-server handler defaults
+/// `podInfoOnMount` and `storageCapacity` to `false` before validation, so a
+/// real object always has them set. The pure validator now requires all three
+/// presence fields (upstream `validateCSIDriverSpec`), so the fixture must
+/// supply them to represent a defaulted, valid object.
 fn defaulted_spec() -> CSIDriverSpec {
     CSIDriverSpec {
         attach_required: Some(true),
+        pod_info_on_mount: Some(false),
+        storage_capacity: Some(false),
         ..Default::default()
     }
 }
