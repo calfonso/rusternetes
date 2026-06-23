@@ -23,10 +23,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
-    Container, EnvVar, Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod,
-    PodDNSConfig, PodSchedulingGate, PodSecurityContext, PodSpec, Probe, Toleration,
+    Container, ContainerPort, EnvVar, ExecAction, GRPCAction, HTTPGetAction, Lifecycle,
+    LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate,
+    PodSecurityContext, PodSpec, Probe, SleepAction, TCPSocketAction, Toleration,
     TopologySpreadConstraint, Volume, VolumeMount,
 };
+use crate::resources::policy::IntOrString;
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::{
     is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
@@ -44,6 +46,78 @@ const ENV_VAR_NAME_ERR_MSG: &str = "a valid environment variable name must consi
 /// Upstream `configMapKeyFmt` / `configMapKeyRegexp`.
 static CONFIG_MAP_KEY_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[-._a-zA-Z0-9]+$").expect("config map key regex"));
+
+/// Upstream `portNameCharsetRegex` (`[-a-z0-9]+`).
+static PORT_NAME_CHARSET_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[-a-z0-9]+$").expect("port name charset regex"));
+/// Upstream `httpHeaderNameFmt` (`[-A-Za-z0-9]+`).
+static HTTP_HEADER_NAME_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[-A-Za-z0-9]+$").expect("http header name regex"));
+const HTTP_HEADER_NAME_ERR_MSG: &str =
+    "a valid HTTP header must consist of alphanumeric characters or '-' (e.g. 'X-Header-Name', regex used for validation is '[-A-Za-z0-9]+')";
+
+/// Port of upstream `validation.IsValidPortNum`: a port in `[1, 65535]`.
+fn is_valid_port_num(port: i64) -> Vec<&'static str> {
+    if (1..=65535).contains(&port) {
+        Vec::new()
+    } else {
+        vec!["must be between 1 and 65535, inclusive"]
+    }
+}
+
+/// Port of upstream `validation.IsValidPortName`: non-empty, ≤15 chars, only
+/// `[-a-z0-9]`, at least one `[a-z]` letter, no consecutive hyphens, no
+/// leading/trailing hyphen. Returns one message per violated rule (mirroring
+/// the upstream ordering so log greps stay valid).
+fn is_valid_port_name(port: &str) -> Vec<String> {
+    let mut errs: Vec<String> = Vec::new();
+    if port.len() > 15 {
+        errs.push("must be no more than 15 characters".to_string());
+    }
+    if !PORT_NAME_CHARSET_RE.is_match(port) {
+        errs.push(
+            "must contain only alpha-numeric characters (a-z, 0-9), and hyphens (-)".to_string(),
+        );
+    }
+    if !port.bytes().any(|b| b.is_ascii_lowercase()) {
+        errs.push("must contain at least one letter (a-z)".to_string());
+    }
+    if port.contains("--") {
+        errs.push("must not contain consecutive hyphens".to_string());
+    }
+    if !port.is_empty() && (port.starts_with('-') || port.ends_with('-')) {
+        errs.push("must not begin or end with a hyphen".to_string());
+    }
+    errs
+}
+
+/// Port of upstream `validation.IsHTTPHeaderName`.
+fn is_http_header_name(value: &str) -> Vec<&'static str> {
+    if HTTP_HEADER_NAME_RE.is_match(value) {
+        Vec::new()
+    } else {
+        vec![HTTP_HEADER_NAME_ERR_MSG]
+    }
+}
+
+/// Port of upstream `ValidatePortNumOrName`: an integer port in `[1, 65535]`,
+/// or a string that satisfies [`is_valid_port_name`].
+fn validate_port_num_or_name(port: &IntOrString, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    match port {
+        IntOrString::Int(n) => {
+            for msg in is_valid_port_num(*n as i64) {
+                errs.push(Error::invalid(fld_path, *n, msg));
+            }
+        }
+        IntOrString::String(s) => {
+            for msg in is_valid_port_name(s) {
+                errs.push(Error::invalid(fld_path, s.clone(), msg));
+            }
+        }
+    }
+    errs
+}
 
 // ---------------------------------------------------------------------------
 // Create-side validation
@@ -100,6 +174,11 @@ pub fn validate_pod_spec(
         .map(|v| v.name.as_str())
         .collect();
 
+    // Pod-level terminationGracePeriodSeconds bounds a `sleep` lifecycle hook
+    // and is threaded into every container's handler validation (upstream
+    // passes `spec.TerminationGracePeriodSeconds` to `validateContainers`).
+    let grace_period = spec.termination_grace_period_seconds;
+
     // Containers must be non-empty.
     if spec.containers.is_empty() {
         errs.push(Error::required(
@@ -115,6 +194,7 @@ pub fn validate_pod_spec(
             c,
             false,
             &volume_names,
+            grace_period,
             &containers_path.index(i),
         ));
         if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -133,6 +213,7 @@ pub fn validate_pod_spec(
                 c,
                 true,
                 &volume_names,
+                grace_period,
                 &init_path.index(i),
             ));
             if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -187,6 +268,30 @@ pub fn validate_pod_spec(
                     }
                 }
             }
+        }
+    }
+
+    // Host-port conflicts. Upstream `checkHostPortConflicts`: regular
+    // containers share one accumulator (a `proto/hostIP/port` tuple may not
+    // repeat); init containers are checked one-by-one (they run serially), so
+    // each gets a fresh accumulator and only collides with itself.
+    {
+        let mut acc: HashSet<String> = HashSet::new();
+        errs.extend(accumulate_unique_host_ports(
+            &spec.containers,
+            &mut acc,
+            &containers_path,
+        ));
+    }
+    if let Some(ref inits) = spec.init_containers {
+        let init_path = fld_path.child("initContainers");
+        for c in inits.iter() {
+            let mut acc: HashSet<String> = HashSet::new();
+            errs.extend(accumulate_unique_host_ports(
+                std::slice::from_ref(c),
+                &mut acc,
+                &init_path,
+            ));
         }
     }
 
@@ -330,6 +435,7 @@ fn validate_container(
     c: &Container,
     is_init: bool,
     volume_names: &HashSet<&str>,
+    grace_period: Option<i64>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -362,7 +468,11 @@ fn validate_container(
 
     // probes.
     if let Some(ref p) = c.liveness_probe {
-        errs.extend(validate_probe(p, &fld_path.child("livenessProbe")));
+        errs.extend(validate_liveness_probe(
+            p,
+            grace_period,
+            &fld_path.child("livenessProbe"),
+        ));
     }
     if let Some(ref p) = c.readiness_probe {
         if is_init && !is_restartable_init {
@@ -371,11 +481,19 @@ fn validate_container(
                 "must not be set for init containers",
             ));
         } else {
-            errs.extend(validate_probe(p, &fld_path.child("readinessProbe")));
+            errs.extend(validate_readiness_probe(
+                p,
+                grace_period,
+                &fld_path.child("readinessProbe"),
+            ));
         }
     }
     if let Some(ref p) = c.startup_probe {
-        errs.extend(validate_probe(p, &fld_path.child("startupProbe")));
+        errs.extend(validate_startup_probe(
+            p,
+            grace_period,
+            &fld_path.child("startupProbe"),
+        ));
     }
 
     // lifecycle — only restartable init containers may have lifecycle hooks.
@@ -386,7 +504,11 @@ fn validate_container(
         ));
     }
     if let Some(ref lc) = c.lifecycle {
-        errs.extend(validate_lifecycle(lc, &fld_path.child("lifecycle")));
+        errs.extend(validate_lifecycle(
+            lc,
+            grace_period,
+            &fld_path.child("lifecycle"),
+        ));
     }
 
     // resources.
@@ -485,14 +607,28 @@ fn is_env_var_name(value: &str) -> Vec<String> {
 }
 
 /// Port of upstream `validateLifecycle`: validates the `postStart`/`preStop`
-/// handlers (each must specify exactly one handler type).
-fn validate_lifecycle(lifecycle: &Lifecycle, fld_path: &Path) -> ErrorList {
+/// handlers (each must specify exactly one handler type and a valid action
+/// body). `grace_period` is the pod's `terminationGracePeriodSeconds`, used to
+/// bound a `sleep` action's duration.
+fn validate_lifecycle(
+    lifecycle: &Lifecycle,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if let Some(ps) = &lifecycle.post_start {
-        errs.extend(validate_lifecycle_handler(ps, &fld_path.child("postStart")));
+        errs.extend(validate_lifecycle_handler(
+            ps,
+            grace_period,
+            &fld_path.child("postStart"),
+        ));
     }
     if let Some(pre) = &lifecycle.pre_stop {
-        errs.extend(validate_lifecycle_handler(pre, &fld_path.child("preStop")));
+        errs.extend(validate_lifecycle_handler(
+            pre,
+            grace_period,
+            &fld_path.child("preStop"),
+        ));
     }
     errs
 }
@@ -765,30 +901,228 @@ fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
     errs
 }
 
-/// Port of upstream `validateHandler` for lifecycle hooks: exactly one of
-/// `exec`/`httpGet`/`tcpSocket`/`sleep`; specifying a second is forbidden, and
-/// specifying none is required.
-fn validate_lifecycle_handler(handler: &LifecycleHandler, fld_path: &Path) -> ErrorList {
+/// Supported HTTP schemes for an `httpGet` handler (upstream
+/// `supportedHTTPSchemes`).
+const SUPPORTED_HTTP_SCHEMES: &[&str] = &["HTTP", "HTTPS"];
+
+/// Port of upstream `validateExecAction`: `command` must be non-empty.
+fn validate_exec_action(exec: &ExecAction, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    let mut num_handlers = 0;
-    let mut check = |present: bool, child: &str| {
-        if present {
-            if num_handlers > 0 {
-                errs.push(Error::forbidden(
-                    &fld_path.child(child),
-                    "may not specify more than 1 handler type",
+    if exec.command.is_empty() {
+        errs.push(Error::required(&fld_path.child("command"), ""));
+    }
+    errs
+}
+
+/// Port of upstream `validateHTTPGetAction`: `path` required, `port` valid
+/// num-or-name, `scheme` (when set) in {HTTP, HTTPS}, header names valid.
+fn validate_http_get_action(http: &HTTPGetAction, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if http.path.as_deref().unwrap_or("").is_empty() {
+        errs.push(Error::required(&fld_path.child("path"), ""));
+    }
+    errs.extend(validate_port_num_or_name(
+        &http.port,
+        &fld_path.child("port"),
+    ));
+    // Upstream defaults Scheme to HTTP, so an unset scheme is valid. Only a
+    // set-but-unsupported value is rejected.
+    if let Some(scheme) = http.scheme.as_deref() {
+        if !SUPPORTED_HTTP_SCHEMES.contains(&scheme) {
+            errs.push(Error::not_supported(
+                &fld_path.child("scheme"),
+                scheme.to_string(),
+                SUPPORTED_HTTP_SCHEMES,
+            ));
+        }
+    }
+    if let Some(headers) = http.http_headers.as_ref() {
+        for header in headers {
+            for msg in is_http_header_name(&header.name) {
+                errs.push(Error::invalid(
+                    &fld_path.child("httpHeaders"),
+                    header.name.clone(),
+                    msg,
                 ));
-            } else {
-                num_handlers += 1;
             }
         }
-    };
-    check(handler.exec.is_some(), "exec");
-    check(handler.http_get.is_some(), "httpGet");
-    check(handler.tcp_socket.is_some(), "tcpSocket");
-    check(handler.sleep.is_some(), "sleep");
+    }
+    errs
+}
+
+/// Port of upstream `validateTCPSocketAction`.
+fn validate_tcp_socket_action(tcp: &TCPSocketAction, fld_path: &Path) -> ErrorList {
+    validate_port_num_or_name(&tcp.port, &fld_path.child("port"))
+}
+
+/// Port of upstream `validateGRPCAction` (`ValidatePortNumOrName(FromInt32(port))`).
+fn validate_grpc_action(grpc: &GRPCAction, fld_path: &Path) -> ErrorList {
+    validate_port_num_or_name(&grpc.port, &fld_path.child("port"))
+}
+
+/// Port of upstream `validateSleepAction`: with grace period known, the sleep
+/// duration must be in `(0, gracePeriod]`. The
+/// `AllowPodLifecycleSleepActionZeroValue` gate (which permits 0) is not
+/// enabled, matching upstream defaults.
+fn validate_sleep_action(
+    sleep: &SleepAction,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(gp) = grace_period {
+        if sleep.seconds <= 0 || sleep.seconds > gp {
+            errs.push(Error::invalid(
+                fld_path,
+                sleep.seconds,
+                format!(
+                    "must be greater than 0 and less than terminationGracePeriodSeconds ({gp}). Enable AllowPodLifecycleSleepActionZeroValue feature gate for zero sleep."
+                ),
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateHandler`: exactly one of
+/// `exec`/`httpGet`/`tcpSocket`/`grpc`/`sleep` must be set (a second is
+/// forbidden, none is required), and the chosen action's body is validated.
+///
+/// The five `Option` args mirror the `commonHandler` fields; a probe handler
+/// passes `None` for `sleep`, a lifecycle handler passes `None` for `grpc`.
+fn validate_handler(
+    exec: Option<&ExecAction>,
+    http_get: Option<&HTTPGetAction>,
+    tcp_socket: Option<&TCPSocketAction>,
+    grpc: Option<&GRPCAction>,
+    sleep: Option<&SleepAction>,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let mut num_handlers = 0;
+
+    if let Some(exec) = exec {
+        if num_handlers > 0 {
+            errs.push(Error::forbidden(
+                &fld_path.child("exec"),
+                "may not specify more than 1 handler type",
+            ));
+        } else {
+            num_handlers += 1;
+            errs.extend(validate_exec_action(exec, &fld_path.child("exec")));
+        }
+    }
+    if let Some(http) = http_get {
+        if num_handlers > 0 {
+            errs.push(Error::forbidden(
+                &fld_path.child("httpGet"),
+                "may not specify more than 1 handler type",
+            ));
+        } else {
+            num_handlers += 1;
+            errs.extend(validate_http_get_action(http, &fld_path.child("httpGet")));
+        }
+    }
+    if let Some(tcp) = tcp_socket {
+        if num_handlers > 0 {
+            errs.push(Error::forbidden(
+                &fld_path.child("tcpSocket"),
+                "may not specify more than 1 handler type",
+            ));
+        } else {
+            num_handlers += 1;
+            errs.extend(validate_tcp_socket_action(
+                tcp,
+                &fld_path.child("tcpSocket"),
+            ));
+        }
+    }
+    if let Some(grpc) = grpc {
+        if num_handlers > 0 {
+            errs.push(Error::forbidden(
+                &fld_path.child("grpc"),
+                "may not specify more than 1 handler type",
+            ));
+        } else {
+            num_handlers += 1;
+            errs.extend(validate_grpc_action(grpc, &fld_path.child("grpc")));
+        }
+    }
+    if let Some(sleep) = sleep {
+        if num_handlers > 0 {
+            errs.push(Error::forbidden(
+                &fld_path.child("sleep"),
+                "may not specify more than 1 handler type",
+            ));
+        } else {
+            num_handlers += 1;
+            errs.extend(validate_sleep_action(
+                sleep,
+                grace_period,
+                &fld_path.child("sleep"),
+            ));
+        }
+    }
+
     if num_handlers == 0 {
         errs.push(Error::required(fld_path, "must specify a handler type"));
+    }
+    errs
+}
+
+/// Port of upstream `validateHandler` applied to a lifecycle hook
+/// (`handlerFromLifecycle` — no `grpc`).
+fn validate_lifecycle_handler(
+    handler: &LifecycleHandler,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+) -> ErrorList {
+    validate_handler(
+        handler.exec.as_ref(),
+        handler.http_get.as_ref(),
+        handler.tcp_socket.as_ref(),
+        None,
+        handler.sleep.as_ref(),
+        grace_period,
+        fld_path,
+    )
+}
+
+/// Port of upstream `AccumulateUniqueHostPorts`: for each non-zero `hostPort`,
+/// a `protocol/hostIP/port` tuple must be unique across the supplied
+/// containers; a repeat is a `Duplicate` error on `[ci].ports[pi].hostPort`.
+fn accumulate_unique_host_ports(
+    containers: &[Container],
+    accumulator: &mut HashSet<String>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    for (ci, ctr) in containers.iter().enumerate() {
+        let ports_path = fld_path.index(ci).child("ports");
+        let Some(ports) = ctr.ports.as_ref() else {
+            continue;
+        };
+        for (pi, p) in ports.iter().enumerate() {
+            let host_port = p.host_port.unwrap_or(0);
+            if host_port == 0 {
+                continue;
+            }
+            let tuple = format!(
+                "{}/{}/{}",
+                p.protocol.as_deref().unwrap_or(""),
+                p.host_ip.as_deref().unwrap_or(""),
+                host_port
+            );
+            if accumulator.contains(&tuple) {
+                errs.push(Error::duplicate(
+                    &ports_path.index(pi).child("hostPort"),
+                    tuple,
+                ));
+            } else {
+                accumulator.insert(tuple);
+            }
+        }
     }
     errs
 }
@@ -1083,91 +1417,156 @@ fn validate_volumes(volumes: &[Volume], fld_path: &Path) -> ErrorList {
 ///
 /// Rules (mirroring upstream `validateContainerPorts`,
 /// `pkg/apis/core/validation/validation.go`, release-1.35):
-/// - `containerPort` must be in [1, 65535].
-/// - `hostPort` (when set) must be in [0, 65535].
-/// - `protocol` (when set) must be TCP / UDP / SCTP.
-/// - Port names (when set) must be a DNS-1123 label and unique per container.
-fn validate_container_ports(
-    ports: &[crate::resources::pod::ContainerPort],
-    fld_path: &Path,
-) -> ErrorList {
+/// - Port `name` (when set) must satisfy [`is_valid_port_name`] and be unique.
+/// - `containerPort == 0` → `Required`; otherwise must be a valid port number.
+/// - `hostPort` (when set) must be a valid port number.
+/// - `protocol` is `Required` when empty, otherwise must be TCP / UDP / SCTP.
+fn validate_container_ports(ports: &[ContainerPort], fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let mut seen_names: HashSet<&str> = HashSet::new();
 
     for (i, p) in ports.iter().enumerate() {
         let ppath = fld_path.index(i);
 
-        // containerPort range [1, 65535].
-        // Note: container_port is u16 in our struct, so 0 is the only
-        // out-of-range case (u16 max is 65535).
-        if p.container_port == 0 {
-            errs.push(Error::invalid(
-                &ppath.child("containerPort"),
-                p.container_port as i64,
-                "must be between 1 and 65535, inclusive",
-            ));
+        // name — IsValidPortName semantics, unique within the container.
+        if let Some(name) = p.name.as_deref().filter(|n| !n.is_empty()) {
+            let msgs = is_valid_port_name(name);
+            if !msgs.is_empty() {
+                for msg in msgs {
+                    errs.push(Error::invalid(&ppath.child("name"), name.to_string(), msg));
+                }
+            } else if !seen_names.insert(name) {
+                errs.push(Error::duplicate(&ppath.child("name"), name.to_string()));
+            }
         }
 
-        // hostPort range [0, 65535] — u16, so always valid.
-
-        // protocol enum.
-        if let Some(ref proto) = p.protocol {
-            if !matches!(proto.as_str(), "TCP" | "UDP" | "SCTP") {
-                errs.push(Error::not_supported(
-                    &ppath.child("protocol"),
-                    proto.clone(),
-                    &["TCP", "UDP", "SCTP"],
+        // containerPort: 0 → Required, else valid port number. (u16, so the
+        // upper bound is never exceeded; only 0 can fail.)
+        if p.container_port == 0 {
+            errs.push(Error::required(&ppath.child("containerPort"), ""));
+        } else {
+            for msg in is_valid_port_num(p.container_port as i64) {
+                errs.push(Error::invalid(
+                    &ppath.child("containerPort"),
+                    p.container_port as i64,
+                    msg,
                 ));
             }
         }
 
-        // port name must be a DNS-1123 label and unique.
-        if let Some(ref name) = p.name {
-            if !name.is_empty() {
-                for msg in is_dns1123_label(name) {
-                    errs.push(Error::invalid(&ppath.child("name"), name.clone(), msg));
-                }
-                if !seen_names.insert(name.as_str()) {
-                    errs.push(Error::duplicate(&ppath.child("name"), name.clone()));
-                }
+        // hostPort: only checked when non-zero (u16, so always valid).
+        if let Some(hp) = p.host_port.filter(|&hp| hp != 0) {
+            for msg in is_valid_port_num(hp as i64) {
+                errs.push(Error::invalid(&ppath.child("hostPort"), hp as i64, msg));
             }
+        }
+
+        // protocol: Required when empty, else enum.
+        match p.protocol.as_deref() {
+            None | Some("") => {
+                errs.push(Error::required(&ppath.child("protocol"), ""));
+            }
+            Some(proto) if !matches!(proto, "TCP" | "UDP" | "SCTP") => {
+                errs.push(Error::not_supported(
+                    &ppath.child("protocol"),
+                    proto.to_string(),
+                    &["TCP", "UDP", "SCTP"],
+                ));
+            }
+            _ => {}
         }
     }
     errs
 }
 
-/// Validates a Probe — exactly one handler must be set.
-///
-/// Mirrors upstream `validateProbe`
-/// (`pkg/apis/core/validation/validation.go`, release-1.35).
-fn validate_probe(probe: &Probe, fld_path: &Path) -> ErrorList {
+/// Port of upstream `validateProbe`: exactly one handler (via
+/// [`validate_handler`]), each numeric timing field nonnegative, and a positive
+/// `terminationGracePeriodSeconds` when set.
+fn validate_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    let num_handlers = [
-        probe.http_get.is_some(),
-        probe.exec.is_some(),
-        probe.tcp_socket.is_some(),
-        probe.grpc.is_some(),
-    ]
-    .iter()
-    .filter(|&&b| b)
-    .count();
+    errs.extend(validate_handler(
+        probe.exec.as_ref(),
+        probe.http_get.as_ref(),
+        probe.tcp_socket.as_ref(),
+        probe.grpc.as_ref(),
+        None,
+        grace_period,
+        fld_path,
+    ));
 
-    if num_handlers == 0 {
-        errs.push(Error::required(fld_path, "must specify a handler type"));
-    } else if num_handlers > 1 {
-        errs.push(Error::invalid(
-            fld_path,
-            BadValue::Omit,
-            "may not specify more than 1 handler type",
-        ));
+    // Nonnegative timing fields. Unset (None) defaults are nonnegative, so
+    // they are skipped — only an explicit negative value is rejected.
+    for (value, child) in [
+        (probe.initial_delay_seconds, "initialDelaySeconds"),
+        (probe.timeout_seconds, "timeoutSeconds"),
+        (probe.period_seconds, "periodSeconds"),
+        (probe.success_threshold, "successThreshold"),
+        (probe.failure_threshold, "failureThreshold"),
+    ] {
+        if let Some(v) = value {
+            if v < 0 {
+                errs.push(Error::invalid(
+                    &fld_path.child(child),
+                    v as i64,
+                    "must be greater than or equal to 0",
+                ));
+            }
+        }
+    }
+
+    if let Some(tgps) = probe.termination_grace_period_seconds {
+        if tgps <= 0 {
+            errs.push(Error::invalid(
+                &fld_path.child("terminationGracePeriodSeconds"),
+                tgps,
+                "must be greater than 0",
+            ));
+        }
     }
 
     errs
 }
 
-// BadValue re-exported from field module for internal use in validate_probe.
-use crate::validation::field::BadValue;
+/// Port of upstream `validateLivenessProbe`: a probe whose `successThreshold`,
+/// when set, must equal 1.
+fn validate_liveness_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> ErrorList {
+    let mut errs = validate_probe(probe, grace_period, fld_path);
+    if let Some(st) = probe.success_threshold {
+        if st != 1 {
+            errs.push(Error::invalid(
+                &fld_path.child("successThreshold"),
+                st as i64,
+                "must be 1",
+            ));
+        }
+    }
+    errs
+}
+
+/// Port of upstream `validateStartupProbe`: same `successThreshold == 1` rule
+/// as the liveness probe.
+fn validate_startup_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> ErrorList {
+    validate_liveness_probe(probe, grace_period, fld_path)
+}
+
+/// Port of upstream `validateReadinessProbe`: a probe that must not set
+/// `terminationGracePeriodSeconds`.
+fn validate_readiness_probe(
+    probe: &Probe,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = validate_probe(probe, grace_period, fld_path);
+    if let Some(tgps) = probe.termination_grace_period_seconds {
+        errs.push(Error::invalid(
+            &fld_path.child("terminationGracePeriodSeconds"),
+            tgps,
+            "must not be set for readinessProbes",
+        ));
+    }
+    errs
+}
 
 /// Validates a container's resource requirements: requests <= limits for each
 /// named resource. Does NOT parse Quantity strings (deferred — no
@@ -2604,6 +3003,7 @@ mod tests {
             &container_from(json),
             false,
             &vols,
+            Some(30),
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
@@ -2807,5 +3207,322 @@ mod tests {
         assert!(env_errs(serde_json::json!([
             {"name": "A", "valueFrom": {"resourceFieldRef": {"resource": "limits.cpu", "divisor": "notaqty"}}}
         ])).iter().any(|m| m.contains("divisor")));
+    }
+
+    // ---- container ports -------------------------------------------------
+
+    fn cports_errs(json: serde_json::Value) -> Vec<String> {
+        let ports: Vec<ContainerPort> = serde_json::from_value(json).unwrap();
+        validate_container_ports(
+            &ports,
+            &Path::new("spec")
+                .child("containers")
+                .index(0)
+                .child("ports"),
+        )
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn container_port_protocol_required_and_enum() {
+        // empty protocol -> Required
+        let missing = cports_errs(serde_json::json!([{"containerPort": 80}]));
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.contains("ports[0].protocol") && m.contains("Required")),
+            "{missing:?}"
+        );
+        // unsupported protocol
+        let bad = cports_errs(serde_json::json!([{"containerPort": 80, "protocol": "QUIC"}]));
+        assert!(bad.iter().any(|m| m.contains("protocol")), "{bad:?}");
+        // valid
+        let ok = cports_errs(serde_json::json!([{"containerPort": 80, "protocol": "TCP"}]));
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn container_port_zero_is_required_not_invalid() {
+        let e = cports_errs(serde_json::json!([{"containerPort": 0, "protocol": "TCP"}]));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("containerPort") && m.contains("Required")),
+            "{e:?}"
+        );
+        assert!(
+            !e.iter().any(|m| m.contains("between 1 and 65535")),
+            "zero should be Required, not Invalid range: {e:?}"
+        );
+    }
+
+    #[test]
+    fn container_port_name_is_valid_port_name() {
+        // uppercase / too long / leading hyphen / consecutive hyphens / no letter
+        let bad_upper = cports_errs(
+            serde_json::json!([{"containerPort": 80, "protocol": "TCP", "name": "Http"}]),
+        );
+        assert!(
+            bad_upper.iter().any(|m| m.contains("name")),
+            "{bad_upper:?}"
+        );
+        let no_letter = cports_errs(
+            serde_json::json!([{"containerPort": 80, "protocol": "TCP", "name": "123"}]),
+        );
+        assert!(
+            no_letter.iter().any(|m| m.contains("at least one letter")),
+            "{no_letter:?}"
+        );
+        let lead = cports_errs(
+            serde_json::json!([{"containerPort": 80, "protocol": "TCP", "name": "-ab"}]),
+        );
+        assert!(
+            lead.iter()
+                .any(|m| m.contains("begin or end with a hyphen")),
+            "{lead:?}"
+        );
+        let dbl = cports_errs(
+            serde_json::json!([{"containerPort": 80, "protocol": "TCP", "name": "a--b"}]),
+        );
+        assert!(
+            dbl.iter().any(|m| m.contains("consecutive hyphens")),
+            "{dbl:?}"
+        );
+        let long = cports_errs(
+            serde_json::json!([{"containerPort": 80, "protocol": "TCP", "name": "abcdefghijklmnop"}]),
+        );
+        assert!(long.iter().any(|m| m.contains("15 characters")), "{long:?}");
+        // valid name passes
+        let ok = cports_errs(
+            serde_json::json!([{"containerPort": 80, "protocol": "TCP", "name": "http-1"}]),
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn container_port_name_duplicate_rejected() {
+        let e = cports_errs(serde_json::json!([
+            {"containerPort": 80, "protocol": "TCP", "name": "web"},
+            {"containerPort": 81, "protocol": "TCP", "name": "web"}
+        ]));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("ports[1].name") && m.contains("Duplicate")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn host_port_conflict_across_containers() {
+        // Same proto/hostIP/port on two containers -> Duplicate on the second.
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p"},
+            "spec": {"containers": [
+                {"name": "a", "image": "i", "ports": [{"containerPort": 80, "protocol": "TCP", "hostPort": 8080}]},
+                {"name": "b", "image": "i", "ports": [{"containerPort": 81, "protocol": "TCP", "hostPort": 8080}]}
+            ]}
+        }))
+        .unwrap();
+        let errs: Vec<String> = validate_pod_create(&pod, false)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("hostPort") && m.contains("Duplicate")),
+            "{errs:?}"
+        );
+        // Different protocol -> no conflict.
+        let pod2: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p"},
+            "spec": {"containers": [
+                {"name": "a", "image": "i", "ports": [{"containerPort": 80, "protocol": "TCP", "hostPort": 8080}]},
+                {"name": "b", "image": "i", "ports": [{"containerPort": 81, "protocol": "UDP", "hostPort": 8080}]}
+            ]}
+        }))
+        .unwrap();
+        let errs2: Vec<String> = validate_pod_create(&pod2, false)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(!errs2.iter().any(|m| m.contains("Duplicate")), "{errs2:?}");
+    }
+
+    // ---- probe / handler bodies -----------------------------------------
+
+    #[test]
+    fn probe_http_get_path_required_and_scheme_enum() {
+        // missing path + bad scheme
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"httpGet": {"port": 8080, "scheme": "FTP"}}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("httpGet.path") && m.contains("Required")),
+            "{e:?}"
+        );
+        assert!(e.iter().any(|m| m.contains("httpGet.scheme")), "{e:?}");
+        // valid passes
+        let ok = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"httpGet": {"path": "/healthz", "port": 8080, "scheme": "HTTPS"}}
+        }));
+        assert!(!ok.iter().any(|m| m.contains("httpGet")), "{ok:?}");
+    }
+
+    #[test]
+    fn probe_http_header_name_validated() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"httpGet": {"path": "/", "port": 80,
+                "httpHeaders": [{"name": "Bad Header", "value": "v"}]}}
+        }));
+        assert!(e.iter().any(|m| m.contains("httpHeaders")), "{e:?}");
+    }
+
+    #[test]
+    fn probe_port_num_or_name_validated() {
+        // out-of-range int port on tcpSocket
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"tcpSocket": {"port": 99999}}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("tcpSocket.port") && m.contains("65535")),
+            "{e:?}"
+        );
+        // bad named port on grpc
+        let g = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"grpc": {"port": -1}}
+        }));
+        assert!(g.iter().any(|m| m.contains("grpc.port")), "{g:?}");
+    }
+
+    #[test]
+    fn probe_exec_command_required() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"exec": {"command": []}}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("exec.command") && m.contains("Required")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn probe_numeric_fields_nonnegative() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"tcpSocket": {"port": 80}, "periodSeconds": -5}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("periodSeconds") && m.contains("greater than or equal to 0")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn liveness_success_threshold_must_be_one() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"tcpSocket": {"port": 80}, "successThreshold": 2}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("livenessProbe.successThreshold") && m.contains("must be 1")),
+            "{e:?}"
+        );
+        // startup probe same rule
+        let s = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "startupProbe": {"tcpSocket": {"port": 80}, "successThreshold": 3}
+        }));
+        assert!(
+            s.iter()
+                .any(|m| m.contains("startupProbe.successThreshold") && m.contains("must be 1")),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn readiness_termination_grace_period_forbidden() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "readinessProbe": {"tcpSocket": {"port": 80}, "terminationGracePeriodSeconds": 5}
+        }));
+        assert!(
+            e.iter().any(
+                |m| m.contains("readinessProbe.terminationGracePeriodSeconds")
+                    && m.contains("must not be set for readinessProbes")
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn probe_termination_grace_period_must_be_positive() {
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "livenessProbe": {"tcpSocket": {"port": 80}, "terminationGracePeriodSeconds": 0}
+        }));
+        assert!(
+            e.iter().any(
+                |m| m.contains("livenessProbe.terminationGracePeriodSeconds")
+                    && m.contains("must be greater than 0")
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_sleep_duration_bounded_by_grace_period() {
+        // cerrs uses grace_period = Some(30); sleep 0 and >30 both rejected.
+        let zero = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "lifecycle": {"preStop": {"sleep": {"seconds": 0}}}
+        }));
+        assert!(
+            zero.iter()
+                .any(|m| m.contains("preStop.sleep") && m.contains("greater than 0")),
+            "{zero:?}"
+        );
+        let over = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "lifecycle": {"postStart": {"sleep": {"seconds": 31}}}
+        }));
+        assert!(
+            over.iter().any(|m| m.contains("postStart.sleep")
+                && m.contains("terminationGracePeriodSeconds (30)")),
+            "{over:?}"
+        );
+        // within range passes
+        let ok = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}
+        }));
+        assert!(!ok.iter().any(|m| m.contains("sleep")), "{ok:?}");
+    }
+
+    #[test]
+    fn lifecycle_handler_action_body_validated() {
+        // httpGet handler in a lifecycle hook with missing path is rejected.
+        let e = cerrs(serde_json::json!({
+            "name": "c", "image": "i",
+            "lifecycle": {"postStart": {"httpGet": {"port": 8080}}}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("postStart.httpGet.path") && m.contains("Required")),
+            "{e:?}"
+        );
     }
 }

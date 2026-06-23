@@ -1215,7 +1215,10 @@ fn host_network_requires_hostport_matches_containerport() {
         c.ports = Some(vec![ContainerPort {
             container_port: 80,
             name: None,
-            protocol: None,
+            // Protocol is TCP-defaulted before validation runs; supply it so the
+            // fixture reflects the post-defaulting state (validateContainerPorts
+            // requires a non-empty protocol, mirroring upstream).
+            protocol: Some("TCP".to_string()),
             host_port,
             host_ip: None,
         }]);
