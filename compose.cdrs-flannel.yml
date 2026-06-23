@@ -1,0 +1,236 @@
+# Per-node (kind-style) stack with flannel-rs CNI, running the rusternetes
+# kubelet on **containerd-rs + crun** instead of upstream containerd + youki.
+#
+# This is the M1 integration spike: each `node-N` is the `rusternetes-node-cdrs`
+# image (deploy/node-cdrs/) — one container running containerd-rs (the Rust CRI
+# runtime, v0.1.1) + crun (the OCI runtime) AND the rusternetes kubelet. The
+# kubelet talks CRI over /run/containerd-rs.sock (set in the image as
+# CONTAINER_RUNTIME_ENDPOINT). Everything else (rhino, api-server, scheduler,
+# controller-manager, kube-proxy) is unchanged from compose.flannel.yml; ONLY
+# the runtime under the kubelet changes.
+#
+# Usage (Task 2: control plane + node-1 only):
+#   bash scripts/generate-certs.sh                 # certs FIRST (api-server mounts them)
+#   docker compose -f compose.cdrs-flannel.yml up -d rhino api-server node-1 \
+#     scheduler controller-manager
+#   ALLOCATE_NODE_CIDRS=1 CLUSTER_CIDR=10.244.0.0/16 \
+#     bash scripts/bootstrap-cluster.sh docker      # registers nodes + static pods
+#   kubectl apply -f deploy/flannel/flannel-rs.yaml # (later task)
+
+x-sccache-args: &sccache-args
+  USE_SCCACHE: "${USE_SCCACHE-${GITHUB_ACTIONS:+1}}"
+  RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+
+services:
+  rhino:
+    build:
+      context: ./rhino
+      dockerfile: ../Dockerfile.rhino
+    image: rusternetes-rhino:latest
+    container_name: rusternetes-cdrsf-rhino
+    restart: unless-stopped
+    volumes:
+      - rhino-data:/data/db
+    networks:
+      - rusternetes-net
+    command: ["--listen-address", "0.0.0.0:2379", "--endpoint", "/data/db/state.db", "--max-connections", "20"]
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.services
+      additional_contexts:
+        rhino: ./rhino
+      args: *sccache-args
+      target: api-server
+    image: isolated-work-api-server:latest
+    container_name: rusternetes-cdrsf-api-server
+    restart: unless-stopped
+    # No host port published: avoids clashing with another local cluster on
+    # 6443. Reach the api-server via `docker compose exec` / in-network clients.
+    depends_on:
+      rhino:
+        condition: service_healthy
+    networks:
+      rusternetes-net:
+        aliases:
+          - api-server
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+    environment:
+      - RUST_LOG=info
+    command:
+      - "--bind-address"
+      - "0.0.0.0:6443"
+      - "--etcd-servers"
+      - "http://rhino:2379"
+      - "--tls"
+      - "--tls-cert-file"
+      - "/etc/kubernetes/pki/api-server.crt"
+      - "--tls-key-file"
+      - "/etc/kubernetes/pki/api-server.key"
+      - "--skip-auth"
+      - "--console-dir"
+      - "/app/console"
+      - "--log-level"
+      - "info"
+
+  # kube-scheduler as a plain compose service (fork/main also ships it as a
+  # static pod via --pod-manifest-path; running it as a service too is harmless
+  # and lets node-1 go Ready without depending on the static-pod image import).
+  scheduler:
+    image: rusternetes-scheduler:latest
+    container_name: rusternetes-cdrsf-scheduler
+    restart: unless-stopped
+    depends_on:
+      - api-server
+    networks:
+      - rusternetes-net
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+    environment:
+      - RUST_LOG=info
+    # Args mirror manifests/control-plane/kube-scheduler.yaml (known-good).
+    command: ["--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/scheduler.conf", "--interval", "1"]
+
+  controller-manager:
+    image: rusternetes-controller-manager:latest
+    container_name: rusternetes-cdrsf-controller-manager
+    restart: unless-stopped
+    depends_on:
+      - api-server
+    networks:
+      - rusternetes-net
+    volumes:
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+    environment:
+      - RUST_LOG=info
+    # Args mirror manifests/control-plane/kube-controller-manager.yaml + the
+    # flannel stack's node-IPAM flags (so each node gets a spec.podCIDR).
+    command:
+      - "--api-server-url"
+      - "https://api-server:6443"
+      - "--kubeconfig"
+      - "/etc/kubernetes/pki/controller-manager.conf"
+      - "--sync-interval"
+      - "5"
+      - "--allocate-node-cidrs"
+      - "--cluster-cidr"
+      - "${CLUSTER_CIDR:-10.244.0.0/16}"
+      - "--node-cidr-mask-size"
+      - "24"
+
+  # Control-plane-ish node: runs the rusternetes kubelet driving containerd-rs.
+  # Single container (kind-style): containerd-rs + crun + kubelet share a
+  # filesystem so flannel's hostPath CNI install lands where the runtime reads.
+  node-1:
+    image: rusternetes-node-cdrs:m1
+    container_name: rusternetes-cdrsf-node-1
+    restart: unless-stopped
+    privileged: true
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - rusternetes-net
+    volumes:
+      # containerd-rs state ("state" dir) + root ("root" dir). The CRI socket
+      # itself lives at /run/containerd-rs.sock inside the container and is
+      # shared with the co-resident kubelet — no socket mount needed.
+      - containerd-rs-run-1:/run/containerd-rs
+      - containerd-rs-data-1:/var/lib/containerd-rs
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+      - ./.rusternetes/manifests:/etc/rusternetes/manifests:ro
+      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_MIN_STACK=8388608
+      # Kubelet -> this node's own containerd-rs CRI socket (also baked into the
+      # image ENV; set here too for explicitness).
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    # --eviction-hard="" disables the eviction manager (shared ~full host disk);
+    # see compose.flannel.yml for the full rationale.
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests", "--eviction-hard", ""]
+
+  # Worker node (brought up in a later task; defined here for completeness).
+  node-2:
+    image: rusternetes-node-cdrs:m1
+    container_name: rusternetes-cdrsf-node-2
+    restart: unless-stopped
+    privileged: true
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - rusternetes-net
+    volumes:
+      - containerd-rs-run-2:/run/containerd-rs
+      - containerd-rs-data-2:/var/lib/containerd-rs
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
+      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_MIN_STACK=8388608
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
+
+  # kube-proxy per node, in that node's network namespace.
+  kube-proxy-1:
+    image: isolated-work-kube-proxy:latest
+    container_name: rusternetes-cdrsf-kube-proxy-1
+    restart: unless-stopped
+    privileged: true
+    network_mode: "service:node-1"
+    user: "0:0"
+    depends_on:
+      - node-1
+    cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+    environment:
+      - RUST_LOG=info
+    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
+
+  kube-proxy-2:
+    image: isolated-work-kube-proxy:latest
+    container_name: rusternetes-cdrsf-kube-proxy-2
+    restart: unless-stopped
+    privileged: true
+    network_mode: "service:node-2"
+    user: "0:0"
+    depends_on:
+      - node-2
+    cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+    environment:
+      - RUST_LOG=info
+    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
+
+networks:
+  rusternetes-net:
+    driver: bridge
+    name: rusternetes-network
+
+volumes:
+  rhino-data:
+    name: rusternetes-cdrsf-rhino-data
+  containerd-rs-run-1:
+    name: rusternetes-cdrsf-containerd-rs-run-1
+  containerd-rs-data-1:
+    name: rusternetes-cdrsf-containerd-rs-data-1
+  containerd-rs-run-2:
+    name: rusternetes-cdrsf-containerd-rs-run-2
+  containerd-rs-data-2:
+    name: rusternetes-cdrsf-containerd-rs-data-2
