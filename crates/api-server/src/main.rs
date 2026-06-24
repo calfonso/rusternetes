@@ -34,8 +34,6 @@ mod spdy;
 #[allow(dead_code)]
 mod spdy3;
 #[allow(dead_code)]
-mod spdy3_handlers;
-#[allow(dead_code)]
 mod spdy_handlers;
 mod ssa;
 mod state;

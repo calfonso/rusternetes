@@ -24,7 +24,6 @@ pub mod router;
 #[allow(dead_code)]
 pub mod spdy;
 pub mod spdy3;
-pub mod spdy3_handlers;
 #[allow(dead_code)]
 pub mod spdy_handlers;
 pub mod ssa;
