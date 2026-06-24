@@ -221,7 +221,6 @@ pub async fn exec(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Result<Response> {
     let raw_query = req.uri().query().unwrap_or("").to_string();
@@ -374,7 +373,6 @@ pub async fn exec(
     // Upgrade-proxy the request to the kubelet (handles SPDY, WebSocket, and plain HTTP).
     // The WebSocket upgrade (if any) is handled transparently by proxy_upgrade via the
     // raw hyper OnUpgrade future; we don't need to handle it separately.
-    let _ = ws;
     Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
 }
 
@@ -387,7 +385,6 @@ pub async fn attach(
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<AttachQuery>,
-    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Result<Response> {
     info!("Attaching to pod {}/{}", namespace, name);
@@ -507,7 +504,6 @@ pub async fn attach(
     // Upgrade-proxy the request to the kubelet (handles SPDY, WebSocket, and plain HTTP).
     // Suppress the unused `ws` warning — the upgrade is handled transparently by
     // proxy_upgrade via the raw hyper OnUpgrade future.
-    let _ = ws;
     Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
 }
 
