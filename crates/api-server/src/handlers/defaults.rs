@@ -137,6 +137,23 @@ fn apply_container_defaults(container: &mut rusternetes_common::resources::Conta
         }
     }
 
+    // K8s: SetDefaults_ObjectFieldSelector — an env `valueFrom.fieldRef` with no
+    // apiVersion defaults to "v1" (pkg/apis/core/v1/defaults.go). Real manifests
+    // (e.g. flannel's downward-API env) omit it and rely on this defaulting;
+    // without it the create-path validation rejects the pod with
+    // "fieldRef.apiVersion: Required value".
+    if let Some(ref mut envs) = container.env {
+        for env in envs.iter_mut() {
+            if let Some(ref mut source) = env.value_from {
+                if let Some(ref mut field_ref) = source.field_ref {
+                    if field_ref.api_version.as_deref().unwrap_or("").is_empty() {
+                        field_ref.api_version = Some("v1".to_string());
+                    }
+                }
+            }
+        }
+    }
+
     // K8s: SetDefaults_Container — default port protocol to TCP
     // K8s ref: pkg/apis/core/v1/defaults.go — SetDefaults_Container
     if let Some(ref mut ports) = container.ports {
@@ -461,6 +478,29 @@ pub fn apply_pvc_spec_defaults(
 mod tests {
     use super::*;
     use rusternetes_common::resources::{Container, PodSpec, PodTemplateSpec};
+
+    #[test]
+    fn defaults_env_field_ref_api_version_to_v1() {
+        // K8s SetDefaults_ObjectFieldSelector: an env valueFrom.fieldRef with no
+        // apiVersion defaults to "v1". Real manifests (e.g. flannel) omit it and
+        // rely on this; without it the create-path validation rejects the pod
+        // with "fieldRef.apiVersion: Required value".
+        let mut c: Container = serde_json::from_value(serde_json::json!({
+            "name": "c",
+            "image": "busybox:1.36",
+            "env": [{
+                "name": "POD_NODE",
+                "valueFrom": { "fieldRef": { "fieldPath": "spec.nodeName" } }
+            }]
+        }))
+        .unwrap();
+
+        apply_container_defaults(&mut c);
+
+        let env_var = c.env.unwrap().remove(0);
+        let field_ref = env_var.value_from.unwrap().field_ref.unwrap();
+        assert_eq!(field_ref.api_version.as_deref(), Some("v1"));
+    }
 
     #[test]
     fn test_apply_pod_spec_defaults() {
