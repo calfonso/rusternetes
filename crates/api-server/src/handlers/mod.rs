@@ -45,6 +45,7 @@ pub mod metrics;
 pub mod namespace;
 pub mod networkpolicy;
 pub mod node;
+pub mod node_conn;
 pub mod openapi;
 pub mod persistentvolume;
 pub mod persistentvolumeclaim;
