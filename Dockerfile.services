@@ -267,6 +267,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes \
         -p rusternetes-scheduler \
         -p rusternetes-storage \
+        -p rusternetes-streamproxy \
  && { [ "$USE_SCCACHE" = "1" ] && sccache --show-stats || true; }
 
 # ----- PASS 2: real source compile (only changed workspace crates rebuild) -----
