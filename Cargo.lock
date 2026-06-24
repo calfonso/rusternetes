@@ -4610,8 +4610,10 @@ name = "rusternetes-kubelet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "futures",
@@ -4626,6 +4628,7 @@ dependencies = [
  "rusternetes-cri",
  "rusternetes-netstack",
  "rusternetes-storage",
+ "rusternetes-streamproxy",
  "rustix 0.38.44",
  "serde",
  "serde_json",

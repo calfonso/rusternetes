@@ -12,6 +12,7 @@
 //! `proxy_upgrade(url, req)`.
 
 use axum::{
+    body::Body,
     extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -58,10 +59,8 @@ impl ExecParams {
             // Percent-decode simple `+` and `%XX` sequences for the value.
             let value = decode_simple(value);
             match key {
-                "command" => {
-                    if !value.is_empty() {
-                        command.push(value);
-                    }
+                "command" if !value.is_empty() => {
+                    command.push(value);
                 }
                 "stdin" => stdin = is_true(&value),
                 "stdout" => stdout = is_true(&value),
@@ -110,6 +109,78 @@ fn decode_simple(s: &str) -> String {
         }
     }
     out
+}
+
+/// Query parameters for `/containerLogs` requests, mirroring upstream
+/// `v1.PodLogOptions` fields forwarded by the api-server.
+#[derive(Debug, Clone, Default)]
+pub struct LogParams {
+    /// Only return the last N lines of container output.
+    pub tail_lines: Option<i32>,
+    /// Stop after this many bytes.
+    pub limit_bytes: Option<i64>,
+    /// Stay attached and stream new output as it is produced.
+    pub follow: bool,
+    /// Preserve the RFC3339Nano timestamp prefix on each emitted line.
+    pub timestamps: bool,
+    /// Only lines at or after this RFC3339 timestamp (resolved to Unix epoch).
+    pub since_time: Option<String>,
+}
+
+impl LogParams {
+    /// Parse `/containerLogs` query params from a raw query string.
+    ///
+    /// Integer fields (`tailLines`, `limitBytes`) are parsed with
+    /// `str::parse`; silently ignored on parse failure. Booleans accept
+    /// `"true"` / `"1"` (case-insensitive).
+    pub fn from_query(query: &str) -> Self {
+        let mut tail_lines: Option<i32> = None;
+        let mut limit_bytes: Option<i64> = None;
+        let mut follow = false;
+        let mut timestamps = false;
+        let mut since_time: Option<String> = None;
+
+        for pair in query.split('&') {
+            let (key, value) = if let Some(pos) = pair.find('=') {
+                (&pair[..pos], &pair[pos + 1..])
+            } else {
+                (pair, "")
+            };
+            let value = decode_simple(value);
+            match key {
+                "tailLines" => tail_lines = value.parse().ok(),
+                "limitBytes" => limit_bytes = value.parse().ok(),
+                "follow" => follow = is_true(&value),
+                "timestamps" => timestamps = is_true(&value),
+                "sinceTime" if !value.is_empty() => {
+                    since_time = Some(value);
+                }
+                _ => {}
+            }
+        }
+        LogParams {
+            tail_lines,
+            limit_bytes,
+            follow,
+            timestamps,
+            since_time,
+        }
+    }
+}
+
+/// Map [`LogParams`] to [`rusternetes_cri::stream::LogReadOptions`].
+fn log_read_options(params: &LogParams) -> rusternetes_cri::stream::LogReadOptions {
+    let since_unix = params.since_time.as_deref().and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.timestamp())
+    });
+    rusternetes_cri::stream::LogReadOptions {
+        timestamps: params.timestamps,
+        tail_lines: params.tail_lines,
+        limit_bytes: params.limit_bytes,
+        since_unix,
+    }
 }
 
 /// Path parameters for the exec/attach routes (3-segment variant: no uid).
@@ -349,9 +420,240 @@ pub async fn handle_attach_uid(Path(p): Path<ExecPath4>, req: axum::extract::Req
     attach_proxy(&p.namespace, &p.pod, &p.uid, &p.container, &params, req).await
 }
 
+/// `GET /containerLogs/:namespace/:pod/:container`
+///
+/// Reads the container's CRI logfile directly from the local node filesystem.
+/// When `follow=true` the response body is a tailing stream that stays open
+/// and pushes new lines as they are written; otherwise the current log
+/// contents are returned in one shot.
+pub async fn handle_container_logs(
+    Path(p): Path<ExecPath3>,
+    req: axum::extract::Request,
+) -> Response {
+    let query = req.uri().query().unwrap_or("").to_string();
+    let params = LogParams::from_query(&query);
+
+    let mut cri = match rusternetes_cri::stream::connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("handle_container_logs: CRI connect failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let pod = pod_for_resolve(&p.namespace, &p.pod, "");
+    let container_id =
+        match rusternetes_cri::stream::resolve_container_id(&mut cri, &pod, &p.container).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                warn!(
+                    "handle_container_logs: container not found: ns={} pod={} container={}",
+                    p.namespace, p.pod, p.container
+                );
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "container {:?} not found in pod {:?} (namespace {:?})",
+                        p.container, p.pod, p.namespace
+                    ),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                warn!("handle_container_logs: resolve_container_id failed: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+
+    let log_path =
+        match rusternetes_cri::stream::resolve_log_path(&mut cri, &pod, &container_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                warn!("handle_container_logs: no log_path for container_id={container_id}");
+                return (
+                    StatusCode::NOT_FOUND,
+                    "container log file not available".to_string(),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                warn!("handle_container_logs: resolve_log_path failed: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+
+    info!(
+        "handle_container_logs: ns={} pod={} container={} container_id={} log_path={} follow={}",
+        p.namespace,
+        p.pod,
+        p.container,
+        container_id,
+        log_path.display(),
+        params.follow
+    );
+
+    if params.follow {
+        // Tailing stream: emit existing backlog then poll for new bytes.
+        let stream = follow_log_stream(log_path, params);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    // Non-follow: read current log contents and return in one shot.
+    let opts = log_read_options(&params);
+    match rusternetes_cri::stream::read_log_file(&log_path, &opts) {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(e) => {
+            warn!("handle_container_logs: read_log_file failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// Build a tailing `Stream` over the container log file.
+///
+/// Emits the existing backlog first (honoring `tail_lines`/`since_time`),
+/// then polls for new bytes every 500ms — identical to the api-server
+/// `stream_container_logs` approach. The stream ends when the log file
+/// disappears (container removed) or after a bounded wait if the file
+/// never appears (container exited without writing logs).
+fn follow_log_stream(
+    log_path: std::path::PathBuf,
+    params: LogParams,
+) -> impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let opts = log_read_options(&params);
+    let timestamps = opts.timestamps;
+    let since_unix = opts.since_unix;
+
+    async_stream::stream! {
+        // Emit existing backlog; a missing file is non-fatal (container may
+        // not have written yet — fall through to the tail loop).
+        match rusternetes_cri::stream::read_log_file(&log_path, &opts) {
+            Ok(bytes) if !bytes.is_empty() => {
+                yield Ok(bytes::Bytes::from(bytes));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    "follow_log_stream: backlog read failed (may not exist yet): {e}"
+                );
+            }
+        }
+
+        let mut offset: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        let mut carry: Vec<u8> = Vec::new();
+        let mut seen_file = std::fs::metadata(&log_path).is_ok();
+        let mut waited_ticks: u32 = 0;
+        const MAX_PRE_FILE_TICKS: u32 = 240; // 240 × 500ms = 120s
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let len = match std::fs::metadata(&log_path) {
+                Ok(m) => {
+                    seen_file = true;
+                    m.len()
+                }
+                Err(_) if !seen_file => {
+                    waited_ticks += 1;
+                    if waited_ticks >= MAX_PRE_FILE_TICKS {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break, // file vanished — container removed
+            };
+            if len < offset {
+                // Truncated / rotated — restart from the beginning.
+                offset = 0;
+                carry.clear();
+            }
+            if len == offset {
+                continue;
+            }
+            let mut f = match std::fs::File::open(&log_path) {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            if f.seek(SeekFrom::Start(offset)).is_err() {
+                break;
+            }
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_err() {
+                break;
+            }
+            offset = len;
+            carry.extend_from_slice(&buf);
+
+            // Only process complete lines; keep any partial tail.
+            let last_nl = carry.iter().rposition(|&b| b == b'\n');
+            let Some(idx) = last_nl else { continue };
+            let complete: Vec<u8> = carry.drain(..=idx).collect();
+
+            let mut out = Vec::new();
+            for line in complete.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let parsed = rusternetes_cri::stream::parse_cri_log_line(line);
+                if let Some(since) = since_unix {
+                    if let Some(ts) = parsed.timestamp_unix {
+                        if ts < since {
+                            continue;
+                        }
+                    }
+                }
+                if timestamps && !parsed.timestamp_prefix.is_empty() {
+                    out.extend_from_slice(parsed.timestamp_prefix.as_bytes());
+                }
+                out.extend_from_slice(&parsed.message);
+            }
+            if !out.is_empty() {
+                yield Ok(bytes::Bytes::from(out));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_params_parse_tail_and_follow() {
+        let p = LogParams::from_query("tailLines=10&follow=true&timestamps=false&limitBytes=2048");
+        assert_eq!(p.tail_lines, Some(10));
+        assert!(p.follow);
+        assert_eq!(p.limit_bytes, Some(2048));
+    }
+
+    #[test]
+    fn log_params_empty_query() {
+        let p = LogParams::from_query("");
+        assert_eq!(p.tail_lines, None);
+        assert!(!p.follow);
+        assert!(!p.timestamps);
+        assert_eq!(p.limit_bytes, None);
+        assert!(p.since_time.is_none());
+    }
+
+    #[test]
+    fn log_params_timestamps_and_since_time() {
+        let p = LogParams::from_query(
+            "timestamps=true&sinceTime=2024-01-01T00%3A00%3A00Z&follow=false",
+        );
+        assert!(p.timestamps);
+        assert!(!p.follow);
+        assert!(p.since_time.is_some());
+    }
 
     #[test]
     fn exec_params_parse_command_and_tty() {

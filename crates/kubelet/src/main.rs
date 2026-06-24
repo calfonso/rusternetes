@@ -491,6 +491,10 @@ async fn main() -> Result<()> {
                 "/attach/:namespace/:pod/:uid/:container",
                 get(streaming_server::handle_attach_uid).post(streaming_server::handle_attach_uid),
             )
+            .route(
+                "/containerLogs/:namespace/:pod/:container",
+                get(streaming_server::handle_container_logs),
+            )
             .merge(server::read_only_router(server_state));
 
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
