@@ -17,7 +17,7 @@
 //! ```
 
 use futures::{SinkExt, StreamExt};
-use rusternetes_api_server::cri_exec;
+use rusternetes_cri::stream as cri_exec;
 use rusternetes_cri::CriClient;
 use tokio_tungstenite::tungstenite::Message;
 
