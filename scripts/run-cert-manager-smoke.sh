@@ -25,6 +25,19 @@ mkdir -p "${RESULTS_DIR}"
 export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-${PROJECT_ROOT}/.rusternetes/volumes}"
 mkdir -p "${KUBELET_VOLUMES_PATH}"
 
+# Pre-create every host dir that compose bind-mounts, BEFORE `compose up`.
+# bootstrap-cluster.sh templates the control-plane static pod YAML
+# (kube-controller-manager.yaml, kube-scheduler.yaml) into
+# .rusternetes/manifests AFTER `compose up`, and compose.sqlite.yml bind-mounts
+# that dir into the kubelets. If the dir does not already exist, the Docker
+# daemon creates it as root on `up`, and bootstrap-cluster.sh — running as this
+# user — then dies with "Permission denied" templating the manifests. The
+# controller-manager static pod never starts, so Deployments never reconcile
+# and cert-manager's rollout times out. This mirrors the fix the conformance
+# canary's bring-up action got (commit b07d5890); the smoke script does its own
+# `compose up`, so it needs the same pre-create.
+mkdir -p "${PROJECT_ROOT}/.rusternetes/manifests"
+
 KUBECONFIG_FILE="${KUBECONFIG:-${HOME}/.kube/rusternetes-config}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
 
