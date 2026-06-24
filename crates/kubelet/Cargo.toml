@@ -28,6 +28,7 @@ rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
 rusternetes-netstack = { path = "../netstack" }
 rusternetes-cri = { path = "../cri" }
+rusternetes-streamproxy = { path = "../streamproxy" }
 thiserror.workspace = true
 tokio.workspace = true
 serde.workspace = true
