@@ -155,6 +155,9 @@ services:
       # Kubelet -> this node's own containerd-rs CRI socket (also baked into the
       # image ENV; set here too for explicitness).
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock
+      # containerd-rs's exec/attach streaming server is co-resident in this
+      # container, so the kubelet reaches it on localhost (not a "containerd" host).
+      - CONTAINERD_STREAM_HOST=127.0.0.1
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     # --eviction-hard="" disables the eviction manager (shared ~full host disk);
     # see compose.flannel.yml for the full rationale.
@@ -180,6 +183,7 @@ services:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock
+      - CONTAINERD_STREAM_HOST=127.0.0.1
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
 
