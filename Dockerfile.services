@@ -179,6 +179,7 @@ COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
+COPY crates/streamproxy/Cargo.toml        crates/streamproxy/Cargo.toml
 COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 # build.rs scripts + proto/ files belong with the manifests because
@@ -201,7 +202,7 @@ COPY crates/cri/proto           crates/cri/proto
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri test_support; do \
+    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -302,6 +303,7 @@ COPY crates/rusternetes/src          crates/rusternetes/src
 COPY crates/scheduler/src            crates/scheduler/src
 COPY crates/scheduler/tests          crates/scheduler/tests
 COPY crates/storage/src              crates/storage/src
+COPY crates/streamproxy/src          crates/streamproxy/src
 # test_support: the in-process api-server test harness. A workspace member, so
 # its manifest is required for `cargo` to resolve the workspace even though the
 # release bins don't depend on it (dev-dependency); src is copied so in-image
