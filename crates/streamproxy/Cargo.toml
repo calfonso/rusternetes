@@ -1,0 +1,16 @@
+[package]
+name = "rusternetes-streamproxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["http1"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http1"] }
+http = "1"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["io-util", "net", "macros", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
