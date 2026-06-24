@@ -23,9 +23,15 @@ tokio.workspace = true
 tower.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
 # UDS connector: tonic 0.12 rides hyper 1.x, so a tokio UnixStream must be wrapped
 # in hyper_util's TokioIo before tonic's transport will accept it.
 hyper-util = { version = "0.1", features = ["client", "tokio"] }
+# Stream helpers (exec/attach/log): WebSocket client for CRI streaming server.
+tokio-tungstenite = "0.21"
+url = "2.5.8"
+rusternetes-common = { path = "../common" }
 
 [build-dependencies]
 tonic-build = "0.12"

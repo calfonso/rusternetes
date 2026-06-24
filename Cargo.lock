@@ -4505,15 +4505,20 @@ dependencies = [
 name = "rusternetes-cri"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
  "hyper-util",
  "prost",
  "prost-types",
+ "rusternetes-common",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.21.0",
  "tonic",
  "tonic-build",
  "tower 0.4.13",
  "tracing",
+ "url",
 ]
 
 [[package]]
