@@ -183,6 +183,15 @@ pub fn dns_config(
     let mut cfg = match policy {
         // DNSNone: empty base, populated solely from the pod's dnsConfig.
         "None" => v1::DnsConfig::default(),
+        // ClusterFirst on a hostNetwork pod falls back to Default (host DNS),
+        // matching upstream getPodDNSType (pkg/kubelet/network/dns/dns.go): only
+        // ClusterFirstWithHostNet keeps clusterDNS when sharing the host netns.
+        // Without this, hostNetwork control-plane static pods (scheduler /
+        // controller-manager, dnsPolicy unset => ClusterFirst) get
+        // `nameserver <clusterDNS>` and can't resolve the `api-server` Docker
+        // alias before cluster DNS is up — their reflectors never sync and the
+        // cluster never schedules anything.
+        "ClusterFirst" if host_network(pod) => return None,
         "ClusterFirst" | "ClusterFirstWithHostNet" => {
             if cluster_dns.is_empty() {
                 return None; // no ClusterDNS -> fall back to Default (host DNS)
@@ -1381,6 +1390,34 @@ mod tests {
     fn dns_cluster_first_without_cluster_dns_falls_back_to_host() {
         let pod = pod_with(PodSpec::default());
         assert!(dns_config(&pod, &[], "cluster.local").is_none());
+    }
+
+    #[test]
+    fn dns_cluster_first_on_host_network_falls_back_to_host() {
+        // hostNetwork pod with default (ClusterFirst) dnsPolicy: upstream
+        // getPodDNSType falls back to Default (host resolv.conf), so we must
+        // NOT stamp clusterDNS — else the pod can't resolve the `api-server`
+        // alias before cluster DNS is up. Regression test for the in-cluster
+        // control-plane static pods (scheduler / controller-manager).
+        let pod = pod_with(PodSpec {
+            host_network: Some(true),
+            ..Default::default()
+        });
+        assert!(dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local").is_none());
+    }
+
+    #[test]
+    fn dns_cluster_first_with_host_net_keeps_cluster_dns_on_host_network() {
+        // ClusterFirstWithHostNet explicitly opts a hostNetwork pod back into
+        // clusterDNS (upstream getPodDNSType returns podDNSCluster).
+        let pod = pod_with(PodSpec {
+            host_network: Some(true),
+            dns_policy: Some("ClusterFirstWithHostNet".to_string()),
+            ..Default::default()
+        });
+        let dns = dns_config(&pod, &["10.96.0.10".to_string()], "cluster.local")
+            .expect("ClusterFirstWithHostNet yields a DnsConfig on hostNetwork");
+        assert_eq!(dns.servers, vec!["10.96.0.10".to_string()]);
     }
 
     #[test]
