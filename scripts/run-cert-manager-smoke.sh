@@ -36,7 +36,23 @@ mkdir -p "${KUBELET_VOLUMES_PATH}"
 # and cert-manager's rollout times out. This mirrors the fix the conformance
 # canary's bring-up action got (commit b07d5890); the smoke script does its own
 # `compose up`, so it needs the same pre-create.
-mkdir -p "${PROJECT_ROOT}/.rusternetes/manifests"
+#
+# A plain `mkdir -p` is NOT enough on the persistent self-hosted (ARC) runner
+# workspace: an earlier run — from before this pre-create existed — already
+# left a root-owned .rusternetes/manifests behind, and `mkdir -p` is a no-op on
+# an existing dir, so it can never repair the ownership (there is no sudo on
+# the runner). The templating then fails forever with "Permission denied". Heal
+# it: if the dir is not writable by us, move it aside (a rename only needs write
+# on the user-owned parent .rusternetes, so it works without sudo) and recreate
+# a fresh, user-owned dir.
+MANIFESTS_DIR="${PROJECT_ROOT}/.rusternetes/manifests"
+if [ -e "${MANIFESTS_DIR}" ] && [ ! -w "${MANIFESTS_DIR}" ]; then
+    echo "manifests dir not writable (stale root-owned?) — moving aside" >&2
+    rm -rf "${MANIFESTS_DIR}" 2>/dev/null \
+        || mv "${MANIFESTS_DIR}" "${MANIFESTS_DIR}.stale.$$" 2>/dev/null \
+        || true
+fi
+mkdir -p "${MANIFESTS_DIR}"
 
 KUBECONFIG_FILE="${KUBECONFIG:-${HOME}/.kube/rusternetes-config}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
