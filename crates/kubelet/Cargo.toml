@@ -28,6 +28,7 @@ rusternetes-storage = { path = "../storage", features = ["api-client"] }
 rusternetes-client = { path = "../client" }
 rusternetes-netstack = { path = "../netstack" }
 rusternetes-cri = { path = "../cri" }
+rusternetes-streamproxy = { path = "../streamproxy" }
 thiserror.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -42,6 +43,8 @@ futures.workspace = true
 chrono.workspace = true
 axum.workspace = true
 futures-util = "0.3"
+async-stream.workspace = true
+bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tonic.workspace = true
 prost.workspace = true

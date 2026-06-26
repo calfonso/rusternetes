@@ -169,53 +169,16 @@ pub async fn proxy_node(
     let node_key = rusternetes_storage::build_key("nodes", None, actual_node_name);
     let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
 
-    // Extract node address (prefer InternalIP, fallback to ExternalIP)
-    let node_address = node
-        .status
-        .as_ref()
-        .and_then(|s| s.addresses.as_ref())
-        .and_then(|addrs| {
-            addrs
-                .iter()
-                .find(|a| a.address_type == "InternalIP")
-                .or_else(|| addrs.iter().find(|a| a.address_type == "ExternalIP"))
-        })
-        .map(|a| a.address.clone())
-        .ok_or_else(|| {
-            rusternetes_common::Error::NotFound(format!(
-                "No address found for node {}",
-                actual_node_name
-            ))
-        })?;
-
-    // Build target URL. Port-fallback order matches
-    // `pkg/registry/core/node/strategy.go::ResourceLocation`:
-    //   1. Explicit port from the URL id (`<name>:<port>`) — used when
-    //      numeric.
-    //   2. The port the node advertises via
-    //      `status.daemonEndpoints.kubeletEndpoint.port`.
-    //   3. Upstream default 10250 when neither is available.
-    //
-    // NOTE: rusternetes kubelet serves its API over plain HTTP today (see
-    // `crates/kubelet/src/main.rs` — no TLS layer on the metrics listener).
-    // Upstream kubelet uses HTTPS with self-signed certs; switching to
-    // HTTPS here requires generating per-kubelet certs and wiring an
-    // `axum_server::tls_rustls` listener. Until then, use `http://` so the
-    // node-proxy actually reaches the kubelet (was 502'ing on TLS handshake).
+    // Resolve kubelet connection parameters (address, port, scheme) via the
+    // shared helper so that exec/attach/logs handlers (Tasks 6/7) can reuse
+    // the same logic without duplication.
     let port_override: Option<u16> = if port_str.is_empty() {
         None
     } else {
         port_str.parse::<u16>().ok()
     };
-    let kubelet_port: u16 = port_override.unwrap_or_else(|| {
-        node.status
-            .as_ref()
-            .and_then(|s| s.daemon_endpoints.as_ref())
-            .and_then(|d| d.kubelet_endpoint.as_ref())
-            .map(|e| e.port as u16)
-            .unwrap_or(10250)
-    });
-    let target_url = format!("http://{}:{}/{}", node_address, kubelet_port, suffix);
+    let conn = super::node_conn::node_conn(&node, port_override)?;
+    let target_url = format!("{}://{}:{}/{}", conn.scheme, conn.host, conn.port, suffix);
 
     // Forward the request to the kubelet, including the original query string.
     proxy_request(target_url, &original_uri, method, headers, body).await

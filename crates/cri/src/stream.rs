@@ -1,25 +1,15 @@
-//! CRI-backed exec + log helpers shared by the pod exec/logs subresource
-//! handlers (HTTP one-shot), the WebSocket exec path, and the SPDY exec path.
+//! CRI exec / attach / log streaming helpers.
 //!
-//! The api-server used to talk to the container runtime directly over the
-//! Docker API for exec and pod logs. The kubelet has since moved to a CRI v1
-//! backend, so the api-server speaks the same Container Runtime Interface here:
-//!
-//! * exec runs via the CRI `ExecSync` RPC (one-shot: collect stdout/stderr +
-//!   exit code), matching the kubelet's own `/exec` endpoint.
-//! * pod logs are read from the CRI container **log file** (the path the
-//!   runtime reports in `ContainerStatus.log_path`) and the CRI log line format
-//!   is parsed into the raw message bytes the API returns.
-//!
-//! The CRI runtime endpoint comes from `CONTAINER_RUNTIME_ENDPOINT`
-//! (default `unix:///run/containerd/containerd.sock`), the same env var the
-//! kubelet uses.
+//! Contains the runtime-facing helpers for interactive exec/attach and log
+//! retrieval. Originally lived in `crates/api-server/src/cri_exec.rs`; moved
+//! here so both the api-server and the kubelet can share one implementation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusternetes_common::resources::Pod;
-use rusternetes_cri::{v1, CriClient};
+
+use crate::{v1, CriClient};
 
 /// CRI pod/container labels the kubelet stamps on every sandbox/container.
 /// Kept in sync with `rusternetes_kubelet::cri_runtime::translate::labels`.

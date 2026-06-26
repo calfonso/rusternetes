@@ -33,18 +33,14 @@ mod lifecycle;
 mod runtime;
 mod server;
 mod static_pods;
+mod streaming_server;
 mod sync_locks;
 mod sysctl;
 #[allow(dead_code)]
 mod volumes;
 
 use anyhow::{Context, Result};
-use axum::{
-    extract::{Path, Query},
-    http::StatusCode,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{routing::get, Json, Router};
 use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
 use eviction::{
@@ -479,7 +475,26 @@ async fn main() -> Result<()> {
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
-            .route("/exec/:container_id", post(handle_exec))
+            .route(
+                "/exec/:namespace/:pod/:container",
+                get(streaming_server::handle_exec).post(streaming_server::handle_exec),
+            )
+            .route(
+                "/exec/:namespace/:pod/:uid/:container",
+                get(streaming_server::handle_exec_uid).post(streaming_server::handle_exec_uid),
+            )
+            .route(
+                "/attach/:namespace/:pod/:container",
+                get(streaming_server::handle_attach).post(streaming_server::handle_attach),
+            )
+            .route(
+                "/attach/:namespace/:pod/:uid/:container",
+                get(streaming_server::handle_attach_uid).post(streaming_server::handle_attach_uid),
+            )
+            .route(
+                "/containerLogs/:namespace/:pod/:container",
+                get(streaming_server::handle_container_logs),
+            )
             .merge(server::read_only_router(server_state));
 
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
@@ -489,46 +504,4 @@ async fn main() -> Result<()> {
     kubelet.run().await?;
 
     Ok(())
-}
-
-/// Handle exec requests from the API server.
-///
-/// The API server proxies exec requests to the kubelet, which runs a one-shot
-/// command on the target container via the CRI `ExecSync` RPC and returns the
-/// collected stdout/stderr. (Interactive tty/stdin streaming is not handled by
-/// this one-shot endpoint, matching the prior behavior.)
-async fn handle_exec(
-    Path(container_id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    _body: axum::body::Bytes,
-) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let command: Vec<String> = params
-        .get("command")
-        .map(|c| c.split(',').map(|s| s.to_string()).collect())
-        .unwrap_or_default();
-
-    let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
-        .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
-    let mut cri = rusternetes_cri::CriClient::connect(&socket)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let cmd: Vec<&str> = command.iter().map(String::as_str).collect();
-    let resp = cri
-        .exec_sync(&container_id, &cmd, 60)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    info!(
-        "Exec completed: container={}, exit_code={}, stdout_len={}, stderr_len={}",
-        container_id,
-        resp.exit_code,
-        resp.stdout.len(),
-        resp.stderr.len()
-    );
-
-    Ok(Json(serde_json::json!({
-        "stdout": String::from_utf8_lossy(&resp.stdout),
-        "stderr": String::from_utf8_lossy(&resp.stderr),
-    })))
 }

@@ -76,6 +76,7 @@ COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
 COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
+COPY crates/streamproxy/Cargo.toml        crates/streamproxy/Cargo.toml
 COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
 COPY crates/api-server/build.rs crates/api-server/build.rs

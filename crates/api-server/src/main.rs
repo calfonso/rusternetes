@@ -10,8 +10,6 @@ pub use rusternetes_admission_webhook as admission_webhook;
 mod bootstrap;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 mod conversion;
-#[allow(dead_code)]
-mod cri_exec;
 mod dynamic_routes;
 #[allow(dead_code)]
 mod flow_control;
@@ -33,8 +31,6 @@ mod spdy;
 // by the lib + tests, so allow dead_code in the binary build.
 #[allow(dead_code)]
 mod spdy3;
-#[allow(dead_code)]
-mod spdy3_handlers;
 #[allow(dead_code)]
 mod spdy_handlers;
 mod ssa;

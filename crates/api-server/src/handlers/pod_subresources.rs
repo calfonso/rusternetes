@@ -2,15 +2,21 @@
 //!
 //! Implements pod subresources required for Kubernetes conformance:
 //! - /logs - Get container logs
-//! - /exec - Execute commands in containers (SPDY and WebSocket)
-//! - /attach - Attach to running containers (SPDY and WebSocket)
+//! - /exec - Execute commands in containers (proxied to kubelet)
+//! - /attach - Attach to running containers (proxied to kubelet)
 //! - /portforward - Forward ports to pods (SPDY and WebSocket)
 
-use crate::{middleware::AuthContext, spdy, spdy_handlers, state::ApiServerState, streaming};
+use crate::{
+    handlers::node_conn::{node_conn, NodeConn},
+    middleware::AuthContext,
+    spdy, spdy_handlers,
+    state::ApiServerState,
+    streaming,
+};
 use axum::{
     body::Body,
     extract::{ws::WebSocketUpgrade, Path, Query, Request, State},
-    http::StatusCode,
+    http::{StatusCode, Uri},
     response::{IntoResponse, Response},
     Extension,
 };
@@ -48,35 +54,6 @@ fn percent_decode_str(s: &str) -> String {
         }
     }
     result
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LogsQuery {
-    /// The container for which to stream logs
-    #[serde(default)]
-    pub container: Option<String>,
-    /// Follow the log stream
-    #[serde(default)]
-    pub follow: bool,
-    /// Return previous terminated container logs
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub previous: bool,
-    /// Show timestamps
-    #[serde(default)]
-    pub timestamps: bool,
-    /// If set, the number of lines from the end of the logs to show
-    #[serde(rename = "tailLines")]
-    pub tail_lines: Option<i32>,
-    /// If set, the number of bytes to read from the server before terminating
-    #[serde(rename = "limitBytes")]
-    pub limit_bytes: Option<i64>,
-    /// Relative time in seconds before the current time from which to show logs
-    #[serde(rename = "sinceSeconds")]
-    pub since_seconds: Option<i64>,
-    /// RFC3339 timestamp from which to show logs
-    #[serde(rename = "sinceTime")]
-    pub since_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,13 +101,16 @@ pub struct PortForwardQuery {
 }
 
 /// GET /api/v1/namespaces/{namespace}/pods/{name}/log
-/// Stream logs from a pod (supports both HTTP and WebSocket)
+///
+/// Proxies log retrieval to the pod's kubelet using a plain HTTP reverse proxy.
+/// Mirrors `pkg/registry/core/pod/rest/log.go` (LogREST) + upstream's
+/// `streamLocation` — the kubelet exposes `/containerLogs/{ns}/{pod}/{ctr}?<params>`
+/// and handles all follow/tailLines/limitBytes logic server-side.
 pub async fn get_logs(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    Query(query): Query<LogsQuery>,
-    ws: Option<WebSocketUpgrade>,
+    req: Request,
 ) -> Result<Response> {
     debug!("Getting logs for pod {}/{}", namespace, name);
 
@@ -147,15 +127,22 @@ pub async fn get_logs(
         }
     }
 
-    // Get the pod to verify it exists and get container information
+    // Determine the container from the query string before consuming `req`.
+    let raw_query = req.uri().query().unwrap_or("").to_string();
+    let container_name: Option<String> = raw_query.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(k, _)| *k == "container")
+            .map(|(_, v)| v.to_string())
+    });
+
+    // Load the pod to verify it exists and resolve container + node.
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
-    // Determine which container to get logs from
-    let container_name = if let Some(ref container) = query.container {
-        container.clone()
+    // Resolve container name (default to first container).
+    let container = if let Some(c) = container_name {
+        c
     } else {
-        // If no container specified, use the first container
         pod.spec
             .as_ref()
             .and_then(|spec| spec.containers.first())
@@ -163,330 +150,82 @@ pub async fn get_logs(
             .ok_or_else(|| Error::InvalidResource("Pod has no containers".to_string()))?
     };
 
-    // Verify the container exists in the pod (check containers, init containers, ephemeral containers)
-    let container_exists = pod
+    // Require spec.nodeName — upstream returns 400 when the pod is unscheduled.
+    let node_name = pod
         .spec
         .as_ref()
-        .map(|spec| {
-            spec.containers.iter().any(|c| c.name == container_name)
-                || spec
-                    .init_containers
-                    .as_ref()
-                    .map(|ics| ics.iter().any(|c| c.name == container_name))
-                    .unwrap_or(false)
-                || spec
-                    .ephemeral_containers
-                    .as_ref()
-                    .map(|ecs| ecs.iter().any(|c| c.name == container_name))
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false);
+        .and_then(|s| s.node_name.as_deref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidResource(format!(
+                "pod {}/{} has not been assigned to a node",
+                namespace, name
+            ))
+        })?
+        .to_string();
 
-    if !container_exists {
-        return Err(Error::NotFound(format!(
-            "Container {} not found in pod {}/{}",
-            container_name, namespace, name
-        )));
-    }
+    // Resolve kubelet connection parameters from the node.
+    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let conn = node_conn(&node, None)?;
 
-    // follow=true: stream incrementally for as long as the container produces
-    // output. Without this, hydrophone (and `kubectl logs -f`) hit EOF on the
-    // first read and reconnect in a tight ~1s loop (>2000 reconnects observed
-    // during a single 17-min conformance run). The streaming path only kicks
-    // in for the plain HTTP case; the WS branch below still uses the buffered
-    // payload because the upstream pod-log WS conformance test reads once and
-    // compares against a fixed byte slice.
-    if query.follow && ws.is_none() {
-        match stream_container_logs(&pod, &container_name, &query).await {
-            Ok(stream) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "text/plain; charset=utf-8")
-                    .body(Body::from_stream(stream))
-                    .unwrap());
-            }
-            Err(e) => {
-                info!(
-                    "Failed to open follow log stream, falling back to buffered: {}",
-                    e
-                );
-                // fall through to the buffered path below
-            }
-        }
-    }
+    // Build the upstream-faithful kubelet containerLogs URL.
+    let target_url = build_kubelet_stream_url(
+        &conn,
+        "containerLogs",
+        &namespace,
+        &name,
+        &container,
+        &raw_query,
+    );
+    info!(
+        "Proxying logs {}/{} to kubelet: {}",
+        namespace, name, target_url
+    );
 
-    // Get logs from the container runtime. Never fabricate output: a failure to
-    // read the real container logs must surface as an error so clients (and the
-    // e2e framework, which retries on error) do not receive synthetic content
-    // masquerading as the container's stdout/stderr.
-    let logs = get_container_logs(&pod, &container_name, &query)
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                "Failed to get container logs for {}/{}: {}",
-                pod.metadata.name,
-                container_name,
-                e
-            );
-            Error::Internal(format!("unable to retrieve container logs: {e}"))
-        })?;
+    // Plain HTTP proxy (non-upgrade) — handles both follow and non-follow since
+    // the kubelet log endpoint is plain HTTP (no WebSocket / SPDY upgrade).
+    Ok(rusternetes_streamproxy::proxy_stream(target_url, req).await)
+}
 
-    // If WebSocket upgrade requested, send logs as the upstream Kubernetes
-    // log-subresource websocket subprotocols expect.
-    //
-    // Logs are a single read-only byte stream, so the canonical subprotocols
-    // are `binary.k8s.io` (raw bytes — the exact bytes written to the stream,
-    // no channel byte prefix) and `base64.binary.k8s.io` (base64-encoded raw).
-    // The multi-stream `channel.k8s.io` / `v4.channel.k8s.io` /
-    // `v5.channel.k8s.io` family is reserved for exec / attach, where
-    // stdin/stdout/stderr/err/resize need to be multiplexed onto one socket.
-    //
-    // Upstream's `Pods should support retrieving logs from the container over
-    // websockets` test (pods.go:583) negotiates ONLY `binary.k8s.io` and
-    // asserts the accumulated bytes equal the raw log payload — a channel-1
-    // prefix would corrupt the first byte and fail the assertion.
-    //
-    // K8s ref: pkg/registry/core/pod/rest/log.go (LogREST) +
-    //          staging/.../wsstream/stream.go (binaryWebSocketProtocol).
-    if let Some(ws) = ws {
-        let logs_clone = logs.clone();
-        Ok(ws
-            .protocols(["binary.k8s.io", "base64.binary.k8s.io"])
-            .on_upgrade(move |socket| async move {
-                streaming::handle_ws_logs(socket, logs_clone).await;
-            }))
+/// Build the kubelet stream URL for an exec or attach subresource.
+///
+/// Upstream: `pkg/registry/core/pod/strategy.go::streamLocation` builds
+/// `/{kind}/{ns}/{pod}/{container}?<raw_query>` on the pod's node and
+/// upgrade-proxies.  We replicate that exact shape here.
+pub fn build_kubelet_stream_url(
+    conn: &NodeConn,
+    kind: &str,
+    ns: &str,
+    pod: &str,
+    container: &str,
+    raw_query: &str,
+) -> Uri {
+    let path = format!("/{kind}/{ns}/{pod}/{container}");
+    let uri_str = if raw_query.is_empty() {
+        format!("{}://{}:{}{}", conn.scheme, conn.host, conn.port, path)
     } else {
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .body(Body::from(logs))
-            .unwrap())
-    }
-}
-
-/// Convert a [`LogsQuery`] into the [`LogReadOptions`](crate::cri_exec::LogReadOptions)
-/// the CRI log reader uses, resolving `sinceSeconds`/`sinceTime` to an absolute
-/// Unix-epoch bound.
-fn log_read_options(query: &LogsQuery) -> crate::cri_exec::LogReadOptions {
-    let mut opts = crate::cri_exec::LogReadOptions {
-        timestamps: query.timestamps,
-        tail_lines: query.tail_lines,
-        limit_bytes: query.limit_bytes,
-        since_unix: None,
+        format!(
+            "{}://{}:{}{}?{}",
+            conn.scheme, conn.host, conn.port, path, raw_query
+        )
     };
-
-    // K8s sinceSeconds is a relative duration (seconds ago from now); resolve
-    // it to an absolute Unix-epoch bound. sinceTime is already absolute.
-    if let Some(since_seconds) = query.since_seconds {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        opts.since_unix = Some(now - since_seconds);
-    }
-    if let Some(ref since_time) = query.since_time {
-        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(since_time) {
-            opts.since_unix = Some(parsed.timestamp());
-        }
-    }
-    opts
-}
-
-/// Get real logs from the container runtime via CRI.
-///
-/// Resolves the named container to its CRI container id, reads the runtime's
-/// container log file ([`resolve_log_path`](crate::cri_exec::resolve_log_path)),
-/// and parses the CRI log line format into the raw bytes the API returns —
-/// honoring `timestamps`, `tailLines`, `limitBytes`, `sinceSeconds`/`sinceTime`.
-async fn get_container_logs(
-    pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
-) -> anyhow::Result<String> {
-    let mut cri = crate::cri_exec::connect().await?;
-
-    let container_id = crate::cri_exec::resolve_container_id(&mut cri, pod, container_name)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no container {} found for pod {}",
-                container_name,
-                pod.metadata.name
-            )
-        })?;
-
-    let Some(log_path) = crate::cri_exec::resolve_log_path(&mut cri, pod, &container_id).await?
-    else {
-        tracing::debug!(
-            "CRI reported no log_path for container {} of pod {}",
-            container_name,
-            pod.metadata.name
-        );
-        return Ok(String::new());
-    };
-
-    let opts = log_read_options(query);
-    let bytes = crate::cri_exec::read_log_file(&log_path, &opts)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Streaming variant of [`get_container_logs`] used when the client requests
-/// `follow=true`. Returns a byte stream that stays open and tails the CRI
-/// container log file, polling for appended output, so incremental log lines
-/// reach the client without the EOF-then-reconnect loop hydrophone fell into.
-///
-/// `limit_bytes` is not enforced on this path — the upstream conformance
-/// tests that exercise follow don't set it, and the cost of tracking a
-/// running byte count through a generic boxed stream isn't worth it.
-async fn stream_container_logs(
-    pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
-) -> anyhow::Result<impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>>
-{
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut cri = crate::cri_exec::connect().await?;
-    let container_id = crate::cri_exec::resolve_container_id(&mut cri, pod, container_name)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no container {} found for pod {}",
-                container_name,
-                pod.metadata.name
-            )
-        })?;
-    let log_path = crate::cri_exec::resolve_log_path(&mut cri, pod, &container_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "CRI reported no log_path for container {} of pod {}",
-                container_name,
-                pod.metadata.name
-            )
-        })?;
-
-    let opts = log_read_options(query);
-    let timestamps = opts.timestamps;
-    let since_unix = opts.since_unix;
-
-    // First emit the existing contents (honoring tail/since), then tail the
-    // file for new lines. `async_stream` lets us poll the file from inside the
-    // stream so the HTTP response body stays open until the container exits.
-    let stream = async_stream::stream! {
-        // Initial backlog read (tail/since honored by read_log_file). A read
-        // error here is NOT fatal: the container may have only just started and
-        // containerd may not have created the log file yet. Yielding an Err
-        // would make hyper reset the HTTP/2 stream (RST_STREAM, INTERNAL_ERROR),
-        // which clients like hydrophone treat as a hard failure rather than a
-        // retryable empty read. Instead, emit nothing and fall through to the
-        // tail loop, which waits for the file to appear.
-        match crate::cri_exec::read_log_file(&log_path, &opts) {
-            Ok(bytes) if !bytes.is_empty() => {
-                yield Ok(bytes::Bytes::from(bytes));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(
-                    "follow log backlog read failed for {} (container may not have written yet): {}",
-                    log_path.display(),
-                    e
-                );
-            }
-        }
-
-        // Seek to end of file and tail. Re-open on each tick so a rotated /
-        // recreated log file is picked up.
-        let mut offset: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
-        let mut carry: Vec<u8> = Vec::new();
-        // Whether the log file has ever existed. Before it appears, a missing
-        // file means "container hasn't logged yet" (keep waiting); after it has
-        // appeared, a missing file means the container/log was removed (stop).
-        let mut seen_file = std::fs::metadata(&log_path).is_ok();
-        // Bound the pre-first-appearance wait so a container that exits without
-        // ever producing a log file ends the stream cleanly (EOF) instead of
-        // tailing a path that will never exist.
-        let mut waited_ticks: u32 = 0;
-        const MAX_PRE_FILE_TICKS: u32 = 240; // 240 * 500ms = 120s
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let len = match std::fs::metadata(&log_path) {
-                Ok(m) => { seen_file = true; m.len() }
-                Err(_) if !seen_file => {
-                    // Log file not created yet — keep waiting, up to the bound.
-                    waited_ticks += 1;
-                    if waited_ticks >= MAX_PRE_FILE_TICKS { break; }
-                    continue;
-                }
-                Err(_) => break, // file existed then vanished — container removed; end stream
-            };
-            if len < offset {
-                // File truncated/rotated — restart from the beginning.
-                offset = 0;
-                carry.clear();
-            }
-            if len == offset {
-                continue;
-            }
-            let mut f = match std::fs::File::open(&log_path) {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            if f.seek(SeekFrom::Start(offset)).is_err() {
-                break;
-            }
-            let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_err() {
-                break;
-            }
-            offset = len;
-            carry.extend_from_slice(&buf);
-
-            // Only parse up to the last complete line; keep any partial tail.
-            let last_nl = carry.iter().rposition(|&b| b == b'\n');
-            let Some(idx) = last_nl else { continue };
-            let complete: Vec<u8> = carry.drain(..=idx).collect();
-
-            let mut out = Vec::new();
-            for line in complete.split(|&b| b == b'\n') {
-                if line.is_empty() {
-                    continue;
-                }
-                let parsed = crate::cri_exec::parse_cri_log_line(line);
-                if let Some(since) = since_unix {
-                    if let Some(ts) = parsed.timestamp_unix {
-                        if ts < since {
-                            continue;
-                        }
-                    }
-                }
-                if timestamps && !parsed.timestamp_prefix.is_empty() {
-                    out.extend_from_slice(parsed.timestamp_prefix.as_bytes());
-                }
-                out.extend_from_slice(&parsed.message);
-            }
-            if !out.is_empty() {
-                yield Ok(bytes::Bytes::from(out));
-            }
-        }
-    };
-
-    Ok(stream)
+    uri_str.parse().expect("kubelet stream URL is always valid")
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec
-/// Execute a command in a container (supports both SPDY and WebSocket)
+///
+/// Proxies exec to the pod's kubelet using an upgrade-aware reverse proxy.
+/// Mirrors `pkg/registry/core/pod/strategy.go::streamLocation`.
 pub async fn exec(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
-    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Result<Response> {
-    // Parse query params manually because `command` can appear multiple times
-    // (e.g., ?command=/bin/sh&command=-c&command=echo+hello) which serde's
-    // query deserializer can't handle as Vec<String>.
-    let raw_query = req.uri().query().unwrap_or("");
+    let raw_query = req.uri().query().unwrap_or("").to_string();
+
+    // Parse query params to build webhook admission object (command/container).
     let query = {
         let mut command = Vec::new();
         let mut container = None;
@@ -518,26 +257,7 @@ pub async fn exec(
         }
     };
 
-    // Log request headers for debugging exec protocol
-    let upgrade_header = req
-        .headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("none");
-    let connection_header = req
-        .headers()
-        .get("connection")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("none");
-    let sec_ws_protocol = req
-        .headers()
-        .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("none");
-    info!(
-        "Exec {}/{}: cmd={:?} upgrade={} connection={} ws-protocol={}",
-        namespace, name, query.command, upgrade_header, connection_header, sec_ws_protocol
-    );
+    info!("Exec {}/{}: cmd={:?}", namespace, name, query.command);
 
     // Save user info for webhook check before auth moves ownership
     let webhook_user_info = rusternetes_common::admission::UserInfo {
@@ -560,8 +280,6 @@ pub async fn exec(
     }
 
     // Run admission webhooks for Connect operation (exec)
-    // K8s passes PodExecOptions as the admission object so webhooks can
-    // inspect what command is being run and what streams are requested.
     {
         use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
         let gvk = GroupVersionKind {
@@ -574,7 +292,6 @@ pub async fn exec(
             version: "v1".to_string(),
             resource: "pods/exec".to_string(),
         };
-        // Build PodExecOptions object matching K8s schema
         let exec_options = serde_json::json!({
             "apiVersion": "v1",
             "kind": "PodExecOptions",
@@ -606,15 +323,27 @@ pub async fn exec(
         }
     }
 
-    // Get the pod
+    // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
-    // Determine which container to exec into
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidResource(format!(
+                "pod {}/{} has not been assigned to a node",
+                namespace, name
+            ))
+        })?
+        .to_string();
+
+    // Resolve the container name (default to first container).
     let container_name = if let Some(ref container) = query.container {
         container.clone()
     } else {
-        // If no container specified, use the first container
         pod.spec
             .as_ref()
             .and_then(|spec| spec.containers.first())
@@ -622,144 +351,45 @@ pub async fn exec(
             .ok_or_else(|| Error::InvalidResource("Pod has no containers".to_string()))?
     };
 
-    // Verify the container exists in regular, init, or ephemeral containers
-    let container_exists = pod
-        .spec
-        .as_ref()
-        .map(|spec| {
-            spec.containers.iter().any(|c| c.name == container_name)
-                || spec
-                    .init_containers
-                    .as_ref()
-                    .map(|ics| ics.iter().any(|c| c.name == container_name))
-                    .unwrap_or(false)
-                || spec
-                    .ephemeral_containers
-                    .as_ref()
-                    .map(|ecs| ecs.iter().any(|c| c.name == container_name))
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false);
+    // Fetch the node and resolve kubelet connection parameters.
+    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let conn = node_conn(&node, None)?;
 
-    if !container_exists {
-        return Err(Error::NotFound(format!(
-            "Container {} not found in pod {}/{}",
-            container_name, namespace, name
-        )));
-    }
-
-    // Handle WebSocket upgrade if requested
-    if let Some(ws) = ws {
-        info!("Upgrading exec to WebSocket for pod {}/{}", namespace, name);
-        // Accept the v5.channel.k8s.io subprotocol for Kubernetes exec
-        // Detect which protocol the client requested. v1 (channel.k8s.io) doesn't
-        // use channel 3 for status; v4/v5 do. We need to tell the handler.
-        let is_v1_protocol = sec_ws_protocol == "channel.k8s.io"
-            || (!sec_ws_protocol.contains("v4.channel") && !sec_ws_protocol.contains("v5.channel"));
-        return Ok(ws
-            .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
-            .on_upgrade(move |socket| {
-                streaming::handle_exec_websocket_with_protocol(
-                    socket,
-                    pod,
-                    container_name,
-                    query.command,
-                    query.stdin,
-                    query.stdout,
-                    query.stderr,
-                    query.tty,
-                    is_v1_protocol,
-                )
-            })
-            .into_response());
-    }
-
-    // SPDY upgrade (older kubectl / client-go SPDY executor): bridge to the CRI
-    // exec stream over the real SPDY/3.1 codec (#1264).
-    if spdy::is_spdy_request(&req) {
-        info!("Upgrading exec to SPDY for pod {}/{}", namespace, name);
-        let response = spdy::create_spdy_upgrade_response()
-            .map_err(|e| Error::Internal(format!("Failed to create SPDY upgrade response: {e}")))?;
-        tokio::spawn(async move {
-            match hyper::upgrade::on(req).await {
-                Ok(upgraded) => {
-                    let io = hyper_util::rt::TokioIo::new(upgraded);
-                    crate::spdy3_handlers::handle_spdy3_exec(
-                        io,
-                        pod,
-                        container_name,
-                        query.command,
-                        query.stdin,
-                        query.stdout,
-                        query.stderr,
-                        query.tty,
-                    )
-                    .await;
-                }
-                Err(e) => tracing::error!("exec SPDY upgrade failed: {e}"),
-            }
-        });
-        return Ok(response.into_response());
-    }
-
-    // Plain HTTP (no upgrade): one-shot exec, return collected output as the body.
+    // Build the upstream-faithful kubelet exec URL.
+    let target_url = build_kubelet_stream_url(
+        &conn,
+        "exec",
+        &namespace,
+        &name,
+        &container_name,
+        &raw_query,
+    );
     info!(
-        "Direct exec for pod {}/{}: {:?}",
-        namespace, name, query.command
+        "Proxying exec {}/{} to kubelet: {}",
+        namespace, name, target_url
     );
 
-    // Run the command one-shot via CRI ExecSync and collect stdout/stderr +
-    // exit code. (The SPDY/plain-HTTP path was never interactive — it always
-    // collected output one-shot — so ExecSync is a faithful replacement.)
-    let mut cri = crate::cri_exec::connect()
-        .await
-        .map_err(|e| Error::Internal(format!("CRI connect: {e}")))?;
-
-    let container_id = crate::cri_exec::resolve_container_id(&mut cri, &pod, &container_name)
-        .await
-        .map_err(|e| Error::Internal(format!("CRI resolve container: {e}")))?
-        .ok_or_else(|| {
-            Error::NotFound(format!(
-                "no running container {} found for pod {}/{}",
-                container_name, namespace, name
-            ))
-        })?;
-
-    let (stdout_data, stderr_data, exit_code) =
-        crate::cri_exec::exec_sync(&mut cri, &container_id, &query.command, 60)
-            .await
-            .map_err(|e| Error::Internal(format!("CRI exec: {e}")))?;
-
-    // Return as Kubernetes-compatible exec response
-    // For SPDY clients: return 101 Switching Protocols with the output
-    // This isn't proper SPDY but gives kubectl something to parse
-    // Return exec output as plain HTTP response
-    let mut output_str = String::from_utf8_lossy(&stdout_data).to_string();
-    if !stderr_data.is_empty() {
-        output_str.push_str(&String::from_utf8_lossy(&stderr_data));
-    }
-    Ok(Response::builder()
-        .status(if exit_code == 0 {
-            StatusCode::OK
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
-        .header("Content-Type", "text/plain")
-        .body(Body::from(output_str))
-        .unwrap())
+    // Upgrade-proxy the request to the kubelet (handles SPDY, WebSocket, and plain HTTP).
+    // The WebSocket upgrade (if any) is handled transparently by proxy_upgrade via the
+    // raw hyper OnUpgrade future; we don't need to handle it separately.
+    Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/attach
-/// Attach to a running container (supports both SPDY and WebSocket)
+///
+/// Proxies attach to the pod's kubelet using an upgrade-aware reverse proxy.
+/// Mirrors `pkg/registry/core/pod/strategy.go::streamLocation`.
 pub async fn attach(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<AttachQuery>,
-    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Result<Response> {
     info!("Attaching to pod {}/{}", namespace, name);
+
+    let raw_query = req.uri().query().unwrap_or("").to_string();
 
     // Save user info for webhook check before auth moves ownership
     let webhook_user_info = rusternetes_common::admission::UserInfo {
@@ -781,54 +411,7 @@ pub async fn attach(
         }
     }
 
-    // Get the pod
-    let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
-    let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
-
-    // Determine which container to attach to
-    let container_name = if let Some(ref container) = query.container {
-        container.clone()
-    } else {
-        // If no container specified, use the first container
-        pod.spec
-            .as_ref()
-            .and_then(|spec| spec.containers.first())
-            .map(|c| c.name.clone())
-            .ok_or_else(|| Error::InvalidResource("Pod has no containers".to_string()))?
-    };
-
-    // Verify the container exists in regular, init, or ephemeral containers
-    let container_exists = pod
-        .spec
-        .as_ref()
-        .map(|spec| {
-            spec.containers.iter().any(|c| c.name == container_name)
-                || spec
-                    .init_containers
-                    .as_ref()
-                    .map(|ics| ics.iter().any(|c| c.name == container_name))
-                    .unwrap_or(false)
-                || spec
-                    .ephemeral_containers
-                    .as_ref()
-                    .map(|ecs| ecs.iter().any(|c| c.name == container_name))
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false);
-
-    if !container_exists {
-        return Err(Error::NotFound(format!(
-            "Container {} not found in pod {}/{}",
-            container_name, namespace, name
-        )));
-    }
-
     // Run admission webhooks for Connect operation (attach)
-    // K8s validates attach requests through admission webhooks the same as exec.
-    // The GVR resource must include the subresource (pods/attach) so that webhook
-    // rules matching "pods/attach" or "pods/*" are correctly triggered.
-    // K8s passes PodAttachOptions as the admission object so webhooks can inspect
-    // which container is being attached to and what streams are requested.
     {
         use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
         let gvk = GroupVersionKind {
@@ -841,7 +424,6 @@ pub async fn attach(
             version: "v1".to_string(),
             resource: "pods/attach".to_string(),
         };
-        // Build PodAttachOptions object matching K8s schema
         let attach_options = serde_json::json!({
             "apiVersion": "v1",
             "kind": "PodAttachOptions",
@@ -872,73 +454,57 @@ pub async fn attach(
         }
     }
 
-    // Check if this is a SPDY upgrade request (kubectl uses SPDY)
-    if spdy::is_spdy_request(&req) {
-        info!(
-            "Upgrading attach to SPDY for pod {}/{} (kubectl compatibility)",
-            namespace, name
-        );
+    // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
+    let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
+    let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
-        // Create SPDY upgrade response
-        let response = spdy::create_spdy_upgrade_response().map_err(|e| {
-            Error::Internal(format!("Failed to create SPDY upgrade response: {}", e))
-        })?;
-
-        // Spawn task to handle SPDY connection after upgrade
-        tokio::spawn(async move {
-            match spdy::upgrade_to_spdy(req).await {
-                Ok(spdy_conn) => {
-                    spdy_handlers::handle_spdy_attach(
-                        spdy_conn,
-                        pod,
-                        container_name,
-                        query.stdin,
-                        query.stdout,
-                        query.stderr,
-                        query.tty,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upgrade to SPDY: {}", e);
-                }
-            }
-        });
-
-        return Ok(response.into_response());
-    }
-
-    // Handle WebSocket upgrade if requested
-    if let Some(ws) = ws {
-        info!(
-            "Upgrading attach to WebSocket for pod {}/{}",
-            namespace, name
-        );
-        Ok(ws
-            .on_upgrade(move |socket| {
-                streaming::handle_attach_websocket(
-                    socket,
-                    pod,
-                    container_name,
-                    query.stdin,
-                    query.stdout,
-                    query.stderr,
-                    query.tty,
-                )
-            })
-            .into_response())
-    } else {
-        // No upgrade requested - return error
-        Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "text/plain")
-            .body(Body::from(
-                "Attach requires protocol upgrade (SPDY or WebSocket). Use:\n\
-                - kubectl (uses SPDY automatically)\n\
-                - WebSocket protocol for custom clients\n",
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidResource(format!(
+                "pod {}/{} has not been assigned to a node",
+                namespace, name
             ))
-            .unwrap())
-    }
+        })?
+        .to_string();
+
+    // Resolve the container name (default to first container).
+    let container_name = if let Some(ref container) = query.container {
+        container.clone()
+    } else {
+        pod.spec
+            .as_ref()
+            .and_then(|spec| spec.containers.first())
+            .map(|c| c.name.clone())
+            .ok_or_else(|| Error::InvalidResource("Pod has no containers".to_string()))?
+    };
+
+    // Fetch the node and resolve kubelet connection parameters.
+    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let conn = node_conn(&node, None)?;
+
+    // Build the upstream-faithful kubelet attach URL.
+    let target_url = build_kubelet_stream_url(
+        &conn,
+        "attach",
+        &namespace,
+        &name,
+        &container_name,
+        &raw_query,
+    );
+    info!(
+        "Proxying attach {}/{} to kubelet: {}",
+        namespace, name, target_url
+    );
+
+    // Upgrade-proxy the request to the kubelet (handles SPDY, WebSocket, and plain HTTP).
+    // Suppress the unused `ws` warning — the upgrade is handled transparently by
+    // proxy_upgrade via the raw hyper OnUpgrade future.
+    Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/portforward
@@ -2262,5 +1828,85 @@ mod tests {
         };
         // 50% of 10 = 5
         assert_eq!(compute_pdb_desired_healthy(&pdb, 10), 5);
+    }
+
+    #[test]
+    fn exec_kubelet_url_matches_upstream_shape() {
+        let u = build_kubelet_stream_url(
+            &NodeConn {
+                host: "10.0.0.5".into(),
+                port: 10250,
+                scheme: "http",
+            },
+            "exec",
+            "ns1",
+            "pod1",
+            "c1",
+            "command=id&tty=false&stdin=false&stdout=true&stderr=true",
+        );
+        assert_eq!(
+            u.to_string(),
+            "http://10.0.0.5:10250/exec/ns1/pod1/c1?command=id&tty=false&stdin=false&stdout=true&stderr=true"
+        );
+    }
+
+    #[test]
+    fn attach_kubelet_url_matches_upstream_shape() {
+        let u = build_kubelet_stream_url(
+            &NodeConn {
+                host: "192.168.1.10".into(),
+                port: 10250,
+                scheme: "http",
+            },
+            "attach",
+            "default",
+            "my-pod",
+            "main",
+            "stdin=true&stdout=true",
+        );
+        assert_eq!(
+            u.to_string(),
+            "http://192.168.1.10:10250/attach/default/my-pod/main?stdin=true&stdout=true"
+        );
+    }
+
+    #[test]
+    fn kubelet_url_no_query() {
+        let u = build_kubelet_stream_url(
+            &NodeConn {
+                host: "10.0.0.1".into(),
+                port: 10250,
+                scheme: "http",
+            },
+            "exec",
+            "kube-system",
+            "coredns",
+            "coredns",
+            "",
+        );
+        assert_eq!(
+            u.to_string(),
+            "http://10.0.0.1:10250/exec/kube-system/coredns/coredns"
+        );
+    }
+
+    #[test]
+    fn logs_kubelet_url_uses_containerlogs_path() {
+        let u = build_kubelet_stream_url(
+            &NodeConn {
+                host: "10.0.0.6".into(),
+                port: 10250,
+                scheme: "http",
+            },
+            "containerLogs",
+            "ns1",
+            "pod1",
+            "c1",
+            "tailLines=5&follow=false",
+        );
+        assert_eq!(
+            u.to_string(),
+            "http://10.0.0.6:10250/containerLogs/ns1/pod1/c1?tailLines=5&follow=false"
+        );
     }
 }

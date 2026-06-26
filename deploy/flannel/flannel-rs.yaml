@@ -126,7 +126,7 @@ spec:
         image: ghcr.io/indyjonesnl/flannel-rs:v0.1.2
         imagePullPolicy: IfNotPresent
         securityContext:
-          privileged: false
+          privileged: true
           capabilities:
             add: ["NET_ADMIN", "NET_RAW"]
         env:
@@ -147,12 +147,15 @@ spec:
       - name: run
         hostPath:
           path: /run/flannel
+          type: DirectoryOrCreate
       - name: cni-plugin
         hostPath:
           path: /opt/cni/bin
+          type: DirectoryOrCreate
       - name: cni
         hostPath:
           path: /etc/cni/net.d
+          type: DirectoryOrCreate
       - name: flannel-cfg
         configMap:
           name: kube-flannel-cfg

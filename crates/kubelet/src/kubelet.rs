@@ -183,6 +183,10 @@ pub struct Kubelet {
     node_name: String,
     storage: Arc<StorageBackend>,
     runtime: Arc<CriContainerRuntime>,
+    /// `containerRuntimeVersion` reported in NodeStatus, resolved once at startup
+    /// from the CRI Version RPC (`<runtime_name>://<runtime_version>`), not a
+    /// hardcoded literal. Falls back to `"unknown"` if the handshake fails.
+    container_runtime_version: String,
     sync_interval: Duration,
     /// Filesystem path used for `statvfs` when computing nodefs eviction stats.
     /// Defaults to `/var/lib/kubelet` when not provided.
@@ -435,6 +439,22 @@ impl Kubelet {
             .with_service_host(service_host, "443")
             .with_cluster_dns(&cluster_dns, &cluster_domain);
 
+        // Resolve the runtime identity once via the CRI Version RPC so
+        // NodeStatus reports the runtime actually behind CONTAINER_RUNTIME_ENDPOINT
+        // (e.g. containerd-rs://0.1.2) instead of a hardcoded literal.
+        let container_runtime_version = match runtime.runtime_version_string().await {
+            Ok(s) => {
+                info!("CRI runtime: {s} (endpoint {socket})");
+                s
+            }
+            Err(e) => {
+                warn!(
+                    "CRI Version RPC failed at {socket} ({e}); reporting containerRuntimeVersion as 'unknown'"
+                );
+                "unknown".to_string()
+            }
+        };
+
         // Log the resolved statvfs path once so operators can see which
         // mount we're measuring for eviction. Upstream cadvisor logs this
         // in `fs.go::GetFsInfoForPath`.
@@ -444,6 +464,7 @@ impl Kubelet {
             node_name,
             storage,
             runtime: Arc::new(runtime),
+            container_runtime_version,
             sync_interval: Duration::from_secs(sync_interval_secs),
             eviction_root_dir,
             eviction_manager: Mutex::new(eviction_manager),
@@ -923,7 +944,7 @@ impl Kubelet {
                 boot_id: format!("rusternetes-{}", self.node_name),
                 kernel_version: "6.1.0-rusternetes".to_string(),
                 os_image: "Rusternetes OS".to_string(),
-                container_runtime_version: "containerd://1.7.0".to_string(),
+                container_runtime_version: self.container_runtime_version.clone(),
                 kubelet_version: "v1.35.0-rusternetes".to_string(),
                 kube_proxy_version: "v1.35.0-rusternetes".to_string(),
                 operating_system: "linux".to_string(),
@@ -1081,7 +1102,7 @@ impl Kubelet {
                     boot_id: format!("rusternetes-{}", self.node_name),
                     kernel_version: "6.1.0-rusternetes".to_string(),
                     os_image: "Rusternetes OS".to_string(),
-                    container_runtime_version: "containerd://1.7.0".to_string(),
+                    container_runtime_version: self.container_runtime_version.clone(),
                     kubelet_version: "v1.35.0-rusternetes".to_string(),
                     kube_proxy_version: "v1.35.0-rusternetes".to_string(),
                     operating_system: "linux".to_string(),

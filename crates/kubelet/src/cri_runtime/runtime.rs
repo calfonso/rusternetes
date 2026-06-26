@@ -167,6 +167,17 @@ impl CriContainerRuntime {
         })
     }
 
+    /// Query the CRI runtime's identity (Version RPC) and format it as the
+    /// k8s `containerRuntimeVersion` string `<runtime_name>://<runtime_version>`
+    /// (e.g. `containerd-rs://0.1.2`). Reflects whichever runtime the configured
+    /// `CONTAINER_RUNTIME_ENDPOINT` actually points at, rather than a hardcoded
+    /// literal.
+    pub async fn runtime_version_string(&self) -> Result<String> {
+        let mut cri = self.cri.clone();
+        let v = cri.version().await?;
+        Ok(format_runtime_version(&v))
+    }
+
     /// Set the `kubernetes` Service host:port injected as KUBERNETES_SERVICE_*
     /// env into pods (defaults to 10.96.0.1:443).
     #[must_use]
@@ -1572,11 +1583,30 @@ fn service_env_vars(host: &str, port: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// Format a CRI `VersionResponse` as the k8s `containerRuntimeVersion`
+/// (`<runtime_name>://<runtime_version>`).
+fn format_runtime_version(v: &v1::VersionResponse) -> String {
+    format!("{}://{}", v.runtime_name, v.runtime_version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::resources::pod::PodSpec;
     use std::collections::HashMap;
+
+    #[test]
+    fn runtime_version_string_uses_cri_name_and_version() {
+        // The k8s `containerRuntimeVersion` is `<runtime_name>://<runtime_version>`,
+        // sourced from the CRI Version RPC — never a hardcoded literal.
+        let v = v1::VersionResponse {
+            version: "0.1.0".to_string(),
+            runtime_name: "containerd-rs".to_string(),
+            runtime_version: "0.1.2".to_string(),
+            runtime_api_version: "v1".to_string(),
+        };
+        assert_eq!(format_runtime_version(&v), "containerd-rs://0.1.2");
+    }
 
     #[test]
     fn find_container_searches_regular_and_init() {

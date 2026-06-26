@@ -4359,6 +4359,7 @@ dependencies = [
  "rusternetes-middleware",
  "rusternetes-protobuf",
  "rusternetes-storage",
+ "rusternetes-streamproxy",
  "rusternetes-test-support",
  "rustls 0.23.40",
  "serde",
@@ -4505,15 +4506,20 @@ dependencies = [
 name = "rusternetes-cri"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
  "hyper-util",
  "prost",
  "prost-types",
+ "rusternetes-common",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.21.0",
  "tonic",
  "tonic-build",
  "tower 0.4.13",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4605,8 +4611,10 @@ name = "rusternetes-kubelet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "futures",
@@ -4621,6 +4629,7 @@ dependencies = [
  "rusternetes-cri",
  "rusternetes-netstack",
  "rusternetes-storage",
+ "rusternetes-streamproxy",
  "rustix 0.38.44",
  "serde",
  "serde_json",
@@ -4742,6 +4751,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rusternetes-streamproxy"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper 1.9.0",
+ "hyper-util",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
