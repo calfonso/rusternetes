@@ -266,8 +266,10 @@ async fn exec_proxy(
             cmd: params.command.clone(),
             tty: params.tty,
             stdin: params.stdin,
-            stdout: true,
-            stderr: !params.tty,
+            stdout: params.stdout,
+            // stderr is not multiplexed under a tty (the pty merges it into
+            // stdout), matching the kubelet/remotecommand contract.
+            stderr: params.stderr && !params.tty,
         })
         .await
     {
@@ -351,8 +353,8 @@ async fn attach_proxy(
             container_id: container_id.clone(),
             stdin: params.stdin,
             tty: params.tty,
-            stdout: true,
-            stderr: !params.tty,
+            stdout: params.stdout,
+            stderr: params.stderr && !params.tty,
         })
         .await
     {
