@@ -56,6 +56,8 @@ sudo dnf install -y \
     make \
     openssl-devel \
     pkg-config \
+    protobuf-compiler \
+    protobuf-devel \
     lsof
 ```
 

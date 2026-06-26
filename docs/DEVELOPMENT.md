@@ -5,6 +5,10 @@ How to build, test, and run Rusternetes locally.
 ## Prerequisites
 
 - **Rust** (latest stable, via [rustup](https://rustup.rs))
+- **Protocol Buffers compiler** — required for building the API server
+  - Fedora/RHEL: `sudo dnf install -y protobuf-compiler protobuf-devel`
+  - Debian/Ubuntu: `sudo apt install -y protobuf-compiler`
+  - macOS: `brew install protobuf`
 - **Container runtime** — Docker or Podman (see [Container Runtime Setup](#container-runtime-setup) below)
 - **Compose tool** — `docker-compose` and/or `podman-compose` for orchestrating the cluster
 

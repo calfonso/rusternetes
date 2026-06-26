@@ -165,6 +165,8 @@ install_system_packages() {
         make \
         openssl-devel \
         pkg-config \
+        protobuf-compiler \
+        protobuf-devel \
         lsof \
         gettext
 

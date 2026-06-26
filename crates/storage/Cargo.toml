@@ -12,7 +12,7 @@ redis = ["dep:rhino"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
-rhino = { path = "../../../rhino", optional = true }
+rhino = { git = "https://github.com/calfonso/rhino", branch = "main", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

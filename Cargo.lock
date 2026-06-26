@@ -3570,6 +3570,7 @@ dependencies = [
 [[package]]
 name = "rhino"
 version = "0.1.0"
+source = "git+https://github.com/calfonso/rhino?branch=main#7f2bd02ca55eab4f6d9dbeef50e29bd993412c95"
 dependencies = [
  "async-stream",
  "async-trait",

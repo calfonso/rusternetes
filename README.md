@@ -64,6 +64,15 @@ Rusternetes supports multiple deployment modes from the same codebase:
 
 The all-in-one mode is built for environments where a full K8s cluster is overkill: edge devices, CI/CD pipelines, local development, IoT gateways, embedded systems, and air-gapped environments.
 
+## Prerequisites
+
+- **Rust** (latest stable) — install via [rustup.rs](https://rustup.rs/)
+- **Protocol Buffers compiler** — required for building the API server
+  - Fedora/RHEL: `sudo dnf install -y protobuf-compiler protobuf-devel`
+  - Debian/Ubuntu: `sudo apt install -y protobuf-compiler`
+  - macOS: `brew install protobuf`
+- **Container runtime** — Docker or Podman
+
 ## Quick Start
 
 ### Full cluster (Podman + etcd)

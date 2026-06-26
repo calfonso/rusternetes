@@ -5,6 +5,7 @@ Thank you for your interest in contributing to Rusternetes. This is a Rust reimp
 ## Prerequisites
 
 - Rust (stable toolchain)
+- Protocol Buffers compiler (`protobuf-compiler` + `protobuf-devel` on Fedora, `protobuf-compiler` on Debian/Ubuntu, `brew install protobuf` on macOS)
 - Docker and Docker Compose (for integration testing)
 - `make` (for convenience targets)
 
