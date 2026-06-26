@@ -19,7 +19,7 @@ services:
       - "--bind-address"
       - "0.0.0.0:6443"
       - "--etcd-servers"
-      - "http://etcd:2379"
+      - "http://rhino:2379"
       - "--tls"
       - "--tls-cert-file"
       - "/etc/kubernetes/pki/api-server.crt"
