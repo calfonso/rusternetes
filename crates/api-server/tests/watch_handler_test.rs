@@ -534,7 +534,7 @@ async fn test_watch_namespace_isolation() {
             selector: Some(std::collections::HashMap::new()),
             ports: vec![ServicePort {
                 name: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: 80,
                 target_port: None,
                 node_port: None,
@@ -581,7 +581,7 @@ async fn test_watch_namespace_isolation() {
             selector: Some(std::collections::HashMap::new()),
             ports: vec![ServicePort {
                 name: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: 80,
                 target_port: None,
                 node_port: None,

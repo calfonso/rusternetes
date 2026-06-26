@@ -84,14 +84,12 @@ fn is_valid_port_name(s: &str) -> bool {
 fn validate_port(port: &NetworkPolicyPort, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    if let Some(proto) = &port.protocol {
-        if !matches!(proto.as_str(), "TCP" | "UDP" | "SCTP") {
-            errs.push(Error::not_supported(
-                &fld_path.child("protocol"),
-                proto.clone(),
-                &["TCP", "UDP", "SCTP"],
-            ));
-        }
+    if !matches!(port.protocol.as_str(), "TCP" | "UDP" | "SCTP") {
+        errs.push(Error::not_supported(
+            &fld_path.child("protocol"),
+            port.protocol.clone(),
+            &["TCP", "UDP", "SCTP"],
+        ));
     }
 
     match &port.port {

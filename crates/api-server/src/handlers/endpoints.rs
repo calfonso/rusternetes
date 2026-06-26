@@ -55,8 +55,8 @@ pub async fn create_endpoints(
     for subset in endpoints.subsets.iter_mut() {
         if let Some(ports) = subset.ports.as_mut() {
             for p in ports.iter_mut() {
-                if p.protocol.is_none() {
-                    p.protocol = Some("TCP".to_string());
+                if p.protocol.is_empty() {
+                    p.protocol = "TCP".to_string();
                 }
             }
         }
@@ -258,8 +258,8 @@ pub async fn update_endpoints(
     for subset in endpoints.subsets.iter_mut() {
         if let Some(ports) = subset.ports.as_mut() {
             for p in ports.iter_mut() {
-                if p.protocol.is_none() {
-                    p.protocol = Some("TCP".to_string());
+                if p.protocol.is_empty() {
+                    p.protocol = "TCP".to_string();
                 }
             }
         }

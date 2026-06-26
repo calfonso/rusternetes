@@ -1731,7 +1731,7 @@ impl IptablesManager {
 
             for svc_port in &service.spec.ports {
                 let port = svc_port.port;
-                let proto = svc_port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
+                let proto = svc_port.protocol.to_lowercase();
 
                 // Find endpoints for this service+port.
                 // EndpointSlice ports are TARGET ports (container port), not service ports.
@@ -1894,7 +1894,7 @@ impl IptablesManager {
                     Some(np) if np > 0 => np,
                     _ => continue,
                 };
-                let proto = svc_port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
+                let proto = svc_port.protocol.to_lowercase();
                 let port = svc_port.port;
 
                 let svc_key = format!("{}/{}", namespace, service.metadata.name);
@@ -2076,7 +2076,7 @@ impl IptablesManager {
                     let Some(host_port) = port.host_port.filter(|hp| *hp > 0) else {
                         continue;
                     };
-                    let proto = port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
+                    let proto = port.protocol.to_lowercase();
                     let host_ip = port.host_ip.as_deref().unwrap_or("");
 
                     // Dedupe duplicate (port, proto, host_ip) tuples. The
@@ -2397,7 +2397,7 @@ mod tests {
                 name: None,
                 port: 80,
                 target_port: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -2477,7 +2477,7 @@ mod tests {
                 name: None,
                 port: 8080,
                 target_port: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -2528,7 +2528,7 @@ mod tests {
                 name: None,
                 port: 80,
                 target_port: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: Some(30080),
                 app_protocol: None,
             }],
@@ -2577,7 +2577,7 @@ mod tests {
                 name: None,
                 port: 80,
                 target_port: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -2624,7 +2624,7 @@ mod tests {
                 name: None,
                 port: 80,
                 target_port: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],

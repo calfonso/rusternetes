@@ -118,7 +118,7 @@ fn make_service(
             name: None,
             port: 80,
             target_port: None,
-            protocol: None,
+            protocol: "TCP".to_string(),
             node_port: None,
             app_protocol: None,
         }],

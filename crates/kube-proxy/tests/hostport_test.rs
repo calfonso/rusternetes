@@ -40,7 +40,7 @@ fn pod_with_hostport(
                 ports: Some(vec![ContainerPort {
                     container_port,
                     name: Some("http".to_string()),
-                    protocol: Some(protocol.to_string()),
+                    protocol: protocol.to_string(),
                     host_port: Some(host_port),
                     host_ip: None,
                 }]),

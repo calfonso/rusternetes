@@ -69,7 +69,7 @@ fn ready_slice(svc_ns: &str, svc_name: &str, port: i32, port_name: Option<&str>)
     slice.ports.push(ESEndpointPort {
         name: port_name.map(|s| s.to_string()),
         port: Some(port),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         app_protocol: None,
     });
     slice

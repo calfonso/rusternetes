@@ -2907,7 +2907,7 @@ mod tests {
                     name: None,
                     port: 443,
                     target_port: Some(IntOrString::Int(8443)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
@@ -2932,7 +2932,7 @@ mod tests {
         slice.ports = vec![EndpointPort {
             name: None,
             port: Some(8443),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             app_protocol: None,
         }];
         slice.endpoints = vec![Endpoint {

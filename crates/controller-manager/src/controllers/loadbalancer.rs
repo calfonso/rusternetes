@@ -463,7 +463,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                 .iter()
                 .map(|p| LoadBalancerPort {
                     name: p.name.clone(),
-                    protocol: p.protocol.clone().unwrap_or_else(|| "TCP".to_string()),
+                    protocol: p.protocol.clone(),
                     port: p.port,
                     node_port: p.node_port.unwrap(),
                 })

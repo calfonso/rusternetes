@@ -36,7 +36,7 @@ fn svc(name: &str, ns: &str, publish_not_ready: bool) -> Service {
                 name: None,
                 port: 80,
                 target_port: Some(IntOrString::Int(80)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -63,7 +63,7 @@ fn ready_pod(name: &str, ns: &str, pod_ip: &str) -> Pod {
                 ports: Some(vec![ContainerPort {
                     container_port: 80,
                     name: None,
-                    protocol: None,
+                    protocol: "TCP".to_string(),
                     host_port: None,
                     host_ip: None,
                 }]),

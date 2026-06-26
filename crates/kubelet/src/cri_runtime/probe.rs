@@ -37,7 +37,7 @@ mod tests {
             ports: Some(vec![ContainerPort {
                 container_port: 8080,
                 name: Some("http".to_string()),
-                protocol: None,
+                protocol: "TCP".to_string(),
                 host_port: None,
                 host_ip: None,
             }]),

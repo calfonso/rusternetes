@@ -38,9 +38,14 @@ pub struct LoadBalancerService {
     pub annotations: std::collections::HashMap<String, String>,
 }
 
+fn default_protocol() -> String {
+    "TCP".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadBalancerPort {
     pub name: Option<String>,
+    #[serde(default = "default_protocol")]
     pub protocol: String,
     pub port: u16,
     pub node_port: u16,

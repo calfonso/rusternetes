@@ -33,8 +33,8 @@ fn apply_networkpolicy_defaults(np: &mut rusternetes_common::resources::NetworkP
         |ports: &mut Option<Vec<rusternetes_common::resources::NetworkPolicyPort>>| {
             if let Some(ports) = ports {
                 for p in ports.iter_mut() {
-                    if p.protocol.is_none() {
-                        p.protocol = Some("TCP".to_string());
+                    if p.protocol.is_empty() {
+                        p.protocol = "TCP".to_string();
                     }
                 }
             }

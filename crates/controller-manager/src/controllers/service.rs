@@ -670,7 +670,7 @@ mod tests {
                     name: Some("http".to_string()),
                     port: 80,
                     target_port: Some(IntOrString::Int(8080)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
@@ -745,7 +745,7 @@ mod tests {
                     name: Some("http".to_string()),
                     port: 80,
                     target_port: Some(IntOrString::Int(8080)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None, // Should be allocated
                     app_protocol: None,
                 }],

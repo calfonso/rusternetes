@@ -96,7 +96,7 @@ async fn test_proxy_service_missing_clusterip() {
                 name: Some("http".to_string()),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -286,7 +286,7 @@ async fn test_proxy_pod_named_port_storage_round_trip() {
                 ports: Some(vec![ContainerPort {
                     container_port: 8080,
                     name: Some("http".to_string()),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     host_port: None,
                     host_ip: None,
                 }]),

@@ -116,7 +116,7 @@ fn make_container_with_port(
         ports: Some(vec![ContainerPort {
             container_port: host_port,
             name: None,
-            protocol: Some(protocol.to_string()),
+            protocol: protocol.to_string(),
             host_port: Some(host_port),
             host_ip: host_ip.map(|s| s.to_string()),
         }]),

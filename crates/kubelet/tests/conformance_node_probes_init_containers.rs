@@ -514,14 +514,14 @@ fn probe_port_named_resolves_via_container_ports() {
             container_port: 8080,
             host_port: None,
             host_ip: None,
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
         },
         ContainerPort {
             name: Some("metrics".to_string()),
             container_port: 9090,
             host_port: None,
             host_ip: None,
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
         },
     ]);
     assert_eq!(

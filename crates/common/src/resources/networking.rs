@@ -76,13 +76,17 @@ pub struct NetworkPolicyEgressRule {
     pub to: Option<Vec<NetworkPolicyPeer>>,
 }
 
+fn default_protocol() -> String {
+    "TCP".to_string()
+}
+
 /// NetworkPolicyPort describes a port to allow traffic on
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyPort {
     /// The protocol (TCP, UDP, SCTP)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
 
     /// The port on the given protocol
     #[serde(skip_serializing_if = "Option::is_none")]

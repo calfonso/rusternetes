@@ -61,7 +61,7 @@ fn make_service(name: &str, namespace: &str, selector: HashMap<String, String>) 
             selector: Some(selector),
             ports: vec![ServicePort {
                 name: Some("http".to_string()),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
                 node_port: None,

@@ -340,11 +340,11 @@ fn service_port_strategy() -> impl Strategy<Value = ServicePort> {
     (
         option::of(k8s_name()),
         1_u16..65535,
-        option::of(prop::sample::select(vec![
+        prop::sample::select(vec![
             "TCP".to_string(),
             "UDP".to_string(),
             "SCTP".to_string(),
-        ])),
+        ]),
     )
         .prop_map(|(name, port, protocol)| ServicePort {
             name,

@@ -1152,7 +1152,7 @@ mod tests {
                     name: Some("http".to_string()),
                     port: 80,
                     target_port: Some(rusternetes_common::resources::IntOrString::Int(8080)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
@@ -1232,7 +1232,7 @@ mod tests {
                     name: Some("http".to_string()),
                     port: 80,
                     target_port: Some(rusternetes_common::resources::IntOrString::Int(8080)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
@@ -1355,7 +1355,7 @@ mod tests {
                     name: Some("http".to_string()),
                     port: 80,
                     target_port: Some(rusternetes_common::resources::IntOrString::Int(8080)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
@@ -1523,7 +1523,7 @@ mod tests {
             Some(vec![EndpointPort {
                 name: Some("http".to_string()),
                 port: p,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 app_protocol: None,
             }])
         };

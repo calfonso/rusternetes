@@ -31,7 +31,7 @@ fn create_test_endpoints(name: &str, namespace: &str) -> Endpoints {
             ports: Some(vec![EndpointPort {
                 name: Some("http".to_string()),
                 port: 80,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 app_protocol: None,
             }]),
         }],
@@ -193,7 +193,7 @@ async fn test_endpoints_with_multiple_subsets() {
                 ports: Some(vec![EndpointPort {
                     name: Some("http".to_string()),
                     port: 80,
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: None,
                 }]),
             },
@@ -208,7 +208,7 @@ async fn test_endpoints_with_multiple_subsets() {
                 ports: Some(vec![EndpointPort {
                     name: Some("https".to_string()),
                     port: 443,
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: None,
                 }]),
             },
@@ -263,7 +263,7 @@ async fn test_endpoints_with_not_ready_addresses() {
             ports: Some(vec![EndpointPort {
                 name: Some("http".to_string()),
                 port: 80,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 app_protocol: None,
             }]),
         }],
@@ -314,19 +314,19 @@ async fn test_endpoints_with_multiple_ports() {
                 EndpointPort {
                     name: Some("http".to_string()),
                     port: 80,
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: Some("http".to_string()),
                 },
                 EndpointPort {
                     name: Some("https".to_string()),
                     port: 443,
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: Some("https".to_string()),
                 },
                 EndpointPort {
                     name: Some("metrics".to_string()),
                     port: 9090,
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: None,
                 },
             ]),

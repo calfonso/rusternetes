@@ -512,7 +512,7 @@ async fn statefulset_pods_should_have_stable_network_identity() {
                 name: Some("http".to_string()),
                 port: 80,
                 target_port: Some(IntOrString::Int(80)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 app_protocol: None,
                 node_port: None,
             }],

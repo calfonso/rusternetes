@@ -365,7 +365,7 @@ impl<S: Storage> KubeProxy<S> {
 
         // Process each service port
         for service_port in &service.spec.ports {
-            let protocol = service_port.protocol.as_deref().unwrap_or("TCP");
+            let protocol = service_port.protocol.as_str();
             let target_port = match &service_port.target_port {
                 Some(rusternetes_common::resources::IntOrString::Int(p)) => *p as u16,
                 Some(rusternetes_common::resources::IntOrString::String(s)) => {
@@ -527,13 +527,13 @@ mod tests {
                 ESEndpointPort {
                     name: Some("http".to_string()),
                     port: Some(8080),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: None,
                 },
                 ESEndpointPort {
                     name: Some("https".to_string()),
                     port: Some(8443),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: None,
                 },
             ],

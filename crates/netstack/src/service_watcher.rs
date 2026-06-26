@@ -245,7 +245,7 @@ fn compute_desired_vips(
 
         for port in &svc.spec.ports {
             // TCP only (default to TCP when protocol unset, per K8s spec).
-            let protocol = port.protocol.as_deref().unwrap_or("TCP");
+            let protocol = port.protocol.as_str();
             if !protocol.eq_ignore_ascii_case("TCP") {
                 continue;
             }
@@ -335,7 +335,7 @@ mod tests {
             name: port_name.map(String::from),
             port,
             target_port: None,
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             node_port: None,
             app_protocol: None,
         }];
@@ -371,7 +371,7 @@ mod tests {
         es.ports = vec![SliceEndpointPort {
             name: None,
             port: Some(target_port as i32),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             app_protocol: None,
         }];
         es
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn compute_desired_vips_skips_udp_ports() {
         let mut services = vec![svc("dns", "kube-system", "10.96.0.10", 53, None)];
-        services[0].spec.ports[0].protocol = Some("UDP".to_string());
+        services[0].spec.ports[0].protocol = "UDP".to_string();
         let desired = compute_desired_vips(&services, &[]);
         assert!(
             desired.is_empty(),

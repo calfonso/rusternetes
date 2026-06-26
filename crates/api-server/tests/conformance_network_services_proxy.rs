@@ -55,7 +55,7 @@ fn pod_listening_on(namespace: &str, name: &str, port: u16) -> Pod {
                 ports: Some(vec![ContainerPort {
                     container_port: port,
                     name: Some("http".to_string()),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     host_port: None,
                     host_ip: None,
                 }]),
@@ -102,7 +102,7 @@ fn service_to_pod_port(namespace: &str, name: &str, svc_port: u16, target_port: 
                 name: Some("http".to_string()),
                 port: svc_port,
                 target_port: Some(IntOrString::Int(target_port as i32)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -144,7 +144,7 @@ fn endpoint_slice_for(namespace: &str, service: &str, addr: &str, port: u16) -> 
     es.ports = vec![ESEndpointPort {
         name: Some("http".to_string()),
         port: Some(port as i32),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         app_protocol: None,
     }];
     es

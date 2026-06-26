@@ -90,7 +90,7 @@ fn pod_with_hostport_ip(
                 ports: Some(vec![ContainerPort {
                     container_port,
                     name: Some("http".to_string()),
-                    protocol: Some(protocol.to_string()),
+                    protocol: protocol.to_string(),
                     host_port: Some(host_port),
                     host_ip: host_ip.map(String::from),
                 }]),
@@ -124,7 +124,7 @@ fn cluster_ip_service(
                 name: Some("http".to_string()),
                 port,
                 target_port: Some(IntOrString::Int(target_port as i32)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -172,7 +172,7 @@ fn endpoint_slice_with_proto(
     es.ports = vec![ESEndpointPort {
         name: port_name.map(String::from),
         port: Some(port_num),
-        protocol: Some(protocol.to_string()),
+        protocol: protocol.to_string(),
         app_protocol: None,
     }];
     es
@@ -654,7 +654,7 @@ async fn services_endpoints_same_port_different_protocols_iptables() {
     let svc_tcp = cluster_ip_service("dual-tcp", "default", "10.97.0.1", 80, 8080);
     // UDP service on port 80, ClusterIP 10.97.0.2
     let mut svc_udp = cluster_ip_service("dual-udp", "default", "10.97.0.2", 80, 8080);
-    svc_udp.spec.ports[0].protocol = Some("UDP".to_string());
+    svc_udp.spec.ports[0].protocol = "UDP".to_string();
 
     let tcp_slice = endpoint_slice_with_proto(
         "default",
@@ -730,7 +730,7 @@ async fn services_same_port_dual_protocol_routes_to_correct_target() {
             name: Some("tcp-p".to_string()),
             port: 80,
             target_port: Some(IntOrString::Int(8080)),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             node_port: None,
             app_protocol: None,
         },
@@ -738,7 +738,7 @@ async fn services_same_port_dual_protocol_routes_to_correct_target() {
             name: Some("udp-p".to_string()),
             port: 80,
             target_port: Some(IntOrString::Int(9090)),
-            protocol: Some("UDP".to_string()),
+            protocol: "UDP".to_string(),
             node_port: None,
             app_protocol: None,
         },
@@ -833,7 +833,7 @@ async fn services_functioning_nodeport_iptables_rules_present() {
                 name: Some("http".to_string()),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: Some(31234),
                 app_protocol: None,
             }],

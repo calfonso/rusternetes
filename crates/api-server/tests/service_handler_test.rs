@@ -41,7 +41,7 @@ fn create_test_service(name: &str, namespace: &str, service_type: ServiceType) -
             selector: Some(selector),
             ports: vec![ServicePort {
                 name: Some("http".to_string()),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
                 node_port: None,
@@ -309,7 +309,7 @@ async fn test_service_with_multiple_ports() {
     service.spec.ports = vec![
         ServicePort {
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: 80,
             target_port: Some(IntOrString::Int(8080)),
             node_port: None,
@@ -317,7 +317,7 @@ async fn test_service_with_multiple_ports() {
         },
         ServicePort {
             name: Some("https".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: 443,
             target_port: Some(IntOrString::Int(8443)),
             node_port: None,

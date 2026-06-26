@@ -292,16 +292,15 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
         rule_idx: usize,
         port_idx: usize,
     ) -> Result<()> {
-        // Validate protocol if specified
-        if let Some(protocol) = &port.protocol {
-            if protocol != "TCP" && protocol != "UDP" && protocol != "SCTP" {
-                return Err(anyhow::anyhow!(
-                    "Invalid protocol '{}' in rule {} port {}, must be TCP, UDP, or SCTP",
-                    protocol,
-                    rule_idx,
-                    port_idx
-                ));
-            }
+        // Validate protocol
+        let protocol = &port.protocol;
+        if protocol != "TCP" && protocol != "UDP" && protocol != "SCTP" {
+            return Err(anyhow::anyhow!(
+                "Invalid protocol '{}' in rule {} port {}, must be TCP, UDP, or SCTP",
+                protocol,
+                rule_idx,
+                port_idx
+            ));
         }
 
         // Validate end_port if specified
@@ -520,7 +519,7 @@ mod tests {
 
         let rule = NetworkPolicyIngressRule {
             ports: Some(vec![NetworkPolicyPort {
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: None,
                 end_port: Some(8080),
             }]),
@@ -543,7 +542,7 @@ mod tests {
         let controller = NetworkPolicyController::new(storage);
 
         let port = NetworkPolicyPort {
-            protocol: Some("HTTP".to_string()), // Invalid
+            protocol: "HTTP".to_string(), // Invalid
             port: None,
             end_port: None,
         };

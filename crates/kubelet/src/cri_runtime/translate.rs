@@ -88,7 +88,7 @@ fn port_mappings(pod: &Pod) -> Vec<v1::PortMapping> {
         };
         for p in ports {
             out.push(v1::PortMapping {
-                protocol: protocol_to_cri(p.protocol.as_deref()),
+                protocol: protocol_to_cri(Some(p.protocol.as_str())),
                 container_port: i32::from(p.container_port),
                 host_port: p.host_port.map(i32::from).unwrap_or(0),
                 host_ip: p.host_ip.clone().unwrap_or_default(),
@@ -1273,14 +1273,14 @@ mod tests {
             ContainerPort {
                 container_port: 53,
                 name: Some("dns".to_string()),
-                protocol: Some("UDP".to_string()),
+                protocol: "UDP".to_string(),
                 host_port: Some(5353),
                 host_ip: None,
             },
             ContainerPort {
                 container_port: 80,
                 name: None,
-                protocol: None, // defaults to TCP
+                protocol: "TCP".to_string(), // defaults to TCP
                 host_port: None,
                 host_ip: None,
             },

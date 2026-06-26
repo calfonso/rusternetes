@@ -72,7 +72,7 @@ fn cluster_ip_service(
                 name: Some("http".to_string()),
                 port,
                 target_port: Some(IntOrString::Int(target_port as i32)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -150,7 +150,7 @@ fn endpoint_slice(
     es.ports = vec![ESEndpointPort {
         name: port_name.map(String::from),
         port: Some(port_num),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         app_protocol: None,
     }];
     es
@@ -254,7 +254,7 @@ async fn services_should_serve_multiport_endpoints_from_pods() {
         name: Some("https".to_string()),
         port: 443,
         target_port: Some(IntOrString::Int(8443)),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         node_port: None,
         app_protocol: None,
     });
@@ -262,7 +262,7 @@ async fn services_should_serve_multiport_endpoints_from_pods() {
     slice.ports.push(ESEndpointPort {
         name: Some("https".to_string()),
         port: Some(8443),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         app_protocol: None,
     });
 
@@ -310,7 +310,7 @@ async fn services_should_be_updated_after_adding_or_deleting_ports() {
         name: Some("metrics".to_string()),
         port: 9090,
         target_port: Some(IntOrString::Int(9091)),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         node_port: None,
         app_protocol: None,
     });
@@ -318,7 +318,7 @@ async fn services_should_be_updated_after_adding_or_deleting_ports() {
     slice_two.ports.push(ESEndpointPort {
         name: Some("metrics".to_string()),
         port: Some(9091),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         app_protocol: None,
     });
     let map2 = endpointslice_map(&[slice_two]);

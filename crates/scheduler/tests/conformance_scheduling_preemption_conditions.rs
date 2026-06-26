@@ -100,7 +100,7 @@ fn container_with_host_port(
     c.ports = Some(vec![ContainerPort {
         container_port: port,
         name: None,
-        protocol: Some(protocol.to_string()),
+        protocol: protocol.to_string(),
         host_port: Some(port),
         host_ip: host_ip.map(|s| s.to_string()),
     }]);

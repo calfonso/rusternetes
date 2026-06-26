@@ -330,11 +330,7 @@ impl Zone {
             let Some(port_name) = &port.name else {
                 continue;
             };
-            let proto = port
-                .protocol
-                .clone()
-                .unwrap_or_else(|| "TCP".to_string())
-                .to_ascii_lowercase();
+            let proto = port.protocol.to_ascii_lowercase();
             let srv_name = format!("_{}._{}.{}", lc(port_name), proto, fqdn,);
 
             if is_headless {
@@ -724,7 +720,7 @@ mod tests {
                     name: Some("https".to_string()),
                     port: 443,
                     target_port: None,
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],

@@ -2504,7 +2504,7 @@ impl Kubelet {
                         // conformance netexec pods declare containerPort with
                         // hostPort: 0.
                         p.host_port.filter(|&hp| hp != 0).map(|hp| {
-                            let proto = p.protocol.clone().unwrap_or_else(|| "TCP".to_string());
+                            let proto = p.protocol.clone();
                             let ip = p.host_ip.clone().unwrap_or_default();
                             (hp, proto, ip)
                         })
@@ -2543,7 +2543,7 @@ impl Kubelet {
                                 for c in &existing_spec.containers {
                                     for ep in c.ports.iter().flatten() {
                                         if let Some(ehp) = ep.host_port {
-                                            let eproto = ep.protocol.as_deref().unwrap_or("TCP");
+                                            let eproto = ep.protocol.as_str();
                                             // Must match port AND protocol to conflict
                                             // K8s ref: pkg/scheduler/framework/types.go — CheckConflict
                                             if ehp == *port && eproto == proto {

@@ -36,12 +36,12 @@ fn validate_port(port: &EndpointPort, fld_path: &Path) -> ErrorList {
     // protocol: required, then must be TCP/UDP/SCTP. Upstream
     // `validateEndpointSlicePorts` (discovery validation.go:193-197) emits
     // Required when protocol is nil, NotSupported otherwise.
-    match port.protocol.as_deref() {
-        None | Some("") => {
+    match port.protocol.as_str() {
+        "" => {
             errs.push(Error::required(&fld_path.child("protocol"), ""));
         }
-        Some("TCP") | Some("UDP") | Some("SCTP") => {}
-        Some(other) => {
+        "TCP" | "UDP" | "SCTP" => {}
+        other => {
             errs.push(Error::not_supported(
                 &fld_path.child("protocol"),
                 other.to_string(),
@@ -236,10 +236,14 @@ mod port_tests {
         errs.iter().any(|e| e.field == field && e.error_type == ty)
     }
 
-    // Upstream: protocol nil → Required (discovery validation.go:193-194).
+    // Upstream: protocol nil → Required (discovery validation.go:193-194). A
+    // *missing* protocol is defaulted to TCP by serde, so the empty case is
+    // exercised with an explicit "" (the String unset sentinel).
     #[test]
-    fn missing_protocol_is_required() {
-        let errs = validate_endpoint_slice(&es(serde_json::json!([{"name": "a", "port": 80}])));
+    fn empty_protocol_is_required() {
+        let errs = validate_endpoint_slice(&es(
+            serde_json::json!([{"name": "a", "port": 80, "protocol": ""}]),
+        ));
         assert!(
             has(&errs, "ports[0].protocol", ErrorType::Required),
             "{errs:?}"

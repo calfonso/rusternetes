@@ -26,7 +26,7 @@ fn cluster_ip_service(name: &str, cluster_ip: Option<&str>) -> Service {
                 name: Some("http".to_string()),
                 port: 80,
                 target_port: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],

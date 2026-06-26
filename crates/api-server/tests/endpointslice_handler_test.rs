@@ -33,7 +33,7 @@ fn create_test_endpointslice(name: &str, namespace: &str) -> EndpointSlice {
         }],
         ports: vec![EndpointPort {
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: Some(80),
             app_protocol: None,
         }],
@@ -207,7 +207,7 @@ async fn test_endpointslice_with_ipv6_addresses() {
         }],
         ports: vec![EndpointPort {
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: Some(80),
             app_protocol: None,
         }],
@@ -253,19 +253,19 @@ async fn test_endpointslice_with_multiple_ports() {
         ports: vec![
             EndpointPort {
                 name: Some("http".to_string()),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: Some(80),
                 app_protocol: Some("http".to_string()),
             },
             EndpointPort {
                 name: Some("https".to_string()),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: Some(443),
                 app_protocol: Some("https".to_string()),
             },
             EndpointPort {
                 name: Some("metrics".to_string()),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: Some(9090),
                 app_protocol: None,
             },
@@ -336,7 +336,7 @@ async fn test_endpointslice_with_endpoint_conditions() {
         ],
         ports: vec![EndpointPort {
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: Some(80),
             app_protocol: None,
         }],
@@ -407,7 +407,7 @@ async fn test_endpointslice_with_zone_hints() {
         ],
         ports: vec![EndpointPort {
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: Some(80),
             app_protocol: None,
         }],
@@ -442,7 +442,7 @@ async fn test_endpointslice_empty_endpoints() {
         endpoints: vec![],
         ports: vec![EndpointPort {
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: Some(80),
             app_protocol: None,
         }],
@@ -650,7 +650,7 @@ async fn test_endpointslice_with_fqdn_address_type() {
         }],
         ports: vec![EndpointPort {
             name: Some("https".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: Some(443),
             app_protocol: Some("https".to_string()),
         }],
@@ -696,13 +696,13 @@ async fn test_endpointslice_with_udp_protocol() {
         ports: vec![
             EndpointPort {
                 name: Some("dns".to_string()),
-                protocol: Some("UDP".to_string()),
+                protocol: "UDP".to_string(),
                 port: Some(53),
                 app_protocol: None,
             },
             EndpointPort {
                 name: Some("dns-tcp".to_string()),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: Some(53),
                 app_protocol: None,
             },
@@ -712,8 +712,8 @@ async fn test_endpointslice_with_udp_protocol() {
     let key = build_key("endpointslices", Some(namespace), "udp-endpointslice");
     let created: EndpointSlice = storage.create(&key, &endpointslice).await.unwrap();
 
-    assert_eq!(created.ports[0].protocol, Some("UDP".to_string()));
-    assert_eq!(created.ports[1].protocol, Some("TCP".to_string()));
+    assert_eq!(created.ports[0].protocol, "UDP");
+    assert_eq!(created.ports[1].protocol, "TCP");
     assert_eq!(created.ports[0].port, Some(53));
 
     // Cleanup

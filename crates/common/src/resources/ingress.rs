@@ -194,6 +194,10 @@ pub struct IngressLoadBalancerIngress {
     pub ports: Option<Vec<IngressPortStatus>>,
 }
 
+fn default_protocol() -> String {
+    "TCP".to_string()
+}
+
 /// IngressPortStatus represents the status of a port exposed by the load-balancer
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -202,6 +206,7 @@ pub struct IngressPortStatus {
     pub port: i32,
 
     /// Protocol is the protocol of the ingress port (TCP, UDP, SCTP)
+    #[serde(default = "default_protocol")]
     pub protocol: String,
 
     /// Error is to record the problem with the service port

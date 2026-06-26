@@ -60,7 +60,7 @@ fn ready_pod(name: &str, ns: &str, ip: &str) -> Pod {
                 ports: Some(vec![ContainerPort {
                     container_port: 8080,
                     name: Some("http".to_string()),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     host_port: None,
                     host_ip: None,
                 }]),
@@ -100,7 +100,7 @@ fn clusterip_service(name: &str, ns: &str) -> Service {
                 name: Some("http".to_string()),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -125,7 +125,7 @@ fn externalname_service(name: &str, ns: &str, external_name: &str) -> Service {
                 name: Some("http".to_string()),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -153,7 +153,7 @@ fn nodeport_service(name: &str, ns: &str) -> Service {
                 name: Some("http".to_string()),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None, // allocated by controller
                 app_protocol: None,
             }],
@@ -685,7 +685,7 @@ async fn endpointslicemirroring_create_update_delete() {
                 ports: Some(vec![EPPort {
                     name: Some("http".to_string()),
                     port: 80,
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     app_protocol: None,
                 }]),
             }],
@@ -827,7 +827,7 @@ async fn services_serve_endpoints_same_port_different_protocols() {
                     name: Some("tcp-http".to_string()),
                     port: 80,
                     target_port: Some(IntOrString::Int(8080)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 },
@@ -835,7 +835,7 @@ async fn services_serve_endpoints_same_port_different_protocols() {
                     name: Some("udp-http".to_string()),
                     port: 80,
                     target_port: Some(IntOrString::Int(8080)),
-                    protocol: Some("UDP".to_string()),
+                    protocol: "UDP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 },
@@ -863,11 +863,7 @@ async fn services_serve_endpoints_same_port_different_protocols() {
         .subsets
         .iter()
         .filter_map(|s| s.ports.as_ref())
-        .flat_map(|ports| {
-            ports
-                .iter()
-                .filter_map(|p| p.protocol.as_ref().map(|pr| pr.to_string()))
-        })
+        .flat_map(|ports| ports.iter().map(|p| p.protocol.clone()))
         .collect();
     assert!(
         protocols.iter().any(|p| p == "TCP"),

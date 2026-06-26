@@ -159,12 +159,12 @@ fn validate_service_port(
     // otherwise — it does NOT default a missing protocol to TCP at validation
     // time (defaulting happens earlier in the API machinery, on a separate
     // path). validation.go:6798-6802.
-    match port.protocol.as_deref() {
-        None | Some("") => {
+    match port.protocol.as_str() {
+        "" => {
             errs.push(Error::required(&fld.child("protocol"), ""));
         }
-        Some("TCP") | Some("UDP") | Some("SCTP") => {}
-        Some(other) => {
+        "TCP" | "UDP" | "SCTP" => {}
+        other => {
             errs.push(Error::not_supported(
                 &fld.child("protocol"),
                 other.to_string(),
@@ -280,7 +280,7 @@ pub fn validate_service_spec(spec: &ServiceSpec, fld: &Path) -> ErrorList {
         ));
 
         // Duplicate (port, protocol) check
-        let proto = port.protocol.as_deref().unwrap_or("TCP").to_string();
+        let proto = port.protocol.clone();
         let key = (port.port, proto.clone());
         if let Some(prev_idx) = seen_port_proto.get(&key) {
             // Upstream reports the duplicate on the port number sub-field
@@ -583,13 +583,14 @@ mod port_protocol_tests {
     }
 
     // Upstream validateServicePort emits Required when protocol is empty
-    // (validation.go:6798-6799). rusternetes no longer defaults a missing
-    // protocol to TCP inside the validator (the handler defaults before calling).
+    // (validation.go:6798-6799). A *missing* protocol is defaulted to TCP by
+    // serde before validation (matching upstream defaulting -> validation
+    // order), so it is not flagged Required; only an explicit "" is.
     #[test]
-    fn missing_protocol_is_required() {
+    fn missing_protocol_defaults_to_tcp() {
         let errs = spec_errs(serde_json::json!({"ports": [{"port": 80}]}));
         assert!(
-            has(&errs, "spec.ports[0].protocol", ErrorType::Required),
+            !errs.iter().any(|e| e.field == "spec.ports[0].protocol"),
             "{errs:?}"
         );
     }

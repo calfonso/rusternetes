@@ -85,7 +85,7 @@ fn container_with_host_port(
     c.ports = Some(vec![ContainerPort {
         container_port: host_port,
         name: None,
-        protocol: protocol.map(|s| s.to_string()),
+        protocol: protocol.unwrap_or("TCP").to_string(),
         host_port: Some(host_port),
         host_ip: host_ip.map(|s| s.to_string()),
     }]);

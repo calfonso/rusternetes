@@ -101,7 +101,7 @@ fn pod_with_host_port(name: &str, node: Option<&str>, port: u16, protocol: &str,
         spec.containers[0].ports = Some(vec![ContainerPort {
             container_port: 80,
             name: None,
-            protocol: Some(protocol.to_string()),
+            protocol: protocol.to_string(),
             host_port: Some(port),
             host_ip: if ip.is_empty() {
                 None

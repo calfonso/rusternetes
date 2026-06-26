@@ -232,6 +232,10 @@ pub struct EndpointConditions {
     pub terminating: Option<bool>,
 }
 
+fn default_protocol() -> String {
+    "TCP".to_string()
+}
+
 /// EndpointPort represents a Port used by an EndpointSlice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -245,8 +249,8 @@ pub struct EndpointPort {
     pub port: Option<i32>,
 
     /// protocol represents the IP protocol for this port. Must be UDP, TCP, or SCTP.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
 
     /// appProtocol is the application protocol for this port.
     #[serde(skip_serializing_if = "Option::is_none", rename = "appProtocol")]

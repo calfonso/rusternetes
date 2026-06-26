@@ -69,7 +69,7 @@ fn desired_subsets(ip: &str, port: u16) -> Vec<rusternetes_common::resources::En
         ports: Some(vec![EndpointPort {
             name: Some("https".to_string()),
             port,
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             app_protocol: None,
         }]),
     }]
@@ -170,7 +170,7 @@ async fn reconcile_endpointslice<S: Storage + ?Sized>(
     let desired_ports = vec![EndpointPort {
         name: Some("https".to_string()),
         port: Some(port as i32),
-        protocol: Some("TCP".to_string()),
+        protocol: "TCP".to_string(),
         app_protocol: None,
     }];
 

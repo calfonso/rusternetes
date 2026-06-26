@@ -430,7 +430,7 @@ fn test_validate_containers_success_with_ports() {
         ports: Some(vec![ContainerPort {
             container_port: 80,
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             host_port: None,
             host_ip: None,
         }]),
@@ -695,7 +695,7 @@ fn test_validate_containers_error_port_zero() {
         ports: Some(vec![ContainerPort {
             container_port: 0,
             name: None,
-            protocol: None,
+            protocol: "TCP".to_string(),
             host_port: None,
             host_ip: None,
         }]),
@@ -718,7 +718,7 @@ fn test_validate_containers_error_port_protocol_invalid() {
         ports: Some(vec![ContainerPort {
             container_port: 80,
             name: None,
-            protocol: Some("INVALID".to_string()),
+            protocol: "INVALID".to_string(),
             host_port: None,
             host_ip: None,
         }]),
@@ -742,14 +742,14 @@ fn test_validate_containers_error_duplicate_port_name() {
             ContainerPort {
                 container_port: 80,
                 name: Some("http".to_string()),
-                protocol: None,
+                protocol: "TCP".to_string(),
                 host_port: None,
                 host_ip: None,
             },
             ContainerPort {
                 container_port: 8080,
                 name: Some("http".to_string()),
-                protocol: None,
+                protocol: "TCP".to_string(),
                 host_port: None,
                 host_ip: None,
             },
@@ -1218,7 +1218,7 @@ fn host_network_requires_hostport_matches_containerport() {
             // Protocol is TCP-defaulted before validation runs; supply it so the
             // fixture reflects the post-defaulting state (validateContainerPorts
             // requires a non-empty protocol, mirroring upstream).
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             host_port,
             host_ip: None,
         }]);

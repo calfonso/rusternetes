@@ -226,7 +226,7 @@ fn collect_host_ports(pod: &Pod) -> Vec<(u16, String, String)> {
                     // containerPort with hostPort: 0; treating 0 as a real port
                     // made the 2nd/3rd such pod unschedulable on every node.
                     if let Some(host_port) = port.host_port.filter(|&p| p != 0) {
-                        let protocol = port.protocol.clone().unwrap_or_else(|| "TCP".to_string());
+                        let protocol = port.protocol.clone();
                         let host_ip = port.host_ip.clone().unwrap_or_default();
                         result.push((host_port, protocol, host_ip));
                     }
@@ -239,8 +239,7 @@ fn collect_host_ports(pod: &Pod) -> Vec<(u16, String, String)> {
                 if let Some(ports) = &container.ports {
                     for port in ports {
                         if let Some(host_port) = port.host_port.filter(|&p| p != 0) {
-                            let protocol =
-                                port.protocol.clone().unwrap_or_else(|| "TCP".to_string());
+                            let protocol = port.protocol.clone();
                             let host_ip = port.host_ip.clone().unwrap_or_default();
                             result.push((host_port, protocol, host_ip));
                         }
@@ -1552,7 +1551,7 @@ mod tests {
             ports: Some(vec![ContainerPort {
                 container_port: 80,
                 name: None,
-                protocol: Some(protocol.to_string()),
+                protocol: protocol.to_string(),
                 host_port: Some(host_port),
                 host_ip: if host_ip.is_empty() {
                     None

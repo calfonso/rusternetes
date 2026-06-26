@@ -79,8 +79,8 @@ fn default_service_ports(spec: &mut rusternetes_common::resources::ServiceSpec) 
             port.target_port = Some(IntOrString::Int(port.port as i32));
             changed = true;
         }
-        if port.protocol.is_none() {
-            port.protocol = Some("TCP".to_string());
+        if port.protocol.is_empty() {
+            port.protocol = "TCP".to_string();
             changed = true;
         }
     }

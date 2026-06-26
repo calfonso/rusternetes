@@ -72,6 +72,10 @@ pub struct EndpointAddress {
     pub target_ref: Option<EndpointReference>,
 }
 
+fn default_protocol() -> String {
+    "TCP".to_string()
+}
+
 /// EndpointPort is a tuple that describes a single port.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,8 +88,8 @@ pub struct EndpointPort {
     pub port: u16,
 
     /// The IP protocol for this port. Must be UDP, TCP, or SCTP.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
 
     /// The application protocol for this port.
     #[serde(skip_serializing_if = "Option::is_none", rename = "appProtocol")]

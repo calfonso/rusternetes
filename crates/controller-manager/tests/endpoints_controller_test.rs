@@ -24,7 +24,7 @@ fn create_test_service(name: &str, namespace: &str, selector: HashMap<String, St
             selector: Some(selector),
             ports: vec![ServicePort {
                 name: Some("http".to_string()),
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 port: 80,
                 target_port: Some(IntOrString::Int(8080)),
                 node_port: None,
@@ -721,7 +721,7 @@ async fn test_endpoints_includes_port_mapping() {
     service.spec.ports = vec![
         ServicePort {
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: 80,
             target_port: Some(IntOrString::Int(8080)),
             node_port: None,
@@ -729,7 +729,7 @@ async fn test_endpoints_includes_port_mapping() {
         },
         ServicePort {
             name: Some("https".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             port: 443,
             target_port: Some(IntOrString::Int(8443)),
             node_port: None,
@@ -783,7 +783,7 @@ async fn test_endpoints_includes_port_mapping() {
         .find(|p| p.name == Some("http".to_string()))
         .unwrap();
     assert_eq!(http_port.port, 8080);
-    assert_eq!(http_port.protocol, Some("TCP".to_string()));
+    assert_eq!(http_port.protocol, "TCP");
 
     // Verify HTTPS port
     let https_port = ports
@@ -791,5 +791,5 @@ async fn test_endpoints_includes_port_mapping() {
         .find(|p| p.name == Some("https".to_string()))
         .unwrap();
     assert_eq!(https_port.port, 8443);
-    assert_eq!(https_port.protocol, Some("TCP".to_string()));
+    assert_eq!(https_port.protocol, "TCP");
 }

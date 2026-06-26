@@ -158,11 +158,7 @@ fn describe_pod(pod: &Pod) {
                         "    Ports:      {}",
                         ports
                             .iter()
-                            .map(|p| format!(
-                                "{}/{}",
-                                p.container_port,
-                                p.protocol.as_deref().unwrap_or("TCP")
-                            ))
+                            .map(|p| format!("{}/{}", p.container_port, p.protocol.as_str()))
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
@@ -228,7 +224,7 @@ fn describe_service(service: &Service) {
             .map(|p| format!(
                 "{}/{} -> {}",
                 p.port,
-                p.protocol.as_deref().unwrap_or("TCP"),
+                p.protocol.as_str(),
                 match &p.target_port {
                     Some(rusternetes_common::resources::IntOrString::Int(tp)) => tp.to_string(),
                     Some(rusternetes_common::resources::IntOrString::String(tp)) => tp.clone(),
@@ -456,7 +452,7 @@ mod tests {
                     image: "nginx:latest".to_string(),
                     ports: Some(vec![ContainerPort {
                         container_port: 80,
-                        protocol: Some("TCP".to_string()),
+                        protocol: "TCP".to_string(),
                         name: None,
                         host_port: None,
                         host_ip: None,
@@ -530,7 +526,7 @@ mod tests {
                 ports: vec![ServicePort {
                     port: 80,
                     target_port: Some(IntOrString::Int(8080)),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     name: Some("http".to_string()),
                     node_port: None,
                     app_protocol: None,
@@ -563,7 +559,7 @@ mod tests {
                 ports: vec![ServicePort {
                     port: 443,
                     target_port: None,
-                    protocol: None,
+                    protocol: "TCP".to_string(),
                     name: None,
                     node_port: None,
                     app_protocol: None,

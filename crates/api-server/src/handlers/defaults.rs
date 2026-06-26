@@ -113,8 +113,8 @@ fn apply_ephemeral_container_defaults(
     }
     if let Some(ref mut ports) = ec.ports {
         for port in ports.iter_mut() {
-            if port.protocol.is_none() {
-                port.protocol = Some("TCP".to_string());
+            if port.protocol.is_empty() {
+                port.protocol = "TCP".to_string();
             }
         }
     }
@@ -158,8 +158,8 @@ fn apply_container_defaults(container: &mut rusternetes_common::resources::Conta
     // K8s ref: pkg/apis/core/v1/defaults.go — SetDefaults_Container
     if let Some(ref mut ports) = container.ports {
         for port in ports.iter_mut() {
-            if port.protocol.is_none() {
-                port.protocol = Some("TCP".to_string());
+            if port.protocol.is_empty() {
+                port.protocol = "TCP".to_string();
             }
         }
     }

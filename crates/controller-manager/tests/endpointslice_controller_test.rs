@@ -34,7 +34,7 @@ fn create_test_endpoints(
         .map(|(name, port)| EndpointPort {
             name: Some(name.clone()),
             port: *port,
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             app_protocol: None,
         })
         .collect();
@@ -226,7 +226,7 @@ async fn test_endpointslice_includes_port_mapping() {
         .find(|p| p.name == Some("http".to_string()))
         .unwrap();
     assert_eq!(http_port.port, Some(8080));
-    assert_eq!(http_port.protocol, Some("TCP".to_string()));
+    assert_eq!(http_port.protocol, "TCP");
 
     let https_port = slice
         .ports
@@ -613,7 +613,7 @@ async fn test_endpointslice_multi_port_multi_ip_service() {
         .find(|p| p.name == Some("http".to_string()));
     assert!(http_port.is_some(), "Should have http port");
     assert_eq!(http_port.unwrap().port, Some(80));
-    assert_eq!(http_port.unwrap().protocol, Some("TCP".to_string()));
+    assert_eq!(http_port.unwrap().protocol, "TCP");
 
     let https_port = slice
         .ports
@@ -621,7 +621,7 @@ async fn test_endpointslice_multi_port_multi_ip_service() {
         .find(|p| p.name == Some("https".to_string()));
     assert!(https_port.is_some(), "Should have https port");
     assert_eq!(https_port.unwrap().port, Some(443));
-    assert_eq!(https_port.unwrap().protocol, Some("TCP".to_string()));
+    assert_eq!(https_port.unwrap().protocol, "TCP");
 
     // Verify both pod IPs are in the endpoints
     assert_eq!(
@@ -705,7 +705,7 @@ async fn test_externally_created_endpointslice_not_deleted() {
         .push(rusternetes_common::resources::endpointslice::EndpointPort {
             name: Some("http".to_string()),
             port: Some(80),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             app_protocol: None,
         });
 

@@ -50,8 +50,8 @@ pub async fn create_endpointslice(
 
     // SetDefaults_EndpointSlice: each port protocol defaults to TCP.
     for p in endpointslice.ports.iter_mut() {
-        if p.protocol.is_none() {
-            p.protocol = Some("TCP".to_string());
+        if p.protocol.is_empty() {
+            p.protocol = "TCP".to_string();
         }
     }
 

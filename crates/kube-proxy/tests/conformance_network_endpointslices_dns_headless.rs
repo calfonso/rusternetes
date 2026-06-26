@@ -54,7 +54,7 @@ fn pod(name: &str, ns: &str, ip: &str, ready: bool) -> Pod {
                 ports: Some(vec![ContainerPort {
                     container_port: 80,
                     name: Some("http".to_string()),
-                    protocol: Some("TCP".to_string()),
+                    protocol: "TCP".to_string(),
                     host_port: None,
                     host_ip: None,
                 }]),
@@ -94,7 +94,7 @@ fn service(name: &str, ns: &str, port: u16) -> Service {
                 name: Some("http".to_string()),
                 port,
                 target_port: None,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 node_port: None,
                 app_protocol: None,
             }],
@@ -224,7 +224,7 @@ fn build_srv_records(svc: &Service, slices: &[EndpointSlice]) -> Vec<SrvRecord> 
             Some(n) if !n.is_empty() => n.clone(),
             _ => continue, // SRV requires named port
         };
-        let proto = sp.protocol.as_deref().unwrap_or("TCP").to_lowercase();
+        let proto = sp.protocol.to_lowercase();
         let srv_name = format!(
             "_{}._{}.{}.{}.svc.cluster.local",
             port_name, proto, svc_name, ns
@@ -407,7 +407,7 @@ async fn endpointslice_should_carry_multiple_named_ports() {
             name: Some("http".to_string()),
             port: 80,
             target_port: None,
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             node_port: None,
             app_protocol: None,
         },
@@ -415,7 +415,7 @@ async fn endpointslice_should_carry_multiple_named_ports() {
             name: Some("metrics".to_string()),
             port: 9090,
             target_port: None,
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             node_port: None,
             app_protocol: None,
         },
@@ -426,14 +426,14 @@ async fn endpointslice_should_carry_multiple_named_ports() {
         ContainerPort {
             container_port: 80,
             name: Some("http".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             host_port: None,
             host_ip: None,
         },
         ContainerPort {
             container_port: 9090,
             name: Some("metrics".to_string()),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             host_port: None,
             host_ip: None,
         },
@@ -935,7 +935,7 @@ async fn endpoints_v1_without_selector_should_be_mirrored_to_endpointslice() {
             ports: Some(vec![EPPort {
                 name: Some("http".to_string()),
                 port: 80,
-                protocol: Some("TCP".to_string()),
+                protocol: "TCP".to_string(),
                 app_protocol: None,
             }]),
         }],
@@ -1600,7 +1600,7 @@ async fn kube_proxy_should_skip_not_ready_endpoints_in_backend_set() {
         ports: vec![ESEndpointPort {
             name: Some("http".to_string()),
             port: Some(80),
-            protocol: Some("TCP".to_string()),
+            protocol: "TCP".to_string(),
             app_protocol: None,
         }],
     };
