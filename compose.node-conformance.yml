@@ -56,20 +56,33 @@ services:
     privileged: true
     ports:
       - "6443:6443"
+    # NET_ADMIN lets the entrypoint install a route to the pod CIDR
+    # (10.244.0.0/16) via the containerd container, so the pod/proxy + log
+    # subresources can reach pod IPs that live in containerd's CNI netns.
+    # Mirrors compose.sqlite.yml.
+    cap_add:
+      - NET_ADMIN
     depends_on:
       rhino:
         condition: service_healthy
+      containerd:
+        condition: service_started
     networks:
       nc-net:
         aliases:
           - api-server
     volumes:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
+      # CRI socket from the containerd service: exec/logs/stats run over CRI v1,
+      # not a Docker/Podman socket (the kubelet was cut over to CRI).
+      - containerd-run:/run/containerd
+      # Pod container logs live under ${KUBELET_VOLUMES_PATH}/pod-logs/...; the
+      # api-server serves GET pods/<p>/log by reading them off the filesystem at
+      # the same absolute path the CRI ContainerStatus.log_path reports.
+      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
@@ -98,6 +111,7 @@ services:
     depends_on:
       - rhino
       - api-server
+      - containerd
     networks:
       - nc-net
     ports:
@@ -115,7 +129,9 @@ services:
       # port and the listening port match.
       - "10250:10250"
     volumes:
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
+      # CRI socket shared from the containerd service — the kubelet drives pod
+      # lifecycle over CRI v1, not a Docker/Podman socket.
+      - containerd-run:/run/containerd
       # rshared so the tmpfs mounts the kubelet makes for Memory-medium emptyDir
       # propagate out to the host daemon and into pod containers — otherwise the
       # pod sees the underlying (ext4) bind dir and the emptyDir-tmpfs
@@ -126,17 +142,14 @@ services:
       - ./.rusternetes/certs:/root/.rusternetes/certs:ro
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}
-    # --network must name THIS stack's bridge so the kubelet attaches pod
-    # (pause) containers to the same Docker network the kubelet itself runs on.
-    # Otherwise pods land on the kubelet's default `rusternetes-network` while
-    # the kubelet sits on `rusternetes-nc-net`, the two are disjoint, and every
-    # network liveness/readiness probe (httpGet/tcp/grpc) plus all pod-to-pod
-    # traffic is unreachable (rc=000) — which silently failed ~30 conformance
-    # specs once pods started scheduling.
-    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--network", "rusternetes-nc-net"]
+    # Pod networking is handled by CNI inside the containerd runtime (cni0,
+    # 10.244.0.0/16), so the old bollard-only `--network` flag (which attached
+    # pause containers to a Docker bridge) no longer applies — omit it to match
+    # the CRI-migrated compose.sqlite.yml kubelet.
+    command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   scheduler:
     build:
@@ -157,6 +170,32 @@ services:
     # conformance pods bind promptly instead of pacing the suite.
     command: ["--etcd-servers", "http://rhino:2379", "--interval", "1"]
 
+  # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelet drives pod
+  # lifecycle over CRI v1 through this service instead of a Docker/Podman socket
+  # (the kubelet was cut over to CRI — without a containerd here the kubelet's
+  # ListPodSandbox/ListContainers fail with "No such file or directory" and
+  # every pod sits Pending forever). The CRI socket is shared with the kubelet +
+  # api-server via the `containerd-run` volume, and KUBELET_VOLUMES_PATH is
+  # bind-mounted at the same host path so pod volumes the kubelet provisions
+  # resolve here too. Mirrors compose.sqlite.yml.
+  containerd:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.containerd
+    container_name: rusternetes-nc-containerd
+    privileged: true
+    networks:
+      - nc-net
+    volumes:
+      - containerd-run:/run/containerd
+      # /var/lib/containerd (overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — a named volume is
+      # host-fs-backed.
+      - containerd-data:/var/lib/containerd
+      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw,rshared
+      - ./.rusternetes/certs:/etc/rusternetes/certs:ro
+
 networks:
   nc-net:
     name: rusternetes-nc-net
@@ -165,3 +204,10 @@ networks:
 volumes:
   rhino-data:
     name: rusternetes-nc-rhino-data
+  # CRI socket shared from the containerd service to the kubelet + api-server.
+  containerd-run:
+    name: rusternetes-nc-containerd-run
+  # containerd's snapshotter root on a real (host-fs-backed) volume so the
+  # overlayfs snapshotter works inside the Docker-hosted containerd.
+  containerd-data:
+    name: rusternetes-nc-containerd-data

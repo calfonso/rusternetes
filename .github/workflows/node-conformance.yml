@@ -131,5 +131,4 @@ jobs:
         if: always()
         run: |
           docker compose -f compose.node-conformance.yml \
-            -f compose.dind.node-conformance.yml \
             down -v --remove-orphans || true

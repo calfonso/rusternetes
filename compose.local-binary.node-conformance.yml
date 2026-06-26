@@ -3,7 +3,6 @@
 # Use with:
 #   cargo build --release --bin api-server --bin kubelet
 #   docker compose -f compose.node-conformance.yml \
-#                  -f compose.dind.node-conformance.yml \
 #                  -f compose.local-binary.node-conformance.yml \
 #                  up -d --build
 #

@@ -40,14 +40,12 @@ fi
 
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
 
-# Layer the dind override automatically when the runtime is docker so the
-# api-server + kubelet bind /var/run/docker.sock instead of the podman socket
-# that doesn't exist on Docker-only hosts (the CI ARC runner is one).
-# Callers can override with EXTRA_COMPOSE_FILES (space-separated).
-if [ -z "${EXTRA_COMPOSE_FILES:-}" ] && [ "${CONTAINER_RUNTIME}" = "docker" ] \
-    && [ -f "${PROJECT_ROOT}/compose.dind.node-conformance.yml" ]; then
-    EXTRA_COMPOSE_FILES="${PROJECT_ROOT}/compose.dind.node-conformance.yml"
-fi
+# The stack runs pods via the bundled `containerd` CRI service over the shared
+# `containerd-run` socket volume (CONTAINER_RUNTIME_ENDPOINT in
+# compose.node-conformance.yml), so it needs no host runtime socket and works
+# as-is on both Docker and Podman. The old compose.dind.node-conformance.yml
+# override (which bind-mounted /var/run/docker.sock for the dead bollard path)
+# is gone — extra overrides can still be layered via EXTRA_COMPOSE_FILES.
 
 COMPOSE_FILES="-f ${PROJECT_ROOT}/compose.node-conformance.yml"
 for extra in ${EXTRA_COMPOSE_FILES:-}; do

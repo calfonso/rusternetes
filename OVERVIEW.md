@@ -423,18 +423,19 @@ Available stacks:
 
 Override files compose on top of the base stack:
 
-- **`compose.dind.all-in-one.yml`** / **`compose.dind.node-conformance.yml`**
-  repoint the container-runtime socket from Podman's `/run/podman/podman.sock`
-  to Docker's `/var/run/docker.sock`. Apply them on Docker-only hosts for the
-  all-in-one and node-conformance stacks, which still run the kubelet's runtime
-  client against a host runtime socket:
+- **`compose.dind.all-in-one.yml`** repoints the container-runtime socket from
+  Podman's `/run/podman/podman.sock` to Docker's `/var/run/docker.sock`. Apply
+  it on Docker-only hosts for the all-in-one stack, which still runs the
+  kubelet's runtime client against a host runtime socket:
   ```bash
   docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d
   ```
   The multi-container stacks (`compose.yml` / `compose.sqlite.yml` /
-  `compose.redis.yml`) no longer need a socket override — they run pods via the
-  bundled `containerd` service over the shared `containerd-run` volume
-  (`CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock`), so they
+  `compose.redis.yml`) and the **node-conformance** stack
+  (`compose.node-conformance.yml`) no longer need a socket override — they run
+  pods via the bundled `containerd` service over the shared `containerd-run`
+  volume (`CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock`),
+  so they
   work unchanged on Docker or Podman. (The old `compose.dind.yml` override was
   removed once those stacks migrated to containerd.)
 - **`compose.local-binary.*`** bind host-built release binaries into the images
