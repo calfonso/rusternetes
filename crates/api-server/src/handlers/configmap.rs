@@ -738,24 +738,23 @@ async fn apply_configmap_ssa(
     let outcome = crate::ssa::apply_configmap(current.as_ref(), &desired, &opts)
         .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
 
-    // Immutability check — mirrors the `update` handler. An immutable
-    // ConfigMap rejects any change to `data`, `binaryData`, or the
-    // `immutable` flag itself. SSA must not bypass this guard, otherwise
-    // a client could mutate an immutable ConfigMap via apply-patch.
-    if let (Some(existing), crate::ssa::ApplyOutcome::Applied { ref object, .. }) =
-        (current.as_ref(), &outcome)
-    {
-        if existing.immutable == Some(true) {
-            let data_changed = existing.data != object.data;
-            let binary_data_changed = existing.binary_data != object.binary_data;
-            let immutable_changed =
-                object.immutable != Some(true) && object.immutable != existing.immutable;
-            if data_changed || binary_data_changed || immutable_changed {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
-                    "ConfigMap \"{}/{}\" is immutable",
-                    namespace, name
-                )));
+    // Validate the SSA-merged object through the same upstream-parity path as
+    // the create/update handlers: validate_config_map_update for a merge over
+    // an existing object (key/size/duplicate checks PLUS the immutable-field
+    // freeze, emitting upstream field.Forbidden errors), validate_config_map
+    // for a fresh create. This replaces the earlier ad-hoc immutability guard
+    // so SSA, update, and create all run identical validation (#1466).
+    if let crate::ssa::ApplyOutcome::Applied { ref object, .. } = &outcome {
+        let validation_errs = match current.as_ref() {
+            Some(existing) => {
+                rusternetes_common::validation::configmap::validate_config_map_update(
+                    existing, object,
+                )
             }
+            None => rusternetes_common::validation::configmap::validate_config_map(object),
+        };
+        if !validation_errs.is_empty() {
+            return Err(rusternetes_common::Error::Invalid(validation_errs));
         }
     }
 
