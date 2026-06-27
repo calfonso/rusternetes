@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::resources::pod::{
     Container, ContainerPort, EnvVar, ExecAction, GRPCAction, HTTPGetAction, Lifecycle,
-    LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodSchedulingGate,
+    LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodDNSConfig, PodOS, PodSchedulingGate,
     PodSecurityContext, PodSpec, Probe, SleepAction, TCPSocketAction, Toleration,
     TopologySpreadConstraint, Volume, VolumeMount,
 };
@@ -179,6 +179,10 @@ pub fn validate_pod_spec(
     // passes `spec.TerminationGracePeriodSeconds` to `validateContainers`).
     let grace_period = spec.termination_grace_period_seconds;
 
+    // spec.os (PodOS) gates lifecycle.stopSignal validation (upstream threads
+    // `os` into validateContainers → validateLifecycle → validateStopSignal).
+    let os = spec.os.as_ref();
+
     // Containers must be non-empty.
     if spec.containers.is_empty() {
         errs.push(Error::required(
@@ -195,6 +199,7 @@ pub fn validate_pod_spec(
             false,
             &volume_names,
             grace_period,
+            os,
             &containers_path.index(i),
         ));
         if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -214,6 +219,7 @@ pub fn validate_pod_spec(
                 true,
                 &volume_names,
                 grace_period,
+                os,
                 &init_path.index(i),
             ));
             if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -436,6 +442,7 @@ fn validate_container(
     is_init: bool,
     volume_names: &HashSet<&str>,
     grace_period: Option<i64>,
+    os: Option<&PodOS>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -507,6 +514,7 @@ fn validate_container(
         errs.extend(validate_lifecycle(
             lc,
             grace_period,
+            os,
             &fld_path.child("lifecycle"),
         ));
     }
@@ -613,6 +621,7 @@ fn is_env_var_name(value: &str) -> Vec<String> {
 fn validate_lifecycle(
     lifecycle: &Lifecycle,
     grace_period: Option<i64>,
+    os: Option<&PodOS>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -629,6 +638,124 @@ fn validate_lifecycle(
             grace_period,
             &fld_path.child("preStop"),
         ));
+    }
+    // stopSignal — only validated when set (upstream `if lifecycle.StopSignal
+    // != nil`); the empty-`spec.os.name` Forbidden case is handled inside.
+    if let Some(signal) = lifecycle.stop_signal.as_deref() {
+        errs.extend(validate_stop_signal(
+            signal,
+            os,
+            &fld_path.child("stopSignal"),
+        ));
+    }
+    errs
+}
+
+/// Linux-supported `lifecycle.stopSignal` values. Port of upstream
+/// `supportedStopSignalsLinux` (pkg/apis/core/validation/validation.go:3552,
+/// release-1.35).
+const STOP_SIGNALS_LINUX: &[&str] = &[
+    "SIGABRT",
+    "SIGALRM",
+    "SIGBUS",
+    "SIGCHLD",
+    "SIGCLD",
+    "SIGCONT",
+    "SIGFPE",
+    "SIGHUP",
+    "SIGILL",
+    "SIGINT",
+    "SIGIO",
+    "SIGIOT",
+    "SIGKILL",
+    "SIGPIPE",
+    "SIGPOLL",
+    "SIGPROF",
+    "SIGPWR",
+    "SIGQUIT",
+    "SIGSEGV",
+    "SIGSTKFLT",
+    "SIGSTOP",
+    "SIGSYS",
+    "SIGTERM",
+    "SIGTRAP",
+    "SIGTSTP",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGURG",
+    "SIGUSR1",
+    "SIGUSR2",
+    "SIGVTALRM",
+    "SIGWINCH",
+    "SIGXCPU",
+    "SIGXFSZ",
+    "SIGRTMIN",
+    "SIGRTMIN+1",
+    "SIGRTMIN+2",
+    "SIGRTMIN+3",
+    "SIGRTMIN+4",
+    "SIGRTMIN+5",
+    "SIGRTMIN+6",
+    "SIGRTMIN+7",
+    "SIGRTMIN+8",
+    "SIGRTMIN+9",
+    "SIGRTMIN+10",
+    "SIGRTMIN+11",
+    "SIGRTMIN+12",
+    "SIGRTMIN+13",
+    "SIGRTMIN+14",
+    "SIGRTMIN+15",
+    "SIGRTMAX-14",
+    "SIGRTMAX-13",
+    "SIGRTMAX-12",
+    "SIGRTMAX-11",
+    "SIGRTMAX-10",
+    "SIGRTMAX-9",
+    "SIGRTMAX-8",
+    "SIGRTMAX-7",
+    "SIGRTMAX-6",
+    "SIGRTMAX-5",
+    "SIGRTMAX-4",
+    "SIGRTMAX-3",
+    "SIGRTMAX-2",
+    "SIGRTMAX-1",
+    "SIGRTMAX",
+];
+
+/// Windows-supported `lifecycle.stopSignal` values. Port of upstream
+/// `supportedStopSignalsWindows` (validation.go:3573): {SIGKILL, SIGTERM}.
+const STOP_SIGNALS_WINDOWS: &[&str] = &["SIGKILL", "SIGTERM"];
+
+/// Port of upstream `validateStopSignal` (validation.go:3575, release-1.35).
+/// `stopSignal` may only be set when `spec.os.name` is set, and must then be a
+/// value supported by that OS.
+fn validate_stop_signal(stop_signal: &str, os: Option<&PodOS>, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    match os.map(|o| o.name.as_str()) {
+        None | Some("") => {
+            errs.push(Error::forbidden(
+                fld_path,
+                "may not be set for containers with empty `spec.os.name`",
+            ));
+        }
+        Some("windows") if !STOP_SIGNALS_WINDOWS.contains(&stop_signal) => {
+            errs.push(Error::not_supported(
+                fld_path,
+                stop_signal.to_string(),
+                STOP_SIGNALS_WINDOWS,
+            ));
+        }
+        Some("linux") if !STOP_SIGNALS_LINUX.contains(&stop_signal) => {
+            errs.push(Error::not_supported(
+                fld_path,
+                stop_signal.to_string(),
+                STOP_SIGNALS_LINUX,
+            ));
+        }
+        // Supported windows/linux signals fall through here, as do other
+        // os.name values (upstream's enum check on spec.os.name handles the
+        // unsupported-OS case elsewhere; stopSignal is not further validated).
+        _ => {}
     }
     errs
 }
@@ -3004,6 +3131,7 @@ mod tests {
             false,
             &vols,
             Some(30),
+            None,
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
@@ -3242,6 +3370,63 @@ mod tests {
         // valid
         let ok = cports_errs(serde_json::json!([{"containerPort": 80, "protocol": "TCP"}]));
         assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn stop_signal_forbidden_when_os_empty() {
+        let p = Path::new("lifecycle").child("stopSignal");
+        // os = None
+        let e = validate_stop_signal("SIGTERM", None, &p);
+        assert!(
+            e.iter().any(
+                |x| x.to_string().contains("spec.os.name") && x.to_string().contains("may not")
+            ),
+            "{e:?}"
+        );
+        // os.name = ""
+        let os = PodOS {
+            name: String::new(),
+        };
+        let e = validate_stop_signal("SIGTERM", Some(&os), &p);
+        assert!(!e.is_empty(), "empty os.name must forbid stopSignal: {e:?}");
+    }
+
+    #[test]
+    fn stop_signal_windows_enum() {
+        let p = Path::new("lifecycle").child("stopSignal");
+        let win = PodOS {
+            name: "windows".to_string(),
+        };
+        // Windows allows only SIGKILL / SIGTERM.
+        assert!(validate_stop_signal("SIGTERM", Some(&win), &p).is_empty());
+        assert!(validate_stop_signal("SIGKILL", Some(&win), &p).is_empty());
+        // A Linux-only signal is rejected on Windows.
+        let e = validate_stop_signal("SIGUSR1", Some(&win), &p);
+        assert!(
+            e.iter().any(|x| x.field.ends_with("stopSignal")),
+            "SIGUSR1 must be NotSupported on windows: {e:?}"
+        );
+    }
+
+    #[test]
+    fn stop_signal_linux_enum() {
+        let p = Path::new("lifecycle").child("stopSignal");
+        let lin = PodOS {
+            name: "linux".to_string(),
+        };
+        // A representative spread of the Linux set, incl. realtime-range names.
+        for sig in ["SIGTERM", "SIGUSR1", "SIGRTMIN+3", "SIGRTMAX-1", "SIGRTMAX"] {
+            assert!(
+                validate_stop_signal(sig, Some(&lin), &p).is_empty(),
+                "{sig} must be allowed on linux"
+            );
+        }
+        // Not a real signal name.
+        let e = validate_stop_signal("SIGNOTASIGNAL", Some(&lin), &p);
+        assert!(
+            e.iter().any(|x| x.field.ends_with("stopSignal")),
+            "bogus signal must be NotSupported on linux: {e:?}"
+        );
     }
 
     #[test]
