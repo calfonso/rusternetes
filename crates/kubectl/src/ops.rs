@@ -118,6 +118,28 @@ pub fn list_path(m: &ResourceMapping, namespace: Option<&str>, all_namespaces: b
     }
 }
 
+/// Build the `?labelSelector=<encoded>` query suffix for a LIST, or an empty
+/// string when no selector is given. Percent-encodes the selector value so
+/// set-based expressions (which may contain spaces / parens) survive transport.
+pub fn label_selector_query(selector: Option<&str>) -> String {
+    match selector.filter(|s| !s.is_empty()) {
+        None => String::new(),
+        Some(sel) => {
+            let encoded: String = sel
+                .chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' | '=' | ',' | '!' => {
+                        c.to_string()
+                    }
+                    ' ' => "+".to_string(),
+                    _ => format!("%{:02X}", c as u8),
+                })
+                .collect();
+            format!("?labelSelector={encoded}")
+        }
+    }
+}
+
 /// GET a resource collection; returns the `.items` array as Values. When
 /// `all_namespaces` is true for a namespaced resource the cluster-wide
 /// collection path is used (no namespace segment). `query` is an optional
@@ -180,6 +202,25 @@ pub fn resource_label(m: &ResourceMapping, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::discovery::ResourceMapping;
+
+    #[test]
+    fn label_selector_query_none_and_empty_are_blank() {
+        assert_eq!(label_selector_query(None), "");
+        assert_eq!(label_selector_query(Some("")), "");
+    }
+
+    #[test]
+    fn label_selector_query_encodes() {
+        assert_eq!(
+            label_selector_query(Some("app=nginx,tier=web")),
+            "?labelSelector=app=nginx,tier=web"
+        );
+        // spaces -> '+', parens percent-encoded (set-based selectors).
+        assert_eq!(
+            label_selector_query(Some("env in (a, b)")),
+            "?labelSelector=env+in+%28a,+b%29"
+        );
+    }
 
     fn m(group: &str, plural: &str, namespaced: bool) -> ResourceMapping {
         ResourceMapping {
