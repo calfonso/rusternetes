@@ -6,9 +6,10 @@
 //! limitResponse + queuing), `exempt` numeric bounds, and `status.conditions`.
 //! ObjectMeta is validated separately (#1087 / #1277).
 //!
-//! Note: the rusternetes type uses `lending_concurrency_limit` rather than
-//! upstream's `lendablePercent`, so the 0–100 lendable-percent check (upstream
-//! lines 432-434 / 447-449) has no field to apply to and is omitted. The
+//! Note: the rusternetes type carries `lendable_percent` (upstream
+//! `lendablePercent`), validated 0–100 in `validate_limited` / `validate_exempt`
+//! (upstream lines 432-434 / 447-449). The legacy `lending_concurrency_limit`
+//! field is retained for wire/proto compatibility but is not range-checked. The
 //! shuffle-sharding entropy-bits check on `handSize`/`queues` is also omitted
 //! (exotic); the positivity, max-queues, and `handSize <= queues` checks are
 //! ported.
@@ -105,6 +106,16 @@ fn validate_limited(lplc: &LimitedPriorityLevelConfiguration, fld_path: &Path) -
             ));
         }
     }
+    // lendablePercent must be 0..=100 (upstream validation.go:432-434).
+    if let Some(lp) = lplc.lendable_percent {
+        if !(0..=100).contains(&lp) {
+            errs.push(Error::invalid(
+                &fld_path.child("lendablePercent"),
+                lp,
+                "must be between 0 and 100, inclusive",
+            ));
+        }
+    }
     if let Some(lr) = &lplc.limit_response {
         errs.extend(validate_limit_response(
             lr,
@@ -122,6 +133,16 @@ fn validate_exempt(eplc: &ExemptPriorityLevelConfiguration, fld_path: &Path) -> 
                 &fld_path.child("nominalConcurrencyShares"),
                 n,
                 "must be a non-negative integer",
+            ));
+        }
+    }
+    // lendablePercent must be 0..=100 (upstream validation.go:447-449).
+    if let Some(lp) = eplc.lendable_percent {
+        if !(0..=100).contains(&lp) {
+            errs.push(Error::invalid(
+                &fld_path.child("lendablePercent"),
+                lp,
+                "must be between 0 and 100, inclusive",
             ));
         }
     }

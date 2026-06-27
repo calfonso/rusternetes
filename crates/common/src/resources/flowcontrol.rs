@@ -50,6 +50,10 @@ pub struct LimitedPriorityLevelConfiguration {
     pub nominal_concurrency_shares: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lending_concurrency_limit: Option<i32>,
+    /// Percent of this level's nominal concurrency limit that may be borrowed
+    /// by other levels. Upstream `flowcontrol/v1` field; validated 0..=100.
+    #[serde(rename = "lendablePercent", skip_serializing_if = "Option::is_none")]
+    pub lendable_percent: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub borrowing_limit_percent: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +93,10 @@ pub struct ExemptPriorityLevelConfiguration {
     pub nominal_concurrency_shares: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lending_concurrency_limit: Option<i32>,
+    /// Percent of the nominal concurrency limit lendable to other levels.
+    /// Upstream `flowcontrol/v1` field; validated 0..=100.
+    #[serde(rename = "lendablePercent", skip_serializing_if = "Option::is_none")]
+    pub lendable_percent: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

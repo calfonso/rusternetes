@@ -24,6 +24,7 @@ fn limited_reject() -> LimitedPriorityLevelConfiguration {
     LimitedPriorityLevelConfiguration {
         nominal_concurrency_shares: Some(30),
         lending_concurrency_limit: None,
+        lendable_percent: None,
         borrowing_limit_percent: None,
         limit_response: Some(LimitResponse {
             type_: LimitResponseType::Reject,
@@ -189,7 +190,66 @@ fn valid_exempt_passes() {
         exempt: Some(ExemptPriorityLevelConfiguration {
             nominal_concurrency_shares: Some(0),
             lending_concurrency_limit: None,
+            lendable_percent: None,
         }),
     };
     assert!(validate_priority_level_configuration(&plc("exempt", spec)).is_empty());
+}
+
+#[test]
+fn limited_lendable_percent_out_of_range_rejected() {
+    for bad in [-1, 101, 200] {
+        let mut l = limited_reject();
+        l.lendable_percent = Some(bad);
+        let spec = PriorityLevelConfigurationSpec {
+            type_: PriorityLevelType::Limited,
+            limited: Some(l),
+            exempt: None,
+        };
+        let errs = validate_priority_level_configuration(&plc("lim", spec));
+        assert!(
+            errs.iter().any(|e| e.field.contains("lendablePercent")
+                && e.to_string()
+                    .contains("must be between 0 and 100, inclusive")),
+            "bad={bad} errs={errs:?}"
+        );
+    }
+}
+
+#[test]
+fn limited_lendable_percent_in_range_passes() {
+    for ok in [0, 50, 100] {
+        let mut l = limited_reject();
+        l.lendable_percent = Some(ok);
+        let spec = PriorityLevelConfigurationSpec {
+            type_: PriorityLevelType::Limited,
+            limited: Some(l),
+            exempt: None,
+        };
+        let errs = validate_priority_level_configuration(&plc("lim", spec));
+        assert!(
+            !errs.iter().any(|e| e.field.contains("lendablePercent")),
+            "ok={ok} errs={errs:?}"
+        );
+    }
+}
+
+#[test]
+fn exempt_lendable_percent_out_of_range_rejected() {
+    let spec = PriorityLevelConfigurationSpec {
+        type_: PriorityLevelType::Exempt,
+        limited: None,
+        exempt: Some(ExemptPriorityLevelConfiguration {
+            nominal_concurrency_shares: Some(0),
+            lending_concurrency_limit: None,
+            lendable_percent: Some(101),
+        }),
+    };
+    let errs = validate_priority_level_configuration(&plc("exempt", spec));
+    assert!(
+        errs.iter().any(|e| e.field.contains("lendablePercent")
+            && e.to_string()
+                .contains("must be between 0 and 100, inclusive")),
+        "errs={errs:?}"
+    );
 }
