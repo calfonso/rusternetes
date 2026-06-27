@@ -8,7 +8,7 @@
 # Dockerfile.node consumes (/app/kubelet, built by Dockerfile.services'
 # `kubelet` target).
 #
-# The containerd-rs binary is the static musl v0.1.1 build from the
+# The containerd-rs binary is the static musl v0.1.3 build from the
 # fix/k0s-worker-cri-gaps branch, staged into the build context at
 # deploy/node-cdrs/bin/containerd-rs.
 #
@@ -45,7 +45,7 @@ RUN mkdir -p /opt/cni/bin \
 # drive crun.
 RUN ln -sf "$(command -v crun)" /usr/local/bin/runc
 
-# The Rust CRI runtime (static musl v0.1.1), staged into the build context.
+# The Rust CRI runtime (static musl v0.1.3), staged into the build context.
 COPY --chmod=0755 deploy/node-cdrs/bin/containerd-rs /usr/local/bin/containerd-rs
 
 # Reused, unmodified rusternetes kubelet binary.
