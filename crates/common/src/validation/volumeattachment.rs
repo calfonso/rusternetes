@@ -58,11 +58,16 @@ pub fn validate_volume_attachment(va: &VolumeAttachment) -> ErrorList {
             &source_path.child("persistentVolumeName"),
             "must specify non empty persistentVolumeName",
         )),
-        // inlineVolumeSpec set: run the full PersistentVolumeSpec validator
-        // (upstream `ValidatePersistentVolumeSpec`).
+        // inlineVolumeSpec set: run the full PersistentVolumeSpec validator with
+        // inline=true (upstream `validateVolumeAttachmentSource` passes
+        // `validateInlinePersistentVolumeSpec=true`), adding the inline-only
+        // deltas: claimRef/capacity forbidden, CSI required, reclaimPolicy must
+        // be Retain, nodeAffinity/storageClassName forbidden, volumeMode must be
+        // Filesystem.
         (Some(inline), None) => {
             errs.extend(validate_persistent_volume_spec(
                 inline,
+                true,
                 &source_path.child("inlineVolumeSpec"),
             ));
         }
@@ -193,37 +198,143 @@ mod inline_spec_tests {
             .collect()
     }
 
-    #[test]
-    fn valid_inline_csi_spec_passes() {
-        let e = errs(serde_json::json!({
+    // Build a VolumeAttachment whose inlineVolumeSpec is `spec` (merged into a
+    // minimal valid inline spec base when used by the per-delta tests).
+    fn inline(spec: serde_json::Value) -> Vec<String> {
+        errs(serde_json::json!({
             "metadata": {"name": "va"},
             "spec": {
                 "attacher": "csi.example.com",
                 "nodeName": "node-1",
-                "source": {"inlineVolumeSpec": {
-                    "capacity": {"storage": "1Gi"},
-                    "accessModes": ["ReadWriteOnce"],
-                    "csi": {"driver": "csi.example.com", "volumeHandle": "vol-1"}
-                }}
+                "source": {"inlineVolumeSpec": spec}
             }
+        }))
+    }
+
+    #[test]
+    fn valid_inline_csi_spec_passes() {
+        // A valid inline spec has NO capacity (forbidden inline), a CSI source,
+        // accessModes, and otherwise no standalone-PV-only fields.
+        let e = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "csi.example.com", "volumeHandle": "vol-1"}
         }));
         assert!(e.iter().all(|m| !m.contains("inlineVolumeSpec")), "{e:?}");
     }
 
     #[test]
     fn invalid_inline_spec_is_validated() {
-        // empty inline spec: PV-spec validation should flag the missing source/capacity.
-        let e = errs(serde_json::json!({
-            "metadata": {"name": "va"},
-            "spec": {
-                "attacher": "csi.example.com",
-                "nodeName": "node-1",
-                "source": {"inlineVolumeSpec": {}}
-            }
-        }));
+        // empty inline spec: inline validation flags the missing CSI source.
+        let e = inline(serde_json::json!({}));
         assert!(
             e.iter().any(|m| m.contains("inlineVolumeSpec")),
             "expected inline spec errors, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn inline_capacity_forbidden() {
+        let e = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "d", "volumeHandle": "v"},
+            "capacity": {"storage": "1Gi"}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("capacity") && m.contains("inline")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn inline_csi_required() {
+        let e = inline(serde_json::json!({ "accessModes": ["ReadWriteOnce"] }));
+        assert!(
+            e.iter().any(|m| m.contains("csi") && m.contains("inline")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn inline_claim_ref_forbidden() {
+        let e = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "d", "volumeHandle": "v"},
+            "claimRef": {"name": "pvc-1", "namespace": "default"}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("claimRef") && m.contains("inline")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn inline_reclaim_policy_must_be_retain() {
+        let e = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "d", "volumeHandle": "v"},
+            "persistentVolumeReclaimPolicy": "Delete"
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("persistentVolumeReclaimPolicy") && m.contains("Retain")),
+            "{e:?}"
+        );
+        // Retain passes.
+        let ok = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "d", "volumeHandle": "v"},
+            "persistentVolumeReclaimPolicy": "Retain"
+        }));
+        assert!(
+            !ok.iter()
+                .any(|m| m.contains("persistentVolumeReclaimPolicy")),
+            "{ok:?}"
+        );
+    }
+
+    #[test]
+    fn inline_node_affinity_forbidden() {
+        let e = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "d", "volumeHandle": "v"},
+            "nodeAffinity": {"required": {"nodeSelectorTerms": [
+                {"matchExpressions": [{"key": "k", "operator": "Exists"}]}
+            ]}}
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("nodeAffinity") && m.contains("inline")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn inline_volume_mode_must_be_filesystem() {
+        let e = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "d", "volumeHandle": "v"},
+            "volumeMode": "Block"
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("volumeMode") && m.contains("Filesystem")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn inline_storage_class_name_forbidden() {
+        let e = inline(serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "csi": {"driver": "d", "volumeHandle": "v"},
+            "storageClassName": "standard"
+        }));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("storageClassName") && m.contains("inline")),
+            "{e:?}"
         );
     }
 }

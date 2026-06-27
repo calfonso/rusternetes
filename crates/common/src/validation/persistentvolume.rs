@@ -15,8 +15,8 @@
 
 use crate::quantity::Quantity;
 use crate::resources::volume::{
-    PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSpec,
+    PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSpec,
 };
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_dns1123_subdomain;
@@ -57,42 +57,75 @@ fn clean_path(p: &str) -> String {
 
 /// Validate a `PersistentVolumeSpec`. Mirrors the core of upstream
 /// `ValidatePersistentVolume`.
-pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &Path) -> ErrorList {
+pub fn validate_persistent_volume_spec(
+    spec: &PersistentVolumeSpec,
+    inline: bool,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
+
+    let capacity_path = fld_path.child("capacity");
+
+    // Inline-volume-only deltas (upstream `validateInlinePersistentVolumeSpec`,
+    // core validation.go:1968-1978): claimRef + capacity are forbidden and a CSI
+    // source is required, because an inline PV (VolumeAttachment.inlineVolumeSpec)
+    // is not a standalone object.
+    if inline {
+        if spec.claim_ref.is_some() {
+            errs.push(Error::forbidden(
+                &fld_path.child("claimRef"),
+                "may not be specified in the context of inline volumes",
+            ));
+        }
+        if !spec.capacity.is_empty() {
+            errs.push(Error::forbidden(
+                &capacity_path,
+                "may not be specified in the context of inline volumes",
+            ));
+        }
+        if spec.csi.is_none() {
+            errs.push(Error::required(
+                &fld_path.child("csi"),
+                "has to be specified in the context of inline volumes",
+            ));
+        }
+    }
 
     // capacity is required (upstream line ~2002). Then it must hold exactly the
     // `storage` resource and nothing else (upstream line ~2005-2007).
     // Upstream uses two independent `if`s (not else-if): an empty capacity is
     // both Required AND NotSupported (storage absent). Match that exactly.
-    let capacity_path = fld_path.child("capacity");
-    if spec.capacity.is_empty() {
-        errs.push(Error::required(&capacity_path, ""));
-    }
-    if !spec.capacity.contains_key("storage") || spec.capacity.len() > 1 {
-        errs.push(Error::not_supported(
-            &capacity_path,
-            "<capacity>",
-            &["storage"],
-        ));
-    }
+    // These run only for standalone PVs — inline volumes forbid capacity above.
+    if !inline {
+        if spec.capacity.is_empty() {
+            errs.push(Error::required(&capacity_path, ""));
+        }
+        if !spec.capacity.contains_key("storage") || spec.capacity.len() > 1 {
+            errs.push(Error::not_supported(
+                &capacity_path,
+                "<capacity>",
+                &["storage"],
+            ));
+        }
 
-    // Every capacity quantity must parse and be a non-negative value
-    // (upstream validateBasicResource + ValidatePositiveQuantityValue, ~2009-2012).
-    for (resource, value) in &spec.capacity {
-        let key_path = capacity_path.key(resource.clone());
-        match Quantity::parse(value) {
-            Err(_) => errs.push(Error::invalid(
-                &key_path,
-                value.clone(),
-                "must be a valid resource quantity",
-            )),
-            Ok(q) => {
-                if q.is_negative() {
-                    errs.push(Error::invalid(
-                        &key_path,
-                        value.clone(),
-                        "must be greater than or equal to 0",
-                    ));
+        // Every capacity quantity must parse and be a non-negative value
+        // (upstream validateBasicResource + ValidatePositiveQuantityValue, ~2009-2012).
+        for (resource, value) in &spec.capacity {
+            let key_path = capacity_path.key(resource.clone());
+            match Quantity::parse(value) {
+                Err(_) => errs.push(Error::invalid(
+                    &key_path,
+                    value.clone(),
+                    "must be a valid resource quantity",
+                )),
+                Ok(q) => {
+                    if q.is_negative() {
+                        errs.push(Error::invalid(
+                            &key_path,
+                            value.clone(),
+                            "must be greater than or equal to 0",
+                        ));
+                    }
                 }
             }
         }
@@ -161,9 +194,49 @@ pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &P
         }
     }
 
-    // storageClassName, when set, must be a DNS-1123 subdomain.
+    // reclaimPolicy: inline volumes may only use Retain (upstream
+    // validation.go:~2018). Standalone PVs accept the full supported set
+    // (enum validation handled elsewhere); the hostPath '/' Recycle case above
+    // is independent.
+    if inline {
+        if let Some(policy) = &spec.persistent_volume_reclaim_policy {
+            if *policy != PersistentVolumeReclaimPolicy::Retain {
+                errs.push(Error::forbidden(
+                    &fld_path.child("persistentVolumeReclaimPolicy"),
+                    "may only be Retain in the context of inline volumes",
+                ));
+            }
+        }
+        // nodeAffinity may not be specified for inline volumes (validation.go:~2228).
+        if spec.node_affinity.is_some() {
+            errs.push(Error::forbidden(
+                &fld_path.child("nodeAffinity"),
+                "may not be specified in the context of inline volumes",
+            ));
+        }
+        // volumeMode, when set, must be Filesystem for inline volumes
+        // (validation.go:~2237).
+        if let Some(mode) = &spec.volume_mode {
+            if *mode != PersistentVolumeMode::Filesystem {
+                errs.push(Error::forbidden(
+                    &fld_path.child("volumeMode"),
+                    "may not specify volumeMode other than Filesystem in the context of inline volumes",
+                ));
+            }
+        }
+    }
+
+    // storageClassName: forbidden for inline volumes; otherwise, when set, must
+    // be a DNS-1123 subdomain (upstream validation.go:~2228-2233).
     if let Some(scn) = &spec.storage_class_name {
-        if !scn.is_empty() {
+        if inline {
+            if !scn.is_empty() {
+                errs.push(Error::forbidden(
+                    &fld_path.child("storageClassName"),
+                    "may not be specified in the context of inline volumes",
+                ));
+            }
+        } else if !scn.is_empty() {
             for msg in is_dns1123_subdomain(scn) {
                 errs.push(Error::invalid(
                     &fld_path.child("storageClassName"),
@@ -179,7 +252,7 @@ pub fn validate_persistent_volume_spec(spec: &PersistentVolumeSpec, fld_path: &P
 
 /// Validate a new `PersistentVolume`. Mirrors upstream `ValidatePersistentVolume`.
 pub fn validate_persistent_volume(pv: &PersistentVolume) -> ErrorList {
-    validate_persistent_volume_spec(&pv.spec, &Path::new("spec"))
+    validate_persistent_volume_spec(&pv.spec, false, &Path::new("spec"))
 }
 
 /// JSON view of just the volume-source union of a `PersistentVolumeSpec`
