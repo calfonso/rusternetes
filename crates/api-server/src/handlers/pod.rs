@@ -106,6 +106,19 @@ pub async fn create(
         }
     }
 
+    // Apply SetDefaults_PodSpec / SetDefaults_Container / SetDefaults_Probe
+    // BEFORE validation. Upstream defaults the object in the decode/admission
+    // path and validates the *defaulted* result, so an omitted/zero probe
+    // successThreshold is backfilled to 1 (and ContainerPort.protocol to TCP,
+    // etc.) before validate_pod_create runs. Validating first (the previous
+    // order) made the probe validator reject undefaulted successThreshold as
+    // "must be 1", rejecting ~28 [NodeConformance] probe specs at create time.
+    // K8s ref: pkg/apis/core/v1/defaults.go runs ahead of
+    // pkg/apis/core/validation.
+    if let Some(ref mut spec) = pod.spec {
+        crate::handlers::defaults::apply_pod_spec_defaults(spec);
+    }
+
     // Validate pod spec — accumulate every violation into a `field::ErrorList`
     // so the 422 response carries one `Status.details.causes[]` entry per
     // failure, matching upstream `NewInvalid`. Short-circuiting on the first
@@ -163,11 +176,10 @@ pub async fn create(
     let limit_ranges: Vec<rusternetes_common::resources::LimitRange> =
         state.storage.list(&lr_prefix).await.unwrap_or_default();
 
-    // Apply shared PodSpec defaults (dnsPolicy, restartPolicy, etc.)
-    // K8s ref: pkg/apis/core/v1/defaults.go SetDefaults_PodSpec + SetDefaults_Container
+    // SetDefaults_PodSpec/Container/Probe already ran before validation above.
+    // The Pod-only defaults below (enableServiceLinks, limits→requests) and the
+    // LimitRange defaults do not affect that validation pass.
     if let Some(ref mut spec) = pod.spec {
-        crate::handlers::defaults::apply_pod_spec_defaults(spec);
-
         // SetDefaults_Pod (Pod-only, NOT templates): enableServiceLinks defaults
         // to true (v1.DefaultEnableServiceLinks). Defaulting this on embedded
         // PodTemplateSpecs would diverge from upstream and break ControllerRevision
