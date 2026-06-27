@@ -2184,7 +2184,7 @@ impl Kubelet {
                         }
                     }
                     // Refresh container statuses
-                    let fresh_statuses = self.runtime.get_container_statuses(&p).await.ok();
+                    let fresh_statuses = self.get_container_statuses(&p).await.ok();
                     if let Some(ref mut status) = p.status {
                         if let Some(cs) = fresh_statuses {
                             status.container_statuses = Some(cs);
@@ -2363,7 +2363,7 @@ impl Kubelet {
                     }
                     Self::fixup_init_container_ready(status);
                 }
-                let fresh_statuses = self.runtime.get_container_statuses(&p).await.ok();
+                let fresh_statuses = self.get_container_statuses(&p).await.ok();
                 if let Some(ref mut status) = p.status {
                     if let Some(cs) = fresh_statuses {
                         status.container_statuses = Some(cs);
@@ -2705,8 +2705,7 @@ impl Kubelet {
                                 //          GeneratePodInitializedCondition
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                                    let init_statuses =
-                                        self.runtime.get_init_container_statuses(&p).await;
+                                    let init_statuses = self.get_init_container_statuses(&p).await;
                                     // Names of init containers that did NOT terminate
                                     // with exit 0 — these are "incomplete" per K8s.
                                     let incomplete_inits: Vec<String> = p
@@ -2846,8 +2845,7 @@ impl Kubelet {
                                     );
                                 }
                                 // Update status
-                                let init_statuses =
-                                    self.runtime.get_init_container_statuses(pod).await;
+                                let init_statuses = self.get_init_container_statuses(pod).await;
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
                                     if let Some(ref mut s) = p.status {
@@ -2934,7 +2932,7 @@ impl Kubelet {
 
                             // Get container statuses and pod IP
                             let container_statuses =
-                                self.runtime.get_container_statuses(&fresh_pod).await.ok();
+                                self.get_container_statuses(&fresh_pod).await.ok();
                             let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
                             let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
 
@@ -2943,7 +2941,7 @@ impl Kubelet {
                             let qos = Self::compute_qos_class(&new_pod);
                             let observed_gen = new_pod.metadata.generation;
                             let init_container_statuses =
-                                self.runtime.get_init_container_statuses(&new_pod).await;
+                                self.get_init_container_statuses(&new_pod).await;
 
                             // If any container has a readiness probe, start as not-ready
                             // and let the probe check in the sync loop update Ready to True.
@@ -3026,9 +3024,9 @@ impl Kubelet {
                                         // K8s prober_manager.UpdatePodStatus always sets
                                         // ready=true for terminated init containers.
                                         let fresh_init_statuses =
-                                            self.runtime.get_init_container_statuses(pod).await;
+                                            self.get_init_container_statuses(pod).await;
                                         let fresh_container_statuses =
-                                            self.runtime.get_container_statuses(pod).await.ok();
+                                            self.get_container_statuses(pod).await.ok();
                                         if let Some(ref mut status) = retry_pod.status {
                                             status.phase = Some(Phase::Running);
                                             status.message =
@@ -3169,7 +3167,7 @@ impl Kubelet {
 
                                 // Get init container statuses — they may have run before the error
                                 let init_container_statuses =
-                                    self.runtime.get_init_container_statuses(&new_pod).await;
+                                    self.get_init_container_statuses(&new_pod).await;
 
                                 let qos = Self::compute_qos_class(&new_pod);
                                 let observed_gen = new_pod.metadata.generation;
@@ -3218,7 +3216,7 @@ impl Kubelet {
                                     _ => pod.clone(),
                                 };
                                 let init_container_statuses =
-                                    self.runtime.get_init_container_statuses(&fresh_pod).await;
+                                    self.get_init_container_statuses(&fresh_pod).await;
                                 let qos = Self::compute_qos_class(&fresh_pod);
                                 let observed_gen = fresh_pod.metadata.generation;
 
@@ -3430,8 +3428,7 @@ impl Kubelet {
                     }
 
                     // Get container statuses
-                    let container_statuses =
-                        self.runtime.get_container_statuses(&fresh_pod).await.ok();
+                    let container_statuses = self.get_container_statuses(&fresh_pod).await.ok();
 
                     // Get pod IP
                     let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
@@ -3441,8 +3438,7 @@ impl Kubelet {
                     let mut new_pod = fresh_pod;
                     let qos = Self::compute_qos_class(&new_pod);
                     let observed_gen = new_pod.metadata.generation;
-                    let init_container_statuses =
-                        self.runtime.get_init_container_statuses(&new_pod).await;
+                    let init_container_statuses = self.get_init_container_statuses(&new_pod).await;
 
                     let has_readiness_probe = new_pod
                         .spec
@@ -3710,9 +3706,7 @@ impl Kubelet {
                         .unwrap_or("Always");
 
                     if restart_policy == "Never" || restart_policy == "OnFailure" {
-                        if let Ok(container_statuses) =
-                            self.runtime.get_container_statuses(pod).await
-                        {
+                        if let Ok(container_statuses) = self.get_container_statuses(pod).await {
                             let all_terminated = !container_statuses.is_empty()
                                 && container_statuses.iter().all(|cs| {
                                     matches!(cs.state, Some(ContainerState::Terminated { .. }))
@@ -3743,7 +3737,7 @@ impl Kubelet {
                                 // have ready=true in the final pod status.
                                 // K8s ref: pkg/kubelet/prober/prober_manager.go — UpdatePodStatus
                                 let init_container_statuses =
-                                    self.runtime.get_init_container_statuses(&new_pod).await;
+                                    self.get_init_container_statuses(&new_pod).await;
                                 if let Some(ref mut status) = new_pod.status {
                                     status.phase = Some(terminal_phase);
                                     status.message = Some(message);
@@ -3783,7 +3777,7 @@ impl Kubelet {
                                     };
                                     let original = new_pod.clone();
                                     let init_container_statuses =
-                                        self.runtime.get_init_container_statuses(&new_pod).await;
+                                        self.get_init_container_statuses(&new_pod).await;
                                     if let Some(ref mut status) = new_pod.status {
                                         status.phase = Some(Phase::Succeeded);
                                         status.message =
@@ -4125,7 +4119,7 @@ impl Kubelet {
                             .await
                             .unwrap_or_else(|_| pod.clone());
                         if let Ok(container_statuses) =
-                            self.runtime.get_container_statuses(&readiness_pod).await
+                            self.get_container_statuses(&readiness_pod).await
                         {
                             // Restartable init containers (sidecars) count toward
                             // ContainersReady too (upstream status/generate.go):
@@ -4200,7 +4194,7 @@ impl Kubelet {
                                 let original = new_pod.clone();
                                 // Refresh init container statuses for terminal pod
                                 let init_container_statuses =
-                                    self.runtime.get_init_container_statuses(&new_pod).await;
+                                    self.get_init_container_statuses(&new_pod).await;
                                 if let Some(ref mut status) = new_pod.status {
                                     status.phase = Some(terminal_phase);
                                     status.message = Some(message);
@@ -4263,7 +4257,7 @@ impl Kubelet {
                                         _ => pod.clone(),
                                     };
                                     let init_container_statuses =
-                                        self.runtime.get_init_container_statuses(&new_pod).await;
+                                        self.get_init_container_statuses(&new_pod).await;
                                     if let Some(ref mut status) = new_pod.status {
                                         status.phase = Some(Phase::Succeeded);
                                         status.message =
@@ -4302,7 +4296,7 @@ impl Kubelet {
                             // status sync. Without this, stale ready=false from an
                             // intermediate write persists indefinitely.
                             let init_container_statuses =
-                                self.runtime.get_init_container_statuses(&new_pod).await;
+                                self.get_init_container_statuses(&new_pod).await;
 
                             if let Some(ref mut status) = new_pod.status {
                                 status.container_statuses = Some(container_statuses);
@@ -4398,7 +4392,7 @@ impl Kubelet {
                     .and_then(|s| s.restart_policy.as_deref())
                     .unwrap_or("Always");
 
-                let container_statuses = self.runtime.get_container_statuses(pod).await.ok();
+                let container_statuses = self.get_container_statuses(pod).await.ok();
                 let any_failed = container_statuses
                     .as_ref()
                     .map(|statuses| {
@@ -4436,7 +4430,7 @@ impl Kubelet {
                                 _ => pod.clone(),
                             };
                             let init_container_statuses =
-                                self.runtime.get_init_container_statuses(&new_pod).await;
+                                self.get_init_container_statuses(&new_pod).await;
                             if let Some(ref mut status) = new_pod.status {
                                 status.phase = Some(Phase::Succeeded);
                                 status.message = Some("Pod completed successfully".to_string());
@@ -4474,7 +4468,7 @@ impl Kubelet {
                             _ => pod.clone(),
                         };
                         let init_container_statuses =
-                            self.runtime.get_init_container_statuses(&new_pod).await;
+                            self.get_init_container_statuses(&new_pod).await;
                         if let Some(ref mut status) = new_pod.status {
                             status.phase = Some(terminal_phase.clone());
                             status.message = Some(message);
@@ -4662,7 +4656,7 @@ impl Kubelet {
         // concurrent writer.
         let key = build_key("pods", Some(namespace), pod_name);
         if let Ok(mut fresh_pod) = self.storage.get::<Pod>(&key).await {
-            if let Ok(mut statuses) = self.runtime.get_container_statuses(&fresh_pod).await {
+            if let Ok(mut statuses) = self.get_container_statuses(&fresh_pod).await {
                 {
                     let map = self.restart_backoff.lock().unwrap();
                     for cs in statuses.iter_mut() {
@@ -4685,7 +4679,7 @@ impl Kubelet {
                 // Restartable init containers (sidecars) carry their own
                 // restart counts in init_container_statuses; overlay the backoff
                 // map there too so a restarted sidecar reports its count.
-                let mut init_statuses = self.runtime.get_init_container_statuses(&fresh_pod).await;
+                let mut init_statuses = self.get_init_container_statuses(&fresh_pod).await;
                 if let Some(ref mut list) = init_statuses {
                     let map = self.restart_backoff.lock().unwrap();
                     for cs in list.iter_mut() {
@@ -4715,6 +4709,40 @@ impl Kubelet {
             .lock()
             .unwrap()
             .retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Overlay the authoritative `restartCount` from the [`RestartBackoff`] map
+    /// onto freshly-read container statuses. The CRI status reports
+    /// `metadata.attempt`, which resets to 0 when a new sandbox is created — so
+    /// without this overlay a status write can report a LOWER count than a prior
+    /// write (non-monotonic `1 → 0`), failing the container_probe NodeConformance
+    /// specs. The backoff map is the single source of truth for restartCount;
+    /// apply it everywhere statuses are published (#1514).
+    fn overlay_restart_backoff(&self, statuses: &mut [ContainerStatus], pod: &Pod) {
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let pod_name = &pod.metadata.name;
+        let map = self.restart_backoff.lock().unwrap();
+        for cs in statuses.iter_mut() {
+            if let Some(entry) = map.get(&format!("{}/{}/{}", namespace, pod_name, cs.name)) {
+                cs.restart_count = entry.restart_count;
+            }
+        }
+    }
+
+    /// `ContainerRuntime::get_container_statuses` + the [`RestartBackoff`] overlay.
+    /// All status-publish paths go through this so `restartCount` is monotonic
+    /// and consistent regardless of CRI sandbox churn (#1514).
+    async fn get_container_statuses(&self, pod: &Pod) -> Result<Vec<ContainerStatus>> {
+        let mut statuses = self.runtime.get_container_statuses(pod).await?;
+        self.overlay_restart_backoff(&mut statuses, pod);
+        Ok(statuses)
+    }
+
+    /// Restartable-init (sidecar) variant — same backoff overlay (#1514).
+    async fn get_init_container_statuses(&self, pod: &Pod) -> Option<Vec<ContainerStatus>> {
+        let mut statuses = self.runtime.get_init_container_statuses(pod).await?;
+        self.overlay_restart_backoff(&mut statuses, pod);
+        Some(statuses)
     }
 
     /// Record one more failed terminal finalize for `key` (the object is still
