@@ -144,11 +144,26 @@ pub async fn update(
 
     let key = build_key("horizontalpodautoscalers", Some(&namespace), &name);
 
-    // Field validation on update (upstream ValidateHorizontalPodAutoscalerUpdate
-    // re-runs validateHorizontalPodAutoscalerSpec on the new object). The create
-    // path validated but the update path previously persisted PUTs unchecked.
+    // Field validation. This handler is an upsert: if the object already exists
+    // we run the update validator (upstream ValidateHorizontalPodAutoscalerUpdate),
+    // which relaxes apiVersion/minReplicas checks against the prior object so a
+    // PUT touching unrelated fields can't be rejected for pre-existing
+    // invalidity. If it doesn't exist yet, this is a create — use the create
+    // validator.
     {
-        let errs = rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler(&hpa);
+        let existing = state
+            .storage
+            .get::<HorizontalPodAutoscaler>(&key)
+            .await
+            .ok();
+        let errs = match &existing {
+            Some(old) => {
+                rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler_update(
+                    &hpa, old,
+                )
+            }
+            None => rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler(&hpa),
+        };
         if !errs.is_empty() {
             return Err(rusternetes_common::Error::Invalid(errs));
         }

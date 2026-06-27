@@ -84,6 +84,63 @@ impl HorizontalPodAutoscalerSpecValidationOptions {
             },
         }
     }
+
+    /// Options for an *update*, mirroring
+    /// `validationOptionsForHorizontalPodAutoscaler(newHPA, oldHPA)` with the
+    /// `HPAScaleToZero` feature gate off. Relative to create, an update relaxes
+    /// validation against the prior object so a PUT that touches unrelated
+    /// fields cannot be rejected for pre-existing invalidity:
+    ///
+    /// * `minReplicas` may stay 0 if the old object already had 0.
+    /// * `scaleTargetRef.apiVersion` validation is skipped when the update does
+    ///   not change the target kind/apiVersion.
+    /// * object-metric `apiVersion` validation is skipped if any old object
+    ///   metric was already invalid.
+    fn for_update(new: &HorizontalPodAutoscalerSpec, old: &HorizontalPodAutoscalerSpec) -> Self {
+        let mut opts = Self {
+            min_replicas_lower_bound: 1,
+            scale_target_ref_validation_options: CrossVersionObjectReferenceValidationOptions {
+                allow_empty_api_group: false,
+                allow_invalid_api_version: false,
+            },
+            object_metrics_validation_options: CrossVersionObjectReferenceValidationOptions {
+                allow_empty_api_group: true,
+                allow_invalid_api_version: false,
+            },
+        };
+
+        // HPAScaleToZero gate is off; allow 0 only if the old object had 0.
+        if old.min_replicas == Some(0) {
+            opts.min_replicas_lower_bound = 0;
+        }
+
+        let old_av = old.scale_target_ref.api_version.as_deref().unwrap_or("");
+        let new_av = new.scale_target_ref.api_version.as_deref().unwrap_or("");
+        if old_av == new_av && old.scale_target_ref.kind == new.scale_target_ref.kind {
+            // Skip apiVersion validation on updates that don't change the kind/apiVersion.
+            opts.scale_target_ref_validation_options
+                .allow_invalid_api_version = true;
+        } else if new.scale_target_ref.kind == "ReplicationController" {
+            // Allow empty apiVersion for the only scalable type in the core v1 API.
+            opts.scale_target_ref_validation_options
+                .allow_empty_api_group = true;
+        }
+
+        // If any old object metric already had an invalid apiVersion, the
+        // metrics are already invalid — don't re-reject them on update.
+        for metric in old.metrics.as_deref().unwrap_or(&[]) {
+            if let Some(object) = &metric.object {
+                let av = object.described_object.api_version.as_deref().unwrap_or("");
+                if validate_api_version(av, opts.object_metrics_validation_options).is_some() {
+                    opts.object_metrics_validation_options
+                        .allow_invalid_api_version = true;
+                    break;
+                }
+            }
+        }
+
+        opts
+    }
 }
 
 /// Upstream `schema.ParseGroupVersion`: returns `(group, version)` or an error
@@ -781,6 +838,23 @@ pub fn validate_horizontal_pod_autoscaler(hpa: &HorizontalPodAutoscaler) -> Erro
     validate_hpa_spec(&hpa.spec, &Path::new("spec"))
 }
 
+/// Validate an update to a `HorizontalPodAutoscaler`. Mirrors upstream
+/// `ValidateHorizontalPodAutoscalerUpdate`, re-running spec validation on the
+/// new object with update-relaxed options derived from the old object (see
+/// [`HorizontalPodAutoscalerSpecValidationOptions::for_update`]).
+///
+/// The upstream entry point also runs `ValidateObjectMetaUpdate`, whose
+/// `resourceVersion`-must-be-specified gate is enforced at the storage layer
+/// here (the update path is an upsert), not re-checked in this validator —
+/// matching [`validate_horizontal_pod_autoscaler_status_update`].
+pub fn validate_horizontal_pod_autoscaler_update(
+    new: &HorizontalPodAutoscaler,
+    old: &HorizontalPodAutoscaler,
+) -> ErrorList {
+    let opts = HorizontalPodAutoscalerSpecValidationOptions::for_update(&new.spec, &old.spec);
+    validate_hpa_spec_with_opts(&new.spec, &Path::new("spec"), &opts)
+}
+
 /// Validate the status subresource of an `HorizontalPodAutoscaler`. Mirrors the
 /// substantive checks of upstream `ValidateHorizontalPodAutoscalerStatusUpdate`
 /// (autoscaling validation.go): `currentReplicas` and `desiredReplicas` must be
@@ -1241,6 +1315,112 @@ mod tests {
                 "spec.behavior.scaleUp.stabilizationWindowSeconds",
                 ErrorType::Invalid
             ),
+            "got: {errs:?}"
+        );
+    }
+
+    fn hpa(spec: serde_json::Value) -> HorizontalPodAutoscaler {
+        serde_json::from_value(json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {"name": "h", "namespace": "default"},
+            "spec": spec,
+        }))
+        .expect("hpa deserializes")
+    }
+
+    fn update_errs(new: serde_json::Value, old: serde_json::Value) -> ErrorList {
+        validate_horizontal_pod_autoscaler_update(&hpa(new), &hpa(old))
+    }
+
+    #[test]
+    fn update_unchanged_target_skips_apiversion_validation() {
+        // Old object already carries a group-less apiVersion on its target. An
+        // update that leaves kind/apiVersion unchanged must not be rejected for
+        // it (upstream skips apiVersion validation on unchanged kind).
+        let bad_target = json!({"kind": "Foo", "name": "x", "apiVersion": "v1"});
+        let spec = json!({
+            "scaleTargetRef": bad_target,
+            "minReplicas": 1,
+            "maxReplicas": 10,
+        });
+        let errs = update_errs(spec.clone(), spec);
+        assert!(errs.is_empty(), "unexpected: {errs:?}");
+    }
+
+    #[test]
+    fn update_changed_target_revalidates_apiversion() {
+        let old = json!({
+            "scaleTargetRef": {"kind": "Deployment", "name": "x", "apiVersion": "apps/v1"},
+            "minReplicas": 1,
+            "maxReplicas": 10,
+        });
+        // New target switches to a group-less apiVersion — kind/apiVersion
+        // changed, so apiVersion validation runs and rejects it.
+        let new = json!({
+            "scaleTargetRef": {"kind": "Foo", "name": "x", "apiVersion": "v1"},
+            "minReplicas": 1,
+            "maxReplicas": 10,
+        });
+        let errs = update_errs(new, old);
+        assert!(
+            has(&errs, "spec.scaleTargetRef.apiVersion", ErrorType::Invalid),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn update_keeps_zero_min_replicas_when_old_was_zero() {
+        // Old already had minReplicas: 0 with an object metric — an update that
+        // keeps 0 stays valid even with the scale-to-zero gate off.
+        let object_metric = json!({
+            "type": "Object",
+            "object": {
+                "describedObject": {"kind": "Service", "name": "s", "apiVersion": "v1"},
+                "metric": {"name": "rps"},
+                "target": {"type": "Value", "value": "100"}
+            }
+        });
+        let old = json!({
+            "scaleTargetRef": {"kind": "Deployment", "name": "x", "apiVersion": "apps/v1"},
+            "minReplicas": 0,
+            "maxReplicas": 10,
+            "metrics": [object_metric.clone()],
+        });
+        let new = json!({
+            "scaleTargetRef": {"kind": "Deployment", "name": "x", "apiVersion": "apps/v1"},
+            "minReplicas": 0,
+            "maxReplicas": 10,
+            "metrics": [object_metric],
+        });
+        let errs = update_errs(new, old);
+        assert!(errs.is_empty(), "unexpected: {errs:?}");
+    }
+
+    #[test]
+    fn update_rejects_zero_min_replicas_when_old_was_nonzero() {
+        let old = json!({
+            "scaleTargetRef": {"kind": "Deployment", "name": "x", "apiVersion": "apps/v1"},
+            "minReplicas": 1,
+            "maxReplicas": 10,
+        });
+        let object_metric = json!({
+            "type": "Object",
+            "object": {
+                "describedObject": {"kind": "Service", "name": "s", "apiVersion": "v1"},
+                "metric": {"name": "rps"},
+                "target": {"type": "Value", "value": "100"}
+            }
+        });
+        let new = json!({
+            "scaleTargetRef": {"kind": "Deployment", "name": "x", "apiVersion": "apps/v1"},
+            "minReplicas": 0,
+            "maxReplicas": 10,
+            "metrics": [object_metric],
+        });
+        let errs = update_errs(new, old);
+        assert!(
+            has(&errs, "spec.minReplicas", ErrorType::Invalid),
             "got: {errs:?}"
         );
     }
