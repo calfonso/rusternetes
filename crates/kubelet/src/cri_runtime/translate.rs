@@ -350,6 +350,67 @@ fn upsert_env(out: &mut Vec<v1::KeyValue>, key: String, value: String) {
     }
 }
 
+/// Expand `$(VAR)` references in `input` against `mapping`, a faithful port of
+/// upstream `third_party/forked/golang/expansion.Expand` +
+/// `MappingFuncFor`:
+/// - `$(VAR)` → `mapping[VAR]`, or the verbatim `$(VAR)` if VAR is unknown;
+/// - `$$` → a literal `$`;
+/// - an incomplete `$(` and a `$` not starting an expression are literal.
+///
+/// The kubelet runs this over both env values (against the vars defined so far)
+/// and container command/args (against the full container env) — see
+/// `pkg/kubelet/kubelet_pods.go::makeEnvironmentVariables` and
+/// `kuberuntime_container.go::expandContainerCommandAndArgs`.
+pub(crate) fn expand(input: &str, mapping: &HashMap<String, String>) -> String {
+    let b = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor < b.len() {
+        if b[cursor] == b'$' && cursor + 1 < b.len() {
+            match b[cursor + 1] {
+                b'$' => {
+                    out.push('$');
+                    cursor += 2;
+                    continue;
+                }
+                b'(' => {
+                    if let Some(rel) = b[cursor + 2..].iter().position(|&c| c == b')') {
+                        let name = &input[cursor + 2..cursor + 2 + rel];
+                        match mapping.get(name) {
+                            Some(v) => out.push_str(v),
+                            // Unknown var: leave the whole `$(name)` verbatim.
+                            None => out.push_str(&input[cursor..cursor + 2 + rel + 1]),
+                        }
+                        cursor = cursor + 2 + rel + 1;
+                        continue;
+                    }
+                    // Incomplete reference `$(` → literal.
+                    out.push_str("$(");
+                    cursor += 2;
+                    continue;
+                }
+                _ => {
+                    // `$` not starting an expression: emit `$` + the next char.
+                    out.push('$');
+                    let ch = input[cursor + 1..].chars().next().unwrap();
+                    out.push(ch);
+                    cursor += 1 + ch.len_utf8();
+                    continue;
+                }
+            }
+        }
+        let ch = input[cursor..].chars().next().unwrap();
+        out.push(ch);
+        cursor += ch.len_utf8();
+    }
+    out
+}
+
+/// Expand `$(VAR)` in every element of a command/args vector against `env`.
+fn expand_all(items: Vec<String>, env: &HashMap<String, String>) -> Vec<String> {
+    items.iter().map(|s| expand(s, env)).collect()
+}
+
 fn env_vars(
     pod: &Pod,
     container: &Container,
@@ -357,6 +418,9 @@ fn env_vars(
     secrets: &HashMap<String, Secret>,
 ) -> Vec<v1::KeyValue> {
     let mut out: Vec<v1::KeyValue> = Vec::new();
+    // Mirror of `out` for `$(VAR)` lookups: upstream expands each literal env
+    // value against the vars defined so far (`makeEnvironmentVariables`).
+    let mut seen: HashMap<String, String> = HashMap::new();
 
     // 1. envFrom: bulk-expand referenced ConfigMaps/Secrets (declared order),
     //    each key optionally prefixed. A later source overrides an earlier one.
@@ -366,7 +430,9 @@ fn env_vars(
             if let Some(cmr) = src.config_map_ref.as_ref() {
                 if let Some(data) = config_maps.get(&cmr.name).and_then(|cm| cm.data.as_ref()) {
                     for (k, v) in data {
-                        upsert_env(&mut out, format!("{prefix}{k}"), v.clone());
+                        let key = format!("{prefix}{k}");
+                        seen.insert(key.clone(), v.clone());
+                        upsert_env(&mut out, key, v.clone());
                     }
                 }
             }
@@ -375,11 +441,10 @@ fn env_vars(
                     for (k, v) in data {
                         // Secret data is decoded bytes; env values are the UTF-8
                         // interpretation (upstream casts []byte→string).
-                        upsert_env(
-                            &mut out,
-                            format!("{prefix}{k}"),
-                            String::from_utf8_lossy(v).into_owned(),
-                        );
+                        let key = format!("{prefix}{k}");
+                        let val = String::from_utf8_lossy(v).into_owned();
+                        seen.insert(key.clone(), val.clone());
+                        upsert_env(&mut out, key, val);
                     }
                 }
             }
@@ -391,12 +456,14 @@ fn env_vars(
     if let Some(env) = container.env.as_ref() {
         for e in env {
             let value = if let Some(v) = e.value.as_ref() {
-                Some(v.clone())
+                // Literal values get `$(VAR)` expanded against vars defined so
+                // far (upstream `makeEnvironmentVariables`); `valueFrom` does not.
+                Some(expand(v, &seen))
             } else if let Some(src) = e.value_from.as_ref() {
                 if let Some(fr) = src.field_ref.as_ref() {
                     pod_field_value(pod, &fr.field_path)
                 } else if let Some(rfr) = src.resource_field_ref.as_ref() {
-                    container_resource_value(container, &rfr.resource)
+                    container_resource_value(container, &rfr.resource, rfr.divisor.as_deref())
                 } else if let Some(cmr) = src.config_map_key_ref.as_ref() {
                     config_maps
                         .get(&cmr.name)
@@ -417,6 +484,7 @@ fn env_vars(
                 None
             };
             if let Some(v) = value {
+                seen.insert(e.name.clone(), v.clone());
                 upsert_env(&mut out, e.name.clone(), v);
             }
         }
@@ -500,7 +568,11 @@ fn phase_str(phase: &rusternetes_common::types::Phase) -> String {
 
 /// Resolve a `resourceFieldRef` (`limits.cpu` / `requests.memory`, etc.) to its
 /// numeric value as a decimal string. `None` if the resource is not set.
-fn container_resource_value(container: &Container, resource: &str) -> Option<String> {
+fn container_resource_value(
+    container: &Container,
+    resource: &str,
+    divisor: Option<&str>,
+) -> Option<String> {
     let req = container.resources.as_ref()?;
     let (kind, name) = resource.split_once('.')?;
     let map = match kind {
@@ -509,12 +581,29 @@ fn container_resource_value(container: &Container, resource: &str) -> Option<Str
         _ => None,
     }?;
     let raw = map.get(name)?;
+    // `divisor` defaults to "1" (cores for cpu, bytes for memory) — matches
+    // upstream `resourcehelper.ExtractContainerResourceValue`. cpu rounds UP
+    // (ceil of milli/divisor-milli); byte quantities truncate (floor).
+    let div = divisor.unwrap_or("1");
     match name {
-        "cpu" => parse_cpu_millicores(raw).map(|m| m.to_string()),
+        "cpu" => {
+            let milli = parse_cpu_millicores(raw)?;
+            let div_milli = parse_cpu_millicores(div).filter(|d| *d > 0)?;
+            // Ceil division (toolchain predates stable `div_ceil`).
+            Some(((milli + div_milli - 1) / div_milli).to_string())
+        }
         // memory, ephemeral-storage and hugepages-<size> are all byte quantities
-        // upstream normalizes to an integer byte count (resource/helpers.go).
-        "memory" | "ephemeral-storage" => parse_memory_bytes(raw).map(|b| b.to_string()),
-        n if n.starts_with("hugepages-") => parse_memory_bytes(raw).map(|b| b.to_string()),
+        // upstream normalizes to an integer count of `divisor` bytes (floor).
+        "memory" | "ephemeral-storage" => {
+            let bytes = parse_memory_bytes(raw)?;
+            let div_bytes = parse_memory_bytes(div).filter(|d| *d > 0)?;
+            Some((bytes / div_bytes).to_string())
+        }
+        n if n.starts_with("hugepages-") => {
+            let bytes = parse_memory_bytes(raw)?;
+            let div_bytes = parse_memory_bytes(div).filter(|d| *d > 0)?;
+            Some((bytes / div_bytes).to_string())
+        }
         _ => Some(raw.clone()),
     }
 }
@@ -967,6 +1056,14 @@ pub fn container_config(
         }
     };
 
+    let envs = env_vars(pod, container, config_maps, secrets);
+    // command/args expand `$(VAR)` against the full container env (upstream
+    // `expandContainerCommandAndArgs`).
+    let env_map: HashMap<String, String> = envs
+        .iter()
+        .map(|kv| (kv.key.clone(), kv.value.clone()))
+        .collect();
+
     v1::ContainerConfig {
         metadata: Some(v1::ContainerMetadata {
             name: container.name.clone(),
@@ -976,10 +1073,10 @@ pub fn container_config(
             image: image_ref.to_string(),
             ..Default::default()
         }),
-        command: container.command.clone().unwrap_or_default(),
-        args: container.args.clone().unwrap_or_default(),
+        command: expand_all(container.command.clone().unwrap_or_default(), &env_map),
+        args: expand_all(container.args.clone().unwrap_or_default(), &env_map),
         working_dir: container.working_dir.clone().unwrap_or_default(),
-        envs: env_vars(pod, container, config_maps, secrets),
+        envs,
         mounts: mounts(container, host_paths),
         labels,
         log_path: format!("{}.log", container.name),
@@ -1861,11 +1958,11 @@ mod tests {
         };
         // Both normalize to bytes, like memory (not raw passthrough).
         assert_eq!(
-            container_resource_value(&c, "limits.ephemeral-storage").as_deref(),
+            container_resource_value(&c, "limits.ephemeral-storage", None).as_deref(),
             Some("1073741824")
         );
         assert_eq!(
-            container_resource_value(&c, "limits.hugepages-2Mi").as_deref(),
+            container_resource_value(&c, "limits.hugepages-2Mi", None).as_deref(),
             Some("4194304")
         );
     }

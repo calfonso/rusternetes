@@ -38,3 +38,7 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Runtime cluster state (certs, manifests, pod volumes) — never part of an image
+# build context; pod-created volume dirs are root-owned 0700 and break context send.
+.rusternetes/

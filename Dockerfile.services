@@ -418,6 +418,13 @@ COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
 
 COPY --from=cargo-builder /out/kubelet /app/kubelet
 
+# Entrypoint installs a route to the pod CIDR via the containerd container so
+# the kubelet can dial pod IPs for probes + HTTP lifecycle hooks (mirrors the
+# api-server entrypoint). iproute2 is installed above; needs NET_ADMIN /
+# privileged (the compose kubelet is privileged).
+COPY deploy/kubelet/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 # NOTE: do NOT declare `VOLUME ["/var/run"]` here. The container runtime
 # socket is provided by the compose *bind* mount (/run/.../podman.sock or
 # /var/run/docker.sock), not by a Docker volume. Declaring /var/run a VOLUME
@@ -428,7 +435,7 @@ COPY --from=cargo-builder /out/kubelet /app/kubelet
 # accumulating anonymous volumes' _data dirs — a 2^n host mount-table explosion
 # that exhausts fs.mount-max during crash-loops. See #66.
 
-ENTRYPOINT ["/app/kubelet"]
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]
 
 # ---------------------------------------------------------------------

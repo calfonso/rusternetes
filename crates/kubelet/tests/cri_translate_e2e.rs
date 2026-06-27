@@ -232,7 +232,7 @@ async fn cri_container_runtime_lifecycle() {
     // Introspection helpers used by the kubelet reconcile loop.
     assert!(
         runtime
-            .is_container_running("sleeper")
+            .is_container_running(&pod.metadata.uid, "sleeper")
             .await
             .expect("is_container_running"),
         "is_container_running(sleeper) should be true"

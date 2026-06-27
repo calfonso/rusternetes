@@ -1028,6 +1028,16 @@ impl Kubelet {
         "127.0.0.1".to_string()
     }
 
+    /// Cached node InternalIP used for pod `status.hostIP` / `status.hostIPs`.
+    /// Upstream sets these to the node's address (kubelet `generateAPIPodStatus`
+    /// → `hostIPs`), and conformance reads them via the downward API. Resolving
+    /// the IP shells out / does DNS, so memoize — it is stable for the kubelet's
+    /// lifetime.
+    fn node_internal_ip() -> &'static str {
+        static NODE_IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NODE_IP.get_or_init(Self::detect_internal_ip)
+    }
+
     async fn update_node_status(&self) -> Result<()> {
         debug!("Updating node status");
 
@@ -2650,13 +2660,8 @@ impl Kubelet {
 
                     // For pods with init containers, use the state machine approach.
                     // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go — computeInitContainerActions
-                    // Check if the pause container exists (pod sandbox created).
-                    let pause_name = format!("{}_pause", pod_name);
-                    let sandbox_exists = self
-                        .runtime
-                        .is_container_running(&pause_name)
-                        .await
-                        .unwrap_or(false);
+                    // Check if the pod sandbox has been created.
+                    let sandbox_exists = self.runtime.has_sandbox(pod_name).await;
 
                     if has_init_containers && sandbox_exists {
                         // Pod sandbox exists — check init container progress
@@ -2679,8 +2684,10 @@ impl Kubelet {
                                     ic.name, namespace, pod_name
                                 );
                                 // Remove failed container so it can be recreated
-                                let cname = format!("{}_{}", pod_name, ic.name);
-                                let _ = self.runtime.remove_terminated_container(&cname).await;
+                                let _ = self
+                                    .runtime
+                                    .remove_terminated_container(&pod.metadata.uid, &ic.name)
+                                    .await;
                                 // Update status with CrashLoopBackOff AND make sure
                                 // the PodInitialized=False condition + app-container
                                 // Waiting/PodInitializing statuses are present.
@@ -2973,7 +2980,7 @@ impl Kubelet {
                                 phase: Some(Phase::Running),
                                 message: Some("All containers started".to_string()),
                                 reason: None,
-                                host_ip: Some("127.0.0.1".to_string()),
+                                host_ip: Some(Self::node_internal_ip().to_string()),
                                 pod_ip,
                                 conditions: Some(conditions),
                                 container_statuses,
@@ -2983,7 +2990,7 @@ impl Kubelet {
                                 resource_claim_statuses: None,
                                 observed_generation: observed_gen,
                                 host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
-                                    ip: "127.0.0.1".to_string(),
+                                    ip: Self::node_internal_ip().to_string(),
                                 }]),
                                 pod_i_ps,
                                 nominated_node_name: None,
@@ -3175,7 +3182,7 @@ impl Kubelet {
                                     phase: Some(Phase::Pending),
                                     message: Some(err_msg),
                                     reason: Some(reason),
-                                    host_ip: Some("127.0.0.1".to_string()),
+                                    host_ip: Some(Self::node_internal_ip().to_string()),
                                     pod_ip: None,
                                     conditions: None,
                                     container_statuses,
@@ -3186,7 +3193,7 @@ impl Kubelet {
                                     observed_generation: observed_gen,
                                     host_i_ps: Some(vec![
                                         rusternetes_common::resources::pod::HostIP {
-                                            ip: "127.0.0.1".to_string(),
+                                            ip: Self::node_internal_ip().to_string(),
                                         },
                                     ]),
                                     pod_i_ps: None,
@@ -3333,7 +3340,7 @@ impl Kubelet {
                                     phase: Some(phase),
                                     message: Some(status_msg),
                                     reason: Some(reason),
-                                    host_ip: Some("127.0.0.1".to_string()),
+                                    host_ip: Some(Self::node_internal_ip().to_string()),
                                     pod_ip: None,
                                     conditions: Some(failed_conditions),
                                     container_statuses: app_container_statuses,
@@ -3344,7 +3351,7 @@ impl Kubelet {
                                     observed_generation: observed_gen,
                                     host_i_ps: Some(vec![
                                         rusternetes_common::resources::pod::HostIP {
-                                            ip: "127.0.0.1".to_string(),
+                                            ip: Self::node_internal_ip().to_string(),
                                         },
                                     ]),
                                     pod_i_ps: None,
@@ -3467,7 +3474,7 @@ impl Kubelet {
                         phase: Some(Phase::Running),
                         message: Some("All containers started".to_string()),
                         reason: None,
-                        host_ip: Some("127.0.0.1".to_string()),
+                        host_ip: Some(Self::node_internal_ip().to_string()),
                         pod_ip,
                         conditions: Some(conditions),
                         container_statuses,
@@ -3476,7 +3483,9 @@ impl Kubelet {
                         resize: None,
                         resource_claim_statuses: None,
                         observed_generation: observed_gen,
-                        host_i_ps: None,
+                        host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
+                            ip: Self::node_internal_ip().to_string(),
+                        }]),
                         pod_i_ps,
                         nominated_node_name: None,
                         qos_class: Some(qos),
@@ -4050,7 +4059,7 @@ impl Kubelet {
                                             phase: Some(Phase::Running),
                                             message: Some("Liveness probe failed".to_string()),
                                             reason: Some("Restarting".to_string()),
-                                            host_ip: Some("127.0.0.1".to_string()),
+                                            host_ip: Some(Self::node_internal_ip().to_string()),
                                             pod_ip: None,
                                             conditions: None,
                                             container_statuses: None,
@@ -4061,7 +4070,7 @@ impl Kubelet {
                                             observed_generation: new_pod.metadata.generation,
                                             host_i_ps: Some(vec![
                                                 rusternetes_common::resources::pod::HostIP {
-                                                    ip: "127.0.0.1".to_string(),
+                                                    ip: Self::node_internal_ip().to_string(),
                                                 },
                                             ]),
                                             pod_i_ps: None,
@@ -4576,10 +4585,9 @@ impl Kubelet {
             .iter()
             .filter(|ic| ic.restart_policy.as_deref() == Some("Always"));
         for c in spec.containers.iter().chain(restartable_inits) {
-            let cname = format!("{}_{}", pod_name, c.name);
             if self
                 .runtime
-                .is_container_running(&cname)
+                .is_container_running(&pod.metadata.uid, &c.name)
                 .await
                 .unwrap_or(true)
             {
@@ -4590,7 +4598,7 @@ impl Kubelet {
             if restart_policy == "OnFailure" {
                 let exit_code = self
                     .runtime
-                    .get_container_exit_code(&cname)
+                    .get_container_exit_code(&pod.metadata.uid, &c.name)
                     .await
                     .unwrap_or(1);
                 if exit_code == 0 {
@@ -4630,7 +4638,10 @@ impl Kubelet {
             };
 
             if do_restart {
-                let _ = self.runtime.remove_terminated_container(&cname).await;
+                let _ = self
+                    .runtime
+                    .remove_terminated_container(&pod.metadata.uid, &c.name)
+                    .await;
                 let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
                 if let Err(e) = self
                     .runtime

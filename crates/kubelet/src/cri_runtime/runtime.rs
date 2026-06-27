@@ -412,6 +412,42 @@ impl CriContainerRuntime {
         // than silently launching the container with the var missing.
         translate::validate_env_key_refs(pod, container, &config_maps, &secrets)
             .map_err(|msg| anyhow::anyhow!("env for container {}: {msg}", container.name))?;
+
+        // Downward-API `status.podIP`/`hostIP`(`s`) env is resolved at
+        // container-create time. Upstream resolves it from the pod status the
+        // kubelet already built off the sandbox; our sync loop only writes that
+        // status after containers start, so populate the IPs here (pod IP from
+        // the running sandbox, host IP = node InternalIP) on a local copy.
+        let mut eff_pod;
+        let pod = if pod
+            .status
+            .as_ref()
+            .map(|s| s.pod_ip.is_none() || s.host_ip.is_none())
+            .unwrap_or(true)
+        {
+            eff_pod = pod.clone();
+            let pod_ip = self.get_pod_ip(&pod.metadata.name).await.ok().flatten();
+            let st = eff_pod.status.get_or_insert_with(Default::default);
+            if st.pod_ip.is_none() {
+                if let Some(ip) = pod_ip {
+                    st.pod_i_ps = Some(vec![rusternetes_common::resources::pod::PodIP {
+                        ip: ip.clone(),
+                    }]);
+                    st.pod_ip = Some(ip);
+                }
+            }
+            if st.host_ip.is_none() {
+                let nip = node_internal_ip().to_string();
+                st.host_i_ps = Some(vec![rusternetes_common::resources::pod::HostIP {
+                    ip: nip.clone(),
+                }]);
+                st.host_ip = Some(nip);
+            }
+            &eff_pod
+        } else {
+            pod
+        };
+
         let mut cfg = translate::container_config(
             pod,
             container,
@@ -450,10 +486,88 @@ impl CriContainerRuntime {
                 container.name
             ),
         }
+        // Managed /etc/hosts (#1024): the CRI/containerd path otherwise gets
+        // containerd's default hosts file, which omits `spec.hostAliases`.
+        // Generate the kubelet-managed file and bind-mount it at /etc/hosts so
+        // hostAliases (and the pod's own FQDN entry) are present — matching
+        // upstream `makeMounts`. hostNetwork pods start from the node's
+        // /etc/hosts and then get the aliases appended.
+        // If the container mounts its own /etc/hosts (a volumeMount at that
+        // path), the user's mount wins — upstream `makeMounts` skips the managed
+        // hosts file in that case (the KubeletManagedEtcHosts spec asserts such
+        // a container's /etc/hosts is NOT kubelet-managed).
+        let container_mounts_etc_hosts = container
+            .volume_mounts
+            .iter()
+            .flatten()
+            .any(|m| Path::new(&m.mount_path) == Path::new("/etc/hosts"));
+        let host_network = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.host_network)
+            .unwrap_or(false);
+        let hosts_content = if container_mounts_etc_hosts {
+            None
+        } else if host_network {
+            let mut c = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+            for alias in pod
+                .spec
+                .iter()
+                .flat_map(|s| s.host_aliases.iter().flatten())
+            {
+                match alias.hostnames.as_deref() {
+                    Some(h) if !h.is_empty() => {
+                        c.push_str(&format!("{}\t{}\n", alias.ip, h.join("\t")));
+                    }
+                    _ => {}
+                }
+            }
+            Some(c)
+        } else {
+            let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
+            crate::kubelet::build_managed_hosts_content(pod, pod_ip, &self.cluster_domain)
+        };
+        if let Some(content) = hosts_content {
+            let hosts_path = format!("{}/etc-hosts", self.log_dir_for(pod));
+            if let Some(parent) = Path::new(&hosts_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&hosts_path, content) {
+                Ok(()) => cfg.mounts.push(v1::Mount {
+                    container_path: "/etc/hosts".to_string(),
+                    host_path: hosts_path,
+                    readonly: false,
+                    ..Default::default()
+                }),
+                Err(e) => warn!(
+                    "container {}: managed /etc/hosts setup failed: {e}",
+                    container.name
+                ),
+            }
+        }
+
         let container_id = cri
             .create_container(sandbox_id, cfg, sandbox_cfg.clone())
             .await?;
         cri.start_container(&container_id).await?;
+
+        // postStart lifecycle hook: runs immediately after the container starts
+        // (upstream kuberuntime `startContainer`). Best-effort — a failed
+        // postStart upstream restarts the container, but the conformance handler
+        // asserts the hook request was *received*, so executing it is the goal;
+        // log on failure rather than tearing the container down.
+        if let Some(ps) = container
+            .lifecycle
+            .as_ref()
+            .and_then(|lc| lc.post_start.as_ref())
+        {
+            if let Err(e) = self
+                .run_lifecycle_handler(pod, container, &container_id, ps)
+                .await
+            {
+                warn!("container {}: postStart hook failed: {e}", container.name);
+            }
+        }
         Ok(container_id)
     }
 
@@ -621,6 +735,17 @@ impl CriContainerRuntime {
         }
 
         for container in &spec.containers {
+            // Idempotent: start_pod is retried by the reconcile loop. Skip a
+            // container the runtime already has (any state) — re-creating it
+            // would race a duplicate CreateContainer for the same name and, for
+            // long-running multi-container pods, crash-loop on port collisions.
+            // Restarting an exited container is the reconcile loop's job.
+            if self
+                .container_exists(&pod.metadata.uid, &container.name)
+                .await
+            {
+                continue;
+            }
             self.create_and_start_container(
                 &mut cri,
                 pod,
@@ -715,23 +840,36 @@ impl CriContainerRuntime {
         let mut cri = self.cri.clone();
         let containers = cri.list_containers(Some(filter)).await?;
 
-        // Index runtime containers by their kubernetes container name.
-        let mut by_name: std::collections::HashMap<String, String> =
+        // Index runtime containers by their kubernetes container name. A
+        // restarting container leaves several CRI containers with the same name
+        // (the exited prior attempt plus the current one); keep the one with the
+        // highest `attempt` so the reported `restartCount` is the latest and
+        // never regresses — list order is unspecified, so picking the last-seen
+        // entry made the count flip backwards (the monotonic-restart-count
+        // NodeConformance spec). Matches upstream, which reports the newest
+        // container and the max restart count.
+        let mut by_name: std::collections::HashMap<String, (String, u32)> =
             std::collections::HashMap::new();
         for c in &containers {
+            let attempt = c.metadata.as_ref().map(|m| m.attempt).unwrap_or(0);
             if let Some(name) = c
                 .labels
                 .get(translate::labels::CONTAINER_NAME)
                 .or_else(|| c.metadata.as_ref().map(|m| &m.name))
             {
-                by_name.insert(name.clone(), c.id.clone());
+                match by_name.get(name) {
+                    Some((_, prev)) if *prev >= attempt => {}
+                    _ => {
+                        by_name.insert(name.clone(), (c.id.clone(), attempt));
+                    }
+                }
             }
         }
 
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             match by_name.get(name) {
-                Some(id) => {
+                Some((id, _)) => {
                     let full = cri.container_status(id, false).await?;
                     let mut mapped = full
                         .status
@@ -865,18 +1003,34 @@ impl CriContainerRuntime {
 
     /// Whether any container named `container_name` is currently RUNNING. CRI
     /// container names are per-pod, so this matches across all pods by label.
-    pub async fn is_container_running(&self, container_name: &str) -> Result<bool> {
+    pub async fn is_container_running(&self, pod_uid: &str, container_name: &str) -> Result<bool> {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();
         let containers = cri.list_containers(Some(filter)).await?;
+        // "Alive" = CREATED or RUNNING. Counting CREATED (not just RUNNING) is
+        // essential: during the create→running window a container is CREATED,
+        // and a concurrent reconcile that treated it as dead would start a
+        // duplicate (port collision → crash-loop). Only EXITED is restartable.
+        let created = v1::ContainerState::ContainerCreated as i32;
         let running = v1::ContainerState::ContainerRunning as i32;
-        Ok(containers.iter().any(|c| c.state == running))
+        Ok(containers
+            .iter()
+            .any(|c| c.state == running || c.state == created))
+    }
+
+    /// True if the pod's sandbox exists on this runtime (the `pause`-equivalent
+    /// PodSandbox has been created), regardless of container state.
+    pub async fn has_sandbox(&self, pod_name: &str) -> bool {
+        self.sandbox_id_for(pod_name).await.ok().flatten().is_some()
     }
 
     /// Execute a single probe attempt against a container, returning whether it
@@ -999,6 +1153,111 @@ impl CriContainerRuntime {
 
         // No probe action configured.
         Ok(true)
+    }
+
+    /// Execute a container lifecycle handler (postStart / preStop): exec via CRI
+    /// `ExecSync` inside `container_id`, an httpGet/tcpSocket dialed from the
+    /// node against the (handler host or pod) IP, or a sleep. Mirrors upstream
+    /// `lifecycle.handlerRunner.Run`. Returns an error when the handler fails
+    /// (non-zero exec, HTTP >= 400, unreachable socket) so the caller can react.
+    async fn run_lifecycle_handler(
+        &self,
+        pod: &Pod,
+        container: &Container,
+        container_id: &str,
+        handler: &rusternetes_common::resources::pod::LifecycleHandler,
+    ) -> anyhow::Result<()> {
+        // Lifecycle handlers have no per-handler timeout in the API; upstream
+        // bounds preStop by the grace period and lets postStart block readiness.
+        // A generous fixed cap keeps a hung handler from wedging the worker.
+        const HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        if let Some(exec) = handler.exec.as_ref() {
+            if exec.command.is_empty() {
+                return Ok(());
+            }
+            let cmd: Vec<&str> = exec.command.iter().map(String::as_str).collect();
+            let mut cri = self.cri.clone();
+            let resp = cri
+                .exec_sync(container_id, &cmd, HANDLER_TIMEOUT.as_secs() as i64)
+                .await?;
+            if resp.exit_code != 0 {
+                anyhow::bail!(
+                    "exec lifecycle handler {:?} exited {}",
+                    exec.command,
+                    resp.exit_code
+                );
+            }
+            return Ok(());
+        }
+
+        if let Some(http) = handler.http_get.as_ref() {
+            let Some(port) = probe::resolve_port(container, &http.port) else {
+                anyhow::bail!("httpGet lifecycle handler: unresolved port");
+            };
+            let host = match http.host.clone() {
+                Some(h) if !h.is_empty() => h,
+                _ => self
+                    .get_pod_ip(&pod.metadata.name)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("httpGet lifecycle handler: no pod IP"))?,
+            };
+            let scheme = if http
+                .scheme
+                .as_deref()
+                .unwrap_or("HTTP")
+                .eq_ignore_ascii_case("HTTPS")
+            {
+                "https"
+            } else {
+                "http"
+            };
+            let path = http.path.as_deref().unwrap_or("/");
+            let url = format!("{scheme}://{host}:{port}{path}");
+            let client = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(HANDLER_TIMEOUT)
+                .build()?;
+            let mut req = client.get(&url);
+            if let Some(headers) = http.http_headers.as_ref() {
+                for h in headers {
+                    req = req.header(&h.name, &h.value);
+                }
+            }
+            let resp = req.send().await?;
+            if resp.status().as_u16() >= 400 {
+                anyhow::bail!("httpGet lifecycle handler {url} returned {}", resp.status());
+            }
+            return Ok(());
+        }
+
+        if let Some(tcp) = handler.tcp_socket.as_ref() {
+            let Some(port) = probe::resolve_port(container, &tcp.port) else {
+                anyhow::bail!("tcpSocket lifecycle handler: unresolved port");
+            };
+            let host = match tcp.host.clone() {
+                Some(h) if !h.is_empty() => h,
+                _ => self
+                    .get_pod_ip(&pod.metadata.name)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("tcpSocket lifecycle handler: no pod IP"))?,
+            };
+            tokio::time::timeout(
+                HANDLER_TIMEOUT,
+                tokio::net::TcpStream::connect(format!("{host}:{port}")),
+            )
+            .await??;
+            return Ok(());
+        }
+
+        if let Some(sleep) = handler.sleep.as_ref() {
+            if sleep.seconds > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(sleep.seconds as u64)).await;
+            }
+            return Ok(());
+        }
+
+        Ok(())
     }
 
     /// Seconds since the named container started, from CRI `started_at`. `None`
@@ -1235,16 +1494,29 @@ impl CriContainerRuntime {
 
     /// Exit code of the (most recent) container named `container_name`, or 0 if
     /// no such container is known to the runtime.
-    pub async fn get_container_exit_code(&self, container_name: &str) -> Result<i64> {
+    pub async fn get_container_exit_code(
+        &self,
+        pod_uid: &str,
+        container_name: &str,
+    ) -> Result<i64> {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();
-        let Some(container) = cri.list_containers(Some(filter)).await?.into_iter().next() else {
+        // Pick the latest attempt so the exit code reflects the most recent run.
+        let Some(container) = cri
+            .list_containers(Some(filter))
+            .await?
+            .into_iter()
+            .max_by_key(|c| c.metadata.as_ref().map(|m| m.attempt).unwrap_or(0))
+        else {
             return Ok(0);
         };
         let status = cri.container_status(&container.id, false).await?;
@@ -1253,12 +1525,19 @@ impl CriContainerRuntime {
 
     /// Remove every exited container named `container_name` so a restart can
     /// recreate it. Running containers are left alone.
-    pub async fn remove_terminated_container(&self, container_name: &str) -> Result<()> {
+    pub async fn remove_terminated_container(
+        &self,
+        pod_uid: &str,
+        container_name: &str,
+    ) -> Result<()> {
         let filter = v1::ContainerFilter {
-            label_selector: std::collections::HashMap::from([(
-                translate::labels::CONTAINER_NAME.to_string(),
-                container_name.to_string(),
-            )]),
+            label_selector: std::collections::HashMap::from([
+                (translate::labels::POD_UID.to_string(), pod_uid.to_string()),
+                (
+                    translate::labels::CONTAINER_NAME.to_string(),
+                    container_name.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         let mut cri = self.cri.clone();
@@ -1461,6 +1740,29 @@ impl CriContainerRuntime {
             ..Default::default()
         };
         for c in cri.list_containers(Some(filter)).await? {
+            // preStop lifecycle hook runs (within the grace period) before the
+            // container is stopped — upstream `kuberuntime_container.go`
+            // killContainer. Best-effort; never block teardown on a hook error.
+            if c.state == v1::ContainerState::ContainerRunning as i32 {
+                if let Some(name) = c
+                    .labels
+                    .get(translate::labels::CONTAINER_NAME)
+                    .or_else(|| c.metadata.as_ref().map(|m| &m.name))
+                {
+                    if let Some(pre) = find_container(pod, name)
+                        .and_then(|spec_c| spec_c.lifecycle.as_ref())
+                        .and_then(|lc| lc.pre_stop.as_ref())
+                    {
+                        if let Some(spec_c) = find_container(pod, name) {
+                            if let Err(e) =
+                                self.run_lifecycle_handler(pod, spec_c, &c.id, pre).await
+                            {
+                                warn!("container {name}: preStop hook failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
             // Best-effort: keep tearing down even if one container stop fails.
             let _ = cri.stop_container(&c.id, grace_period_seconds).await;
         }
@@ -1581,6 +1883,28 @@ fn service_env_vars(host: &str, port: &str) -> Vec<(String, String)> {
         (format!("{pp}_PORT"), port.to_string()),
         (format!("{pp}_ADDR"), host.to_string()),
     ]
+}
+
+/// Memoized node InternalIP, used to fill `status.hostIP`(`s`) for downward-API
+/// env resolution at container-create time. Mirrors the kubelet's
+/// `detect_internal_ip` (resolve our own hostname to its non-loopback IPv4);
+/// stable for the process lifetime.
+fn node_internal_ip() -> &'static str {
+    static NODE_IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NODE_IP.get_or_init(|| {
+        std::env::var("HOSTNAME")
+            .ok()
+            .and_then(|h| std::net::ToSocketAddrs::to_socket_addrs(&(h.as_str(), 0u16)).ok())
+            .and_then(|addrs| {
+                addrs
+                    .filter_map(|a| match a.ip() {
+                        std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+                        _ => None,
+                    })
+                    .next()
+            })
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    })
 }
 
 /// Format a CRI `VersionResponse` as the k8s `containerRuntimeVersion`
