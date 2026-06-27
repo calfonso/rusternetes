@@ -40,7 +40,7 @@ concurrency:
 jobs:
   publish:
     name: build + push (sqlite stack images)
-    runs-on: arc-runner-set-conformance
+    runs-on: arc-runner-set-dind
     permissions:
       contents: read
       packages: write

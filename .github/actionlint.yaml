@@ -8,3 +8,4 @@ self-hosted-runner:
     - arc-runner-set
     - arc-runner-set-small
     - arc-runner-set-conformance
+    - arc-runner-set-dind

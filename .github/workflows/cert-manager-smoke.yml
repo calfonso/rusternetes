@@ -19,7 +19,7 @@ on:
 
 jobs:
   cert-manager-smoke:
-    runs-on: arc-runner-set-conformance
+    runs-on: arc-runner-set-dind
     timeout-minutes: 45
     steps:
       - name: Checkout repository
