@@ -170,6 +170,29 @@ services:
     # conformance pods bind promptly instead of pacing the suite.
     command: ["--etcd-servers", "http://rhino:2379", "--interval", "1"]
 
+  # Controller-manager: without it nothing finalizes deleted namespaces, so
+  # every conformance spec's namespace leaks `Terminating` forever and its pods
+  # are never reclaimed — the node fills to its pod cap and later specs fail
+  # under resource pressure (#1520). The namespace controller deletes contained
+  # resources, drains the `kubernetes` finalizer, and lets the api-server GC the
+  # namespace. Tight sync interval to keep up with the suite's churn.
+  controller-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.services
+      target: controller-manager
+      additional_contexts:
+        rhino: ./rhino
+    container_name: rusternetes-nc-controller-manager
+    depends_on:
+      - rhino
+      - api-server
+    networks:
+      - nc-net
+    environment:
+      - RUST_LOG=info
+    command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "2"]
+
   # Shared CRI runtime: containerd (CRI plugin) + Youki. The kubelet drives pod
   # lifecycle over CRI v1 through this service instead of a Docker/Podman socket
   # (the kubelet was cut over to CRI — without a containerd here the kubelet's
