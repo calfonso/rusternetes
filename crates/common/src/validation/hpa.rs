@@ -781,6 +781,36 @@ pub fn validate_horizontal_pod_autoscaler(hpa: &HorizontalPodAutoscaler) -> Erro
     validate_hpa_spec(&hpa.spec, &Path::new("spec"))
 }
 
+/// Validate the status subresource of an `HorizontalPodAutoscaler`. Mirrors the
+/// substantive checks of upstream `ValidateHorizontalPodAutoscalerStatusUpdate`
+/// (autoscaling validation.go): `currentReplicas` and `desiredReplicas` must be
+/// non-negative. The upstream `ValidateObjectMetaUpdate` resourceVersion gate is
+/// enforced at the storage layer here (see the resourceVersion handling in the
+/// /status handlers), not re-checked in this validator.
+pub fn validate_horizontal_pod_autoscaler_status_update(
+    hpa: &HorizontalPodAutoscaler,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(status) = &hpa.status {
+        let sp = Path::new("status");
+        if status.current_replicas < 0 {
+            errs.push(Error::invalid(
+                &sp.child("currentReplicas"),
+                status.current_replicas,
+                "must be greater than or equal to 0",
+            ));
+        }
+        if status.desired_replicas < 0 {
+            errs.push(Error::invalid(
+                &sp.child("desiredReplicas"),
+                status.desired_replicas,
+                "must be greater than or equal to 0",
+            ));
+        }
+    }
+    errs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

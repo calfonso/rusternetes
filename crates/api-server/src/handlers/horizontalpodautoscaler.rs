@@ -383,6 +383,16 @@ pub async fn update_status(
     // Update only the status field
     existing.status = hpa.status;
 
+    // Validate the merged status (upstream ValidateHorizontalPodAutoscalerStatusUpdate:
+    // currentReplicas / desiredReplicas must be non-negative).
+    let errs =
+        rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler_status_update(
+            &existing,
+        );
+    if !errs.is_empty() {
+        return Err(rusternetes_common::Error::Invalid(errs));
+    }
+
     let updated = state.storage.update(&key, &existing).await?;
 
     Ok(Json(updated))
