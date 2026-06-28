@@ -1131,14 +1131,20 @@ impl CriContainerRuntime {
                 return Ok(false);
             };
             let cmd: Vec<&str> = exec.command.iter().map(String::as_str).collect();
-            let resp = cri
-                .exec_sync(
-                    &c.id,
-                    &cmd,
-                    probe.timeout_seconds.unwrap_or(1).max(1) as i64,
-                )
-                .await?;
-            return Ok(resp.exit_code == 0);
+            // Enforce timeoutSeconds node-side: a CRI runtime may not honor
+            // ExecSyncRequest.timeout, so bound the call ourselves. A command
+            // that outruns the timeout fails the probe (→ restart), matching the
+            // kubelet exec prober — the in-container process is left to the
+            // runtime to reap.
+            let timeout_secs = probe.timeout_seconds.unwrap_or(1).max(1) as i64;
+            let exit = match tokio::time::timeout(timeout, cri.exec_sync(&c.id, &cmd, timeout_secs))
+                .await
+            {
+                Ok(Ok(resp)) => Some(resp.exit_code),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_elapsed) => None,
+            };
+            return Ok(exec_probe_passed(exit));
         }
 
         if let Some(tcp) = probe.tcp_socket.as_ref() {
@@ -2004,6 +2010,13 @@ fn grpc_status_healthy(status: i32) -> bool {
     status == tonic_health::pb::health_check_response::ServingStatus::Serving as i32
 }
 
+/// An exec probe passes iff the command completed with exit code 0 within
+/// timeoutSeconds. `None` (the call timed out) fails — the command outran its
+/// timeout, which the kubelet exec prober treats as a probe failure.
+fn exec_probe_passed(exit_code: Option<i32>) -> bool {
+    exit_code == Some(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2019,6 +2032,16 @@ mod tests {
         assert!(!grpc_status_healthy(ServingStatus::NotServing as i32));
         assert!(!grpc_status_healthy(ServingStatus::Unknown as i32));
         assert!(!grpc_status_healthy(ServingStatus::ServiceUnknown as i32));
+    }
+
+    #[test]
+    fn exec_probe_passes_only_on_zero_exit_within_timeout() {
+        // Healthy iff the command completed with exit 0 within timeoutSeconds.
+        // A timed-out exec (None) fails — the command outran its timeout, which
+        // the kubelet exec prober treats as a probe failure (→ restart).
+        assert!(exec_probe_passed(Some(0)));
+        assert!(!exec_probe_passed(Some(1)));
+        assert!(!exec_probe_passed(None));
     }
 
     #[test]
