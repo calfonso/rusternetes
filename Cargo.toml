@@ -61,6 +61,7 @@ async-trait = "0.1"
 async-stream = "0.3"
 futures = "0.3"
 tonic = "0.12" # gRPC
+tonic-health = "0.12" # grpc.health.v1 client for gRPC liveness/readiness probes
 prost = "0.13"
 prost-types = "0.13"
 jsonwebtoken = "9.3" # JWT token generation and validation

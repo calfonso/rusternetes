@@ -1094,7 +1094,8 @@ impl CriContainerRuntime {
     /// - `tcpSocket`: TCP connect to the (host or pod IP):port from the node.
     /// - `httpGet`: HTTP(S) GET to the (host or pod IP):port/path; success =
     ///   status < 400 (k8s treats 2xx/3xx as healthy).
-    /// - `grpc`: not yet supported — returns `false`.
+    /// - `grpc`: dial `grpc.health.v1` Health/Check at (pod IP):port; success =
+    ///   `SERVING`. Unreachable / NOT_SERVING / errored = failure.
     ///
     /// A probe with no action configured is treated as success (nothing to check).
     pub async fn probe_container(
@@ -1202,6 +1203,36 @@ impl CriContainerRuntime {
                 Err(_) => false,
             };
             return Ok(ok);
+        }
+
+        if let Some(grpc) = probe.grpc.as_ref() {
+            let Some(port) = probe::resolve_port(container, &grpc.port) else {
+                return Ok(false);
+            };
+            let Some(host) = self.get_pod_ip(&pod.metadata.name).await? else {
+                return Ok(false);
+            };
+            let endpoint = format!("http://{host}:{port}");
+            let service = grpc.service.clone().unwrap_or_default();
+            // Dial grpc.health.v1 Health/Check from the node; SERVING = healthy.
+            // Connect + RPC are bounded by the probe timeout; any error (down,
+            // refused, NOT_SERVING) fails the probe (matches the kubelet grpc
+            // prober).
+            let check = async {
+                let channel = tonic::transport::Channel::from_shared(endpoint)
+                    .map_err(|e| anyhow::anyhow!("grpc probe endpoint: {e}"))?
+                    .connect()
+                    .await?;
+                let resp = tonic_health::pb::health_client::HealthClient::new(channel)
+                    .check(tonic_health::pb::HealthCheckRequest { service })
+                    .await?;
+                Ok::<i32, anyhow::Error>(resp.into_inner().status)
+            };
+            let healthy = matches!(
+                tokio::time::timeout(timeout, check).await,
+                Ok(Ok(status)) if grpc_status_healthy(status)
+            );
+            return Ok(healthy);
         }
 
         // No probe action configured.
@@ -1966,11 +1997,29 @@ fn format_runtime_version(v: &v1::VersionResponse) -> String {
     format!("{}://{}", v.runtime_name, v.runtime_version)
 }
 
+/// Map a `grpc.health.v1` ServingStatus code to probe success. Per the kubelet
+/// grpc prober, only SERVING is healthy; NOT_SERVING / UNKNOWN / SERVICE_UNKNOWN
+/// and an unreachable/errored server all fail.
+fn grpc_status_healthy(status: i32) -> bool {
+    status == tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::resources::pod::PodSpec;
     use std::collections::HashMap;
+
+    #[test]
+    fn grpc_probe_only_serving_status_is_healthy() {
+        use tonic_health::pb::health_check_response::ServingStatus;
+        // The kubelet grpc prober treats only SERVING as healthy; every other
+        // status (and an unreachable server) is a probe failure.
+        assert!(grpc_status_healthy(ServingStatus::Serving as i32));
+        assert!(!grpc_status_healthy(ServingStatus::NotServing as i32));
+        assert!(!grpc_status_healthy(ServingStatus::Unknown as i32));
+        assert!(!grpc_status_healthy(ServingStatus::ServiceUnknown as i32));
+    }
 
     #[test]
     fn runtime_version_string_uses_cri_name_and_version() {
