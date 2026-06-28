@@ -37,6 +37,38 @@ struct ProbeState {
     /// Last time this probe was evaluated; honors `periodSeconds` so counters
     /// advance at most once per period regardless of reconcile-loop frequency.
     last_eval: Option<chrono::DateTime<Utc>>,
+    /// Level-triggered readiness latch (readiness probes only): held between
+    /// evaluations, flipped only when a success/failure threshold is crossed.
+    /// Starts `false` — a container is not ready until its readiness probe
+    /// first passes.
+    ready: bool,
+}
+
+/// Advance a readiness probe's threshold state machine by one observation and
+/// return the resulting readiness. Becomes ready after `success_threshold`
+/// consecutive successes; not-ready after `failure_threshold` consecutive
+/// failures; otherwise holds the prior readiness (level-triggered, matching the
+/// upstream prober worker).
+fn readiness_after_observation(
+    st: &mut ProbeState,
+    healthy: bool,
+    success_threshold: i32,
+    failure_threshold: i32,
+) -> bool {
+    if healthy {
+        st.consecutive_successes += 1;
+        st.consecutive_failures = 0;
+        if st.consecutive_successes >= success_threshold.max(1) {
+            st.ready = true;
+        }
+    } else {
+        st.consecutive_failures += 1;
+        st.consecutive_successes = 0;
+        if st.consecutive_failures >= failure_threshold.max(1) {
+            st.ready = false;
+        }
+    }
+    st.ready
 }
 
 /// Errors from the CRI-backed runtime.
@@ -1582,6 +1614,91 @@ impl CriContainerRuntime {
         }
     }
 
+    /// Set `ready` on each container status from its readiness probe, with
+    /// initialDelay + success/failure threshold tracking. Containers without a
+    /// readiness probe keep their running-based readiness; only a running
+    /// container can be ready. Readiness never restarts — it only gates the
+    /// `ready` flag the api-server rolls up into ContainersReady/Ready.
+    pub async fn apply_readiness(&self, pod: &Pod, statuses: &mut [ContainerStatus]) {
+        let Some(spec) = pod.spec.as_ref() else {
+            return;
+        };
+        for st in statuses.iter_mut() {
+            let container = spec
+                .containers
+                .iter()
+                .chain(spec.init_containers.iter().flatten())
+                .find(|c| c.name == st.name);
+            let Some(container) = container else { continue };
+            let Some(probe) = container.readiness_probe.as_ref() else {
+                continue;
+            };
+            let running = matches!(st.state, Some(ContainerState::Running { .. }));
+            st.ready = running
+                && self
+                    .evaluate_container_readiness(pod, container, probe)
+                    .await;
+        }
+    }
+
+    /// Evaluate one container's readiness probe, returning the current readiness
+    /// latch. Honors `initialDelaySeconds` (not ready, and unprobed, until it
+    /// elapses) and `periodSeconds` (the latch holds between periods). A probe
+    /// error counts as a failure (upstream `doProbe`).
+    async fn evaluate_container_readiness(
+        &self,
+        pod: &Pod,
+        container: &Container,
+        probe: &Probe,
+    ) -> bool {
+        let key = format!("{}/{}/readiness", pod.metadata.name, container.name);
+
+        let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
+        if initial_delay > 0 {
+            if let Some(age) = self.container_age_secs(pod, &container.name).await {
+                if age < initial_delay as i64 {
+                    let mut states = self.probe_states.lock().unwrap();
+                    states.entry(key).or_default().ready = false;
+                    return false;
+                }
+            }
+        }
+
+        let period = probe.period_seconds.unwrap_or(10).max(1) as i64;
+        let due = {
+            let mut states = self.probe_states.lock().unwrap();
+            let st = states.entry(key.clone()).or_default();
+            let now = Utc::now();
+            let due = st
+                .last_eval
+                .map(|t| (now - t).num_seconds() >= period)
+                .unwrap_or(true);
+            if due {
+                st.last_eval = Some(now);
+            }
+            due
+        };
+        if !due {
+            return self
+                .probe_states
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .ready;
+        }
+
+        let healthy = self
+            .probe_container(pod, container, probe)
+            .await
+            .unwrap_or(false);
+        let success_threshold = probe.success_threshold.unwrap_or(1);
+        let failure_threshold = probe.failure_threshold.unwrap_or(3);
+        let mut states = self.probe_states.lock().unwrap();
+        let st = states.entry(key).or_default();
+        readiness_after_observation(st, healthy, success_threshold, failure_threshold)
+    }
+
     /// Exit code of the (most recent) container named `container_name`, or 0 if
     /// no such container is known to the runtime.
     pub async fn get_container_exit_code(
@@ -2042,6 +2159,21 @@ mod tests {
         assert!(exec_probe_passed(Some(0)));
         assert!(!exec_probe_passed(Some(1)));
         assert!(!exec_probe_passed(None));
+    }
+
+    #[test]
+    fn readiness_state_machine_latches_on_thresholds() {
+        let mut st = ProbeState::default();
+        // Not ready until the first success (successThreshold 1).
+        assert!(!st.ready);
+        assert!(readiness_after_observation(&mut st, true, 1, 3));
+        // Single/second failure with failureThreshold 3 holds ready=true.
+        assert!(readiness_after_observation(&mut st, false, 1, 3));
+        assert!(readiness_after_observation(&mut st, false, 1, 3));
+        // Third consecutive failure crosses the threshold → not ready.
+        assert!(!readiness_after_observation(&mut st, false, 1, 3));
+        // A later success (threshold 1) recovers readiness.
+        assert!(readiness_after_observation(&mut st, true, 1, 3));
     }
 
     #[test]

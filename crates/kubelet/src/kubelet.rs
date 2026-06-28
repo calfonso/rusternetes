@@ -4130,9 +4130,19 @@ impl Kubelet {
                             .get::<Pod>(&readiness_pod_key)
                             .await
                             .unwrap_or_else(|_| pod.clone());
-                        if let Ok(container_statuses) =
+                        if let Ok(mut container_statuses) =
                             self.get_container_statuses(&readiness_pod).await
                         {
+                            // Gate each container's `ready` on its readiness probe
+                            // (threshold + initialDelay tracked). Without this a
+                            // running container is always ready, so a failing
+                            // readiness probe never holds the pod not-ready. This
+                            // is the single per-cycle readiness eval point (the
+                            // restart path deliberately avoids probing — see the
+                            // has_terminated_containers note above).
+                            self.runtime
+                                .apply_readiness(&readiness_pod, &mut container_statuses)
+                                .await;
                             // Restartable init containers (sidecars) count toward
                             // ContainersReady too (upstream status/generate.go):
                             // every sidecar must be ready. Plain init containers
