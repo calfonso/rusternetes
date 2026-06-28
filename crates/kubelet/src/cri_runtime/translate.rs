@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use rusternetes_common::resources::pod::{Container, Pod};
-use rusternetes_common::resources::{ConfigMap, Secret};
+use rusternetes_common::resources::{ConfigMap, Secret, Service};
 use rusternetes_cri::v1;
 
 /// Well-known CRI metadata label keys the runtime indexes sandboxes/containers
@@ -416,6 +416,7 @@ fn env_vars(
     container: &Container,
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
+    node_allocatable: Option<&HashMap<String, String>>,
 ) -> Vec<v1::KeyValue> {
     let mut out: Vec<v1::KeyValue> = Vec::new();
     // Mirror of `out` for `$(VAR)` lookups: upstream expands each literal env
@@ -463,7 +464,12 @@ fn env_vars(
                 if let Some(fr) = src.field_ref.as_ref() {
                     pod_field_value(pod, &fr.field_path)
                 } else if let Some(rfr) = src.resource_field_ref.as_ref() {
-                    container_resource_value(container, &rfr.resource, rfr.divisor.as_deref())
+                    container_resource_value(
+                        container,
+                        &rfr.resource,
+                        rfr.divisor.as_deref(),
+                        node_allocatable,
+                    )
                 } else if let Some(cmr) = src.config_map_key_ref.as_ref() {
                     config_maps
                         .get(&cmr.name)
@@ -572,15 +578,39 @@ fn container_resource_value(
     container: &Container,
     resource: &str,
     divisor: Option<&str>,
+    node_allocatable: Option<&HashMap<String, String>>,
 ) -> Option<String> {
-    let req = container.resources.as_ref()?;
     let (kind, name) = resource.split_once('.')?;
-    let map = match kind {
-        "limits" => req.limits.as_ref(),
-        "requests" => req.requests.as_ref(),
+    let req = container.resources.as_ref();
+    let explicit = |which: &str| -> Option<String> {
+        match which {
+            "limits" => req.and_then(|r| r.limits.as_ref()),
+            "requests" => req.and_then(|r| r.requests.as_ref()),
+            _ => None,
+        }
+        .and_then(|m| m.get(name).cloned())
+    };
+    // Upstream MergeContainerResourceLimits: an unset cpu/memory/
+    // ephemeral-storage/hugepages LIMIT defaults to the node's allocatable;
+    // an unset REQUEST defaults to the (possibly defaulted) limit. Other
+    // resources have no default — the var is omitted when absent.
+    let defaultable =
+        matches!(name, "cpu" | "memory" | "ephemeral-storage") || name.starts_with("hugepages-");
+    let from_allocatable = || -> Option<String> {
+        if defaultable {
+            node_allocatable.and_then(|a| a.get(name).cloned())
+        } else {
+            None
+        }
+    };
+    let raw = match kind {
+        "limits" => explicit("limits").or_else(from_allocatable),
+        "requests" => explicit("requests")
+            .or_else(|| explicit("limits"))
+            .or_else(from_allocatable),
         _ => None,
     }?;
-    let raw = map.get(name)?;
+    let raw = &raw;
     // `divisor` defaults to "1" (cores for cpu, bytes for memory) — matches
     // upstream `resourcehelper.ExtractContainerResourceValue`. cpu rounds UP
     // (ceil of milli/divisor-milli); byte quantities truncate (floor).
@@ -1040,6 +1070,31 @@ pub fn container_config(
     config_maps: &HashMap<String, ConfigMap>,
     secrets: &HashMap<String, Secret>,
 ) -> v1::ContainerConfig {
+    container_config_with_allocatable(
+        pod,
+        container,
+        image_ref,
+        host_paths,
+        config_maps,
+        secrets,
+        None,
+    )
+}
+
+/// As [`container_config`], but `node_allocatable` lets unset cpu/memory/
+/// ephemeral-storage resourceFieldRef LIMITS default to the node's allocatable
+/// (upstream `MergeContainerResourceLimits`). The kubelet passes its node
+/// allocatable here; the no-allocatable wrapper above keeps `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn container_config_with_allocatable(
+    pod: &Pod,
+    container: &Container,
+    image_ref: &str,
+    host_paths: &HashMap<String, String>,
+    config_maps: &HashMap<String, ConfigMap>,
+    secrets: &HashMap<String, Secret>,
+    node_allocatable: Option<&HashMap<String, String>>,
+) -> v1::ContainerConfig {
     let mut labels = pod_labels(pod);
     labels.insert(labels::CONTAINER_NAME.to_string(), container.name.clone());
 
@@ -1056,7 +1111,7 @@ pub fn container_config(
         }
     };
 
-    let envs = env_vars(pod, container, config_maps, secrets);
+    let envs = env_vars(pod, container, config_maps, secrets, node_allocatable);
     // command/args expand `$(VAR)` against the full container env (upstream
     // `expandContainerCommandAndArgs`).
     let env_map: HashMap<String, String> = envs
@@ -1085,6 +1140,54 @@ pub fn container_config(
     }
 }
 
+/// Build the Docker-link-style service env a container sees, per upstream
+/// kubelet `getServiceEnvVarMap` + `makeLinkVariables`. Each service with a
+/// usable ClusterIP contributes vars keyed by the uppercased ('-'→'_') service
+/// name: `{N}_SERVICE_HOST`, `{N}_SERVICE_PORT`, optional named
+/// `{N}_SERVICE_PORT_{PORTNAME}`, and for each declared port the docker-link
+/// quartet `{N}_PORT_{port}_{PROTO}[ |_PROTO|_PORT|_ADDR]` plus a single
+/// `{N}_PORT` from the first port. Headless ("None") and IP-less services are
+/// skipped. Services are processed in name order for deterministic output.
+pub(crate) fn service_link_env_vars(services: &[Service]) -> Vec<(String, String)> {
+    let mut sorted: Vec<&Service> = services.iter().collect();
+    sorted.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    let mut out: Vec<(String, String)> = Vec::new();
+    for svc in sorted {
+        let Some(ip) = svc.spec.cluster_ip.as_deref() else {
+            continue;
+        };
+        if ip.is_empty() || ip == "None" {
+            continue;
+        }
+        let Some(first) = svc.spec.ports.first() else {
+            continue;
+        };
+        let n = svc.metadata.name.to_uppercase().replace('-', "_");
+        out.push((format!("{n}_SERVICE_HOST"), ip.to_string()));
+        out.push((format!("{n}_SERVICE_PORT"), first.port.to_string()));
+        for p in &svc.spec.ports {
+            if let Some(name) = p.name.as_deref().filter(|s| !s.is_empty()) {
+                let pn = name.to_uppercase().replace('-', "_");
+                out.push((format!("{n}_SERVICE_PORT_{pn}"), p.port.to_string()));
+            }
+        }
+        let proto0 = first.protocol.to_lowercase();
+        out.push((
+            format!("{n}_PORT"),
+            format!("{proto0}://{ip}:{}", first.port),
+        ));
+        for p in &svc.spec.ports {
+            let proto = p.protocol.to_lowercase();
+            let prefix = format!("{n}_PORT_{}_{}", p.port, p.protocol.to_uppercase());
+            out.push((prefix.clone(), format!("{proto}://{ip}:{}", p.port)));
+            out.push((format!("{prefix}_PROTO"), proto.clone()));
+            out.push((format!("{prefix}_PORT"), p.port.to_string()));
+            out.push((format!("{prefix}_ADDR"), ip.to_string()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1198,59 @@ mod tests {
         pod.metadata.uid = "uid-123".to_string();
         pod.metadata.namespace = Some("prod".to_string());
         pod
+    }
+
+    fn svc(name: &str, cluster_ip: Option<&str>, port: u16, proto: &str) -> Service {
+        use rusternetes_common::resources::service::{ServicePort, ServiceSpec};
+        let mut s = Service {
+            type_meta: Default::default(),
+            metadata: Default::default(),
+            spec: ServiceSpec {
+                ports: vec![ServicePort {
+                    name: None,
+                    port,
+                    target_port: None,
+                    protocol: proto.to_string(),
+                    node_port: None,
+                    app_protocol: None,
+                }],
+                cluster_ip: cluster_ip.map(|s| s.to_string()),
+                ..Default::default()
+            },
+            status: None,
+        };
+        s.metadata.name = name.to_string();
+        s
+    }
+
+    #[test]
+    fn service_links_emit_docker_link_vars_and_skip_headless() {
+        // Upstream getServiceEnvVarMap/makeLinkVariables: each service with a
+        // real ClusterIP yields the docker-link env quartet, keyed by the
+        // uppercased, '-'→'_' service name. Headless ("None") and IP-less
+        // services contribute nothing.
+        let services = vec![
+            svc("redis-master", Some("10.0.0.11"), 6379, "TCP"),
+            svc("headless", Some("None"), 80, "TCP"),
+            svc("pending", None, 80, "TCP"),
+        ];
+        let env = service_link_env_vars(&services);
+        let get = |k: &str| env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("REDIS_MASTER_SERVICE_HOST"), Some("10.0.0.11"));
+        assert_eq!(get("REDIS_MASTER_SERVICE_PORT"), Some("6379"));
+        assert_eq!(get("REDIS_MASTER_PORT"), Some("tcp://10.0.0.11:6379"));
+        assert_eq!(
+            get("REDIS_MASTER_PORT_6379_TCP"),
+            Some("tcp://10.0.0.11:6379")
+        );
+        assert_eq!(get("REDIS_MASTER_PORT_6379_TCP_ADDR"), Some("10.0.0.11"));
+        assert_eq!(get("REDIS_MASTER_PORT_6379_TCP_PROTO"), Some("tcp"));
+        assert_eq!(get("REDIS_MASTER_PORT_6379_TCP_PORT"), Some("6379"));
+        assert!(
+            env.iter()
+                .all(|(k, _)| !k.starts_with("HEADLESS_") && !k.starts_with("PENDING_")),
+            "headless / IP-less services must contribute no env"
+        );
     }
 
     #[test]
@@ -1958,13 +2114,46 @@ mod tests {
         };
         // Both normalize to bytes, like memory (not raw passthrough).
         assert_eq!(
-            container_resource_value(&c, "limits.ephemeral-storage", None).as_deref(),
+            container_resource_value(&c, "limits.ephemeral-storage", None, None).as_deref(),
             Some("1073741824")
         );
         assert_eq!(
-            container_resource_value(&c, "limits.hugepages-2Mi", None).as_deref(),
+            container_resource_value(&c, "limits.hugepages-2Mi", None, None).as_deref(),
             Some("4194304")
         );
+    }
+
+    #[test]
+    fn resource_field_ref_defaults_unset_limits_to_node_allocatable() {
+        use rusternetes_common::types::ResourceRequirements;
+        // upstream MergeContainerResourceLimits: an unset cpu/memory LIMIT
+        // defaults to the node's allocatable for resourceFieldRef extraction
+        // (the "default limits.cpu/memory from node allocatable" NodeConformance
+        // spec). cpu rounds up to whole cores; memory is bytes.
+        let c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            resources: Some(ResourceRequirements {
+                limits: None,
+                requests: None,
+                claims: None,
+            }),
+            ..Default::default()
+        };
+        let alloc = HashMap::from([
+            ("cpu".to_string(), "4".to_string()),
+            ("memory".to_string(), "8Gi".to_string()),
+        ]);
+        assert_eq!(
+            container_resource_value(&c, "limits.cpu", None, Some(&alloc)).as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            container_resource_value(&c, "limits.memory", None, Some(&alloc)).as_deref(),
+            Some("8589934592")
+        );
+        // No node allocatable available → var omitted, as before.
+        assert_eq!(container_resource_value(&c, "limits.cpu", None, None), None);
     }
 
     #[test]

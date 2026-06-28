@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusternetes_common::resources::pod::{Container, ContainerState, ContainerStatus, Pod, Probe};
-use rusternetes_common::resources::{ConfigMap, Secret};
+use rusternetes_common::resources::{ConfigMap, Secret, Service};
 use rusternetes_cri::{v1, CriClient, CriError};
-use rusternetes_storage::Storage;
+use rusternetes_storage::{build_prefix, Storage};
 use tracing::{debug, warn};
 
 use super::{probe, status, translate};
@@ -142,6 +142,10 @@ pub struct CriContainerRuntime {
     /// `cluster_dns` => pods inherit the node's resolv.conf.
     cluster_dns: Vec<String>,
     cluster_domain: String,
+    /// Node allocatable (`cpu`/`memory`/`ephemeral-storage`/`hugepages-*`),
+    /// used to default unset resourceFieldRef LIMITS into downward-API env
+    /// (upstream `MergeContainerResourceLimits`). Empty leaves such vars unset.
+    node_allocatable: std::collections::HashMap<String, String>,
 }
 
 impl CriContainerRuntime {
@@ -164,6 +168,7 @@ impl CriContainerRuntime {
             service_port: "443".to_string(),
             cluster_dns: Vec::new(),
             cluster_domain: "cluster.local".to_string(),
+            node_allocatable: std::collections::HashMap::new(),
         })
     }
 
@@ -184,6 +189,17 @@ impl CriContainerRuntime {
     pub fn with_service_host(mut self, host: impl Into<String>, port: impl Into<String>) -> Self {
         self.service_host = host.into();
         self.service_port = port.into();
+        self
+    }
+
+    /// Set the node allocatable used to default unset resourceFieldRef LIMITS
+    /// into downward-API env (e.g. `limits.cpu` → node allocatable cpu).
+    #[must_use]
+    pub fn with_node_allocatable(
+        mut self,
+        allocatable: std::collections::HashMap<String, String>,
+    ) -> Self {
+        self.node_allocatable = allocatable;
         self
     }
 
@@ -448,15 +464,22 @@ impl CriContainerRuntime {
             pod
         };
 
-        let mut cfg = translate::container_config(
+        let node_allocatable = if self.node_allocatable.is_empty() {
+            None
+        } else {
+            Some(&self.node_allocatable)
+        };
+        let mut cfg = translate::container_config_with_allocatable(
             pod,
             container,
             &container.image,
             host_paths,
             &config_maps,
             &secrets,
+            node_allocatable,
         );
         self.inject_service_env(&mut cfg);
+        self.inject_service_links(pod, &mut cfg).await;
 
         // Bind-mount a per-container host file at the container's
         // terminationMessagePath so it can write a termination message that the
@@ -644,6 +667,36 @@ impl CriContainerRuntime {
         for (key, value) in service_env_vars(&self.service_host, &self.service_port) {
             if cfg.envs.iter().any(|e| e.key == key) {
                 continue; // explicit pod env overrides the injected default
+            }
+            cfg.envs.push(v1::KeyValue { key, value });
+        }
+    }
+
+    /// Inject Docker-link Service env for every service in the pod's namespace
+    /// (upstream `enableServiceLinks`, default on). Mirrors the kubelet's
+    /// `getServiceEnvVarMap`; explicit container env wins over an injected var.
+    async fn inject_service_links(&self, pod: &Pod, cfg: &mut v1::ContainerConfig) {
+        let enabled = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.enable_service_links)
+            .unwrap_or(true);
+        if !enabled {
+            return;
+        }
+        let Some(storage) = self.volumes.as_ref().and_then(|v| v.storage.as_ref()) else {
+            return;
+        };
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let Ok(services) = storage
+            .list::<Service>(&build_prefix("services", Some(ns)))
+            .await
+        else {
+            return;
+        };
+        for (key, value) in translate::service_link_env_vars(&services) {
+            if cfg.envs.iter().any(|e| e.key == key) {
+                continue;
             }
             cfg.envs.push(v1::KeyValue { key, value });
         }

@@ -165,6 +165,18 @@ fn terminal_finalize_backoff(count: u32) -> Duration {
 /// observed a terminated container* and restarted with no wall-clock gate — so
 /// the watch-driven sync hot loop (~30 Hz) drove `restartCount` to tens of
 /// thousands instead of the handful the conformance suite expects. K8s ref:
+/// The node's advertised capacity/allocatable. Single source of truth so the
+/// NodeStatus the kubelet posts and the values the runtime uses to default
+/// resourceFieldRef LIMITS (downward-API `limits.cpu`/`memory` env) never drift.
+fn node_allocatable_map() -> HashMap<String, String> {
+    HashMap::from([
+        ("cpu".to_string(), "4".to_string()),
+        ("memory".to_string(), "8Gi".to_string()),
+        ("pods".to_string(), "110".to_string()),
+        ("ephemeral-storage".to_string(), "100Gi".to_string()),
+    ])
+}
+
 /// `pkg/kubelet/kuberuntime/kuberuntime_manager.go` `doBackOff` +
 /// `client-go/util/flowcontrol.Backoff`.
 #[derive(Clone)]
@@ -437,7 +449,8 @@ impl Kubelet {
             .with_volumes(volumes)
             .with_event_recorder(storage.clone())
             .with_service_host(service_host, "443")
-            .with_cluster_dns(&cluster_dns, &cluster_domain);
+            .with_cluster_dns(&cluster_dns, &cluster_domain)
+            .with_node_allocatable(node_allocatable_map());
 
         // Resolve the runtime identity once via the CRI Version RPC so
         // NodeStatus reports the runtime actually behind CONTAINER_RUNTIME_ENDPOINT
@@ -908,18 +921,8 @@ impl Kubelet {
 
         // Set node status
         node.status = Some(NodeStatus {
-            capacity: Some(HashMap::from([
-                ("cpu".to_string(), "4".to_string()),
-                ("memory".to_string(), "8Gi".to_string()),
-                ("pods".to_string(), "110".to_string()),
-                ("ephemeral-storage".to_string(), "100Gi".to_string()),
-            ])),
-            allocatable: Some(HashMap::from([
-                ("cpu".to_string(), "4".to_string()),
-                ("memory".to_string(), "8Gi".to_string()),
-                ("pods".to_string(), "110".to_string()),
-                ("ephemeral-storage".to_string(), "100Gi".to_string()),
-            ])),
+            capacity: Some(node_allocatable_map()),
+            allocatable: Some(node_allocatable_map()),
             conditions: Some(vec![NodeCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
