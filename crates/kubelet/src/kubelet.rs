@@ -165,6 +165,17 @@ fn terminal_finalize_backoff(count: u32) -> Duration {
 /// observed a terminated container* and restarted with no wall-clock gate — so
 /// the watch-driven sync hot loop (~30 Hz) drove `restartCount` to tens of
 /// thousands instead of the handful the conformance suite expects. K8s ref:
+/// The pod's `status.startTime`: set once (when the pod first becomes Running)
+/// and preserved across every later status rebuild. Resetting it each sync
+/// would zero out the activeDeadlineSeconds elapsed clock so the deadline is
+/// never reached. Upstream stamps startTime once and never moves it.
+fn preserved_start_time(
+    prior: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    prior.unwrap_or(now)
+}
+
 /// The node's advertised capacity/allocatable. Single source of truth so the
 /// NodeStatus the kubelet posts and the values the runtime uses to default
 /// resourceFieldRef LIMITS (downward-API `limits.cpu`/`memory` env) never drift.
@@ -2998,7 +3009,10 @@ impl Kubelet {
                                 pod_i_ps,
                                 nominated_node_name: None,
                                 qos_class: Some(qos),
-                                start_time: Some(chrono::Utc::now()),
+                                start_time: Some(preserved_start_time(
+                                    new_pod.status.as_ref().and_then(|s| s.start_time),
+                                    chrono::Utc::now(),
+                                )),
                                 ..Default::default()
                             });
 
@@ -3492,7 +3506,10 @@ impl Kubelet {
                         pod_i_ps,
                         nominated_node_name: None,
                         qos_class: Some(qos),
-                        start_time: Some(chrono::Utc::now()),
+                        start_time: Some(preserved_start_time(
+                            new_pod.status.as_ref().and_then(|s| s.start_time),
+                            chrono::Utc::now(),
+                        )),
                         ..Default::default()
                     });
 
@@ -5598,6 +5615,19 @@ mod tests {
         Container, ContainerState, ContainerStatus, Pod, PodStatus,
     };
     use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+
+    #[test]
+    fn start_time_is_preserved_once_set() {
+        use chrono::{Duration, Utc};
+        let now = Utc::now();
+        let earlier = now - Duration::seconds(100);
+        // An already-set startTime is kept across status rebuilds, so
+        // activeDeadlineSeconds elapsed keeps growing instead of resetting to ~0
+        // every sync (which would mean the deadline is never reached).
+        assert_eq!(super::preserved_start_time(Some(earlier), now), earlier);
+        // First Running write (no prior startTime) stamps now.
+        assert_eq!(super::preserved_start_time(None, now), now);
+    }
 
     #[test]
     fn terminal_finalize_backoff_grows_then_caps() {
