@@ -988,7 +988,20 @@ impl CriContainerRuntime {
             return None;
         }
         let names: Vec<String> = init.iter().map(|c| c.name.clone()).collect();
-        self.statuses_for(pod, &names).await.ok()
+        let mut statuses = self.statuses_for(pod, &names).await.ok()?;
+        // A successfully-terminated plain init container is Ready=true (upstream
+        // prober_manager); statuses_for derives ready from RUNNING only, so a
+        // completed init container would otherwise report ready=false and fail
+        // the "init container should be in Ready status" NodeConformance spec.
+        for st in &mut statuses {
+            let restartable = init
+                .iter()
+                .find(|c| c.name == st.name)
+                .and_then(|c| c.restart_policy.as_deref())
+                == Some("Always");
+            st.ready = init_container_ready(&st.state, restartable, st.ready);
+        }
+        Some(statuses)
     }
 
     /// Statuses for the pod's ephemeral containers, in spec order. `None` if the
@@ -2120,6 +2133,17 @@ fn format_runtime_version(v: &v1::VersionResponse) -> String {
     format!("{}://{}", v.runtime_name, v.runtime_version)
 }
 
+/// Readiness of an init container's status, per upstream prober_manager. A
+/// plain (non-restartable) init container is Ready only once it has terminated
+/// successfully (exit 0). A restartable init (sidecar) keeps its existing
+/// running/probe-based readiness (`prior`).
+fn init_container_ready(state: &Option<ContainerState>, restartable: bool, prior: bool) -> bool {
+    if restartable {
+        return prior;
+    }
+    matches!(state, Some(ContainerState::Terminated { exit_code, .. }) if *exit_code == 0)
+}
+
 /// Map a `grpc.health.v1` ServingStatus code to probe success. Per the kubelet
 /// grpc prober, only SERVING is healthy; NOT_SERVING / UNKNOWN / SERVICE_UNKNOWN
 /// and an unreachable/errored server all fail.
@@ -2139,6 +2163,30 @@ mod tests {
     use super::*;
     use rusternetes_common::resources::pod::PodSpec;
     use std::collections::HashMap;
+
+    #[test]
+    fn plain_init_container_ready_only_after_successful_exit() {
+        let term = |code| {
+            Some(ContainerState::Terminated {
+                exit_code: code,
+                signal: None,
+                reason: None,
+                message: None,
+                started_at: None,
+                finished_at: None,
+                container_id: None,
+            })
+        };
+        let running = Some(ContainerState::Running { started_at: None });
+        // Plain init container: Ready only once it has terminated with exit 0
+        // (upstream prober_manager). A non-zero exit or still-running = not ready.
+        assert!(init_container_ready(&term(0), false, false));
+        assert!(!init_container_ready(&term(1), false, false));
+        assert!(!init_container_ready(&running, false, false));
+        // Restartable init (sidecar) keeps its prior running/probe-based readiness.
+        assert!(init_container_ready(&running, true, true));
+        assert!(!init_container_ready(&running, true, false));
+    }
 
     #[test]
     fn grpc_probe_only_serving_status_is_healthy() {
