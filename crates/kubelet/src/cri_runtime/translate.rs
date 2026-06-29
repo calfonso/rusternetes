@@ -106,6 +106,26 @@ fn protocol_to_cri(proto: Option<&str>) -> i32 {
     }
 }
 
+/// Normalize a sysctl name before handing it to the CRI runtime.
+///
+/// Kubernetes accepts `/` as an alternate separator for `.`. Runtimes such as
+/// runc still validate namespace ownership against dot-form names, so kubelet
+/// normalizes slash-first names before sandbox creation. The swap preserves
+/// interface names such as `eno2/100` in already-dot-form names.
+fn normalize_sysctl_name(name: &str) -> String {
+    match name.find(['.', '/']) {
+        Some(index) if name.as_bytes()[index] == b'/' => name
+            .chars()
+            .map(|c| match c {
+                '.' => '/',
+                '/' => '.',
+                _ => c,
+            })
+            .collect(),
+        _ => name.to_string(),
+    }
+}
+
 /// Sysctls to apply to the pod sandbox, from `spec.securityContext.sysctls`.
 ///
 /// CRI carries these as `LinuxPodSandboxConfig.sysctls` (a `name -> value`
@@ -119,7 +139,7 @@ fn sysctls(pod: &Pod) -> HashMap<String, String> {
         .and_then(|sc| sc.sysctls.as_ref())
         .map(|list| {
             list.iter()
-                .map(|s| (s.name.clone(), s.value.clone()))
+                .map(|s| (normalize_sysctl_name(&s.name), s.value.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -1584,13 +1604,21 @@ mod tests {
                         name: "kernel.shm_rmid_forced".to_string(),
                         value: "1".to_string(),
                     },
+                    Sysctl {
+                        name: "net/ipv4/ip_local_port_range".to_string(),
+                        value: "1024 65535".to_string(),
+                    },
+                    Sysctl {
+                        name: "net.ipv4.conf.eno2/100.rp_filter".to_string(),
+                        value: "1".to_string(),
+                    },
                 ]),
                 ..Default::default()
             }),
             ..Default::default()
         });
         let sysctls = sandbox_config(&pod, "/log").linux.unwrap().sysctls;
-        assert_eq!(sysctls.len(), 2);
+        assert_eq!(sysctls.len(), 4);
         assert_eq!(
             sysctls.get("net.core.somaxconn").map(String::as_str),
             Some("1024")
@@ -1599,6 +1627,48 @@ mod tests {
             sysctls.get("kernel.shm_rmid_forced").map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            sysctls
+                .get("net.ipv4.ip_local_port_range")
+                .map(String::as_str),
+            Some("1024 65535")
+        );
+        assert_eq!(
+            sysctls
+                .get("net.ipv4.conf.eno2/100.rp_filter")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            !sysctls.contains_key("net/ipv4/ip_local_port_range"),
+            "slash-first sysctl names must be normalized before CRI"
+        );
+    }
+
+    #[test]
+    fn normalize_sysctl_name_matches_upstream_separator_rules() {
+        let cases = [
+            ("kernel.shm_rmid_forced", "kernel.shm_rmid_forced"),
+            ("kernel/shm_rmid_forced", "kernel.shm_rmid_forced"),
+            (
+                "net.ipv4.conf.eno2/100.rp_filter",
+                "net.ipv4.conf.eno2/100.rp_filter",
+            ),
+            (
+                "net/ipv4/conf/eno2.100/rp_filter",
+                "net.ipv4.conf.eno2/100.rp_filter",
+            ),
+            (
+                "net/ipv4/ip_local_port_range",
+                "net.ipv4.ip_local_port_range",
+            ),
+            ("kernel/msgmax", "kernel.msgmax"),
+            ("kernel/sem", "kernel.sem"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(normalize_sysctl_name(input), expected);
+        }
     }
 
     #[test]
