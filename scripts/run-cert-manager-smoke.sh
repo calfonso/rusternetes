@@ -91,6 +91,13 @@ ${COMPOSE} down -v --remove-orphans >/dev/null 2>&1 || true
 
 echo "[2/7] Generating certs (if absent) + bringing up the stack..."
 [ -f "${PROJECT_ROOT}/.rusternetes/certs/api-server.crt" ] || bash "${PROJECT_ROOT}/scripts/generate-certs.sh"
+# The control-plane images (scheduler, controller-manager) and the in-cluster
+# dns Deployment image are gated behind the `build` profile in compose.sqlite.yml.
+# `compose up -d --build` does not include profile-only services, so bootstrap
+# would later fail to import missing local tags into containerd and the static
+# pods would stay Pending. Build those images explicitly first.
+# shellcheck disable=SC2086
+${CONTAINER_RUNTIME} compose -f ${PROJECT_ROOT}/compose.sqlite.yml --profile build build --parallel
 # shellcheck disable=SC2086
 ${COMPOSE} up -d --build
 

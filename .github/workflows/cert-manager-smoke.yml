@@ -71,5 +71,7 @@ jobs:
 
       - name: Tear down stack
         if: always()
+        env:
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
         run: |
           docker compose -f compose.sqlite.yml down -v --remove-orphans || true
