@@ -403,16 +403,57 @@ impl VolumeManager {
                                         .await
                                     {
                                         if let Some(data) = &secret.data {
-                                            for (k, v) in data {
-                                                let file_path = format!("{}/{}", volume_dir, k);
-                                                expected_files.insert(file_path.clone());
-                                                if let Ok(existing) = std::fs::read(&file_path) {
-                                                    if existing == *v {
-                                                        continue;
+                                            if let Some(items) = &sec_proj.items {
+                                                for item in items {
+                                                    let file_path =
+                                                        format!("{}/{}", volume_dir, item.path);
+                                                    expected_files.insert(file_path.clone());
+                                                    if let Some(v) = data.get(&item.key) {
+                                                        if let Ok(existing) =
+                                                            std::fs::read(&file_path)
+                                                        {
+                                                            if existing == *v {
+                                                                apply_mode(
+                                                                    &file_path,
+                                                                    item.mode.unwrap_or(
+                                                                        proj_default_mode,
+                                                                    ),
+                                                                );
+                                                                continue;
+                                                            }
+                                                        }
+                                                        if let Some(parent) =
+                                                            std::path::Path::new(&file_path)
+                                                                .parent()
+                                                        {
+                                                            let _ = std::fs::create_dir_all(parent);
+                                                        }
+                                                        if std::fs::write(&file_path, v).is_ok() {
+                                                            apply_mode(
+                                                                &file_path,
+                                                                item.mode
+                                                                    .unwrap_or(proj_default_mode),
+                                                            );
+                                                        }
                                                     }
                                                 }
-                                                if std::fs::write(&file_path, v).is_ok() {
-                                                    apply_mode(&file_path, proj_default_mode);
+                                            } else {
+                                                for (k, v) in data {
+                                                    let file_path = format!("{}/{}", volume_dir, k);
+                                                    expected_files.insert(file_path.clone());
+                                                    if let Ok(existing) = std::fs::read(&file_path)
+                                                    {
+                                                        if existing == *v {
+                                                            apply_mode(
+                                                                &file_path,
+                                                                proj_default_mode,
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+                                                    if std::fs::write(&file_path, v).is_ok() {
+                                                        apply_mode(&file_path, proj_default_mode);
+                                                    }
                                                 }
                                             }
                                         }
@@ -1957,6 +1998,70 @@ mod projected_mode_tests {
             perms.mode() & 0o777,
             0o400,
             "projected configMap item mode must be applied on resync"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Projected secret resync must honor `items` mappings. If it writes every
+    /// secret key at the volume root, stale cleanup can delete the mapped file
+    /// that the container is waiting for.
+    #[tokio::test]
+    async fn resync_projected_secret_honors_items_mapping() {
+        let tmp =
+            std::env::temp_dir().join(format!("rn-projmode-{}-{}", std::process::id(), "secret"));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let storage = Arc::new(StorageBackend::new_memory());
+        let secret: rusternetes_common::resources::Secret = serde_json::from_value(json!({
+            "metadata": {"name": "sec", "namespace": "default"},
+            "data": {"data-1": "dmFsdWUtMQ=="}
+        }))
+        .unwrap();
+        Storage::create(
+            storage.as_ref(),
+            &build_key("secrets", Some("default"), "sec"),
+            &secret,
+        )
+        .await
+        .unwrap();
+
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": [], "volumes": [{
+                "name": "proj",
+                "projected": {
+                    "defaultMode": 420,
+                    "sources": [{"secret": {
+                        "name": "sec",
+                        "items": [{"key": "data-1", "path": "new-path-data-1", "mode": 256}]
+                    }}]
+                }
+            }]}
+        }))
+        .unwrap();
+
+        let volume_dir = tmp.join("p").join("proj");
+        std::fs::create_dir_all(&volume_dir).unwrap();
+        std::fs::write(volume_dir.join("data-1"), b"stale-root").unwrap();
+
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+
+        let mapped = volume_dir.join("new-path-data-1");
+        assert_eq!(std::fs::read(&mapped).unwrap(), b"value-1");
+        assert!(
+            !volume_dir.join("data-1").exists(),
+            "unmapped root secret key must be removed as stale"
+        );
+        let perms = std::fs::metadata(&mapped).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o400,
+            "projected secret item mode must be applied on resync"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
