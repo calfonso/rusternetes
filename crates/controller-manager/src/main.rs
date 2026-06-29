@@ -731,7 +731,7 @@ async fn main() -> Result<()> {
     // same dir the metrics/cert paths use above).
     let ns_ca = std::fs::read_to_string(format!("{}/ca.crt", args.pki_dir)).ok();
     let namespace_controller =
-        Arc::new(NamespaceController::new(storage.clone()).with_ca_cert(ns_ca));
+        Arc::new(NamespaceController::new(storage.clone()).with_ca_cert(ns_ca.clone()));
     spawn_controller!("Namespace controller", leader_elector, {
         let controller = namespace_controller.clone();
         async move {
@@ -754,7 +754,8 @@ async fn main() -> Result<()> {
     });
 
     // Start ServiceAccount controller (watch-based)
-    let serviceaccount_controller = Arc::new(ServiceAccountController::new(storage.clone()));
+    let serviceaccount_controller =
+        Arc::new(ServiceAccountController::new(storage.clone()).with_ca_cert(ns_ca));
     spawn_controller!("ServiceAccount controller", leader_elector, {
         let controller = serviceaccount_controller.clone();
         async move {

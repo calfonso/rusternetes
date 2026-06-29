@@ -46,7 +46,6 @@ use prometheus_client::PrometheusClient;
 use rusternetes_common::auth::TokenManager;
 use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::tls::TlsConfig;
 use rusternetes_storage::{Storage, StorageBackend, StorageConfig};
 use state::ApiServerState;
 use std::sync::Arc;
@@ -173,39 +172,21 @@ async fn main() -> Result<()> {
     info!("Initializing Metrics Registry");
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
 
-    // Load or generate TLS config (if TLS is enabled)
-    let ca_cert_pem = if args.tls {
-        info!("TLS enabled - loading/generating certificates");
-
-        let tls_config = if let (Some(cert_file), Some(key_file)) =
-            (args.tls_cert_file.clone(), args.tls_key_file.clone())
-        {
-            info!(
-                "Loading TLS certificate from {} and key from {}",
-                cert_file, key_file
-            );
-            TlsConfig::from_pem_files(&cert_file, &key_file)?
-        } else if args.tls_self_signed {
-            warn!("Generating self-signed certificate - NOT suitable for production!");
-            let sans: Vec<String> = args
-                .tls_san
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            info!("Self-signed cert SANs: {:?}", sans);
-            TlsConfig::generate_self_signed("rusternetes-api", sans)?
-        } else {
-            anyhow::bail!("TLS enabled but no certificate provided. Use --tls-cert-file and --tls-key-file, or --tls-self-signed");
-        };
-
-        // ca.crt distributed to SA tokens / kube-root-ca must be the issuing CA,
-        // not the (now leaf) serving cert — see resolve_ca_cert_pem.
-        tls_config.cert_pem.as_deref().map(|serving| {
-            rusternetes_api_server::resolve_ca_cert_pem(args.tls_cert_file.as_deref(), serving)
-        })
-    } else {
-        None
+    let api_config = rusternetes_api_server::ApiServerConfig {
+        bind_address: args.bind_address.clone(),
+        tls: args.tls,
+        tls_cert_file: args.tls_cert_file.clone(),
+        tls_key_file: args.tls_key_file.clone(),
+        tls_self_signed: args.tls_self_signed,
+        tls_san: args.tls_san.clone(),
+        skip_auth: args.skip_auth,
+        client_ca_file: args.client_ca_file.clone(),
+        ..Default::default()
     };
+    let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
+    let ca_cert_pem = prepared_tls
+        .as_ref()
+        .and_then(|prepared| prepared.ca_cert_pem().map(str::to_string));
 
     // Bootstrap kubernetes Service Endpoints with dynamic IP discovery
     let api_port = args
@@ -341,19 +322,9 @@ async fn main() -> Result<()> {
     if args.tls {
         info!("TLS enabled - starting HTTPS server");
 
-        // Reload TLS config for server
-        let tls_config =
-            if let (Some(cert_file), Some(key_file)) = (args.tls_cert_file, args.tls_key_file) {
-                TlsConfig::from_pem_files(&cert_file, &key_file)?
-            } else {
-                // Must be self-signed
-                let sans: Vec<String> = args
-                    .tls_san
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect();
-                TlsConfig::generate_self_signed("rusternetes-api", sans)?
-            };
+        let tls_config = prepared_tls
+            .ok_or_else(|| anyhow::anyhow!("TLS config unavailable"))?
+            .into_tls_config();
 
         // `--client-ca-file` enables x509 client-cert authentication: build an
         // mTLS server config (client cert OPTIONAL — bearer-token clients still

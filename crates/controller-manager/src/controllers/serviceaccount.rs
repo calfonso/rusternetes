@@ -65,6 +65,8 @@ pub struct ServiceAccountController<S: Storage> {
     /// RSA private key for signing tokens (PEM format)
     /// In production, this would be loaded from a secure key file
     signing_key: Option<EncodingKey>,
+    /// PEM-encoded CA certificate injected into SA token secrets
+    ca_cert_pem: Option<String>,
 }
 
 impl<S: Storage + 'static> ServiceAccountController<S> {
@@ -79,7 +81,13 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         Self {
             storage,
             signing_key,
+            ca_cert_pem: None,
         }
+    }
+
+    pub fn with_ca_cert(mut self, ca_cert_pem: Option<String>) -> Self {
+        self.ca_cert_pem = ca_cert_pem;
+        self
     }
 
     /// Load the RSA private key for signing ServiceAccount tokens
@@ -403,9 +411,14 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 let mut data = HashMap::new();
                 // Secret data is raw bytes (not base64 encoded - that's done on serialization)
                 data.insert("token".to_string(), token.as_bytes().to_vec());
-                // Add namespace and ca.crt (empty for now)
+                // Add namespace and ca.crt
                 data.insert("namespace".to_string(), namespace.as_bytes().to_vec());
-                data.insert("ca.crt".to_string(), Vec::new());
+                let ca_bytes = self
+                    .ca_cert_pem
+                    .as_deref()
+                    .map(|pem| pem.as_bytes().to_vec())
+                    .unwrap_or_default();
+                data.insert("ca.crt".to_string(), ca_bytes);
                 Some(data)
             },
             string_data: None,

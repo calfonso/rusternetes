@@ -82,6 +82,68 @@ pub fn resolve_ca_cert_pem(cert_file: Option<&str>, serving_cert_pem: &str) -> S
     serving_cert_pem.to_string()
 }
 
+/// TLS material prepared from [`ApiServerConfig`].
+///
+/// When a self-signed certificate is generated, this keeps the generated key
+/// pair together with the CA PEM derived from that same certificate so embedded
+/// components can trust the exact cert the API server will serve.
+pub struct PreparedTlsConfig {
+    tls_config: TlsConfig,
+    ca_cert_pem: Option<String>,
+}
+
+impl PreparedTlsConfig {
+    pub fn ca_cert_pem(&self) -> Option<&str> {
+        self.ca_cert_pem.as_deref()
+    }
+
+    pub fn into_tls_config(self) -> TlsConfig {
+        self.tls_config
+    }
+}
+
+/// Load or generate TLS material for an `ApiServerConfig`.
+///
+/// Returns `None` when TLS is disabled.
+pub fn prepare_tls_for_config(
+    config: &ApiServerConfig,
+) -> anyhow::Result<Option<PreparedTlsConfig>> {
+    if !config.tls {
+        return Ok(None);
+    }
+    let tls_config = if let (Some(ref cert_file), Some(ref key_file)) =
+        (&config.tls_cert_file, &config.tls_key_file)
+    {
+        TlsConfig::from_pem_files(cert_file, key_file)?
+    } else if config.tls_self_signed {
+        let sans: Vec<String> = config
+            .tls_san
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        TlsConfig::generate_self_signed("rusternetes-api", sans)?
+    } else {
+        anyhow::bail!("TLS enabled but no certificate provided");
+    };
+    let ca_cert_pem = tls_config
+        .cert_pem
+        .as_deref()
+        .map(|serving| resolve_ca_cert_pem(config.tls_cert_file.as_deref(), serving));
+    Ok(Some(PreparedTlsConfig {
+        tls_config,
+        ca_cert_pem,
+    }))
+}
+
+/// Derive the cluster CA certificate PEM from an `ApiServerConfig` without
+/// starting the server.
+///
+/// Prefer [`prepare_tls_for_config`] when the same generated TLS material will
+/// be used to start the API server.
+pub fn ca_cert_pem_for_config(config: &ApiServerConfig) -> anyhow::Result<Option<String>> {
+    Ok(prepare_tls_for_config(config)?.and_then(|prepared| prepared.ca_cert_pem))
+}
+
 /// Configuration for the API server component.
 pub struct ApiServerConfig {
     pub bind_address: String,
@@ -103,6 +165,10 @@ pub struct ApiServerConfig {
     /// OPTIONAL — bearer-token clients still connect; presenting one is just an
     /// additional way to authenticate.
     pub client_ca_file: Option<String>,
+    /// Preloaded/generated TLS material. Embedded callers can set this after
+    /// calling [`prepare_tls_for_config`] so the CA handed to other components
+    /// matches the certificate served by the API server.
+    pub prepared_tls: Option<PreparedTlsConfig>,
 }
 
 impl Default for ApiServerConfig {
@@ -119,6 +185,7 @@ impl Default for ApiServerConfig {
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
+            prepared_tls: None,
         }
     }
 }
@@ -127,7 +194,7 @@ impl Default for ApiServerConfig {
 ///
 /// This is the main entry point for embedding the API server in the all-in-one binary.
 /// Starts the HTTPS/HTTP server and blocks until shutdown.
-pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyhow::Result<()> {
+pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> anyhow::Result<()> {
     info!("Starting Rusternetes API Server");
 
     let token_manager = Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()));
@@ -142,29 +209,24 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
 
-    let ca_cert_pem = if config.tls {
+    // Generate or load the TLS config once so that the serving cert and the
+    // kube-root-ca.crt written into SA volumes are always the same certificate.
+    // Previously a second call to generate_self_signed at the server-bind site
+    // produced a different random key pair, causing in-cluster kube clients
+    // (flanneld, etc.) to fail TLS verification (M2a fix).
+    let prepared_tls = if config.tls {
         info!("TLS enabled - loading/generating certificates");
-        let tls_config = if let (Some(ref cert_file), Some(ref key_file)) =
-            (&config.tls_cert_file, &config.tls_key_file)
-        {
-            TlsConfig::from_pem_files(cert_file, key_file)?
-        } else if config.tls_self_signed {
-            let sans: Vec<String> = config
-                .tls_san
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            TlsConfig::generate_self_signed("rusternetes-api", sans)?
+        if let Some(prepared) = config.prepared_tls.take() {
+            Some(prepared)
         } else {
-            anyhow::bail!("TLS enabled but no certificate provided");
-        };
-        tls_config
-            .cert_pem
-            .as_deref()
-            .map(|serving| resolve_ca_cert_pem(config.tls_cert_file.as_deref(), serving))
+            prepare_tls_for_config(&config)?
+        }
     } else {
         None
     };
+    let ca_cert_pem = prepared_tls
+        .as_ref()
+        .and_then(|prepared| prepared.ca_cert_pem().map(str::to_string));
 
     // Bootstrap kubernetes Service
     let api_port = config
@@ -287,18 +349,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
     let app = router::build_router(state, config.console_dir.as_deref());
 
     if config.tls {
-        let tls_config = if let (Some(cert_file), Some(key_file)) =
-            (config.tls_cert_file, config.tls_key_file)
-        {
-            TlsConfig::from_pem_files(&cert_file, &key_file)?
-        } else {
-            let sans: Vec<String> = config
-                .tls_san
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            TlsConfig::generate_self_signed("rusternetes-api", sans)?
-        };
+        // Reuse the cert generated/loaded above so the serving cert matches
+        // the one written into kube-root-ca.crt / SA volumes.
+        let tls_config = prepared_tls
+            .ok_or_else(|| anyhow::anyhow!("TLS config unavailable"))?
+            .into_tls_config();
 
         let client_cert_authn = config.client_ca_file.is_some();
         let server_config = if let Some(ref client_ca) = config.client_ca_file {
@@ -346,4 +401,45 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn prepare_tls_for_self_signed_exposes_served_cert_as_ca() {
+        let old_ca_cert_path = std::env::var_os("CA_CERT_PATH");
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("CA_CERT_PATH", "/tmp/rusternetes-test-missing-ca-cert.pem");
+        std::env::set_var("HOME", "/tmp/rusternetes-test-missing-home");
+
+        let config = ApiServerConfig {
+            tls: true,
+            tls_self_signed: true,
+            tls_san: "localhost,127.0.0.1".to_string(),
+            ..Default::default()
+        };
+
+        let prepared = prepare_tls_for_config(&config)
+            .expect("self-signed TLS should prepare")
+            .expect("TLS is enabled");
+        let ca_cert_pem = prepared
+            .ca_cert_pem()
+            .expect("self-signed TLS should expose a CA PEM")
+            .to_string();
+        let tls_config = prepared.into_tls_config();
+
+        assert_eq!(tls_config.cert_pem.as_deref(), Some(ca_cert_pem.as_str()));
+
+        match old_ca_cert_path {
+            Some(value) => std::env::set_var("CA_CERT_PATH", value),
+            None => std::env::remove_var("CA_CERT_PATH"),
+        }
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 }

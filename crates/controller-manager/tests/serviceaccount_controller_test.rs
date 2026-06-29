@@ -291,6 +291,34 @@ async fn test_serviceaccount_token_contains_required_fields() {
 }
 
 #[tokio::test]
+async fn test_serviceaccount_token_secret_includes_configured_ca_cert() {
+    let storage = Arc::new(MemoryStorage::new());
+    let ca_cert_pem = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----\n";
+    let controller =
+        ServiceAccountController::new(storage.clone()).with_ca_cert(Some(ca_cert_pem.to_string()));
+
+    let namespace = active_namespace("test-token-ca-cert");
+    let ns_key = build_key("namespaces", None, "test-token-ca-cert");
+    storage.create(&ns_key, &namespace).await.unwrap();
+
+    controller.reconcile_all().await.unwrap();
+
+    let secret_key = build_key("secrets", Some("test-token-ca-cert"), "default-token");
+    let secret: Secret = storage.get(&secret_key).await.unwrap();
+    let data = secret
+        .data
+        .as_ref()
+        .expect("service account token secret must have data");
+
+    assert_eq!(data.get("ca.crt"), Some(&ca_cert_pem.as_bytes().to_vec()));
+
+    let sa_key = build_key("serviceaccounts", Some("test-token-ca-cert"), "default");
+    storage.delete(&sa_key).await.unwrap();
+    storage.delete(&secret_key).await.unwrap();
+    storage.delete(&ns_key).await.unwrap();
+}
+
+#[tokio::test]
 async fn test_serviceaccount_skips_terminating_namespaces() {
     let storage = Arc::new(MemoryStorage::new());
     let controller = ServiceAccountController::new(storage.clone());

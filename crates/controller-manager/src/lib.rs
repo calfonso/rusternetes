@@ -336,8 +336,9 @@ async fn run_controllers<S: Storage + Send + Sync + 'static>(
     });
 
     let s = storage.clone();
+    let sa_ca = config.ca_cert_pem.clone();
     tokio::spawn(async move {
-        let c = Arc::new(ServiceAccountController::new(s));
+        let c = Arc::new(ServiceAccountController::new(s).with_ca_cert(sa_ca));
         if let Err(e) = c.run().await {
             error!("ServiceAccount controller error: {}", e);
         }

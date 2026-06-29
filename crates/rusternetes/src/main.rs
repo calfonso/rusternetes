@@ -269,7 +269,7 @@ async fn async_main() -> Result<()> {
 
     // --- API Server ---
     let api_storage = storage.clone();
-    let api_config = rusternetes_api_server::ApiServerConfig {
+    let mut api_config = rusternetes_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
         tls: args.tls,
         tls_cert_file: args.tls_cert_file.clone(),
@@ -281,6 +281,11 @@ async fn async_main() -> Result<()> {
         client_ca_file: args.client_ca_file.clone(),
         ..Default::default()
     };
+    let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
+    let cm_ca_pem = prepared_tls
+        .as_ref()
+        .and_then(|prepared| prepared.ca_cert_pem().map(str::to_string));
+    api_config.prepared_tls = prepared_tls;
     let api_handle = tokio::spawn(async move {
         if let Err(e) = rusternetes_api_server::run(api_storage, api_config).await {
             error!("API server error: {}", e);
@@ -339,13 +344,6 @@ async fn async_main() -> Result<()> {
                 insecure_skip_tls_verify: true,
             }
         });
-    // CA cert PEM for the namespace controller's kube-root-ca.crt publisher.
-    // Read from the configured CA file (falling back to the serving cert).
-    let cm_ca_pem = args
-        .client_ca_file
-        .as_ref()
-        .or(args.tls_cert_file.as_ref())
-        .and_then(|p| std::fs::read_to_string(p).ok());
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
         metrics_config,
