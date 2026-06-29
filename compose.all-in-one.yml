@@ -7,16 +7,11 @@
 #   podman compose -f compose.all-in-one.yml build
 #   podman compose -f compose.all-in-one.yml up -d
 #
-# Requires the rhino repo adjacent to this one:
-#   dev/
-#     rusternetes/   (this repo)
-#     rhino/         (https://github.com/calfonso/rhino)
-
 services:
   rusternetes:
     build:
-      context: ..
-      dockerfile: rusternetes/Dockerfile.all-in-one
+      context: .
+      dockerfile: Dockerfile.all-in-one
       args:
         CARGO_FEATURES: sqlite
     container_name: rusternetes

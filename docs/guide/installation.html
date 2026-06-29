@@ -548,15 +548,15 @@ sudo podman compose -f compose.yml up -d</code>
         <tbody>
           <tr>
             <td>Ubuntu / Debian</td>
-            <td><code>build-essential pkg-config libssl-dev</code></td>
+            <td><code>build-essential pkg-config libssl-dev protobuf-compiler</code></td>
           </tr>
           <tr>
             <td>Fedora / RHEL</td>
-            <td><code>gcc openssl-devel pkg-config</code></td>
+            <td><code>gcc openssl-devel pkg-config protobuf-compiler protobuf-devel</code></td>
           </tr>
           <tr>
             <td>macOS</td>
-            <td>Xcode Command Line Tools (<code>xcode-select --install</code>)</td>
+            <td>Xcode Command Line Tools (<code>xcode-select --install</code>), <code>brew install protobuf</code></td>
           </tr>
         </tbody>
       </table>
@@ -569,13 +569,14 @@ sudo podman compose -f compose.yml up -d</code>
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Ubuntu / Debian</span>
-sudo apt-get install -y build-essential pkg-config libssl-dev
+sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler
 
 <span class="comment"># Fedora / RHEL</span>
-sudo dnf install -y gcc openssl-devel pkg-config
+sudo dnf install -y gcc openssl-devel pkg-config protobuf-compiler protobuf-devel
 
 <span class="comment"># macOS (if not already installed)</span>
-xcode-select --install</code>
+xcode-select --install
+brew install protobuf</code>
       </pre>
 
       <h2>Verify Your Installation</h2>

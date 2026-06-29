@@ -8,11 +8,6 @@
 #   podman compose -f compose.all-in-one-redis.yml build
 #   podman compose -f compose.all-in-one-redis.yml up -d
 #
-# Requires the rhino repo adjacent to this one:
-#   dev/
-#     rusternetes/   (this repo)
-#     rhino/         (https://github.com/calfonso/rhino)
-
 services:
   redis:
     image: docker.io/library/redis:7-alpine
@@ -32,8 +27,8 @@ services:
 
   rusternetes:
     build:
-      context: ..
-      dockerfile: rusternetes/Dockerfile.all-in-one
+      context: .
+      dockerfile: Dockerfile.all-in-one
       args:
         CARGO_FEATURES: redis
     container_name: rusternetes

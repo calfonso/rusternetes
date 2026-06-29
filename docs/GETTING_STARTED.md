@@ -7,6 +7,7 @@ This guide shows how to run each rusternetes component as a separate process on 
 ## Prerequisites
 
 - **Rust toolchain** — install via [rustup.rs](https://rustup.rs/)
+- **Protocol Buffers compiler** — `protobuf-compiler` + `protobuf-devel` (Fedora), `protobuf-compiler` (Debian/Ubuntu), `brew install protobuf` (macOS)
 - **etcd** — for cluster state storage (or use SQLite/Redis with the all-in-one binary)
 - **Docker** — for the kubelet to create containers
 

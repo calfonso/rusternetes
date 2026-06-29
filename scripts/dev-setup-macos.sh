@@ -55,6 +55,11 @@ if ! check_command "cargo"; then
     MISSING_DEPS=1
 fi
 
+if ! check_command "protoc"; then
+    echo "  Install protobuf: brew install protobuf"
+    MISSING_DEPS=1
+fi
+
 # Check for Docker or Podman (prefer Docker on macOS)
 CONTAINER_RUNTIME=""
 if check_command "docker"; then
