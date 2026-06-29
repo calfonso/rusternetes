@@ -17,6 +17,7 @@
 //! configs.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use rusternetes_common::resources::pod::{Container, Pod};
 use rusternetes_common::resources::{ConfigMap, Secret, Service};
@@ -753,7 +754,13 @@ fn mounts(container: &Container, host_paths: &HashMap<String, String>) -> Vec<v1
         .filter_map(|vm| {
             host_paths.get(&vm.name).map(|host| v1::Mount {
                 container_path: vm.mount_path.clone(),
-                host_path: host.clone(),
+                host_path: match vm.sub_path.as_deref().filter(|s| !s.is_empty()) {
+                    Some(sub_path) => Path::new(host)
+                        .join(sub_path)
+                        .to_string_lossy()
+                        .into_owned(),
+                    None => host.clone(),
+                },
                 readonly: vm.read_only.unwrap_or(false),
                 propagation: translate_mount_propagation(vm.mount_propagation.as_deref()),
                 ..Default::default()
@@ -1494,6 +1501,40 @@ mod tests {
             cfg.mounts[0].propagation,
             v1::MountPropagation::PropagationPrivate as i32
         );
+    }
+
+    #[test]
+    fn volume_mount_subpath_joins_onto_host_path() {
+        use rusternetes_common::resources::pod::VolumeMount;
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.volume_mounts = Some(vec![VolumeMount {
+            name: "data".to_string(),
+            mount_path: "/data".to_string(),
+            read_only: None,
+            sub_path: Some("nested/sub".to_string()),
+            sub_path_expr: None,
+            mount_propagation: None,
+            recursive_read_only: None,
+        }]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        let host_paths = HashMap::from([("data".to_string(), "/host/data".to_string())]);
+        let cfg = container_config(
+            &pod,
+            &c,
+            "img",
+            &host_paths,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(cfg.mounts.len(), 1);
+        assert_eq!(cfg.mounts[0].host_path, "/host/data/nested/sub");
     }
 
     #[test]
