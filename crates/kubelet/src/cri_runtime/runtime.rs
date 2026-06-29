@@ -1640,8 +1640,12 @@ impl CriContainerRuntime {
             let container = spec
                 .containers
                 .iter()
-                .chain(spec.init_containers.iter().flatten())
-                .find(|c| c.name == st.name);
+                .find(|c| c.name == st.name)
+                .or_else(|| {
+                    spec.init_containers.iter().flatten().find(|c| {
+                        c.name == st.name && c.restart_policy.as_deref() == Some("Always")
+                    })
+                });
             let Some(container) = container else { continue };
             let Some(probe) = container.readiness_probe.as_ref() else {
                 continue;
@@ -2222,6 +2226,69 @@ mod tests {
         assert!(!readiness_after_observation(&mut st, false, 1, 3));
         // A later success (threshold 1) recovers readiness.
         assert!(readiness_after_observation(&mut st, true, 1, 3));
+    }
+
+    #[tokio::test]
+    async fn apply_readiness_updates_restartable_init_sidecars_only() {
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .expect("runtime handle is lazy and should not dial during construction");
+        let plain_init = Container {
+            name: "plain-init".to_string(),
+            image: "busybox".to_string(),
+            readiness_probe: Some(serde_json::from_str::<Probe>("{}").unwrap()),
+            ..Default::default()
+        };
+        let sidecar = Container {
+            name: "sidecar".to_string(),
+            image: "busybox".to_string(),
+            restart_policy: Some("Always".to_string()),
+            readiness_probe: Some(serde_json::from_str::<Probe>("{}").unwrap()),
+            ..Default::default()
+        };
+        let app = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        let pod = Pod::new(
+            "sidecar-ready",
+            PodSpec {
+                containers: vec![app],
+                init_containers: Some(vec![plain_init, sidecar]),
+                ..Default::default()
+            },
+        );
+        let running = Some(ContainerState::Running { started_at: None });
+        let mut statuses = vec![
+            ContainerStatus {
+                name: "plain-init".to_string(),
+                ready: false,
+                state: running.clone(),
+                ..waiting_status("plain-init")
+            },
+            ContainerStatus {
+                name: "sidecar".to_string(),
+                ready: false,
+                state: running,
+                ..waiting_status("sidecar")
+            },
+        ];
+
+        runtime.apply_readiness(&pod, &mut statuses).await;
+
+        assert!(
+            !statuses[0].ready,
+            "plain init containers are not readiness-probe targets"
+        );
+        assert!(
+            statuses[1].ready,
+            "restartable init sidecars must get readiness-probe results"
+        );
     }
 
     #[test]

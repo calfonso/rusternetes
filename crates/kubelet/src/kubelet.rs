@@ -4160,16 +4160,19 @@ impl Kubelet {
                             self.runtime
                                 .apply_readiness(&readiness_pod, &mut container_statuses)
                                 .await;
+                            let mut init_container_statuses =
+                                self.get_init_container_statuses(&readiness_pod).await;
+                            if let Some(init_statuses) = init_container_statuses.as_mut() {
+                                self.runtime
+                                    .apply_readiness(&readiness_pod, init_statuses)
+                                    .await;
+                            }
                             // Restartable init containers (sidecars) count toward
                             // ContainersReady too (upstream status/generate.go):
                             // every sidecar must be ready. Plain init containers
                             // are excluded — they complete before the main
                             // containers and aren't part of steady-state readiness.
-                            let init_sidecars_ready = match self
-                                .runtime
-                                .get_init_container_statuses(&readiness_pod)
-                                .await
-                            {
+                            let init_sidecars_ready = match init_container_statuses.as_ref() {
                                 Some(init) => {
                                     let ics = readiness_pod
                                         .spec
@@ -4329,13 +4332,6 @@ impl Kubelet {
                                 .runtime
                                 .get_ephemeral_container_statuses(&new_pod)
                                 .await;
-
-                            // Refresh init container statuses — K8s prober_manager
-                            // sets ready=true for terminated init containers on every
-                            // status sync. Without this, stale ready=false from an
-                            // intermediate write persists indefinitely.
-                            let init_container_statuses =
-                                self.get_init_container_statuses(&new_pod).await;
 
                             if let Some(ref mut status) = new_pod.status {
                                 status.container_statuses = Some(container_statuses);
