@@ -34,6 +34,8 @@ pub const KILLING_CONTAINER: &str = "Killing";
 pub const BACK_OFF_START_CONTAINER: &str = "BackOff";
 /// A liveness/readiness/startup probe failed (`ContainerUnhealthy`).
 pub const CONTAINER_UNHEALTHY: &str = "Unhealthy";
+/// A probe succeeded with warning (`ContainerProbeWarning`).
+pub const CONTAINER_PROBE_WARNING: &str = "ProbeWarning";
 
 /// The component name the kubelet stamps on every event it sources.
 pub const KUBELET_COMPONENT: &str = "kubelet";

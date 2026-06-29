@@ -25,6 +25,15 @@ pub fn resolve_port(container: &Container, port: &IntOrString) -> Option<i32> {
     }
 }
 
+/// Kubernetes HTTP probes follow redirects only while the target hostname stays
+/// local to the original request. Redirects to a different hostname terminate
+/// the probe with a warning result, which still counts as success for liveness.
+pub fn redirect_is_non_local(next: &reqwest::Url, previous: &[reqwest::Url]) -> bool {
+    previous
+        .first()
+        .is_some_and(|first| next.host_str() != first.host_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +76,21 @@ mod tests {
             resolve_port(&c, &IntOrString::String("grpc".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn redirect_to_same_hostname_is_local_even_on_new_port() {
+        let original = reqwest::Url::parse("http://127.0.0.1:8080/redirect").unwrap();
+        let next = reqwest::Url::parse("http://127.0.0.1:9090/success").unwrap();
+
+        assert!(!redirect_is_non_local(&next, &[original]));
+    }
+
+    #[test]
+    fn redirect_to_different_hostname_is_non_local() {
+        let original = reqwest::Url::parse("http://10.244.0.12:8080/redirect").unwrap();
+        let next = reqwest::Url::parse("http://0.0.0.0/fail").unwrap();
+
+        assert!(redirect_is_non_local(&next, &[original]));
     }
 }

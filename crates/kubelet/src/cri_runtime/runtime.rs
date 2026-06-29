@@ -1238,6 +1238,15 @@ impl CriContainerRuntime {
             let client = match reqwest::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if probe::redirect_is_non_local(attempt.url(), attempt.previous()) {
+                        return attempt.stop();
+                    }
+                    if attempt.previous().len() >= 10 {
+                        return attempt.error("stopped after 10 redirects");
+                    }
+                    attempt.follow()
+                }))
                 .build()
             {
                 Ok(c) => c,
@@ -1250,7 +1259,21 @@ impl CriContainerRuntime {
                 }
             }
             let ok = match req.send().await {
-                Ok(resp) => resp.status().as_u16() < 400,
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_redirection() {
+                        let body = resp.text().await.unwrap_or_default();
+                        self.emit_event(
+                            pod,
+                            Some(&container.name),
+                            crate::events::CONTAINER_PROBE_WARNING,
+                            rusternetes_common::resources::EventType::Warning,
+                            &format!("Probe terminated redirects, Response body: {body}"),
+                        )
+                        .await;
+                    }
+                    status.as_u16() < 400
+                }
                 Err(_) => false,
             };
             return Ok(ok);
@@ -2165,8 +2188,13 @@ fn exec_probe_passed(exit_code: Option<i32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::resources::pod::HTTPGetAction;
     use rusternetes_common::resources::pod::PodSpec;
+    use rusternetes_common::resources::policy::IntOrString;
+    use rusternetes_common::resources::Event;
+    use rusternetes_storage::{Storage, StorageBackend};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn plain_init_container_ready_only_after_successful_exit() {
@@ -2291,6 +2319,144 @@ mod tests {
         );
     }
 
+    async fn spawn_http_probe_redirect_server() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let response = match path {
+                        "/redirect-local" => {
+                            "HTTP/1.1 302 Found\r\nLocation: /fail\r\nContent-Length: 0\r\n\r\n"
+                        }
+                        "/redirect-nonlocal" => {
+                            concat!(
+                                "HTTP/1.1 302 Found\r\n",
+                                "Location: http://0.0.0.0/fail\r\n",
+                                "Content-Length: 40\r\n",
+                                "\r\n",
+                                "<a href=\"http://0.0.0.0/fail\">Found</a>."
+                            )
+                        }
+                        "/fail" => {
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+                        }
+                        _ => "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    fn http_probe(path: &str, port: u16) -> Probe {
+        Probe {
+            http_get: Some(HTTPGetAction {
+                path: Some(path.to_string()),
+                port: IntOrString::Int(i32::from(port)),
+                host: Some("127.0.0.1".to_string()),
+                scheme: Some("HTTP".to_string()),
+                http_headers: None,
+            }),
+            ..serde_json::from_str::<Probe>("{}").unwrap()
+        }
+    }
+
+    fn probe_test_container() -> Container {
+        Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn http_probe_follows_local_redirect_to_final_failure() {
+        let port = spawn_http_probe_redirect_server().await;
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap();
+        let container = probe_test_container();
+        let pod = Pod::new(
+            "http-local-redirect",
+            PodSpec {
+                containers: vec![container.clone()],
+                ..Default::default()
+            },
+        );
+
+        let healthy = runtime
+            .probe_container(&pod, &container, &http_probe("/redirect-local", port))
+            .await
+            .unwrap();
+
+        assert!(
+            !healthy,
+            "same-host redirects must be followed and use the final response"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_non_local_redirect_is_warning_success() {
+        let port = spawn_http_probe_redirect_server().await;
+        let storage = Arc::new(StorageBackend::new_memory());
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap()
+        .with_event_recorder(Arc::clone(&storage));
+        let container = probe_test_container();
+        let mut pod = Pod::new(
+            "http-nonlocal-redirect",
+            PodSpec {
+                containers: vec![container.clone()],
+                ..Default::default()
+            },
+        );
+        pod.metadata.namespace = Some("default".to_string());
+        pod.metadata.uid = "pod-uid".to_string();
+
+        let healthy = runtime
+            .probe_container(&pod, &container, &http_probe("/redirect-nonlocal", port))
+            .await
+            .unwrap();
+
+        assert!(
+            healthy,
+            "different-host redirects terminate with warning but count as success"
+        );
+        let obj = crate::events::container_object_reference(&pod, &container.name);
+        let key = format!(
+            "/registry/events/default/{}",
+            Event::generate_name(&obj, crate::events::CONTAINER_PROBE_WARNING)
+        );
+        let event: Event = storage.get(&key).await.expect("warning event recorded");
+        assert_eq!(event.reason, crate::events::CONTAINER_PROBE_WARNING);
+        assert!(event
+            .message
+            .contains("Probe terminated redirects, Response body:"));
+    }
     #[test]
     fn runtime_version_string_uses_cri_name_and_version() {
         // The k8s `containerRuntimeVersion` is `<runtime_name>://<runtime_version>`,
