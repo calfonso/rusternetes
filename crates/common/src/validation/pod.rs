@@ -2044,6 +2044,46 @@ pub fn validate_only_deleted_scheduling_gates(
     errs
 }
 
+/// Mirrors upstream's full activeDeadlineSeconds update validation
+/// (`validatePodMetadataAndSpec` plus validation.go:5720-5738).
+///
+/// Allowed transitions:
+/// - `None` -> positive value
+/// - positive value -> lesser positive value
+pub fn validate_active_deadline_seconds_update(
+    old: Option<i64>,
+    new: Option<i64>,
+    path: &Path,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    if let Some(new_deadline) = new {
+        if !(1..=i32::MAX as i64).contains(&new_deadline) {
+            errs.push(Error::invalid(
+                path,
+                new_deadline,
+                "must be in the range [1, 2147483647]",
+            ));
+            return errs;
+        }
+        if let Some(old_deadline) = old {
+            if old_deadline < new_deadline {
+                errs.push(Error::invalid(
+                    path,
+                    new_deadline,
+                    "must be less than or equal to previous value",
+                ));
+            }
+        }
+    } else if old.is_some() {
+        errs.push(Error::invalid(
+            path,
+            serde_json::Value::Null,
+            "must not update from a positive integer to nil value",
+        ));
+    }
+    errs
+}
+
 /// Mirrors upstream's TerminationGracePeriodSeconds rule
 /// (validation.go:5780-5783). Field is immutable, with one relaxation:
 /// an old negative value may be replaced by `1` (kubelet legacy).
@@ -2254,7 +2294,17 @@ pub fn validate_pod_spec_update(
         return Err(e.to_string());
     }
 
-    // 4. TerminationGracePeriodSeconds: immutable except negative→1.
+    // 4. activeDeadlineSeconds: nil->positive or decrease-only.
+    let errs = validate_active_deadline_seconds_update(
+        old.active_deadline_seconds,
+        new.active_deadline_seconds,
+        &spec.child("activeDeadlineSeconds"),
+    );
+    if let Some(e) = errs.first() {
+        return Err(e.to_string());
+    }
+
+    // 5. TerminationGracePeriodSeconds: immutable except negative→1.
     let errs = validate_termination_grace_period_immutable(
         old.termination_grace_period_seconds,
         new.termination_grace_period_seconds,
@@ -2264,7 +2314,7 @@ pub fn validate_pod_spec_update(
         return Err(e.to_string());
     }
 
-    // 5. Munge + DeepEqual fence. Reset every field K8s allows to mutate to
+    // 6. Munge + DeepEqual fence. Reset every field K8s allows to mutate to
     //    the OLD value, then compare. Any remaining diff = forbidden change.
     let mut munged = new.clone();
     for (i, c) in munged.containers.iter_mut().enumerate() {
@@ -2536,6 +2586,18 @@ mod tests {
         }
     }
 
+    fn pod_spec_with_active_deadline(active_deadline_seconds: Option<i64>) -> PodSpec {
+        PodSpec {
+            containers: vec![Container {
+                name: "c".to_string(),
+                image: "pause".to_string(),
+                ..Default::default()
+            }],
+            active_deadline_seconds,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn tolerations_additions_only_allows_add() {
         let p = Path::new("spec").child("tolerations");
@@ -2593,6 +2655,55 @@ mod tests {
         let errs = validate_termination_grace_period_immutable(Some(30), Some(60), &p);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].to_string().contains("field is immutable"));
+    }
+
+    #[test]
+    fn active_deadline_update_allows_nil_to_positive() {
+        let old = pod_spec_with_active_deadline(None);
+        let new = pod_spec_with_active_deadline(Some(5));
+
+        assert!(validate_pod_spec_update(&old, &new, false).is_ok());
+    }
+
+    #[test]
+    fn active_deadline_update_allows_decrease() {
+        let old = pod_spec_with_active_deadline(Some(10));
+        let new = pod_spec_with_active_deadline(Some(5));
+
+        assert!(validate_pod_spec_update(&old, &new, false).is_ok());
+    }
+
+    #[test]
+    fn active_deadline_update_rejects_increase() {
+        let old = pod_spec_with_active_deadline(Some(5));
+        let new = pod_spec_with_active_deadline(Some(10));
+        let err = validate_pod_spec_update(&old, &new, false).unwrap_err();
+
+        assert!(err.contains("spec.activeDeadlineSeconds"));
+        assert!(err.contains("must be less than or equal to previous value"));
+    }
+
+    #[test]
+    fn active_deadline_update_rejects_unset_zero_and_negative() {
+        let path = Path::new("spec").child("activeDeadlineSeconds");
+
+        let unset_errs = validate_active_deadline_seconds_update(Some(5), None, &path);
+        assert_eq!(unset_errs.len(), 1);
+        assert!(unset_errs[0]
+            .to_string()
+            .contains("must not update from a positive integer to nil value"));
+
+        let zero_errs = validate_active_deadline_seconds_update(None, Some(0), &path);
+        assert_eq!(zero_errs.len(), 1);
+        assert!(zero_errs[0]
+            .to_string()
+            .contains("must be in the range [1, 2147483647]"));
+
+        let negative_errs = validate_active_deadline_seconds_update(None, Some(-1), &path);
+        assert_eq!(negative_errs.len(), 1);
+        assert!(negative_errs[0]
+            .to_string()
+            .contains("must be in the range [1, 2147483647]"));
     }
 
     fn dns_cfg(searches: &[&str]) -> PodDNSConfig {

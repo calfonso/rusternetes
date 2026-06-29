@@ -147,6 +147,9 @@ const TERMINAL_FINALIZE_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const TERMINAL_FINALIZE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Attempt count at which the still-present warning escalates to `error!`.
 const TERMINAL_FINALIZE_ERROR_THRESHOLD: u32 = 3;
+const ACTIVE_DEADLINE_REASON: &str = "DeadlineExceeded";
+const ACTIVE_DEADLINE_MESSAGE: &str =
+    "Pod was active on the node longer than the specified deadline";
 
 /// Backoff delay before re-attempting termination of a terminal pod whose
 /// storage delete isn't taking effect, given the failed-attempt `count` (1 =
@@ -174,6 +177,20 @@ fn preserved_start_time(
     now: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
     prior.unwrap_or(now)
+}
+
+fn active_deadline_elapsed(
+    status: Option<&PodStatus>,
+    deadline_seconds: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<i64> {
+    let start_time = status.and_then(|status| status.start_time)?;
+    let elapsed = now.signed_duration_since(start_time).num_seconds();
+    if elapsed >= deadline_seconds {
+        Some(elapsed)
+    } else {
+        None
+    }
 }
 
 /// The node's advertised capacity/allocatable. Single source of truth so the
@@ -2408,32 +2425,26 @@ impl Kubelet {
         if let Some(ref spec) = pod.spec {
             if let Some(deadline) = spec.active_deadline_seconds {
                 if let Some(ref status) = pod.status {
-                    if let Some(start_time) = status.start_time {
-                        let elapsed = chrono::Utc::now()
-                            .signed_duration_since(start_time)
-                            .num_seconds();
-                        if elapsed > deadline {
-                            info!(
-                                "Pod {}/{} exceeded activeDeadlineSeconds ({}s > {}s)",
-                                namespace, pod_name, elapsed, deadline
-                            );
-                            let key = build_key("pods", Some(namespace), pod_name);
-                            let mut failed_pod = pod.clone();
-                            if let Some(ref mut s) = failed_pod.status {
-                                s.phase = Some(Phase::Failed);
-                                s.reason = Some("DeadlineExceeded".to_string());
-                                s.message = Some(format!(
-                                    "Pod was active on the node longer than the specified deadline ({}s)",
-                                    deadline
-                                ));
-                            }
-                            let _ = self.storage.update_status(&key, &failed_pod).await;
-                            // Stop the pod
-                            if self.runtime.is_pod_running(pod).await.unwrap_or(false) {
-                                let _ = self.runtime.stop_pod_with_grace_period(pod_name, 0).await;
-                            }
-                            return Ok(());
+                    if let Some(elapsed) =
+                        active_deadline_elapsed(Some(status), deadline, chrono::Utc::now())
+                    {
+                        info!(
+                            "Pod {}/{} exceeded activeDeadlineSeconds ({}s >= {}s)",
+                            namespace, pod_name, elapsed, deadline
+                        );
+                        let key = build_key("pods", Some(namespace), pod_name);
+                        let mut failed_pod = pod.clone();
+                        if let Some(ref mut s) = failed_pod.status {
+                            s.phase = Some(Phase::Failed);
+                            s.reason = Some(ACTIVE_DEADLINE_REASON.to_string());
+                            s.message = Some(ACTIVE_DEADLINE_MESSAGE.to_string());
                         }
+                        let _ = self.storage.update_status(&key, &failed_pod).await;
+                        // Stop the pod
+                        if self.runtime.is_pod_running(pod).await.unwrap_or(false) {
+                            let _ = self.runtime.stop_pod_with_grace_period(pod_name, 0).await;
+                        }
+                        return Ok(());
                     }
                 }
             }
@@ -5623,6 +5634,40 @@ mod tests {
         assert_eq!(super::preserved_start_time(Some(earlier), now), earlier);
         // First Running write (no prior startTime) stamps now.
         assert_eq!(super::preserved_start_time(None, now), now);
+    }
+
+    #[test]
+    fn active_deadline_elapsed_matches_upstream_boundary() {
+        use chrono::{Duration, Utc};
+
+        let now = Utc::now();
+        let status = PodStatus {
+            start_time: Some(now - Duration::seconds(5)),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::active_deadline_elapsed(Some(&status), 5, now),
+            Some(5)
+        );
+        assert_eq!(super::active_deadline_elapsed(Some(&status), 6, now), None);
+    }
+
+    #[test]
+    fn active_deadline_elapsed_requires_start_time() {
+        let status = PodStatus {
+            start_time: None,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::active_deadline_elapsed(Some(&status), 5, chrono::Utc::now()),
+            None
+        );
+        assert_eq!(
+            super::active_deadline_elapsed(None, 5, chrono::Utc::now()),
+            None
+        );
     }
 
     #[test]
