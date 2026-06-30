@@ -193,6 +193,33 @@ fn active_deadline_elapsed(
     }
 }
 
+fn deadline_exceeded_terminal(status: Option<&PodStatus>) -> bool {
+    status.is_some_and(|status| {
+        status.phase == Some(Phase::Failed)
+            && status.reason.as_deref() == Some(ACTIVE_DEADLINE_REASON)
+    })
+}
+
+fn terminal_phase_requires_termination(pod: &Pod) -> bool {
+    let is_terminal_phase = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_ref())
+        .map(|p| matches!(p, Phase::Succeeded | Phase::Failed))
+        .unwrap_or(false);
+    if !is_terminal_phase {
+        return false;
+    }
+
+    let restart_policy = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.restart_policy.as_deref())
+        .unwrap_or("Always");
+
+    restart_policy != "Always" || deadline_exceeded_terminal(pod.status.as_ref())
+}
+
 /// The node's advertised capacity/allocatable. Single source of truth so the
 /// NodeStatus the kubelet posts and the values the runtime uses to default
 /// resourceFieldRef LIMITS (downward-API `limits.cpu`/`memory` env) never drift.
@@ -2087,18 +2114,7 @@ impl Kubelet {
         //    K8s ref: pkg/kubelet/pod_workers.go — completeSync checks isTerminal
         //    which is only true when the pod is finished (all containers exited
         //    and restartPolicy doesn't allow restart).
-        let is_terminal_phase = pod
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.as_ref())
-            .map(|p| matches!(p, Phase::Succeeded | Phase::Failed))
-            .unwrap_or(false);
-        let restart_policy = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.restart_policy.as_deref())
-            .unwrap_or("Always");
-        let terminal_and_done = is_terminal_phase && restart_policy != "Always";
+        let terminal_and_done = terminal_phase_requires_termination(pod);
         let needs_terminating = (pod.metadata.deletion_timestamp.is_some() || terminal_and_done)
             && matches!(current_state, PodWorkerState::SyncPod);
         // INVARIANT: a pod whose phase is terminal either transitions to
@@ -2438,6 +2454,17 @@ impl Kubelet {
                             s.phase = Some(Phase::Failed);
                             s.reason = Some(ACTIVE_DEADLINE_REASON.to_string());
                             s.message = Some(ACTIVE_DEADLINE_MESSAGE.to_string());
+                            s.conditions = Some(Self::failed_pod_conditions());
+                            if let Some(ref mut cs) = s.container_statuses {
+                                for c in cs.iter_mut() {
+                                    c.ready = false;
+                                }
+                            }
+                            if let Some(ref mut ics) = s.init_container_statuses {
+                                for ic in ics.iter_mut() {
+                                    ic.ready = false;
+                                }
+                            }
                         }
                         let _ = self.storage.update_status(&key, &failed_pod).await;
                         // Stop the pod
@@ -5668,6 +5695,60 @@ mod tests {
             super::active_deadline_elapsed(None, 5, chrono::Utc::now()),
             None
         );
+    }
+
+    #[test]
+    fn deadline_exceeded_failed_pod_requires_termination_even_with_restart_always() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("deadline-pod").with_namespace("default"),
+            spec: Some(PodSpec {
+                restart_policy: Some("Always".to_string()),
+                containers: vec![Container {
+                    name: "app".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some(Phase::Failed),
+                reason: Some(super::ACTIVE_DEADLINE_REASON.to_string()),
+                ..Default::default()
+            }),
+        };
+
+        assert!(super::terminal_phase_requires_termination(&pod));
+    }
+
+    #[test]
+    fn ordinary_failed_pod_with_restart_always_does_not_force_termination() {
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("non-deadline-failed").with_namespace("default"),
+            spec: Some(PodSpec {
+                restart_policy: Some("Always".to_string()),
+                containers: vec![Container {
+                    name: "app".to_string(),
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some(Phase::Failed),
+                reason: Some("CreateContainerError".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        assert!(!super::terminal_phase_requires_termination(&pod));
     }
 
     #[test]

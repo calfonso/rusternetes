@@ -27,6 +27,7 @@ configs/local-*
 # Development environment
 .env
 .env.local
+*.local.*
 
 # Podman/Docker volumes
 etcd-data/
@@ -39,5 +40,4 @@ etcd-data/
 # Node conformance harness
 .bin/
 
-# Documentation
-docs/conformance/MISSING_TESTS_ROADMAP.md
+*.db*
