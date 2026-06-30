@@ -128,6 +128,24 @@ fn find_container<'a>(pod: &'a Pod, name: &str) -> Option<&'a Container> {
         .find(|c| c.name == name)
 }
 
+fn is_restartable_init_container(container: &Container) -> bool {
+    container.restart_policy.as_deref() == Some("Always")
+}
+
+fn is_https_to_http_error(err: &reqwest::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(source) = current {
+        let message = source.to_string();
+        if message.contains("server gave HTTP response to HTTPS client")
+            || message.contains("InvalidContentType")
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 /// Read the last [`status::MAX_TERMINATION_MESSAGE_LENGTH`] bytes of a container
 /// log file for the `FallbackToLogsOnError` path. `None` if the log is absent or
 /// empty. Returns the raw log tail; the CRI log line framing is left intact
@@ -795,7 +813,9 @@ impl CriContainerRuntime {
             }
         };
 
-        // Init containers run sequentially to completion before app containers.
+        // Plain init containers run sequentially to completion before app
+        // containers. Restartable init containers (sidecars) start here too,
+        // but they do not gate app startup and are not waited to completion.
         if let Some(init_containers) = spec.init_containers.as_ref() {
             for container in init_containers {
                 let id = self
@@ -808,6 +828,9 @@ impl CriContainerRuntime {
                         &host_paths,
                     )
                     .await?;
+                if is_restartable_init_container(container) {
+                    continue;
+                }
                 let exit_code = self.wait_for_exit(&mut cri, &id, &container.name).await?;
                 if exit_code != 0 {
                     return Err(CriRuntimeError::InitContainerFailed {
@@ -1382,9 +1405,19 @@ impl CriContainerRuntime {
                     req = req.header(&h.name, &h.value);
                 }
             }
-            let resp = req.send().await?;
-            if resp.status().as_u16() >= 400 {
-                anyhow::bail!("httpGet lifecycle handler {url} returned {}", resp.status());
+            match req.send().await {
+                Ok(_resp) => {}
+                Err(err) if scheme == "https" && is_https_to_http_error(&err) => {
+                    let fallback_url = format!("http://{host}:{port}{path}");
+                    let mut fallback = client.get(&fallback_url);
+                    if let Some(headers) = http.http_headers.as_ref() {
+                        for h in headers {
+                            fallback = fallback.header(&h.name, &h.value);
+                        }
+                    }
+                    fallback.send().await?;
+                }
+                Err(err) => return Err(err.into()),
             }
             return Ok(());
         }
@@ -2363,6 +2396,26 @@ mod tests {
         port
     }
 
+    async fn spawn_lifecycle_hook_http_server(response: &'static str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
     fn http_probe(path: &str, port: u16) -> Probe {
         Probe {
             http_get: Some(HTTPGetAction {
@@ -2382,6 +2435,86 @@ mod tests {
             image: "busybox".to_string(),
             ..Default::default()
         }
+    }
+
+    fn lifecycle_test_pod_and_container() -> (Pod, Container) {
+        let container = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        let pod = Pod::new(
+            "lifecycle-hook-test",
+            PodSpec {
+                containers: vec![container.clone()],
+                ..Default::default()
+            },
+        );
+        (pod, container)
+    }
+
+    #[tokio::test]
+    async fn lifecycle_http_hook_ignores_non_2xx_status() {
+        let port =
+            spawn_lifecycle_hook_http_server("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap();
+        let (pod, container) = lifecycle_test_pod_and_container();
+        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+            exec: None,
+            http_get: Some(HTTPGetAction {
+                path: Some("/echo?msg=poststart".to_string()),
+                port: IntOrString::Int(i32::from(port)),
+                host: Some("127.0.0.1".to_string()),
+                scheme: Some("HTTP".to_string()),
+                http_headers: None,
+            }),
+            tcp_socket: None,
+            sleep: None,
+        };
+
+        runtime
+            .run_lifecycle_handler(&pod, &container, "unused", &handler)
+            .await
+            .expect("lifecycle hooks should ignore HTTP status codes");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_https_hook_falls_back_to_http() {
+        let port =
+            spawn_lifecycle_hook_http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        let runtime = CriContainerRuntime::connect(
+            "/tmp/rusternetes-test-missing-cri.sock",
+            "",
+            "/tmp/rusternetes-test-logs",
+        )
+        .await
+        .unwrap();
+        let (pod, container) = lifecycle_test_pod_and_container();
+        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+            exec: None,
+            http_get: Some(HTTPGetAction {
+                path: Some("/echo?msg=prestop".to_string()),
+                port: IntOrString::Int(i32::from(port)),
+                host: Some("127.0.0.1".to_string()),
+                scheme: Some("HTTPS".to_string()),
+                http_headers: None,
+            }),
+            tcp_socket: None,
+            sleep: None,
+        };
+
+        runtime
+            .run_lifecycle_handler(&pod, &container, "unused", &handler)
+            .await
+            .expect("HTTPS lifecycle hooks must fall back to HTTP");
     }
 
     #[tokio::test]
@@ -2494,6 +2627,24 @@ mod tests {
             Some("FallbackToLogsOnError")
         );
         assert!(find_container(&pod, "missing").is_none());
+    }
+
+    #[test]
+    fn restartable_init_container_is_detected_by_per_container_restart_policy() {
+        let regular = Container {
+            name: "init".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        let sidecar = Container {
+            name: "sidecar".to_string(),
+            image: "busybox".to_string(),
+            restart_policy: Some("Always".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!is_restartable_init_container(&regular));
+        assert!(is_restartable_init_container(&sidecar));
     }
 
     #[test]
