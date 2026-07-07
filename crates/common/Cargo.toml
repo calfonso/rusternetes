@@ -33,7 +33,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-jaeger = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry-stdout = { version = "0.3", optional = true }
+opentelemetry-stdout = { version = "0.32", optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 sha2 = "0.10.9"
 reqwest = { workspace = true }
