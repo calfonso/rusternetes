@@ -11,7 +11,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::advanced::{
     check_host_port_conflicts, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
-    check_preemption, check_taints_tolerations, check_topology_spread_constraints, NodeScore,
+    check_preemption, check_taints_tolerations, check_topology_spread_constraints,
+    parse_resource_quantity, NodeScore,
 };
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
@@ -1098,10 +1099,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let mut memory_overhead = 0i64;
 
         if let Some(cpu) = overhead.get("cpu") {
-            cpu_overhead = self.parse_resource_quantity(cpu, "cpu");
+            cpu_overhead = parse_resource_quantity(cpu, "cpu");
         }
         if let Some(memory) = overhead.get("memory") {
-            memory_overhead = self.parse_resource_quantity(memory, "memory");
+            memory_overhead = parse_resource_quantity(memory, "memory");
         }
 
         // Get node allocatable resources
@@ -1115,11 +1116,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         let available_cpu = allocatable
             .get("cpu")
-            .map(|s| self.parse_resource_quantity(s, "cpu"))
+            .map(|s| parse_resource_quantity(s, "cpu"))
             .unwrap_or(0);
         let available_memory = allocatable
             .get("memory")
-            .map(|s| self.parse_resource_quantity(s, "memory"))
+            .map(|s| parse_resource_quantity(s, "memory"))
             .unwrap_or(0);
 
         // Check if overhead alone would prevent scheduling
@@ -1143,50 +1144,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // Return score minus overhead penalty (but not less than 0)
         (base_score - overhead_penalty).max(0)
-    }
-
-    /// Parse resource quantity (helper method)
-    /// Handles K8s resource formats:
-    ///   CPU: "100m" (millicores), "0.5" or "1.5" (decimal cores), "2" (whole cores)
-    ///   Memory: "128974848" (bytes), "129e6" (scientific), "129M" (SI), "123Mi" (binary)
-    fn parse_resource_quantity(&self, quantity: &str, resource_type: &str) -> i64 {
-        let quantity = quantity.trim();
-
-        if resource_type == "cpu" {
-            if let Some(stripped) = quantity.strip_suffix('m') {
-                stripped.parse::<i64>().unwrap_or(0)
-            } else if let Ok(val) = quantity.parse::<f64>() {
-                (val * 1000.0) as i64
-            } else {
-                0
-            }
-        } else {
-            if let Some(stripped) = quantity.strip_suffix("Ki") {
-                stripped.parse::<i64>().unwrap_or(0) * 1024
-            } else if let Some(stripped) = quantity.strip_suffix("Mi") {
-                stripped.parse::<i64>().unwrap_or(0) * 1024 * 1024
-            } else if let Some(stripped) = quantity.strip_suffix("Gi") {
-                stripped.parse::<i64>().unwrap_or(0) * 1024 * 1024 * 1024
-            } else if let Some(stripped) = quantity.strip_suffix("Ti") {
-                stripped.parse::<i64>().unwrap_or(0) * 1024 * 1024 * 1024 * 1024
-            } else if let Some(stripped) = quantity.strip_suffix('T') {
-                stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000_000
-            } else if let Some(stripped) = quantity.strip_suffix('G') {
-                stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000
-            } else if let Some(stripped) = quantity.strip_suffix('M') {
-                stripped.parse::<i64>().unwrap_or(0) * 1_000_000
-            } else if let Some(stripped) = quantity.strip_suffix('k') {
-                stripped.parse::<i64>().unwrap_or(0) * 1000
-            } else if let Some(stripped) = quantity.strip_suffix('E') {
-                stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000_000_000_000
-            } else if let Some(stripped) = quantity.strip_suffix('P') {
-                stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000_000_000
-            } else if let Ok(val) = quantity.parse::<f64>() {
-                val as i64
-            } else {
-                0
-            }
-        }
     }
 
     /// Get the priority value for a pod (synchronous version using pre-loaded PriorityClasses)
