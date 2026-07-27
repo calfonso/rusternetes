@@ -92,6 +92,9 @@ pub struct ContainerRuntime {
     network: String,
     cni: Option<CniRuntime>,
     use_cni: bool,
+    /// Whether the daemon accepts `UtsMode: "container:<id>"`. Podman does;
+    /// Docker rejects it outright. See [`Self::detect_uts_container_mode`].
+    supports_uts_container_mode: bool,
     kubernetes_service_host: String,
     /// Token manager for generating projected service account tokens
     token_manager: rusternetes_common::auth::TokenManager,
@@ -215,6 +218,8 @@ impl ContainerRuntime {
             .unwrap_or_else(|_| "rusternetes-secret-change-in-production".to_string());
         let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
 
+        let supports_uts_container_mode = Self::detect_uts_container_mode(&docker).await;
+
         Ok(Self {
             docker,
             storage: None,
@@ -224,12 +229,73 @@ impl ContainerRuntime {
             network,
             cni,
             use_cni,
+            supports_uts_container_mode,
             kubernetes_service_host,
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Classify a daemon identity string as Podman, Docker, or unknown.
+    ///
+    /// Split out from [`Self::detect_uts_container_mode`] so the matching
+    /// rules can be unit-tested without a live daemon.
+    fn uts_container_mode_from_identity(identity: &str) -> bool {
+        let identity = identity.to_lowercase();
+        if identity.contains("podman") {
+            true
+        } else if identity.contains("docker") {
+            false
+        } else {
+            // Unrecognised daemon: keep the pre-existing behaviour.
+            true
+        }
+    }
+
+    /// Determine whether the daemon accepts `UtsMode: "container:<id>"`.
+    ///
+    /// Joining another container's UTS namespace is a Podman extension.
+    /// Docker only accepts `""` or `"host"` and fails container creation with
+    /// `400 invalid UTS mode` for anything else, so setting the field there
+    /// makes every pod unstartable.
+    ///
+    /// Podman's Docker-compatible `/version` endpoint identifies itself as
+    /// "Podman Engine" in `Components[].Name`; Docker reports "Engine" plus a
+    /// `Platform.Name` of "Docker Engine - <edition>". Anything we cannot
+    /// positively identify as Docker keeps the previous behaviour.
+    async fn detect_uts_container_mode(docker: &Docker) -> bool {
+        let version = match docker.version().await {
+            Ok(version) => version,
+            Err(e) => {
+                // The daemon is unreachable; nothing else will work either.
+                // Don't change pod-creation behaviour off a failed probe.
+                warn!("Could not probe container runtime version: {}", e);
+                return true;
+            }
+        };
+
+        let identity = version
+            .platform
+            .as_ref()
+            .map(|p| p.name.as_str())
+            .into_iter()
+            .chain(version.components.iter().flatten().map(|c| c.name.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let supported = Self::uts_container_mode_from_identity(&identity);
+        if supported {
+            debug!("Container runtime ({identity}) supports uts_mode=container:");
+        } else {
+            info!(
+                "Container runtime ({identity}) does not support \
+                 uts_mode=container:; pod containers will inherit the pod \
+                 hostname through the shared network namespace instead"
+            );
+        }
+        supported
     }
 
     /// Initialize CNI runtime
@@ -4400,8 +4466,18 @@ impl ContainerRuntime {
                 // Share UTS namespace with pause container so app containers
                 // inherit the pod hostname. Without this, containers get their
                 // container ID as hostname instead of the pod name.
-                // K8s CRI shares UTS via the pod sandbox; Docker/Podman need explicit uts_mode.
-                uts_mode: if using_container_network {
+                // K8s CRI shares UTS via the pod sandbox; Podman needs an
+                // explicit uts_mode.
+                //
+                // Docker has no equivalent: it accepts only ""/"host" for
+                // UtsMode and rejects container creation with `400 invalid UTS
+                // mode` otherwise, which previously left every pod stuck in a
+                // create-fail loop. It also refuses an explicit `hostname`
+                // alongside `network_mode: container:` ("conflicting options").
+                // Neither is needed there — Docker already propagates the
+                // target container's hostname when joining its network
+                // namespace, so the pod hostname is inherited regardless.
+                uts_mode: if using_container_network && self.supports_uts_container_mode {
                     Some(format!("container:{}_pause", pod_name))
                 } else {
                     None
@@ -8116,8 +8192,53 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::ContainerRuntime;
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    /// Docker rejects `UtsMode: "container:<id>"` with `400 invalid UTS mode`,
+    /// so it must be classified as unsupported; Podman accepts it.
+    #[test]
+    fn test_uts_container_mode_detection() {
+        // Docker CE reports this Platform.Name plus generic component names.
+        assert!(!ContainerRuntime::uts_container_mode_from_identity(
+            "Docker Engine - Community Engine containerd runc docker-init"
+        ));
+        assert!(!ContainerRuntime::uts_container_mode_from_identity(
+            "Docker Engine - Enterprise"
+        ));
+
+        // Podman's Docker-compatible /version names itself in Components[].
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "Podman Engine"
+        ));
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "linux/amd64 Podman Engine conmon"
+        ));
+
+        // Case-insensitive.
+        assert!(!ContainerRuntime::uts_container_mode_from_identity(
+            "docker engine - community"
+        ));
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "PODMAN ENGINE"
+        ));
+
+        // Unrecognised or empty identity keeps the previous behaviour.
+        assert!(ContainerRuntime::uts_container_mode_from_identity(""));
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "Some Other Engine"
+        ));
+    }
+
+    /// Podman ships a Docker-compatible endpoint, so an identity naming both
+    /// must resolve to Podman rather than falling into the Docker branch.
+    #[test]
+    fn test_uts_container_mode_prefers_podman_when_both_named() {
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "Podman Engine (Docker compatible)"
+        ));
+    }
 
     fn make_container(name: &str) -> Container {
         Container {
