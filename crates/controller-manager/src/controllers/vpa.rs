@@ -350,7 +350,7 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         &self,
         container: &rusternetes_common::resources::Container,
     ) -> (i64, i64) {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
 
         // Get CPU request (default to 100m if not specified)

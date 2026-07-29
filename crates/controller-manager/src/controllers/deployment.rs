@@ -1190,7 +1190,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         // Also update the deployment's revision annotation (with CAS retry +
         // exponential backoff + jitter so contended deployments don't thrash).
         {
-            use rand::Rng;
+            use rand::RngExt;
             let dep_key = build_key("deployments", Some(namespace), &deployment.metadata.name);
             let new_rev = new_revision.clone();
             let mut delay_ms: u64 = 10;

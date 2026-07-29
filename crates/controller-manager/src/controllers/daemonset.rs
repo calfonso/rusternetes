@@ -883,7 +883,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // failed daemon pods" which checks that the original failed pod's name
         // returns NotFound via GET.
         let suffix: String = {
-            use rand::Rng;
+            use rand::RngExt;
             let mut rng = rand::rng();
             (0..5)
                 .map(|_| {
