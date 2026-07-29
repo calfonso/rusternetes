@@ -5,7 +5,7 @@
 
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
-    Aes256Gcm, Nonce,
+    Aes256Gcm,
 };
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -143,7 +143,7 @@ impl EncryptionProvider for AesGcmProvider {
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         // Generate random nonce
         let nonce_bytes = Self::generate_nonce();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = &nonce_bytes.into();
 
         // Encrypt
         let ciphertext = self
@@ -169,12 +169,14 @@ impl EncryptionProvider for AesGcmProvider {
         }
 
         // Extract nonce (first 12 bytes)
-        let nonce = Nonce::from_slice(&ciphertext[..12]);
+        let nonce_bytes: [u8; 12] = ciphertext[..12]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid nonce length"))?;
 
         // Decrypt
         let plaintext = self
             .cipher
-            .decrypt(nonce, &ciphertext[12..])
+            .decrypt(&nonce_bytes.into(), &ciphertext[12..])
             .map_err(|e| anyhow!("Decryption failed: {}", e))?;
 
         debug!(
