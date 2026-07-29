@@ -68,9 +68,10 @@ fn make_daemonset(name: &str, ns: &str) -> DaemonSet {
             },
             template: PodTemplateSpec {
                 metadata: Some({
-                    let mut m = ObjectMeta::default();
-                    m.labels = Some(labels);
-                    m
+                    ObjectMeta {
+                        labels: Some(labels),
+                        ..Default::default()
+                    }
                 }),
                 spec: PodSpec {
                     containers: vec![Container {

@@ -8,12 +8,12 @@ use rusternetes_common::{
 #[cfg(feature = "aws")]
 use std::collections::HashMap;
 #[cfg(feature = "aws")]
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "aws")]
 use aws_sdk_elasticloadbalancingv2::{
     types::{
-        Action, ActionTypeEnum, ForwardActionConfig, IpAddressType, Listener, LoadBalancer,
+        Action, ActionTypeEnum, ForwardActionConfig, IpAddressType, LoadBalancer,
         LoadBalancerSchemeEnum, LoadBalancerTypeEnum, TargetGroup, TargetGroupIpAddressTypeEnum,
         TargetTypeEnum,
     },
@@ -35,12 +35,12 @@ impl AwsProvider {
     /// Create a new AWS provider
     pub async fn new(cluster_name: String, region: Option<String>) -> Result<Self> {
         let config = if let Some(r) = region {
-            aws_config::from_env()
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .region(aws_config::Region::new(r))
                 .load()
                 .await
         } else {
-            aws_config::load_from_env().await
+            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
         };
 
         let elb_client = ElbClient::new(&config);
@@ -511,15 +511,16 @@ mod tests {
 
     #[test]
     fn test_lb_name_generation() {
+        let config = aws_config::SdkConfig::builder().build();
         let provider = AwsProvider {
-            elb_client: unsafe { std::mem::zeroed() },
+            elb_client: ElbClient::new(&config),
             vpc_id: Some("vpc-123".to_string()),
             subnet_ids: vec![],
             cluster_name: "my-cluster".to_string(),
             tags: HashMap::new(),
         };
 
-        let service = CloudLBService {
+        let service = LoadBalancerService {
             namespace: "default".to_string(),
             name: "my-service".to_string(),
             cluster_name: "my-cluster".to_string(),
@@ -541,15 +542,16 @@ mod tests {
 
     #[test]
     fn test_lb_name_sanitization() {
+        let config = aws_config::SdkConfig::builder().build();
         let provider = AwsProvider {
-            elb_client: unsafe { std::mem::zeroed() },
+            elb_client: ElbClient::new(&config),
             vpc_id: Some("vpc-123".to_string()),
             subnet_ids: vec![],
             cluster_name: "test_cluster".to_string(),
             tags: HashMap::new(),
         };
 
-        let service = CloudLBService {
+        let service = LoadBalancerService {
             namespace: "my@namespace".to_string(),
             name: "service#123".to_string(),
             cluster_name: "test_cluster".to_string(),
@@ -569,15 +571,16 @@ mod tests {
 
     #[test]
     fn test_tg_name_generation() {
+        let config = aws_config::SdkConfig::builder().build();
         let provider = AwsProvider {
-            elb_client: unsafe { std::mem::zeroed() },
+            elb_client: ElbClient::new(&config),
             vpc_id: Some("vpc-123".to_string()),
             subnet_ids: vec![],
             cluster_name: "cluster".to_string(),
             tags: HashMap::new(),
         };
 
-        let service = CloudLBService {
+        let service = LoadBalancerService {
             namespace: "ns".to_string(),
             name: "svc".to_string(),
             cluster_name: "cluster".to_string(),

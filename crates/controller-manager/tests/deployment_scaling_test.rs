@@ -14,6 +14,8 @@ use rusternetes_controller_manager::controllers::replicaset::ReplicaSetControlle
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
+// sleep and Duration kept for potential future test use
+#[allow(unused_imports)]
 use tokio::time::{sleep, Duration};
 
 async fn setup() -> Arc<MemoryStorage> {
@@ -99,6 +101,7 @@ fn create_deployment(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_owned_rs(
     name: &str,
     namespace: &str,
@@ -814,7 +817,7 @@ async fn test_single_active_rs_scales_directly() {
     let storage = setup().await;
     let ns = "default";
     let deploy_name = "single-rs";
-    let deploy_uid = "deploy-uid-single-rs";
+    let _deploy_uid = "deploy-uid-single-rs";
 
     let deployment = create_deployment(deploy_name, ns, 5, "nginx:1.0", None);
     let dep_key = build_key("deployments", Some(ns), deploy_name);

@@ -38,6 +38,7 @@ impl<S: Storage + 'static> NodeController<S> {
     /// within the K8s-standard 60s startup grace; this lets tests observe the
     /// Ready-flip behavior deterministically without sleeping.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn seed_first_seen_for_test(&self, node_name: &str) {
         let past = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(

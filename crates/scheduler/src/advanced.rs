@@ -790,10 +790,12 @@ fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i64 {
 
 /// System-critical priority threshold. Pods at or above this priority
 /// can only be preempted by pods with strictly higher priority.
+#[allow(dead_code)]
 const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 
 /// Check if preemption should occur and return pods to evict
 /// Returns (should_preempt, pods_to_evict)
+#[allow(dead_code)]
 pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<String>) {
     // Get the priority of the incoming pod
     let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);

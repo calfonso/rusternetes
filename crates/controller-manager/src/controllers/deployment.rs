@@ -1208,7 +1208,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                             Ok(_) => break,
                             Err(rusternetes_common::Error::Conflict(_)) => {
                                 if attempt + 1 < 3 {
-                                    let jitter = rand::thread_rng().gen_range(0..delay_ms);
+                                    let jitter = rand::rng().random_range(0..delay_ms);
                                     tokio::time::sleep(Duration::from_millis(delay_ms + jitter))
                                         .await;
                                     delay_ms = (delay_ms * 2).min(500);
@@ -2611,6 +2611,7 @@ mod tests {
     /// Build a Deployment with the given image + replicas + (maxSurge,
     /// maxUnavailable) and optional `paused` flag. Reduces boilerplate in the
     /// proportional / rollover tests below.
+    #[allow(clippy::too_many_arguments)]
     fn build_deployment_for_tests(
         name: &str,
         replicas: i32,

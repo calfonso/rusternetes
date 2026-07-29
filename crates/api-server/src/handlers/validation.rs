@@ -346,7 +346,15 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
-                } else {
+                } else if !orig_val.is_null() {
+                    // A field present in the original but missing from the
+                    // canonical (re-serialized) JSON is unknown — unless its
+                    // value is `null`.  Optional fields annotated with
+                    // `skip_serializing_if = "Option::is_none"` deserialize
+                    // `null` as `None` and then disappear on re-serialization,
+                    // so a `null` value is never evidence of an unknown field.
+                    // This matches upstream k8s behaviour: clients routinely
+                    // send `"creationTimestamp": null` and similar.
                     unknown.push(field_path);
                 }
             }

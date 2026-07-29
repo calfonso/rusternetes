@@ -146,27 +146,23 @@ pub async fn handle_ws_exec(
                 Ok(Message::Binary(data)) if !data.is_empty() => {
                     let channel = data[0];
                     let payload = &data[1..];
-                    match channel {
-                        0 => {
-                            // stdin frame
-                            if payload.is_empty() {
-                                // v5 close-stream signal for stdin
-                                if let Some(mut w) = exec_input.take() {
-                                    let _ = w.shutdown().await;
-                                }
-                            } else if let Some(w) = exec_input.as_mut() {
-                                if w.write_all(payload).await.is_err() {
-                                    let _ = w.shutdown().await;
-                                    exec_input = None;
-                                } else {
-                                    let _ = w.flush().await;
-                                }
+                    // Channel 0 is stdin; channels 1-3 are server→client only,
+                    // channel 4 (resize) is accepted but not acted on since
+                    // bollard doesn't expose resize_exec here.
+                    if channel == 0 {
+                        if payload.is_empty() {
+                            // v5 close-stream signal for stdin
+                            if let Some(mut w) = exec_input.take() {
+                                let _ = w.shutdown().await;
+                            }
+                        } else if let Some(w) = exec_input.as_mut() {
+                            if w.write_all(payload).await.is_err() {
+                                let _ = w.shutdown().await;
+                                exec_input = None;
+                            } else {
+                                let _ = w.flush().await;
                             }
                         }
-                        // Channel 4 (resize) and other channels are accepted
-                        // but not acted on — bollard doesn't expose resize_exec
-                        // here, and channels 1-3 are server→client only.
-                        _ => {}
                     }
                 }
                 _ => {} // ignore text frames, pings, pongs

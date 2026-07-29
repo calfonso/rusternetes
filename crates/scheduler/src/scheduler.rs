@@ -257,6 +257,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Run one scheduling cycle — schedules all pending pods.
     /// Public for testing.
+    #[allow(dead_code)]
     pub async fn schedule_pending_pods(&self) -> rusternetes_common::Result<()> {
         debug!("Looking for pending pods to schedule");
 
@@ -943,6 +944,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Try to preempt lower-priority pods to make room for a high-priority pod
     /// Returns Some((node_name, pods_to_evict)) if preemption is possible, None otherwise
+    #[allow(dead_code)]
     async fn try_preempt(
         &self,
         pod: &Pod,
@@ -1004,6 +1006,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Evict a pod by setting its deletionTimestamp (graceful delete).
     /// The kubelet will detect the deletionTimestamp and handle graceful shutdown.
+    #[allow(dead_code)]
     async fn evict_pod(&self, pod_name: &str) -> rusternetes_common::Result<()> {
         // Find the pod in all namespaces
         let prefix = build_prefix("pods", None);
