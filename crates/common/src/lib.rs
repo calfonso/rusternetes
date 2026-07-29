@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod async_runtime;
 pub mod audit;
 pub mod auth;
 pub mod authz;

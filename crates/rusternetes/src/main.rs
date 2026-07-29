@@ -113,8 +113,18 @@ struct Args {
     client_ca_file: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Built by hand rather than with `#[tokio::main]` so the worker threads get
+    // a stack large enough for the kubelet's pod sync path — see
+    // `worker_stack_size`. Everything else matches what the macro expands to.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(rusternetes_common::async_runtime::worker_stack_size())
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     let level = match args.log_level.as_str() {
