@@ -35,7 +35,7 @@ opentelemetry-jaeger = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry-stdout = { version = "0.32", optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 reqwest = { workspace = true }
 cel.workspace = true
 prost.workspace = true
