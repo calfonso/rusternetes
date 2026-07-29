@@ -60,7 +60,7 @@ cel = "0.13" # Common Expression Language (CEL) interpreter
 x509-parser = "0.16" # X.509 certificate parsing
 pem = "3.0" # PEM format encoding/decoding
 base64 = "0.22" # Base64 encoding/decoding
-serial_test = "3.0" # Serialize tests that modify global state
+serial_test = "4.0" # Serialize tests that modify global state
 warp = "0.3" # HTTP server framework for testing
 
 # Cloud provider SDKs
