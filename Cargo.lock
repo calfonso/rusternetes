@@ -3187,7 +3187,7 @@ dependencies = [
  "petgraph",
  "prettyplease",
  "prost 0.13.5",
- "prost-types",
+ "prost-types 0.13.5",
  "regex",
  "syn 2.0.117",
  "tempfile",
@@ -3226,6 +3226,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
  "prost 0.13.5",
+]
+
+[[package]]
+name = "prost-types"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
+dependencies = [
+ "prost 0.14.3",
 ]
 
 [[package]]
@@ -3726,7 +3735,7 @@ dependencies = [
  "prometheus-http-query",
  "prost 0.13.5",
  "prost-build",
- "prost-types",
+ "prost-types 0.14.3",
  "reqwest 0.12.28",
  "rusternetes-common",
  "rusternetes-controller-manager",
@@ -3788,7 +3797,7 @@ dependencies = [
  "prometheus",
  "proptest",
  "prost 0.13.5",
- "prost-types",
+ "prost-types 0.14.3",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
@@ -5065,7 +5074,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "prost-build",
- "prost-types",
+ "prost-types 0.13.5",
  "quote",
  "syn 2.0.117",
 ]
