@@ -1214,20 +1214,28 @@ fn matches_field_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
 
     for requirement in selector.split(',') {
         let requirement = requirement.trim();
-        if let Some((field, value)) = requirement.split_once('=') {
-            match field {
-                "metadata.name" => {
-                    if metadata.name != value {
-                        return false;
-                    }
-                }
-                "metadata.namespace" => {
-                    if metadata.namespace.as_deref() != Some(value) {
-                        return false;
-                    }
-                }
-                _ => {} // Unknown fields pass through
-            }
+
+        // `!=` has to be probed before `=`. `split_once('=')` splits inside the
+        // `!=`, which leaves the field name with a trailing `!` ("metadata.name!"),
+        // and an unrecognised field is passed through — so a negated requirement
+        // would be dropped instead of applied.
+        let (field, value, negated) = match requirement.split_once("!=") {
+            Some((field, value)) => (field.trim(), value.trim(), true),
+            None => match requirement.split_once('=') {
+                Some((field, value)) => (field.trim(), value.trim(), false),
+                None => continue,
+            },
+        };
+
+        let equal = match field {
+            "metadata.name" => metadata.name == value,
+            "metadata.namespace" => metadata.namespace.as_deref() == Some(value),
+            _ => continue, // Unknown fields pass through
+        };
+
+        // `=` keeps only equal objects, `!=` keeps only unequal ones.
+        if equal == negated {
+            return false;
         }
     }
     true
@@ -2617,4 +2625,116 @@ pub async fn watch_namespaced_json(
         .header(header::TRANSFER_ENCODING, "chunked")
         .body(body)
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(name: &str, namespace: Option<&str>) -> ObjectMeta {
+        let meta = ObjectMeta::new(name);
+        match namespace {
+            Some(ns) => meta.with_namespace(ns),
+            None => meta,
+        }
+    }
+
+    #[test]
+    fn field_selector_absent_or_empty_matches_everything() {
+        let m = meta("pod-a", Some("default"));
+        assert!(matches_field_selector(&m, &None));
+        assert!(matches_field_selector(&m, &Some(String::new())));
+    }
+
+    #[test]
+    fn field_selector_equality_filters_name_and_namespace() {
+        let m = meta("pod-a", Some("default"));
+
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.name=pod-a".to_string())
+        ));
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.name=pod-b".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default".to_string())
+        ));
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace=kube-system".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_honours_negated_requirements() {
+        let m = meta("pod-a", Some("default"));
+
+        // `split_once('=')` used to split inside the `!=`, leaving the field name
+        // as "metadata.name!" -- an unrecognised field, so the requirement was
+        // dropped and the object matched regardless of the value.
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.name!=pod-a".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.name!=pod-b".to_string())
+        ));
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace!=default".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace!=kube-system".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_combines_requirements_with_and() {
+        let m = meta("pod-a", Some("default"));
+
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default,metadata.name!=pod-b".to_string())
+        ));
+        // The second requirement excludes it even though the first matches.
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default,metadata.name!=pod-a".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_passes_through_unsupported_fields() {
+        // Only metadata.name / metadata.namespace are evaluated here; anything
+        // else is deliberately not filtered, in either polarity.
+        let m = meta("pod-a", Some("default"));
+        assert!(matches_field_selector(
+            &m,
+            &Some("spec.nodeName=node-1".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("spec.nodeName!=node-1".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_namespace_requirement_excludes_cluster_scoped_objects() {
+        // Unchanged from before: an object with no namespace never satisfies a
+        // metadata.namespace equality requirement.
+        let m = meta("node-1", None);
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace!=default".to_string())
+        ));
+    }
 }
