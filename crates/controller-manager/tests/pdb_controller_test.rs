@@ -557,3 +557,134 @@ async fn test_pdb_only_counts_healthy_pods() {
         "At minimum healthy threshold"
     );
 }
+
+#[tokio::test]
+async fn test_pdb_disruptions_allowed_is_never_negative_when_budget_is_breached() {
+    let storage = setup_test().await;
+    let controller = PodDisruptionBudgetController::new(storage.clone());
+
+    // minAvailable=3 over 3 pods, but only 1 of them is healthy: the budget is
+    // already breached, so no disruption is allowed. It is not "-2 allowed".
+    let spec = PodDisruptionBudgetSpec {
+        min_available: Some(IntOrString::Int(3)),
+        max_unavailable: None,
+        selector: LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+            match_expressions: None,
+        },
+        unhealthy_pod_eviction_policy: None,
+    };
+
+    let pdb = PodDisruptionBudget::new("web-pdb", "default", spec);
+    let pdb_key = build_key("poddisruptionbudgets", Some("default"), "web-pdb");
+    storage.create(&pdb_key, &pdb).await.unwrap();
+
+    for i in 0..3 {
+        let pod = create_test_pod(
+            &format!("web-{}", i),
+            "default",
+            HashMap::from([("app".to_string(), "web".to_string())]),
+            i == 0,
+        );
+        let pod_key = build_key("pods", Some("default"), &format!("web-{}", i));
+        storage.create(&pod_key, &pod).await.unwrap();
+    }
+
+    controller.reconcile_all().await.unwrap();
+
+    let status = storage
+        .get::<PodDisruptionBudget>(&pdb_key)
+        .await
+        .unwrap()
+        .status
+        .expect("Status should be set");
+
+    assert_eq!(status.current_healthy, 1);
+    assert_eq!(status.desired_healthy, 3);
+    assert_eq!(status.expected_pods, 3);
+    assert_eq!(
+        status.disruptions_allowed, 0,
+        "a breached budget allows no disruptions, not a negative number of them"
+    );
+}
+
+#[tokio::test]
+async fn test_pdb_desired_healthy_is_never_negative_when_max_unavailable_exceeds_pods() {
+    let storage = setup_test().await;
+    let controller = PodDisruptionBudgetController::new(storage.clone());
+
+    // maxUnavailable=5 over 3 pods is legal — it means every pod is disposable.
+    let spec = PodDisruptionBudgetSpec {
+        min_available: None,
+        max_unavailable: Some(IntOrString::Int(5)),
+        selector: LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "batch".to_string())])),
+            match_expressions: None,
+        },
+        unhealthy_pod_eviction_policy: None,
+    };
+
+    let pdb = PodDisruptionBudget::new("batch-pdb", "default", spec);
+    let pdb_key = build_key("poddisruptionbudgets", Some("default"), "batch-pdb");
+    storage.create(&pdb_key, &pdb).await.unwrap();
+
+    for i in 0..3 {
+        let pod = create_test_pod(
+            &format!("batch-{}", i),
+            "default",
+            HashMap::from([("app".to_string(), "batch".to_string())]),
+            true,
+        );
+        let pod_key = build_key("pods", Some("default"), &format!("batch-{}", i));
+        storage.create(&pod_key, &pod).await.unwrap();
+    }
+
+    controller.reconcile_all().await.unwrap();
+
+    let status = storage
+        .get::<PodDisruptionBudget>(&pdb_key)
+        .await
+        .unwrap()
+        .status
+        .expect("Status should be set");
+
+    assert_eq!(
+        status.desired_healthy, 0,
+        "3 - maxUnavailable(5) floors at 0"
+    );
+    assert_eq!(status.current_healthy, 3);
+    assert_eq!(status.disruptions_allowed, 3, "all three pods may go");
+}
+
+#[tokio::test]
+async fn test_pdb_with_no_matching_pods_allows_no_disruptions() {
+    let storage = setup_test().await;
+    let controller = PodDisruptionBudgetController::new(storage.clone());
+
+    let spec = PodDisruptionBudgetSpec {
+        min_available: Some(IntOrString::Int(2)),
+        max_unavailable: None,
+        selector: LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "absent".to_string())])),
+            match_expressions: None,
+        },
+        unhealthy_pod_eviction_policy: None,
+    };
+
+    let pdb = PodDisruptionBudget::new("absent-pdb", "default", spec);
+    let pdb_key = build_key("poddisruptionbudgets", Some("default"), "absent-pdb");
+    storage.create(&pdb_key, &pdb).await.unwrap();
+
+    controller.reconcile_all().await.unwrap();
+
+    let status = storage
+        .get::<PodDisruptionBudget>(&pdb_key)
+        .await
+        .unwrap()
+        .status
+        .expect("Status should be set");
+
+    assert_eq!(status.expected_pods, 0);
+    assert_eq!(status.current_healthy, 0);
+    assert_eq!(status.disruptions_allowed, 0);
+}
