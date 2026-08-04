@@ -47,7 +47,7 @@ prost-types = "0.13"
 jsonwebtoken = "9.3" # JWT token generation and validation
 rustls = { version = "0.23", features = ["aws-lc-rs"] } # TLS support with aws-lc-rs crypto provider
 tokio-rustls = "0.26" # Tokio integration for rustls
-rcgen = "0.13" # Certificate generation
+rcgen = "0.14" # Certificate generation
 prometheus = "0.14" # Prometheus metrics
 opentelemetry = "0.22" # Distributed tracing
 opentelemetry-prometheus = "0.15" # Prometheus exporter for OpenTelemetry
