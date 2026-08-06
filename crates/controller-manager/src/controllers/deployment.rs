@@ -11,11 +11,23 @@ use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
 /// Parse a value that can be either an absolute integer or a percentage string (e.g. "25%" or "1").
-/// For percentages, the result is ceil(pct/100 * total). Defaults to 1 if unparseable.
-fn parse_int_or_percent(s: &str, total: i32) -> i32 {
+///
+/// `round_up` selects the rounding direction for percentages, mirroring
+/// `intstr.GetScaledValueFromIntOrPercent(value, total, roundUp)`. The two
+/// rolling-update fenceposts round in opposite directions, so the caller has to
+/// say which one it is asking for.
+///
+/// Defaults to 1 for an unparseable absolute value and to 25% for an
+/// unparseable percentage.
+fn parse_int_or_percent(s: &str, total: i32, round_up: bool) -> i32 {
     if s.ends_with('%') {
         let pct: f64 = s.trim_end_matches('%').parse().unwrap_or(25.0);
-        ((pct / 100.0) * total as f64).ceil() as i32
+        let scaled = (pct / 100.0) * total as f64;
+        if round_up {
+            scaled.ceil() as i32
+        } else {
+            scaled.floor() as i32
+        }
     } else {
         s.parse().unwrap_or(1)
     }
@@ -23,13 +35,30 @@ fn parse_int_or_percent(s: &str, total: i32) -> i32 {
 
 /// Compute the max surge and max unavailable counts for a rolling update.
 /// Returns (max_surge, max_unavailable).
+///
+/// K8s ref: pkg/controller/deployment/util/deployment_util.go — ResolveFenceposts.
+/// `maxSurge` is rounded up and `maxUnavailable` down, per
+/// `k8s.io/api/apps/v1` RollingUpdateDeployment: "Absolute number is calculated
+/// from percentage by rounding up" for surge and "by rounding down" for
+/// unavailable. Rounding unavailable up would let a rollout take down more pods
+/// than the spec permits, since the caller derives
+/// `min_available = desired - max_unavailable`.
+///
+/// Rounding down can legitimately produce 0. If surge is also 0 the rollout
+/// could neither add nor remove a pod, so unavailable is forced to 1 to keep it
+/// from stalling — the same fallback, for the same reason, as upstream.
 fn compute_rolling_update_counts(
     desired: i32,
     max_surge: &str,
     max_unavailable: &str,
 ) -> (i32, i32) {
-    let surge = parse_int_or_percent(max_surge, desired);
-    let unavailable = parse_int_or_percent(max_unavailable, desired);
+    let surge = parse_int_or_percent(max_surge, desired, true);
+    let mut unavailable = parse_int_or_percent(max_unavailable, desired, false);
+
+    if surge == 0 && unavailable == 0 {
+        unavailable = 1;
+    }
+
     (surge, unavailable)
 }
 
@@ -1176,7 +1205,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                     })
                 })
                 .unwrap_or_else(|| "25%".to_string());
-            let surge = parse_int_or_percent(&local_max_surge, desired);
+            let surge = parse_int_or_percent(&local_max_surge, desired, true);
             annotations.insert(
                 "deployment.kubernetes.io/desired-replicas".to_string(),
                 desired.to_string(),
@@ -1962,38 +1991,53 @@ mod tests {
 
     #[test]
     fn test_parse_int_or_percent_percentage() {
-        assert_eq!(parse_int_or_percent("25%", 10), 3); // ceil(2.5) = 3
-        assert_eq!(parse_int_or_percent("50%", 10), 5);
-        assert_eq!(parse_int_or_percent("100%", 10), 10);
-        assert_eq!(parse_int_or_percent("25%", 4), 1); // ceil(1.0) = 1
-        assert_eq!(parse_int_or_percent("25%", 1), 1); // ceil(0.25) = 1
+        assert_eq!(parse_int_or_percent("25%", 10, true), 3); // ceil(2.5) = 3
+        assert_eq!(parse_int_or_percent("50%", 10, true), 5);
+        assert_eq!(parse_int_or_percent("100%", 10, true), 10);
+        assert_eq!(parse_int_or_percent("25%", 4, true), 1); // ceil(1.0) = 1
+        assert_eq!(parse_int_or_percent("25%", 1, true), 1); // ceil(0.25) = 1
+    }
+
+    #[test]
+    fn test_parse_int_or_percent_percentage_rounding_down() {
+        assert_eq!(parse_int_or_percent("25%", 10, false), 2); // floor(2.5) = 2
+        assert_eq!(parse_int_or_percent("50%", 10, false), 5); // exact, unaffected
+        assert_eq!(parse_int_or_percent("100%", 10, false), 10);
+        assert_eq!(parse_int_or_percent("25%", 4, false), 1); // floor(1.0) = 1
+        assert_eq!(parse_int_or_percent("25%", 1, false), 0); // floor(0.25) = 0
     }
 
     #[test]
     fn test_parse_int_or_percent_absolute() {
-        assert_eq!(parse_int_or_percent("1", 10), 1);
-        assert_eq!(parse_int_or_percent("3", 10), 3);
-        assert_eq!(parse_int_or_percent("0", 10), 0);
+        // Absolute values are exact, so the rounding direction cannot matter.
+        for round_up in [true, false] {
+            assert_eq!(parse_int_or_percent("1", 10, round_up), 1);
+            assert_eq!(parse_int_or_percent("3", 10, round_up), 3);
+            assert_eq!(parse_int_or_percent("0", 10, round_up), 0);
+        }
     }
 
     #[test]
     fn test_parse_int_or_percent_invalid() {
         // Invalid strings default to 1
-        assert_eq!(parse_int_or_percent("abc", 10), 1);
-        assert_eq!(parse_int_or_percent("", 10), 1);
+        for round_up in [true, false] {
+            assert_eq!(parse_int_or_percent("abc", 10, round_up), 1);
+            assert_eq!(parse_int_or_percent("", 10, round_up), 1);
+        }
     }
 
     #[test]
     fn test_parse_int_or_percent_invalid_percentage() {
-        // Invalid percentage defaults to 25%
-        assert_eq!(parse_int_or_percent("abc%", 10), 3); // ceil(25% of 10) = 3
+        // Invalid percentage defaults to 25%, then rounds as asked.
+        assert_eq!(parse_int_or_percent("abc%", 10, true), 3); // ceil(2.5) = 3
+        assert_eq!(parse_int_or_percent("abc%", 10, false), 2); // floor(2.5) = 2
     }
 
     #[test]
     fn test_compute_rolling_update_counts_defaults() {
         let (surge, unavailable) = compute_rolling_update_counts(10, "25%", "25%");
         assert_eq!(surge, 3); // ceil(2.5) = 3
-        assert_eq!(unavailable, 3);
+        assert_eq!(unavailable, 2); // floor(2.5) = 2
     }
 
     #[test]
@@ -2012,10 +2056,44 @@ mod tests {
 
     #[test]
     fn test_compute_rolling_update_counts_small_deployment() {
-        // For a deployment with 1 replica, 25% rounds up to 1
+        // 1 replica with the default strategy: surge to 2, and keep the single
+        // pod available while the replacement comes up.
         let (surge, unavailable) = compute_rolling_update_counts(1, "25%", "25%");
-        assert_eq!(surge, 1);
-        assert_eq!(unavailable, 1);
+        assert_eq!(surge, 1); // ceil(0.25) = 1
+        assert_eq!(unavailable, 0); // floor(0.25) = 0
+    }
+
+    #[test]
+    fn test_compute_rolling_update_counts_forces_progress_when_both_zero() {
+        // Rounding maxUnavailable down can reach 0. With no surge either, the
+        // rollout could not add or remove a pod, so unavailable becomes 1.
+        assert_eq!(compute_rolling_update_counts(1, "0", "25%"), (0, 1));
+        assert_eq!(compute_rolling_update_counts(3, "0%", "30%"), (0, 1));
+        assert_eq!(compute_rolling_update_counts(10, "0", "0"), (0, 1));
+
+        // A surge of at least 1 already allows progress, so 0 unavailable stands.
+        assert_eq!(compute_rolling_update_counts(1, "1", "25%"), (1, 0));
+    }
+
+    #[test]
+    fn test_compute_rolling_update_counts_never_exceeds_requested_unavailability() {
+        // The caller derives min_available = desired - max_unavailable, so
+        // max_unavailable must never exceed the percentage the spec asked for.
+        for desired in 1..=64 {
+            for pct in ["10%", "25%", "33%", "50%", "75%"] {
+                let (surge, unavailable) = compute_rolling_update_counts(desired, "25%", pct);
+                let requested = pct.trim_end_matches('%').parse::<f64>().unwrap() / 100.0;
+                let allowed = (desired as f64 * requested).floor() as i32;
+
+                // The both-zero fallback is the one documented exception, and it
+                // needs surge to be 0 — which "25%" never is for desired >= 1.
+                assert!(surge >= 1, "desired={desired}");
+                assert!(
+                    unavailable <= allowed,
+                    "desired={desired} maxUnavailable={pct}: got {unavailable}, spec allows {allowed}"
+                );
+            }
+        }
     }
 
     /// Helper to create a minimal Container for tests
