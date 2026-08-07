@@ -443,10 +443,19 @@ async fn test_pod_metadata_immutability() {
     let pod = create_test_pod("immutable-pod", "default");
     let key = build_key("pods", Some("default"), "immutable-pod");
     let original_uid = pod.metadata.uid.clone();
-    let original_creation = pod.metadata.creation_timestamp;
 
     // Create pod
     storage.create(&key, &pod).await.unwrap();
+
+    // Read the stored creationTimestamp rather than the in-memory one:
+    // timestamps serialize at second precision (metav1.Time), so the value
+    // built by `Utc::now()` still carries sub-second digits that never persist.
+    let original_creation = storage
+        .get::<Pod>(&key)
+        .await
+        .unwrap()
+        .metadata
+        .creation_timestamp;
 
     // Update pod
     let mut updated_pod: Pod = storage.get(&key).await.unwrap();

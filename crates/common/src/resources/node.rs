@@ -64,7 +64,12 @@ pub struct Taint {
     pub value: Option<String>,
     #[serde(default)]
     pub effect: String, // NoSchedule, PreferNoSchedule, NoExecute
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub time_added: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -173,10 +178,20 @@ pub struct NodeCondition {
     #[serde(default)]
     pub status: String, // True, False, Unknown
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_heartbeat_time: Option<DateTime<Utc>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]

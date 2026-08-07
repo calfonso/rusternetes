@@ -11,6 +11,10 @@ pub struct MetricValue {
     pub kind: String,
     pub described_object: ObjectReference,
     pub metric_name: String,
+    #[serde(
+        serialize_with = "crate::time::k8s_time::serialize_required",
+        deserialize_with = "crate::time::k8s_time::deserialize_required"
+    )]
     pub timestamp: DateTime<Utc>,
     pub window: Option<String>,
     pub value: String,
@@ -55,6 +59,7 @@ pub struct ListMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::SubsecRound;
 
     #[test]
     fn test_metric_value_serialization() {
@@ -68,7 +73,7 @@ mod tests {
                 api_version: Some("v1".to_string()),
             },
             metric_name: "http_requests_per_second".to_string(),
-            timestamp: Utc::now(),
+            timestamp: Utc::now().trunc_subsecs(0),
             window: Some("60s".to_string()),
             value: "100".to_string(),
             selector: Some(MetricSelector {
@@ -100,7 +105,7 @@ mod tests {
                         api_version: Some("v1".to_string()),
                     },
                     metric_name: "http_requests_per_second".to_string(),
-                    timestamp: Utc::now(),
+                    timestamp: Utc::now().trunc_subsecs(0),
                     window: Some("60s".to_string()),
                     value: "100".to_string(),
                     selector: None,
@@ -125,7 +130,7 @@ mod tests {
                 api_version: None,
             },
             metric_name: "http_requests".to_string(),
-            timestamp: Utc::now(),
+            timestamp: Utc::now().trunc_subsecs(0),
             window: None,
             value: "50".to_string(),
             selector: None,

@@ -344,7 +344,9 @@ pub struct DeviceCondition {
     #[serde(
         rename = "lastTransitionTime",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
     )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
@@ -691,7 +693,13 @@ pub struct DeviceTaint {
     pub effect: DeviceTaintEffect,
 
     /// TimeAdded represents when the taint was added
-    #[serde(rename = "timeAdded", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "timeAdded",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub time_added: Option<DateTime<Utc>>,
 }
 
@@ -762,14 +770,18 @@ pub struct ObjectMeta {
     #[serde(
         rename = "creationTimestamp",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
     )]
     pub creation_timestamp: Option<DateTime<Utc>>,
 
     #[serde(
         rename = "deletionTimestamp",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
     )]
     pub deletion_timestamp: Option<DateTime<Utc>>,
 

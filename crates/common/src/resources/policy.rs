@@ -354,7 +354,12 @@ pub struct PodDisruptionBudgetStatus {
     /// eviction request to the time when the pod is seen by PDB controller
     /// as having been marked for deletion (or after a timeout). The key in the map is the name of the pod
     /// and the value is the time when the API server processed the eviction request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::time::k8s_time_map::serialize",
+        deserialize_with = "crate::time::k8s_time_map::deserialize"
+    )]
     pub disrupted_pods: Option<HashMap<String, DateTime<Utc>>>,
 }
 

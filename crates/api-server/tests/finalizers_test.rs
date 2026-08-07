@@ -130,6 +130,11 @@ async fn test_delete_already_marked_logs_correctly() {
     let key = "test/pods/default/test-pod-already-marked";
     storage.create(key, &pod).await.unwrap();
 
+    // Read the stored form back before acting: timestamps serialize at second
+    // precision (metav1.Time), so the in-memory `Utc::now()` still carries
+    // sub-second digits that never reach storage.
+    let stored_pod: Pod = storage.get(key).await.unwrap();
+
     // Delete should return true but not modify resource
     let marked = handle_delete_with_finalizers(&storage, key, &pod)
         .await
@@ -140,7 +145,7 @@ async fn test_delete_already_marked_logs_correctly() {
     // Verify deletion timestamp didn't change
     let updated_pod: Pod = storage.get(key).await.unwrap();
     assert_eq!(
-        updated_pod.metadata.deletion_timestamp, pod.metadata.deletion_timestamp,
+        updated_pod.metadata.deletion_timestamp, stored_pod.metadata.deletion_timestamp,
         "Deletion timestamp should not change"
     );
 
