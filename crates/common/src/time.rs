@@ -70,7 +70,7 @@ pub mod k8s_time {
     }
 
     /// Kubernetes Time format: WITHOUT fractional seconds (RFC3339 basic).
-    pub(super) fn format(date: &DateTime<Utc>) -> String {
+    pub fn format(date: &DateTime<Utc>) -> String {
         date.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
@@ -81,6 +81,23 @@ pub mod k8s_time {
         }
         s.parse::<DateTime<Utc>>().map_err(serde::de::Error::custom)
     }
+}
+
+/// Parse an RFC3339 timestamp that came from outside the API — a container
+/// runtime, for instance.
+///
+/// Returns `None` for anything unparseable and for the zero time
+/// (`0001-01-01T00:00:00Z`), which Docker reports for a timestamp it has no
+/// value for. Kubernetes omits the field in that case rather than reporting
+/// year 1.
+pub fn parse_external(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::Datelike;
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+
+    (parsed.year() > 1).then_some(parsed)
 }
 
 /// Kubernetes `Time` values keyed by name, as in

@@ -235,7 +235,7 @@ pub async fn create_token_request(
 
     token_request.status = Some(TokenRequestStatus {
         token,
-        expiration_timestamp: expiration_timestamp.to_rfc3339(),
+        expiration_timestamp: rusternetes_common::time::k8s_time::format(&expiration_timestamp),
     });
 
     Ok(Json(token_request))

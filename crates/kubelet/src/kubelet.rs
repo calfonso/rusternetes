@@ -3471,15 +3471,10 @@ impl Kubelet {
                             .and_then(|c| match &c.state {
                                 Some(ContainerState::Terminated { finished_at, .. }) => finished_at
                                     .as_ref()
-                                    .and_then(|ft| {
-                                        chrono::DateTime::parse_from_rfc3339(ft).ok().map(
-                                            |parsed| {
-                                                let elapsed = (chrono::Utc::now()
-                                                    - parsed.with_timezone(&chrono::Utc))
-                                                .num_seconds();
-                                                elapsed >= backoff_secs
-                                            },
-                                        )
+                                    .map(|finished| {
+                                        let elapsed =
+                                            (chrono::Utc::now() - *finished).num_seconds();
+                                        elapsed >= backoff_secs
                                     })
                                     .or(Some(true)),
                                 _ => Some(true),
@@ -4172,7 +4167,7 @@ mod tests {
             image_id: None,
             container_id: Some("docker://abc123".to_string()),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
             }),
             started: None,
             allocated_resources: None,
@@ -4503,7 +4498,7 @@ mod tests {
                 ready: true,
                 restart_count: 0,
                 state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
                 }),
                 last_state: None,
                 image: Some("nginx:latest".to_string()),
