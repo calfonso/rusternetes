@@ -43,7 +43,7 @@ jobs:
       - name: Install cargo-nextest
         # Prebuilt binary install — much faster and more parallel than
         # `cargo test`. The action caches the binary across runs.
-        uses: taiki-e/install-action@v2.85.6
+        uses: taiki-e/install-action@v2.85.10
         with:
           tool: nextest
 
