@@ -3793,7 +3793,7 @@ dependencies = [
  "chrono",
  "etcd-client",
  "jsonwebtoken",
- "opentelemetry 0.22.0",
+ "opentelemetry 0.32.0",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
  "opentelemetry-stdout",
