@@ -263,3 +263,60 @@ fn lease_keeps_micro_time() {
     }
     assert!(found.iter().any(|(p, _)| p == "spec.renewTime"));
 }
+
+#[test]
+fn container_state_timestamps_are_whole_seconds() {
+    use rusternetes_common::resources::Pod;
+
+    // A container runtime reports nanoseconds; the API must not pass that on.
+    let found = round_trip::<Pod>(json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "pod", "namespace": "default" },
+        "spec": { "containers": [{ "name": "c", "image": "nginx" }] },
+        "status": {
+            "containerStatuses": [{
+                "name": "c",
+                "ready": true,
+                "restartCount": 0,
+                "state": { "running": { "startedAt": NANOS } },
+                "lastState": {
+                    "terminated": {
+                        "exitCode": 0,
+                        "startedAt": NANOS,
+                        "finishedAt": NANOS,
+                    }
+                }
+            }]
+        }
+    }));
+
+    assert_whole_seconds(
+        &found,
+        &[
+            "status.containerStatuses[0].state.running.startedAt",
+            "status.containerStatuses[0].lastState.terminated.startedAt",
+            "status.containerStatuses[0].lastState.terminated.finishedAt",
+        ],
+    );
+}
+
+#[test]
+fn external_timestamps_are_parsed_and_zero_time_is_dropped() {
+    use rusternetes_common::time::parse_external;
+
+    assert_eq!(
+        parse_external("2026-08-07T04:32:22.089611138Z"),
+        Some("2026-08-07T04:32:22.089611138Z".parse().unwrap())
+    );
+    assert_eq!(
+        parse_external("2026-08-07T04:32:22Z"),
+        Some("2026-08-07T04:32:22Z".parse().unwrap())
+    );
+
+    // Docker reports the Go zero time when it has no value; Kubernetes omits
+    // the field rather than reporting year 1.
+    assert_eq!(parse_external("0001-01-01T00:00:00Z"), None);
+    assert_eq!(parse_external(""), None);
+    assert_eq!(parse_external("not a time"), None);
+}

@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
                 "metadata": {
                     "name": "kubernetes",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339()
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now())
                 },
                 "spec": {
                     "cidrs": ["10.96.0.0/12"]
@@ -229,7 +229,7 @@ async fn main() -> Result<()> {
                     "conditions": [{
                         "type": "Ready",
                         "status": "True",
-                        "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                        "lastTransitionTime": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                         "reason": "NetworkReady",
                         "message": "ServiceCIDR is ready"
                     }]
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
                 "metadata": {
                     "name": "standard",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                     "annotations": {
                         "storageclass.kubernetes.io/is-default-class": "true"
                     }

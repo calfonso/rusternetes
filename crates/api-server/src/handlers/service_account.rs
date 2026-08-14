@@ -510,12 +510,12 @@ pub async fn create_token(
         "metadata": {
             "name": name,
             "namespace": namespace,
-            "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+            "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
         },
         "spec": body.get("spec").cloned().unwrap_or(serde_json::json!({})),
         "status": {
             "token": token,
-            "expirationTimestamp": expiration_time.to_rfc3339(),
+            "expirationTimestamp": rusternetes_common::time::k8s_time::format(&expiration_time),
         }
     });
 

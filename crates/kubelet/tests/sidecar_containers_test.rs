@@ -239,7 +239,7 @@ fn test_sidecar_runs_alongside_main_containers() {
             ContainerStatus {
                 name: "sidecar-0".to_string(),
                 state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:05Z".to_string()),
+                    started_at: Some("2024-01-01T00:00:05Z".parse().unwrap()),
                 }),
                 ready: true,
                 restart_count: 0,
@@ -259,7 +259,7 @@ fn test_sidecar_runs_alongside_main_containers() {
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:06Z".to_string()),
+                started_at: Some("2024-01-01T00:00:06Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,
@@ -446,7 +446,7 @@ fn test_sidecar_failure_should_not_block_pod() {
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,

@@ -161,7 +161,7 @@ fn test_init_container_status_sequence() {
             ContainerStatus {
                 name: "init-0".to_string(),
                 state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
                 }),
                 ready: false,
                 restart_count: 0,
@@ -271,7 +271,7 @@ fn test_init_containers_completed_app_starting() {
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:11Z".to_string()),
+                started_at: Some("2024-01-01T00:00:11Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,

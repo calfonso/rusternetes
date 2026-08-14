@@ -53,7 +53,9 @@ pub async fn create_apiservice(
         .and_then(|m| m.get("creationTimestamp"))
         .is_none()
     {
-        value["metadata"]["creationTimestamp"] = Value::String(chrono::Utc::now().to_rfc3339());
+        value["metadata"]["creationTimestamp"] = Value::String(
+            rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
+        );
     }
 
     // Initial status conditions:
@@ -61,7 +63,7 @@ pub async fn create_apiservice(
     //   - remote APIService (spec.service set): Available=Unknown until the
     //     APIServiceAvailabilityController probes the backing service. This
     //     matches kube-aggregator behaviour and keeps tests deterministic.
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = rusternetes_common::time::k8s_time::format(&chrono::Utc::now());
     let has_service_backend = value.pointer("/spec/service").is_some_and(|v| !v.is_null());
     let (status, reason, message) = if has_service_backend {
         (

@@ -5338,7 +5338,10 @@ impl ContainerRuntime {
                         if running {
                             (
                                 ContainerState::Running {
-                                    started_at: ds.started_at,
+                                    started_at: ds
+                                        .started_at
+                                        .as_deref()
+                                        .and_then(rusternetes_common::time::parse_external),
                                 },
                                 cid,
                                 iid,
@@ -5365,8 +5368,14 @@ impl ContainerRuntime {
                                         .unwrap_or_else(|| "Error".to_string())
                                 }),
                                 message: term_msg,
-                                started_at: ds.started_at.clone(),
-                                finished_at: ds.finished_at.clone(),
+                                started_at: ds
+                                    .started_at
+                                    .as_deref()
+                                    .and_then(rusternetes_common::time::parse_external),
+                                finished_at: ds
+                                    .finished_at
+                                    .as_deref()
+                                    .and_then(rusternetes_common::time::parse_external),
                                 container_id: cid.clone(),
                             };
                             // Keep the Terminated state as-is — K8s shows the actual
@@ -5457,12 +5466,12 @@ impl ContainerRuntime {
                                         message: None,
                                         started_at: prev_status.state.as_ref().and_then(|s| {
                                             if let ContainerState::Running { started_at } = s {
-                                                started_at.clone()
+                                                *started_at
                                             } else {
                                                 None
                                             }
                                         }),
-                                        finished_at: Some(chrono::Utc::now().to_rfc3339()),
+                                        finished_at: Some(chrono::Utc::now()),
                                         container_id: prev_status.container_id.clone(),
                                         signal: None,
                                     },
@@ -5733,11 +5742,17 @@ impl ContainerRuntime {
                     let exit_code = state.exit_code.unwrap_or(0);
 
                     // Capture started_at before state fields are consumed
-                    let ec_started_at = state.started_at.clone();
+                    let ec_started_at = state
+                        .started_at
+                        .as_deref()
+                        .and_then(rusternetes_common::time::parse_external);
 
                     let container_state = if running {
                         Some(ContainerState::Running {
-                            started_at: state.started_at,
+                            started_at: state
+                                .started_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                         })
                     } else if state.finished_at.is_some() {
                         Some(ContainerState::Terminated {
@@ -5750,7 +5765,10 @@ impl ContainerRuntime {
                             }),
                             message: None,
                             started_at: ec_started_at,
-                            finished_at: state.finished_at,
+                            finished_at: state
+                                .finished_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                             container_id: inspect.id.clone().map(|id| format!("docker://{}", id)),
                         })
                     } else {
@@ -5843,7 +5861,10 @@ impl ContainerRuntime {
                     let restart_count = docker_count.max(prev_count);
 
                     // Capture started_at before state fields are consumed by branches
-                    let docker_started_at = state.started_at.clone();
+                    let docker_started_at = state
+                        .started_at
+                        .as_deref()
+                        .and_then(rusternetes_common::time::parse_external);
 
                     // Preserve last_state from existing pod status for restart tracking
                     let prev_last_state = pod
@@ -5855,7 +5876,10 @@ impl ContainerRuntime {
 
                     let container_state = if running {
                         Some(ContainerState::Running {
-                            started_at: state.started_at,
+                            started_at: state
+                                .started_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                         })
                     } else if matches!(
                         state.status,
@@ -5890,7 +5914,10 @@ impl ContainerRuntime {
                             }),
                             message: termination_msg,
                             started_at: docker_started_at,
-                            finished_at: state.finished_at,
+                            finished_at: state
+                                .finished_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                             container_id: inspect.id.clone().map(|id| format!("docker://{}", id)),
                         })
                     } else {
@@ -5940,17 +5967,11 @@ impl ContainerRuntime {
                             let past_initial_delay = if initial_delay > 0 {
                                 // Check container start time from Docker state
                                 if let Some(ContainerState::Running {
-                                    started_at: Some(ref started_at_str),
+                                    started_at: Some(started),
                                 }) = container_state
                                 {
-                                    if let Ok(started) =
-                                        chrono::DateTime::parse_from_rfc3339(started_at_str)
-                                    {
-                                        let elapsed = Utc::now().signed_duration_since(started);
-                                        elapsed.num_seconds() >= initial_delay as i64
-                                    } else {
-                                        false
-                                    }
+                                    let elapsed = Utc::now().signed_duration_since(started);
+                                    elapsed.num_seconds() >= initial_delay as i64
                                 } else {
                                     false
                                 }
@@ -10545,8 +10566,8 @@ mod tests {
                 signal: None,
                 reason: Some("Error".to_string()),
                 message: None,
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
-                finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+                started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+                finished_at: Some("2026-01-01T00:00:01Z".parse().unwrap()),
                 container_id: Some("docker://abc123".to_string()),
             }),
             last_state: None,
@@ -10793,16 +10814,16 @@ mod tests {
     fn test_container_status_terminated_has_started_at() {
         // Verify that building a Terminated container state includes started_at.
         // This tests the logic fixed in get_container_statuses.
-        let started = "2026-01-01T00:00:00Z".to_string();
-        let finished = "2026-01-01T00:01:00Z".to_string();
+        let started: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let finished: chrono::DateTime<chrono::Utc> = "2026-01-01T00:01:00Z".parse().unwrap();
 
         let state = ContainerState::Terminated {
             exit_code: 0,
             signal: None,
             reason: Some("Completed".to_string()),
             message: None,
-            started_at: Some(started.clone()),
-            finished_at: Some(finished.clone()),
+            started_at: Some(started),
+            finished_at: Some(finished),
             container_id: Some("docker://abc123".to_string()),
         };
 
@@ -10835,8 +10856,8 @@ mod tests {
             signal: None,
             reason: Some("Error".to_string()),
             message: None,
-            started_at: Some("2026-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2026-01-01T00:01:00Z".to_string()),
+            started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            finished_at: Some("2026-01-01T00:01:00Z".parse().unwrap()),
             container_id: Some("docker://prev123".to_string()),
         };
 
@@ -10845,7 +10866,7 @@ mod tests {
             ready: false,
             restart_count: 1,
             state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:02:00Z".to_string()),
+                started_at: Some("2026-01-01T00:02:00Z".parse().unwrap()),
             }),
             last_state: Some(prev_state.clone()),
             image: Some("nginx:latest".to_string()),
@@ -10896,7 +10917,7 @@ mod tests {
             ready: true,
             restart_count: 0,
             state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
             }),
             last_state: None,
             image: Some("nginx:1.25".to_string()),
@@ -11541,8 +11562,8 @@ mod tests {
             signal: None,
             reason: Some("Error".to_string()),
             message: None,
-            started_at: Some("2026-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2026-01-01T00:00:05Z".to_string()),
+            started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            finished_at: Some("2026-01-01T00:00:05Z".parse().unwrap()),
             container_id: Some("docker://prev".to_string()),
         };
         let cs = ContainerStatus {
@@ -11550,7 +11571,7 @@ mod tests {
             ready: true,
             restart_count: 1,
             state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:00:10Z".to_string()),
+                started_at: Some("2026-01-01T00:00:10Z".parse().unwrap()),
             }),
             last_state: Some(prev_terminated.clone()),
             image: Some("busybox".to_string()),
@@ -11597,8 +11618,8 @@ mod tests {
                 signal: None,
                 reason: Some("OOMKilled".to_string()),
                 message: None,
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
-                finished_at: Some("2026-01-01T00:00:30Z".to_string()),
+                started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+                finished_at: Some("2026-01-01T00:00:30Z".parse().unwrap()),
                 container_id: Some("docker://abc".to_string()),
             }),
             last_state: None,

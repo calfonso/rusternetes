@@ -140,11 +140,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
                 "metadata": {
                     "name": "kubernetes",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339()
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now())
                 },
                 "spec": { "cidrs": ["10.96.0.0/12"] },
                 "status": { "conditions": [{ "type": "Ready", "status": "True",
-                    "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                    "lastTransitionTime": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                     "reason": "NetworkReady", "message": "ServiceCIDR is ready" }] }
             });
             if let Err(e) = storage.create(&cidr_key, &service_cidr).await {
@@ -165,7 +165,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
                 "metadata": {
                     "name": "standard",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                     "annotations": {
                         "storageclass.kubernetes.io/is-default-class": "true"
                     }
