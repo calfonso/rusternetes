@@ -1189,7 +1189,12 @@ pub struct PodCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1232,7 +1237,12 @@ pub struct PodStatus {
     pub qos_class: Option<String>,
 
     /// Time at which the pod was acknowledged by the kubelet
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Pod-level conditions (Ready, ContainersReady, Initialized, PodScheduled)

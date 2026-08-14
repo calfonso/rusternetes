@@ -99,7 +99,12 @@ pub struct ReplicationControllerCondition {
     pub status: String,
 
     /// Last time the condition transitioned
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// The reason for the condition's last transition
@@ -210,7 +215,12 @@ pub struct ReplicaSetCondition {
     pub status: String,
 
     /// Last time the condition transitioned
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// The reason for the condition's last transition
@@ -403,7 +413,12 @@ pub struct StatefulSetCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 }
 
@@ -547,7 +562,12 @@ pub struct DaemonSetCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 }
 
@@ -658,11 +678,21 @@ pub struct JobStatus {
     pub conditions: Option<Vec<JobCondition>>,
 
     /// When the job started
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub start_time: Option<DateTime<Utc>>,
 
     /// When the job completed
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub completion_time: Option<DateTime<Utc>>,
 
     /// Number of pods which have a ready condition
@@ -696,11 +726,21 @@ pub struct JobCondition {
     pub status: String,
 
     /// Last time the condition was probed
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_probe_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Last time the condition transitioned
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -793,11 +833,21 @@ pub struct CronJobStatus {
     pub active: Vec<crate::resources::service_account::ObjectReference>,
 
     /// Last time the job was scheduled
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_schedule_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Last successful job time
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_successful_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 

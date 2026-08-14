@@ -46,11 +46,21 @@ pub struct ObjectMeta {
     pub managed_fields: Option<Vec<ManagedFieldsEntry>>,
 
     /// CreationTimestamp is the creation time
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub creation_timestamp: Option<DateTime<Utc>>,
 
     /// DeletionTimestamp is the time when the resource will be deleted
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub deletion_timestamp: Option<DateTime<Utc>>,
 
     /// DeletionGracePeriodSeconds is the number of seconds before the object should be deleted
@@ -543,7 +553,12 @@ pub struct Condition {
     pub observed_generation: Option<i64>,
 
     /// LastTransitionTime is the last time the condition transitioned from one status to another
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
     /// Reason contains a programmatic identifier indicating the reason for the condition's last transition
@@ -717,7 +732,12 @@ pub struct ManagedFieldsEntry {
     pub api_version: Option<String>,
 
     /// Time is the timestamp of when the ManagedFields entry was added
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub time: Option<DateTime<Utc>>,
 
     /// FieldsType is the discriminator for the different fields format
@@ -860,27 +880,29 @@ mod tests {
     }
 
     #[test]
-    fn test_creation_timestamp_nanosecond_preservation() {
+    fn test_creation_timestamp_round_trip_is_stable() {
         use chrono::{DateTime, Utc};
-        // K8s client sends nanosecond-precision timestamps
-        let ts_str = "2026-03-29T21:05:27.270173921Z";
-        let ts: DateTime<Utc> = ts_str.parse().unwrap();
+        // A client may send a sub-second timestamp; it must be accepted.
+        let ts: DateTime<Utc> = "2026-03-29T21:05:27.270173921Z".parse().unwrap();
         let meta = ObjectMeta {
             name: "test".to_string(),
             creation_timestamp: Some(ts),
             ..Default::default()
         };
-        // Serialize (as our API server does when writing to etcd)
+
+        // Serialize (as our API server does when writing to etcd). `metav1.Time`
+        // is whole seconds, which is the precision client-go keeps: emitting more
+        // makes a client's round-trip differ from what the server holds.
         let json = serde_json::to_string(&meta).unwrap();
-        // The timestamp should contain fractional seconds
         assert!(
-            json.contains(".270173921") || json.contains(".27017392"),
-            "Timestamp should preserve sub-second precision: {}",
+            json.contains("\"creationTimestamp\":\"2026-03-29T21:05:27Z\""),
+            "Timestamp should serialize at second precision: {}",
             json
         );
-        // Deserialize (as our API server does when reading from etcd)
+
+        // Deserialize (as our API server does when reading from etcd), then
+        // re-serialize (as it does when responding to a client).
         let meta2: ObjectMeta = serde_json::from_str(&json).unwrap();
-        // Re-serialize (as our API server does when responding to client)
         let json2 = serde_json::to_string(&meta2).unwrap();
         assert_eq!(json, json2, "Timestamp should survive round-trip");
     }

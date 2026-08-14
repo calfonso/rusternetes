@@ -38,8 +38,16 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_status: Option<ResponseStatus>,
     /// Request received timestamp
+    #[serde(
+        serialize_with = "crate::time::micro_time::serialize_required",
+        deserialize_with = "crate::time::micro_time::deserialize_required"
+    )]
     pub request_received_timestamp: DateTime<Utc>,
     /// Stage timestamp
+    #[serde(
+        serialize_with = "crate::time::micro_time::serialize_required",
+        deserialize_with = "crate::time::micro_time::deserialize_required"
+    )]
     pub stage_timestamp: DateTime<Utc>,
     /// Annotations (optional metadata)
     #[serde(skip_serializing_if = "Option::is_none")]
