@@ -56,7 +56,7 @@ opentelemetry-otlp = "0.32" # OTLP exporter for OpenTelemetry
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] } # OpenTelemetry SDK
 tracing-opentelemetry = "0.23" # OpenTelemetry integration with tracing
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false } # HTTP client
-cel = "0.13" # Common Expression Language (CEL) interpreter
+cel = "0.14" # Common Expression Language (CEL) interpreter
 x509-parser = "0.16" # X.509 certificate parsing
 pem = "3.0" # PEM format encoding/decoding
 base64 = "0.22" # Base64 encoding/decoding
