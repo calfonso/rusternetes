@@ -34,7 +34,7 @@ axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
 hyper = "1.0"
-etcd-client = "0.14"
+etcd-client = "0.19"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
