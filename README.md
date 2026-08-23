@@ -81,6 +81,7 @@ The all-in-one mode is built for environments where a full K8s cluster is overki
 git clone https://github.com/calfonso/rusternetes.git
 cd rusternetes
 bash scripts/generate-certs.sh
+cp kubeconfig.example.yaml ~/.kube/rusternetes-config
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
 podman compose build
 podman compose up -d
@@ -99,6 +100,7 @@ cd rusternetes
 
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
 bash scripts/generate-certs.sh
+cp kubeconfig.example.yaml ~/.kube/rusternetes-config
 docker compose build
 docker compose up -d
 bash scripts/bootstrap-cluster.sh
