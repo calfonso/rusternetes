@@ -102,7 +102,7 @@ export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
 bash scripts/generate-certs.sh
 cp kubeconfig.example.yaml ~/.kube/rusternetes-config
 docker compose build
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 bash scripts/bootstrap-cluster.sh
 
 export KUBECONFIG=~/.kube/rusternetes-config
