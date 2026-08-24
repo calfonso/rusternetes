@@ -138,6 +138,7 @@ The cluster runs etcd, the API server (port 6443 with TLS), a scheduler, a contr
 ## Running Conformance Tests
 
 ```bash
+bash scripts/bootstrap-conformance.sh
 bash scripts/run-conformance.sh
 bash scripts/conformance-progress.sh
 ```
