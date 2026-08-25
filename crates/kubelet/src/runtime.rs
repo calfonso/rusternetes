@@ -1204,15 +1204,18 @@ impl ContainerRuntime {
              127.0.0.1\tlocalhost\n\
              ::1\tlocalhost ip6-localhost ip6-loopback\n\
              fe00::\tip6-localnet\n\
-             fe00::\tip6-mcastprefix\n\
-             fe00::1\tip6-allnodes\n\
-             fe00::2\tip6-allrouters\n",
+             ff00::\tip6-mcastprefix\n\
+             ff00::1\tip6-allnodes\n\
+             ff00::2\tip6-allrouters\n",
         );
 
         // Add the pod's own hostname → IP entry if we have an IP
         if let Some(ip) = pod_ip {
             // Build FQDN aliases based on subdomain and cluster domain
             let mut aliases = vec![hostname.to_string()];
+            if hostname != pod_name {
+                aliases.push(pod_name.to_string());
+            }
             if let Some(subdomain) = &spec.subdomain {
                 // <hostname>.<subdomain>.<namespace>.svc.<cluster-domain>
                 aliases.push(format!(
