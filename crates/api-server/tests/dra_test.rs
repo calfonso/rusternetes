@@ -13,7 +13,6 @@ use rusternetes_common::resources::{
     ResourceClaimTemplate, ResourceClaimTemplateSpec, ResourcePool, ResourceSlice,
     ResourceSliceSpec,
 };
-use serde_json;
 
 #[test]
 fn test_resourceclaim_serialization() {
@@ -632,6 +631,6 @@ fn test_resourceslice_with_all_nodes() {
     assert!(json.contains("cluster-wide-driver.example.com"));
 
     let deserialized: ResourceSlice = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(deserialized.spec.all_nodes.unwrap(), true);
+    assert!(deserialized.spec.all_nodes.unwrap());
     assert!(deserialized.spec.node_name.is_none());
 }

@@ -4,10 +4,10 @@ use rusternetes_common::resources::{
     EndpointAddress, EndpointPort, EndpointReference, EndpointSubset, Endpoints, Pod, Service,
 };
 use rusternetes_common::types::OwnerReference;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// EndpointsController watches Services and Pods to automatically maintain Endpoints resources.
 /// It creates/updates Endpoints based on:
@@ -27,7 +27,6 @@ impl<S: Storage + 'static> EndpointsController<S> {
     /// When a pod changes, we find services whose selector matches the pod
     /// and enqueue them for reconciliation.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -61,7 +60,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
 
             let mut svc_watch = svc_watch;
             let mut pod_watch = pod_watch;
-            let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut resync = tokio::time::interval(std::time::Duration::from_secs(5));
             resync.tick().await;
 
             let mut watch_broken = false;
@@ -108,7 +107,11 @@ impl<S: Storage + 'static> EndpointsController<S> {
 
     /// When a pod changes, find services in the same namespace whose selector
     /// matches the pod and enqueue them for reconciliation.
-    async fn enqueue_services_for_pod(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+    async fn enqueue_services_for_pod(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
         let pod_key = extract_key(event);
         // Parse pod key: "pods/{namespace}/{name}"
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
@@ -122,13 +125,19 @@ impl<S: Storage + 'static> EndpointsController<S> {
         let pod: Option<Pod> = self.storage.get(&storage_key).await.ok();
 
         // List services in this namespace and find matches
-        if let Ok(services) = self.storage.list::<Service>(&build_prefix("services", Some(ns))).await {
+        if let Ok(services) = self
+            .storage
+            .list::<Service>(&build_prefix("services", Some(ns)))
+            .await
+        {
             match pod {
                 Some(ref pod) => {
                     for svc in &services {
                         if let Some(ref selector) = svc.spec.selector {
                             if Self::labels_match(selector, &pod.metadata.labels) {
-                                queue.add(format!("services/{}/{}", ns, svc.metadata.name)).await;
+                                queue
+                                    .add(format!("services/{}/{}", ns, svc.metadata.name))
+                                    .await;
                             }
                         }
                     }
@@ -137,7 +146,9 @@ impl<S: Storage + 'static> EndpointsController<S> {
                     // Pod was deleted -- enqueue all services in this namespace
                     // since we don't know which ones matched
                     for svc in &services {
-                        queue.add(format!("services/{}/{}", ns, svc.metadata.name)).await;
+                        queue
+                            .add(format!("services/{}/{}", ns, svc.metadata.name))
+                            .await;
                     }
                 }
             }
@@ -145,7 +156,10 @@ impl<S: Storage + 'static> EndpointsController<S> {
     }
 
     /// Check if all selector key-value pairs exist in the pod's labels.
-    fn labels_match(selector: &HashMap<String, String>, labels: &Option<HashMap<String, String>>) -> bool {
+    fn labels_match(
+        selector: &HashMap<String, String>,
+        labels: &Option<HashMap<String, String>>,
+    ) -> bool {
         let labels = match labels {
             Some(l) => l,
             None => return selector.is_empty(),
@@ -159,19 +173,20 @@ impl<S: Storage + 'static> EndpointsController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("services", Some(ns), name);
             match self.storage.get::<Service>(&storage_key).await {
-                Ok(service) => {
-                    match self.reconcile_service(&service).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(service) => match self.reconcile_service(&service).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     queue.forget(&key).await;
                 }
@@ -195,6 +210,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting endpoints reconciliation");
 
@@ -578,7 +594,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
         pod.spec.as_ref()?.containers.iter().find_map(|c| {
             c.ports.as_ref()?.iter().find_map(|p| {
                 if p.name.as_deref() == Some(port_name) {
-                    Some(p.container_port as u16)
+                    Some(p.container_port)
                 } else {
                     None
                 }
@@ -588,7 +604,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
 
     /// Check if a pod is ready by examining its conditions
     fn is_pod_ready(&self, pod: &Pod) -> bool {
-        if let Some(ref conditions) = pod.status.as_ref().and_then(|s| s.conditions.as_ref()) {
+        if let Some(conditions) = pod.status.as_ref().and_then(|s| s.conditions.as_ref()) {
             conditions
                 .iter()
                 .any(|c| c.condition_type == "Ready" && c.status == "True")
@@ -1032,7 +1048,7 @@ mod tests {
         controller.reconcile_all().await.unwrap();
         let ep_key = "/registry/endpoints/default/test-svc";
         let ep1: Endpoints = storage.get(ep_key).await.unwrap();
-        let rv1 = ep1.metadata.resource_version.clone();
+        let _rv1 = ep1.metadata.resource_version.clone();
         assert!(ep1.subsets.is_empty());
 
         // Now add a matching pod with an IP and Running phase

@@ -10,7 +10,7 @@ pub async fn execute(
     name: &str,
     namespace: &str,
     annotations: &[String],
-    overwrite: bool,
+    _overwrite: bool,
 ) -> Result<()> {
     // Parse annotations from key=value or key- (removal) format
     let mut annotation_map = HashMap::new();

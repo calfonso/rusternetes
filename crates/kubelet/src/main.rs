@@ -1,5 +1,7 @@
+#[allow(dead_code)]
 mod cni;
 mod config;
+#[allow(dead_code)]
 mod eviction;
 mod kubelet;
 mod runtime;
@@ -86,8 +88,18 @@ struct Args {
     data_dir: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Built by hand rather than with `#[tokio::main]` so the worker threads get
+    // a stack large enough for the pod sync path — see `worker_stack_size`.
+    // Everything else matches what the macro expands to.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(rusternetes_common::async_runtime::worker_stack_size())
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Load configuration file if specified
@@ -138,11 +150,15 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir.clone() }
+            StorageConfig::Sqlite {
+                path: args.data_dir.clone(),
+            }
         }
         _ => {
             info!("Connecting to etcd: {:?}", runtime_config.etcd_endpoints);
-            StorageConfig::Etcd { endpoints: runtime_config.etcd_endpoints.clone() }
+            StorageConfig::Etcd {
+                endpoints: runtime_config.etcd_endpoints.clone(),
+            }
         }
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
@@ -261,7 +277,7 @@ async fn handle_exec(
     let stdin_data = if body.is_empty() { None } else { Some(body) };
     let tty = params.get("tty").map(|v| v == "true").unwrap_or(false);
 
-    let docker = Docker::connect_with_socket_defaults()
+    let docker = Docker::connect_with_local_defaults()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let exec_config = CreateExecOptions {

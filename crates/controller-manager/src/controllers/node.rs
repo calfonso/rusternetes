@@ -1,9 +1,9 @@
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use futures::StreamExt;
 use rusternetes_common::resources::{Node, NodeCondition, NodeStatus, Pod, PodStatus};
 use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -33,10 +33,27 @@ impl<S: Storage + 'static> NodeController<S> {
         }
     }
 
+    /// Test helper: mark `node_name` as first seen long enough ago that the
+    /// startup grace period is over. Reconcile_node skips condition updates
+    /// within the K8s-standard 60s startup grace; this lets tests observe the
+    /// Ready-flip behavior deterministically without sleeping.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn seed_first_seen_for_test(&self, node_name: &str) {
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(
+                NODE_STARTUP_GRACE_PERIOD_SECS * 2,
+            ))
+            .unwrap_or_else(std::time::Instant::now);
+        self.first_seen
+            .lock()
+            .unwrap()
+            .insert(node_name.to_string(), past);
+    }
+
     /// Watch-based run loop. Performs an initial full reconciliation, then watches
     /// for node changes. Falls back to periodic resync every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -95,15 +112,13 @@ impl<S: Storage + 'static> NodeController<S> {
             let name = key.strip_prefix("nodes/").unwrap_or(&key);
             let storage_key = build_key("nodes", None, name);
             match self.storage.get::<Node>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_node(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_node(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -127,6 +142,7 @@ impl<S: Storage + 'static> NodeController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting node reconciliation");
 
@@ -149,9 +165,13 @@ impl<S: Storage + 'static> NodeController<S> {
         // Don't change node conditions during startup grace period (K8s: nodeStartupGracePeriod = 60s)
         let first_seen_time = {
             let mut first_seen = self.first_seen.lock().unwrap();
-            *first_seen.entry(node_name.clone()).or_insert_with(std::time::Instant::now)
+            *first_seen
+                .entry(node_name.clone())
+                .or_insert_with(std::time::Instant::now)
         };
-        if first_seen_time.elapsed() < std::time::Duration::from_secs(NODE_STARTUP_GRACE_PERIOD_SECS) {
+        if first_seen_time.elapsed()
+            < std::time::Duration::from_secs(NODE_STARTUP_GRACE_PERIOD_SECS)
+        {
             // Node is still in startup grace period — don't modify its conditions
             return Ok(());
         }
@@ -190,11 +210,9 @@ impl<S: Storage + 'static> NodeController<S> {
         }
 
         // Evict pods from nodes that have been NotReady for too long
-        if !is_ready {
-            if self.should_evict_pods(node) {
-                info!("Evicting pods from NotReady node {}", node_name);
-                self.evict_pods_from_node(node_name).await?;
-            }
+        if !is_ready && self.should_evict_pods(node) {
+            info!("Evicting pods from NotReady node {}", node_name);
+            self.evict_pods_from_node(node_name).await?;
         }
 
         Ok(())
@@ -290,7 +308,7 @@ impl<S: Storage + 'static> NodeController<S> {
     /// Check if the node's Lease in kube-node-lease namespace has a
     /// recent renewTime. Returns true if the Lease exists and was
     /// renewed within the grace period.
-    fn is_node_lease_fresh(&self, node_name: &str) -> bool {
+    fn is_node_lease_fresh(&self, _node_name: &str) -> bool {
         // Sync stub — async version in is_node_ready_async
         false
     }
@@ -422,13 +440,15 @@ impl<S: Storage + 'static> NodeController<S> {
             time_added: None,
         };
 
-        let spec = updated_node.spec.get_or_insert_with(|| rusternetes_common::resources::NodeSpec {
-            pod_cidr: None,
-            pod_cidrs: None,
-            provider_id: None,
-            unschedulable: None,
-            taints: None,
-        });
+        let spec = updated_node
+            .spec
+            .get_or_insert(rusternetes_common::resources::NodeSpec {
+                pod_cidr: None,
+                pod_cidrs: None,
+                provider_id: None,
+                unschedulable: None,
+                taints: None,
+            });
         let taints = spec.taints.get_or_insert_with(Vec::new);
         if !taints.iter().any(|t| t.key == not_ready_taint.key) {
             taints.push(not_ready_taint);
@@ -513,6 +533,7 @@ impl<S: Storage + 'static> NodeController<S> {
     }
 
     /// Mark a pod as failed due to node failure
+    #[allow(dead_code)]
     async fn mark_pod_failed(&self, namespace: &str, pod_name: &str, reason: &str) -> Result<()> {
         let pod_key = build_key("pods", Some(namespace), pod_name);
 

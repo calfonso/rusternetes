@@ -358,6 +358,30 @@ fn describe_node(node: &Node) {
     }
 }
 
+fn describe_namespace(namespace: &Namespace) {
+    println!("Name:         {}", namespace.metadata.name);
+
+    if let Some(labels) = &namespace.metadata.labels {
+        println!(
+            "Labels:       {}",
+            labels
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join("\n              ")
+        );
+    }
+
+    if let Some(status) = &namespace.status {
+        println!("Status:       {:?}", status.phase);
+    }
+
+    if let Some(ts) = namespace.metadata.creation_timestamp {
+        let age = format_duration(Utc::now().signed_duration_since(ts));
+        println!("\nAge:          {}", age);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,29 +834,5 @@ mod tests {
         let result = execute_enhanced(&client, "pod", None, "default", None, true).await;
         // All-namespaces describe just prints a message and returns Ok
         assert!(result.is_ok());
-    }
-}
-
-fn describe_namespace(namespace: &Namespace) {
-    println!("Name:         {}", namespace.metadata.name);
-
-    if let Some(labels) = &namespace.metadata.labels {
-        println!(
-            "Labels:       {}",
-            labels
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<_>>()
-                .join("\n              ")
-        );
-    }
-
-    if let Some(status) = &namespace.status {
-        println!("Status:       {:?}", status.phase);
-    }
-
-    if let Some(ts) = namespace.metadata.creation_timestamp {
-        let age = format_duration(Utc::now().signed_duration_since(ts));
-        println!("\nAge:          {}", age);
     }
 }

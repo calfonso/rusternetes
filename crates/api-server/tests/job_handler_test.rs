@@ -3,7 +3,7 @@
 //! Tests all CRUD operations, edge cases, and error handling for jobs
 
 use rusternetes_common::resources::pod::{Container, PodSpec};
-use rusternetes_common::resources::{Job, JobSpec, JobStatus, LabelSelector, PodTemplateSpec};
+use rusternetes_common::resources::{Job, JobSpec, JobStatus, PodTemplateSpec};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ fn create_test_job(name: &str, namespace: &str) -> Job {
             backoff_limit: Some(6),
             template: PodTemplateSpec {
                 metadata: Some({
-                    let mut meta = ObjectMeta::new(&format!("{}-pod", name));
+                    let mut meta = ObjectMeta::new(format!("{}-pod", name));
                     meta.namespace = Some(namespace.to_string());
                     meta.labels = Some(labels);
                     meta

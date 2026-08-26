@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod async_runtime;
 pub mod audit;
 pub mod auth;
 pub mod authz;
@@ -16,6 +17,7 @@ pub mod protobuf;
 pub mod resources;
 pub mod schema_validation;
 pub mod server_side_apply;
+pub mod time;
 pub mod tls;
 pub mod tracing;
 pub mod types;

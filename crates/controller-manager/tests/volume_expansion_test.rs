@@ -158,7 +158,7 @@ async fn test_volume_expansion_allowed() {
     create_test_storage_class(&storage, "expandable", true).await;
 
     // Create PV with 5Gi
-    let pv = create_test_pv(&storage, "test-pv", "expandable", 5).await;
+    let _pv = create_test_pv(&storage, "test-pv", "expandable", 5).await;
 
     // Create bound PVC with 5Gi
     let mut pvc =
@@ -353,7 +353,7 @@ async fn test_no_expansion_when_sizes_equal() {
     create_test_pv(&storage, "test-pv-3", "expandable-3", 5).await;
 
     // Create bound PVC with 5Gi (request and capacity match)
-    let pvc = create_bound_pvc(
+    let _pvc = create_bound_pvc(
         &storage,
         "test-pvc-3",
         "default",

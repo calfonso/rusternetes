@@ -71,7 +71,7 @@ async fn rollout_status(
     name: &str,
     namespace: &str,
 ) -> Result<()> {
-    let (api_path, api_version) = get_resource_api_path(resource_type, namespace, name)?;
+    let (api_path, _api_version) = get_resource_api_path(resource_type, namespace, name)?;
 
     let resource: Value = client
         .get(&api_path)
@@ -148,7 +148,7 @@ async fn rollout_history(
     namespace: &str,
     revision: Option<i32>,
 ) -> Result<()> {
-    let (api_base, _) = get_resource_api_path(resource_type, namespace, name)?;
+    let (_api_base, _) = get_resource_api_path(resource_type, namespace, name)?;
     let rs_path = format!("/apis/apps/v1/namespaces/{}/replicasets", namespace);
 
     let replicasets: Value = client
@@ -235,7 +235,7 @@ async fn rollout_undo(
     }
 
     // Get the deployment
-    let deployment: Value = client
+    let _deployment: Value = client
         .get(&api_path)
         .await
         .context("Failed to get deployment")?;
@@ -413,6 +413,34 @@ async fn rollout_resume(
     println!("deployment.apps/{} resumed", name);
 
     Ok(())
+}
+
+fn get_resource_api_path(
+    resource_type: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<(String, String)> {
+    match resource_type {
+        "deployment" | "deployments" | "deploy" => Ok((
+            format!(
+                "/apis/apps/v1/namespaces/{}/deployments/{}",
+                namespace, name
+            ),
+            "apps/v1".to_string(),
+        )),
+        "statefulset" | "statefulsets" | "sts" => Ok((
+            format!(
+                "/apis/apps/v1/namespaces/{}/statefulsets/{}",
+                namespace, name
+            ),
+            "apps/v1".to_string(),
+        )),
+        "daemonset" | "daemonsets" | "ds" => Ok((
+            format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", namespace, name),
+            "apps/v1".to_string(),
+        )),
+        _ => anyhow::bail!("Unsupported resource type for rollout: {}", resource_type),
+    }
 }
 
 #[cfg(test)]
@@ -621,33 +649,5 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("only supported for deployments"));
-    }
-}
-
-fn get_resource_api_path(
-    resource_type: &str,
-    namespace: &str,
-    name: &str,
-) -> Result<(String, String)> {
-    match resource_type {
-        "deployment" | "deployments" | "deploy" => Ok((
-            format!(
-                "/apis/apps/v1/namespaces/{}/deployments/{}",
-                namespace, name
-            ),
-            "apps/v1".to_string(),
-        )),
-        "statefulset" | "statefulsets" | "sts" => Ok((
-            format!(
-                "/apis/apps/v1/namespaces/{}/statefulsets/{}",
-                namespace, name
-            ),
-            "apps/v1".to_string(),
-        )),
-        "daemonset" | "daemonsets" | "ds" => Ok((
-            format!("/apis/apps/v1/namespaces/{}/daemonsets/{}", namespace, name),
-            "apps/v1".to_string(),
-        )),
-        _ => anyhow::bail!("Unsupported resource type for rollout: {}", resource_type),
     }
 }

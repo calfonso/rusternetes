@@ -175,10 +175,10 @@ pub fn collect_files(inputs: &[String], recursive: bool) -> Result<Vec<String>> 
 
 /// Return true if the file extension indicates a Kubernetes manifest.
 fn is_manifest_file(path: &Path) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("yaml") | Some("yml") | Some("json") => true,
-        _ => false,
-    }
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yaml") | Some("yml") | Some("json")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +231,7 @@ struct ApplyResult {
     kind: String,
     api_group: String,
     name: String,
+    #[allow(dead_code)]
     namespace: Option<String>,
     action: ApplyAction,
     response: Value,
@@ -754,6 +755,7 @@ impl_has_metadata!(
 );
 
 /// Apply a namespaced resource.
+#[allow(clippy::too_many_arguments)]
 async fn apply_namespaced<T: HasMetadata>(
     client: &ApiClient,
     yaml_str: &str,
@@ -811,6 +813,7 @@ async fn apply_namespaced<T: HasMetadata>(
 }
 
 /// Apply a cluster-scoped resource.
+#[allow(clippy::too_many_arguments)]
 async fn apply_cluster<T: HasMetadata>(
     client: &ApiClient,
     yaml_str: &str,

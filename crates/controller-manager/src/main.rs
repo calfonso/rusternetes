@@ -24,9 +24,6 @@ use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{error, info, warn, Level};
 
-#[cfg(feature = "cloud-providers")]
-use rusternetes_cloud_providers;
-
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes-controller-manager")]
 #[command(about = "Rusternetes Controller Manager - Runs controller loops")]
@@ -103,7 +100,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir.clone() }
+            StorageConfig::Sqlite {
+                path: args.data_dir.clone(),
+            }
         }
         _ => {
             let etcd_endpoints: Vec<String> = args
@@ -112,7 +111,9 @@ async fn main() -> Result<()> {
                 .map(|s| s.trim().to_string())
                 .collect();
             info!("Connecting to etcd: {:?}", etcd_endpoints);
-            StorageConfig::Etcd { endpoints: etcd_endpoints }
+            StorageConfig::Etcd {
+                endpoints: etcd_endpoints,
+            }
         }
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);

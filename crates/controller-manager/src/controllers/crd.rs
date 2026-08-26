@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use rusternetes_common::resources::{
     CustomResourceDefinition, CustomResourceDefinitionCondition, CustomResourceDefinitionStatus,
 };
-use rusternetes_storage::{Storage, WorkQueue, extract_key, build_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -86,18 +86,22 @@ impl<S: Storage + 'static> CRDController<S> {
     }
     async fn worker(&self, queue: WorkQueue) {
         while let Some(key) = queue.get().await {
-            let name = key.strip_prefix("customresourcedefinitions/").unwrap_or(&key);
+            let name = key
+                .strip_prefix("customresourcedefinitions/")
+                .unwrap_or(&key);
             let storage_key = build_key("customresourcedefinitions", None, name);
-            match self.storage.get::<CustomResourceDefinition>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_crd(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<CustomResourceDefinition>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_crd(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -108,7 +112,11 @@ impl<S: Storage + 'static> CRDController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<CustomResourceDefinition>("/registry/customresourcedefinitions/").await {
+        match self
+            .storage
+            .list::<CustomResourceDefinition>("/registry/customresourcedefinitions/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = format!("customresourcedefinitions/{}", item.metadata.name);
@@ -116,12 +124,16 @@ impl<S: Storage + 'static> CRDController<S> {
                 }
             }
             Err(e) => {
-                error!("Failed to list customresourcedefinitions for enqueue: {}", e);
+                error!(
+                    "Failed to list customresourcedefinitions for enqueue: {}",
+                    e
+                );
             }
         }
     }
 
     /// Main reconciliation loop - processes all CRD resources
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting CRD reconciliation");
 
@@ -150,6 +162,15 @@ impl<S: Storage + 'static> CRDController<S> {
         let crd_name = &crd.metadata.name;
         debug!("Reconciling CRD {}", crd_name);
 
+        // Handle CRD deletion with finalizer cleanup.
+        // K8s has a CRD finalizer controller that processes the
+        // "customresourcecleanup.apiextensions.k8s.io" finalizer by deleting
+        // all custom resource instances, then removing the finalizer so the
+        // CRD can be garbage collected.
+        if crd.metadata.deletion_timestamp.is_some() {
+            return self.handle_crd_deletion(crd).await;
+        }
+
         // Validate the CRD spec
         if let Err(e) = self.validate_crd_spec(crd) {
             warn!("CRD {} validation failed: {}", crd_name, e);
@@ -169,20 +190,119 @@ impl<S: Storage + 'static> CRDController<S> {
             }
         }
 
-        // In a real implementation, this controller would:
-        // 1. Register the CRD with the API server's discovery system
-        // 2. Set up dynamic API handlers for the custom resource
-        // 3. Configure OpenAPI schema for validation
-        // 4. Set up watches for custom resource instances
-        // 5. Update CRD status with:
-        //    - "NamesAccepted" condition
-        //    - "Established" condition
-        //    - "AcceptedNames" reflecting the names being served
-        //    - "StoredVersions" tracking versions used in storage
-        //
-        // For conformance, we ensure CRDs are validated and can be stored.
-
         debug!("CRD {} reconciled successfully", crd_name);
+
+        Ok(())
+    }
+
+    /// Handle CRD deletion: process finalizers by cleaning up custom resources,
+    /// then remove the finalizer and delete the CRD.
+    ///
+    /// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/finalizer/crd_finalizer.go
+    async fn handle_crd_deletion(&self, crd: &CustomResourceDefinition) -> Result<()> {
+        let crd_name = &crd.metadata.name;
+        let finalizers = crd.metadata.finalizers.as_deref().unwrap_or(&[]);
+
+        // Check for the cleanup finalizer
+        let cleanup_finalizer = "customresourcecleanup.apiextensions.k8s.io";
+        if !finalizers.contains(&cleanup_finalizer.to_string()) {
+            debug!("CRD {} has no cleanup finalizer, nothing to do", crd_name);
+            return Ok(());
+        }
+
+        info!("Processing cleanup finalizer for CRD {}", crd_name);
+
+        // Delete all custom resource instances for this CRD.
+        // CRs are stored at /apis/{group}/{version}/{plural}/{ns}/{name}
+        for version in &crd.spec.versions {
+            let cr_prefix = format!(
+                "/apis/{}/{}/{}/",
+                crd.spec.group, version.name, crd.spec.names.plural
+            );
+
+            let crs: Vec<serde_json::Value> =
+                self.storage.list(&cr_prefix).await.unwrap_or_default();
+
+            for cr in &crs {
+                let cr_name = cr
+                    .pointer("/metadata/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let cr_ns = cr
+                    .pointer("/metadata/namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let cr_key = if cr_ns.is_empty() {
+                    format!(
+                        "/apis/{}/{}/{}/{}",
+                        crd.spec.group, version.name, crd.spec.names.plural, cr_name
+                    )
+                } else {
+                    format!(
+                        "/apis/{}/{}/{}/{}/{}",
+                        crd.spec.group, version.name, crd.spec.names.plural, cr_ns, cr_name
+                    )
+                };
+
+                if let Err(e) = self.storage.delete(&cr_key).await {
+                    warn!("Failed to delete CR {} for CRD {}: {}", cr_key, crd_name, e);
+                } else {
+                    debug!("Deleted CR {} for CRD {}", cr_key, crd_name);
+                }
+            }
+        }
+
+        // Remove the cleanup finalizer from the CRD
+        let crd_key = build_key("customresourcedefinitions", None, crd_name);
+        match self.storage.get::<serde_json::Value>(&crd_key).await {
+            Ok(mut crd_value) => {
+                // Remove the finalizer
+                if let Some(meta) = crd_value
+                    .get_mut("metadata")
+                    .and_then(|m| m.as_object_mut())
+                {
+                    if let Some(fins) = meta.get_mut("finalizers").and_then(|f| f.as_array_mut()) {
+                        fins.retain(|f| f.as_str() != Some(cleanup_finalizer));
+                        if fins.is_empty() {
+                            meta.remove("finalizers");
+                        }
+                    }
+                }
+
+                // Check if any finalizers remain
+                let has_finalizers = crd_value
+                    .pointer("/metadata/finalizers")
+                    .and_then(|f| f.as_array())
+                    .is_some_and(|f| !f.is_empty());
+
+                if has_finalizers {
+                    // Other finalizers remain — just update to remove ours
+                    if let Err(e) = self.storage.update(&crd_key, &crd_value).await {
+                        error!(
+                            "Failed to update CRD {} after removing finalizer: {}",
+                            crd_name, e
+                        );
+                        return Err(anyhow!("Failed to update CRD: {}", e));
+                    }
+                    info!(
+                        "Removed cleanup finalizer from CRD {}, other finalizers remain",
+                        crd_name
+                    );
+                } else {
+                    // No finalizers left — delete the CRD
+                    if let Err(e) = self.storage.delete(&crd_key).await {
+                        error!("Failed to delete CRD {}: {}", crd_name, e);
+                        return Err(anyhow!("Failed to delete CRD: {}", e));
+                    }
+                    info!("CRD {} fully deleted after finalizer cleanup", crd_name);
+                }
+            }
+            Err(e) => {
+                // CRD already deleted
+                debug!("CRD {} already deleted: {}", crd_name, e);
+            }
+        }
 
         Ok(())
     }
@@ -259,6 +379,7 @@ impl<S: Storage + 'static> CRDController<S> {
     }
 
     /// Create or update CRD status with conditions
+    #[allow(dead_code)]
     pub async fn update_crd_status(
         &self,
         crd_name: &str,
@@ -267,6 +388,23 @@ impl<S: Storage + 'static> CRDController<S> {
     ) -> Result<()> {
         let crd_key = format!("/registry/customresourcedefinitions/{}", crd_name);
         let mut crd: CustomResourceDefinition = self.storage.get(&crd_key).await?;
+        let prev_status = crd.status.clone();
+
+        // Capture prior Established / NamesAccepted timestamps so we can carry
+        // them forward when the condition's .status hasn't actually changed.
+        // K8s convention: last_transition_time updates ONLY on a real status
+        // transition. Re-stamping it on every reconcile would emit a MODIFIED
+        // watch event every resync interval (30s here) — a controller hot-loop.
+        let lookup_prev_time = |target_type: &str, target_status: &str| -> Option<String> {
+            prev_status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .and_then(|cs| {
+                    cs.iter()
+                        .find(|c| c.type_ == target_type && c.status == target_status)
+                        .and_then(|c| c.last_transition_time.clone())
+                })
+        };
 
         // Preserve existing conditions and only update/add Established and NamesAccepted.
         // Other conditions (e.g., set by tests or external controllers) must be kept.
@@ -279,21 +417,27 @@ impl<S: Storage + 'static> CRDController<S> {
         // Remove existing Established and NamesAccepted conditions (we'll re-add them)
         conditions.retain(|c| c.type_ != "Established" && c.type_ != "NamesAccepted");
 
+        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+
         if names_accepted {
+            let last_transition_time =
+                lookup_prev_time("NamesAccepted", "True").unwrap_or_else(|| now_rfc3339.clone());
             conditions.push(CustomResourceDefinitionCondition {
                 type_: "NamesAccepted".to_string(),
                 status: "True".to_string(),
-                last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+                last_transition_time: Some(last_transition_time),
                 reason: Some("NoConflicts".to_string()),
                 message: Some("no conflicts found".to_string()),
             });
         }
 
         if established {
+            let last_transition_time =
+                lookup_prev_time("Established", "True").unwrap_or_else(|| now_rfc3339.clone());
             conditions.push(CustomResourceDefinitionCondition {
                 type_: "Established".to_string(),
                 status: "True".to_string(),
-                last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+                last_transition_time: Some(last_transition_time),
                 reason: Some("InitialNamesAccepted".to_string()),
                 message: Some("the initial names have been accepted".to_string()),
             });
@@ -308,12 +452,21 @@ impl<S: Storage + 'static> CRDController<S> {
             .map(|v| v.name.clone())
             .collect();
 
-        crd.status = Some(CustomResourceDefinitionStatus {
+        let new_status = CustomResourceDefinitionStatus {
             conditions: Some(conditions),
             accepted_names: Some(crd.spec.names.clone()),
             stored_versions: Some(stored_versions),
-        });
+        };
 
+        // Skip the write when nothing actually changed. Compare via canonical
+        // JSON so optional field ordering doesn't trigger spurious updates.
+        let old_v = serde_json::to_value(&prev_status).ok();
+        let new_v = serde_json::to_value(Some(&new_status)).ok();
+        if old_v == new_v {
+            return Ok(());
+        }
+
+        crd.status = Some(new_status);
         self.storage.update(&crd_key, &crd).await?;
 
         Ok(())
@@ -584,6 +737,48 @@ mod tests {
         let has_names_accepted = conditions.iter().any(|c| c.type_ == "NamesAccepted");
         assert!(has_established);
         assert!(has_names_accepted);
+    }
+
+    /// Regression test: update_crd_status must not churn last_transition_time
+    /// on successive reconciles when the established/names_accepted state is
+    /// unchanged. Without preservation, every 30s resync re-stamped Utc::now()
+    /// and rewrote the CRD — emitting a MODIFIED watch event each cycle.
+    #[tokio::test]
+    async fn test_update_crd_status_idempotent_when_unchanged() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = CRDController::new(storage.clone());
+
+        let crd = create_test_crd("crontab", "stable.example.com", "crontabs");
+        let crd_key = format!("/registry/customresourcedefinitions/{}", crd.metadata.name);
+        storage.create(&crd_key, &crd).await.unwrap();
+
+        // First reconcile establishes status + condition timestamps.
+        controller
+            .update_crd_status(&crd.metadata.name, true, true)
+            .await
+            .unwrap();
+        let after_first: CustomResourceDefinition = storage.get(&crd_key).await.unwrap();
+        let first_v: serde_json::Value = serde_json::to_value(after_first.status.as_ref()).unwrap();
+
+        // Sleep enough that any Utc::now() on a re-write would advance past
+        // the first call's timestamps.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Second update with identical inputs must NOT bump timestamps and
+        // must NOT re-write the CRD.
+        controller
+            .update_crd_status(&crd.metadata.name, true, true)
+            .await
+            .unwrap();
+        let after_second: CustomResourceDefinition = storage.get(&crd_key).await.unwrap();
+        let second_v: serde_json::Value =
+            serde_json::to_value(after_second.status.as_ref()).unwrap();
+
+        assert_eq!(
+            first_v, second_v,
+            "CRD status (incl. condition.last_transition_time) must remain stable \
+             on a no-op update — otherwise every resync writes the CRD and churns watchers."
+        );
     }
 
     #[tokio::test]

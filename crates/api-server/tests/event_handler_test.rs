@@ -5,7 +5,7 @@
 use rusternetes_common::resources::{Event, EventSource, EventType, ObjectReference};
 use rusternetes_common::types::ObjectMeta;
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // Helper function to create test Event

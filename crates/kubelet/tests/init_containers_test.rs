@@ -161,7 +161,7 @@ fn test_init_container_status_sequence() {
             ContainerStatus {
                 name: "init-0".to_string(),
                 state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
                 }),
                 ready: false,
                 restart_count: 0,
@@ -271,7 +271,7 @@ fn test_init_containers_completed_app_starting() {
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:11Z".to_string()),
+                started_at: Some("2024-01-01T00:00:11Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,
@@ -459,8 +459,8 @@ fn test_multiple_init_containers_sequential_execution() {
     assert_eq!(init_containers.len(), 5);
 
     // Verify init container names are in order
-    for i in 0..5 {
-        assert_eq!(init_containers[i].name, format!("init-{}", i));
+    for (i, container) in init_containers.iter().enumerate().take(5) {
+        assert_eq!(container.name, format!("init-{}", i));
     }
 
     // Verify app containers defined

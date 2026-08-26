@@ -1,13 +1,17 @@
+#[allow(dead_code)]
 pub mod cni;
 pub mod config;
+#[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
 pub mod runtime;
 
-use config::{KubeletConfiguration, RuntimeConfig};
-use rusternetes_storage::{StorageBackend, Storage};
+pub use kubelet::PodWorkerState;
+
+use config::KubeletConfiguration;
+use rusternetes_storage::{Storage, StorageBackend};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Configuration for the kubelet component.
 pub struct KubeletConfig {
@@ -41,12 +45,18 @@ impl Default for KubeletConfig {
 /// This is the main entry point for embedding the kubelet in the all-in-one binary.
 /// Starts the kubelet sync loop and metrics server, blocks until shutdown.
 pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow::Result<()> {
-    info!("Starting Rusternetes Kubelet for node: {}", config.node_name);
+    info!(
+        "Starting Rusternetes Kubelet for node: {}",
+        config.node_name
+    );
 
     // Discover cluster DNS if not hardcoded
     let cluster_dns = {
         use rusternetes_common::resources::Service;
-        match storage.get::<Service>("/registry/services/kube-system/kube-dns").await {
+        match storage
+            .get::<Service>("/registry/services/kube-system/kube-dns")
+            .await
+        {
             Ok(service) => {
                 if let Some(ref cluster_ip) = service.spec.cluster_ip {
                     info!("Discovered cluster DNS IP: {}", cluster_ip);
@@ -60,7 +70,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
     };
 
     // Metrics server
-    let metrics = Arc::new(rusternetes_common::observability::MetricsRegistry::new().with_kubelet_metrics()?);
+    let metrics =
+        Arc::new(rusternetes_common::observability::MetricsRegistry::new().with_kubelet_metrics()?);
     let metrics_clone = metrics.clone();
 
     let kubelet_config = KubeletConfiguration {
@@ -78,13 +89,19 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
     let kubelet_config_clone = kubelet_config.clone();
 
     let metrics_addr = format!("0.0.0.0:{}", config.metrics_port);
-    info!("Starting kubelet API server on {} (metrics + configz)", metrics_addr);
+    info!(
+        "Starting kubelet API server on {} (metrics + configz)",
+        metrics_addr
+    );
 
     tokio::spawn(async move {
-        use axum::{routing::{get, post}, Json, Router};
+        use axum::{routing::get, Json, Router};
         let app = Router::new()
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
-            .route("/configz", get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }));
+            .route(
+                "/configz",
+                get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
+            );
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });

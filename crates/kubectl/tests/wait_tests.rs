@@ -1,5 +1,5 @@
-/// Tests for kubectl wait command
-/// Tests condition parsing and timeout handling without requiring a cluster
+//! Tests for kubectl wait command
+//! Tests condition parsing and timeout handling without requiring a cluster
 
 #[cfg(test)]
 mod condition_tests {

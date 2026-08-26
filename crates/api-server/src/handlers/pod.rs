@@ -26,16 +26,56 @@ pub async fn create(
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, Json<Pod>)> {
-    // Parse the body manually so we can do strict field validation against the raw bytes
-    let mut pod: Pod = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
-    })?;
+) -> Result<(StatusCode, HeaderMap, Json<Pod>)> {
+    // Parse the body manually so we can do strict field validation against the
+    // raw bytes. In strict mode (now the K8s 1.25+ default) serde_json will
+    // reject duplicate keys outright — fall back to a lenient Value parse so
+    // validate_strict_fields can report the duplicate in the canonical
+    // `strict decoding error: duplicate field "..."` shape rather than a raw
+    // serde error.
+    let is_lenient = matches!(
+        crate::handlers::validation::FieldValidationMode::from_query(&params),
+        crate::handlers::validation::FieldValidationMode::Warn
+            | crate::handlers::validation::FieldValidationMode::Ignore
+    );
+    let mut pod: Pod = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("duplicate field") {
+                // Re-parse via Value (lenient — takes last duplicate) so the
+                // strict-decode error path can synthesize a parity-shaped
+                // message that names every duplicate.
+                let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e2| {
+                    rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
+                })?;
+                serde_json::from_value(value).map_err(|e2| {
+                    rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
+                })?
+            } else if is_lenient {
+                // Warn / Ignore mode: even ordinary decode failures shouldn't
+                // mask the user's intent — but if the body is unparseable we
+                // can't continue at all, so still error.
+                return Err(rusternetes_common::Error::BadRequest(format!(
+                    "failed to decode: {}",
+                    msg
+                )));
+            } else {
+                return Err(rusternetes_common::Error::BadRequest(format!(
+                    "failed to decode: {}",
+                    msg
+                )));
+            }
+        }
+    };
 
     info!("Creating pod: {}/{}", namespace, pod.metadata.name);
 
-    // Strict field validation: reject unknown fields when requested
-    crate::handlers::validation::validate_strict_fields(&params, &body, &pod)?;
+    // Strict field validation: reject unknown fields when requested. Warn
+    // mode returns one warning string per unknown field; the handler turns
+    // those into `Warning: 299 - "..."` response headers below.
+    let warnings = crate::handlers::validation::validate_strict_fields(&params, &body, &pod)?;
+    let response_headers = build_warning_headers(&warnings);
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -60,6 +100,15 @@ pub async fn create(
     }
 
     // Validate pod spec
+    // K8s ref: pkg/apis/core/validation/validation.go ValidatePodSpec — `spec.containers`
+    // is required. Upstream uses `field.Required(field.NewPath("spec").Child("containers"), "")`
+    // when spec is missing/null. Reject `spec: null` (and an absent spec) with 422 Invalid
+    // here so we do not persist an empty Pod.
+    if pod.spec.is_none() {
+        return Err(rusternetes_common::Error::InvalidResource(
+            "spec.containers: Required value".to_string(),
+        ));
+    }
     if let Some(ref spec) = pod.spec {
         if spec.containers.is_empty() {
             return Err(rusternetes_common::Error::InvalidResource(
@@ -130,7 +179,7 @@ pub async fn create(
         for container in &mut spec.containers {
             if let Some(ref limits) = container.resources.as_ref().and_then(|r| r.limits.clone()) {
                 if !limits.is_empty() {
-                    let resources = container.resources.get_or_insert_with(|| {
+                    let resources = container.resources.get_or_insert({
                         rusternetes_common::types::ResourceRequirements {
                             limits: None,
                             requests: None,
@@ -259,7 +308,7 @@ pub async fn create(
 
     let (mutation_response, mutated_pod_value) = state
         .webhook_manager
-        .run_mutating_webhooks(
+        .run_mutating_webhooks_with_dryrun(
             &Operation::Create,
             &gvk,
             &gvr,
@@ -268,6 +317,7 @@ pub async fn create(
             Some(pod_value),
             None,
             &user_info,
+            is_dry_run,
         )
         .await?;
 
@@ -452,7 +502,7 @@ pub async fn create(
 
     let validation_response = state
         .webhook_manager
-        .run_validating_webhooks(
+        .run_validating_webhooks_with_dryrun(
             &Operation::Create,
             &gvk,
             &gvr,
@@ -461,6 +511,7 @@ pub async fn create(
             Some(final_pod_value),
             None,
             &user_info,
+            is_dry_run,
         )
         .await?;
 
@@ -480,7 +531,7 @@ pub async fn create(
 
     // Run ValidatingAdmissionPolicy checks
     let pod_value_for_vap = serde_json::to_value(&pod).ok();
-    if let Err(e) = state
+    state
         .webhook_manager
         .run_validating_admission_policies_ext(
             &Operation::Create,
@@ -490,10 +541,7 @@ pub async fn create(
             Some("pods"),
             Some(&namespace),
         )
-        .await
-    {
-        return Err(e);
-    }
+        .await?;
 
     pod.metadata.ensure_uid();
     pod.metadata.ensure_creation_timestamp();
@@ -535,11 +583,11 @@ pub async fn create(
                     let has_limits = res
                         .limits
                         .as_ref()
-                        .map_or(false, |l| l.contains_key("cpu") && l.contains_key("memory"));
+                        .is_some_and(|l| l.contains_key("cpu") && l.contains_key("memory"));
                     let has_requests = res
                         .requests
                         .as_ref()
-                        .map_or(false, |r| r.contains_key("cpu") && r.contains_key("memory"));
+                        .is_some_and(|r| r.contains_key("cpu") && r.contains_key("memory"));
                     if has_limits || has_requests {
                         any_resources = true;
                     }
@@ -572,7 +620,7 @@ pub async fn create(
             "Dry-run: Pod {}/{} validated successfully (not created)",
             namespace, pod.metadata.name
         );
-        return Ok((StatusCode::CREATED, Json(pod)));
+        return Ok((StatusCode::CREATED, response_headers, Json(pod)));
     }
 
     match state.storage.create(&key, &pod).await {
@@ -581,7 +629,7 @@ pub async fn create(
                 "Pod created successfully: {}/{}",
                 namespace, pod.metadata.name
             );
-            Ok((StatusCode::CREATED, Json(created)))
+            Ok((StatusCode::CREATED, response_headers, Json(created)))
         }
         Err(e) => {
             warn!(
@@ -591,6 +639,20 @@ pub async fn create(
             Err(e)
         }
     }
+}
+
+/// Convert the `validate_strict_fields` warning strings into a `HeaderMap`
+/// holding RFC 7234 `Warning: 299 - "..."` entries. Empty input → empty map,
+/// which keeps response shape identical for non-Warn callers.
+fn build_warning_headers(warnings: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for warning in warnings {
+        let value = crate::handlers::validation::format_warning_header(warning);
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&value) {
+            headers.append(axum::http::header::WARNING, hv);
+        }
+    }
+    headers
 }
 
 pub async fn get(
@@ -673,6 +735,57 @@ pub async fn update(
         &name,
     )?;
 
+    // Validate pod spec immutability.
+    // K8s ValidatePodUpdate only allows changing:
+    //   - spec.containers[*].image
+    //   - spec.initContainers[*].image
+    //   - spec.activeDeadlineSeconds
+    //   - spec.terminationGracePeriodSeconds
+    //   - spec.tolerations (additions only)
+    //   - spec.schedulingGates (deletions only)
+    // All other spec fields are immutable after creation.
+    // K8s ref: pkg/apis/core/validation/validation.go:5701 — ValidatePodUpdate
+    if let (Some(old_spec), Some(new_spec)) = (&old_pod.spec, &pod.spec) {
+        // Check container count hasn't changed
+        if old_spec.containers.len() != new_spec.containers.len() {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "pod updates may not add or remove containers".to_string(),
+            ));
+        }
+
+        // Build a munged copy: reset mutable fields to old values, then compare
+        let mut munged = new_spec.clone();
+        // Reset images to old values
+        for (i, c) in munged.containers.iter_mut().enumerate() {
+            if i < old_spec.containers.len() {
+                c.image = old_spec.containers[i].image.clone();
+            }
+        }
+        if let (Some(old_init), Some(new_init)) =
+            (&old_spec.init_containers, &mut munged.init_containers)
+        {
+            for (i, c) in new_init.iter_mut().enumerate() {
+                if i < old_init.len() {
+                    c.image = old_init[i].image.clone();
+                }
+            }
+        }
+        // Reset other mutable fields
+        munged.active_deadline_seconds = old_spec.active_deadline_seconds;
+        munged.termination_grace_period_seconds = old_spec.termination_grace_period_seconds;
+        munged.tolerations = old_spec.tolerations.clone();
+        munged.scheduling_gates = old_spec.scheduling_gates.clone();
+
+        // Compare: if munged spec != old spec, immutable fields were changed
+        let munged_json = serde_json::to_value(&munged).unwrap_or_default();
+        let old_json = serde_json::to_value(old_spec).unwrap_or_default();
+        if munged_json != old_json {
+            return Err(rusternetes_common::Error::InvalidResource(
+                "pod updates may not change fields other than `spec.containers[*].image`, `spec.initContainers[*].image`, `spec.activeDeadlineSeconds`, `spec.terminationGracePeriodSeconds`, `spec.tolerations`, `spec.schedulingGates`".to_string(),
+            ));
+        }
+    }
+
     let old_pod_value = serde_json::to_value(&old_pod)
         .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
 
@@ -695,7 +808,7 @@ pub async fn update(
 
     let (mutation_response, mutated_pod_value) = state
         .webhook_manager
-        .run_mutating_webhooks(
+        .run_mutating_webhooks_with_dryrun(
             &Operation::Update,
             &gvk,
             &gvr,
@@ -704,6 +817,7 @@ pub async fn update(
             Some(pod_value),
             Some(old_pod_value.clone()),
             &user_info,
+            is_dry_run,
         )
         .await?;
 
@@ -729,7 +843,7 @@ pub async fn update(
 
     let validation_response = state
         .webhook_manager
-        .run_validating_webhooks(
+        .run_validating_webhooks_with_dryrun(
             &Operation::Update,
             &gvk,
             &gvr,
@@ -738,6 +852,7 @@ pub async fn update(
             Some(final_pod_value),
             Some(old_pod_value.clone()),
             &user_info,
+            is_dry_run,
         )
         .await?;
 
@@ -776,6 +891,11 @@ pub async fn update(
             }
         }
     }
+
+    // Note: ResourceQuota is NOT checked on pod UPDATE because the spec
+    // immutability validation above already rejects resource changes.
+    // K8s only checks quota on CREATE.
+    // K8s ref: pkg/apis/core/validation/validation.go:5701 — ValidatePodUpdate
 
     // If dry-run, skip storage operation but return the validated resource
     if is_dry_run {
@@ -923,8 +1043,8 @@ pub async fn list(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -1040,8 +1160,8 @@ pub async fn list_all_pods(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -1088,7 +1208,10 @@ pub async fn list_all_pods(
         continue_token,
     };
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Apply pagination
     let paginated = match rusternetes_common::paginate(pods, pagination_params, &resource_version) {
@@ -1482,7 +1605,6 @@ fn detect_container_resource_change(old_pod: &Pod, new_pod: &Pod) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
     use std::collections::HashMap;
 
     fn make_container_with_resources(

@@ -41,6 +41,7 @@ use tracing::info;
 ///
 /// # Returns
 /// Updated resource after applying patch
+#[allow(clippy::too_many_arguments)]
 pub async fn patch_namespaced_resource<T>(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -293,7 +294,7 @@ where
         }
 
         // Validating webhooks
-        match state
+        if let admission::AdmissionResponse::Deny(reason) = state
             .webhook_manager
             .run_validating_webhooks(
                 &admission::Operation::Update,
@@ -307,13 +308,10 @@ where
             )
             .await?
         {
-            admission::AdmissionResponse::Deny(reason) => {
-                return Err(rusternetes_common::Error::Forbidden(format!(
-                    "admission webhook denied the request: {}",
-                    reason
-                )));
-            }
-            _ => {}
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "admission webhook denied the request: {}",
+                reason
+            )));
         }
     }
 
@@ -340,8 +338,9 @@ where
                 .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
             let re_patched = apply_patch(&fresh_json, &patch_json, patch_type_for_retry)
                 .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
-            let re_patched_resource: T = serde_json::from_value(re_patched)
-                .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e)))?;
+            let re_patched_resource: T = serde_json::from_value(re_patched).map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
+            })?;
             let updated = state.storage.update(&key, &re_patched_resource).await?;
             Ok(Json(updated))
         }
@@ -365,6 +364,7 @@ where
 ///
 /// # Returns
 /// Updated resource after applying patch
+#[allow(clippy::too_many_arguments)]
 pub async fn patch_cluster_resource<T>(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -524,7 +524,7 @@ where
         .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e)))?;
 
     // Apply patch (clone patch_type for potential retry on rv conflict)
-    let patch_type_for_retry = patch_type.clone();
+    let _patch_type_for_retry = patch_type.clone();
     let mut patched_json = apply_patch(&current_json, &patch_json, patch_type)
         .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
 

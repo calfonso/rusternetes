@@ -16,7 +16,7 @@ mod tests {
         StatefulSetSpec,
     };
     use rusternetes_common::resources::{
-        EndpointSubset, Endpoints, Node, NodeStatus, Pod, PodSpec, PodStatus, PodTemplateSpec,
+        Endpoints, Node, NodeStatus, Pod, PodSpec, PodStatus, PodTemplateSpec,
     };
     use rusternetes_common::types::{LabelSelector, ObjectMeta, OwnerReference, TypeMeta};
     use rusternetes_storage::{memory::MemoryStorage, Storage};
@@ -76,6 +76,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn minimal_pod_status() -> PodStatus {
         PodStatus {
             phase: None,

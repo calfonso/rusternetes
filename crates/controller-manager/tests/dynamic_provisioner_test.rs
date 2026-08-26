@@ -2,7 +2,6 @@
 // Note: These tests use in-memory storage for fast, isolated testing
 
 use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::*;
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
@@ -11,11 +10,7 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 async fn setup_test() -> Arc<MemoryStorage> {
-    let storage = Arc::new(MemoryStorage::new());
-
-    // Clean up test data
-
-    storage
+    Arc::new(MemoryStorage::new())
 }
 
 #[tokio::test]
@@ -923,7 +918,7 @@ async fn test_rejects_pvc_restore_from_non_ready_snapshot() {
 
     // Step 4: Run provisioner - should fail or skip
     let controller = DynamicProvisionerController::new(storage.clone());
-    let result = controller.reconcile_all().await;
+    let _result = controller.reconcile_all().await;
 
     // The reconcile might succeed but not create the PV
     // Let's verify the PV was NOT created

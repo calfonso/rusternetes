@@ -189,42 +189,6 @@ crate::patch_handler_cluster!(
     "storage.k8s.io"
 );
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::{
-        resources::{VolumeAttachmentSource, VolumeAttachmentSpec},
-        types::{ObjectMeta, TypeMeta},
-    };
-
-    fn create_test_volume_attachment(name: &str) -> VolumeAttachment {
-        VolumeAttachment {
-            type_meta: TypeMeta {
-                kind: "VolumeAttachment".to_string(),
-                api_version: "storage.k8s.io/v1".to_string(),
-            },
-            metadata: ObjectMeta::new(name),
-            spec: VolumeAttachmentSpec {
-                attacher: "test-driver".to_string(),
-                node_name: "node1".to_string(),
-                source: VolumeAttachmentSource {
-                    persistent_volume_name: Some("pv-123".to_string()),
-                    inline_volume_spec: None,
-                },
-            },
-            status: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_volumeattachment_serialization() {
-        let va = create_test_volume_attachment("test-va");
-        let json = serde_json::to_string(&va).unwrap();
-        let deserialized: VolumeAttachment = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metadata.name, "test-va");
-    }
-}
-
 pub async fn deletecollection_volumeattachments(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -283,4 +247,40 @@ pub async fn deletecollection_volumeattachments(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::{
+        resources::{VolumeAttachmentSource, VolumeAttachmentSpec},
+        types::{ObjectMeta, TypeMeta},
+    };
+
+    fn create_test_volume_attachment(name: &str) -> VolumeAttachment {
+        VolumeAttachment {
+            type_meta: TypeMeta {
+                kind: "VolumeAttachment".to_string(),
+                api_version: "storage.k8s.io/v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name),
+            spec: VolumeAttachmentSpec {
+                attacher: "test-driver".to_string(),
+                node_name: "node1".to_string(),
+                source: VolumeAttachmentSource {
+                    persistent_volume_name: Some("pv-123".to_string()),
+                    inline_volume_spec: None,
+                },
+            },
+            status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_volumeattachment_serialization() {
+        let va = create_test_volume_attachment("test-va");
+        let json = serde_json::to_string(&va).unwrap();
+        let deserialized: VolumeAttachment = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.metadata.name, "test-va");
+    }
 }

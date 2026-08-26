@@ -1,5 +1,5 @@
-/// Tests for kubectl informational commands
-/// Tests version, cluster-info, api-resources, api-versions, and explain commands
+//! Tests for kubectl informational commands
+//! Tests version, cluster-info, api-resources, api-versions, and explain commands
 
 #[cfg(test)]
 mod version_tests {

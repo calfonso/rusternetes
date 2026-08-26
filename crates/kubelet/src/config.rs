@@ -156,6 +156,7 @@ impl KubeletConfiguration {
     }
 
     /// Save configuration to a YAML file
+    #[allow(dead_code)]
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let contents = serde_yaml::to_string(self).context("Failed to serialize configuration")?;
 
@@ -233,6 +234,7 @@ fn first_ip_from_cidr(cidr: &str) -> Result<String> {
 impl RuntimeConfig {
     /// Build RuntimeConfig from multiple sources with proper precedence:
     /// CLI flags > Config file > Environment variables > Defaults
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         cli_root_dir: Option<String>,
         cli_volume_dir: Option<String>,
@@ -244,11 +246,47 @@ impl RuntimeConfig {
         node_name: String,
         etcd_endpoints: Vec<String>,
     ) -> Result<Self> {
+        Self::build_with_env(
+            cli_root_dir,
+            cli_volume_dir,
+            cli_volume_plugin_dir,
+            cli_sync_frequency,
+            cli_metrics_port,
+            cli_log_level,
+            config_file,
+            node_name,
+            etcd_endpoints,
+            |key| std::env::var(key).ok(),
+        )
+    }
+
+    /// Testable core of [`RuntimeConfig::build`].
+    ///
+    /// Takes the environment lookup as an argument instead of reading the
+    /// process environment, so a test can exercise the config-file and default
+    /// tiers without depending on the developer's shell. The environment tier
+    /// sits above the defaults, so reading the real environment makes any
+    /// assertion about a default fail once the corresponding variable is
+    /// exported — and this repo's own workflow exports `KUBELET_VOLUMES_PATH`.
+    /// Same rationale as `rusternetes_common::async_runtime`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_env(
+        cli_root_dir: Option<String>,
+        cli_volume_dir: Option<String>,
+        cli_volume_plugin_dir: Option<String>,
+        cli_sync_frequency: Option<u64>,
+        cli_metrics_port: Option<u16>,
+        cli_log_level: Option<String>,
+        config_file: Option<KubeletConfiguration>,
+        node_name: String,
+        etcd_endpoints: Vec<String>,
+        mut get_env: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
         // Determine root directory
         // Precedence: CLI > Config > Env > Default
         let root_dir = cli_root_dir
             .or_else(|| config_file.as_ref().and_then(|c| c.root_dir.clone()))
-            .or_else(|| std::env::var("KUBELET_ROOT_DIR").ok())
+            .or_else(|| get_env("KUBELET_ROOT_DIR"))
             .unwrap_or_else(|| {
                 // For development: use current dir, for production: /var/lib/kubelet
                 std::env::current_dir()
@@ -261,7 +299,7 @@ impl RuntimeConfig {
         // Precedence: CLI > Config > Env > Root-dir-based default
         let volume_dir = cli_volume_dir
             .or_else(|| config_file.as_ref().and_then(|c| c.volume_dir.clone()))
-            .or_else(|| std::env::var("KUBELET_VOLUMES_PATH").ok())
+            .or_else(|| get_env("KUBELET_VOLUMES_PATH"))
             .unwrap_or_else(|| format!("{}/volumes", root_dir));
 
         // Determine volume plugin directory
@@ -271,7 +309,7 @@ impl RuntimeConfig {
                     .as_ref()
                     .and_then(|c| c.volume_plugin_dir.clone())
             })
-            .or_else(|| std::env::var("KUBELET_VOLUME_PLUGIN_DIR").ok())
+            .or_else(|| get_env("KUBELET_VOLUME_PLUGIN_DIR"))
             .unwrap_or_else(|| "/usr/libexec/kubernetes/kubelet-plugins/volume/exec".to_string());
 
         // Determine sync frequency
@@ -287,7 +325,7 @@ impl RuntimeConfig {
         // Determine log level
         let log_level = cli_log_level
             .or_else(|| config_file.as_ref().and_then(|c| c.log_level.clone()))
-            .or_else(|| std::env::var("RUST_LOG").ok())
+            .or_else(|| get_env("RUST_LOG"))
             .unwrap_or_else(|| "info".to_string());
 
         // Determine cluster service CIDR and extract kubernetes service host IP
@@ -295,30 +333,18 @@ impl RuntimeConfig {
         let cluster_service_cidr = config_file
             .as_ref()
             .and_then(|c| c.cluster_service_cidr.clone())
-            .or_else(|| std::env::var("CLUSTER_SERVICE_CIDR").ok())
+            .or_else(|| get_env("CLUSTER_SERVICE_CIDR"))
             .unwrap_or_else(|| "10.96.0.0/12".to_string());
 
-        // Allow overriding the kubernetes service host via env var.
-        // In Docker Desktop environments, the ClusterIP (10.96.0.1) is not
-        // routable from bridge containers because kube-proxy's iptables DNAT
-        // only applies in the host network namespace. Use the API server's
-        // Use the kubernetes service ClusterIP (10.96.0.1) as KUBERNETES_SERVICE_HOST.
-        // This is stable across container restarts (unlike container IPs which change).
-        // The TLS cert includes 10.96.0.1 as a SAN.
-        // Fallback to the override hostname if set.
-        let kubernetes_service_host = if let Ok(override_host) =
-            std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE")
-        {
-            // Don't resolve to IP — use the hostname or ClusterIP directly.
-            // Container IPs change on restart; ClusterIP and DNS names are stable.
-            tracing::info!(
-                "Using KUBERNETES_SERVICE_HOST_OVERRIDE: {}",
-                override_host
-            );
-            override_host
-        } else {
-            first_ip_from_cidr(&cluster_service_cidr).unwrap_or_else(|_| "10.96.0.1".to_string())
-        };
+        // Use KUBERNETES_SERVICE_HOST_OVERRIDE if set — this allows the API server
+        // address to be configured for environments where ClusterIP routing doesn't
+        // work from pod containers (e.g., Podman Machine without br_netfilter).
+        // Falls back to the kubernetes service ClusterIP (10.96.0.1).
+        let kubernetes_service_host =
+            get_env("KUBERNETES_SERVICE_HOST_OVERRIDE").unwrap_or_else(|| {
+                first_ip_from_cidr(&cluster_service_cidr)
+                    .unwrap_or_else(|_| "10.96.0.1".to_string())
+            });
 
         let config = Self {
             root_dir: PathBuf::from(root_dir),
@@ -521,7 +547,10 @@ mod tests {
 
     #[test]
     fn test_runtime_config_defaults() {
-        let runtime = RuntimeConfig::build(
+        // Empty environment: the env tier outranks the defaults asserted here,
+        // so reading the real one would fail this test for anyone who exports
+        // RUST_LOG or KUBELET_VOLUMES_PATH.
+        let runtime = RuntimeConfig::build_with_env(
             None,
             None,
             None,
@@ -531,6 +560,7 @@ mod tests {
             None,
             "test-node".to_string(),
             vec!["http://localhost:2379".to_string()],
+            |_| None,
         )
         .unwrap();
 
@@ -538,6 +568,35 @@ mod tests {
         assert_eq!(runtime.metrics_bind_port, 8082);
         assert_eq!(runtime.log_level, "info");
         assert!(runtime.volume_dir.ends_with("volumes"));
+    }
+
+    #[test]
+    fn test_runtime_config_env_tier_outranks_defaults() {
+        // The tier the test above has to be insulated from: with no CLI flag and
+        // no config file, an exported value wins over the default.
+        let runtime = RuntimeConfig::build_with_env(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "test-node".to_string(),
+            vec!["http://localhost:2379".to_string()],
+            |key| match key {
+                "RUST_LOG" => Some("debug".to_string()),
+                "KUBELET_VOLUMES_PATH" => Some("/tmp/rusternetes-test-volume-dir".to_string()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(runtime.log_level, "debug");
+        assert_eq!(
+            runtime.volume_dir,
+            PathBuf::from("/tmp/rusternetes-test-volume-dir")
+        );
     }
 
     #[test]

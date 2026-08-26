@@ -6,7 +6,7 @@ use rusternetes_common::resources::{
     HorizontalPodAutoscalerStatus, MetricSpec, MetricStatus, MetricValueStatus, ReplicaSet,
     StatefulSet,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -24,7 +24,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         info!("Starting HorizontalPodAutoscaler controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -32,7 +31,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -82,19 +80,24 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("horizontalpodautoscalers", Some(ns), name);
-            match self.storage.get::<HorizontalPodAutoscaler>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_hpa(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<HorizontalPodAutoscaler>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_hpa(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -105,13 +108,17 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<HorizontalPodAutoscaler>("/registry/horizontalpodautoscalers/").await {
+        match self
+            .storage
+            .list::<HorizontalPodAutoscaler>("/registry/horizontalpodautoscalers/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("horizontalpodautoscalers/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("horizontalpodautoscalers/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -121,6 +128,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Reconciling all HorizontalPodAutoscalers");
 
@@ -478,30 +486,26 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         let mut updated_hpa = hpa.clone();
 
         // Build metric status (simplified for now)
-        let current_metrics = if let Some(specs) = &hpa.spec.metrics {
-            Some(
-                specs
-                    .iter()
-                    .map(|spec| MetricStatus {
-                        metric_type: spec.metric_type.clone(),
-                        resource: spec.resource.as_ref().map(|r| ResourceMetricStatus {
-                            name: r.name.clone(),
-                            current: MetricValueStatus {
-                                value: None,
-                                average_value: None,
-                                average_utilization: Some(85), // Mock current utilization
-                            },
-                        }),
-                        pods: None,
-                        object: None,
-                        external: None,
-                        container_resource: None,
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let current_metrics = hpa.spec.metrics.as_ref().map(|specs| {
+            specs
+                .iter()
+                .map(|spec| MetricStatus {
+                    metric_type: spec.metric_type.clone(),
+                    resource: spec.resource.as_ref().map(|r| ResourceMetricStatus {
+                        name: r.name.clone(),
+                        current: MetricValueStatus {
+                            value: None,
+                            average_value: None,
+                            average_utilization: Some(85), // Mock current utilization
+                        },
+                    }),
+                    pods: None,
+                    object: None,
+                    external: None,
+                    container_resource: None,
+                })
+                .collect()
+        });
 
         // Build conditions
         let now = Utc::now();
@@ -570,6 +574,28 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             hpa.status.as_ref().and_then(|s| s.last_scale_time)
         };
 
+        // K8s convention: condition.last_transition_time updates ONLY when the
+        // condition's .status field actually transitions (e.g. False -> True).
+        // Without this preservation we'd stamp Utc::now() every reconcile and
+        // produce a MODIFIED watch event every interval, even when nothing
+        // changed — a controller-side hot-loop source.
+        let prev_conditions = hpa
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        for new_cond in conditions.iter_mut() {
+            if let Some(prev) = prev_conditions
+                .iter()
+                .find(|p| p.condition_type == new_cond.condition_type)
+            {
+                if prev.status == new_cond.status {
+                    new_cond.last_transition_time = prev.last_transition_time;
+                }
+            }
+        }
+
         updated_hpa.status = Some(HorizontalPodAutoscalerStatus {
             observed_generation: None, // Would need generation tracking in ObjectMeta
             last_scale_time,
@@ -578,6 +604,18 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             current_metrics,
             conditions: Some(conditions),
         });
+
+        // Skip the write when nothing actually changed. Compare via canonical
+        // JSON so optional field ordering doesn't trigger spurious updates.
+        let old_status_json = serde_json::to_value(hpa.status.as_ref()).ok();
+        let new_status_json = serde_json::to_value(updated_hpa.status.as_ref()).ok();
+        if old_status_json == new_status_json {
+            debug!(
+                "HPA {}/{} status unchanged — skipping write",
+                namespace, hpa.metadata.name
+            );
+            return Ok(());
+        }
 
         self.storage.update(&key, &updated_hpa).await?;
         debug!("Updated HPA status: {}/{}", namespace, hpa.metadata.name);
@@ -889,5 +927,87 @@ mod tests {
         // Verify the deployment was scaled
         let updated_deployment: Deployment = storage.get(&key).await.unwrap();
         assert_eq!(updated_deployment.spec.replicas, Some(5));
+    }
+
+    /// Regression test: `update_hpa_status_success` must not rewrite the HPA on
+    /// successive reconciles when nothing has changed. Without preservation of
+    /// each condition's `last_transition_time`, every reconcile cycle stamped
+    /// `Utc::now()` into the conditions and re-wrote the HPA — emitting a
+    /// MODIFIED watch event per interval and a downstream churn loop.
+    #[tokio::test]
+    async fn test_update_hpa_status_idempotent_when_nothing_changes() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = HorizontalPodAutoscalerController::new(storage.clone());
+
+        // Minimal Deployment with replicas matching what the HPA will compute.
+        let mut deployment_spec = DeploymentSpec {
+            replicas: Some(3),
+            selector: rusternetes_common::types::LabelSelector {
+                match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+                match_expressions: None,
+            },
+            template: rusternetes_common::resources::PodTemplateSpec {
+                metadata: Some(ObjectMeta::new("web-pod")),
+                spec: rusternetes_common::resources::PodSpec::default(),
+            },
+            strategy: None,
+            min_ready_seconds: None,
+            revision_history_limit: None,
+            paused: None,
+            progress_deadline_seconds: None,
+        };
+        deployment_spec.replicas = Some(3);
+
+        let mut deployment = Deployment::new("web-app", deployment_spec);
+        deployment.metadata = ObjectMeta::new("web-app").with_namespace("default");
+        deployment.metadata.ensure_uid();
+        deployment.metadata.ensure_creation_timestamp();
+        storage
+            .create(
+                &build_key("deployments", Some("default"), "web-app"),
+                &deployment,
+            )
+            .await
+            .unwrap();
+
+        // HPA targeting that Deployment, with min/max wide enough to leave
+        // ScalingLimited=False so we exercise the within-range branch.
+        let spec = HorizontalPodAutoscalerSpec {
+            scale_target_ref: CrossVersionObjectReference {
+                kind: "Deployment".to_string(),
+                name: "web-app".to_string(),
+                api_version: Some("apps/v1".to_string()),
+            },
+            min_replicas: Some(1),
+            max_replicas: 10,
+            metrics: None,
+            behavior: None,
+        };
+        let hpa = HorizontalPodAutoscaler::new("test-hpa", "default", spec);
+        let hpa_key = build_key("horizontalpodautoscalers", Some("default"), "test-hpa");
+        storage.create(&hpa_key, &hpa).await.unwrap();
+
+        // First reconcile establishes the HPA status + conditions.
+        controller.reconcile_all().await.unwrap();
+        let after_first: HorizontalPodAutoscaler = storage.get(&hpa_key).await.unwrap();
+        let first_v: serde_json::Value = serde_json::to_value(after_first.status.as_ref()).unwrap();
+
+        // Sleep enough that any Utc::now() on a re-write would differ from the
+        // timestamps captured above (chrono::Utc has sub-millisecond resolution
+        // but in tight CI the two calls could otherwise coincide).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Second reconcile over the unchanged cluster must NOT mutate the HPA.
+        controller.reconcile_all().await.unwrap();
+        let after_second: HorizontalPodAutoscaler = storage.get(&hpa_key).await.unwrap();
+        let second_v: serde_json::Value =
+            serde_json::to_value(after_second.status.as_ref()).unwrap();
+
+        assert_eq!(
+            first_v, second_v,
+            "HPA status (incl. condition.last_transition_time fields) must be \
+             semantically equal after a no-op reconcile — otherwise the controller \
+             produces a MODIFIED event every interval (controller hot-loop)."
+        );
     }
 }

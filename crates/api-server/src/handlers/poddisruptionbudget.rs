@@ -208,8 +208,8 @@ pub async fn list(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -271,8 +271,8 @@ pub async fn list_all(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -381,32 +381,6 @@ pub async fn update_status(
 // Use the macro to create a PATCH handler
 crate::patch_handler_namespaced!(patch, PodDisruptionBudget, "poddisruptionbudgets", "policy");
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::resources::{IntOrString, PodDisruptionBudgetSpec};
-    use rusternetes_common::types::LabelSelector;
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_pdb_handler_structure() {
-        // Basic test to ensure handler structure is correct
-        let spec = PodDisruptionBudgetSpec {
-            min_available: Some(IntOrString::Int(2)),
-            max_unavailable: None,
-            selector: LabelSelector {
-                match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
-                match_expressions: None,
-            },
-            unhealthy_pod_eviction_policy: None,
-        };
-
-        let pdb = PodDisruptionBudget::new("test-pdb", "default", spec);
-        assert_eq!(pdb.metadata.name, "test-pdb");
-        assert_eq!(pdb.metadata.namespace, Some("default".to_string()));
-    }
-}
-
 pub async fn deletecollection_poddisruptionbudgets(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -471,4 +445,30 @@ pub async fn deletecollection_poddisruptionbudgets(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::resources::{IntOrString, PodDisruptionBudgetSpec};
+    use rusternetes_common::types::LabelSelector;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_pdb_handler_structure() {
+        // Basic test to ensure handler structure is correct
+        let spec = PodDisruptionBudgetSpec {
+            min_available: Some(IntOrString::Int(2)),
+            max_unavailable: None,
+            selector: LabelSelector {
+                match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+                match_expressions: None,
+            },
+            unhealthy_pod_eviction_policy: None,
+        };
+
+        let pdb = PodDisruptionBudget::new("test-pdb", "default", spec);
+        assert_eq!(pdb.metadata.name, "test-pdb");
+        assert_eq!(pdb.metadata.namespace, Some("default".to_string()));
+    }
 }

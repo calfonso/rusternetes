@@ -1,4 +1,6 @@
-use rusternetes_kubelet::cni::{CniPluginManager, CniRuntime, NetworkConfig};
+use rusternetes_kubelet::cni::config::NetworkConfig;
+use rusternetes_kubelet::cni::plugin::CniPluginManager;
+use rusternetes_kubelet::cni::CniRuntime;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -253,7 +255,8 @@ fn test_cni_result_parsing() {
         }
     }"#;
 
-    let result: Result<rusternetes_kubelet::cni::CniResult, _> = serde_json::from_str(result_json);
+    let result: Result<rusternetes_kubelet::cni::result::CniResult, _> =
+        serde_json::from_str(result_json);
     assert!(result.is_ok(), "Should parse valid CNI result");
 
     let cni_result = result.unwrap();

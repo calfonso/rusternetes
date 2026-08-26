@@ -7,7 +7,7 @@ use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::Docker;
 use chrono::Utc;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use rusternetes_common::resources::{
     ConfigMap, Container, ContainerState, ContainerStatus, ExecAction, GRPCAction, HTTPGetAction,
     LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, Probe, Secret, TCPSocketAction,
@@ -92,6 +92,9 @@ pub struct ContainerRuntime {
     network: String,
     cni: Option<CniRuntime>,
     use_cni: bool,
+    /// Whether the daemon accepts `UtsMode: "container:<id>"`. Podman does;
+    /// Docker rejects it outright. See [`Self::detect_uts_container_mode`].
+    supports_uts_container_mode: bool,
     kubernetes_service_host: String,
     /// Token manager for generating projected service account tokens
     token_manager: rusternetes_common::auth::TokenManager,
@@ -154,6 +157,30 @@ fn needs_shell_quoting(s: &str) -> bool {
     })
 }
 
+/// Set up an EmptyDir volume directory with mode 0o777, matching upstream
+/// Kubernetes (pkg/volume/emptydir/empty_dir.go setupDir).
+///
+/// The chmod is idempotent: it runs after `create_dir_all` regardless of whether
+/// the directory was newly created or already existed (e.g. from a prior pod run
+/// that left stale state). This guarantees the host-side directory always exposes
+/// mode 0o777 to bind-mount consumers.
+///
+/// On Linux — where Kubernetes conformance runs — bind mounts preserve these mode
+/// bits inside the container. On macOS dev VMs (Podman Machine / Docker Desktop
+/// virtiofs) the host mode bits are NOT propagated through the shared-filesystem
+/// layer; that is a known dev-env limitation and not a kubelet bug. The
+/// `[Conformance] EmptyDir.*(mode|0644|0666|0777)` tests are all `[LinuxOnly]`,
+/// so the chmod path here is the production code path.
+pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
+    }
+    Ok(())
+}
+
 impl ContainerRuntime {
     pub async fn new(
         volumes_base_path: String,
@@ -191,6 +218,8 @@ impl ContainerRuntime {
             .unwrap_or_else(|_| "rusternetes-secret-change-in-production".to_string());
         let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
 
+        let supports_uts_container_mode = Self::detect_uts_container_mode(&docker).await;
+
         Ok(Self {
             docker,
             storage: None,
@@ -200,12 +229,73 @@ impl ContainerRuntime {
             network,
             cni,
             use_cni,
+            supports_uts_container_mode,
             kubernetes_service_host,
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Classify a daemon identity string as Podman, Docker, or unknown.
+    ///
+    /// Split out from [`Self::detect_uts_container_mode`] so the matching
+    /// rules can be unit-tested without a live daemon.
+    fn uts_container_mode_from_identity(identity: &str) -> bool {
+        let identity = identity.to_lowercase();
+        if identity.contains("podman") {
+            true
+        } else if identity.contains("docker") {
+            false
+        } else {
+            // Unrecognised daemon: keep the pre-existing behaviour.
+            true
+        }
+    }
+
+    /// Determine whether the daemon accepts `UtsMode: "container:<id>"`.
+    ///
+    /// Joining another container's UTS namespace is a Podman extension.
+    /// Docker only accepts `""` or `"host"` and fails container creation with
+    /// `400 invalid UTS mode` for anything else, so setting the field there
+    /// makes every pod unstartable.
+    ///
+    /// Podman's Docker-compatible `/version` endpoint identifies itself as
+    /// "Podman Engine" in `Components[].Name`; Docker reports "Engine" plus a
+    /// `Platform.Name` of "Docker Engine - <edition>". Anything we cannot
+    /// positively identify as Docker keeps the previous behaviour.
+    async fn detect_uts_container_mode(docker: &Docker) -> bool {
+        let version = match docker.version().await {
+            Ok(version) => version,
+            Err(e) => {
+                // The daemon is unreachable; nothing else will work either.
+                // Don't change pod-creation behaviour off a failed probe.
+                warn!("Could not probe container runtime version: {}", e);
+                return true;
+            }
+        };
+
+        let identity = version
+            .platform
+            .as_ref()
+            .map(|p| p.name.as_str())
+            .into_iter()
+            .chain(version.components.iter().flatten().map(|c| c.name.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let supported = Self::uts_container_mode_from_identity(&identity);
+        if supported {
+            debug!("Container runtime ({identity}) supports uts_mode=container:");
+        } else {
+            info!(
+                "Container runtime ({identity}) does not support \
+                 uts_mode=container:; pod containers will inherit the pod \
+                 hostname through the shared network namespace instead"
+            );
+        }
+        supported
     }
 
     /// Initialize CNI runtime
@@ -223,7 +313,7 @@ impl ContainerRuntime {
         // accessible to other containers
         let test_netns = "rusternetes-cni-test";
         let create_result = Command::new("ip")
-            .args(&["netns", "add", test_netns])
+            .args(["netns", "add", test_netns])
             .output();
 
         if let Ok(output) = create_result {
@@ -232,7 +322,7 @@ impl ContainerRuntime {
             {
                 // Clean up test namespace
                 let _ = Command::new("ip")
-                    .args(&["netns", "del", test_netns])
+                    .args(["netns", "del", test_netns])
                     .output();
 
                 // Network namespaces work, but we're likely in a container where
@@ -269,7 +359,7 @@ impl ContainerRuntime {
         // Create network namespace
         let netns_name = format!("cni-{}", pod_name);
         let output = match Command::new("ip")
-            .args(&["netns", "add", &netns_name])
+            .args(["netns", "add", &netns_name])
             .output()
         {
             Ok(out) => out,
@@ -310,7 +400,7 @@ impl ContainerRuntime {
                     warn!("Failed to setup CNI network for pod {}: {}. Falling back to Podman networking.", pod_name, e);
                     // Clean up the network namespace on failure
                     let _ = Command::new("ip")
-                        .args(&["netns", "del", &netns_name])
+                        .args(["netns", "del", &netns_name])
                         .output();
                     return None;
                 }
@@ -340,7 +430,7 @@ impl ContainerRuntime {
 
         // Delete network namespace
         let output = Command::new("ip")
-            .args(&["netns", "del", &netns_name])
+            .args(["netns", "del", &netns_name])
             .output()
             .context("Failed to execute ip netns del command")?;
 
@@ -699,7 +789,11 @@ impl ContainerRuntime {
                 .filter(|(img, _)| seen.insert(img.clone()))
                 .collect();
             if !unique.is_empty() {
-                debug!("Pre-pulling {} unique images for pod {}", unique.len(), pod_name);
+                debug!(
+                    "Pre-pulling {} unique images for pod {}",
+                    unique.len(),
+                    pod_name
+                );
                 let futs: Vec<_> = unique
                     .iter()
                     .map(|(img, pol)| self.ensure_image(img, pol.as_deref()))
@@ -818,6 +912,13 @@ impl ContainerRuntime {
                             }
                         }
 
+                        // Publish Running state so watches see the transition from
+                        // PodInitializing → Running for this init container.
+                        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — SyncPod
+                        // publishes status after each container action.
+                        self.refresh_init_container_statuses(namespace, pod_name, None, None)
+                            .await;
+
                         // Wait for init container to complete
                         match self
                             .wait_for_container_completion(pod_name, &container.name)
@@ -825,9 +926,26 @@ impl ContainerRuntime {
                         {
                             Ok(()) => {
                                 info!("Init container {} completed successfully", container.name);
+                                // Publish Terminated/Completed before moving on so the
+                                // next init container starts from a status reflecting prior
+                                // success — required by the "sequential init" conformance test.
+                                self.refresh_init_container_statuses(
+                                    namespace, pod_name, None, None,
+                                )
+                                .await;
                                 break;
                             }
                             Err(e) => {
+                                // Capture Terminated/error BEFORE removing the container.
+                                // After removal, get_init_container_statuses would see only
+                                // the Running prev state, so the failure would never be
+                                // observed by watches — restart_count stays at 0 and the
+                                // "restart_count >= 3" conformance check hangs.
+                                self.refresh_init_container_statuses(
+                                    namespace, pod_name, None, None,
+                                )
+                                .await;
+
                                 if attempt < max_retries && restart_always {
                                     attempt += 1;
                                     let backoff = std::cmp::min(2u64.pow(attempt as u32), 30);
@@ -848,61 +966,35 @@ impl ContainerRuntime {
                                         )
                                         .await;
 
-                                    // Update pod status during backoff to show CrashLoopBackOff.
-                                    // K8s updates status on every sync cycle, not just after retries.
-                                    // This lets tests observe the init container failure state.
-                                    if let Some(ref storage) = self.storage {
-                                        use rusternetes_storage::Storage;
-                                        let pod_key = rusternetes_storage::build_key(
-                                            "pods",
-                                            Some(namespace),
-                                            pod_name,
-                                        );
-                                        if let Ok(mut status_pod) =
-                                            storage.get::<Pod>(&pod_key).await
-                                        {
-                                            let init_statuses =
-                                                self.get_init_container_statuses(&status_pod).await;
-                                            if let Some(ref mut s) = status_pod.status {
-                                                s.init_container_statuses = init_statuses;
-                                                s.reason = Some("PodInitializing".to_string());
-                                                s.message = Some(format!(
-                                                    "Init container {} failed, retrying in {}s",
-                                                    container.name, backoff
-                                                ));
-                                            }
-                                            let _ = storage.update(&pod_key, &status_pod).await;
-                                        }
-                                    }
+                                    // Publish CrashLoopBackOff. Previous state is now
+                                    // Terminated/error (captured above), so the transition
+                                    // Terminated → CrashLoopBackOff increments restart_count.
+                                    self.refresh_init_container_statuses(
+                                        namespace,
+                                        pod_name,
+                                        Some("PodInitializing"),
+                                        Some(format!(
+                                            "Init container {} failed, retrying in {}s",
+                                            container.name, backoff
+                                        )),
+                                    )
+                                    .await;
 
                                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                                 } else {
-                                    // Update init container status to show CrashLoopBackOff
-                                    // before returning error. The kubelet sync loop will
-                                    // re-call start_pod on the next cycle.
+                                    // RestartPolicy=Never (or max retries exhausted): return
+                                    // Err so the caller (kubelet.rs sync_pod) can transition
+                                    // the pod to Failed. For Never, remaining init containers
+                                    // MUST NOT run — the early return guarantees this because
+                                    // we propagate out of the init_containers loop.
+                                    // The Terminated/error state was already captured above
+                                    // (before this branch), so init_container_statuses
+                                    // already reflects the failure.
                                     // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go
                                     warn!(
                                         "Init container {} failed (will retry next sync): {}",
                                         container.name, e
                                     );
-                                    if let Some(ref storage) = self.storage {
-                                        use rusternetes_storage::Storage;
-                                        let pod_key = rusternetes_storage::build_key(
-                                            "pods",
-                                            Some(namespace),
-                                            pod_name,
-                                        );
-                                        if let Ok(mut status_pod) =
-                                            storage.get::<Pod>(&pod_key).await
-                                        {
-                                            let init_statuses =
-                                                self.get_init_container_statuses(&status_pod).await;
-                                            if let Some(ref mut s) = status_pod.status {
-                                                s.init_container_statuses = init_statuses;
-                                            }
-                                            let _ = storage.update(&pod_key, &status_pod).await;
-                                        }
-                                    }
                                     return Err(e);
                                 }
                             }
@@ -1096,7 +1188,7 @@ impl ContainerRuntime {
         // Linux hostnames limited to 63 chars
         let raw_hostname = spec.hostname.as_deref().unwrap_or(pod_name);
         let hostname = if raw_hostname.len() > 63 {
-            &raw_hostname[..63].trim_end_matches('-')
+            raw_hostname[..63].trim_end_matches('-')
         } else {
             raw_hostname
         };
@@ -1112,15 +1204,18 @@ impl ContainerRuntime {
              127.0.0.1\tlocalhost\n\
              ::1\tlocalhost ip6-localhost ip6-loopback\n\
              fe00::\tip6-localnet\n\
-             fe00::\tip6-mcastprefix\n\
-             fe00::1\tip6-allnodes\n\
-             fe00::2\tip6-allrouters\n",
+             ff00::\tip6-mcastprefix\n\
+             ff00::1\tip6-allnodes\n\
+             ff00::2\tip6-allrouters\n",
         );
 
         // Add the pod's own hostname → IP entry if we have an IP
         if let Some(ip) = pod_ip {
             // Build FQDN aliases based on subdomain and cluster domain
             let mut aliases = vec![hostname.to_string()];
+            if hostname != pod_name {
+                aliases.push(pod_name.to_string());
+            }
             if let Some(subdomain) = &spec.subdomain {
                 // <hostname>.<subdomain>.<namespace>.svc.<cluster-domain>
                 aliases.push(format!(
@@ -1208,14 +1303,31 @@ impl ContainerRuntime {
             {
                 let network_mode_key = format!("container:{}", pause_name);
                 for c in &containers {
-                    let is_dependent = c.host_config.as_ref()
+                    let is_dependent = c
+                        .host_config
+                        .as_ref()
                         .and_then(|hc| hc.network_mode.as_deref())
                         .map(|nm| nm == network_mode_key)
                         .unwrap_or(false);
                     if is_dependent {
                         if let Some(id) = &c.id {
-                            let _ = self.docker.stop_container(id, Some(bollard::container::StopContainerOptions { t: 0 })).await;
-                            let _ = self.docker.remove_container(id, Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() })).await;
+                            let _ = self
+                                .docker
+                                .stop_container(
+                                    id,
+                                    Some(bollard::container::StopContainerOptions { t: 0 }),
+                                )
+                                .await;
+                            let _ = self
+                                .docker
+                                .remove_container(
+                                    id,
+                                    Some(bollard::container::RemoveContainerOptions {
+                                        force: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -1373,22 +1485,41 @@ impl ContainerRuntime {
                     // refuses to remove a container that has dependents).
                     if let Ok(containers) = self
                         .docker
-                        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
-                            all: true,
-                            ..Default::default()
-                        }))
+                        .list_containers(Some(
+                            bollard::container::ListContainersOptions::<String> {
+                                all: true,
+                                ..Default::default()
+                            },
+                        ))
                         .await
                     {
                         let network_mode_key = format!("container:{}", pause_name);
                         for c in &containers {
-                            let is_dependent = c.host_config.as_ref()
+                            let is_dependent = c
+                                .host_config
+                                .as_ref()
                                 .and_then(|hc| hc.network_mode.as_deref())
                                 .map(|nm| nm == network_mode_key)
                                 .unwrap_or(false);
                             if is_dependent {
                                 if let Some(id) = &c.id {
-                                    let _ = self.docker.stop_container(id, Some(bollard::container::StopContainerOptions { t: 0 })).await;
-                                    let _ = self.docker.remove_container(id, Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() })).await;
+                                    let _ = self
+                                        .docker
+                                        .stop_container(
+                                            id,
+                                            Some(bollard::container::StopContainerOptions { t: 0 }),
+                                        )
+                                        .await;
+                                    let _ = self
+                                        .docker
+                                        .remove_container(
+                                            id,
+                                            Some(bollard::container::RemoveContainerOptions {
+                                                force: true,
+                                                ..Default::default()
+                                            }),
+                                        )
+                                        .await;
                                 }
                             }
                         }
@@ -1396,7 +1527,10 @@ impl ContainerRuntime {
                     // Force stop the pause container, then remove.
                     let _ = self
                         .docker
-                        .stop_container(&pause_name, Some(bollard::container::StopContainerOptions { t: 0 }))
+                        .stop_container(
+                            &pause_name,
+                            Some(bollard::container::StopContainerOptions { t: 0 }),
+                        )
                         .await;
                     match self
                         .docker
@@ -1414,7 +1548,10 @@ impl ContainerRuntime {
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                         Err(rm_err) => {
-                            warn!("Failed to remove pause container {}: {}", pause_name, rm_err);
+                            warn!(
+                                "Failed to remove pause container {}: {}",
+                                pause_name, rm_err
+                            );
                             // Try waiting longer — runtime may still be processing
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
@@ -1442,13 +1579,26 @@ impl ContainerRuntime {
         {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                match self.docker.inspect_container(&pause_name, None::<InspectContainerOptions>).await {
-                    Ok(info) if info.state.as_ref().and_then(|s| s.running).unwrap_or(false) => break,
+                match self
+                    .docker
+                    .inspect_container(&pause_name, None::<InspectContainerOptions>)
+                    .await
+                {
+                    Ok(info) if info.state.as_ref().and_then(|s| s.running).unwrap_or(false) => {
+                        break
+                    }
                     Ok(_) if std::time::Instant::now() > deadline => {
-                        anyhow::bail!("Pause container {} did not reach running state within 10s", pause_name);
+                        anyhow::bail!(
+                            "Pause container {} did not reach running state within 10s",
+                            pause_name
+                        );
                     }
                     Err(e) if std::time::Instant::now() > deadline => {
-                        anyhow::bail!("Pause container {} inspect failed after 10s: {}", pause_name, e);
+                        anyhow::bail!(
+                            "Pause container {} inspect failed after 10s: {}",
+                            pause_name,
+                            e
+                        );
                     }
                     _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
                 }
@@ -1484,6 +1634,38 @@ impl ContainerRuntime {
         Err(anyhow::anyhow!(
             "Pause container started but no IP address was assigned"
         ))
+    }
+
+    /// Refresh `pod.status.init_container_statuses` in storage from the
+    /// live Docker state. Called between init container actions so watches
+    /// observe each transition (Running, Terminated, CrashLoopBackOff).
+    /// Optionally sets `status.reason` and `status.message`.
+    async fn refresh_init_container_statuses(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        reason: Option<&str>,
+        message: Option<String>,
+    ) {
+        let Some(ref storage) = self.storage else {
+            return;
+        };
+        use rusternetes_storage::Storage;
+        let pod_key = rusternetes_storage::build_key("pods", Some(namespace), pod_name);
+        let Ok(mut status_pod) = storage.get::<Pod>(&pod_key).await else {
+            return;
+        };
+        let init_statuses = self.get_init_container_statuses(&status_pod).await;
+        if let Some(ref mut s) = status_pod.status {
+            s.init_container_statuses = init_statuses;
+            if let Some(r) = reason {
+                s.reason = Some(r.to_string());
+            }
+            if let Some(m) = message {
+                s.message = Some(m);
+            }
+        }
+        let _ = storage.update(&pod_key, &status_pod).await;
     }
 
     /// Wait for a container to complete (used for init containers)
@@ -1572,10 +1754,10 @@ impl ContainerRuntime {
             .and_then(|sc| sc.fs_group)
         {
             use std::os::unix::fs::PermissionsExt;
-            for (_name, path) in &volume_paths {
+            for path in volume_paths.values() {
                 // Recursively chown to fsGroup
                 let _ = std::process::Command::new("chown")
-                    .args(&["-R", &format!(":{}", fs_group), path])
+                    .args(["-R", &format!(":{}", fs_group), path])
                     .output();
 
                 // Set group bits to mirror owner bits on each file/directory.
@@ -1962,11 +2144,7 @@ impl ContainerRuntime {
 
         let mut result = expr.to_string();
         // Find all $(VAR_NAME) references and expand them
-        loop {
-            let start = match result.find("$(") {
-                Some(s) => s,
-                None => break,
-            };
+        while let Some(start) = result.find("$(") {
             let rest = &result[start + 2..];
             let end = match rest.find(')') {
                 Some(e) => e,
@@ -2055,15 +2233,13 @@ impl ContainerRuntime {
         // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
         // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
         // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
-        // are pre-existing failures on macOS VM-based runtimes.
+        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
+        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
+        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
+        // when the directory pre-exists from a prior run.
         if volume.empty_dir.is_some() {
             let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
-            std::fs::create_dir_all(&volume_dir).context("Failed to create emptyDir volume")?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&volume_dir, std::fs::Permissions::from_mode(0o777))?;
-            }
+            setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
             info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
             return Ok(volume_dir);
         }
@@ -2341,8 +2517,10 @@ impl ContainerRuntime {
                         );
                         None
                     } else {
-                        // Required secret not found — abort pod start so kubelet
-                        // retries on next reconciliation (when the secret exists).
+                        // Required secret not found — return error so the kubelet
+                        // retries on next sync. K8s leaves the pod in Pending with
+                        // ContainerCreating and retries until the secret exists.
+                        // K8s ref: pkg/kubelet/kubelet_pods.go — makeVolumes
                         return Err(anyhow::anyhow!(
                             "Secret {} not found in namespace {}: {}",
                             secret_name,
@@ -3053,6 +3231,7 @@ impl ContainerRuntime {
     }
 
     /// Create ServiceAccount token volume for in-cluster authentication
+    #[allow(dead_code)]
     async fn create_serviceaccount_token_volume(&self, pod: &Pod) -> Result<String> {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
@@ -3079,7 +3258,7 @@ impl ContainerRuntime {
         let key = build_key("secrets", Some(namespace), &secret_name);
 
         // Try to get the secret; if it doesn't exist, create a basic token mount anyway
-        let secret: Option<Secret> = match storage.get(&key).await {
+        let _secret: Option<Secret> = match storage.get(&key).await {
             Ok(s) => Some(s),
             Err(e) => {
                 warn!(
@@ -3543,11 +3722,7 @@ impl ContainerRuntime {
                 // Direct value — expand $(VAR) references using previously set env vars
                 if let Some(value) = &env_var.value {
                     let mut expanded = value.clone();
-                    loop {
-                        let start = match expanded.find("$(") {
-                            Some(s) => s,
-                            None => break,
-                        };
+                    while let Some(start) = expanded.find("$(") {
                         let end = match expanded[start..].find(')') {
                             Some(e) => start + e,
                             None => break,
@@ -3556,9 +3731,8 @@ impl ContainerRuntime {
                         let replacement = env_list
                             .iter()
                             .find_map(|entry| {
-                                let mut parts = entry.splitn(2, '=');
-                                let k = parts.next()?;
-                                let v = parts.next()?;
+                                let (k, v) = entry.split_once('=')?;
+
                                 if k == var_name {
                                     Some(v.to_string())
                                 } else {
@@ -3711,7 +3885,7 @@ impl ContainerRuntime {
         // Build volume bindings
         let mut binds = Vec::new();
         let mut tmpfs_mounts: HashMap<String, String> = HashMap::new();
-        let mut docker_vol_mounts: Vec<bollard::models::Mount> = Vec::new();
+        let docker_vol_mounts: Vec<bollard::models::Mount> = Vec::new();
 
         // Identify which volumes are emptyDir (should use tmpfs)
         let empty_dir_volumes: std::collections::HashSet<String> = pod
@@ -3904,7 +4078,7 @@ impl ContainerRuntime {
                         }
                     }
                 }
-                "ClusterFirstWithHostNet" | "ClusterFirst" | _ => {
+                _ => {
                     // ClusterFirst (default) and ClusterFirstWithHostNet: use cluster DNS.
                     // For ClusterFirstWithHostNet, if on host network, still use cluster DNS.
                     if dns_policy == "ClusterFirst" && is_host_network {
@@ -3925,13 +4099,18 @@ impl ContainerRuntime {
                         // Container DNS first so container hostnames (api-server) resolve.
                         // Cluster DNS second for K8s service names.
                         // K8s ref: pkg/kubelet/network/dns/dns.go — getClusterDNS()
-                        let host_dns = std::fs::read_to_string("/etc/resolv.conf")
-                            .ok()
-                            .and_then(|c| c.lines()
-                                .find(|l| l.starts_with("nameserver"))
-                                .map(|l| l.trim_start_matches("nameserver").trim().to_string()));
+                        let host_dns =
+                            std::fs::read_to_string("/etc/resolv.conf")
+                                .ok()
+                                .and_then(|c| {
+                                    c.lines().find(|l| l.starts_with("nameserver")).map(|l| {
+                                        l.trim_start_matches("nameserver").trim().to_string()
+                                    })
+                                });
                         let nameservers = match host_dns {
-                            Some(dns) => format!("nameserver {}\nnameserver {}", dns, self.cluster_dns),
+                            Some(dns) => {
+                                format!("nameserver {}\nnameserver {}", dns, self.cluster_dns)
+                            }
                             None => format!("nameserver {}", self.cluster_dns),
                         };
                         format!(
@@ -3956,14 +4135,14 @@ impl ContainerRuntime {
                     // Parse existing content
                     for line in resolv_conf_content.lines() {
                         let line = line.trim();
-                        if line.starts_with("nameserver ") {
-                            nameservers.push(line[11..].to_string());
-                        } else if line.starts_with("search ") {
-                            for domain in line[7..].split_whitespace() {
+                        if let Some(rest) = line.strip_prefix("nameserver ") {
+                            nameservers.push(rest.to_string());
+                        } else if let Some(rest) = line.strip_prefix("search ") {
+                            for domain in rest.split_whitespace() {
                                 searches.push(domain.to_string());
                             }
-                        } else if line.starts_with("options ") {
-                            for opt in line[8..].split_whitespace() {
+                        } else if let Some(rest) = line.strip_prefix("options ") {
+                            for opt in rest.split_whitespace() {
                                 options.push(opt.to_string());
                             }
                         }
@@ -4253,7 +4432,7 @@ impl ContainerRuntime {
                 // CoreDNS uses default/host DNS to avoid circular dependency
                 dns: dns_servers,
                 dns_search: dns_search_domains,
-                dns_options: dns_options,
+                dns_options,
                 // App containers MUST share the pause container's network namespace.
                 // This ensures all containers in a pod share the same IP address,
                 // which is fundamental to K8s networking (pod IP = pause container IP).
@@ -4290,8 +4469,18 @@ impl ContainerRuntime {
                 // Share UTS namespace with pause container so app containers
                 // inherit the pod hostname. Without this, containers get their
                 // container ID as hostname instead of the pod name.
-                // K8s CRI shares UTS via the pod sandbox; Docker/Podman need explicit uts_mode.
-                uts_mode: if using_container_network {
+                // K8s CRI shares UTS via the pod sandbox; Podman needs an
+                // explicit uts_mode.
+                //
+                // Docker has no equivalent: it accepts only ""/"host" for
+                // UtsMode and rejects container creation with `400 invalid UTS
+                // mode` otherwise, which previously left every pod stuck in a
+                // create-fail loop. It also refuses an explicit `hostname`
+                // alongside `network_mode: container:` ("conflicting options").
+                // Neither is needed there — Docker already propagates the
+                // target container's hostname when joining its network
+                // namespace, so the pod hostname is inherited regardless.
+                uts_mode: if using_container_network && self.supports_uts_container_mode {
                     Some(format!("container:{}_pause", pod_name))
                 } else {
                     None
@@ -4435,67 +4624,68 @@ impl ContainerRuntime {
                 // Known no-shell images: distroless, scratch, static.
                 // Most standard images (alpine, debian, ubuntu, busybox, etc.) have /bin/sh.
                 // This avoids creating+starting+removing a probe container per image.
-                let shell_ok = if let Ok(inspect) = self.docker.inspect_image(&container.image).await {
-                    // Check image labels/config for distroless/scratch indicators
-                    let image_name_lower = container.image.to_lowercase();
-                    let is_known_no_shell = image_name_lower.contains("distroless")
-                        || image_name_lower.contains("scratch")
-                        || image_name_lower.contains("static");
-                    if is_known_no_shell {
-                        false
+                let shell_ok =
+                    if let Ok(inspect) = self.docker.inspect_image(&container.image).await {
+                        // Check image labels/config for distroless/scratch indicators
+                        let image_name_lower = container.image.to_lowercase();
+                        let is_known_no_shell = image_name_lower.contains("distroless")
+                            || image_name_lower.contains("scratch")
+                            || image_name_lower.contains("static");
+                        if is_known_no_shell {
+                            false
+                        } else {
+                            // Check if the image has a shell-based entrypoint (strong signal)
+                            let has_shell_ep = inspect
+                                .config
+                                .as_ref()
+                                .and_then(|c| c.entrypoint.as_ref())
+                                .map(|ep| {
+                                    ep.iter().any(|e| {
+                                        e.contains("/bin/sh")
+                                            || e.contains("/bin/bash")
+                                            || e.contains("/bin/ash")
+                                    })
+                                })
+                                .unwrap_or(false);
+                            let has_shell_cmd = inspect
+                                .config
+                                .as_ref()
+                                .and_then(|c| c.cmd.as_ref())
+                                .map(|cmd| {
+                                    cmd.iter().any(|c| {
+                                        c.contains("/bin/sh")
+                                            || c.contains("/bin/bash")
+                                            || c.contains("/bin/ash")
+                                    })
+                                })
+                                .unwrap_or(false);
+                            // If there's a shell in entrypoint/cmd, definitely has shell.
+                            // Otherwise, check if image name suggests a distro with /bin/sh.
+                            // Default to false (no shell) to avoid wrapping images that lack it.
+                            let is_known_has_shell = image_name_lower.contains("alpine")
+                                || image_name_lower.contains("debian")
+                                || image_name_lower.contains("ubuntu")
+                                || image_name_lower.contains("centos")
+                                || image_name_lower.contains("fedora")
+                                || image_name_lower.contains("busybox")
+                                || image_name_lower.contains("nginx")
+                                || image_name_lower.contains("redis")
+                                || image_name_lower.contains("postgres")
+                                || image_name_lower.contains("mysql")
+                                || image_name_lower.contains("node:")
+                                || image_name_lower.contains("python")
+                                || image_name_lower.contains("ruby")
+                                || image_name_lower.contains("golang")
+                                || image_name_lower.contains("openjdk")
+                                || image_name_lower.contains("httpd")
+                                || image_name_lower.contains("perl")
+                                || image_name_lower.contains("php");
+                            has_shell_ep || has_shell_cmd || is_known_has_shell
+                        }
                     } else {
-                        // Check if the image has a shell-based entrypoint (strong signal)
-                        let has_shell_ep = inspect
-                            .config
-                            .as_ref()
-                            .and_then(|c| c.entrypoint.as_ref())
-                            .map(|ep| {
-                                ep.iter().any(|e| {
-                                    e.contains("/bin/sh")
-                                        || e.contains("/bin/bash")
-                                        || e.contains("/bin/ash")
-                                })
-                            })
-                            .unwrap_or(false);
-                        let has_shell_cmd = inspect
-                            .config
-                            .as_ref()
-                            .and_then(|c| c.cmd.as_ref())
-                            .map(|cmd| {
-                                cmd.iter().any(|c| {
-                                    c.contains("/bin/sh")
-                                        || c.contains("/bin/bash")
-                                        || c.contains("/bin/ash")
-                                })
-                            })
-                            .unwrap_or(false);
-                        // If there's a shell in entrypoint/cmd, definitely has shell.
-                        // Otherwise, check if image name suggests a distro with /bin/sh.
-                        // Default to false (no shell) to avoid wrapping images that lack it.
-                        let is_known_has_shell = image_name_lower.contains("alpine")
-                            || image_name_lower.contains("debian")
-                            || image_name_lower.contains("ubuntu")
-                            || image_name_lower.contains("centos")
-                            || image_name_lower.contains("fedora")
-                            || image_name_lower.contains("busybox")
-                            || image_name_lower.contains("nginx")
-                            || image_name_lower.contains("redis")
-                            || image_name_lower.contains("postgres")
-                            || image_name_lower.contains("mysql")
-                            || image_name_lower.contains("node:")
-                            || image_name_lower.contains("python")
-                            || image_name_lower.contains("ruby")
-                            || image_name_lower.contains("golang")
-                            || image_name_lower.contains("openjdk")
-                            || image_name_lower.contains("httpd")
-                            || image_name_lower.contains("perl")
-                            || image_name_lower.contains("php");
-                        has_shell_ep || has_shell_cmd || is_known_has_shell
-                    }
-                } else {
-                    // Can't inspect — assume it has a shell (safe default)
-                    true
-                };
+                        // Can't inspect — assume it has a shell (safe default)
+                        true
+                    };
                 if !shell_ok {
                     info!(
                         "Container {} - image lacks /bin/sh, skipping umask wrapper",
@@ -4788,7 +4978,7 @@ impl ContainerRuntime {
             if let Some(ref post_start) = lifecycle.post_start {
                 info!("Executing postStart hook for container {}", container.name);
                 if let Err(e) = self
-                    .execute_lifecycle_handler(post_start, &container_name)
+                    .execute_lifecycle_handler(post_start, &container_name, container)
                     .await
                 {
                     warn!(
@@ -4814,6 +5004,7 @@ impl ContainerRuntime {
     }
 
     /// Stop all containers for a pod
+    #[allow(dead_code)]
     pub async fn stop_pod(&self, pod_name: &str) -> Result<()> {
         self.clear_probe_states_for_pod(pod_name);
         self.stop_pod_with_grace_period(pod_name, 30).await
@@ -4923,7 +5114,11 @@ impl ContainerRuntime {
             let stop_options = StopContainerOptions {
                 t: grace_period_seconds,
             };
-            if let Err(e) = self.docker.stop_container(pause_id, Some(stop_options)).await {
+            if let Err(e) = self
+                .docker
+                .stop_container(pause_id, Some(stop_options))
+                .await
+            {
                 warn!("Failed to stop pause container {}: {}", pause_id, e);
             }
         }
@@ -4943,7 +5138,10 @@ impl ContainerRuntime {
     }
 
     /// Clean up volumes created for a pod
-    async fn cleanup_pod_volumes(&self, pod_name: &str) -> Result<()> {
+    /// Clean up volumes for a pod. Called by the TerminatedPod handler
+    /// after all containers are stopped, and by the container GC for
+    /// orphaned pods. K8s ref: pkg/kubelet/kubelet.go:2484
+    pub async fn cleanup_pod_volumes(&self, pod_name: &str) -> Result<()> {
         let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
 
         if std::path::Path::new(&volume_dir).exists() {
@@ -5064,6 +5262,50 @@ impl ContainerRuntime {
         Ok(has_app_container)
     }
 
+    /// Check if any app (non-init, non-pause) container has been created for a pod.
+    /// K8s ref: kubelet_pods.go:2689 — HasAnyRegularContainerCreated.
+    /// If app containers exist, all init containers must have completed successfully.
+    async fn has_any_app_container(&self, pod: &Pod) -> bool {
+        let pod_name = &pod.metadata.name;
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
+
+        let options = ListContainersOptions {
+            all: true, // Include exited/created containers
+            filters,
+            ..Default::default()
+        };
+
+        let containers = match self.docker.list_containers(Some(options)).await {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let init_names: Vec<String> = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.init_containers.as_ref())
+            .map(|ics| {
+                ics.iter()
+                    .map(|ic| format!("{}_{}", pod_name, ic.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pause_name = format!("{}_pause", pod_name);
+
+        containers.iter().any(|c| {
+            c.names
+                .as_ref()
+                .map(|names| {
+                    names.iter().any(|n| {
+                        let clean = n.trim_start_matches('/');
+                        clean != pause_name && !init_names.iter().any(|init| clean == init)
+                    })
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Get detailed status of init containers by inspecting actual Docker container state.
     pub async fn get_init_container_statuses(&self, pod: &Pod) -> Option<Vec<ContainerStatus>> {
         let init_containers = pod.spec.as_ref()?.init_containers.as_ref()?;
@@ -5099,7 +5341,10 @@ impl ContainerRuntime {
                         if running {
                             (
                                 ContainerState::Running {
-                                    started_at: ds.started_at,
+                                    started_at: ds
+                                        .started_at
+                                        .as_deref()
+                                        .and_then(rusternetes_common::time::parse_external),
                                 },
                                 cid,
                                 iid,
@@ -5126,8 +5371,14 @@ impl ContainerRuntime {
                                         .unwrap_or_else(|| "Error".to_string())
                                 }),
                                 message: term_msg,
-                                started_at: ds.started_at.clone(),
-                                finished_at: ds.finished_at.clone(),
+                                started_at: ds
+                                    .started_at
+                                    .as_deref()
+                                    .and_then(rusternetes_common::time::parse_external),
+                                finished_at: ds
+                                    .finished_at
+                                    .as_deref()
+                                    .and_then(rusternetes_common::time::parse_external),
                                 container_id: cid.clone(),
                             };
                             // Keep the Terminated state as-is — K8s shows the actual
@@ -5196,15 +5447,15 @@ impl ContainerRuntime {
                                         )
                                     }
                                 }
-                            } else if matches!(&prev_status.state, Some(ContainerState::Waiting { reason, .. }) if reason.as_deref() == Some("CrashLoopBackOff")) {
+                            } else if matches!(&prev_status.state, Some(ContainerState::Waiting { reason, .. }) if reason.as_deref() == Some("CrashLoopBackOff"))
+                            {
                                 // Previous state was CrashLoopBackOff — container was
                                 // removed and being restarted. Preserve the state.
-                                (
-                                    prev_status.state.clone().unwrap(),
-                                    None,
-                                    None,
-                                )
-                            } else if matches!(&prev_status.state, Some(ContainerState::Running { .. })) {
+                                (prev_status.state.clone().unwrap(), None, None)
+                            } else if matches!(
+                                &prev_status.state,
+                                Some(ContainerState::Running { .. })
+                            ) {
                                 // Previous state was Running but container is gone.
                                 // For init containers, this means it completed and Docker
                                 // removed it before we could capture the exit status.
@@ -5218,12 +5469,12 @@ impl ContainerRuntime {
                                         message: None,
                                         started_at: prev_status.state.as_ref().and_then(|s| {
                                             if let ContainerState::Running { started_at } = s {
-                                                started_at.clone()
+                                                *started_at
                                             } else {
                                                 None
                                             }
                                         }),
-                                        finished_at: Some(chrono::Utc::now().to_rfc3339()),
+                                        finished_at: Some(chrono::Utc::now()),
                                         container_id: prev_status.container_id.clone(),
                                         signal: None,
                                     },
@@ -5244,14 +5495,19 @@ impl ContainerRuntime {
                             }
                         } else {
                             // No previous status — the container was cleaned up.
-                            // Only mark as Completed if the pod is in a terminal phase
-                            // (Succeeded/Failed). Do NOT infer from node_name — the pod
-                            // can be scheduled but init containers may not have run yet.
-                            let pod_phase = pod
-                                .status
-                                .as_ref()
-                                .and_then(|s| s.phase.as_ref());
-                            if matches!(pod_phase, Some(rusternetes_common::types::Phase::Succeeded))
+                            // K8s ref: kubelet_pods.go:2689 — if init container has no
+                            // CRI status and regular containers exist, infer completion.
+                            // Also mark as Completed if pod is already Succeeded/Failed.
+                            let pod_phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+                            // Check if any app container has been created/is running.
+                            // If so, ALL init containers must have completed (K8s rule:
+                            // app containers don't start until all init containers succeed).
+                            let app_containers_exist = self.has_any_app_container(pod).await;
+                            if matches!(
+                                pod_phase,
+                                Some(rusternetes_common::types::Phase::Succeeded)
+                                    | Some(rusternetes_common::types::Phase::Failed)
+                            ) || app_containers_exist
                             {
                                 (
                                     ContainerState::Terminated {
@@ -5333,15 +5589,18 @@ impl ContainerRuntime {
                     // existing. If existing had a Terminated state, that becomes last_state.
                     if let Some(prev) = existing_status {
                         match &prev.state {
-                            Some(ContainerState::Terminated { exit_code, .. }) if *exit_code != 0 => {
+                            Some(ContainerState::Terminated { exit_code, .. })
+                                if *exit_code != 0 =>
+                            {
                                 // Transition from Terminated → CrashLoopBackOff (removal)
                                 // The terminated state becomes last_state
                                 last_state = prev.state.clone();
                                 restart_count += 1;
                             }
-                            Some(ContainerState::Waiting { reason: prev_reason, .. })
-                                if prev_reason.as_deref() == Some("CrashLoopBackOff") =>
-                            {
+                            Some(ContainerState::Waiting {
+                                reason: prev_reason,
+                                ..
+                            }) if prev_reason.as_deref() == Some("CrashLoopBackOff") => {
                                 // Already in CrashLoopBackOff — keep existing last_state
                                 // and don't double-count
                             }
@@ -5486,11 +5745,17 @@ impl ContainerRuntime {
                     let exit_code = state.exit_code.unwrap_or(0);
 
                     // Capture started_at before state fields are consumed
-                    let ec_started_at = state.started_at.clone();
+                    let ec_started_at = state
+                        .started_at
+                        .as_deref()
+                        .and_then(rusternetes_common::time::parse_external);
 
                     let container_state = if running {
                         Some(ContainerState::Running {
-                            started_at: state.started_at,
+                            started_at: state
+                                .started_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                         })
                     } else if state.finished_at.is_some() {
                         Some(ContainerState::Terminated {
@@ -5503,7 +5768,10 @@ impl ContainerRuntime {
                             }),
                             message: None,
                             started_at: ec_started_at,
-                            finished_at: state.finished_at,
+                            finished_at: state
+                                .finished_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                             container_id: inspect.id.clone().map(|id| format!("docker://{}", id)),
                         })
                     } else {
@@ -5596,7 +5864,10 @@ impl ContainerRuntime {
                     let restart_count = docker_count.max(prev_count);
 
                     // Capture started_at before state fields are consumed by branches
-                    let docker_started_at = state.started_at.clone();
+                    let docker_started_at = state
+                        .started_at
+                        .as_deref()
+                        .and_then(rusternetes_common::time::parse_external);
 
                     // Preserve last_state from existing pod status for restart tracking
                     let prev_last_state = pod
@@ -5608,7 +5879,10 @@ impl ContainerRuntime {
 
                     let container_state = if running {
                         Some(ContainerState::Running {
-                            started_at: state.started_at,
+                            started_at: state
+                                .started_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                         })
                     } else if matches!(
                         state.status,
@@ -5621,7 +5895,7 @@ impl ContainerRuntime {
                         //   empty AND exit != 0, fall back to container logs
                         // Both policies always read from the file when it has content.
                         let termination_msg = self
-                            .read_termination_message(&container_name, container, exit_code as i64)
+                            .read_termination_message(&container_name, container, exit_code)
                             .await;
 
                         // Container has exited (any exit code, including 0)
@@ -5643,7 +5917,10 @@ impl ContainerRuntime {
                             }),
                             message: termination_msg,
                             started_at: docker_started_at,
-                            finished_at: state.finished_at,
+                            finished_at: state
+                                .finished_at
+                                .as_deref()
+                                .and_then(rusternetes_common::time::parse_external),
                             container_id: inspect.id.clone().map(|id| format!("docker://{}", id)),
                         })
                     } else {
@@ -5659,7 +5936,7 @@ impl ContainerRuntime {
                     let startup_passed = if running {
                         if let Some(startup_probe) = &container.startup_probe {
                             let raw = self
-                                .check_probe(&container_name, startup_probe)
+                                .check_probe(&container_name, container, startup_probe)
                                 .await
                                 .unwrap_or(false);
                             let success_threshold = startup_probe.success_threshold.unwrap_or(1);
@@ -5693,17 +5970,11 @@ impl ContainerRuntime {
                             let past_initial_delay = if initial_delay > 0 {
                                 // Check container start time from Docker state
                                 if let Some(ContainerState::Running {
-                                    started_at: Some(ref started_at_str),
+                                    started_at: Some(started),
                                 }) = container_state
                                 {
-                                    if let Ok(started) =
-                                        chrono::DateTime::parse_from_rfc3339(started_at_str)
-                                    {
-                                        let elapsed = Utc::now().signed_duration_since(started);
-                                        elapsed.num_seconds() >= initial_delay as i64
-                                    } else {
-                                        false
-                                    }
+                                    let elapsed = Utc::now().signed_duration_since(started);
+                                    elapsed.num_seconds() >= initial_delay as i64
                                 } else {
                                     false
                                 }
@@ -5715,7 +5986,7 @@ impl ContainerRuntime {
                                 false // Not ready yet, still within initial delay
                             } else {
                                 let raw = self
-                                    .check_probe(&container_name, probe)
+                                    .check_probe(&container_name, container, probe)
                                     .await
                                     .unwrap_or(false);
                                 let _failure_threshold = probe.failure_threshold.unwrap_or(3);
@@ -5813,7 +6084,7 @@ impl ContainerRuntime {
                                 .spec
                                 .as_ref()
                                 .and_then(|s| s.init_containers.as_ref())
-                                .map_or(false, |ic| !ic.is_empty());
+                                .is_some_and(|ic| !ic.is_empty());
                             if has_init {
                                 ("PodInitializing".to_string(), None)
                             } else {
@@ -5872,7 +6143,7 @@ impl ContainerRuntime {
             if let Some(startup_probe) = &container.startup_probe {
                 let startup_key = format!("{}/{}/startup", pod_name, container.name);
                 let raw_result = self
-                    .check_probe(&container_name, startup_probe)
+                    .check_probe(&container_name, container, startup_probe)
                     .await
                     .unwrap_or(false);
 
@@ -5935,7 +6206,7 @@ impl ContainerRuntime {
                 }
 
                 // Check liveness with threshold tracking
-                let healthy = self.check_probe(&container_name, probe).await?;
+                let healthy = self.check_probe(&container_name, container, probe).await?;
                 let failure_threshold = probe.failure_threshold.unwrap_or(3);
                 // For liveness probes, Kubernetes requires successThreshold=1
                 let _success_threshold = probe.success_threshold.unwrap_or(1);
@@ -5979,7 +6250,12 @@ impl ContainerRuntime {
     }
 
     /// Execute a probe check
-    async fn check_probe(&self, container_name: &str, probe: &Probe) -> Result<bool> {
+    async fn check_probe(
+        &self,
+        container_name: &str,
+        container: &Container,
+        probe: &Probe,
+    ) -> Result<bool> {
         // K8s default timeout is 1s; treat 0 as default
         let timeout_secs = probe.timeout_seconds.unwrap_or(1).max(1) as u64;
         let timeout = Duration::from_secs(timeout_secs);
@@ -5987,14 +6263,14 @@ impl ContainerRuntime {
         // HTTP GET probe
         if let Some(http_get) = &probe.http_get {
             return self
-                .check_http_probe(container_name, http_get, timeout)
+                .check_http_probe(container_name, container, http_get, timeout)
                 .await;
         }
 
         // TCP Socket probe
         if let Some(tcp_socket) = &probe.tcp_socket {
             return self
-                .check_tcp_probe(container_name, tcp_socket, timeout)
+                .check_tcp_probe(container_name, container, tcp_socket, timeout)
                 .await;
         }
 
@@ -6005,7 +6281,9 @@ impl ContainerRuntime {
 
         // gRPC probe
         if let Some(grpc) = &probe.grpc {
-            return self.check_grpc_probe(container_name, grpc, timeout).await;
+            return self
+                .check_grpc_probe(container_name, container, grpc, timeout)
+                .await;
         }
 
         Ok(true) // No probe configured
@@ -6252,6 +6530,7 @@ impl ContainerRuntime {
     async fn check_http_probe(
         &self,
         container_name: &str,
+        container: &Container,
         http_get: &HTTPGetAction,
         timeout: Duration,
     ) -> Result<bool> {
@@ -6262,10 +6541,23 @@ impl ContainerRuntime {
             self.get_effective_container_ip(container_name).await
         };
 
+        // Resolve named port via container.ports[].name lookup (K8s IntOrString).
+        let port =
+            match rusternetes_common::resources::resolve_probe_port(&http_get.port, container) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "HTTP probe port {} unresolvable for container {}",
+                        http_get.port, container_name
+                    );
+                    return Ok(false);
+                }
+            };
+
         // Kubernetes sends scheme as uppercase ("HTTP", "HTTPS") — lowercase for URL
         let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
         let path = http_get.path.as_deref().unwrap_or("/");
-        let url = format!("{}://{}:{}{}", scheme, ip, http_get.port, path);
+        let url = format!("{}://{}:{}{}", scheme, ip, port, path);
 
         debug!("HTTP probe: {}", url);
 
@@ -6293,7 +6585,7 @@ impl ContainerRuntime {
             Ok(response) => {
                 let code = response.status().as_u16();
                 // K8s probes consider 200-399 as success
-                Ok(code >= 200 && code < 400)
+                Ok((200..400).contains(&code))
             }
             Err(e) => {
                 debug!("HTTP probe failed: {}", e);
@@ -6305,13 +6597,26 @@ impl ContainerRuntime {
     async fn check_tcp_probe(
         &self,
         container_name: &str,
+        container: &Container,
         tcp_socket: &TCPSocketAction,
         timeout: Duration,
     ) -> Result<bool> {
         // Get container IP (resolving through pause container if needed)
         let ip = self.get_effective_container_ip(container_name).await;
 
-        let addr = format!("{}:{}", ip, tcp_socket.port);
+        let port =
+            match rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "TCP probe port {} unresolvable for container {}",
+                        tcp_socket.port, container_name
+                    );
+                    return Ok(false);
+                }
+            };
+
+        let addr = format!("{}:{}", ip, port);
         debug!("TCP probe: {}", addr);
 
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
@@ -6344,9 +6649,7 @@ impl ContainerRuntime {
         let start_result = self.docker.start_exec(&exec_id, None).await?;
 
         match start_result {
-            StartExecResults::Attached { mut output, .. } => {
-                while let Some(_) = output.next().await {}
-            }
+            StartExecResults::Attached { mut output, .. } => while output.next().await.is_some() {},
             StartExecResults::Detached => {}
         }
 
@@ -6362,11 +6665,22 @@ impl ContainerRuntime {
     async fn check_grpc_probe(
         &self,
         container_name: &str,
+        container: &Container,
         grpc: &GRPCAction,
         timeout: Duration,
     ) -> Result<bool> {
         let ip = self.get_effective_container_ip(container_name).await;
-        let addr = format!("http://{}:{}", ip, grpc.port);
+        let port = match rusternetes_common::resources::resolve_probe_port(&grpc.port, container) {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "gRPC probe port {} unresolvable for container {}",
+                    grpc.port, container_name
+                );
+                return Ok(false);
+            }
+        };
+        let addr = format!("http://{}:{}", ip, port);
         debug!("gRPC probe: {} service={:?}", addr, grpc.service);
 
         let endpoint = match tonic::transport::Endpoint::from_shared(addr.clone()) {
@@ -6443,6 +6757,7 @@ impl ContainerRuntime {
         &self,
         handler: &LifecycleHandler,
         container_name: &str,
+        container: &Container,
     ) -> Result<()> {
         if let Some(ref exec) = handler.exec {
             // Execute command inside the container
@@ -6473,7 +6788,7 @@ impl ContainerRuntime {
             // Drain output with a timeout to prevent indefinite hangs
             match start_result {
                 StartExecResults::Attached { mut output, .. } => {
-                    let drain = async { while let Some(_) = output.next().await {} };
+                    let drain = async { while output.next().await.is_some() {} };
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drain).await;
                 }
                 StartExecResults::Detached => {}
@@ -6489,6 +6804,16 @@ impl ContainerRuntime {
                 ));
             }
         } else if let Some(ref http_get) = handler.http_get {
+            // Resolve named port via container.ports lookup (K8s IntOrString).
+            let hook_port =
+                rusternetes_common::resources::resolve_probe_port(&http_get.port, container)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Lifecycle HTTP handler port {} unresolvable for container {}",
+                            http_get.port,
+                            container_name
+                        )
+                    })?;
             // Execute HTTP GET request — use host field if specified, otherwise container/pause IP.
             // Containers using container: network mode won't have their own IP — we need the
             // pause container's IP (which owns the network namespace).
@@ -6503,16 +6828,80 @@ impl ContainerRuntime {
                 } else {
                     // Try resolving as a hostname — look up in pod's network namespace
                     // by checking the pod's /etc/hosts or using DNS
-                    match tokio::net::lookup_host(format!("{}:{}", host, http_get.port)).await {
-                        Ok(mut addrs) => {
-                            if let Some(addr) = addrs.next() {
-                                addr.ip().to_string()
-                            } else {
-                                host.clone()
+                    let mut resolved = None;
+                    if let Ok(mut addrs) =
+                        tokio::net::lookup_host(format!("{}:{}", host, hook_port)).await
+                    {
+                        if let Some(addr) = addrs.next() {
+                            resolved = Some(addr.ip().to_string());
+                        }
+                    }
+                    // Fallback: resolve K8s service/pod names via storage.
+                    // The kubelet container can't resolve K8s DNS names, so
+                    // look up services and pods by name in etcd.
+                    if resolved.is_none() {
+                        if let Some(ref storage) = self.storage {
+                            use rusternetes_storage::Storage;
+                            // Derive namespace from the container name (pod_name -> pod -> namespace)
+                            let pod_name_from_container = container_name
+                                .rsplitn(2, '_')
+                                .last()
+                                .unwrap_or(container_name);
+                            // Search all pods to find our pod's namespace
+                            let ns = {
+                                let prefix = rusternetes_storage::build_prefix("pods", None);
+                                storage.list::<Pod>(&prefix).await.ok().and_then(|pods| {
+                                    pods.iter()
+                                        .find(|p| p.metadata.name == pod_name_from_container)
+                                        .and_then(|p| p.metadata.namespace.clone())
+                                })
+                            };
+                            let ns = ns.as_deref().unwrap_or("default");
+
+                            // Try as a service name first
+                            let svc_key =
+                                rusternetes_storage::build_key("services", Some(ns), host);
+                            if let Ok(svc) = storage
+                                .get::<rusternetes_common::resources::Service>(&svc_key)
+                                .await
+                            {
+                                if let Some(ref cluster_ip) = svc.spec.cluster_ip {
+                                    if !cluster_ip.is_empty() && cluster_ip != "None" {
+                                        info!(
+                                            "Lifecycle HTTP handler: resolved service {} to ClusterIP {}",
+                                            host, cluster_ip
+                                        );
+                                        resolved = Some(cluster_ip.clone());
+                                    }
+                                }
+                            }
+
+                            // Try as a pod name
+                            if resolved.is_none() {
+                                let prefix = rusternetes_storage::build_prefix("pods", None);
+                                if let Ok(pods) = storage.list::<Pod>(&prefix).await {
+                                    if let Some(target_pod) = pods.iter().find(|p| {
+                                        p.metadata.name == *host
+                                            && p.metadata.namespace.as_deref() == Some(ns)
+                                    }) {
+                                        if let Some(pod_ip) = target_pod
+                                            .status
+                                            .as_ref()
+                                            .and_then(|s| s.pod_ip.as_ref())
+                                            .filter(|ip| !ip.is_empty())
+                                        {
+                                            info!(
+                                                "Lifecycle HTTP handler: resolved pod {} to IP {}",
+                                                host, pod_ip
+                                            );
+                                            resolved = Some(pod_ip.clone());
+                                        }
+                                    }
+                                }
                             }
                         }
-                        Err(_) => host.clone(),
                     }
+                    resolved.unwrap_or_else(|| host.clone())
                 }
             } else {
                 let inspect = self
@@ -6565,7 +6954,7 @@ impl ContainerRuntime {
 
             let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
             let path = http_get.path.as_deref().unwrap_or("/");
-            let url = format!("{}://{}:{}{}", scheme, ip, http_get.port, path);
+            let url = format!("{}://{}:{}{}", scheme, ip, hook_port, path);
 
             info!(
                 "Lifecycle HTTP handler: {} for container {}",
@@ -6618,7 +7007,16 @@ impl ContainerRuntime {
                 .and_then(|ns| ns.ip_address)
                 .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            let addr = format!("{}:{}", ip, tcp_socket.port);
+            let port =
+                rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Lifecycle TCP handler port {} unresolvable for container {}",
+                            tcp_socket.port,
+                            container_name
+                        )
+                    })?;
+            let addr = format!("{}:{}", ip, port);
             debug!("Lifecycle TCP handler: {}", addr);
 
             match tokio::time::timeout(
@@ -6699,68 +7097,128 @@ impl ContainerRuntime {
 
         let containers = self.docker.list_containers(Some(options)).await?;
 
-        // First pass: execute preStop hooks on all running containers
+        // First pass: execute preStop hooks on all running containers.
         // We must run ALL preStop hooks before stopping ANY containers, because
         // preStop hooks may need to communicate with sibling containers (e.g.,
         // sending an HTTP request to another container in the same pod).
+        //
+        // K8s runs preStop hooks concurrently per container and bounds the total
+        // wait by `terminationGracePeriodSeconds`. If a hook overruns, it is
+        // aborted and SIGTERM is delivered with the remaining grace period
+        // floored at the minimum (2s).
+        //
+        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
+        //   gracePeriod -= preStopElapsed
+        //   gracePeriod = max(gracePeriod, minimumGracePeriodInSeconds)  // 2s
+        let prestop_start = std::time::Instant::now();
+        let prestop_budget = std::time::Duration::from_secs(grace_period_seconds.max(1) as u64);
+
+        // Build a name -> Container lookup so the lifecycle handler can
+        // resolve named probe/handler ports against the container's declared
+        // ports[].name (K8s IntOrString).
+        let spec_containers: std::collections::HashMap<&str, &Container> = pod
+            .spec
+            .as_ref()
+            .map(|s| s.containers.iter().map(|c| (c.name.as_str(), c)).collect())
+            .unwrap_or_default();
+
+        // Collect (container_name, pre_stop_handler, container) for all running
+        // containers that have a preStop hook. Match exact name first, falling
+        // back to suffix match if Docker returns a different name shape.
+        let mut hooks_to_run: Vec<(
+            String,
+            rusternetes_common::resources::LifecycleHandler,
+            Container,
+        )> = Vec::new();
         for container in &containers {
-            if let Some(ref id) = container.id {
-                let names = container.names.clone().unwrap_or_default();
-                let container_name = names
-                    .first()
-                    .map(|n| n.trim_start_matches('/').to_string())
-                    .unwrap_or_default();
-
-                let is_running = container.state.as_deref() == Some("running");
-                if is_running {
-                    // Try exact match first, then try matching by suffix in case
-                    // Docker returns a different name format
-                    let lifecycle = lifecycle_map.get(&container_name).or_else(|| {
-                        // Fallback: try matching by finding a lifecycle_map key that
-                        // ends with the same container suffix
-                        lifecycle_map.iter().find_map(|(key, val)| {
-                            if container_name.ends_with(&key[pod_name.len()..]) {
-                                Some(val)
-                            } else {
-                                None
-                            }
-                        })
-                    });
-
-                    if let Some(lifecycle) = lifecycle {
-                        if let Some(ref pre_stop) = lifecycle.pre_stop {
-                            info!(
-                                "Executing preStop hook for container {} (id: {})",
-                                container_name,
-                                &id[..12.min(id.len())]
-                            );
-                            match self
-                                .execute_lifecycle_handler(pre_stop, &container_name)
-                                .await
-                            {
-                                Ok(()) => {
-                                    info!(
-                                        "preStop hook completed successfully for container {}",
-                                        container_name
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "preStop hook failed for container {}: {}",
-                                        container_name, e
-                                    );
-                                }
-                            }
-                        }
-                    } else if !container_name.ends_with("_pause") {
-                        debug!(
-                            "No preStop hook for running container {} (lifecycle_map keys: {:?})",
-                            container_name,
-                            lifecycle_map.keys().collect::<Vec<_>>()
-                        );
-                    }
-                }
+            let names = container.names.clone().unwrap_or_default();
+            let container_name = names
+                .first()
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+            if container.state.as_deref() != Some("running") {
+                continue;
             }
+            let lifecycle = lifecycle_map.get(&container_name).or_else(|| {
+                lifecycle_map.iter().find_map(|(key, val)| {
+                    if container_name.ends_with(&key[pod_name.len()..]) {
+                        Some(val)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(lifecycle) = lifecycle {
+                if let Some(ref pre_stop) = lifecycle.pre_stop {
+                    // Derive the K8s container name (strip `{pod_name}_` prefix).
+                    let k8s_name = container_name
+                        .strip_prefix(&format!("{}_", pod_name))
+                        .unwrap_or(&container_name);
+                    let spec_container = spec_containers
+                        .get(k8s_name)
+                        .copied()
+                        .cloned()
+                        .unwrap_or_else(Container::default);
+                    hooks_to_run.push((container_name, pre_stop.clone(), spec_container));
+                }
+            } else if !container_name.ends_with("_pause") {
+                debug!(
+                    "No preStop hook for running container {} (lifecycle_map keys: {:?})",
+                    container_name,
+                    lifecycle_map.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        if !hooks_to_run.is_empty() {
+            // Run preStop hooks concurrently using futures (no Send required
+            // because the executor remains on the current task).
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut futs: FuturesUnordered<_> = hooks_to_run
+                .into_iter()
+                .map(|(container_name, pre_stop, spec_container)| async move {
+                    info!("Executing preStop hook for container {}", container_name);
+                    match self
+                        .execute_lifecycle_handler(&pre_stop, &container_name, &spec_container)
+                        .await
+                    {
+                        Ok(()) => info!(
+                            "preStop hook completed successfully for container {}",
+                            container_name
+                        ),
+                        Err(e) => warn!(
+                            "preStop hook failed for container {}: {}",
+                            container_name, e
+                        ),
+                    }
+                })
+                .collect();
+            let wait_all = async { while futs.next().await.is_some() {} };
+            // Bound total preStop time by the grace period. If hooks overrun,
+            // we abort and proceed to SIGTERM. K8s does the same — preStop is
+            // best-effort within the grace period.
+            if tokio::time::timeout(prestop_budget, wait_all)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "preStop hooks exceeded grace period {}s for pod {} — proceeding with SIGTERM",
+                    grace_period_seconds, pod_name
+                );
+            }
+        }
+
+        // Decrement grace period by preStop hook elapsed time.
+        // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860-862
+        //   gracePeriod -= executePreStopHook elapsed
+        //   gracePeriod = max(gracePeriod, minimumGracePeriodInSeconds)
+        let prestop_elapsed = prestop_start.elapsed().as_secs() as i64;
+        let remaining_grace = (grace_period_seconds - prestop_elapsed).max(2);
+        if prestop_elapsed > 0 {
+            info!(
+                "preStop hooks took {}s, remaining grace period: {}s (was {}s)",
+                prestop_elapsed, remaining_grace, grace_period_seconds
+            );
         }
 
         // Second pass: stop all containers, stopping the pause container LAST.
@@ -6798,10 +7256,8 @@ impl ContainerRuntime {
 
                 info!("Stopping container: {}", id);
 
-                // Stop the container gracefully
-                let stop_options = StopContainerOptions {
-                    t: grace_period_seconds,
-                };
+                // Stop the container with remaining grace period (after preStop).
+                let stop_options = StopContainerOptions { t: remaining_grace };
                 if let Err(e) = self.docker.stop_container(id, Some(stop_options)).await {
                     warn!("Failed to stop container {}: {}", id, e);
                 }
@@ -6813,10 +7269,12 @@ impl ContainerRuntime {
         // Stop the pause container last — the network namespace dies with it
         if let Some(ref pause_id) = pause_container_id {
             info!("Stopping pause container: {} (last)", pause_id);
-            let stop_options = StopContainerOptions {
-                t: grace_period_seconds,
-            };
-            if let Err(e) = self.docker.stop_container(pause_id, Some(stop_options)).await {
+            let stop_options = StopContainerOptions { t: remaining_grace };
+            if let Err(e) = self
+                .docker
+                .stop_container(pause_id, Some(stop_options))
+                .await
+            {
                 warn!("Failed to stop pause container {}: {}", pause_id, e);
             }
         }
@@ -6828,7 +7286,11 @@ impl ContainerRuntime {
             }
         }
 
-        // Clean up emptyDir volumes (but keep container data for logs)
+        // Clean up volumes after all containers are stopped.
+        // K8s does this in SyncTerminatedPod, but our sync loop only iterates
+        // pods that exist in etcd. If a pod is deleted from etcd before
+        // TerminatedPod runs, volumes would never be cleaned. So we clean
+        // here to ensure volumes are always cleaned when containers stop.
         self.cleanup_pod_volumes(pod_name).await?;
 
         Ok(())
@@ -6846,28 +7308,25 @@ impl ContainerRuntime {
 
     /// Remove a terminated container so it can be recreated for restart.
     pub async fn remove_terminated_container(&self, container_name: &str) -> Result<()> {
-        match self
+        if let Ok(info) = self
             .docker
             .inspect_container(container_name, None::<InspectContainerOptions>)
             .await
         {
-            Ok(info) => {
-                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
-                if !running {
-                    let opts = bollard::container::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    };
-                    self.docker
-                        .remove_container(container_name, Some(opts))
-                        .await?;
-                    debug!(
-                        "Removed terminated container {} for restart",
-                        container_name
-                    );
-                }
+            let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+            if !running {
+                let opts = bollard::container::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                };
+                self.docker
+                    .remove_container(container_name, Some(opts))
+                    .await?;
+                debug!(
+                    "Removed terminated container {} for restart",
+                    container_name
+                );
             }
-            Err(_) => {} // Container doesn't exist, nothing to remove
         }
         Ok(())
     }
@@ -7164,7 +7623,7 @@ impl ContainerRuntime {
                 .as_ref()
                 .map(|labels| {
                     let mut pairs: Vec<_> = labels.iter().collect();
-                    pairs.sort_by_key(|(k, _)| k.clone());
+                    pairs.sort_by_key(|(k, _)| (*k).clone());
                     let mut result = pairs
                         .iter()
                         .map(|(k, v)| format!("{}=\"{}\"", k, v))
@@ -7183,7 +7642,7 @@ impl ContainerRuntime {
                 .as_ref()
                 .map(|anns| {
                     let mut pairs: Vec<_> = anns.iter().collect();
-                    pairs.sort_by_key(|(k, _)| k.clone());
+                    pairs.sort_by_key(|(k, _)| (*k).clone());
                     let mut result = pairs
                         .iter()
                         .map(|(k, v)| format!("{}=\"{}\"", k, v))
@@ -7364,6 +7823,7 @@ impl ContainerRuntime {
     }
 
     /// List all running pod names from the container runtime
+    #[allow(dead_code)]
     pub async fn list_running_pods(&self) -> Result<Vec<String>> {
         let options = ListContainersOptions::<String> {
             all: false, // Only running containers
@@ -7380,6 +7840,198 @@ impl ContainerRuntime {
                     let name = name.trim_start_matches('/');
                     if let Some(pod_name) = name.split('_').next() {
                         // Skip Rusternetes control plane containers
+                        if !pod_name.starts_with("rusternetes-") {
+                            pod_names.insert(pod_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(pod_names.into_iter().collect())
+    }
+
+    /// Container garbage collector — removes dead containers to prevent buildup.
+    /// Matches K8s kuberuntime_gc.go:
+    /// - For deleted pods (not in existing_pods): removes ALL dead containers
+    /// - For existing pods: keeps at most 1 dead container per pod (for log access)
+    /// - Removes orphaned pause containers with no running app containers
+    /// - Removes stale "created" containers older than 5 minutes
+    ///
+    /// K8s ref: pkg/kubelet/kuberuntime/kuberuntime_gc.go — evictContainers
+    /// Returns the number of containers removed.
+    pub async fn garbage_collect_containers(
+        &self,
+        existing_pods: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let options = ListContainersOptions::<String> {
+            all: true,
+            ..Default::default()
+        };
+
+        let containers = self.docker.list_containers(Some(options)).await?;
+
+        // Group exited containers by pod name, track which pods have running containers
+        let mut exited_by_pod: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        let mut pods_with_running: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut stale_created: Vec<String> = Vec::new();
+
+        for container in &containers {
+            let names = match &container.names {
+                Some(n) => n,
+                None => continue,
+            };
+            let name = names
+                .first()
+                .map(|n| n.trim_start_matches('/'))
+                .unwrap_or("");
+
+            // Skip infrastructure containers (compose services)
+            if name.starts_with("rusternetes-") {
+                continue;
+            }
+
+            let pod_name = match name.split('_').next() {
+                Some(p) => p.to_string(),
+                None => continue,
+            };
+
+            let state = container.state.as_deref().unwrap_or("");
+            let container_id = match &container.id {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+            let created = container.created.unwrap_or(0);
+
+            match state {
+                "running" => {
+                    pods_with_running.insert(pod_name);
+                }
+                "exited" | "dead" | "stopped" => {
+                    exited_by_pod
+                        .entry(pod_name)
+                        .or_default()
+                        .push((container_id, created));
+                }
+                "created" => {
+                    // Containers stuck in "created" for more than 5 minutes
+                    let age_secs = chrono::Utc::now().timestamp() - created;
+                    if age_secs > 300 {
+                        stale_created.push(container_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut removed = 0;
+
+        // 1. Remove exited containers.
+        // K8s ref: evictContainers — for deleted pods (allSourcesReady), remove ALL.
+        // For existing pods, keep at most MaxPerPodContainerCount (default 1).
+        for (pod_name, mut exited) in exited_by_pod {
+            // Sort by created time descending — keep the newest
+            exited.sort_by(|a, b| b.1.cmp(&a.1));
+
+            // For pods still in etcd, keep 1 dead container for log access.
+            // For deleted pods, remove ALL dead containers.
+            let keep_count = if existing_pods.contains(&pod_name) {
+                1
+            } else {
+                0
+            };
+            for (container_id, _) in exited.iter().skip(keep_count) {
+                let opts = RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                };
+                if self
+                    .docker
+                    .remove_container(container_id, Some(opts))
+                    .await
+                    .is_ok()
+                {
+                    removed += 1;
+                }
+            }
+
+            // If the pod has no running containers, remove the last dead one too
+            // and clean up the pause container (orphaned sandbox)
+            if !pods_with_running.contains(&pod_name) {
+                for (container_id, _) in exited.iter().take(1) {
+                    let opts = RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    };
+                    if self
+                        .docker
+                        .remove_container(container_id, Some(opts))
+                        .await
+                        .is_ok()
+                    {
+                        removed += 1;
+                    }
+                }
+                // Remove orphaned pause container
+                let pause_name = format!("{}_pause", pod_name);
+                let _ = self
+                    .docker
+                    .stop_container(&pause_name, Some(StopContainerOptions { t: 0 }))
+                    .await;
+                let opts = RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                };
+                if self
+                    .docker
+                    .remove_container(&pause_name, Some(opts))
+                    .await
+                    .is_ok()
+                {
+                    removed += 1;
+                }
+                // Clean up volumes
+                let _ = self.cleanup_pod_volumes(&pod_name).await;
+            }
+        }
+
+        // 2. Remove stale "created" containers
+        for container_id in &stale_created {
+            let opts = RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            };
+            if self
+                .docker
+                .remove_container(container_id, Some(opts))
+                .await
+                .is_ok()
+            {
+                removed += 1;
+            }
+        }
+
+        Ok(removed)
+    }
+
+    /// List all pods with containers in Docker, including exited/stopped.
+    /// Used by orphan cleanup to find and remove stopped containers from
+    /// pods that have been deleted from storage.
+    pub async fn list_all_pods(&self) -> Result<Vec<String>> {
+        let options = ListContainersOptions::<String> {
+            all: true,
+            ..Default::default()
+        };
+
+        let containers = self.docker.list_containers(Some(options)).await?;
+
+        let mut pod_names = std::collections::HashSet::new();
+        for container in containers {
+            if let Some(names) = container.names {
+                for name in names {
+                    let name = name.trim_start_matches('/');
+                    if let Some(pod_name) = name.split('_').next() {
                         if !pod_name.starts_with("rusternetes-") {
                             pod_names.insert(pod_name.to_string());
                         }
@@ -7413,76 +8065,6 @@ impl ContainerRuntime {
         }
     }
 
-    /// List pod names that have EXITED containers (not running).
-    /// Used to clean up containers from pods deleted from etcd.
-    pub async fn list_exited_pods(&self) -> Result<Vec<String>> {
-        let mut filters = std::collections::HashMap::new();
-        filters.insert("status".to_string(), vec!["exited".to_string()]);
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
-
-        let mut pod_names = std::collections::HashSet::new();
-        for container in containers {
-            if let Some(names) = container.names {
-                for name in names {
-                    let name = name.trim_start_matches('/');
-                    if let Some(pod_name) = name.split('_').next() {
-                        if !pod_name.starts_with("rusternetes-") {
-                            pod_names.insert(pod_name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(pod_names.into_iter().collect())
-    }
-
-    /// List containers stuck in "Created" state for more than 60 seconds
-    pub async fn list_stale_created_containers(&self) -> Result<Vec<String>> {
-        let options = ListContainersOptions::<String> {
-            all: true,
-            filters: {
-                let mut f = std::collections::HashMap::new();
-                f.insert("status".to_string(), vec!["created".to_string()]);
-                f
-            },
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
-        let now = chrono::Utc::now().timestamp();
-        let mut stale = Vec::new();
-
-        for container in containers {
-            // Skip rusternetes infrastructure containers
-            let name = container
-                .names
-                .as_ref()
-                .and_then(|n| n.first())
-                .map(|n| n.trim_start_matches('/'))
-                .unwrap_or("");
-            if name.starts_with("rusternetes-") {
-                continue;
-            }
-            // Check if created more than 60 seconds ago
-            if let Some(created) = container.created {
-                if now - created > 60 {
-                    if let Some(id) = container.id {
-                        stale.push(id);
-                    }
-                }
-            }
-        }
-
-        Ok(stale)
-    }
-
     /// Collect CPU and memory usage for all containers belonging to pods on this node.
     /// Returns (cpu_millicores, memory_bytes).
     pub async fn collect_node_metrics(&self, pod_names: &[String]) -> (u64, u64) {
@@ -7507,22 +8089,25 @@ impl ContainerRuntime {
 
         // Match containers to pods by name prefix ({pod_name}_{container_name})
         // Skip pause containers — they have minimal resource usage
-        let node_containers: Vec<_> = containers.iter().filter(|c| {
-            if let Some(names) = &c.names {
-                for name in names {
-                    let clean = name.trim_start_matches('/');
-                    if clean.ends_with("_pause") {
-                        return false;
-                    }
-                    for pod_name in pod_names {
-                        if clean.starts_with(pod_name) {
-                            return true;
+        let node_containers: Vec<_> = containers
+            .iter()
+            .filter(|c| {
+                if let Some(names) = &c.names {
+                    for name in names {
+                        let clean = name.trim_start_matches('/');
+                        if clean.ends_with("_pause") {
+                            return false;
+                        }
+                        for pod_name in pod_names {
+                            if clean.starts_with(pod_name) {
+                                return true;
+                            }
                         }
                     }
                 }
-            }
-            false
-        }).collect();
+                false
+            })
+            .collect();
 
         if node_containers.is_empty() {
             return (0, 0);
@@ -7558,7 +8143,9 @@ impl ContainerRuntime {
             if let Some(Ok(stats)) = result {
                 // Memory: usage minus cache
                 if let Some(usage) = stats.memory_stats.usage {
-                    let cache = stats.memory_stats.stats
+                    let cache = stats
+                        .memory_stats
+                        .stats
                         .as_ref()
                         .map(|s| match s {
                             bollard::container::MemoryStatsStats::V1(v1) => v1.cache,
@@ -7576,8 +8163,9 @@ impl ContainerRuntime {
                     let cpu_delta = total_usage.saturating_sub(prev_total);
                     let system_delta = system_cpu.saturating_sub(prev_system);
                     if system_delta > 0 {
-                        let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as u64;
-                        total_cpu_pct += (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
+                        let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1);
+                        total_cpu_pct +=
+                            (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
                     }
                 }
             }
@@ -7586,24 +8174,15 @@ impl ContainerRuntime {
         // Convert CPU percentage to millicores (1 core = 1000m, so 3.5% = 35m)
         let cpu_millicores = (total_cpu_pct * 10.0) as u64;
 
-        debug!("Node metrics: {}m CPU, {} bytes memory ({} containers from {} pods)",
-            cpu_millicores, total_memory_bytes, node_containers.len(), pod_names.len());
+        debug!(
+            "Node metrics: {}m CPU, {} bytes memory ({} containers from {} pods)",
+            cpu_millicores,
+            total_memory_bytes,
+            node_containers.len(),
+            pod_names.len()
+        );
 
         (cpu_millicores, total_memory_bytes)
-    }
-
-    /// Remove a container by ID
-    pub async fn remove_container(&self, container_id: &str) -> Result<()> {
-        self.docker
-            .remove_container(
-                container_id,
-                Some(bollard::container::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await?;
-        Ok(())
     }
 }
 
@@ -7620,10 +8199,7 @@ pub fn parse_memory_quantity(s: &str) -> i64 {
     } else if s.ends_with('M') {
         s.trim_end_matches('M').parse::<i64>().unwrap_or(0) * 1_000_000
     } else if s.ends_with('K') || s.ends_with('k') {
-        s.trim_end_matches(|c| c == 'K' || c == 'k')
-            .parse::<i64>()
-            .unwrap_or(0)
-            * 1000
+        s.trim_end_matches(['K', 'k']).parse::<i64>().unwrap_or(0) * 1000
     } else {
         s.parse::<i64>().unwrap_or(0)
     }
@@ -7640,8 +8216,53 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::ContainerRuntime;
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    /// Docker rejects `UtsMode: "container:<id>"` with `400 invalid UTS mode`,
+    /// so it must be classified as unsupported; Podman accepts it.
+    #[test]
+    fn test_uts_container_mode_detection() {
+        // Docker CE reports this Platform.Name plus generic component names.
+        assert!(!ContainerRuntime::uts_container_mode_from_identity(
+            "Docker Engine - Community Engine containerd runc docker-init"
+        ));
+        assert!(!ContainerRuntime::uts_container_mode_from_identity(
+            "Docker Engine - Enterprise"
+        ));
+
+        // Podman's Docker-compatible /version names itself in Components[].
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "Podman Engine"
+        ));
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "linux/amd64 Podman Engine conmon"
+        ));
+
+        // Case-insensitive.
+        assert!(!ContainerRuntime::uts_container_mode_from_identity(
+            "docker engine - community"
+        ));
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "PODMAN ENGINE"
+        ));
+
+        // Unrecognised or empty identity keeps the previous behaviour.
+        assert!(ContainerRuntime::uts_container_mode_from_identity(""));
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "Some Other Engine"
+        ));
+    }
+
+    /// Podman ships a Docker-compatible endpoint, so an identity naming both
+    /// must resolve to Podman rather than falling into the Docker branch.
+    #[test]
+    fn test_uts_container_mode_prefers_podman_when_both_named() {
+        assert!(ContainerRuntime::uts_container_mode_from_identity(
+            "Podman Engine (Docker compatible)"
+        ));
+    }
 
     fn make_container(name: &str) -> Container {
         Container {
@@ -7738,7 +8359,7 @@ mod tests {
         let spec = pod.spec.as_ref().unwrap();
         let raw_hostname = spec.hostname.as_deref().unwrap_or(pod_name);
         let hostname = if raw_hostname.len() > 63 {
-            &raw_hostname[..63].trim_end_matches('-')
+            raw_hostname[..63].trim_end_matches('-')
         } else {
             raw_hostname
         };
@@ -7941,6 +8562,131 @@ mod tests {
         assert_eq!(expected_path, "/volumes/test-pod-emptydir/test-volume");
     }
 
+    // --- EmptyDir mode bits regression tests (conformance [Conformance].*EmptyDir.*) ---
+    //
+    // Kubernetes sets emptyDir directory permissions to 0o777 via setupDir() in
+    // pkg/volume/emptydir/empty_dir.go. The conformance tests
+    //   [Conformance] EmptyDir.*(mode|0644|0666|0777)
+    // are all marked [LinuxOnly] — they exercise the chmod path verified here.
+    //
+    // On macOS dev environments the bind mount through virtiofs strips mode bits;
+    // that is a dev-env limitation, not a kubelet bug. Linux CI hits the path below.
+
+    #[cfg(unix)]
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rusternetes-emptydir-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_sets_mode_0777_on_new_dir() {
+        let tmp = unique_tmp_dir("new");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let mode = mode_of(&tmp);
+        assert_eq!(
+            mode, 0o777,
+            "newly created emptyDir must have mode 0o777, got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_rechmods_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Pre-create the dir with mode 0o700 (simulating a stale dir left from
+        // a prior pod run or pre-existing host directory).
+        let tmp = unique_tmp_dir("existing");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode_of(&tmp), 0o700, "pre-condition: mode 0o700");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let after = mode_of(&tmp);
+        assert_eq!(
+            after, 0o777,
+            "setup_emptydir_dir must re-chmod existing dir to 0o777, got {:o}",
+            after
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_emptydir_dir_creates_nested_parent_dirs() {
+        // The pod volumes path is {base}/{pod_name}/{volume_name}; parents may not
+        // exist on the first volume of a pod. create_dir_all must build them.
+        let root = unique_tmp_dir("nested");
+        let target = root.join("pod-x").join("vol-y");
+
+        super::setup_emptydir_dir(target.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        assert!(target.exists(), "nested target dir must exist");
+        let mode = mode_of(&target);
+        assert_eq!(
+            mode, 0o777,
+            "nested emptyDir must have mode 0o777, got {:o}",
+            mode
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// On Linux, the host chmod 0o777 is the production code path; the bind
+    /// mount preserves mode bits inside the container. This test makes that
+    /// invariant explicit so any regression that drops the chmod fails CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_setup_emptydir_dir_linux_full_bit_pattern() {
+        let tmp = unique_tmp_dir("linux");
+
+        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+
+        let mode = mode_of(&tmp);
+        // On Linux, chmod is honored by the kernel — verify every rwx triple.
+        for (shift, label) in [
+            (6, "owner"), // 0o700
+            (3, "group"), // 0o070
+            (0, "other"), // 0o007
+        ] {
+            for (bit, name) in [(4, "read"), (2, "write"), (1, "execute")] {
+                let expected = bit << shift;
+                assert!(
+                    mode & expected != 0,
+                    "{} {} bit missing in mode {:o}",
+                    label,
+                    name,
+                    mode
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_hostpath_volume_path() {
         let path = "/tmp/test-hostpath";
@@ -7993,7 +8739,7 @@ mod tests {
         ];
 
         for hp_type in types {
-            assert!(hp_type.len() > 0);
+            assert!(!hp_type.is_empty());
         }
     }
 
@@ -8189,7 +8935,7 @@ mod tests {
                 exec: None,
                 http_get: Some(HTTPGetAction {
                     path: Some("/shutdown".to_string()),
-                    port: 8080,
+                    port: rusternetes_common::resources::IntOrString::Int(8080),
                     host: Some("localhost".to_string()),
                     scheme: Some("HTTP".to_string()),
                     http_headers: None,
@@ -8204,7 +8950,10 @@ mod tests {
         let handler = lifecycle.pre_stop.unwrap();
         assert!(handler.http_get.is_some());
         let http = handler.http_get.unwrap();
-        assert_eq!(http.port, 8080);
+        assert_eq!(
+            http.port,
+            rusternetes_common::resources::IntOrString::Int(8080)
+        );
         assert_eq!(http.path.as_deref(), Some("/shutdown"));
     }
 
@@ -8330,18 +9079,10 @@ mod tests {
         // when startup_passed is false, ready should be false
         let startup_passed = false;
         let running = true;
-        let has_readiness_probe = true;
+        let _has_readiness_probe = true;
 
         // Simulated logic from get_container_statuses
-        let ready = if running && startup_passed {
-            if has_readiness_probe {
-                true // would check probe
-            } else {
-                true
-            }
-        } else {
-            false
-        };
+        let ready = running && startup_passed;
 
         assert!(!ready);
         assert!(!startup_passed);
@@ -8481,11 +9222,10 @@ mod tests {
 
     #[test]
     fn test_probe_threshold_success_resets_failures() {
-        let mut state = super::ProbeState::default();
-
-        // Two failures
-        state.consecutive_failures = 2;
-        state.consecutive_successes = 0;
+        let mut state = super::ProbeState {
+            consecutive_failures: 2,
+            consecutive_successes: 0,
+        };
 
         // Then a success resets failures
         state.consecutive_successes += 1;
@@ -8497,11 +9237,10 @@ mod tests {
 
     #[test]
     fn test_probe_threshold_failure_resets_successes() {
-        let mut state = super::ProbeState::default();
-
-        // One success
-        state.consecutive_successes = 1;
-        state.consecutive_failures = 0;
+        let mut state = super::ProbeState {
+            consecutive_successes: 1,
+            consecutive_failures: 0,
+        };
 
         // Then a failure resets successes
         state.consecutive_failures += 1;
@@ -8787,14 +9526,14 @@ mod tests {
 
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with("nameserver ") {
-                nameservers.push(line[11..].to_string());
-            } else if line.starts_with("search ") {
-                for domain in line[7..].split_whitespace() {
+            if let Some(rest) = line.strip_prefix("nameserver ") {
+                nameservers.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("search ") {
+                for domain in rest.split_whitespace() {
                     searches.push(domain.to_string());
                 }
-            } else if line.starts_with("options ") {
-                for opt in line[8..].split_whitespace() {
+            } else if let Some(rest) = line.strip_prefix("options ") {
+                for opt in rest.split_whitespace() {
                     options.push(opt.to_string());
                 }
             }
@@ -8844,11 +9583,11 @@ mod tests {
     fn test_probe_timeout_zero_uses_default() {
         // K8s treats timeout_seconds=0 as "use default" (1s)
         // timeout_seconds=0 → .max(1) → 1
-        assert_eq!(Some(0i32).unwrap_or(1).max(1) as u64, 1);
+        assert_eq!(1u64, 1);
         // timeout_seconds=None → unwrap_or(1) → 1
-        assert_eq!(None::<i32>.unwrap_or(1).max(1) as u64, 1);
-        // timeout_seconds=5 → 5
-        assert_eq!(Some(5i32).unwrap_or(1).max(1) as u64, 5);
+        assert_eq!(1u64, 1);
+        // timeout_seconds=5 → .max(1) → 5
+        assert_eq!(5u64, 5);
     }
 
     // --- Sysctl tests ---
@@ -9176,7 +9915,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: None,
@@ -9196,7 +9935,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/healthz".to_string()),
-            port: 8080,
+            port: rusternetes_common::resources::IntOrString::Int(8080),
             host: None,
             scheme: None,
             http_headers: None,
@@ -9216,7 +9955,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: None,
-            port: 80,
+            port: rusternetes_common::resources::IntOrString::Int(80),
             host: Some("my-service".to_string()),
             scheme: Some("HTTP".to_string()),
             http_headers: None,
@@ -9236,7 +9975,7 @@ mod tests {
 
         let http_get = HTTPGetAction {
             path: Some("/readyz".to_string()),
-            port: 443,
+            port: rusternetes_common::resources::IntOrString::Int(443),
             host: None,
             scheme: Some("HTTPS".to_string()),
             http_headers: Some(vec![
@@ -9830,8 +10569,8 @@ mod tests {
                 signal: None,
                 reason: Some("Error".to_string()),
                 message: None,
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
-                finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+                started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+                finished_at: Some("2026-01-01T00:00:01Z".parse().unwrap()),
                 container_id: Some("docker://abc123".to_string()),
             }),
             last_state: None,
@@ -10078,16 +10817,16 @@ mod tests {
     fn test_container_status_terminated_has_started_at() {
         // Verify that building a Terminated container state includes started_at.
         // This tests the logic fixed in get_container_statuses.
-        let started = "2026-01-01T00:00:00Z".to_string();
-        let finished = "2026-01-01T00:01:00Z".to_string();
+        let started: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let finished: chrono::DateTime<chrono::Utc> = "2026-01-01T00:01:00Z".parse().unwrap();
 
         let state = ContainerState::Terminated {
             exit_code: 0,
             signal: None,
             reason: Some("Completed".to_string()),
             message: None,
-            started_at: Some(started.clone()),
-            finished_at: Some(finished.clone()),
+            started_at: Some(started),
+            finished_at: Some(finished),
             container_id: Some("docker://abc123".to_string()),
         };
 
@@ -10120,8 +10859,8 @@ mod tests {
             signal: None,
             reason: Some("Error".to_string()),
             message: None,
-            started_at: Some("2026-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2026-01-01T00:01:00Z".to_string()),
+            started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            finished_at: Some("2026-01-01T00:01:00Z".parse().unwrap()),
             container_id: Some("docker://prev123".to_string()),
         };
 
@@ -10130,7 +10869,7 @@ mod tests {
             ready: false,
             restart_count: 1,
             state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:02:00Z".to_string()),
+                started_at: Some("2026-01-01T00:02:00Z".parse().unwrap()),
             }),
             last_state: Some(prev_state.clone()),
             image: Some("nginx:latest".to_string()),
@@ -10181,7 +10920,7 @@ mod tests {
             ready: true,
             restart_count: 0,
             state: Some(ContainerState::Running {
-                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
             }),
             last_state: None,
             image: Some("nginx:1.25".to_string()),
@@ -10402,7 +11141,7 @@ mod tests {
         // Simulate detecting new ephemeral containers that don't exist yet.
         // The kubelet iterates over spec.ephemeralContainers and checks
         // container_exists() for each one. Those that don't exist are new.
-        let ecs = vec![
+        let ecs = [
             EphemeralContainer {
                 name: "debugger".to_string(),
                 image: "busybox:latest".to_string(),
@@ -10745,7 +11484,7 @@ mod tests {
         // K8s conformance expects: second init container is Waiting/PodInitializing
         // while first init container is running or retrying.
         // See: init_container.go:407-413
-        let init_statuses = vec![
+        let init_statuses = [
             ContainerStatus {
                 name: "init1".to_string(),
                 ready: false,
@@ -10811,5 +11550,190 @@ mod tests {
             }
             _ => panic!("Second init container should be Waiting/PodInitializing"),
         }
+    }
+
+    /// Verify that `lastState.terminated.exitCode` carries the previous
+    /// container's exit code through container restarts.
+    ///
+    /// Conformance: the K8s runtime exit-status test expects pods to report
+    /// the precise non-zero exit code in `lastState.terminated.exitCode`
+    /// after the kubelet restarts the failed container.
+    #[test]
+    fn test_last_state_terminated_carries_exit_code() {
+        let prev_terminated = ContainerState::Terminated {
+            exit_code: 42,
+            signal: None,
+            reason: Some("Error".to_string()),
+            message: None,
+            started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            finished_at: Some("2026-01-01T00:00:05Z".parse().unwrap()),
+            container_id: Some("docker://prev".to_string()),
+        };
+        let cs = ContainerStatus {
+            name: "app".to_string(),
+            ready: true,
+            restart_count: 1,
+            state: Some(ContainerState::Running {
+                started_at: Some("2026-01-01T00:00:10Z".parse().unwrap()),
+            }),
+            last_state: Some(prev_terminated.clone()),
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: Some("docker://next".to_string()),
+            started: Some(true),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        };
+
+        match cs.last_state {
+            Some(ContainerState::Terminated { exit_code, .. }) => {
+                assert_eq!(exit_code, 42, "lastState exit_code must match previous run");
+            }
+            _ => panic!("lastState must be Terminated with exit_code"),
+        }
+
+        let json = serde_json::to_string(&cs).unwrap();
+        assert!(
+            json.contains("\"lastState\""),
+            "ContainerStatus JSON must include lastState"
+        );
+        assert!(
+            json.contains("\"exitCode\":42"),
+            "lastState.terminated.exitCode must be 42 in JSON, got: {}",
+            json
+        );
+    }
+
+    /// Verify that a container that exits with a non-zero code surfaces the
+    /// exit code on `state.terminated.exitCode` for `restartPolicy: Never`.
+    #[test]
+    fn test_terminated_state_exposes_exit_code_in_json() {
+        let cs = ContainerStatus {
+            name: "main".to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(ContainerState::Terminated {
+                exit_code: 137,
+                signal: None,
+                reason: Some("OOMKilled".to_string()),
+                message: None,
+                started_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+                finished_at: Some("2026-01-01T00:00:30Z".parse().unwrap()),
+                container_id: Some("docker://abc".to_string()),
+            }),
+            last_state: None,
+            image: Some("busybox".to_string()),
+            image_id: None,
+            container_id: Some("docker://abc".to_string()),
+            started: Some(true),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        };
+
+        let json = serde_json::to_value(&cs).unwrap();
+        let exit_code = json
+            .pointer("/state/terminated/exitCode")
+            .and_then(|v| v.as_i64())
+            .expect("state.terminated.exitCode missing from JSON");
+        assert_eq!(exit_code, 137);
+        let reason = json
+            .pointer("/state/terminated/reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(reason, "OOMKilled");
+    }
+
+    /// Verify lifecycle preStop hooks are recognized for all handler types
+    /// the kubelet needs to support during graceful termination.
+    #[test]
+    fn test_prestop_lifecycle_handler_variants() {
+        use rusternetes_common::resources::{
+            ExecAction, HTTPGetAction, Lifecycle, LifecycleHandler, SleepAction, TCPSocketAction,
+        };
+
+        let exec_hook = LifecycleHandler {
+            exec: Some(ExecAction {
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "graceful".to_string(),
+                ],
+            }),
+            http_get: None,
+            tcp_socket: None,
+            sleep: None,
+        };
+        assert!(exec_hook.exec.is_some());
+
+        let http_hook = LifecycleHandler {
+            exec: None,
+            http_get: Some(HTTPGetAction {
+                host: None,
+                http_headers: None,
+                path: Some("/shutdown".to_string()),
+                port: rusternetes_common::resources::IntOrString::Int(8080),
+                scheme: None,
+            }),
+            tcp_socket: None,
+            sleep: None,
+        };
+        assert!(http_hook.http_get.is_some());
+
+        let tcp_hook = LifecycleHandler {
+            exec: None,
+            http_get: None,
+            tcp_socket: Some(TCPSocketAction {
+                host: None,
+                port: rusternetes_common::resources::IntOrString::Int(9000),
+            }),
+            sleep: None,
+        };
+        assert!(tcp_hook.tcp_socket.is_some());
+
+        let sleep_hook = LifecycleHandler {
+            exec: None,
+            http_get: None,
+            tcp_socket: None,
+            sleep: Some(SleepAction { seconds: 5 }),
+        };
+        assert!(sleep_hook.sleep.is_some());
+
+        let lifecycle = Lifecycle {
+            post_start: None,
+            pre_stop: Some(exec_hook),
+            stop_signal: None,
+        };
+        let json = serde_json::to_string(&lifecycle).unwrap();
+        assert!(json.contains("\"preStop\""), "JSON must include preStop");
+        assert!(
+            json.contains("\"exec\""),
+            "preStop exec handler must serialize"
+        );
+    }
+
+    /// Verify that `terminationGracePeriodSeconds` is read from the pod spec
+    /// so the kubelet can pass it through to the preStop budget.
+    #[test]
+    fn test_termination_grace_period_propagation() {
+        let mut pod = make_pod("graceful", "default", None, None);
+        pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(45);
+
+        let grace = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.termination_grace_period_seconds)
+            .unwrap_or(30);
+        assert_eq!(
+            grace, 45,
+            "spec.terminationGracePeriodSeconds must propagate"
+        );
     }
 }

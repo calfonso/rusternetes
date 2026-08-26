@@ -1,5 +1,5 @@
-/// Example of how to test kubectl commands with a mock HTTP client
-/// This demonstrates the pattern without requiring a running cluster
+//! Example of how to test kubectl commands with a mock HTTP client
+//! This demonstrates the pattern without requiring a running cluster
 
 #[cfg(test)]
 mod tests {
@@ -193,8 +193,8 @@ mod tests {
     #[test]
     fn test_duration_to_seconds_conversion() {
         fn parse_duration(s: &str) -> Result<i64> {
-            let (num_str, unit) = if s.ends_with("ms") {
-                (&s[..s.len() - 2], "ms")
+            let (num_str, unit) = if let Some(stripped) = s.strip_suffix("ms") {
+                (stripped, "ms")
             } else {
                 let last = s.chars().last().unwrap();
                 if last.is_alphabetic() {

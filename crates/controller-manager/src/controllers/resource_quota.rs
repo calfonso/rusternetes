@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
 use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -25,7 +25,6 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
 
         info!("Starting ResourceQuota controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -47,6 +46,34 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                     continue;
                 }
             };
+
+            // Also watch resources whose lifecycle drives quota usage. When a
+            // pod (or other tracked resource) is created/updated/deleted we
+            // re-enqueue every quota in the affected namespace so status.used
+            // reflects the change quickly — without this, usage only refreshes
+            // on the 30s resync, which is what conformance tests probing the
+            // ResourceQuota lifecycle (pod create/delete → used updated) hit.
+            let mut pod_watch = self.storage.watch(&build_prefix("pods", None)).await.ok();
+            let mut svc_watch = self
+                .storage
+                .watch(&build_prefix("services", None))
+                .await
+                .ok();
+            let mut cm_watch = self
+                .storage
+                .watch(&build_prefix("configmaps", None))
+                .await
+                .ok();
+            let mut secret_watch = self
+                .storage
+                .watch(&build_prefix("secrets", None))
+                .await
+                .ok();
+            let mut pvc_watch = self
+                .storage
+                .watch(&build_prefix("persistentvolumeclaims", None))
+                .await
+                .ok();
 
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
             resync.tick().await;
@@ -70,10 +97,62 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                             }
                         }
                     }
+                    event = async { pod_watch.as_mut().unwrap().next().await }, if pod_watch.is_some() => {
+                        if let Some(Ok(ev)) = event {
+                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                        }
+                    }
+                    event = async { svc_watch.as_mut().unwrap().next().await }, if svc_watch.is_some() => {
+                        if let Some(Ok(ev)) = event {
+                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                        }
+                    }
+                    event = async { cm_watch.as_mut().unwrap().next().await }, if cm_watch.is_some() => {
+                        if let Some(Ok(ev)) = event {
+                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                        }
+                    }
+                    event = async { secret_watch.as_mut().unwrap().next().await }, if secret_watch.is_some() => {
+                        if let Some(Ok(ev)) = event {
+                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                        }
+                    }
+                    event = async { pvc_watch.as_mut().unwrap().next().await }, if pvc_watch.is_some() => {
+                        if let Some(Ok(ev)) = event {
+                            self.enqueue_quotas_for_event(&queue, &ev).await;
+                        }
+                    }
                     _ = resync.tick() => {
                         self.enqueue_all(&queue).await;
                     }
                 }
+            }
+        }
+    }
+
+    /// Extract the namespace from a watched resource's storage key and
+    /// enqueue every ResourceQuota in that namespace for reconciliation.
+    async fn enqueue_quotas_for_event(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
+        let key = extract_key(event);
+        // Key format: "{resource_type}/{namespace}/{name}"
+        let parts: Vec<&str> = key.splitn(3, '/').collect();
+        let ns = match parts.get(1) {
+            Some(ns) => *ns,
+            None => return,
+        };
+        if let Ok(quotas) = self
+            .storage
+            .list::<ResourceQuota>(&build_prefix("resourcequotas", Some(ns)))
+            .await
+        {
+            for q in &quotas {
+                queue
+                    .add(format!("resourcequotas/{}/{}", ns, q.metadata.name))
+                    .await;
             }
         }
     }
@@ -84,19 +163,20 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("resourcequotas", Some(ns), name);
             match self.storage.get::<ResourceQuota>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_quota(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_quota(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -107,13 +187,17 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<ResourceQuota>("/registry/resourcequotas/").await {
+        match self
+            .storage
+            .list::<ResourceQuota>("/registry/resourcequotas/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("resourcequotas/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("resourcequotas/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -123,6 +207,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting resource quota reconciliation");
 
@@ -342,18 +427,19 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                             .as_ref()
                             .and_then(|s| s.priority_class_name.as_deref())
                             .unwrap_or("");
-                        let matches =
-                            match req.operator.as_str() {
-                                "In" => req.values.as_ref().map_or(false, |v| {
-                                    v.iter().any(|val| val == pod_priority_class)
-                                }),
-                                "NotIn" => req.values.as_ref().map_or(true, |v| {
-                                    !v.iter().any(|val| val == pod_priority_class)
-                                }),
-                                "Exists" => !pod_priority_class.is_empty(),
-                                "DoesNotExist" => pod_priority_class.is_empty(),
-                                _ => true,
-                            };
+                        let matches = match req.operator.as_str() {
+                            "In" => req
+                                .values
+                                .as_ref()
+                                .is_some_and(|v| v.iter().any(|val| val == pod_priority_class)),
+                            "NotIn" => req
+                                .values
+                                .as_ref()
+                                .is_none_or(|v| !v.iter().any(|val| val == pod_priority_class)),
+                            "Exists" => !pod_priority_class.is_empty(),
+                            "DoesNotExist" => pod_priority_class.is_empty(),
+                            _ => true,
+                        };
                         if !matches {
                             return false;
                         }
@@ -1065,5 +1151,74 @@ mod tests {
         let used = status.used.unwrap();
         assert_eq!(used.get("pods").unwrap(), "0");
         assert_eq!(used.get("requests.cpu").unwrap(), "0m");
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_quotas_for_event_reacts_to_pod_change() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ResourceQuotaController::new(storage.clone());
+
+        // Two quotas in the same namespace should both be enqueued
+        let mut hard = HashMap::new();
+        hard.insert("pods".to_string(), "10".to_string());
+        for name in ["quota-a", "quota-b"] {
+            let q = ResourceQuota {
+                type_meta: TypeMeta {
+                    kind: "ResourceQuota".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: ObjectMeta::new(name).with_namespace("ns-1"),
+                spec: ResourceQuotaSpec {
+                    hard: Some(hard.clone()),
+                    scopes: None,
+                    scope_selector: None,
+                },
+                status: None,
+            };
+            storage
+                .create(&format!("/registry/resourcequotas/ns-1/{}", name), &q)
+                .await
+                .unwrap();
+        }
+        // And one in a different namespace that should NOT be enqueued
+        let other = ResourceQuota {
+            type_meta: TypeMeta {
+                kind: "ResourceQuota".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("quota-x").with_namespace("ns-2"),
+            spec: ResourceQuotaSpec {
+                hard: Some(hard),
+                scopes: None,
+                scope_selector: None,
+            },
+            status: None,
+        };
+        storage
+            .create("/registry/resourcequotas/ns-2/quota-x", &other)
+            .await
+            .unwrap();
+
+        let queue = WorkQueue::new();
+        // Simulate a pod create event in ns-1
+        let ev = rusternetes_storage::WatchEvent::Added(
+            "/registry/pods/ns-1/some-pod".to_string(),
+            "{}".to_string(),
+        );
+        controller.enqueue_quotas_for_event(&queue, &ev).await;
+
+        // Both ns-1 quotas should be queued, ns-2 should not
+        assert_eq!(queue.len().await, 2);
+        let k1 = queue.get().await.unwrap();
+        let k2 = queue.get().await.unwrap();
+        let mut keys = vec![k1, k2];
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "resourcequotas/ns-1/quota-a".to_string(),
+                "resourcequotas/ns-1/quota-b".to_string(),
+            ]
+        );
     }
 }

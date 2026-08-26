@@ -28,7 +28,7 @@ fn create_test_replicaset(name: &str, namespace: &str, replicas: i32) -> Replica
             ..Default::default()
         },
         spec: ReplicaSetSpec {
-            replicas: replicas,
+            replicas,
             selector: LabelSelector {
                 match_labels: Some(labels.clone()),
                 match_expressions: None,

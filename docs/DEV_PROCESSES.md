@@ -6,8 +6,11 @@
 
 ```bash
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
-podman compose build                              # Full cluster with etcd
-podman compose -f compose.sqlite.yml build # SQLite cluster (no etcd)
+podman compose build                               # Full cluster with etcd
+podman compose -f compose.sqlite.yml build         # SQLite cluster (no etcd)
+podman compose -f compose.redis.yml build          # Redis cluster (no etcd)
+podman compose -f compose.all-in-one.yml build     # All-in-one with SQLite
+podman compose -f compose.all-in-one-redis.yml build # All-in-one with Redis
 ```
 
 ### Deploy the cluster
@@ -85,7 +88,7 @@ docker exec sonobuoy-e2e-job-*_e2e cat /tmp/sonobuoy/results/e2e.log | tail -50
 2. Research the expected behavior in the Kubernetes source code
 3. Implement the fix with a test that verifies correctness
 4. Commit the fix: `git commit -m "fix: description of what was fixed"`
-5. Update `docs/CONFORMANCE_FAILURES.md` with the status
+5. Update `.work/CONFORMANCE_TRACKER.md` with the status
 6. Do not redeploy until you've fixed multiple issues — batch them
 
 ## Console Development

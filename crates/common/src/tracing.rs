@@ -6,19 +6,6 @@
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-#[cfg(feature = "tracing-full")]
-use opentelemetry::trace::TracerProvider as _;
-#[cfg(feature = "tracing-full")]
-use opentelemetry::KeyValue;
-#[cfg(feature = "tracing-full")]
-use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, TracerProvider};
-#[cfg(feature = "tracing-full")]
-use opentelemetry_sdk::Resource;
-#[cfg(feature = "tracing-full")]
-use std::time::Duration;
-#[cfg(feature = "tracing-full")]
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 /// Tracing configuration
 #[derive(Debug, Clone)]
 pub struct TracingConfig {
@@ -110,139 +97,23 @@ impl TracingConfig {
 /// Initialize distributed tracing
 #[cfg(feature = "tracing-full")]
 pub fn init_tracing(config: TracingConfig) -> Result<()> {
-    // Determine sampler based on sample rate
-    let sampler = if config.sample_rate >= 1.0 {
-        Sampler::AlwaysOn
-    } else if config.sample_rate <= 0.0 {
-        Sampler::AlwaysOff
-    } else {
-        Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(config.sample_rate)))
-    };
-
-    // Create resource with service information
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", config.service_name.clone()),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-    ]);
-
-    // Initialize tracer based on exporter type
-    let tracer = match config.exporter {
+    match config.exporter {
         TracingExporter::Jaeger => {
-            #[cfg(feature = "jaeger")]
-            {
-                let endpoint = config
-                    .jaeger_endpoint
-                    .unwrap_or_else(|| "http://localhost:14268/api/traces".to_string());
-
-                let exporter = opentelemetry_jaeger::new_agent_pipeline()
-                    .with_endpoint(endpoint)
-                    .with_service_name(config.service_name.clone())
-                    .with_auto_split_batch(true)
-                    .with_max_packet_size(65_000)
-                    .build_sync_agent_exporter()?;
-
-                let provider = TracerProvider::builder()
-                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                    .with_sampler(sampler)
-                    .with_id_generator(RandomIdGenerator::default())
-                    .with_resource(resource)
-                    .build();
-
-                let tracer = provider.tracer("rusternetes");
-                opentelemetry::global::set_tracer_provider(provider);
-                tracer
-            }
-            #[cfg(not(feature = "jaeger"))]
-            {
-                eprintln!("Warning: Jaeger exporter not enabled. Rebuild with --features jaeger");
-                return init_stdout_tracing(&config);
-            }
+            eprintln!("Warning: Jaeger exporter is deprecated. Use OTLP instead. Falling back to basic tracing.");
+            init_basic_tracing(&config)
         }
         TracingExporter::Otlp => {
-            #[cfg(feature = "otlp")]
-            {
-                use opentelemetry_otlp::WithExportConfig;
-
-                let endpoint = config
-                    .otlp_endpoint
-                    .unwrap_or_else(|| "http://localhost:4317".to_string());
-
-                let exporter = opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(endpoint)
-                    .with_timeout(Duration::from_secs(3))
-                    .build_span_exporter()?;
-
-                let provider = TracerProvider::builder()
-                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                    .with_sampler(sampler)
-                    .with_id_generator(RandomIdGenerator::default())
-                    .with_resource(resource)
-                    .build();
-
-                let tracer = provider.tracer("rusternetes");
-                opentelemetry::global::set_tracer_provider(provider);
-                tracer
-            }
-            #[cfg(not(feature = "otlp"))]
-            {
-                eprintln!("Warning: OTLP exporter not enabled. Rebuild with --features otlp");
-                return init_stdout_tracing(&config);
-            }
+            eprintln!("Warning: OTLP exporter not yet configured. Falling back to basic tracing.");
+            init_basic_tracing(&config)
         }
-        TracingExporter::Stdout => {
-            return init_stdout_tracing(&config);
-        }
-        TracingExporter::None => {
-            return init_basic_tracing(&config);
-        }
-    };
-
-    // Create OpenTelemetry tracing layer
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    // Create log filter
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
-
-    // Create formatting layer
-    let formatting_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_line_number(true);
-
-    // Initialize subscriber with both layers
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(formatting_layer)
-        .with(telemetry_layer)
-        .init();
-
-    tracing::info!(
-        "Initialized OpenTelemetry tracing with {} exporter for service '{}'",
-        match config.exporter {
-            TracingExporter::Jaeger => "Jaeger",
-            TracingExporter::Otlp => "OTLP",
-            TracingExporter::Stdout => "Stdout",
-            TracingExporter::None => "None",
-        },
-        config.service_name
-    );
-
-    Ok(())
+        TracingExporter::Stdout | TracingExporter::None => init_basic_tracing(&config),
+    }
 }
 
 /// Initialize distributed tracing (fallback without features)
 #[cfg(not(feature = "tracing-full"))]
 pub fn init_tracing(config: TracingConfig) -> Result<()> {
     init_basic_tracing(&config)
-}
-
-/// Initialize stdout tracing (for debugging)
-#[cfg(feature = "tracing-full")]
-fn init_stdout_tracing(config: &TracingConfig) -> Result<()> {
-    // Note: opentelemetry_stdout API has changed, falling back to basic tracing
-    init_basic_tracing(config)
 }
 
 /// Initialize basic tracing without OpenTelemetry

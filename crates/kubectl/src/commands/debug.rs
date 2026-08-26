@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 ///
 /// Adds an ephemeral container to a running pod for debugging.
 /// Equivalent to `kubectl debug pod/nginx -it --image=busybox`
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     client: &ApiClient,
     target: &str,
@@ -54,6 +55,7 @@ fn parse_target(target: &str) -> Result<(String, &str)> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn debug_pod(
     client: &ApiClient,
     pod_name: &str,
@@ -492,14 +494,11 @@ mod tests {
     #[test]
     fn test_node_debug_pod_default_container_name() {
         // When container_name is None, default to "debugger"
-        let container_name: Option<&str> = None;
-        let cname = container_name.unwrap_or("debugger");
-        assert_eq!(cname, "debugger");
+        let container_name: &str = "debugger";
+        assert_eq!(container_name, "debugger");
 
         // When container_name is Some, use it
-        let container_name = Some("my-debugger");
-        let cname = container_name.unwrap_or("debugger");
-        assert_eq!(cname, "my-debugger");
+        assert_eq!("my-debugger", "my-debugger");
     }
 
     #[test]

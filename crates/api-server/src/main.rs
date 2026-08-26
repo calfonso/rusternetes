@@ -3,6 +3,7 @@ mod admission_webhook;
 mod bootstrap;
 mod conversion;
 mod dynamic_routes;
+#[allow(dead_code)]
 mod flow_control;
 mod gnostic;
 mod handlers;
@@ -12,11 +13,15 @@ mod openapi;
 mod patch;
 mod prometheus_client;
 pub mod protobuf;
+#[allow(dead_code)]
 mod response;
 mod router;
+#[allow(dead_code)]
 mod spdy;
+#[allow(dead_code)]
 mod spdy_handlers;
 mod state;
+#[allow(dead_code)]
 mod streaming;
 mod watch_cache;
 
@@ -28,12 +33,11 @@ use rusternetes_common::auth::TokenManager;
 use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::tls::TlsConfig;
-use rusternetes_storage::{StorageBackend, StorageConfig, Storage};
+use rusternetes_storage::{Storage, StorageBackend, StorageConfig};
 use state::ApiServerState;
 use std::sync::Arc;
 use tracing::debug;
 use tracing::{info, warn, Level};
-use tracing_subscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes-api-server")]
@@ -123,7 +127,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir.clone() }
+            StorageConfig::Sqlite {
+                path: args.data_dir.clone(),
+            }
         }
         _ => {
             let etcd_endpoints: Vec<String> = args
@@ -132,7 +138,9 @@ async fn main() -> Result<()> {
                 .map(|s| s.trim().to_string())
                 .collect();
             info!("Connecting to etcd: {:?}", etcd_endpoints);
-            StorageConfig::Etcd { endpoints: etcd_endpoints }
+            StorageConfig::Etcd {
+                endpoints: etcd_endpoints,
+            }
         }
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
@@ -191,7 +199,7 @@ async fn main() -> Result<()> {
     let api_port = args
         .bind_address
         .split(':')
-        .last()
+        .next_back()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
@@ -212,7 +220,7 @@ async fn main() -> Result<()> {
                 "metadata": {
                     "name": "kubernetes",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339()
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now())
                 },
                 "spec": {
                     "cidrs": ["10.96.0.0/12"]
@@ -221,7 +229,7 @@ async fn main() -> Result<()> {
                     "conditions": [{
                         "type": "Ready",
                         "status": "True",
-                        "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                        "lastTransitionTime": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                         "reason": "NetworkReady",
                         "message": "ServiceCIDR is ready"
                     }]
@@ -245,7 +253,7 @@ async fn main() -> Result<()> {
                 "metadata": {
                     "name": "standard",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                     "annotations": {
                         "storageclass.kubernetes.io/is-default-class": "true"
                     }
@@ -350,7 +358,8 @@ async fn main() -> Result<()> {
         {
             let builder = server.http_builder();
             // Set timer first — required for HTTP/2 keepalive to function
-            builder.http2()
+            builder
+                .http2()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .initial_stream_window_size(256 * 1024) // 256KB per stream (K8s: 256KB)
                 .initial_connection_window_size(256 * 1024 * 100) // 25MB total (K8s: 256KB * 100)

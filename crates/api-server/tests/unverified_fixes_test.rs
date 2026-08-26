@@ -149,14 +149,14 @@ fn test_67_resolv_conf_has_search_domains() {
 
     for line in resolv_conf.lines() {
         let line = line.trim();
-        if line.starts_with("nameserver ") {
-            nameservers.push(line[11..].to_string());
-        } else if line.starts_with("search ") {
-            for domain in line[7..].split_whitespace() {
+        if let Some(rest) = line.strip_prefix("nameserver ") {
+            nameservers.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("search ") {
+            for domain in rest.split_whitespace() {
                 search_domains.push(domain.to_string());
             }
-        } else if line.starts_with("options ") {
-            for opt in line[8..].split_whitespace() {
+        } else if let Some(rest) = line.strip_prefix("options ") {
+            for opt in rest.split_whitespace() {
                 options.push(opt.to_string());
             }
         }

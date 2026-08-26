@@ -450,7 +450,13 @@ mod garbage_collector_integration {
         assert_eq!(pods_after.len(), 0);
     }
 
+    // Namespace cascade is no longer the GC's responsibility — it was removed
+    // because force-deleting namespaced resources from the GC ignored
+    // finalizers and raced with NamespaceController, breaking conformance
+    // ordering tests (see garbage_collector.rs around the deleted_namespaces
+    // no-op loop). Cascade behavior belongs in namespace_controller_test.
     #[tokio::test]
+    #[ignore = "moved to namespace_controller_test; GC no longer cascades namespaces"]
     async fn test_gc_namespace_cascade_deletion() {
         let storage = setup_test().await;
         let gc = GarbageCollector::new(storage.clone());
@@ -553,7 +559,7 @@ mod garbage_collector_integration {
                 .metadata
                 .owner_references
                 .as_ref()
-                .map_or(false, |refs| !refs.is_empty());
+                .is_some_and(|refs| !refs.is_empty());
             assert!(
                 !has_owner_ref,
                 "Child {} should have ownerReferences removed after orphan propagation, but still has {:?}",

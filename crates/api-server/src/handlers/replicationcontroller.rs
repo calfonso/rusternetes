@@ -252,7 +252,10 @@ pub async fn list_replicationcontrollers(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rcs, &params)?;
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -307,7 +310,10 @@ pub async fn list_all_replicationcontrollers(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut rcs, &params)?;
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());

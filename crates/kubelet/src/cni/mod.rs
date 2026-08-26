@@ -8,10 +8,8 @@ pub mod plugin;
 pub mod result;
 pub mod runtime;
 
-pub use config::{NetworkConfig, NetworkConfigList, PluginConfig};
-pub use plugin::{CniPlugin, CniPluginManager};
-pub use result::{CniError, CniResult, ErrorCode};
-pub use runtime::{CniRuntime, NetworkAttachment};
+pub use result::{CniError, ErrorCode};
+pub use runtime::CniRuntime;
 
 /// CNI specification version supported
 pub const CNI_VERSION: &str = "1.0.0";

@@ -1,7 +1,7 @@
 # Dockerfile for API Server component
 
 # Stage 1: Build the console SPA
-FROM node:24-slim AS console-builder
+FROM node:26-slim AS console-builder
 WORKDIR /console
 COPY console/package.json console/package-lock.json* ./
 RUN npm ci --ignore-scripts

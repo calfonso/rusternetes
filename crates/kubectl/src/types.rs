@@ -652,6 +652,7 @@ pub enum SetCommands {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::enum_variant_names)]
 pub enum ApplyCommands {
     /// Edit the latest last-applied-configuration annotation of a resource
     EditLastApplied {

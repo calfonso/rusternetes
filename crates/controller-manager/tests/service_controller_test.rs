@@ -167,7 +167,7 @@ async fn test_service_nodeport_allocation() {
 
     // NodePort should be in valid range (30000-32767)
     let node_port = retrieved.spec.ports[0].node_port.unwrap();
-    assert!(node_port >= 30000 && node_port <= 32767);
+    assert!((30000..=32767).contains(&node_port));
 
     // Clean up
     storage.delete(&key).await.unwrap();

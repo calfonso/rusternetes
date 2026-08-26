@@ -10,7 +10,7 @@ use rusternetes_common::types::{DeletionPropagation, ObjectMeta};
 use rusternetes_storage::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
@@ -47,6 +47,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     }
 
     /// Create a new garbage collector with custom settings
+    #[allow(dead_code)]
     pub fn with_config(
         storage: Arc<S>,
         scan_interval_secs: u64,
@@ -95,33 +96,32 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // Find orphaned resources (resources whose owners no longer exist)
         let orphans = self.find_orphans(&all_resources, &owner_map);
 
-        // Two-scan grace period: only delete orphans that were ALSO orphans in
-        // the previous scan. This prevents race conditions where a resource is
-        // created between the GC listing owners and listing dependents.
-        // K8s avoids this via informer caches with consistent snapshots.
-        let orphan_keys: HashSet<String> = orphans.iter().map(|o| o.key.clone()).collect();
-        let confirmed_orphans: Vec<ResourceInfo>;
+        // K8s GC does not require multiple scans to confirm an orphan — it
+        // re-reads each owner from the apiserver before deleting the dependent
+        // (attemptToDeleteItem → getObject in garbagecollector.go:521). We
+        // do the same in `delete_orphan`, which re-reads both the dependent
+        // and every owner from storage and only deletes when all owners are
+        // confirmed gone. The previous 2-scan grace introduced a full-cycle
+        // delay between owner deletion and dependent removal, which
+        // conformance tests for GC orphan-pod cleanup observe as a failure.
+        //
+        // We still record `pending_orphans` as a no-op so existing fields
+        // compile, but it is no longer consulted to gate deletion.
         {
             let mut pending = self.pending_orphans.lock().unwrap();
-            // Only delete orphans that were pending from the PREVIOUS scan
-            confirmed_orphans = orphans
-                .into_iter()
-                .filter(|o| pending.contains(&o.key))
-                .collect();
-            // Update pending set for next scan
-            *pending = orphan_keys;
+            *pending = orphans.iter().map(|o| o.key.clone()).collect();
         }
 
-        if !confirmed_orphans.is_empty() {
+        if !orphans.is_empty() {
             info!(
-                "Found {} confirmed orphaned resources (2-scan grace)",
-                confirmed_orphans.len()
+                "Found {} orphaned resources to verify and delete",
+                orphans.len()
             );
 
             let mut deleted_count = 0;
             let mut failed_count = 0;
 
-            for orphan in &confirmed_orphans {
+            for orphan in &orphans {
                 match self.delete_orphan(orphan).await {
                     Ok(_) => deleted_count += 1,
                     Err(e) => {
@@ -251,7 +251,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             if let Err(e) = self.extract_metadata(&value) {
                 debug!(
                     "GC: Failed to extract metadata from {} resource: {} (key hint: {:?})",
-                    resource_type, e,
+                    resource_type,
+                    e,
                     value.pointer("/metadata/name").and_then(|v| v.as_str())
                 );
             }
@@ -301,13 +302,13 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     // Map: owner UID -> list of dependent UIDs
                     owner_map
                         .entry(owner_ref.uid.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(resource_uid.clone());
 
                     // Map: dependent UID -> list of owner UIDs
                     dependent_map
                         .entry(resource_uid.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(owner_ref.uid.clone());
                 }
             }
@@ -330,10 +331,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // orphan) or background cascade will handle them properly.
         // K8s GC uses informer caches where a resource is "existing" until the
         // DELETE event fires (i.e., it's removed from etcd).
-        let existing_uids: HashSet<_> = resources
-            .iter()
-            .map(|r| r.metadata.uid.as_str())
-            .collect();
+        let existing_uids: HashSet<_> = resources.iter().map(|r| r.metadata.uid.as_str()).collect();
         let mut orphans = Vec::new();
 
         for resource in resources {
@@ -350,7 +348,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     debug!(
                         "GC: orphan {} — ownerRef UIDs {:?} not in existing_uids ({} entries)",
                         resource.key,
-                        owner_refs.iter().map(|r| r.uid.as_str()).collect::<Vec<_>>(),
+                        owner_refs
+                            .iter()
+                            .map(|r| r.uid.as_str())
+                            .collect::<Vec<_>>(),
                         existing_uids.len(),
                     );
                     orphans.push(resource.clone());
@@ -398,7 +399,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             let plural = kind_to_plural(&owner_ref.kind);
             if plural.is_empty() {
                 // Unknown kind — be conservative, don't delete
-                debug!("GC: {} has owner of unknown kind '{}', skipping", orphan.key, owner_ref.kind);
+                debug!(
+                    "GC: {} has owner of unknown kind '{}', skipping",
+                    orphan.key, owner_ref.kind
+                );
                 return Ok(());
             }
             let owner_key = if let Some(ns) = namespace {
@@ -411,7 +415,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             match self.storage.get::<Value>(&owner_key).await {
                 Ok(owner_value) => {
                     // Owner exists — verify UID matches
-                    if let Some(uid) = owner_value.pointer("/metadata/uid").and_then(|u| u.as_str()) {
+                    if let Some(uid) = owner_value
+                        .pointer("/metadata/uid")
+                        .and_then(|u| u.as_str())
+                    {
                         if uid == owner_ref.uid {
                             // Owner with matching UID exists — NOT an orphan
                             debug!(
@@ -562,9 +569,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         let dependents: Vec<_> = all_resources
             .iter()
             .filter(|r| {
-                r.metadata.owner_references.as_ref().map_or(false, |refs| {
-                    refs.iter().any(|oref| oref.uid == *resource_uid)
-                })
+                r.metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|refs| refs.iter().any(|oref| oref.uid == *resource_uid))
             })
             .collect();
 
@@ -655,9 +663,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         let dependents: Vec<_> = all_resources
             .iter()
             .filter(|r| {
-                r.metadata.owner_references.as_ref().map_or(false, |refs| {
-                    refs.iter().any(|oref| oref.uid == *resource_uid)
-                })
+                r.metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|refs| refs.iter().any(|oref| oref.uid == *resource_uid))
             })
             .collect();
 
@@ -723,6 +732,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     }
 
     /// Cascade delete all resources in a namespace
+    #[allow(dead_code)]
     async fn cascade_delete_namespace(
         &self,
         namespace: &ResourceInfo,
@@ -799,6 +809,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     }
 
     /// DFS helper for cycle detection
+    #[allow(clippy::only_used_in_recursion)]
     fn detect_cycle_dfs(
         &self,
         uid: &str,
@@ -984,6 +995,53 @@ impl Default for DeleteOptions {
     }
 }
 
+/// Map K8s Kind names to their plural storage resource names.
+/// K8s uses discovery API for this; we use a static mapping.
+fn kind_to_plural(kind: &str) -> &str {
+    match kind {
+        "Pod" => "pods",
+        "Service" => "services",
+        "Endpoints" => "endpoints",
+        "EndpointSlice" => "endpointslices",
+        "Namespace" => "namespaces",
+        "Node" => "nodes",
+        "ConfigMap" => "configmaps",
+        "Secret" => "secrets",
+        "ServiceAccount" => "serviceaccounts",
+        "Deployment" => "deployments",
+        "ReplicaSet" => "replicasets",
+        "StatefulSet" => "statefulsets",
+        "DaemonSet" => "daemonsets",
+        "ReplicationController" => "replicationcontrollers",
+        "Job" => "jobs",
+        "CronJob" => "cronjobs",
+        "Ingress" => "ingresses",
+        "NetworkPolicy" => "networkpolicies",
+        "PersistentVolumeClaim" => "persistentvolumeclaims",
+        "PersistentVolume" => "persistentvolumes",
+        "StorageClass" => "storageclasses",
+        "ClusterRole" => "clusterroles",
+        "ClusterRoleBinding" => "clusterrolebindings",
+        "Role" => "roles",
+        "RoleBinding" => "rolebindings",
+        "CustomResourceDefinition" => "customresourcedefinitions",
+        "ControllerRevision" => "controllerrevisions",
+        "HorizontalPodAutoscaler" => "horizontalpodautoscalers",
+        "PodDisruptionBudget" => "poddisruptionbudgets",
+        "ResourceQuota" => "resourcequotas",
+        "LimitRange" => "limitranges",
+        _ => {
+            // Fallback: lowercase + "s" (works for many K8s kinds)
+            // This is imperfect but better than failing
+            tracing::warn!("GC: unknown kind '{}', using lowercase+s fallback", kind);
+            // Return a static str — caller should handle the fallback case
+            // We can't return a dynamically constructed string as &str,
+            // so return an empty string to signal "unknown"
+            ""
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,51 +1103,55 @@ mod tests {
         metadata.remove_finalizer("my-finalizer");
         assert!(!metadata.has_finalizers());
     }
-}
 
-/// Map K8s Kind names to their plural storage resource names.
-/// K8s uses discovery API for this; we use a static mapping.
-fn kind_to_plural(kind: &str) -> &str {
-    match kind {
-        "Pod" => "pods",
-        "Service" => "services",
-        "Endpoints" => "endpoints",
-        "EndpointSlice" => "endpointslices",
-        "Namespace" => "namespaces",
-        "Node" => "nodes",
-        "ConfigMap" => "configmaps",
-        "Secret" => "secrets",
-        "ServiceAccount" => "serviceaccounts",
-        "Deployment" => "deployments",
-        "ReplicaSet" => "replicasets",
-        "StatefulSet" => "statefulsets",
-        "DaemonSet" => "daemonsets",
-        "ReplicationController" => "replicationcontrollers",
-        "Job" => "jobs",
-        "CronJob" => "cronjobs",
-        "Ingress" => "ingresses",
-        "NetworkPolicy" => "networkpolicies",
-        "PersistentVolumeClaim" => "persistentvolumeclaims",
-        "PersistentVolume" => "persistentvolumes",
-        "StorageClass" => "storageclasses",
-        "ClusterRole" => "clusterroles",
-        "ClusterRoleBinding" => "clusterrolebindings",
-        "Role" => "roles",
-        "RoleBinding" => "rolebindings",
-        "CustomResourceDefinition" => "customresourcedefinitions",
-        "ControllerRevision" => "controllerrevisions",
-        "HorizontalPodAutoscaler" => "horizontalpodautoscalers",
-        "PodDisruptionBudget" => "poddisruptionbudgets",
-        "ResourceQuota" => "resourcequotas",
-        "LimitRange" => "limitranges",
-        _ => {
-            // Fallback: lowercase + "s" (works for many K8s kinds)
-            // This is imperfect but better than failing
-            tracing::warn!("GC: unknown kind '{}', using lowercase+s fallback", kind);
-            // Return a static str — caller should handle the fallback case
-            // We can't return a dynamically constructed string as &str,
-            // so return an empty string to signal "unknown"
-            ""
-        }
+    /// A single GC scan must remove an orphan whose owner is already gone.
+    /// Conformance tests for orphan pod cleanup observe per-cycle latency,
+    /// so the previous "2-scan grace" gating added a full reconcile cycle
+    /// of wait before any orphan was reaped. `delete_orphan` already re-reads
+    /// the owner from storage as a race guard, so the second scan was
+    /// unnecessary and observably slow.
+    #[tokio::test]
+    async fn test_orphan_deleted_on_first_scan() {
+        use rusternetes_common::resources::Pod;
+        use rusternetes_common::types::TypeMeta;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let gc = GarbageCollector::new(storage.clone());
+
+        let mut m = ObjectMeta::new("orphan-pod");
+        m.namespace = Some("default".to_string());
+        m.owner_references = Some(vec![OwnerReference {
+            api_version: "apps/v1".to_string(),
+            kind: "ReplicaSet".to_string(),
+            name: "missing-rs".to_string(),
+            uid: "missing-rs-uid-never-existed".to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: m,
+            spec: None,
+            status: None,
+        };
+        storage
+            .create("/registry/pods/default/orphan-pod", &pod)
+            .await
+            .unwrap();
+
+        gc.scan_and_collect().await.unwrap();
+
+        let pods: Vec<Pod> = storage
+            .list("/registry/pods/default/")
+            .await
+            .unwrap_or_default();
+        assert!(
+            pods.is_empty(),
+            "orphan must be deleted on the first GC scan, got {} remaining",
+            pods.len()
+        );
     }
 }

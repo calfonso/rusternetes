@@ -1,6 +1,7 @@
 use crate::client::ApiClient;
 use anyhow::Result;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_enhanced(
     client: &ApiClient,
     pod_name: &str,
@@ -28,6 +29,7 @@ pub async fn execute_enhanced(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn execute(
     client: &ApiClient,
     pod_name: &str,
@@ -42,6 +44,7 @@ pub async fn execute(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_full(
     client: &ApiClient,
     pod_name: &str,
@@ -99,6 +102,45 @@ pub async fn execute_full(
     Ok(())
 }
 
+fn parse_duration_to_seconds(duration: &str) -> Result<i64> {
+    let duration = duration.trim();
+    if duration.is_empty() {
+        anyhow::bail!("Empty duration");
+    }
+
+    let (value_str, unit) = if let Some(stripped) = duration.strip_suffix("ms") {
+        (stripped, "ms")
+    } else {
+        let last_char = duration.chars().last().unwrap();
+        if last_char.is_alphabetic() {
+            (
+                &duration[..duration.len() - 1],
+                &duration[duration.len() - 1..],
+            )
+        } else {
+            (duration, "s") // Default to seconds
+        }
+    };
+
+    let value: i64 = value_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid duration value: {}", value_str))?;
+
+    let seconds = match unit {
+        "s" => value,
+        "m" => value * 60,
+        "h" => value * 3600,
+        "d" => value * 86400,
+        "ms" => value / 1000, // Convert milliseconds to seconds
+        _ => anyhow::bail!(
+            "Unknown duration unit: {}. Supported units: s, m, h, d",
+            unit
+        ),
+    };
+
+    Ok(seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,10 +156,11 @@ mod tests {
         let ns = "prod";
         let pod = "web";
         let mut url = format!("/api/v1/namespaces/{}/pods/{}/log", ns, pod);
-        let mut params = Vec::new();
-        params.push("container=nginx".to_string());
-        params.push("follow=true".to_string());
-        params.push(format!("tailLines={}", 100));
+        let params = [
+            "container=nginx".to_string(),
+            "follow=true".to_string(),
+            format!("tailLines={}", 100),
+        ];
         url.push('?');
         url.push_str(&params.join("&"));
 
@@ -177,9 +220,7 @@ mod tests {
         let ns = "default";
         let pod = "app";
         let mut url = format!("/api/v1/namespaces/{}/pods/{}/log", ns, pod);
-        let mut params = Vec::new();
-        params.push("timestamps=true".to_string());
-        params.push("previous=true".to_string());
+        let params = ["timestamps=true".to_string(), "previous=true".to_string()];
         url.push('?');
         url.push_str(&params.join("&"));
         assert_eq!(
@@ -194,8 +235,7 @@ mod tests {
         let pod = "app";
         let mut url = format!("/api/v1/namespaces/{}/pods/{}/log", ns, pod);
         let seconds = parse_duration_to_seconds("5m").unwrap();
-        let mut params = Vec::new();
-        params.push(format!("sinceSeconds={}", seconds));
+        let params = [format!("sinceSeconds={}", seconds)];
         url.push('?');
         url.push_str(&params.join("&"));
         assert_eq!(
@@ -225,13 +265,14 @@ mod tests {
         let ns = "prod";
         let pod = "web";
         let mut url = format!("/api/v1/namespaces/{}/pods/{}/log", ns, pod);
-        let mut params = Vec::new();
-        params.push("container=app".to_string());
-        params.push("follow=true".to_string());
-        params.push("tailLines=50".to_string());
-        params.push("timestamps=true".to_string());
-        params.push("sinceTime=2024-01-01T00:00:00Z".to_string());
-        params.push("previous=true".to_string());
+        let params = [
+            "container=app".to_string(),
+            "follow=true".to_string(),
+            "tailLines=50".to_string(),
+            "timestamps=true".to_string(),
+            "sinceTime=2024-01-01T00:00:00Z".to_string(),
+            "previous=true".to_string(),
+        ];
         url.push('?');
         url.push_str(&params.join("&"));
         assert!(url.contains("container=app"));
@@ -241,43 +282,4 @@ mod tests {
         assert!(url.contains("sinceTime="));
         assert!(url.contains("previous=true"));
     }
-}
-
-fn parse_duration_to_seconds(duration: &str) -> Result<i64> {
-    let duration = duration.trim();
-    if duration.is_empty() {
-        anyhow::bail!("Empty duration");
-    }
-
-    let (value_str, unit) = if duration.ends_with("ms") {
-        (&duration[..duration.len() - 2], "ms")
-    } else {
-        let last_char = duration.chars().last().unwrap();
-        if last_char.is_alphabetic() {
-            (
-                &duration[..duration.len() - 1],
-                &duration[duration.len() - 1..],
-            )
-        } else {
-            (duration, "s") // Default to seconds
-        }
-    };
-
-    let value: i64 = value_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid duration value: {}", value_str))?;
-
-    let seconds = match unit {
-        "s" => value,
-        "m" => value * 60,
-        "h" => value * 3600,
-        "d" => value * 86400,
-        "ms" => value / 1000, // Convert milliseconds to seconds
-        _ => anyhow::bail!(
-            "Unknown duration unit: {}. Supported units: s, m, h, d",
-            unit
-        ),
-    };
-
-    Ok(seconds)
 }

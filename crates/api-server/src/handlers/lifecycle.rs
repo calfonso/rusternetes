@@ -73,8 +73,10 @@ mod tests {
 
     #[test]
     fn test_set_initial_generation_preserves_existing() {
-        let mut meta = ObjectMeta::default();
-        meta.generation = Some(5);
+        let mut meta = ObjectMeta {
+            generation: Some(5),
+            ..Default::default()
+        };
         set_initial_generation(&mut meta);
         assert_eq!(meta.generation, Some(1)); // K8s always sets generation=1 on creation
     }
@@ -91,8 +93,10 @@ mod tests {
             "spec": {"replicas": 3},
             "status": {"ready": true}
         });
-        let mut meta = ObjectMeta::default();
-        meta.generation = Some(1);
+        let mut meta = ObjectMeta {
+            generation: Some(1),
+            ..Default::default()
+        };
         maybe_increment_generation(&old, &new, &mut meta);
         assert_eq!(meta.generation, Some(2));
     }
@@ -109,8 +113,10 @@ mod tests {
             "spec": {"replicas": 1},
             "status": {"ready": true}
         });
-        let mut meta = ObjectMeta::default();
-        meta.generation = Some(1);
+        let mut meta = ObjectMeta {
+            generation: Some(1),
+            ..Default::default()
+        };
         maybe_increment_generation(&old, &new, &mut meta);
         assert_eq!(meta.generation, Some(1));
     }

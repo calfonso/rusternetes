@@ -5,6 +5,7 @@ Thank you for your interest in contributing to Rusternetes. This is a Rust reimp
 ## Prerequisites
 
 - Rust (stable toolchain)
+- Protocol Buffers compiler (`protobuf-compiler` + `protobuf-devel` on Fedora, `protobuf-compiler` on Debian/Ubuntu, `brew install protobuf` on macOS)
 - Docker and Docker Compose (for integration testing)
 - `make` (for convenience targets)
 
@@ -137,6 +138,7 @@ The cluster runs etcd, the API server (port 6443 with TLS), a scheduler, a contr
 ## Running Conformance Tests
 
 ```bash
+bash scripts/bootstrap-conformance.sh
 bash scripts/run-conformance.sh
 bash scripts/conformance-progress.sh
 ```
@@ -149,13 +151,13 @@ The e2e log is written to `/tmp/sonobuoy/results/e2e.log` inside the e2e contain
 |---|---|
 | `common` | Shared resource types, error types, utilities |
 | `api-server` | Axum-based REST API with per-resource handler files |
-| `storage` | Pluggable storage: etcd, SQLite (rhino), and in-memory backends |
+| `storage` | Pluggable storage: etcd, SQLite/Redis (rhino), and in-memory backends |
 | `controller-manager` | 31 controllers following the reconciliation loop pattern |
 | `kubelet` | Container runtime via bollard, pod lifecycle, volumes, probes |
 | `kube-proxy` | iptables-based service routing |
 | `scheduler` | Pod scheduling with affinity, taints, tolerations, preemption |
 | `kubectl` | CLI tool |
-| `rusternetes` | All-in-one binary (all components as tokio tasks, embedded SQLite) |
+| `rusternetes` | All-in-one binary (all components as tokio tasks, embedded SQLite or Redis) |
 | `cloud-providers` | AWS, GCP, and Azure integrations |
 
 ## Code Style

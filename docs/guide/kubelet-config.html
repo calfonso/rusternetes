@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -197,13 +198,19 @@
             <td><code>--storage-backend</code></td>
             <td>String</td>
             <td><code>etcd</code></td>
-            <td>Storage backend: <code>etcd</code> or <code>sqlite</code></td>
+            <td>Storage backend: <code>etcd</code>, <code>sqlite</code>, or <code>redis</code></td>
           </tr>
           <tr>
             <td><code>--data-dir</code></td>
             <td>String</td>
             <td><code>./data/rusternetes.db</code></td>
             <td>SQLite database path (only with <code>--storage-backend=sqlite</code>)</td>
+          </tr>
+          <tr>
+            <td><code>--redis-url</code></td>
+            <td>String</td>
+            <td><code>redis://localhost:6379</code></td>
+            <td>Redis server URL (only with <code>--storage-backend=redis</code>)</td>
           </tr>
         </tbody>
       </table>

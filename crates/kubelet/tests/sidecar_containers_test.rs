@@ -80,7 +80,7 @@ fn create_pod_with_sidecar(
     for i in 0..app_count {
         containers.push(Container {
             name: format!("app-{}", i),
-            image: format!("nginx:latest"),
+            image: "nginx:latest".to_string(),
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: None,
             args: None,
@@ -239,7 +239,7 @@ fn test_sidecar_runs_alongside_main_containers() {
             ContainerStatus {
                 name: "sidecar-0".to_string(),
                 state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:05Z".to_string()),
+                    started_at: Some("2024-01-01T00:00:05Z".parse().unwrap()),
                 }),
                 ready: true,
                 restart_count: 0,
@@ -259,7 +259,7 @@ fn test_sidecar_runs_alongside_main_containers() {
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:06Z".to_string()),
+                started_at: Some("2024-01-01T00:00:06Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,
@@ -329,18 +329,15 @@ fn test_multiple_sidecars_with_init_containers() {
     assert_eq!(init_containers.len(), 5);
 
     // First 2 are regular init containers
-    for i in 0..2 {
-        assert_eq!(init_containers[i].name, format!("init-{}", i));
-        assert_eq!(init_containers[i].restart_policy, None);
+    for (i, container) in init_containers.iter().enumerate().take(2) {
+        assert_eq!(container.name, format!("init-{}", i));
+        assert_eq!(container.restart_policy, None);
     }
 
     // Next 3 are sidecars
-    for i in 0..3 {
-        assert_eq!(init_containers[i + 2].name, format!("sidecar-{}", i));
-        assert_eq!(
-            init_containers[i + 2].restart_policy,
-            Some("Always".to_string())
-        );
+    for (i, container) in init_containers.iter().skip(2).enumerate().take(3) {
+        assert_eq!(container.name, format!("sidecar-{}", i));
+        assert_eq!(container.restart_policy, Some("Always".to_string()));
     }
 
     // Should have 2 main containers
@@ -398,12 +395,9 @@ fn test_only_sidecars_no_regular_init() {
     // Should have only sidecars
     assert_eq!(init_containers.len(), 2);
 
-    for i in 0..2 {
-        assert_eq!(init_containers[i].name, format!("sidecar-{}", i));
-        assert_eq!(
-            init_containers[i].restart_policy,
-            Some("Always".to_string())
-        );
+    for (i, container) in init_containers.iter().enumerate().take(2) {
+        assert_eq!(container.name, format!("sidecar-{}", i));
+        assert_eq!(container.restart_policy, Some("Always".to_string()));
     }
 }
 
@@ -452,7 +446,7 @@ fn test_sidecar_failure_should_not_block_pod() {
         container_statuses: Some(vec![ContainerStatus {
             name: "app-0".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,

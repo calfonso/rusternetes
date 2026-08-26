@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn create_test_deployment_with_pods(
-    storage: &Arc<MemoryStorage>,
+    _storage: &Arc<MemoryStorage>,
     name: &str,
     namespace: &str,
     replicas: i32,
@@ -39,7 +39,7 @@ fn create_test_deployment_with_pods(
             revision_history_limit: None,
             template: PodTemplateSpec {
                 metadata: Some({
-                    let mut meta = ObjectMeta::new(&format!("{}-pod", name));
+                    let mut meta = ObjectMeta::new(format!("{}-pod", name));
                     meta.labels = Some(labels.clone());
                     meta
                 }),
@@ -127,7 +127,7 @@ fn create_test_deployment_with_pods(
                 api_version: "v1".to_string(),
             },
             metadata: {
-                let mut meta = ObjectMeta::new(&format!("{}-pod-{}", name, i));
+                let mut meta = ObjectMeta::new(format!("{}-pod-{}", name, i));
                 meta.namespace = Some(namespace.to_string());
                 meta.labels = Some(labels.clone());
                 meta.uid = uuid::Uuid::new_v4().to_string();
@@ -579,7 +579,7 @@ async fn test_vpa_with_no_pods() {
         if let Some(recommendation) = status.recommendation {
             if let Some(containers) = recommendation.container_recommendations {
                 assert!(
-                    containers.is_empty() || containers.len() == 0,
+                    containers.is_empty() || containers.is_empty(),
                     "Should have no recommendations without pods or very few"
                 );
             }

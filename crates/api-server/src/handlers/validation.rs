@@ -78,10 +78,7 @@ fn find_duplicates_in_object(
         }
 
         // Extract key
-        let (key, key_end) = match extract_string(bytes, pos) {
-            Some(v) => v,
-            None => return None,
-        };
+        let (key, key_end) = extract_string(bytes, pos)?;
         pos = key_end;
 
         // Build the dotted path for this key
@@ -349,7 +346,15 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
-                } else {
+                } else if !orig_val.is_null() {
+                    // A field present in the original but missing from the
+                    // canonical (re-serialized) JSON is unknown — unless its
+                    // value is `null`.  Optional fields annotated with
+                    // `skip_serializing_if = "Option::is_none"` deserialize
+                    // `null` as `None` and then disappear on re-serialization,
+                    // so a `null` value is never evidence of an unknown field.
+                    // This matches upstream k8s behaviour: clients routinely
+                    // send `"creationTimestamp": null` and similar.
                     unknown.push(field_path);
                 }
             }
@@ -367,67 +372,146 @@ fn find_unknown_fields_recursive(
     }
 }
 
-/// When `fieldValidation=Strict` is set, validate that the request body does not
-/// contain unknown or duplicate fields. Unknown fields are detected by comparing
-/// the original JSON against a re-serialized version of the parsed struct.
-/// Duplicate fields are detected by scanning the raw JSON.
-/// All errors are combined into a single message matching the Kubernetes format:
-/// `strict decoding error: unknown field "spec.foo", duplicate field "spec.bar"`
+/// Field-validation mode resolved from the `?fieldValidation=` query param.
+///
+/// Mirrors upstream k8s `apimachinery/pkg/runtime/serializer/json/json.go`
+/// validation directive parsing. Starting with Kubernetes 1.25 (`PR #107807`,
+/// promoted to GA in 1.27), the server-side default when the param is absent
+/// is `Strict`. Earlier clients that omit the param therefore now get the same
+/// behaviour as if they had asked for it explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldValidationMode {
+    /// Reject unknown / duplicate fields with a 400 BadRequest.
+    Strict,
+    /// Accept unknown fields but emit a `Warning: 299` response header per
+    /// offending field path.
+    Warn,
+    /// Accept unknown fields silently (drop them on read-back).
+    Ignore,
+}
+
+impl FieldValidationMode {
+    /// Resolve the mode from the query param map, defaulting to `Strict` when
+    /// the param is absent. Unknown values fall back to `Strict` to match
+    /// upstream's conservative behaviour.
+    pub fn from_query(params: &HashMap<String, String>) -> Self {
+        match params.get("fieldValidation").map(|v| v.as_str()) {
+            Some("Warn") => Self::Warn,
+            Some("Ignore") => Self::Ignore,
+            // Strict, missing, or unknown values: default to Strict per
+            // K8s 1.25+ server-side default.
+            _ => Self::Strict,
+        }
+    }
+}
+
+/// Build the canonical `strict decoding error: ...` message from the collected
+/// unknown / duplicate field paths.
+fn build_strict_decoding_message(unknown: &[String], duplicates: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for field in unknown {
+        parts.push(format!("unknown field \"{}\"", field));
+    }
+    for field in duplicates {
+        parts.push(format!("duplicate field \"{}\"", field));
+    }
+    format!("strict decoding error: {}", parts.join(", "))
+}
+
+/// Validate the request body against the parsed resource per the
+/// `?fieldValidation=` directive.
+///
+/// Behaviour by mode (matches upstream k8s 1.35):
+/// - `Strict` (or absent param, since 1.25): unknown / duplicate fields are
+///   rejected with `Error::BadRequest` → HTTP 400 reason=BadRequest. Message
+///   format: `strict decoding error: unknown field "spec.foo", duplicate field
+///   "spec.bar"`.
+/// - `Warn`: unknown fields are returned in the `Ok(Vec<String>)` so the
+///   handler can emit one `Warning: 299 - "..."` response header per field.
+///   Duplicate fields are NOT enforced in Warn mode (matches upstream — only
+///   strict decoding splits on duplicates).
+/// - `Ignore`: empty vec, no enforcement.
+///
+/// On success the returned vector contains zero or more `unknown field "..."`
+/// strings ready to be wrapped in the RFC 7234 Warning header value.
 pub fn validate_strict_fields(
     params: &HashMap<String, String>,
     original_body: &[u8],
     parsed_resource: &impl serde::Serialize,
-) -> Result<(), Error> {
-    if params.get("fieldValidation").map(|v| v.as_str()) != Some("Strict") {
-        return Ok(());
+) -> Result<Vec<String>, Error> {
+    let mode = FieldValidationMode::from_query(params);
+    if matches!(mode, FieldValidationMode::Ignore) {
+        return Ok(Vec::new());
     }
 
-    let mut error_parts: Vec<String> = Vec::new();
-
-    // Parse original as generic JSON
+    // Parse original as generic JSON. A serde_json failure here is a true
+    // syntactic error → BadRequest regardless of mode (matches upstream:
+    // duplicate-field detection at the decoder level can't be downgraded by
+    // ?fieldValidation=Warn).
     let original: serde_json::Value = serde_json::from_slice(original_body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("duplicate field") {
             if let Some(field) = msg.split('`').nth(1) {
-                return Error::InvalidResource(format!(
+                return Error::BadRequest(format!(
                     "strict decoding error: json: unknown field \"{}\"",
                     field
                 ));
             }
         }
-        Error::InvalidResource(msg)
+        Error::BadRequest(msg)
     })?;
 
-    // Re-serialize the parsed struct to get canonical JSON
+    // Re-serialize the parsed struct to get canonical JSON.
     let canonical =
         serde_json::to_value(parsed_resource).map_err(|e| Error::Internal(e.to_string()))?;
 
-    // Find unknown fields recursively
+    // Collect unknown field paths.
     let mut unknown = Vec::new();
     find_unknown_fields_recursive(&original, &canonical, "", &mut unknown);
 
-    // Add unknown field errors
-    for field in &unknown {
-        error_parts.push(format!("unknown field \"{}\"", field));
-    }
+    // Collect duplicate field paths from the raw bytes (serde_json silently
+    // takes the last duplicate so we must rescan).
+    let duplicates: Vec<String> = std::str::from_utf8(original_body)
+        .map(find_all_duplicate_json_keys)
+        .unwrap_or_default();
 
-    // Check for duplicate keys in the JSON body
-    // serde_json silently takes the last value for duplicates, so we must detect manually
-    if let Ok(body_str) = std::str::from_utf8(original_body) {
-        let dup_fields = find_all_duplicate_json_keys(body_str);
-        for dup_field in &dup_fields {
-            error_parts.push(format!("duplicate field \"{}\"", dup_field));
+    match mode {
+        FieldValidationMode::Strict => {
+            if unknown.is_empty() && duplicates.is_empty() {
+                return Ok(Vec::new());
+            }
+            Err(Error::BadRequest(build_strict_decoding_message(
+                &unknown,
+                &duplicates,
+            )))
         }
+        FieldValidationMode::Warn => {
+            // Warn mode: unknown fields become per-field warnings. Drop
+            // duplicates here — Warn does not surface duplicate keys (they
+            // would have already been merged by serde_json without raising).
+            Ok(unknown
+                .into_iter()
+                .map(|field| format!("unknown field \"{}\"", field))
+                .collect())
+        }
+        FieldValidationMode::Ignore => Ok(Vec::new()), // unreachable, handled above
     }
+}
 
-    if !error_parts.is_empty() {
-        return Err(Error::InvalidResource(format!(
-            "strict decoding error: {}",
-            error_parts.join(", ")
-        )));
-    }
-
-    Ok(())
+/// Build the RFC 7234 `Warning` header value for an unknown-field warning.
+///
+/// Upstream k8s (`apimachinery/pkg/util/warning/warning.go`) uses warn-code
+/// `299` ("Miscellaneous persistent warning") and the agent token `-` to mean
+/// "no agent identifier". Each unknown field becomes one header value:
+///
+/// ```text
+/// Warning: 299 - "unknown field \"spec.foo\""
+/// ```
+pub fn format_warning_header(warning_text: &str) -> String {
+    // `299 <agent> "<quoted-string>"` — agent token `-` is used when no
+    // host:port identifier is available, matching upstream.
+    let escaped = warning_text.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("299 - \"{}\"", escaped)
 }
 
 /// Validate that a resource name is a valid DNS subdomain name (RFC 1123).
@@ -452,7 +536,7 @@ pub fn validate_resource_name(name: &str) -> Result<(), Error> {
     }
 
     // Check each character
-    for (i, c) in name.chars().enumerate() {
+    for c in name.chars() {
         if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' && c != '.' {
             return Err(Error::InvalidResource(format!(
                 "name '{}' is invalid: a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')",
@@ -599,7 +683,8 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("fieldValidation".to_string(), "Strict".to_string());
 
-        assert!(validate_strict_fields(&params, body, &parsed).is_ok());
+        let warnings = validate_strict_fields(&params, body, &parsed).unwrap();
+        assert!(warnings.is_empty(), "no warnings on clean body");
     }
 
     #[test]
@@ -656,7 +741,9 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_validation_not_strict_mode_allows_unknown() {
+    fn test_strict_validation_default_is_strict() {
+        // K8s 1.25+ default: missing ?fieldValidation= behaves like
+        // ?fieldValidation=Strict, so unknown fields must be rejected.
         #[derive(serde::Serialize, serde::Deserialize)]
         struct Simple {
             name: String,
@@ -668,12 +755,39 @@ mod tests {
         };
         let params = HashMap::new(); // no fieldValidation param
 
-        // Should pass since not in strict mode
-        assert!(validate_strict_fields(&params, body, &parsed).is_ok());
+        let result = validate_strict_fields(&params, body, &parsed);
+        assert!(
+            result.is_err(),
+            "default mode must reject unknown fields (K8s 1.25+ default is Strict)"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("strict decoding error") && err_msg.contains("unknown field"),
+            "default rejection should match strict decoder format: {}",
+            err_msg
+        );
     }
 
     #[test]
-    fn test_strict_validation_warn_mode_allows_unknown() {
+    fn test_strict_validation_ignore_mode_allows_unknown() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Simple {
+            name: String,
+        }
+
+        let body = br#"{"name": "test", "extra": "field"}"#;
+        let parsed = Simple {
+            name: "test".to_string(),
+        };
+        let mut params = HashMap::new();
+        params.insert("fieldValidation".to_string(), "Ignore".to_string());
+
+        let warnings = validate_strict_fields(&params, body, &parsed).unwrap();
+        assert!(warnings.is_empty(), "Ignore mode must not surface warnings");
+    }
+
+    #[test]
+    fn test_strict_validation_warn_mode_returns_warnings() {
         #[derive(serde::Serialize, serde::Deserialize)]
         struct Simple {
             name: String,
@@ -686,8 +800,14 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("fieldValidation".to_string(), "Warn".to_string());
 
-        // Should pass since Warn mode, not Strict
-        assert!(validate_strict_fields(&params, body, &parsed).is_ok());
+        // Warn mode must surface unknown fields as warning strings (no error).
+        let warnings = validate_strict_fields(&params, body, &parsed).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("unknown field") && warnings[0].contains("extra"),
+            "warning must identify the unknown field: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -806,5 +926,56 @@ mod tests {
         let json = r#"{"spec": {"replicas": 1, "replicas": 2}}"#;
         let dups = find_all_duplicate_json_keys(json);
         assert_eq!(dups, vec!["spec.replicas".to_string()]);
+    }
+
+    #[test]
+    fn test_format_warning_header_shape() {
+        // Upstream emits `Warning: 299 - "..."` per RFC 7234.
+        let header = format_warning_header(r#"unknown field "spec.bogus""#);
+        assert!(
+            header.starts_with("299 "),
+            "header must start with warn-code 299: {}",
+            header
+        );
+        assert!(
+            header.contains("spec.bogus"),
+            "header must mention the unknown field: {}",
+            header
+        );
+        assert!(
+            header.contains(r#"\"spec.bogus\""#),
+            "field name should be quoted/escaped: {}",
+            header
+        );
+    }
+
+    #[test]
+    fn test_field_validation_mode_from_query_defaults_to_strict() {
+        let empty = HashMap::new();
+        assert_eq!(
+            FieldValidationMode::from_query(&empty),
+            FieldValidationMode::Strict
+        );
+
+        let mut warn = HashMap::new();
+        warn.insert("fieldValidation".to_string(), "Warn".to_string());
+        assert_eq!(
+            FieldValidationMode::from_query(&warn),
+            FieldValidationMode::Warn
+        );
+
+        let mut ignore = HashMap::new();
+        ignore.insert("fieldValidation".to_string(), "Ignore".to_string());
+        assert_eq!(
+            FieldValidationMode::from_query(&ignore),
+            FieldValidationMode::Ignore
+        );
+
+        let mut strict = HashMap::new();
+        strict.insert("fieldValidation".to_string(), "Strict".to_string());
+        assert_eq!(
+            FieldValidationMode::from_query(&strict),
+            FieldValidationMode::Strict
+        );
     }
 }

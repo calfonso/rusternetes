@@ -176,6 +176,7 @@ pub struct CustomResourceValidation {
 /// This is a simplified implementation of OpenAPI v3 schema
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct JSONSchemaProps {
     #[serde(skip_serializing_if = "skip_empty_string")]
     pub id: Option<String>,
@@ -334,6 +335,7 @@ pub struct JSONSchemaProps {
 /// JSONSchemaPropsOrArray represents a value that can be either a JSONSchemaProps or an array of them
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum JSONSchemaPropsOrArray {
     Schema(JSONSchemaProps),
     Schemas(Vec<JSONSchemaProps>),
@@ -342,6 +344,7 @@ pub enum JSONSchemaPropsOrArray {
 /// JSONSchemaPropsOrBool represents a value that can be either a JSONSchemaProps or a boolean
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum JSONSchemaPropsOrBool {
     Schema(JSONSchemaProps),
     Bool(bool),
@@ -350,6 +353,7 @@ pub enum JSONSchemaPropsOrBool {
 /// JSONSchemaPropsOrStringArray represents a value that can be either a JSONSchemaProps or a string array
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum JSONSchemaPropsOrStringArray {
     Schema(JSONSchemaProps),
     Strings(Vec<String>),
@@ -621,55 +625,108 @@ mod tests {
         let cluster = serde_json::to_string(&ResourceScope::Cluster).unwrap();
         assert_eq!(cluster, r#""Cluster""#);
     }
-}
 
-impl Default for JSONSchemaProps {
-    fn default() -> Self {
-        Self {
-            id: None,
-            schema: None,
-            ref_path: None,
-            description: None,
-            type_: None,
-            format: None,
-            title: None,
-            default: None,
-            maximum: None,
-            minimum: None,
-            exclusive_maximum: None,
-            exclusive_minimum: None,
-            max_length: None,
-            min_length: None,
-            pattern: None,
-            max_items: None,
-            min_items: None,
-            unique_items: None,
-            multiple_of: None,
-            max_properties: None,
-            min_properties: None,
-            required: None,
-            items: None,
-            all_of: None,
-            one_of: None,
-            any_of: None,
-            not: None,
-            properties: None,
-            additional_properties: None,
-            pattern_properties: None,
-            dependencies: None,
-            additional_items: None,
-            definitions: None,
-            enum_: None,
-            example: None,
-            external_docs: None,
-            nullable: None,
-            x_kubernetes_preserve_unknown_fields: None,
-            x_kubernetes_embedded_resource: None,
-            x_kubernetes_int_or_string: None,
-            x_kubernetes_list_map_keys: None,
-            x_kubernetes_list_type: None,
-            x_kubernetes_map_type: None,
-            x_kubernetes_validations: None,
+    /// Test that enum values survive a JSON round-trip through the typed struct.
+    /// This verifies the CRD schema with nested items + enum can be stored as
+    /// raw JSON and deserialized back without losing enum values.
+    #[test]
+    fn test_enum_survives_json_roundtrip() {
+        let crd_json = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foos.tests.example.com"},
+            "spec": {
+                "group": "tests.example.com",
+                "names": {
+                    "plural": "foos",
+                    "kind": "Foo"
+                },
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "bars": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "required": ["name"],
+                                                "properties": {
+                                                    "name": { "type": "string" },
+                                                    "feeling": {
+                                                        "type": "string",
+                                                        "enum": ["Great", "Down"]
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+
+        // Deserialize to typed struct
+        let crd: super::super::CustomResourceDefinition =
+            serde_json::from_value(crd_json).expect("Failed to deserialize CRD");
+
+        // Check that enum values are preserved in the typed struct
+        let version = &crd.spec.versions[0];
+        let schema = version.schema.as_ref().expect("no schema");
+        let spec_schema = schema
+            .open_apiv3_schema
+            .properties
+            .as_ref()
+            .unwrap()
+            .get("spec")
+            .unwrap();
+        let bars_schema = spec_schema
+            .properties
+            .as_ref()
+            .unwrap()
+            .get("bars")
+            .unwrap();
+
+        match bars_schema.items.as_ref() {
+            Some(items) => match items.as_ref() {
+                JSONSchemaPropsOrArray::Schema(item_schema) => {
+                    let feeling = item_schema
+                        .properties
+                        .as_ref()
+                        .unwrap()
+                        .get("feeling")
+                        .unwrap();
+                    assert_eq!(
+                        feeling.enum_,
+                        Some(vec![serde_json::json!("Great"), serde_json::json!("Down")]),
+                        "enum values should survive deserialization"
+                    );
+                }
+                JSONSchemaPropsOrArray::Schemas(_) => {
+                    panic!("items should be Schema variant, not Schemas");
+                }
+            },
+            None => panic!("items should not be None"),
         }
+
+        // Serialize back and check again
+        let roundtripped = serde_json::to_value(&crd).expect("Failed to serialize CRD");
+        let feeling_enum = &roundtripped["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+            ["properties"]["spec"]["properties"]["bars"]["items"]["properties"]["feeling"]["enum"];
+        assert_eq!(
+            feeling_enum,
+            &serde_json::json!(["Great", "Down"]),
+            "enum values should survive full JSON round-trip"
+        );
     }
 }

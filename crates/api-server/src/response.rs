@@ -82,7 +82,7 @@ impl ContentType {
 
 /// Create a response with content negotiation
 /// Note: Protobuf encoding requires api_version and kind, so this is a simplified version
-pub fn create_response<T>(data: T, status: StatusCode, content_type: ContentType) -> Response
+pub fn create_response<T>(data: T, status: StatusCode, _content_type: ContentType) -> Response
 where
     T: Serialize,
 {

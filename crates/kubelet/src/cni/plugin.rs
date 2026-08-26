@@ -28,6 +28,7 @@ impl CniPlugin {
     }
 
     /// Execute the plugin with given parameters
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &self,
         command: CniCommand,

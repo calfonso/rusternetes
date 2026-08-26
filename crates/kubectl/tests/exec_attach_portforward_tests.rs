@@ -1,5 +1,5 @@
-/// Tests for kubectl exec, attach, and port-forward commands
-/// Tests argument parsing and URL building without requiring a cluster
+//! Tests for kubectl exec, attach, and port-forward commands
+//! Tests argument parsing and URL building without requiring a cluster
 
 mod urlencoding {
     pub fn encode(s: &str) -> String {

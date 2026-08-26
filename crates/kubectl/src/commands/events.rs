@@ -10,6 +10,7 @@ use serde_json::Value;
 ///   kubectl events --for pod/nginx
 ///   kubectl events -A
 ///   kubectl events --types=Warning
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     client: &ApiClient,
     namespace: &str,
@@ -478,7 +479,7 @@ mod tests {
     fn test_event_type_filtering() {
         use serde_json::json;
 
-        let events = vec![
+        let events = [
             json!({"type": "Normal", "reason": "Scheduled"}),
             json!({"type": "Warning", "reason": "BackOff"}),
             json!({"type": "Normal", "reason": "Pulled"}),
@@ -486,7 +487,7 @@ mod tests {
         ];
 
         // Filter to Warning only
-        let type_filters = vec!["Warning".to_string()];
+        let type_filters = ["Warning".to_string()];
         let filtered: Vec<&Value> = events
             .iter()
             .filter(|event| {
@@ -509,12 +510,12 @@ mod tests {
     fn test_event_type_filter_case_insensitive() {
         use serde_json::json;
 
-        let events = vec![
+        let events = [
             json!({"type": "normal", "reason": "Started"}),
             json!({"type": "WARNING", "reason": "Failed"}),
         ];
 
-        let type_filters = vec!["warning".to_string()];
+        let type_filters = ["warning".to_string()];
         let filtered: Vec<&Value> = events
             .iter()
             .filter(|event| {
@@ -536,7 +537,7 @@ mod tests {
     fn test_event_sorting_by_timestamp() {
         use serde_json::json;
 
-        let events = vec![
+        let events = [
             json!({"lastTimestamp": "2024-03-01T00:00:00Z", "reason": "third"}),
             json!({"lastTimestamp": "2024-01-01T00:00:00Z", "reason": "first"}),
             json!({"lastTimestamp": "2024-02-01T00:00:00Z", "reason": "second"}),

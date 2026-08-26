@@ -401,11 +401,11 @@ async fn test_deployment_min_ready_seconds() {
 async fn test_deployment_progress_deadline() {
     let storage = Arc::new(MemoryStorage::new());
 
-    let mut deployment = create_test_deployment("test-deadline", "default", 3);
+    let deployment = create_test_deployment("test-deadline", "default", 3);
 
     let key = build_key("deployments", Some("default"), "test-deadline");
 
-    let created: Deployment = storage.create(&key, &deployment).await.unwrap();
+    let _created: Deployment = storage.create(&key, &deployment).await.unwrap();
 
     // Clean up
     storage.delete(&key).await.unwrap();

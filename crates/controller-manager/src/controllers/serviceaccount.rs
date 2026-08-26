@@ -3,7 +3,7 @@ use futures::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rusternetes_common::resources::{Namespace, Secret, ServiceAccount};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -118,7 +118,6 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
     /// Watch-based run loop. Watches for serviceaccount changes and
     /// periodically resyncs every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -177,7 +176,10 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             // Skip namespaces that are being deleted — don't create SAs
             // in terminating namespaces (fights with namespace controller)
@@ -207,7 +209,11 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
         // Enqueue all existing service accounts
-        match self.storage.list::<ServiceAccount>("/registry/serviceaccounts/").await {
+        match self
+            .storage
+            .list::<ServiceAccount>("/registry/serviceaccounts/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let ns = item.metadata.namespace.as_deref().unwrap_or("");
@@ -220,7 +226,11 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             }
         }
         // Also ensure default SA in all namespaces
-        match self.storage.list::<Namespace>("/registry/namespaces/").await {
+        match self
+            .storage
+            .list::<Namespace>("/registry/namespaces/")
+            .await
+        {
             Ok(namespaces) => {
                 for ns in &namespaces {
                     if ns.metadata.deletion_timestamp.is_none() {
@@ -235,6 +245,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting service account reconciliation");
 
@@ -313,7 +324,10 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             Ok(_) => {}
             Err(rusternetes_common::Error::AlreadyExists(_)) => {
                 // Another reconciliation created it — this is fine
-                debug!("Default ServiceAccount already exists in namespace {}", namespace);
+                debug!(
+                    "Default ServiceAccount already exists in namespace {}",
+                    namespace
+                );
                 return Ok(());
             }
             Err(e) => return Err(e.into()),

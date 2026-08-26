@@ -3,7 +3,7 @@ use rusternetes_common::resources::{
     AllocationResult, DeviceAllocationResult, DeviceClass, DeviceRequestAllocationResult,
     ResourceClaim, ResourceClaimStatus, ResourceSlice,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -29,7 +29,6 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
 
         info!("Starting ResourceClaim Controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -37,7 +36,6 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -87,13 +85,16 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("resourceclaims", Some(ns), name);
             match self.storage.get::<ResourceClaim>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile_claim(&mut resource).await {
+                    match self.reconcile_claim(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -111,7 +112,11 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<ResourceClaim>("/registry/resourceclaims/").await {
+        match self
+            .storage
+            .list::<ResourceClaim>("/registry/resourceclaims/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     if let Some(ref meta) = item.metadata {
@@ -353,10 +358,7 @@ struct AllocatedDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::{
-        Device, DeviceAllocationMode, DeviceClaim, DeviceClassSpec, DeviceRequest,
-        ExactDeviceRequest, ResourceClaimSpec, ResourcePool, ResourceSliceSpec,
-    };
+    use rusternetes_common::resources::{DeviceClaim, DeviceClassSpec, ResourceClaimSpec};
     use rusternetes_storage::memory::MemoryStorage;
 
     #[tokio::test]

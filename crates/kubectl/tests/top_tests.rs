@@ -1,16 +1,11 @@
 /// Tests for kubectl top command
 /// Tests metrics formatting and resource calculation without requiring a cluster
-
 #[cfg(test)]
 mod metrics_formatting_tests {
     #[test]
     fn test_format_cpu_usage() {
         fn format_cpu(millicores: u64) -> String {
-            if millicores >= 1000 {
-                format!("{}m", millicores)
-            } else {
-                format!("{}m", millicores)
-            }
+            format!("{}m", millicores)
         }
 
         assert_eq!(format_cpu(100), "100m");

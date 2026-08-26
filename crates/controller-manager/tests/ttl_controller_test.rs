@@ -252,7 +252,7 @@ async fn test_ttl_controller_deletes_job_pods() {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: ObjectMeta::new(&format!("job-pod-{}", i)).with_namespace("default"),
+            metadata: ObjectMeta::new(format!("job-pod-{}", i)).with_namespace("default"),
             spec: Some(PodSpec {
                 containers: vec![Container {
                     name: "test".to_string(),

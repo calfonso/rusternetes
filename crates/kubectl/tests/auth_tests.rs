@@ -1,5 +1,5 @@
-/// Tests for kubectl auth commands
-/// Tests authentication and authorization checking without requiring a cluster
+//! Tests for kubectl auth commands
+//! Tests authentication and authorization checking without requiring a cluster
 
 #[cfg(test)]
 mod can_i_tests {

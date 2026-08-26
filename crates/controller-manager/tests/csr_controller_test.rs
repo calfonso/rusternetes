@@ -299,7 +299,7 @@ async fn test_csr_controller_handles_different_signers() {
     let storage = setup_test().await;
 
     // Test different standard signers
-    let signers = vec![
+    let signers = [
         "kubernetes.io/kube-apiserver-client",
         "kubernetes.io/kube-apiserver-client-kubelet",
         "kubernetes.io/kubelet-serving",

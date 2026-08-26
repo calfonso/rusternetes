@@ -24,7 +24,7 @@ pub async fn create_crd(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
     // Reject empty request bodies with a clear error message.
@@ -408,7 +408,7 @@ pub async fn update_crd(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<CustomResourceDefinition>> {
     // Reject empty or binary-protobuf request bodies
@@ -546,7 +546,7 @@ pub async fn update_crd(
             None,
             &name,
             Some(final_crd_value),
-            old_crd_value,
+            old_crd_value.clone(),
             &user_info,
         )
         .await?;
@@ -574,20 +574,8 @@ pub async fn update_crd(
     // K8s ref: CRD storage preserves original schema bytes.
     let mut raw_value: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| rusternetes_common::Error::Internal(format!("re-parse for storage: {}", e)))?;
-    // Apply metadata from typed struct (uid, resourceVersion, generation)
-    if let Some(obj) = raw_value.as_object_mut() {
-        if let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            meta.insert("uid".to_string(), serde_json::json!(crd.metadata.uid));
-            meta.insert("name".to_string(), serde_json::json!(crd.metadata.name));
-            if let Some(gen) = crd.metadata.generation {
-                meta.insert("generation".to_string(), serde_json::json!(gen));
-            }
-        }
-        // Copy status from typed struct (may have been enriched)
-        if let Ok(status_val) = serde_json::to_value(&crd.status) {
-            obj.insert("status".to_string(), status_val);
-        }
-    }
+
+    enrich_updated_crd(&mut raw_value, &crd, old_crd_value.as_ref());
     let updated: serde_json::Value = state.storage.update(&key, &raw_value).await?;
 
     // Notify dynamic route manager about CRD update
@@ -616,7 +604,7 @@ pub async fn delete_crd(
         }
     }
 
-    // Get CRD to check for custom resources
+    // Get CRD to validate it exists
     let key = build_key("customresourcedefinitions", None, &name);
     let crd: CustomResourceDefinition = state.storage.get(&key).await?;
 
@@ -627,49 +615,9 @@ pub async fn delete_crd(
         return Ok(Json(crd));
     }
 
-    // Check if there are any custom resources of this type
-    // Custom resources are stored with keys like: /apis/{group}/{version}/{resource}/{namespace}/{name}
-    // or /apis/{group}/{version}/{resource}/{name} for cluster-scoped
-    for version in &crd.spec.versions {
-        let resource_prefix =
-            if crd.spec.scope == rusternetes_common::resources::ResourceScope::Namespaced {
-                // For namespaced resources, check across all namespaces
-                format!(
-                    "/apis/{}/{}/{}/",
-                    crd.spec.group, version.name, crd.spec.names.plural
-                )
-            } else {
-                // For cluster-scoped resources
-                format!(
-                    "/apis/{}/{}/{}/",
-                    crd.spec.group, version.name, crd.spec.names.plural
-                )
-            };
-
-        // List all custom resources with this prefix
-        let custom_resources: Vec<serde_json::Value> = state
-            .storage
-            .list(&resource_prefix)
-            .await
-            .unwrap_or_default();
-
-        if !custom_resources.is_empty() {
-            warn!(
-                "CRD {} has {} existing custom resources of type {}/{}/{}",
-                name,
-                custom_resources.len(),
-                crd.spec.group,
-                version.name,
-                crd.spec.names.plural
-            );
-
-            return Err(rusternetes_common::Error::InvalidResource(format!(
-                "CustomResourceDefinition {} cannot be deleted because {} custom resource(s) still exist. Delete all custom resources first.",
-                name,
-                custom_resources.len()
-            )));
-        }
-    }
+    // K8s does NOT block CRD deletion when custom resources exist.
+    // Instead, the CRD finalizer controller (customresourcecleanup.apiextensions.k8s.io)
+    // handles cleanup of custom resources after deletionTimestamp is set.
 
     // Handle deletion with finalizers
     let deleted_immediately =
@@ -804,10 +752,9 @@ pub async fn patch_crd(
                 state.storage.get::<serde_json::Value>(&key).await.ok();
 
             // Parse desired resource
-            let desired_json: serde_json::Value =
-                serde_json::from_slice(&body).map_err(|e| {
-                    rusternetes_common::Error::InvalidResource(format!("Invalid resource: {}", e))
-                })?;
+            let desired_json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!("Invalid resource: {}", e))
+            })?;
 
             let force = params
                 .get("force")
@@ -890,9 +837,8 @@ pub async fn patch_crd(
     let current_json: serde_json::Value = state.storage.get(&key).await?;
 
     // Parse patch document
-    let patch_json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e))
-    })?;
+    let patch_json: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e)))?;
 
     // Apply patch to raw JSON
     let mut patched_json = crate::patch::apply_patch(&current_json, &patch_json, patch_type)
@@ -923,12 +869,9 @@ pub async fn patch_crd(
 
     // Validate that the patched JSON can still be parsed as a CRD (catch structural errors)
     // but do NOT use the typed struct for storage — store the raw JSON directly.
-    let _validate: CustomResourceDefinition =
-        serde_json::from_value(patched_json.clone()).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Patched CRD is not valid: {}",
-                e
-            ))
+    let _validate: CustomResourceDefinition = serde_json::from_value(patched_json.clone())
+        .map_err(|e| {
+            rusternetes_common::Error::InvalidResource(format!("Patched CRD is not valid: {}", e))
         })?;
 
     // Check if this is a dry-run request
@@ -945,6 +888,159 @@ pub async fn patch_crd(
     let updated: serde_json::Value = state.storage.update(&key, &patched_json).await?;
 
     Ok(Json(updated))
+}
+
+/// Enrich a CRD raw JSON value being stored on update with derived metadata
+/// and status fields. Specifically:
+///
+/// - Sets `metadata.uid`/`metadata.name` from the typed CRD.
+/// - Bumps `metadata.generation` when the spec differs from the previously
+///   stored version.
+/// - Preserves the previously stored `status` when the new body omits it
+///   (a PUT without a status subresource must not erase Established/NamesAccepted
+///   conditions — losing them would prevent the OpenAPI publisher from
+///   regenerating x-kubernetes-group-version-kind correctly after a version
+///   rename).
+/// - Refreshes `status.acceptedNames` from the new spec names.
+/// - Appends any new storage versions to `status.storedVersions` without
+///   dropping historical entries (K8s leaves removal to the migration
+///   controller).
+fn enrich_updated_crd(
+    raw_value: &mut serde_json::Value,
+    crd: &CustomResourceDefinition,
+    old_crd_value: Option<&serde_json::Value>,
+) {
+    let spec_changed = match (
+        old_crd_value.and_then(|v| v.get("spec")),
+        raw_value.get("spec"),
+    ) {
+        (Some(old), Some(new)) => old != new,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+
+    let obj = match raw_value.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+
+    if let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        meta.insert("uid".to_string(), serde_json::json!(crd.metadata.uid));
+        meta.insert("name".to_string(), serde_json::json!(crd.metadata.name));
+
+        let old_gen = old_crd_value
+            .and_then(|v| v.pointer("/metadata/generation"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let new_gen = if spec_changed { old_gen + 1 } else { old_gen };
+        meta.insert("generation".to_string(), serde_json::json!(new_gen));
+    }
+
+    // If the new body omitted status, restore the previously stored status so
+    // Established/NamesAccepted survive a spec-only update like a rename.
+    let body_has_status = obj.get("status").map(|s| !s.is_null()).unwrap_or(false);
+    if !body_has_status {
+        if let Some(prev_status) = old_crd_value.and_then(|v| v.get("status")).cloned() {
+            obj.insert("status".to_string(), prev_status);
+        } else if let Ok(status_val) = serde_json::to_value(&crd.status) {
+            obj.insert("status".to_string(), status_val);
+        }
+    }
+
+    // Refresh acceptedNames + storedVersions from the new spec.
+    let new_storage: Vec<String> = crd
+        .spec
+        .versions
+        .iter()
+        .filter(|v| v.storage)
+        .map(|v| v.name.clone())
+        .collect();
+    let names_val = serde_json::to_value(&crd.spec.names).unwrap_or(serde_json::Value::Null);
+    if let Some(status) = obj.get_mut("status").and_then(|s| s.as_object_mut()) {
+        status.insert("acceptedNames".to_string(), names_val);
+        let mut stored: Vec<String> = status
+            .get("storedVersions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for v in new_storage {
+            if !stored.contains(&v) {
+                stored.push(v);
+            }
+        }
+        status.insert("storedVersions".to_string(), serde_json::json!(stored));
+    }
+}
+
+pub async fn deletecollection_customresourcedefinitions(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<StatusCode> {
+    info!(
+        "DeleteCollection customresourcedefinitions with params: {:?}",
+        params
+    );
+
+    // Check authorization
+    let attrs = RequestAttributes::new(
+        auth_ctx.user,
+        "deletecollection",
+        "customresourcedefinitions",
+    )
+    .with_api_group("apiextensions.k8s.io");
+
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => {
+            return Err(rusternetes_common::Error::Forbidden(reason));
+        }
+    }
+
+    // Handle dry-run
+    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
+    if is_dry_run {
+        info!("Dry-run: CustomResourceDefinition collection would be deleted (not deleted)");
+        return Ok(StatusCode::OK);
+    }
+
+    // Get all customresourcedefinitions
+    let prefix = build_prefix("customresourcedefinitions", None);
+    let mut items = state
+        .storage
+        .list::<CustomResourceDefinition>(&prefix)
+        .await?;
+
+    // Apply field and label selector filtering
+    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
+
+    // Delete each matching resource
+    let mut deleted_count = 0;
+    for item in items {
+        let key = build_key("customresourcedefinitions", None, &item.metadata.name);
+
+        // Handle deletion with finalizers
+        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
+            &state.storage,
+            &key,
+            &item,
+        )
+        .await?;
+
+        if deleted_immediately {
+            deleted_count += 1;
+        }
+    }
+
+    info!(
+        "DeleteCollection completed: {} customresourcedefinitions deleted",
+        deleted_count
+    );
+    Ok(StatusCode::OK)
 }
 
 #[cfg(test)]
@@ -1137,71 +1233,187 @@ mod tests {
             result
         );
     }
-}
 
-pub async fn deletecollection_customresourcedefinitions(
-    State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
-    info!(
-        "DeleteCollection customresourcedefinitions with params: {:?}",
-        params
-    );
+    /// After renaming a CRD's served/storage version, the stored representation
+    /// must reflect the new version names so the OpenAPI publisher emits a
+    /// correct x-kubernetes-group-version-kind extension. Specifically:
+    ///   * status conditions (Established / NamesAccepted) must be preserved
+    ///     even when the PUT body omits status — otherwise downstream
+    ///     publishers refuse to advertise the CRD.
+    ///   * metadata.generation must bump on a spec change so watchers reload.
+    ///   * status.storedVersions must accumulate any new storage version while
+    ///     preserving prior entries (the migration controller — not the API
+    ///     server — is responsible for trimming).
+    ///   * the resulting spec.versions list drives the GVK extension, so each
+    ///     served version must map cleanly back to {group, version, kind}.
+    #[test]
+    fn test_gvk_after_version_rename_preserves_status_and_bumps_generation() {
+        // Previously stored CRD with version "v1beta1" as the storage version.
+        let old_stored = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {
+                "name": "examples.test.example.com",
+                "uid": "abc-123",
+                "generation": 1
+            },
+            "spec": {
+                "group": "test.example.com",
+                "names": { "plural": "examples", "kind": "Example" },
+                "scope": "Namespaced",
+                "versions": [
+                    { "name": "v1beta1", "served": true, "storage": true }
+                ]
+            },
+            "status": {
+                "conditions": [
+                    { "type": "Established", "status": "True" },
+                    { "type": "NamesAccepted", "status": "True" }
+                ],
+                "acceptedNames": { "plural": "examples", "kind": "Example" },
+                "storedVersions": ["v1beta1"]
+            }
+        });
 
-    // Check authorization
-    let attrs = RequestAttributes::new(
-        auth_ctx.user,
-        "deletecollection",
-        "customresourcedefinitions",
-    )
-    .with_api_group("apiextensions.k8s.io");
+        // Client renames v1beta1 -> v1beta2 (same kind) via PUT — no status.
+        let renamed_body = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "examples.test.example.com" },
+            "spec": {
+                "group": "test.example.com",
+                "names": { "plural": "examples", "kind": "Example" },
+                "scope": "Namespaced",
+                "versions": [
+                    { "name": "v1beta2", "served": true, "storage": true }
+                ]
+            }
+        });
 
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
+        let typed: CustomResourceDefinition =
+            serde_json::from_value(renamed_body.clone()).expect("decode renamed CRD");
+        let mut raw = renamed_body;
+        enrich_updated_crd(&mut raw, &typed, Some(&old_stored));
+
+        // Status preserved across the rename — Established condition still present.
+        let conditions = raw.pointer("/status/conditions").expect("conditions");
+        let established = conditions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c.get("type").and_then(|v| v.as_str()) == Some("Established"))
+            .expect("Established condition preserved");
+        assert_eq!(
+            established.get("status").and_then(|v| v.as_str()),
+            Some("True")
+        );
+
+        // Generation bumped because spec changed.
+        assert_eq!(
+            raw.pointer("/metadata/generation").and_then(|v| v.as_i64()),
+            Some(2),
+            "generation must bump from 1 -> 2 on spec change"
+        );
+
+        // storedVersions accumulates the new storage version (both old + new).
+        let stored: Vec<String> = raw
+            .pointer("/status/storedVersions")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(stored.contains(&"v1beta1".to_string()), "old version kept");
+        assert!(stored.contains(&"v1beta2".to_string()), "new version added");
+
+        // acceptedNames refreshed from the new spec.
+        assert_eq!(
+            raw.pointer("/status/acceptedNames/kind")
+                .and_then(|v| v.as_str()),
+            Some("Example")
+        );
+
+        // GVK extension synthesis from the served versions yields the renamed
+        // version (and only that one).
+        let gvks: Vec<serde_json::Value> = raw
+            .pointer("/spec/versions")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter(|v| v.get("served").and_then(|s| s.as_bool()) == Some(true))
+            .map(|v| {
+                serde_json::json!({
+                    "group": raw.pointer("/spec/group").and_then(|g| g.as_str()).unwrap_or(""),
+                    "version": v.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "kind": raw.pointer("/spec/names/kind").and_then(|k| k.as_str()).unwrap_or(""),
+                })
+            })
+            .collect();
+        assert_eq!(
+            gvks,
+            vec![serde_json::json!({
+                "group": "test.example.com",
+                "version": "v1beta2",
+                "kind": "Example"
+            })],
+            "after rename the GVK extension must reflect only the new served version"
+        );
     }
 
-    // Handle dry-run
-    let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
-    if is_dry_run {
-        info!("Dry-run: CustomResourceDefinition collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+    /// A no-op update (same spec sent back) must not bump generation and must
+    /// not duplicate entries in storedVersions.
+    #[test]
+    fn test_noop_update_keeps_generation_and_storedversions() {
+        let old_stored = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {
+                "name": "examples.test.example.com",
+                "uid": "abc-123",
+                "generation": 3
+            },
+            "spec": {
+                "group": "test.example.com",
+                "names": { "plural": "examples", "kind": "Example" },
+                "scope": "Namespaced",
+                "versions": [
+                    { "name": "v1", "served": true, "storage": true }
+                ]
+            },
+            "status": { "storedVersions": ["v1"] }
+        });
+        // PUT body has identical spec — no rename.
+        let same_body = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "examples.test.example.com" },
+            "spec": {
+                "group": "test.example.com",
+                "names": { "plural": "examples", "kind": "Example" },
+                "scope": "Namespaced",
+                "versions": [
+                    { "name": "v1", "served": true, "storage": true }
+                ]
+            }
+        });
+
+        let typed: CustomResourceDefinition =
+            serde_json::from_value(same_body.clone()).expect("decode CRD");
+        let mut raw = same_body;
+        enrich_updated_crd(&mut raw, &typed, Some(&old_stored));
+
+        assert_eq!(
+            raw.pointer("/metadata/generation").and_then(|v| v.as_i64()),
+            Some(3),
+            "no-op update must not bump generation"
+        );
+        let stored: Vec<&str> = raw
+            .pointer("/status/storedVersions")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(stored, vec!["v1"], "storedVersions must not duplicate");
     }
-
-    // Get all customresourcedefinitions
-    let prefix = build_prefix("customresourcedefinitions", None);
-    let mut items = state
-        .storage
-        .list::<CustomResourceDefinition>(&prefix)
-        .await?;
-
-    // Apply field and label selector filtering
-    crate::handlers::filtering::apply_selectors(&mut items, &params)?;
-
-    // Delete each matching resource
-    let mut deleted_count = 0;
-    for item in items {
-        let key = build_key("customresourcedefinitions", None, &item.metadata.name);
-
-        // Handle deletion with finalizers
-        let deleted_immediately = !crate::handlers::finalizers::handle_delete_with_finalizers(
-            &state.storage,
-            &key,
-            &item,
-        )
-        .await?;
-
-        if deleted_immediately {
-            deleted_count += 1;
-        }
-    }
-
-    info!(
-        "DeleteCollection completed: {} customresourcedefinitions deleted",
-        deleted_count
-    );
-    Ok(StatusCode::OK)
 }

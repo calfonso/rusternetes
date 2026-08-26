@@ -1,49 +1,7 @@
+use crate::time::micro_time;
 use crate::types::{ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-/// Module for serializing/deserializing MicroTime format (with microsecond precision).
-/// Kubernetes MicroTime requires the format: "2006-01-02T15:04:05.000000Z"
-mod micro_time {
-    use chrono::{DateTime, Utc};
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match date {
-            Some(dt) => {
-                let s = dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-                serializer.serialize_str(&s)
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt: Option<String> = Option::deserialize(deserializer)?;
-        match opt {
-            Some(s) => {
-                // Try parsing with microseconds first, then without
-                if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.6fZ") {
-                    return Ok(Some(dt.with_timezone(&Utc)));
-                }
-                if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
-                    return Ok(Some(dt.with_timezone(&Utc)));
-                }
-                // Try chrono's default parsing
-                s.parse::<DateTime<Utc>>()
-                    .map(Some)
-                    .map_err(serde::de::Error::custom)
-            }
-            None => Ok(None),
-        }
-    }
-}
 
 /// Lease defines a lease concept
 #[derive(Debug, Clone, Serialize, Deserialize)]

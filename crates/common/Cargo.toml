@@ -23,7 +23,7 @@ axum = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 base64 = "0.22"
 regex = "1.10"
 etcd-client.workspace = true
@@ -33,11 +33,11 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-jaeger = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry-stdout = { version = "0.3", optional = true }
+opentelemetry-stdout = { version = "0.32", optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 reqwest = { workspace = true }
-cel-interpreter.workspace = true
+cel.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 
@@ -50,3 +50,4 @@ tracing-full = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-stdout", "t
 
 [dev-dependencies]
 tempfile = "3.27.0"
+proptest = "1"

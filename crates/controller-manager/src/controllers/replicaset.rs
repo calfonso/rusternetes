@@ -1,9 +1,9 @@
+use futures::StreamExt;
 use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicaSet, ReplicaSetStatus},
     types::{ObjectMeta, Phase},
 };
-use futures::StreamExt;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -25,7 +25,6 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         info!("ReplicaSet controller started (watch-based)");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -44,7 +43,10 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
@@ -54,14 +56,17 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             let mut pod_watch = match self.storage.watch(&pod_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish pod watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
             };
 
-            // Periodic full resync as safety net (every 30s)
-            let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
+            // Periodic full resync as safety net
+            let mut resync = tokio::time::interval(std::time::Duration::from_secs(5));
             resync.tick().await; // consume first immediate tick
 
             let mut watch_broken = false;
@@ -111,19 +116,20 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("replicasets", Some(ns), name);
             match self.storage.get::<ReplicaSet>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_replicaset(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_replicaset(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -134,13 +140,17 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<ReplicaSet>("/registry/replicasets/").await {
+        match self
+            .storage
+            .list::<ReplicaSet>("/registry/replicasets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("replicasets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("replicasets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -152,7 +162,11 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
     /// When a pod changes, check its ownerReferences for a ReplicaSet owner
     /// and enqueue that ReplicaSet for reconciliation.
-    async fn enqueue_owner_replicaset(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+    async fn enqueue_owner_replicaset(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
         let pod_key = extract_key(event);
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -166,22 +180,31 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
                 if let Some(refs) = &pod.metadata.owner_references {
                     for owner_ref in refs {
                         if owner_ref.kind == "ReplicaSet" {
-                            queue.add(format!("replicasets/{}/{}", ns, owner_ref.name)).await;
+                            queue
+                                .add(format!("replicasets/{}/{}", ns, owner_ref.name))
+                                .await;
                         }
                     }
                 }
             }
             Err(_) => {
                 // Pod deleted — enqueue all ReplicaSets in this namespace
-                if let Ok(items) = self.storage.list::<ReplicaSet>(&build_prefix("replicasets", Some(ns))).await {
+                if let Ok(items) = self
+                    .storage
+                    .list::<ReplicaSet>(&build_prefix("replicasets", Some(ns)))
+                    .await
+                {
                     for rs in &items {
-                        queue.add(format!("replicasets/{}/{}", ns, rs.metadata.name)).await;
+                        queue
+                            .add(format!("replicasets/{}/{}", ns, rs.metadata.name))
+                            .await;
                     }
                 }
             }
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
         debug!("Reconciling all replicasets");
 
@@ -366,6 +389,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         mut all_pods: Vec<Pod>,
         namespace: &str,
     ) -> rusternetes_common::Result<Vec<Pod>> {
+        #[allow(clippy::needless_range_loop)]
         for i in 0..all_pods.len() {
             let pod = &all_pods[i];
 
@@ -492,7 +516,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
     /// Check if a pod is ready by examining its conditions
     fn is_pod_ready(&self, pod: &Pod) -> bool {
-        if let Some(ref conditions) = pod.status.as_ref().and_then(|s| s.conditions.as_ref()) {
+        if let Some(conditions) = pod.status.as_ref().and_then(|s| s.conditions.as_ref()) {
             conditions
                 .iter()
                 .any(|c| c.condition_type == "Ready" && c.status == "True")
@@ -620,12 +644,19 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
 
         let mut metadata = ObjectMeta::new(&pod_name);
         metadata.namespace = Some(namespace.to_string());
+        // Use template labels when present, otherwise fall back to selector
+        // matchLabels so created pods can be matched by the controller on the
+        // next reconcile. Per K8s validation, template labels must be a
+        // superset of the selector — but a defensive fallback prevents
+        // runaway pod creation if a malformed RS arrives with no template
+        // labels.
         metadata.labels = replicaset
             .spec
             .template
             .metadata
             .as_ref()
-            .and_then(|m| m.labels.clone());
+            .and_then(|m| m.labels.clone())
+            .or_else(|| replicaset.spec.selector.match_labels.clone());
 
         // Set owner reference so pods are garbage collected when ReplicaSet is deleted
         metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
@@ -859,5 +890,48 @@ mod tests {
         let refs = pod.metadata.owner_references.as_ref().unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "other-rs");
+    }
+
+    #[tokio::test]
+    async fn test_rs_creates_pods_with_selector_labels_when_template_has_none() {
+        // Regression: a ReplicaSet whose template has no labels would create
+        // pods with no labels, so the controller's matches_selector check
+        // failed for its own pods, causing infinite pod creation. Fall back
+        // to selector matchLabels when template labels are absent.
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = ReplicaSetController::new(storage.clone(), 5);
+
+        let labels = make_labels(&[("app", "myapp")]);
+
+        // Build an RS where the pod template has no labels at all.
+        let mut rs = make_replicaset("no-template-labels-rs", labels.clone(), 2);
+        rs.spec.template.metadata = None;
+        let rs_key = build_key("replicasets", Some("default"), "no-template-labels-rs");
+        storage.create(&rs_key, &rs).await.unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        // Two pods should be created with selector labels applied so the
+        // controller matches them on the next reconcile.
+        let pods_prefix = build_prefix("pods", Some("default"));
+        let pods: Vec<Pod> = storage.list(&pods_prefix).await.unwrap();
+        assert_eq!(pods.len(), 2, "RS should create exactly 2 pods");
+        for pod in &pods {
+            let pod_labels = pod
+                .metadata
+                .labels
+                .as_ref()
+                .expect("Pod must inherit selector labels");
+            assert_eq!(pod_labels.get("app"), Some(&"myapp".to_string()));
+        }
+
+        // Second reconcile must not create more pods (matching works).
+        controller.reconcile_all().await.unwrap();
+        let pods: Vec<Pod> = storage.list(&pods_prefix).await.unwrap();
+        assert_eq!(
+            pods.len(),
+            2,
+            "second reconcile must match existing pods, not create more"
+        );
     }
 }

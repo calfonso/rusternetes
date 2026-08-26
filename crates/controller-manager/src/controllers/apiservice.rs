@@ -10,7 +10,7 @@ use rusternetes_common::resources::EndpointSlice;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 pub struct APIServiceAvailabilityController<S: Storage> {
     storage: Arc<S>,
@@ -126,7 +126,10 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("EndpointSlice watch failed for apiservice controller: {}", e);
+                    error!(
+                        "EndpointSlice watch failed for apiservice controller: {}",
+                        e
+                    );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -225,8 +228,13 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             Some(n) => n.to_string(),
             None => {
                 // Local APIService (no service backing) — always available
-                self.update_condition(name, "True", "Local", "Local APIService is always available")
-                    .await?;
+                self.update_condition(
+                    name,
+                    "True",
+                    "Local",
+                    "Local APIService is always available",
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -436,7 +444,7 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
                         }
                     }
                     if !found {
-                        arr.push(condition);
+                        arr.push(condition.clone());
                     }
                 }
             } else {
@@ -452,7 +460,50 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             "Updating APIService {} Available condition: {} ({})",
             apiservice_name, status, reason
         );
-        let _ = self.storage.update(&key, &apiservice).await;
+        match self.storage.update(&key, &apiservice).await {
+            Ok(_) => {}
+            Err(rusternetes_common::Error::Conflict(_)) => {
+                // Another writer raced — re-read and retry once.
+                if let Ok(mut fresh) = self.storage.get::<serde_json::Value>(&key).await {
+                    if let Some(status_obj) = fresh.get_mut("status") {
+                        if let Some(conditions) = status_obj
+                            .get_mut("conditions")
+                            .and_then(|v| v.as_array_mut())
+                        {
+                            let mut found = false;
+                            for c in conditions.iter_mut() {
+                                if c.get("type").and_then(|v| v.as_str()) == Some("Available") {
+                                    *c = condition.clone();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                conditions.push(condition);
+                            }
+                        } else {
+                            status_obj["conditions"] = serde_json::json!([condition]);
+                        }
+                    } else {
+                        fresh["status"] = serde_json::json!({ "conditions": [condition] });
+                    }
+                    if let Err(e) = self.storage.update(&key, &fresh).await {
+                        error!(
+                            error = %e,
+                            apiservice = apiservice_name,
+                            "failed to update apiservice after conflict retry"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    apiservice = apiservice_name,
+                    "failed to update apiservice"
+                );
+            }
+        }
         Ok(())
     }
 }

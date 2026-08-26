@@ -219,7 +219,7 @@ fn test_hosts_file_entry_with_fqdn_uses_tab_separation() {
     let ip = "10.244.1.5";
     let hostname = "web-0";
     let fqdn = "web-0.nginx.default.svc.cluster.local";
-    let aliases = vec![hostname, fqdn];
+    let aliases = [hostname, fqdn];
     let entry = format!("{}\t{}\n", ip, aliases.join("\t"));
 
     let parts: Vec<&str> = entry.trim().split('\t').collect();

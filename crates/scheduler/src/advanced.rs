@@ -575,7 +575,8 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
     // K8s checks ALL resources (cpu, memory, AND extended resources like fakecpu).
     let mut used_cpu = 0i64;
     let mut used_memory = 0i64;
-    let mut used_extended: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut used_extended: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     let node_name = &node.metadata.name;
     for existing_pod in all_pods {
         let scheduled_on_this_node = existing_pod
@@ -738,61 +739,104 @@ pub fn calculate_resource_score_with_pods(node: &Node, pod: &Pod, all_pods: &[Po
     (cpu_score + memory_score) / 2
 }
 
-/// Parse resource quantity (simplified)
-/// Handles K8s resource formats:
-///   CPU: "100m" (millicores), "0.5" or "1.5" (decimal cores), "2" (whole cores)
-///   Memory: "128974848" (bytes), "129e6" (scientific), "129M" (SI), "123Mi" (binary)
-///   Supported suffixes: Ki, Mi, Gi, Ti, k, M, G, T, E, P
-fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i64 {
-    let quantity = quantity.trim();
+/// Suffix multipliers for the Kubernetes `resource.Quantity` grammar.
+///
+/// Ordered longest-first so that the two-character binary suffixes match
+/// before the single-character decimal ones (`"1Mi"` must not be read as
+/// `"1M"` followed by a stray `i`).
+const QUANTITY_SUFFIXES: &[(&str, f64)] = &[
+    // binarySI
+    ("Ki", 1024.0),
+    ("Mi", 1_048_576.0),
+    ("Gi", 1_073_741_824.0),
+    ("Ti", 1_099_511_627_776.0),
+    ("Pi", 1_125_899_906_842_624.0),
+    ("Ei", 1_152_921_504_606_846_976.0),
+    // decimalSI
+    ("m", 0.001),
+    ("k", 1_000.0),
+    ("M", 1_000_000.0),
+    ("G", 1_000_000_000.0),
+    ("T", 1_000_000_000_000.0),
+    ("P", 1_000_000_000_000_000.0),
+    ("E", 1_000_000_000_000_000_000.0),
+];
 
-    if resource_type == "cpu" {
-        // CPU: support m (millicores), decimal, and integer cores
-        if let Some(stripped) = quantity.strip_suffix('m') {
-            stripped.parse::<i64>().unwrap_or(0)
-        } else if let Ok(val) = quantity.parse::<f64>() {
-            // Handles both "2" and "0.8" and "1.5"
-            (val * 1000.0) as i64
-        } else {
-            0
-        }
-    } else {
-        // Memory: binary suffixes (Ki, Mi, Gi, Ti) and SI suffixes (k, M, G, T, E, P)
-        if let Some(stripped) = quantity.strip_suffix("Ki") {
-            stripped.parse::<i64>().unwrap_or(0) * 1024
-        } else if let Some(stripped) = quantity.strip_suffix("Mi") {
-            stripped.parse::<i64>().unwrap_or(0) * 1024 * 1024
-        } else if let Some(stripped) = quantity.strip_suffix("Gi") {
-            stripped.parse::<i64>().unwrap_or(0) * 1024 * 1024 * 1024
-        } else if let Some(stripped) = quantity.strip_suffix("Ti") {
-            stripped.parse::<i64>().unwrap_or(0) * 1024 * 1024 * 1024 * 1024
-        } else if let Some(stripped) = quantity.strip_suffix('T') {
-            stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000_000
-        } else if let Some(stripped) = quantity.strip_suffix('G') {
-            stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000
-        } else if let Some(stripped) = quantity.strip_suffix('M') {
-            stripped.parse::<i64>().unwrap_or(0) * 1_000_000
-        } else if let Some(stripped) = quantity.strip_suffix('k') {
-            stripped.parse::<i64>().unwrap_or(0) * 1000
-        } else if let Some(stripped) = quantity.strip_suffix('E') {
-            stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000_000_000_000
-        } else if let Some(stripped) = quantity.strip_suffix('P') {
-            stripped.parse::<i64>().unwrap_or(0) * 1_000_000_000_000_000
-        } else if let Ok(val) = quantity.parse::<f64>() {
-            // Plain number (bytes) or scientific notation like "129e6"
-            val as i64
-        } else {
-            0
-        }
+/// Parse a Kubernetes `resource.Quantity` string into its scalar value.
+///
+/// Implements the upstream grammar from
+/// `k8s.io/apimachinery/pkg/api/resource/quantity.go`:
+///
+/// ```text
+/// <quantity>        ::= <signedNumber><suffix>
+/// <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits>
+/// <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI>
+/// <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+/// <decimalSI>       ::= m | "" | k | M | G | T | P | E
+/// <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber>
+/// ```
+///
+/// Note that `<number>` permits a decimal point with *every* suffix, so
+/// `"0.5Gi"` is as valid as `"512Mi"` and denotes the same 536870912 bytes.
+///
+/// Returns `None` for input that is not a well-formed finite quantity.
+fn parse_quantity_value(quantity: &str) -> Option<f64> {
+    let quantity = quantity.trim();
+    if quantity.is_empty() {
+        return None;
     }
+
+    // Bare numbers and the <decimalExponent> form ("129e6", "1.5", "12").
+    // Attempted first because Rust's float parser already implements that
+    // grammar exactly; it rejects suffixed forms such as "1E" or "1Gi",
+    // which then fall through to the suffix table below.
+    let value = match quantity.parse::<f64>() {
+        Ok(value) => value,
+        Err(_) => {
+            let (digits, multiplier) =
+                QUANTITY_SUFFIXES.iter().find_map(|(suffix, multiplier)| {
+                    quantity.strip_suffix(suffix).map(|rest| (rest, multiplier))
+                })?;
+            digits.trim().parse::<f64>().ok()? * multiplier
+        }
+    };
+
+    // `"inf"`/`"NaN"`/`"1e400"` parse as floats but are not quantities, and
+    // casting them to i64 would saturate to a nonsense capacity.
+    value.is_finite().then_some(value)
+}
+
+/// Parse a resource quantity into the unit the scheduler accounts in.
+///
+/// CPU is returned in millicores; every other resource is returned in its
+/// base unit (bytes, for memory).
+pub(crate) fn parse_resource_quantity(quantity: &str, resource_type: &str) -> i64 {
+    let Some(value) = parse_quantity_value(quantity) else {
+        return 0;
+    };
+
+    // CPU quantities are denominated in cores, so the shared `m` suffix
+    // (10^-3) converts to millicores for free: "100m" -> 0.1 -> 100.
+    let value = if resource_type == "cpu" {
+        value * 1000.0
+    } else {
+        value
+    };
+
+    // Saturate rather than wrap; `as` on an out-of-range float is already
+    // saturating in Rust, and rounding keeps "0.7" cores at 700m instead of
+    // losing a millicore to binary representation error.
+    value.round() as i64
 }
 
 /// System-critical priority threshold. Pods at or above this priority
 /// can only be preempted by pods with strictly higher priority.
+#[allow(dead_code)]
 const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 
 /// Check if preemption should occur and return pods to evict
 /// Returns (should_preempt, pods_to_evict)
+#[allow(dead_code)]
 pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<String>) {
     // Get the priority of the incoming pod
     let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
@@ -1079,7 +1123,7 @@ pub fn check_topology_spread_constraints(
 /// Check a single topology spread constraint
 fn check_single_topology_constraint(
     node: &Node,
-    pod: &Pod,
+    _pod: &Pod,
     constraint: &TopologySpreadConstraint,
     all_pods: &[Pod],
     all_nodes: &[Node],
@@ -1236,6 +1280,88 @@ mod tests {
         assert_eq!(parse_resource_quantity("128974848", "memory"), 128974848);
         // Scientific notation
         assert_eq!(parse_resource_quantity("129e6", "memory"), 129_000_000);
+    }
+
+    /// The `<number>` production allows a decimal point with every suffix,
+    /// so these are ordinary quantities that a pod spec may carry. They used
+    /// to parse as 0, which reads to the scheduler as "requests nothing".
+    #[test]
+    fn test_parse_fractional_memory_quantity() {
+        assert_eq!(parse_resource_quantity("0.5Gi", "memory"), 536_870_912);
+        assert_eq!(parse_resource_quantity("1.5Gi", "memory"), 1_610_612_736);
+        assert_eq!(parse_resource_quantity("0.5Mi", "memory"), 524_288);
+        assert_eq!(parse_resource_quantity("2.5Mi", "memory"), 2_621_440);
+        assert_eq!(parse_resource_quantity("0.5Ki", "memory"), 512);
+        assert_eq!(parse_resource_quantity("1.5G", "memory"), 1_500_000_000);
+        assert_eq!(parse_resource_quantity("0.5M", "memory"), 500_000);
+        assert_eq!(parse_resource_quantity("1.5k", "memory"), 1_500);
+        // A fractional quantity must never round down to "free".
+        assert!(parse_resource_quantity("0.25Gi", "memory") > 0);
+    }
+
+    /// `Pi`/`Ei` complete the binarySI set; both previously parsed as 0.
+    #[test]
+    fn test_parse_large_binary_suffixes() {
+        assert_eq!(parse_resource_quantity("1Ti", "memory"), 1_099_511_627_776);
+        assert_eq!(
+            parse_resource_quantity("1Pi", "memory"),
+            1_125_899_906_842_624
+        );
+        assert_eq!(
+            parse_resource_quantity("1Ei", "memory"),
+            1_152_921_504_606_846_976
+        );
+        assert_eq!(
+            parse_resource_quantity("2Pi", "memory"),
+            2_251_799_813_685_248
+        );
+    }
+
+    /// Decimal SI suffixes and the bare `<decimalExponent>` form.
+    #[test]
+    fn test_parse_decimal_si_and_exponent() {
+        assert_eq!(parse_resource_quantity("1T", "memory"), 1_000_000_000_000);
+        assert_eq!(
+            parse_resource_quantity("1P", "memory"),
+            1_000_000_000_000_000
+        );
+        assert_eq!(
+            parse_resource_quantity("1E", "memory"),
+            1_000_000_000_000_000_000
+        );
+        assert_eq!(parse_resource_quantity("1k", "memory"), 1_000);
+        // "E"/"e" as an exponent marker rather than the exa suffix.
+        assert_eq!(parse_resource_quantity("129E6", "memory"), 129_000_000);
+        assert_eq!(parse_resource_quantity("1.5e3", "memory"), 1_500);
+    }
+
+    /// CPU accepts the same grammar; `m` is the shared 10^-3 decimalSI suffix.
+    #[test]
+    fn test_parse_cpu_fractional_and_milli() {
+        assert_eq!(parse_resource_quantity("100m", "cpu"), 100);
+        assert_eq!(parse_resource_quantity("1500m", "cpu"), 1500);
+        assert_eq!(parse_resource_quantity("0.7", "cpu"), 700);
+        assert_eq!(parse_resource_quantity("2.5", "cpu"), 2500);
+        // Fractional millicores round to the nearest millicore.
+        assert_eq!(parse_resource_quantity("10.5m", "cpu"), 11);
+    }
+
+    /// Malformed input must degrade to 0 rather than a saturated i64: an
+    /// `inf` node capacity would otherwise look like infinite headroom.
+    #[test]
+    fn test_parse_quantity_rejects_malformed_input() {
+        for bad in ["", "   ", "abc", "Gi", "1Xi", "--5", "inf", "NaN", "1e400"] {
+            assert_eq!(
+                parse_resource_quantity(bad, "memory"),
+                0,
+                "expected {bad:?} to parse as 0"
+            );
+            assert_eq!(
+                parse_resource_quantity(bad, "cpu"),
+                0,
+                "expected {bad:?} to parse as 0"
+            );
+        }
     }
 
     #[test]

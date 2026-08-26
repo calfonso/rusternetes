@@ -1,4 +1,3 @@
-use axum::body::to_bytes;
 use axum::{
     body::Body,
     extract::Request,
@@ -9,7 +8,7 @@ use axum::{
 };
 use rusternetes_common::auth::{BootstrapTokenManager, TokenManager, UserInfo};
 use std::sync::{Arc, LazyLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Global protobuf schema registry — initialized once on first use
 static PROTO_REGISTRY: LazyLock<crate::protobuf::ProtoRegistry> =
@@ -61,8 +60,8 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    let user = if auth_header.starts_with("Bearer ") {
-        let token = &auth_header[7..]; // Skip "Bearer "
+    let user = if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        // Skip "Bearer "
 
         // Try to validate as a service account token first
         if let Ok(claims) = token_manager.validate_token(token) {
@@ -151,13 +150,14 @@ pub async fn normalize_content_type_middleware(
                     // Extraction failed — the `raw` field contains native protobuf, not JSON.
                     // First try the structured protobuf-to-JSON decoder.
                     // Then fall back to brace-scanning, but always validate the result.
-                    let hex_preview: String = body_bytes
-                        .iter()
-                        .skip(4)
-                        .take(80)
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    use std::fmt::Write as _;
+                    let mut hex_preview = String::with_capacity(80 * 3);
+                    for b in body_bytes.iter().skip(4).take(80) {
+                        let _ = write!(hex_preview, "{:02x} ", b);
+                    }
+                    if hex_preview.ends_with(' ') {
+                        hex_preview.pop();
+                    }
                     debug!(
                         "Protobuf body has no JSON in raw field ({} bytes). Hex after k8s\\0: {}",
                         body_bytes.len(),
@@ -285,7 +285,7 @@ pub async fn normalize_content_type_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let is_watch_request = accept_header.contains("stream=watch")
+    let _is_watch_request = accept_header.contains("stream=watch")
         || request.uri().path().contains("/watch/")
         || request
             .uri()
@@ -406,6 +406,7 @@ fn wrap_json_in_protobuf_with_type_meta(json: &[u8], api_version: &str, kind: &s
 }
 
 /// Wrap JSON bytes in the K8s protobuf envelope: "k8s\0" + Unknown{raw: json}
+#[allow(dead_code)]
 fn wrap_json_in_protobuf(json: &[u8]) -> Vec<u8> {
     // K8s runtime.Unknown protobuf message (from k8s.io/apimachinery generated.proto):
     //   field 1 (typeMeta, TypeMeta): nested message (empty for responses)
@@ -1131,7 +1132,7 @@ fn decode_k8s_protobuf_to_json(data: &[u8]) -> Option<Vec<u8>> {
         }
     });
 
-    Some(serde_json::to_vec(&json).ok()?)
+    serde_json::to_vec(&json).ok()
 }
 
 /// Scan for a balanced JSON object starting from data[0] which must be `{`.

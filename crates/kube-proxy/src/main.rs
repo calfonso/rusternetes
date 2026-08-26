@@ -53,10 +53,16 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir }
+            StorageConfig::Sqlite {
+                path: args.data_dir,
+            }
         }
         _ => {
-            let endpoints: Vec<String> = args.etcd_servers.split(',').map(|s| s.trim().to_string()).collect();
+            let endpoints: Vec<String> = args
+                .etcd_servers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
             info!("Connecting to etcd at: {:?}", endpoints);
             StorageConfig::Etcd { endpoints }
         }

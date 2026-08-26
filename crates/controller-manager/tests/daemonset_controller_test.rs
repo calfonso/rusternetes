@@ -3,12 +3,11 @@
 
 use rusternetes_common::resources::pod::*;
 use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
 use rusternetes_controller_manager::controllers::daemonset::DaemonSetController;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
 
 async fn setup_test() -> Arc<MemoryStorage> {
     let storage = Arc::new(MemoryStorage::new());
@@ -75,7 +74,7 @@ fn create_test_daemonset(
             },
             template: PodTemplateSpec {
                 metadata: Some({
-                    let mut meta = ObjectMeta::new(&format!("{}-pod", name));
+                    let mut meta = ObjectMeta::new(format!("{}-pod", name));
                     meta.labels = Some(labels);
                     meta
                 }),
@@ -475,9 +474,14 @@ async fn test_daemonset_pod_naming_convention() {
     assert_eq!(pods.len(), 1);
 
     let pod = &pods[0];
+    // K8s convention: DaemonSet pods are named "<ds-name>-<random>" via
+    // generateName, NOT "<ds-name>-<node-name>-...". A fresh suffix every
+    // time a pod is recreated is required by the "should retry creating
+    // failed daemon pods" conformance test, which asserts the original
+    // failed pod's name returns NotFound via GET.
     assert!(
-        pod.metadata.name.starts_with("test-ds-node-example-com-"),
-        "Pod name should start with 'test-ds-node-example-com-', got: {}",
+        pod.metadata.name.starts_with("test-ds-"),
+        "Pod name should start with 'test-ds-', got: {}",
         pod.metadata.name
     );
     assert!(

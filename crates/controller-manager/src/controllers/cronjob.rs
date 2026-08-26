@@ -2,11 +2,84 @@ use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::workloads::{CronJob, CronJobStatus, Job};
 use rusternetes_common::types::OwnerReference;
-use rusternetes_storage::{Storage, WorkQueue, extract_key, build_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// Renumber a day-of-week field from Kubernetes' numbering to the `cron` crate's.
+///
+/// Kubernetes follows standard cron and numbers days 0-6 with Sunday as 0. The
+/// `cron` crate numbers them 1-7 with Sunday as 1, so every day value has to be
+/// shifted up by one.
+///
+/// Only value positions are shifted. A step (`*/2`) counts intervals rather than
+/// days, and day names (`SUN`, `MON`) already mean the same thing to both, so
+/// both are passed through untouched — as is any number outside 0-6, which lets
+/// the parser reject it rather than turning it into a different day.
+fn renumber_day_of_week(field: &str) -> String {
+    field
+        .split(',')
+        .map(|item| {
+            let (values, step) = match item.split_once('/') {
+                Some((values, step)) => (values, Some(step)),
+                None => (item, None),
+            };
+
+            let renumbered = values
+                .split('-')
+                .map(|value| match value.parse::<u32>() {
+                    Ok(day) if day <= 6 => (day + 1).to_string(),
+                    _ => value.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("-");
+
+            match step {
+                Some(step) => format!("{}/{}", renumbered, step),
+                None => renumbered,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Convert a Kubernetes cron schedule into the expression the `cron` crate parses.
+///
+/// Kubernetes accepts the standard five-field form (`min hour dom month dow`)
+/// plus the `@` shortcuts. The crate wants seven (`sec min hour dom month dow
+/// year`) and numbers days of the week differently, so the day-of-week field is
+/// renumbered as well as padded.
+fn to_cron_expression(schedule: &str) -> String {
+    let expanded = match schedule.trim() {
+        "@yearly" | "@annually" => "0 0 1 1 *",
+        "@monthly" => "0 0 1 * *",
+        "@weekly" => "0 0 * * 0",
+        "@daily" | "@midnight" => "0 0 * * *",
+        "@hourly" => "0 * * * *",
+        other => other,
+    };
+
+    // Kubernetes supports `?` in cron expressions (Quartz-style "no specific
+    // value"). Replace with `*` since the `cron` crate doesn't support `?`.
+    let expanded = expanded.replace('?', "*");
+
+    let mut fields: Vec<String> = expanded.split_whitespace().map(str::to_string).collect();
+
+    // Five and six fields are the Kubernetes-shaped forms, where day of week is
+    // the fifth field. A seven-field expression is already in the crate's own
+    // format and is left alone.
+    if matches!(fields.len(), 5 | 6) {
+        fields[4] = renumber_day_of_week(&fields[4]);
+    }
+
+    match fields.len() {
+        5 => format!("0 {} *", fields.join(" ")),
+        6 => format!("0 {}", fields.join(" ")),
+        _ => fields.join(" "),
+    }
+}
 
 pub struct CronJobController<S: Storage> {
     storage: Arc<S>,
@@ -23,7 +96,6 @@ impl<S: Storage + 'static> CronJobController<S> {
         // CronJobs need frequent resync to check cron schedules, even without
         // watch events — a cron trigger is time-based, not change-based.
         let resync_secs = 10;
-
 
         let queue = WorkQueue::new();
 
@@ -43,7 +115,10 @@ impl<S: Storage + 'static> CronJobController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -86,13 +161,16 @@ impl<S: Storage + 'static> CronJobController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("cronjobs", Some(ns), name);
             match self.storage.get::<CronJob>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile(&mut resource).await {
+                    match self.reconcile(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -114,9 +192,9 @@ impl<S: Storage + 'static> CronJobController<S> {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("cronjobs/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("cronjobs/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -126,6 +204,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         let cronjobs: Vec<CronJob> = self.storage.list("/registry/cronjobs/").await?;
 
@@ -200,8 +279,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         let concurrency_policy = cronjob
             .spec
             .concurrency_policy
-            .as_ref()
-            .map(|s| s.as_str())
+            .as_deref()
             .unwrap_or("Allow");
 
         match concurrency_policy {
@@ -212,10 +290,15 @@ impl<S: Storage + 'static> CronJobController<S> {
                     name,
                     active_jobs.len()
                 );
-                // Still update status with active jobs list
+                // Still update status with active jobs list.
+                // Sort by name + omit resource_version so the active list is
+                // stable across reconciles (otherwise comparisons in the
+                // skip-write guard below would flicker on every Job update).
+                let mut sorted_active: Vec<&Job> = active_jobs.iter().collect();
+                sorted_active.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
                 let active_refs: Vec<
                     rusternetes_common::resources::service_account::ObjectReference,
-                > = active_jobs
+                > = sorted_active
                     .iter()
                     .map(
                         |job| rusternetes_common::resources::service_account::ObjectReference {
@@ -224,7 +307,10 @@ impl<S: Storage + 'static> CronJobController<S> {
                             name: Some(job.metadata.name.clone()),
                             uid: Some(job.metadata.uid.clone()),
                             api_version: Some("batch/v1".to_string()),
-                            resource_version: job.metadata.resource_version.clone(),
+                            // Omitted: resource_version flickers on every Job
+                            // update and is not part of CronJob.status.active
+                            // identity in upstream K8s.
+                            resource_version: None,
                             field_path: None,
                         },
                     )
@@ -262,10 +348,14 @@ impl<S: Storage + 'static> CronJobController<S> {
         // Create new Job
         self.create_job(cronjob, namespace).await?;
 
-        // Build active job references from all active jobs for this cronjob
+        // Build active job references from all active jobs for this cronjob.
+        // Sort by name so the active list is deterministic across reconciles
+        // (MemoryStorage list iterates a HashMap in non-deterministic order).
         let active_refs: Vec<rusternetes_common::resources::service_account::ObjectReference> = {
             let job_prefix = format!("/registry/jobs/{}/", namespace);
-            let current_jobs: Vec<Job> = self.storage.list(&job_prefix).await.unwrap_or_default();
+            let mut current_jobs: Vec<Job> =
+                self.storage.list(&job_prefix).await.unwrap_or_default();
+            current_jobs.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
             current_jobs
                 .iter()
                 .filter(|job| {
@@ -293,7 +383,7 @@ impl<S: Storage + 'static> CronJobController<S> {
                         name: Some(job.metadata.name.clone()),
                         uid: Some(job.metadata.uid.clone()),
                         api_version: Some("batch/v1".to_string()),
-                        resource_version: job.metadata.resource_version.clone(),
+                        resource_version: None,
                         field_path: None,
                     },
                 )
@@ -330,31 +420,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         // Get last schedule time
         let last_schedule = cronjob.status.as_ref().and_then(|s| s.last_schedule_time);
 
-        // Handle special schedules (Kubernetes 5-field format)
-        let cron_schedule = match schedule {
-            "@yearly" | "@annually" => "0 0 1 1 *",
-            "@monthly" => "0 0 1 * *",
-            "@weekly" => "0 0 * * 0",
-            "@daily" | "@midnight" => "0 0 * * *",
-            "@hourly" => "0 * * * *",
-            other => other,
-        };
-
-        // Kubernetes supports `?` in cron expressions (Quartz-style "no specific value").
-        // Replace with `*` since the `cron` crate doesn't support `?`.
-        let cron_schedule = cron_schedule.replace('?', "*");
-
-        // The `cron` crate expects 7 fields (sec min hour dom month dow year),
-        // but Kubernetes uses 5 fields (min hour dom month dow).
-        // Convert by prepending "0" for seconds and appending "*" for year.
-        let field_count = cron_schedule.split_whitespace().count();
-        let cron_schedule = if field_count == 5 {
-            format!("0 {} *", cron_schedule)
-        } else if field_count == 6 {
-            format!("0 {}", cron_schedule)
-        } else {
-            cron_schedule.to_string()
-        };
+        let cron_schedule = to_cron_expression(schedule);
 
         // Parse cron expression using the `cron` crate
         let schedule_parsed = match cron::Schedule::try_from(cron_schedule.as_str()) {
@@ -459,8 +525,12 @@ impl<S: Storage + 'static> CronJobController<S> {
 
     async fn cleanup_old_jobs(&self, cronjob: &CronJob, namespace: &str) -> Result<()> {
         let cronjob_name = &cronjob.metadata.name;
-        let success_limit = cronjob.spec.successful_jobs_history_limit.unwrap_or(3);
-        let failed_limit = cronjob.spec.failed_jobs_history_limit.unwrap_or(1);
+        // Clamp negative user-supplied values to 0 so the cast to usize does not
+        // wrap to a huge number, which would prevent any history cleanup.
+        let success_limit: usize =
+            usize::try_from(cronjob.spec.successful_jobs_history_limit.unwrap_or(3)).unwrap_or(0);
+        let failed_limit: usize =
+            usize::try_from(cronjob.spec.failed_jobs_history_limit.unwrap_or(1)).unwrap_or(0);
 
         let job_prefix = format!("/registry/jobs/{}/", namespace);
         let mut all_jobs: Vec<Job> = self.storage.list(&job_prefix).await?;
@@ -521,8 +591,8 @@ impl<S: Storage + 'static> CronJobController<S> {
         });
 
         // Delete old successful jobs
-        if successful_jobs.len() > success_limit as usize {
-            let to_delete = successful_jobs.len() - success_limit as usize;
+        if successful_jobs.len() > success_limit {
+            let to_delete = successful_jobs.len() - success_limit;
             for job in successful_jobs.iter().take(to_delete) {
                 let job_name = &job.metadata.name;
                 let job_key = format!("/registry/jobs/{}/{}", namespace, job_name);
@@ -532,8 +602,8 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
 
         // Delete old failed jobs
-        if failed_jobs.len() > failed_limit as usize {
-            let to_delete = failed_jobs.len() - failed_limit as usize;
+        if failed_jobs.len() > failed_limit {
+            let to_delete = failed_jobs.len() - failed_limit;
             for job in failed_jobs.iter().take(to_delete) {
                 let job_name = &job.metadata.name;
                 let job_key = format!("/registry/jobs/{}/{}", namespace, job_name);
@@ -548,12 +618,92 @@ impl<S: Storage + 'static> CronJobController<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use chrono::{Datelike, TimeZone, Utc, Weekday};
+
+    /// The weekday a schedule actually fires on, as the controller parses it.
+    fn first_fire_weekday(schedule: &str) -> Weekday {
+        let expression = to_cron_expression(schedule);
+        let parsed = cron::Schedule::try_from(expression.as_str())
+            .unwrap_or_else(|e| panic!("{schedule:?} -> {expression:?} did not parse: {e}"));
+
+        // Saturday 2026-08-01, so the following week covers every weekday.
+        let after = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        parsed
+            .after(&after)
+            .next()
+            .unwrap_or_else(|| panic!("{schedule:?} has no next fire time"))
+            .weekday()
+    }
+
     #[test]
-    fn test_cron_schedule_parsing() {
-        // Test that schedule patterns are recognized
-        assert!("*/5 * * * *".starts_with("*/"));
-        assert_eq!("@hourly", "@hourly");
-        assert_eq!("@daily", "@daily");
+    fn test_day_of_week_numbers_follow_kubernetes() {
+        // Kubernetes numbers days 0-6 with Sunday as 0.
+        let expected = [
+            ("0", Weekday::Sun),
+            ("1", Weekday::Mon),
+            ("2", Weekday::Tue),
+            ("3", Weekday::Wed),
+            ("4", Weekday::Thu),
+            ("5", Weekday::Fri),
+            ("6", Weekday::Sat),
+        ];
+
+        for (day, weekday) in expected {
+            assert_eq!(
+                first_fire_weekday(&format!("0 0 * * {day}")),
+                weekday,
+                "day-of-week {day}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_day_of_week_names_are_unchanged() {
+        // Names already mean the same thing to both, so they must not shift.
+        assert_eq!(first_fire_weekday("0 0 * * SUN"), Weekday::Sun);
+        assert_eq!(first_fire_weekday("0 0 * * MON"), Weekday::Mon);
+        assert_eq!(first_fire_weekday("0 0 * * SAT"), Weekday::Sat);
+    }
+
+    #[test]
+    fn test_weekly_shortcut_runs_on_sunday() {
+        // "@weekly" expands to day-of-week 0, which the crate rejects untranslated.
+        assert_eq!(first_fire_weekday("@weekly"), Weekday::Sun);
+    }
+
+    #[test]
+    fn test_day_of_week_lists_ranges_and_steps() {
+        // Lists and ranges shift; the step interval does not.
+        assert_eq!(renumber_day_of_week("0"), "1");
+        assert_eq!(renumber_day_of_week("0,3"), "1,4");
+        assert_eq!(renumber_day_of_week("1-5"), "2-6");
+        assert_eq!(renumber_day_of_week("1-5/2"), "2-6/2");
+        assert_eq!(renumber_day_of_week("*/2"), "*/2");
+        assert_eq!(renumber_day_of_week("*"), "*");
+        assert_eq!(renumber_day_of_week("MON-FRI"), "MON-FRI");
+
+        // A Monday-to-Friday range must still be Monday to Friday.
+        assert_eq!(first_fire_weekday("0 0 * * 1-5"), Weekday::Mon);
+        // 0,3 is Sunday and Wednesday; Sunday comes first after a Saturday.
+        assert_eq!(first_fire_weekday("0 0 * * 0,3"), Weekday::Sun);
+    }
+
+    #[test]
+    fn test_non_weekday_fields_are_untouched() {
+        assert_eq!(to_cron_expression("*/5 * * * *"), "0 */5 * * * * *");
+        assert_eq!(to_cron_expression("@hourly"), "0 0 * * * * *");
+        assert_eq!(to_cron_expression("@daily"), "0 0 0 * * * *");
+        assert_eq!(to_cron_expression("@monthly"), "0 0 0 1 * * *");
+        assert_eq!(to_cron_expression("@yearly"), "0 0 0 1 1 * *");
+        // `?` is accepted by Kubernetes but not by the crate.
+        assert_eq!(to_cron_expression("0 0 ? * *"), "0 0 0 * * * *");
+        // A seven-field expression is already in the crate's format.
+        assert_eq!(
+            to_cron_expression("0 0 0 * * 1 *"),
+            "0 0 0 * * 1 *",
+            "seven-field expressions must not be renumbered twice"
+        );
     }
 
     #[test]

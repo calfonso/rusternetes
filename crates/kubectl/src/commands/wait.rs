@@ -63,7 +63,7 @@ async fn wait_for_deletion(
     resource_type: &str,
     name: Option<&str>,
     namespace: &str,
-    selector: Option<&str>,
+    _selector: Option<&str>,
     start: Instant,
     timeout: Duration,
 ) -> Result<()> {
@@ -97,12 +97,13 @@ async fn wait_for_deletion(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_condition(
     client: &ApiClient,
     resource_type: &str,
     name: Option<&str>,
     namespace: &str,
-    selector: Option<&str>,
+    _selector: Option<&str>,
     condition: &str,
     start: Instant,
     timeout: Duration,
@@ -191,6 +192,29 @@ fn check_condition(resource: &Value, condition_type: &str, expected_status: &str
         }
     }
     Ok(false)
+}
+
+fn parse_duration(duration: &str) -> Result<Duration> {
+    let duration = duration.trim();
+    if duration.is_empty() {
+        return Ok(Duration::from_secs(30)); // default
+    }
+
+    // Parse "30s", "5m", "1h", etc.
+    if let Some(s) = duration.strip_suffix('s') {
+        let secs: u64 = s.parse().context("Invalid seconds")?;
+        Ok(Duration::from_secs(secs))
+    } else if let Some(m) = duration.strip_suffix('m') {
+        let mins: u64 = m.parse().context("Invalid minutes")?;
+        Ok(Duration::from_secs(mins * 60))
+    } else if let Some(h) = duration.strip_suffix('h') {
+        let hours: u64 = h.parse().context("Invalid hours")?;
+        Ok(Duration::from_secs(hours * 3600))
+    } else {
+        // Try parsing as raw seconds
+        let secs: u64 = duration.parse().context("Invalid duration format")?;
+        Ok(Duration::from_secs(secs))
+    }
 }
 
 #[cfg(test)]
@@ -458,28 +482,5 @@ mod tests {
             api_path, "batch-ns", resource_name, "my-job"
         );
         assert_eq!(path, "/apis/batch/v1/namespaces/batch-ns/jobs/my-job");
-    }
-}
-
-fn parse_duration(duration: &str) -> Result<Duration> {
-    let duration = duration.trim();
-    if duration.is_empty() {
-        return Ok(Duration::from_secs(30)); // default
-    }
-
-    // Parse "30s", "5m", "1h", etc.
-    if let Some(s) = duration.strip_suffix('s') {
-        let secs: u64 = s.parse().context("Invalid seconds")?;
-        Ok(Duration::from_secs(secs))
-    } else if let Some(m) = duration.strip_suffix('m') {
-        let mins: u64 = m.parse().context("Invalid minutes")?;
-        Ok(Duration::from_secs(mins * 60))
-    } else if let Some(h) = duration.strip_suffix('h') {
-        let hours: u64 = h.parse().context("Invalid hours")?;
-        Ok(Duration::from_secs(hours * 3600))
-    } else {
-        // Try parsing as raw seconds
-        let secs: u64 = duration.parse().context("Invalid duration format")?;
-        Ok(Duration::from_secs(secs))
     }
 }

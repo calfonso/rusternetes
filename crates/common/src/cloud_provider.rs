@@ -79,6 +79,7 @@ pub enum CloudProviderType {
 }
 
 impl CloudProviderType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "aws" => Some(CloudProviderType::AWS),

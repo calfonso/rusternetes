@@ -60,9 +60,9 @@ pub async fn create_validating_webhook(
                     let expr_clone = condition.expression.clone();
                     let compile_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            cel_interpreter::Program::compile(&expr_clone)
+                            cel::Program::compile(&expr_clone)
                         }));
-                    let _program = match compile_result {
+                    let program = match compile_result {
                         Ok(Ok(p)) => p,
                         Ok(Err(e)) => {
                             let err_str = format!("{}", e);
@@ -91,6 +91,44 @@ pub async fn create_validating_webhook(
                             )));
                         }
                     };
+
+                    // The cel crate's parser accepts some invalid expressions
+                    // that K8s rejects. Try executing with an empty context as
+                    // an additional validation step — genuinely invalid syntax
+                    // will fail at execution even with no variables.
+                    let test_ctx = cel::Context::default();
+                    let exec_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            program.execute(&test_ctx)
+                        }));
+                    match exec_result {
+                        Ok(Ok(_)) => {} // Valid expression
+                        Ok(Err(e)) => {
+                            let err_str = format!("{}", e);
+                            let err_lower = err_str.to_lowercase();
+                            // Allow runtime errors from missing variables — those
+                            // are expected since we don't provide the real context
+                            if err_lower.contains("no such key")
+                                || err_lower.contains("not found")
+                                || err_lower.contains("undeclared")
+                                || err_lower.contains("undefined")
+                                || err_lower.contains("no matching overload")
+                            {
+                                // Valid expression, just missing runtime variables
+                            } else {
+                                return Err(rusternetes_common::Error::InvalidResource(format!(
+                                    "matchConditions[{}].expression: compilation failed: {}",
+                                    i, e
+                                )));
+                            }
+                        }
+                        Err(_panic) => {
+                            return Err(rusternetes_common::Error::InvalidResource(format!(
+                                "matchConditions[{}].expression: compilation failed: invalid CEL expression '{}'",
+                                i, condition.expression
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -330,10 +368,42 @@ pub async fn create_mutating_webhook(
                     let expr_clone = condition.expression.clone();
                     let compile_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            cel_interpreter::Program::compile(&expr_clone)
+                            cel::Program::compile(&expr_clone)
                         }));
-                    match compile_result {
-                        Ok(Ok(_p)) => {}
+                    let program = match compile_result {
+                        Ok(Ok(p)) => p,
+                        Ok(Err(e)) => {
+                            let err_str = format!("{}", e);
+                            let err_lower = err_str.to_lowercase();
+                            if err_lower.contains("no such key")
+                                || err_lower.contains("not found")
+                                || err_lower.contains("undeclared")
+                                || err_lower.contains("undefined")
+                            {
+                                continue;
+                            }
+                            return Err(rusternetes_common::Error::InvalidResource(format!(
+                                "matchConditions[{}].expression: compilation failed: {}",
+                                i, e
+                            )));
+                        }
+                        Err(_panic) => {
+                            return Err(rusternetes_common::Error::InvalidResource(format!(
+                                "matchConditions[{}].expression: compilation failed: invalid CEL expression '{}'",
+                                i, condition.expression
+                            )));
+                        }
+                    };
+
+                    // The cel crate's parser accepts some invalid expressions.
+                    // Try executing with empty context as validation.
+                    let test_ctx = cel::Context::default();
+                    let exec_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            program.execute(&test_ctx)
+                        }));
+                    match exec_result {
+                        Ok(Ok(_)) => {}
                         Ok(Err(e)) => {
                             let err_str = format!("{}", e);
                             let err_lower = err_str.to_lowercase();
@@ -341,10 +411,11 @@ pub async fn create_mutating_webhook(
                                 && !err_lower.contains("not found")
                                 && !err_lower.contains("undeclared")
                                 && !err_lower.contains("undefined")
+                                && !err_lower.contains("no matching overload")
                             {
                                 return Err(rusternetes_common::Error::InvalidResource(format!(
-                                    "matchConditions[{}].expression: Invalid CEL expression '{}': {}",
-                                    i, condition.expression, e
+                                    "matchConditions[{}].expression: compilation failed: {}",
+                                    i, e
                                 )));
                             }
                         }

@@ -95,8 +95,8 @@ pub fn apply_selectors<T: Serialize>(
     resources: &mut Vec<T>,
     params: &HashMap<String, String>,
 ) -> Result<(), rusternetes_common::Error> {
-    let has_field_selector = params.get("fieldSelector").map_or(false, |s| !s.is_empty());
-    let has_label_selector = params.get("labelSelector").map_or(false, |s| !s.is_empty());
+    let has_field_selector = params.get("fieldSelector").is_some_and(|s| !s.is_empty());
+    let has_label_selector = params.get("labelSelector").is_some_and(|s| !s.is_empty());
 
     // Fast path: no selectors
     if !has_field_selector && !has_label_selector {
@@ -148,7 +148,6 @@ pub fn apply_selectors<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[derive(Serialize)]
     struct TestResource {

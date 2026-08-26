@@ -31,8 +31,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
 axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
 hyper = "1.0"
 etcd-client = "0.14"
 uuid = { version = "1.10", features = ["v4", "serde"] }
@@ -48,19 +48,19 @@ jsonwebtoken = "9.3" # JWT token generation and validation
 rustls = { version = "0.23", features = ["aws-lc-rs"] } # TLS support with aws-lc-rs crypto provider
 tokio-rustls = "0.26" # Tokio integration for rustls
 rcgen = "0.13" # Certificate generation
-prometheus = "0.13" # Prometheus metrics
-opentelemetry = "0.22" # Distributed tracing
+prometheus = "0.14" # Prometheus metrics
+opentelemetry = "0.32" # Distributed tracing
 opentelemetry-prometheus = "0.15" # Prometheus exporter for OpenTelemetry
 opentelemetry-jaeger = "0.21" # Jaeger exporter for OpenTelemetry
-opentelemetry-otlp = "0.15" # OTLP exporter for OpenTelemetry
-opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] } # OpenTelemetry SDK
+opentelemetry-otlp = "0.32" # OTLP exporter for OpenTelemetry
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] } # OpenTelemetry SDK
 tracing-opentelemetry = "0.23" # OpenTelemetry integration with tracing
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false } # HTTP client
-cel-interpreter = "0.10" # Common Expression Language (CEL) interpreter
+cel = "0.14" # Common Expression Language (CEL) interpreter
 x509-parser = "0.16" # X.509 certificate parsing
-pem = "3.0" # PEM format encoding/decoding
+pem = "4.0" # PEM format encoding/decoding
 base64 = "0.22" # Base64 encoding/decoding
-serial_test = "3.0" # Serialize tests that modify global state
+serial_test = "4.0" # Serialize tests that modify global state
 warp = "0.3" # HTTP server framework for testing
 
 # Cloud provider SDKs

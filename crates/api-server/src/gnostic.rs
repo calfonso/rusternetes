@@ -4,7 +4,7 @@
 //! K8s client-go's OpenAPISchema() expects this format.
 //! K8s ref: vendor/k8s.io/kube-openapi/pkg/handler/handler.go — ToProtoBinary()
 
-#[allow(clippy::all, non_camel_case_types)]
+#[allow(clippy::all, non_camel_case_types, dead_code, unused_imports)]
 pub mod openapi_v2 {
     include!(concat!(env!("OUT_DIR"), "/openapi.v2.rs"));
 }
@@ -55,9 +55,18 @@ fn get_str<'a>(obj: &'a serde_json::Map<String, serde_json::Value>, key: &str) -
 fn json_to_info(v: &serde_json::Value) -> Info {
     let obj = v.as_object();
     Info {
-        title: obj.and_then(|o| get_str(o, "title")).unwrap_or("").to_string(),
-        version: obj.and_then(|o| get_str(o, "version")).unwrap_or("").to_string(),
-        description: obj.and_then(|o| get_str(o, "description")).unwrap_or("").to_string(),
+        title: obj
+            .and_then(|o| get_str(o, "title"))
+            .unwrap_or("")
+            .to_string(),
+        version: obj
+            .and_then(|o| get_str(o, "version"))
+            .unwrap_or("")
+            .to_string(),
+        description: obj
+            .and_then(|o| get_str(o, "description"))
+            .unwrap_or("")
+            .to_string(),
         terms_of_service: String::new(),
         contact: None,
         license: None,
@@ -68,7 +77,12 @@ fn json_to_info(v: &serde_json::Value) -> Info {
 fn json_to_paths(v: &serde_json::Value) -> Paths {
     let obj = match v.as_object() {
         Some(o) => o,
-        None => return Paths { vendor_extension: vec![], path: vec![] },
+        None => {
+            return Paths {
+                vendor_extension: vec![],
+                path: vec![],
+            }
+        }
     };
     Paths {
         vendor_extension: vec![],
@@ -104,7 +118,10 @@ fn json_to_operation(v: &serde_json::Value) -> Operation {
     Operation {
         tags: vec![],
         summary: String::new(),
-        description: obj.and_then(|o| get_str(o, "description")).unwrap_or("").to_string(),
+        description: obj
+            .and_then(|o| get_str(o, "description"))
+            .unwrap_or("")
+            .to_string(),
         external_docs: None,
         operation_id: String::new(),
         produces: vec![],
@@ -121,7 +138,11 @@ fn json_to_operation(v: &serde_json::Value) -> Operation {
 fn json_to_definitions(v: &serde_json::Value) -> Definitions {
     let obj = match v.as_object() {
         Some(o) => o,
-        None => return Definitions { additional_properties: vec![] },
+        None => {
+            return Definitions {
+                additional_properties: vec![],
+            }
+        }
     };
     Definitions {
         additional_properties: obj
@@ -136,16 +157,37 @@ fn json_to_definitions(v: &serde_json::Value) -> Definitions {
 
 fn empty_schema() -> Schema {
     Schema {
-        r#ref: String::new(), format: String::new(), title: String::new(),
-        description: String::new(), default: None, multiple_of: 0.0,
-        maximum: 0.0, exclusive_maximum: false, minimum: 0.0,
-        exclusive_minimum: false, max_length: 0, min_length: 0,
-        pattern: String::new(), max_items: 0, min_items: 0,
-        unique_items: false, max_properties: 0, min_properties: 0,
-        required: vec![], r#enum: vec![], additional_properties: None,
-        r#type: None, items: None, all_of: vec![], properties: None,
-        discriminator: String::new(), read_only: false, xml: None,
-        external_docs: None, example: None, vendor_extension: vec![],
+        r#ref: String::new(),
+        format: String::new(),
+        title: String::new(),
+        description: String::new(),
+        default: None,
+        multiple_of: 0.0,
+        maximum: 0.0,
+        exclusive_maximum: false,
+        minimum: 0.0,
+        exclusive_minimum: false,
+        max_length: 0,
+        min_length: 0,
+        pattern: String::new(),
+        max_items: 0,
+        min_items: 0,
+        unique_items: false,
+        max_properties: 0,
+        min_properties: 0,
+        required: vec![],
+        r#enum: vec![],
+        additional_properties: None,
+        r#type: None,
+        items: None,
+        all_of: vec![],
+        properties: None,
+        discriminator: String::new(),
+        read_only: false,
+        xml: None,
+        external_docs: None,
+        example: None,
+        vendor_extension: vec![],
     }
 }
 
@@ -163,21 +205,40 @@ fn json_to_schema(v: &serde_json::Value) -> Schema {
         default: None,
         multiple_of: 0.0,
         maximum: obj.get("maximum").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        exclusive_maximum: obj.get("exclusiveMaximum").and_then(|v| v.as_bool()).unwrap_or(false),
+        exclusive_maximum: obj
+            .get("exclusiveMaximum")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         minimum: obj.get("minimum").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        exclusive_minimum: obj.get("exclusiveMinimum").and_then(|v| v.as_bool()).unwrap_or(false),
+        exclusive_minimum: obj
+            .get("exclusiveMinimum")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         max_length: obj.get("maxLength").and_then(|v| v.as_i64()).unwrap_or(0),
         min_length: obj.get("minLength").and_then(|v| v.as_i64()).unwrap_or(0),
         pattern: get_str(obj, "pattern").unwrap_or("").to_string(),
         max_items: obj.get("maxItems").and_then(|v| v.as_i64()).unwrap_or(0),
         min_items: obj.get("minItems").and_then(|v| v.as_i64()).unwrap_or(0),
-        unique_items: obj.get("uniqueItems").and_then(|v| v.as_bool()).unwrap_or(false),
-        max_properties: obj.get("maxProperties").and_then(|v| v.as_i64()).unwrap_or(0),
-        min_properties: obj.get("minProperties").and_then(|v| v.as_i64()).unwrap_or(0),
+        unique_items: obj
+            .get("uniqueItems")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        max_properties: obj
+            .get("maxProperties")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        min_properties: obj
+            .get("minProperties")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
         required: obj
             .get("required")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
         r#enum: obj
             .get("enum")
@@ -187,10 +248,15 @@ fn json_to_schema(v: &serde_json::Value) -> Schema {
         additional_properties: None,
         r#type: obj.get("type").map(|v| {
             if let Some(s) = v.as_str() {
-                TypeItem { value: vec![s.to_string()] }
+                TypeItem {
+                    value: vec![s.to_string()],
+                }
             } else if let Some(arr) = v.as_array() {
                 TypeItem {
-                    value: arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    value: arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
                 }
             } else {
                 TypeItem { value: vec![] }
@@ -216,7 +282,10 @@ fn json_to_schema(v: &serde_json::Value) -> Schema {
             .unwrap_or_default(),
         properties: obj.get("properties").map(json_to_properties),
         discriminator: get_str(obj, "discriminator").unwrap_or("").to_string(),
-        read_only: obj.get("readOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+        read_only: obj
+            .get("readOnly")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         xml: None,
         external_docs: None,
         example: None,
@@ -227,7 +296,11 @@ fn json_to_schema(v: &serde_json::Value) -> Schema {
 fn json_to_properties(v: &serde_json::Value) -> Properties {
     let obj = match v.as_object() {
         Some(o) => o,
-        None => return Properties { additional_properties: vec![] },
+        None => {
+            return Properties {
+                additional_properties: vec![],
+            }
+        }
     };
     Properties {
         additional_properties: obj

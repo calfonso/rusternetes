@@ -3,7 +3,7 @@
 // This module provides CEL expression evaluation for ValidatingAdmissionPolicy
 
 use anyhow::{anyhow, Result};
-use cel_interpreter::{
+use cel::{
     objects::{Key, Map},
     Context, Program, Value,
 };
@@ -49,7 +49,7 @@ impl CELEvaluator {
 
         // Add variables to context
         for (key, value) in &context.variables {
-            cel_context.add_variable(key.clone(), value.clone());
+            let _ = cel_context.add_variable(key.clone(), value.clone());
         }
 
         // Execute the program
@@ -84,7 +84,7 @@ impl CELEvaluator {
 
         // Add variables to context
         for (key, value) in &context.variables {
-            cel_context.add_variable(key.clone(), value.clone());
+            let _ = cel_context.add_variable(key.clone(), value.clone());
         }
 
         // Execute the program
@@ -116,7 +116,7 @@ impl CELEvaluator {
 
         let mut cel_context = Context::default();
         for (key, value) in &context.variables {
-            cel_context.add_variable(key.clone(), value.clone());
+            let _ = cel_context.add_variable(key.clone(), value.clone());
         }
 
         program

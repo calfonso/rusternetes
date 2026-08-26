@@ -596,7 +596,7 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
     let mut stats_map = HashMap::new();
 
     // Connect to Docker/Podman
-    let docker = match Docker::connect_with_socket_defaults() {
+    let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(e) => {
             warn!("Failed to connect to container runtime: {}", e);

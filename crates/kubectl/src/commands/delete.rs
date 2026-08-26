@@ -49,6 +49,7 @@ pub struct DeleteOptions {
     /// Cascade strategy (foreground, background, orphan).
     pub cascade: CascadeStrategy,
     /// Delete all resources of the type in the namespace.
+    #[allow(dead_code)]
     pub delete_all: bool,
     /// Server-side dry run — no changes are persisted.
     pub dry_run: bool,
@@ -565,6 +566,7 @@ pub async fn execute_enhanced(
     delete_single_resource(client, resource_type, name, Some(namespace), opts).await
 }
 
+#[allow(dead_code)]
 pub async fn execute(
     client: &ApiClient,
     resource_type: &str,

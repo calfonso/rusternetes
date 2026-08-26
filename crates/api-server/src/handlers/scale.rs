@@ -248,7 +248,9 @@ pub async fn patch_scale(
         }
     }
     if updated_resource.is_null() {
-        return Err(Error::Conflict("scale patch failed after retries".to_string()));
+        return Err(Error::Conflict(
+            "scale patch failed after retries".to_string(),
+        ));
     }
 
     // Extract and return the updated scale
@@ -322,10 +324,8 @@ fn extract_scale(
                     .collect();
                 Some(parts.join(","))
             }
-        } else if let Some(str_val) = s.as_str() {
-            Some(str_val.to_string())
         } else {
-            None
+            s.as_str().map(|str_val| str_val.to_string())
         }
     });
 

@@ -3,6 +3,7 @@ pub mod admission_webhook;
 pub mod bootstrap;
 pub mod conversion;
 pub mod dynamic_routes;
+#[allow(dead_code)]
 pub mod flow_control;
 pub mod gnostic;
 pub mod handlers;
@@ -12,11 +13,15 @@ pub mod openapi;
 pub mod patch;
 pub mod prometheus_client;
 pub mod protobuf;
+#[allow(dead_code)]
 pub mod response;
 pub mod router;
+#[allow(dead_code)]
 pub mod spdy;
+#[allow(dead_code)]
 pub mod spdy_handlers;
 pub mod state;
+#[allow(dead_code)]
 pub mod streaming;
 pub mod watch_cache;
 
@@ -25,7 +30,7 @@ use rusternetes_common::auth::TokenManager;
 use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::tls::TlsConfig;
-use rusternetes_storage::{StorageBackend, Storage};
+use rusternetes_storage::{Storage, StorageBackend};
 use state::ApiServerState;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,7 +101,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         {
             TlsConfig::from_pem_files(cert_file, key_file)?
         } else if config.tls_self_signed {
-            let sans: Vec<String> = config.tls_san.split(',').map(|s| s.trim().to_string()).collect();
+            let sans: Vec<String> = config
+                .tls_san
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
             TlsConfig::generate_self_signed("rusternetes-api", sans)?
         } else {
             anyhow::bail!("TLS enabled but no certificate provided");
@@ -107,12 +116,18 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
     };
 
     // Bootstrap kubernetes Service
-    let api_port = config.bind_address.split(':').last()
+    let api_port = config
+        .bind_address
+        .split(':')
+        .next_back()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
     if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
-        warn!("Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.", e);
+        warn!(
+            "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",
+            e
+        );
     }
 
     // Create default ServiceCIDR
@@ -125,11 +140,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
                 "metadata": {
                     "name": "kubernetes",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339()
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now())
                 },
                 "spec": { "cidrs": ["10.96.0.0/12"] },
                 "status": { "conditions": [{ "type": "Ready", "status": "True",
-                    "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                    "lastTransitionTime": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                     "reason": "NetworkReady", "message": "ServiceCIDR is ready" }] }
             });
             if let Err(e) = storage.create(&cidr_key, &service_cidr).await {
@@ -150,7 +165,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
                 "metadata": {
                     "name": "standard",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+                    "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
                     "annotations": {
                         "storageclass.kubernetes.io/is-default-class": "true"
                     }
@@ -171,45 +186,71 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
     let prom_client = if let Some(ref url) = config.prometheus_url {
         match prometheus_client::PrometheusClient::new(url.clone()) {
             Ok(c) => Some(Arc::new(c)),
-            Err(e) => { warn!("Failed to init Prometheus client: {}", e); None }
+            Err(e) => {
+                warn!("Failed to init Prometheus client: {}", e);
+                None
+            }
         }
     } else {
         None
     };
 
     let state = Arc::new(
-        ApiServerState::new(storage, token_manager, authorizer, metrics, config.skip_auth)
-            .with_ca_cert(ca_cert_pem)
-            .with_prometheus_client(prom_client),
+        ApiServerState::new(
+            storage,
+            token_manager,
+            authorizer,
+            metrics,
+            config.skip_auth,
+        )
+        .with_ca_cert(ca_cert_pem)
+        .with_prometheus_client(prom_client),
     );
 
     // Pre-allocate ClusterIPs
     {
         let existing_services: Vec<rusternetes_common::resources::Service> =
-            Storage::list(state.storage.as_ref(), "/registry/services/").await.unwrap_or_default();
+            Storage::list(state.storage.as_ref(), "/registry/services/")
+                .await
+                .unwrap_or_default();
         for svc in &existing_services {
             if let Some(ref ip) = svc.spec.cluster_ip {
                 if ip != "None" && !ip.is_empty() {
                     state.ip_allocator.mark_allocated(ip.clone());
-                    debug!("Pre-allocated ClusterIP {} for existing service {}", ip, svc.metadata.name);
+                    debug!(
+                        "Pre-allocated ClusterIP {} for existing service {}",
+                        ip, svc.metadata.name
+                    );
                 }
             }
         }
-        info!("Pre-allocated {} ClusterIPs from existing services", existing_services.len());
+        info!(
+            "Pre-allocated {} ClusterIPs from existing services",
+            existing_services.len()
+        );
     }
 
     let app = router::build_router(state, config.console_dir.as_deref());
 
     if config.tls {
-        let tls_config = if let (Some(cert_file), Some(key_file)) = (config.tls_cert_file, config.tls_key_file) {
+        let tls_config = if let (Some(cert_file), Some(key_file)) =
+            (config.tls_cert_file, config.tls_key_file)
+        {
             TlsConfig::from_pem_files(&cert_file, &key_file)?
         } else {
-            let sans: Vec<String> = config.tls_san.split(',').map(|s| s.trim().to_string()).collect();
+            let sans: Vec<String> = config
+                .tls_san
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
             TlsConfig::generate_self_signed("rusternetes-api", sans)?
         };
 
         let server_config = if let Some(ref client_ca) = config.client_ca_file {
-            info!("Client certificate authentication enabled (CA: {})", client_ca);
+            info!(
+                "Client certificate authentication enabled (CA: {})",
+                client_ca
+            );
             tls_config.into_mtls_server_config(client_ca)?
         } else {
             tls_config.into_server_config()?
@@ -217,13 +258,18 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         let rustls_config = RustlsConfig::from_config(server_config);
         info!("HTTPS server listening on {}", config.bind_address);
         let mut server = axum_server::bind_rustls(config.bind_address.parse()?, rustls_config);
-        server.http_builder().http2()
+        server
+            .http_builder()
+            .http2()
             .initial_stream_window_size(256 * 1024)
             .initial_connection_window_size(256 * 1024 * 100)
             .max_concurrent_streams(250);
         server.serve(app.into_make_service()).await?;
     } else {
-        info!("API Server listening on {} (HTTP, no TLS)", config.bind_address);
+        info!(
+            "API Server listening on {} (HTTP, no TLS)",
+            config.bind_address
+        );
         let listener = tokio::net::TcpListener::bind(&config.bind_address).await?;
         axum::serve(listener, app).await?;
     }

@@ -20,6 +20,14 @@ sqlite = [
     "rusternetes-kubelet/sqlite",
     "rusternetes-kube-proxy/sqlite",
 ]
+redis = [
+    "rusternetes-storage/redis",
+    "rusternetes-api-server/redis",
+    "rusternetes-scheduler/redis",
+    "rusternetes-controller-manager/redis",
+    "rusternetes-kubelet/redis",
+    "rusternetes-kube-proxy/redis",
+]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }

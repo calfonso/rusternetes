@@ -4,7 +4,7 @@ use rusternetes_common::resources::{
     PersistentVolumeClaim, Pod, PodStatus, StatefulSet, StatefulSetStatus,
 };
 use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -19,10 +19,38 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         Self { storage }
     }
 
+    /// Re-read the pod, apply `mutate`, and write it back. On a resource-version
+    /// conflict, re-read and reapply once. NotFound is a no-op (the pod is
+    /// already gone). Other errors are logged via tracing::error!. Avoids
+    /// silently dropping storage failures from `let _ = storage.update(...)`.
+    async fn update_pod_with_retry<F>(&self, pod_key: &str, mutate: F)
+    where
+        F: Fn(&mut Pod) + Send,
+    {
+        for attempt in 0..2 {
+            let mut pod: Pod = match self.storage.get(pod_key).await {
+                Ok(p) => p,
+                Err(rusternetes_common::Error::NotFound(_)) => return,
+                Err(e) => {
+                    error!(error = %e, pod = pod_key, "failed to read pod for update");
+                    return;
+                }
+            };
+            mutate(&mut pod);
+            match self.storage.update(pod_key, &pod).await {
+                Ok(_) => return,
+                Err(rusternetes_common::Error::Conflict(_)) if attempt == 0 => continue,
+                Err(e) => {
+                    error!(error = %e, pod = pod_key, "failed to update pod");
+                    return;
+                }
+            }
+        }
+    }
+
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting StatefulSetController (watch-based)");
         let retry_interval = Duration::from_secs(5);
-
 
         let queue = WorkQueue::new();
 
@@ -42,7 +70,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -52,7 +83,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             let mut pod_watch = match self.storage.watch(&pod_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish pod watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -109,13 +143,16 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("statefulsets", Some(ns), name);
             match self.storage.get::<StatefulSet>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile(&mut resource).await {
+                    match self.reconcile(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -133,13 +170,17 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<StatefulSet>("/registry/statefulsets/").await {
+        match self
+            .storage
+            .list::<StatefulSet>("/registry/statefulsets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("statefulsets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("statefulsets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -151,7 +192,11 @@ impl<S: Storage + 'static> StatefulSetController<S> {
 
     /// When a pod changes, check its ownerReferences for a StatefulSet owner
     /// and enqueue that StatefulSet for reconciliation.
-    async fn enqueue_owner_statefulset(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+    async fn enqueue_owner_statefulset(
+        &self,
+        queue: &WorkQueue,
+        event: &rusternetes_storage::WatchEvent,
+    ) {
         let pod_key = extract_key(event);
         let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -165,22 +210,31 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 if let Some(refs) = &pod.metadata.owner_references {
                     for owner_ref in refs {
                         if owner_ref.kind == "StatefulSet" {
-                            queue.add(format!("statefulsets/{}/{}", ns, owner_ref.name)).await;
+                            queue
+                                .add(format!("statefulsets/{}/{}", ns, owner_ref.name))
+                                .await;
                         }
                     }
                 }
             }
             Err(_) => {
                 // Pod deleted — enqueue all StatefulSets in this namespace
-                if let Ok(items) = self.storage.list::<StatefulSet>(&build_prefix("statefulsets", Some(ns))).await {
+                if let Ok(items) = self
+                    .storage
+                    .list::<StatefulSet>(&build_prefix("statefulsets", Some(ns)))
+                    .await
+                {
                     for ss in &items {
-                        queue.add(format!("statefulsets/{}/{}", ns, ss.metadata.name)).await;
+                        queue
+                            .add(format!("statefulsets/{}/{}", ns, ss.metadata.name))
+                            .await;
                     }
                 }
             }
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         let statefulsets: Vec<StatefulSet> = self.storage.list("/registry/statefulsets/").await?;
 
@@ -216,7 +270,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         // Filter pods that belong to this StatefulSet via ownerReferences (authoritative)
         // Fall back to label matching for backwards compatibility
         let statefulset_uid = &statefulset.metadata.uid;
-        let mut statefulset_pods: Vec<Pod> = all_pods
+        let statefulset_pods: Vec<Pod> = all_pods
             .into_iter()
             .filter(|pod| {
                 let owned_by_ref = pod
@@ -254,10 +308,11 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             if is_terminal && pod.metadata.deletion_timestamp.is_none() {
                 // Delete the terminal pod so it gets recreated
                 let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-                let mut pod_to_delete = pod.clone();
-                pod_to_delete.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                pod_to_delete.metadata.deletion_grace_period_seconds = Some(0);
-                let _ = self.storage.update(&pod_key, &pod_to_delete).await;
+                self.update_pod_with_retry(&pod_key, |p| {
+                    p.metadata.deletion_timestamp = Some(chrono::Utc::now());
+                    p.metadata.deletion_grace_period_seconds = Some(0);
+                })
+                .await;
                 info!(
                     "StatefulSet {}/{}: deleted terminal pod {} (phase: {:?})",
                     namespace,
@@ -520,25 +575,30 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 // deletionTimestamp and lets the kubelet handle graceful shutdown.
                 let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
                 match self.storage.get::<Pod>(&pod_key).await {
-                    Ok(mut pod_to_delete) => {
+                    Ok(pod_to_delete) => {
                         if pod_to_delete.metadata.deletion_timestamp.is_none() {
-                            pod_to_delete.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                            // Use pod's terminationGracePeriodSeconds (K8s default behavior
-                            // when DeleteOptions.GracePeriodSeconds is not set)
-                            pod_to_delete.metadata.deletion_grace_period_seconds = pod_to_delete
-                                .spec
-                                .as_ref()
-                                .and_then(|s| s.termination_grace_period_seconds);
-                            // Set pod phase to indicate it's terminating
-                            if let Some(ref mut status) = pod_to_delete.status {
-                                if !matches!(
-                                    status.phase,
-                                    Some(Phase::Succeeded) | Some(Phase::Failed)
-                                ) {
-                                    status.reason = Some("StatefulSetScaleDown".to_string());
+                            self.update_pod_with_retry(&pod_key, |p| {
+                                if p.metadata.deletion_timestamp.is_some() {
+                                    return;
                                 }
-                            }
-                            let _ = self.storage.update(&pod_key, &pod_to_delete).await;
+                                p.metadata.deletion_timestamp = Some(chrono::Utc::now());
+                                // Use pod's terminationGracePeriodSeconds (K8s default behavior
+                                // when DeleteOptions.GracePeriodSeconds is not set)
+                                p.metadata.deletion_grace_period_seconds = p
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|s| s.termination_grace_period_seconds);
+                                // Set pod phase to indicate it's terminating
+                                if let Some(ref mut status) = p.status {
+                                    if !matches!(
+                                        status.phase,
+                                        Some(Phase::Succeeded) | Some(Phase::Failed)
+                                    ) {
+                                        status.reason = Some("StatefulSetScaleDown".to_string());
+                                    }
+                                }
+                            })
+                            .await;
                             info!(
                                 "Scale down: set deletionTimestamp on pod {} ({} -> {})",
                                 pod.metadata.name, current_replicas, desired_replicas
@@ -630,14 +690,18 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     if !pod_revision.is_empty() && (pod_is_ready || pod_is_active) {
                         let pod_key = format!("/registry/pods/{}/{}", namespace, pod.metadata.name);
                         if pod.metadata.deletion_timestamp.is_none() {
-                            let mut pod_to_delete = pod.clone();
-                            pod_to_delete.metadata.deletion_timestamp = Some(chrono::Utc::now());
-                            pod_to_delete.metadata.deletion_grace_period_seconds = pod_to_delete
-                                .spec
-                                .as_ref()
-                                .and_then(|s| s.termination_grace_period_seconds)
-                                .or(Some(30));
-                            let _ = self.storage.update(&pod_key, &pod_to_delete).await;
+                            self.update_pod_with_retry(&pod_key, |p| {
+                                if p.metadata.deletion_timestamp.is_some() {
+                                    return;
+                                }
+                                p.metadata.deletion_timestamp = Some(chrono::Utc::now());
+                                p.metadata.deletion_grace_period_seconds = p
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|s| s.termination_grace_period_seconds)
+                                    .or(Some(30));
+                            })
+                            .await;
                             info!(
                                 "Rolling update: set deletionTimestamp on pod {} (old revision {}, update revision {})",
                                 pod.metadata.name, pod_revision, update_revision
@@ -689,7 +753,15 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         // See: pkg/controller/statefulset/stateful_set_control.go:370-399
         let is_created =
             |pod: &&Pod| -> bool { pod.status.as_ref().and_then(|s| s.phase.as_ref()).is_some() };
+        let is_terminating = |pod: &&Pod| -> bool { pod.metadata.deletion_timestamp.is_some() };
         let is_ready = |pod: &&Pod| -> bool {
+            // K8s isRunningAndReady excludes terminating pods so that a pod
+            // marked for graceful deletion drops out of readyReplicas
+            // immediately. Conformance tests for SS eviction/scale-down rely
+            // on this — see pkg/controller/statefulset/stateful_set_utils.go.
+            if is_terminating(pod) {
+                return false;
+            }
             matches!(
                 pod.status.as_ref().and_then(|s| s.phase.as_ref()),
                 Some(Phase::Running)
@@ -704,12 +776,17 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 })
                 .unwrap_or(false)
         };
-        let is_terminating = |pod: &&Pod| -> bool { pod.metadata.deletion_timestamp.is_some() };
 
-        // replicas = all created pods (including terminating)
+        // replicas = created pods excluding those being terminated.
+        // K8s historically counted all created pods, but conformance tests for
+        // StatefulSet eviction/scale-down observe replicas decrement as soon as
+        // deletionTimestamp is set (graceful termination), not only when the
+        // pod is fully removed. Counting terminating pods here causes the
+        // scale-down test to flap on `status.replicas` and the eviction tests
+        // to fail on PDB recalculation timing.
         let final_current_replicas = statefulset_pods_after
             .iter()
-            .filter(|p| is_created(p))
+            .filter(|p| is_created(p) && !is_terminating(p))
             .count() as i32;
         // readyReplicas = Running + Ready (non-terminating implied by Running phase)
         let final_ready_pods = statefulset_pods_after
@@ -786,7 +863,9 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         // doesn't manage any condition types itself, so keep ALL existing conditions.
         // This prevents overwriting conditions set via PUT /status (e.g. "StatusUpdate"
         // condition from conformance tests).
-        let existing_conditions = statefulset.status.as_ref()
+        let existing_conditions = statefulset
+            .status
+            .as_ref()
             .and_then(|s| s.conditions.clone());
 
         // Update status with accurate counts
@@ -1785,7 +1864,7 @@ mod tests {
             controller.reconcile(&mut ss).await.unwrap();
             // Make the newly created pod Ready so the next one can be created
             let pod_key = format!("/registry/pods/default/ss-block-{}", round);
-            if let Ok(mut pod) = storage.get::<Pod>(&pod_key).await {
+            if storage.get::<Pod>(&pod_key).await.is_ok() {
                 make_pod_ready(&storage, ns, &format!("ss-block-{}", round)).await;
             }
         }
@@ -1839,7 +1918,7 @@ mod tests {
             let pod: Pod = storage
                 .get(&pod_key)
                 .await
-                .expect(&format!("Pod ss-block-{} should still exist", i));
+                .unwrap_or_else(|_| panic!("Pod ss-block-{} should still exist", i));
             assert!(
                 pod.metadata.deletion_timestamp.is_none(),
                 "Pod ss-block-{} should NOT have deletionTimestamp — scale-down should be blocked when pods are unhealthy",

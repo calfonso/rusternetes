@@ -2,7 +2,7 @@ use rusternetes_common::resources::{
     IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetStatus,
 };
 use rusternetes_common::types::LabelSelector;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -19,7 +19,6 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         use futures::StreamExt;
 
         info!("Starting PodDisruptionBudget controller");
-
 
         let queue = WorkQueue::new();
 
@@ -77,19 +76,20 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("poddisruptionbudgets", Some(ns), name);
             match self.storage.get::<PodDisruptionBudget>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_pdb(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_pdb(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -100,13 +100,17 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<PodDisruptionBudget>("/registry/poddisruptionbudgets/").await {
+        match self
+            .storage
+            .list::<PodDisruptionBudget>("/registry/poddisruptionbudgets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("poddisruptionbudgets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("poddisruptionbudgets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -116,6 +120,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
         debug!("Reconciling all PodDisruptionBudgets");
 
@@ -163,11 +168,25 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         );
 
         // 4. Calculate desired_healthy based on min_available or max_unavailable
-        let desired_healthy = self.calculate_desired_healthy(&pdb, total_pods)?;
+        let desired_healthy = self.calculate_desired_healthy(pdb, total_pods)?;
 
         // 5. Calculate disruptions_allowed
-        // disruptions_allowed = current_healthy - desired_healthy
-        let disruptions_allowed = healthy_pods - desired_healthy;
+        //
+        // A budget that is already breached allows no further disruption; it does
+        // not allow a negative number of them. Consumers read this as a count —
+        // the eviction handler in `pod_subresources` denies eviction on any value
+        // <= 0, and users see it as ALLOWED DISRUPTIONS.
+        //
+        // K8s ref: pkg/controller/disruption/disruption.go — updatePdbStatus:
+        //   disruptionsAllowed := currentHealthy - desiredHealthy
+        //   if expectedCount <= 0 || disruptionsAllowed <= 0 {
+        //       disruptionsAllowed = 0
+        //   }
+        let disruptions_allowed = if total_pods <= 0 {
+            0
+        } else {
+            (healthy_pods - desired_healthy).max(0)
+        };
 
         debug!(
             "PDB {}/{}: desired_healthy={}, disruptions_allowed={}",
@@ -252,8 +271,16 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
                     }
                 }
             };
-            // desired_healthy = total - max_unavailable
-            Ok(total_pods - max_unavailable_count)
+            // desired_healthy = total - max_unavailable, floored at 0.
+            // maxUnavailable may legitimately exceed the pod count — it means
+            // every pod is disposable — and a count of pods cannot be negative.
+            //
+            // K8s ref: pkg/controller/disruption/disruption.go:
+            //   desiredHealthy = expectedCount - int32(maxUnavailable)
+            //   if desiredHealthy < 0 {
+            //       desiredHealthy = 0
+            //   }
+            Ok((total_pods - max_unavailable_count).max(0))
         } else {
             // No min_available or max_unavailable specified - invalid PDB
             Err(rusternetes_common::Error::InvalidResource(
@@ -374,6 +401,36 @@ mod tests {
         let pdb = PodDisruptionBudget::new("test-pdb", "default", spec);
         let desired = controller.calculate_desired_healthy(&pdb, 5).unwrap();
         assert_eq!(desired, 3); // 5 - 2 = 3
+    }
+
+    #[tokio::test]
+    async fn test_calculate_desired_healthy_max_unavailable_exceeding_pod_count() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PodDisruptionBudgetController::new(storage);
+
+        // maxUnavailable above the pod count means every pod is disposable, so
+        // the number that must stay healthy is 0 — never a negative count.
+        for (max_unavailable, total_pods) in [(5, 3), (1, 0), (100, 1)] {
+            let spec = PodDisruptionBudgetSpec {
+                min_available: None,
+                max_unavailable: Some(IntOrString::Int(max_unavailable)),
+                selector: LabelSelector {
+                    match_labels: Some(HashMap::new()),
+                    match_expressions: None,
+                },
+                unhealthy_pod_eviction_policy: None,
+            };
+
+            let pdb = PodDisruptionBudget::new("test-pdb", "default", spec);
+            let desired = controller
+                .calculate_desired_healthy(&pdb, total_pods)
+                .unwrap();
+
+            assert_eq!(
+                desired, 0,
+                "maxUnavailable={max_unavailable} over {total_pods} pods"
+            );
+        }
     }
 
     #[tokio::test]

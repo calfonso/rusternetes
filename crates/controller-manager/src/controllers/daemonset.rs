@@ -6,7 +6,7 @@ use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
 use rusternetes_common::types::{OwnerReference, Phase};
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -57,7 +57,6 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         info!("Starting DaemonSetController (watch-based)");
         let retry_interval = Duration::from_secs(5);
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -81,7 +80,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let ds_watch = match self.storage.watch(ds_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish daemonset watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish daemonset watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -89,7 +91,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let node_watch = match self.storage.watch(node_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish node watch: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish node watch: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -97,7 +102,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let pod_watch = match self.storage.watch(pod_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish pod watch for DS controller: {}, retrying in {:?}", e, retry_interval);
+                    error!(
+                        "Failed to establish pod watch for DS controller: {}, retrying in {:?}",
+                        e, retry_interval
+                    );
                     time::sleep(retry_interval).await;
                     continue;
                 }
@@ -107,8 +115,8 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let mut node_watch = node_watch;
             let mut pod_watch = pod_watch;
 
-            // Periodic full resync as safety net (every 30s)
-            let mut resync = tokio::time::interval(Duration::from_secs(30));
+            // Periodic full resync as safety net
+            let mut resync = tokio::time::interval(Duration::from_secs(5));
             resync.tick().await; // consume first immediate tick
 
             let mut watch_broken = false;
@@ -172,7 +180,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     }
 
     /// When a pod changes, find its owning DaemonSet and enqueue it for reconciliation.
-    async fn enqueue_ds_for_pod_event(&self, event: &rusternetes_storage::WatchEvent, queue: &WorkQueue) {
+    async fn enqueue_ds_for_pod_event(
+        &self,
+        event: &rusternetes_storage::WatchEvent,
+        queue: &WorkQueue,
+    ) {
         let json_str = match event {
             rusternetes_storage::WatchEvent::Added(_, v)
             | rusternetes_storage::WatchEvent::Modified(_, v)
@@ -194,10 +206,16 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// When a node changes, enqueue ALL daemonsets since any DS might need
     /// to create/delete a pod on the changed node.
     async fn enqueue_all_for_node_change(&self, queue: &WorkQueue) {
-        if let Ok(daemonsets) = self.storage.list::<DaemonSet>("/registry/daemonsets/").await {
+        if let Ok(daemonsets) = self
+            .storage
+            .list::<DaemonSet>("/registry/daemonsets/")
+            .await
+        {
             for ds in &daemonsets {
                 let ns = ds.metadata.namespace.as_deref().unwrap_or("");
-                queue.add(format!("daemonsets/{}/{}", ns, ds.metadata.name)).await;
+                queue
+                    .add(format!("daemonsets/{}/{}", ns, ds.metadata.name))
+                    .await;
             }
         }
     }
@@ -206,13 +224,16 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("daemonsets", Some(ns), name);
             match self.storage.get::<DaemonSet>(&storage_key).await {
                 Ok(resource) => {
                     let mut resource = resource;
-                        match self.reconcile(&mut resource).await {
+                    match self.reconcile(&mut resource).await {
                         Ok(()) => queue.forget(&key).await,
                         Err(e) => {
                             error!("Failed to reconcile {}: {}", key, e);
@@ -230,13 +251,17 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<DaemonSet>("/registry/daemonsets/").await {
+        match self
+            .storage
+            .list::<DaemonSet>("/registry/daemonsets/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("daemonsets/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("daemonsets/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -246,6 +271,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         let daemonsets: Vec<DaemonSet> = self.storage.list("/registry/daemonsets/").await?;
 
@@ -342,33 +368,17 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 block_owner_deletion: Some(true),
             }]);
 
-            // Build ControllerRevision data using raw JSON from storage.
-            // K8s Match() does byte-level comparison between getPatch(dsFromAPI) and
-            // history.Data.Raw. getPatch() takes the DaemonSet JSON (as served by the API),
-            // extracts spec.template, adds "$patch":"replace", and re-marshals.
-            // We must produce identical bytes by reading the DaemonSet as raw JSON from
-            // storage (same bytes the API serves) and extracting the template from it.
-            let ds_key = rusternetes_storage::build_key("daemonsets", Some(namespace), name);
-            let cr_data = if let Ok(raw_ds) = self.storage.get::<serde_json::Value>(&ds_key).await {
-                // Extract spec.template from the raw stored JSON
-                if let Some(template_val) = raw_ds.pointer("/spec/template").cloned() {
-                    let mut template_obj = template_val;
-                    if let Some(obj) = template_obj.as_object_mut() {
-                        obj.insert("$patch".to_string(), serde_json::json!("replace"));
-                    }
-                    // Re-serialize with sorted keys to match Go's encoding/json
-                    let patch = Self::sort_json_keys(&serde_json::json!({
-                        "spec": {
-                            "template": template_obj
-                        }
-                    }));
-                    Some(patch)
-                } else {
-                    Self::build_patch_data(&daemonset.spec.template)
-                }
-            } else {
-                Self::build_patch_data(&daemonset.spec.template)
-            };
+            // Build ControllerRevision data matching K8s getPatch() format.
+            // K8s Match() does byte-level comparison between getPatch(dsFromAPI)
+            // and history.Data.Raw. getPatch() marshals the DaemonSet through Go's
+            // typed struct serialization (which applies omitempty to drop zero-value
+            // fields), extracts spec.template, adds "$patch":"replace", and
+            // re-marshals with sorted keys.
+            //
+            // We use build_patch_data() which serializes through our typed struct
+            // (applying skip_serializing_if), then strips remaining Go-omitempty
+            // zero values (like empty "name" fields in metadata), and sorts keys.
+            let cr_data = Self::build_patch_data(&daemonset.spec.template);
             cr.data = cr_data;
 
             if self.storage.create(&cr_key, &cr).await.is_ok() {
@@ -533,15 +543,15 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // This ensures that at any point in time, the number of unavailable pods
         // never exceeds maxUnavailable, which is what the conformance test checks.
         if update_strategy == "RollingUpdate" {
-            let max_unavailable = daemonset
+            let max_unavailable_raw = daemonset
                 .spec
                 .update_strategy
                 .as_ref()
                 .and_then(|s| s.rolling_update.as_ref())
-                .and_then(|r| r.max_unavailable.as_ref())
-                .and_then(|s| s.trim_end_matches('%').parse::<i32>().ok())
-                .unwrap_or(1)
-                .max(1);
+                .and_then(|r| r.max_unavailable.as_ref());
+            let desired = eligible_nodes.len() as i32;
+            let max_unavailable =
+                resolve_max_unavailable(max_unavailable_raw.map(|s| s.as_str()), desired);
 
             // Re-read pods after manage phase to get accurate state
             let all_pods_now: Vec<Pod> = self.storage.list(&pod_prefix).await?;
@@ -670,7 +680,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 if let Ok(()) = self.storage.delete(&pod_key).await {
                     info!(
                         "Rolling update: deleted unavailable old pod {} on node {} (budget {}/{})",
-                        pod_name, node_name, deleted_count + 1, allowed_deletions
+                        pod_name,
+                        node_name,
+                        deleted_count + 1,
+                        allowed_deletions
                     );
                     deleted_count += 1;
                 }
@@ -686,8 +699,11 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 if let Ok(()) = self.storage.delete(&pod_key).await {
                     info!(
                         "Rolling update: deleted old pod {} on node {} (hash != {}, budget {}/{})",
-                        pod_name, node_name, template_hash,
-                        deleted_count + 1, allowed_deletions
+                        pod_name,
+                        node_name,
+                        template_hash,
+                        deleted_count + 1,
+                        allowed_deletions
                     );
                     deleted_count += 1;
                 }
@@ -775,8 +791,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             .count() as i32;
 
         // Preserve existing conditions from current status (merge pattern)
-        let existing_conditions = daemonset.status.as_ref()
-            .and_then(|s| s.conditions.clone());
+        let existing_conditions = daemonset.status.as_ref().and_then(|s| s.conditions.clone());
 
         let new_status = Some(DaemonSetStatus {
             desired_number_scheduled,
@@ -821,7 +836,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                             updated_pod.metadata.deletion_timestamp = Some(chrono::Utc::now());
                             let pod_key = build_key("pods", Some(ns), &pod.metadata.name);
                             let _ = self.storage.update(&pod_key, &updated_pod).await;
-                            info!("Marked pod {} for deletion (DaemonSet {} being deleted)", pod.metadata.name, ds_name);
+                            info!(
+                                "Marked pod {} for deletion (DaemonSet {} being deleted)",
+                                pod.metadata.name, ds_name
+                            );
                         }
                     }
                 }
@@ -858,23 +876,23 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         namespace: &str,
     ) -> Result<()> {
         let daemonset_name = &daemonset.metadata.name;
-        // Use a deterministic hash suffix based on daemonset UID + node name.
-        // This ensures the same pod name is generated for the same node,
-        // preventing orphan cleanup from killing pods that the controller
-        // will just recreate with a different name.
-        use sha2::{Digest, Sha256};
-        let hash_input = format!("{}-{}", daemonset.metadata.uid, node_name);
-        let hash = Sha256::digest(hash_input.as_bytes());
-        let suffix = format!(
-            "{:05x}",
-            u32::from_be_bytes(hash[..4].try_into().unwrap_or([0u8; 4])) & 0xFFFFF
-        );
-        let pod_name = format!(
-            "{}-{}-{}",
-            daemonset_name,
-            &node_name.replace('.', "-"),
-            suffix
-        );
+        // Use a random suffix like K8s does (via generateName).
+        // K8s generates unique pod names each time, so when a failed pod
+        // is deleted and a replacement created, the replacement has a DIFFERENT
+        // name. This is critical for the conformance test "should retry creating
+        // failed daemon pods" which checks that the original failed pod's name
+        // returns NotFound via GET.
+        let suffix: String = {
+            use rand::RngExt;
+            let mut rng = rand::rng();
+            (0..5)
+                .map(|_| {
+                    const CHARSET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
+                    CHARSET[rng.random_range(0..CHARSET.len())] as char
+                })
+                .collect()
+        };
+        let pod_name = format!("{}-{}", daemonset_name, suffix);
 
         // Create pod from template
         let template = &daemonset.spec.template;
@@ -1119,12 +1137,20 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// Format: {"spec":{"template":{...,"$patch":"replace"}}}
     ///
     /// K8s Match() does byte-level comparison of getPatch() output with
-    /// history.Data.Raw. Go's encoding/json sorts map keys alphabetically.
-    /// We must sort keys the same way for the comparison to succeed.
-    fn build_patch_data(
+    /// history.Data.Raw. Go's encoding/json sorts map keys alphabetically
+    /// and omits zero-value fields with `omitempty`. We must:
+    /// 1. Sort keys the same way
+    /// 2. Strip zero-value fields (empty strings, false bools, 0 ints, empty
+    ///    arrays/maps, nulls) that Go's omitempty would drop
+    pub fn build_patch_data(
         template: &rusternetes_common::resources::PodTemplateSpec,
     ) -> Option<serde_json::Value> {
         let mut template_value = serde_json::to_value(template).ok()?;
+        // Strip Go-omitempty zero values BEFORE adding $patch marker.
+        // Go's getPatch() round-trips the DaemonSet through Go's typed struct
+        // serialization which applies omitempty, dropping empty strings, null
+        // pointers, empty slices/maps, zero ints, and false booleans.
+        template_value = Self::strip_go_omitempty_zeros(&template_value);
         // Add $patch: "replace" to the template object (K8s strategic merge patch marker)
         if let Some(obj) = template_value.as_object_mut() {
             obj.insert("$patch".to_string(), serde_json::json!("replace"));
@@ -1158,6 +1184,84 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             }
             other => other.clone(),
         }
+    }
+
+    /// Strip zero-value fields that Go's `omitempty` json tag would omit.
+    /// Go's encoding/json omits:
+    ///   - false booleans
+    ///   - 0 integers/floats
+    ///   - empty strings ""
+    ///   - nil pointers (null)
+    ///   - empty arrays []
+    ///   - empty maps {}
+    ///
+    /// This is critical for byte-level comparison with Go's getPatch() output.
+    /// When Go round-trips a DaemonSet through its typed struct serialization,
+    /// all fields with `json:",omitempty"` that have zero values are dropped.
+    /// Our ControllerRevision data must match those exact bytes.
+    fn strip_go_omitempty_zeros(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut cleaned = serde_json::Map::new();
+                for (key, val) in map {
+                    // Recursively clean nested values first
+                    let cleaned_val = Self::strip_go_omitempty_zeros(val);
+                    // Skip zero-value fields (Go's omitempty behavior).
+                    // Exception: Go keeps empty structs that come from non-nil
+                    // pointers (e.g., securityContext: {} from &SecurityContext{}).
+                    // These are NOT dropped by omitempty because the pointer is
+                    // non-nil even though the struct is empty.
+                    // K8s ref: api/core/v1/types.go — SecurityContext is *SecurityContext
+                    let is_preserved_empty_struct = cleaned_val.is_object()
+                        && cleaned_val.as_object().unwrap().is_empty()
+                        && matches!(
+                            key.as_str(),
+                            "securityContext" | "resources" | "capabilities"
+                        );
+                    if !is_preserved_empty_struct && Self::is_go_zero_value(&cleaned_val) {
+                        continue;
+                    }
+                    cleaned.insert(key.clone(), cleaned_val);
+                }
+                serde_json::Value::Object(cleaned)
+            }
+            serde_json::Value::Array(arr) => serde_json::Value::Array(
+                arr.iter()
+                    .map(|v| Self::strip_go_omitempty_zeros(v))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// Check if a JSON value is a Go zero value (would be omitted by omitempty).
+    fn is_go_zero_value(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Null => true,
+            serde_json::Value::Bool(b) => !b,
+            serde_json::Value::Number(n) => n.as_f64().map(|f| f == 0.0).unwrap_or(false),
+            serde_json::Value::String(s) => s.is_empty(),
+            serde_json::Value::Array(arr) => arr.is_empty(),
+            serde_json::Value::Object(map) => map.is_empty(),
+        }
+    }
+}
+
+/// Resolve a DaemonSet `maxUnavailable` IntOrString against the desired pod
+/// count (number of eligible nodes). Percentages are rounded UP per K8s
+/// semantics (`intstr.GetScaledValueFromIntOrPercent` with `roundUp=true`).
+/// Absolute values pass through, and any unparseable input defaults to 1.
+/// The result is clamped to at least 1 so the rolling update can always make
+/// progress on small clusters.
+fn resolve_max_unavailable(raw: Option<&str>, desired: i32) -> i32 {
+    match raw {
+        Some(s) if s.ends_with('%') => {
+            let pct = s.trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
+            let scaled = (pct * desired as f64 / 100.0).ceil() as i32;
+            scaled.max(1)
+        }
+        Some(s) => s.parse::<i32>().unwrap_or(1).max(1),
+        None => 1,
     }
 }
 
@@ -1727,7 +1831,7 @@ mod tests {
                 p.metadata
                     .owner_references
                     .as_ref()
-                    .map_or(false, |refs| refs.iter().any(|r| r.name == "fail-ds"))
+                    .is_some_and(|refs| refs.iter().any(|r| r.name == "fail-ds"))
             })
             .collect();
         assert_eq!(ds_pods.len(), 1, "Should have 1 DS pod");
@@ -1764,7 +1868,7 @@ mod tests {
                 p.metadata
                     .owner_references
                     .as_ref()
-                    .map_or(false, |refs| refs.iter().any(|r| r.name == "fail-ds"))
+                    .is_some_and(|refs| refs.iter().any(|r| r.name == "fail-ds"))
             })
             .collect();
         assert_eq!(
@@ -1816,5 +1920,34 @@ mod tests {
             "updated_number_scheduled should be set"
         );
         assert_eq!(status.updated_number_scheduled, Some(1));
+    }
+
+    #[test]
+    fn test_resolve_max_unavailable_absolute() {
+        // None defaults to 1
+        assert_eq!(resolve_max_unavailable(None, 3), 1);
+        // Absolute integer passes through
+        assert_eq!(resolve_max_unavailable(Some("2"), 5), 2);
+        // Absolute clamped to at least 1
+        assert_eq!(resolve_max_unavailable(Some("0"), 5), 1);
+        // Unparseable falls back to 1
+        assert_eq!(resolve_max_unavailable(Some("notanumber"), 5), 1);
+    }
+
+    #[test]
+    fn test_resolve_max_unavailable_percentage() {
+        // 25% of 4 nodes = 1 (rounded up from 1.0)
+        assert_eq!(resolve_max_unavailable(Some("25%"), 4), 1);
+        // 50% of 4 nodes = 2
+        assert_eq!(resolve_max_unavailable(Some("50%"), 4), 2);
+        // 25% of 5 nodes = 2 (rounded up from 1.25)
+        assert_eq!(resolve_max_unavailable(Some("25%"), 5), 2);
+        // 100% of 3 nodes = 3
+        assert_eq!(resolve_max_unavailable(Some("100%"), 3), 3);
+        // Tiny percentage on tiny cluster still allows at least 1
+        assert_eq!(resolve_max_unavailable(Some("1%"), 1), 1);
+        // Regression guard: "25%" must NOT be parsed as 25 absolute on a
+        // small cluster — that previously allowed all pods to be deleted.
+        assert_eq!(resolve_max_unavailable(Some("25%"), 3), 1);
     }
 }

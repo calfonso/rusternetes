@@ -22,6 +22,11 @@ pub struct ManagedFieldsEntry {
     pub api_version: String,
 
     /// Timestamp of last modification
+    #[serde(
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub time: Option<DateTime<Utc>>,
 
     /// Fields owned by this manager (JSON representation)
@@ -217,7 +222,7 @@ fn detect_conflicts(
 ) -> Vec<Conflict> {
     let mut conflicts = Vec::new();
 
-    for (field, _value) in modified_fields {
+    for field in modified_fields.keys() {
         // Skip metadata fields (always allowed to update)
         if field == "metadata" {
             continue;

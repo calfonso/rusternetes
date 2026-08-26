@@ -1,6 +1,6 @@
 # Rūsternetes
 
-**A ground-up reimplementation of Kubernetes in Rust.**
+**A ground-up reimplementation of Kubernetes in Rust.** [Documentation Site](https://calfonso.github.io/rusternetes/)
 
 216,000+ lines of Rust across 10 crates. 31 controllers. 3,100+ tests. Actively conformance-tested against the official Kubernetes e2e test suite — currently passing 94% of conformance tests (415/441) across 160 rounds of testing.
 
@@ -39,7 +39,7 @@ See the [Console User Guide](docs/CONSOLE_USER_GUIDE.md) for full documentation.
 │           │                                                   │
 │  ┌────────▼─────────┐                                         │
 │  │ Storage          │                                         │
-│  │ etcd | SQLite    │                                         │
+│  │ etcd|SQLite|Redis│                                         │
 │  └──────────────────┘                                         │
 ├───────────────────────────────────────────────────────────────┤
 │                       Node Components                         │
@@ -54,15 +54,24 @@ See the [Console User Guide](docs/CONSOLE_USER_GUIDE.md) for full documentation.
 
 ## Deploy Your Way
 
-Rusternetes supports three deployment modes from the same codebase:
+Rusternetes supports multiple deployment modes from the same codebase:
 
 **Full cluster with etcd** — the standard production deployment with separate containers per component, backed by an etcd cluster with Raft consensus and leader election.
 
-**Swap the database** — replace etcd with [Rhino](https://github.com/calfonso/rhino), an etcd-compatible gRPC server written in Rust that stores everything in SQLite, PostgreSQL, or MySQL. Same Kubernetes API, same binaries, zero etcd infrastructure. Just change the compose file.
+**Swap the database** — replace etcd with [Rhino](https://github.com/calfonso/rhino), an etcd-compatible gRPC server written in Rust that stores everything in SQLite, Redis, PostgreSQL, or MySQL. Same Kubernetes API, same binaries, zero etcd infrastructure. Just change the compose file.
 
-**Single binary, single process** — all five components running as concurrent tokio tasks in one process with an embedded SQLite database. No containers, no external dependencies. Your entire cluster state lives in a single SQLite file — back it up with `cp`, inspect it with `sqlite3`, move it to another machine.
+**Single binary, single process** — all five components running as concurrent tokio tasks in one process with an embedded SQLite or Redis backend. No etcd, no external infrastructure. Your entire cluster state lives in a single SQLite file or a Redis instance.
 
 The all-in-one mode is built for environments where a full K8s cluster is overkill: edge devices, CI/CD pipelines, local development, IoT gateways, embedded systems, and air-gapped environments.
+
+## Prerequisites
+
+- **Rust** (latest stable) — install via [rustup.rs](https://rustup.rs/)
+- **Protocol Buffers compiler** — required for building the API server
+  - Fedora/RHEL: `sudo dnf install -y protobuf-compiler protobuf-devel`
+  - Debian/Ubuntu: `sudo apt install -y protobuf-compiler`
+  - macOS: `brew install protobuf`
+- **Container runtime** — Docker or Podman
 
 ## Quick Start
 
@@ -71,7 +80,8 @@ The all-in-one mode is built for environments where a full K8s cluster is overki
 ```bash
 git clone https://github.com/calfonso/rusternetes.git
 cd rusternetes
-
+bash scripts/generate-certs.sh
+cp kubeconfig.example.yaml ~/.kube/rusternetes-config
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
 podman compose build
 podman compose up -d
@@ -89,8 +99,10 @@ git clone https://github.com/calfonso/rusternetes.git
 cd rusternetes
 
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+bash scripts/generate-certs.sh
+cp kubeconfig.example.yaml ~/.kube/rusternetes-config
 docker compose build
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 bash scripts/bootstrap-cluster.sh
 
 export KUBECONFIG=~/.kube/rusternetes-config
@@ -113,6 +125,16 @@ docker compose -f docker-compose.sqlite.yml up -d
 bash scripts/bootstrap-cluster.sh
 ```
 
+### Full cluster with Redis (no etcd)
+
+Same cluster, but Rhino uses Redis for in-memory storage:
+
+```bash
+podman compose -f compose.redis.yml build
+podman compose -f compose.redis.yml up -d
+bash scripts/bootstrap-cluster.sh
+```
+
 ### All-in-one binary
 
 Full Kubernetes in a single process with embedded SQLite:
@@ -120,6 +142,13 @@ Full Kubernetes in a single process with embedded SQLite:
 ```bash
 cargo build -p rusternetes
 ./target/release/rusternetes --data-dir ./cluster.db
+```
+
+Or with Redis:
+
+```bash
+cargo build -p rusternetes --features redis
+./target/release/rusternetes --storage-backend redis --redis-url redis://localhost:6379
 ```
 
 **Prerequisites:** Podman or Docker for the kubelet to manage containers. On Linux with Podman, rootful mode is required for kube-proxy iptables access. See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed setup.
@@ -236,8 +265,6 @@ bash scripts/run-conformance.sh
 # Monitor progress
 bash scripts/conformance-progress.sh
 ```
-
-See [CONFORMANCE_FAILURES.md](docs/CONFORMANCE_FAILURES.md) for the full fix tracker.
 
 ## Project Structure
 

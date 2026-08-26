@@ -12,7 +12,6 @@ use rusternetes_common::{
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -103,10 +102,15 @@ pub async fn create(
     }
 
     // Create kube-root-ca.crt ConfigMap (required by Kubernetes conformance)
-    let ca_cert = std::fs::read_to_string("/etc/kubernetes/pki/ca.crt")
-        .or_else(|_| std::fs::read_to_string("/etc/kubernetes/pki/api-server.crt"))
-        .or_else(|_| std::fs::read_to_string("/root/.rusternetes/certs/ca.crt"))
-        .unwrap_or_else(|_| "".to_string());
+    let ca_cert = match tokio::fs::read_to_string("/etc/kubernetes/pki/ca.crt").await {
+        Ok(s) => s,
+        Err(_) => match tokio::fs::read_to_string("/etc/kubernetes/pki/api-server.crt").await {
+            Ok(s) => s,
+            Err(_) => tokio::fs::read_to_string("/root/.rusternetes/certs/ca.crt")
+                .await
+                .unwrap_or_default(),
+        },
+    };
 
     info!(
         "kube-root-ca.crt for namespace {}: cert_len={}, ns_name={}",
@@ -143,6 +147,87 @@ pub async fn create(
             "CA cert is empty, skipping kube-root-ca.crt for namespace {}",
             ns_name
         );
+    }
+
+    // Create extension-apiserver-authentication ConfigMap in kube-system.
+    // K8s creates this via the ClusterAuthenticationTrust controller.
+    // Extension API servers (like sample-apiserver) read this on startup
+    // to configure authentication delegation. Without it they crash.
+    if ns_name == "kube-system" {
+        let ca_cert_for_auth = std::fs::read_to_string("/etc/kubernetes/pki/ca.crt")
+            .or_else(|_| std::fs::read_to_string("/etc/kubernetes/pki/api-server.crt"))
+            .or_else(|_| std::fs::read_to_string("/root/.rusternetes/certs/ca.crt"))
+            .unwrap_or_default();
+
+        let auth_cm = rusternetes_common::resources::ConfigMap {
+            type_meta: rusternetes_common::types::TypeMeta {
+                kind: "ConfigMap".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: rusternetes_common::types::ObjectMeta::new(
+                "extension-apiserver-authentication",
+            )
+            .with_namespace("kube-system".to_string()),
+            data: Some(std::collections::HashMap::from([
+                ("client-ca-file".to_string(), ca_cert_for_auth.clone()),
+                ("requestheader-client-ca-file".to_string(), ca_cert_for_auth),
+                (
+                    "requestheader-username-headers".to_string(),
+                    "[\"x-remote-user\"]".to_string(),
+                ),
+                (
+                    "requestheader-group-headers".to_string(),
+                    "[\"x-remote-group\"]".to_string(),
+                ),
+                (
+                    "requestheader-extra-headers-prefix".to_string(),
+                    "[\"x-remote-extra-\"]".to_string(),
+                ),
+                ("requestheader-allowed-names".to_string(), "[]".to_string()),
+            ])),
+            binary_data: None,
+            immutable: None,
+        };
+        let auth_cm_key = build_key(
+            "configmaps",
+            Some("kube-system"),
+            "extension-apiserver-authentication",
+        );
+        match state.storage.create(&auth_cm_key, &auth_cm).await {
+            Ok(_) => info!("Created extension-apiserver-authentication ConfigMap in kube-system"),
+            Err(e) => debug!(
+                "extension-apiserver-authentication already exists or error: {}",
+                e
+            ),
+        }
+
+        // Create the Role that allows extension API servers to read this ConfigMap
+        let reader_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {
+                "name": "extension-apiserver-authentication-reader",
+                "namespace": "kube-system"
+            },
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["configmaps"],
+                "resourceNames": ["extension-apiserver-authentication"],
+                "verbs": ["get", "list", "watch"]
+            }]
+        });
+        let role_key = build_key(
+            "roles",
+            Some("kube-system"),
+            "extension-apiserver-authentication-reader",
+        );
+        match state.storage.create(&role_key, &reader_role).await {
+            Ok(_) => info!("Created extension-apiserver-authentication-reader Role"),
+            Err(e) => debug!(
+                "extension-apiserver-authentication-reader already exists or error: {}",
+                e
+            ),
+        }
     }
 
     Ok((StatusCode::CREATED, Json(created)))
@@ -319,6 +404,7 @@ pub async fn delete_ns(
 
 /// Cascade delete all resources in a namespace
 /// This ensures proper cleanup when a namespace is deleted
+#[allow(dead_code)]
 async fn cascade_delete_namespace_resources(
     storage: &rusternetes_storage::StorageBackend,
     namespace: &str,
@@ -436,8 +522,8 @@ pub async fn list(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")

@@ -184,42 +184,6 @@ pub async fn delete_csidriver(
 // Use the macro to create a PATCH handler
 crate::patch_handler_cluster!(patch_csidriver, CSIDriver, "csidrivers", "storage.k8s.io");
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::resources::CSIDriverSpec;
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-
-    fn create_test_driver(name: &str) -> CSIDriver {
-        CSIDriver {
-            type_meta: TypeMeta {
-                kind: "CSIDriver".to_string(),
-                api_version: "storage.k8s.io/v1".to_string(),
-            },
-            metadata: ObjectMeta::new(name),
-            spec: CSIDriverSpec {
-                attach_required: Some(true),
-                pod_info_on_mount: Some(false),
-                fs_group_policy: None,
-                storage_capacity: Some(true),
-                volume_lifecycle_modes: None,
-                token_requests: None,
-                requires_republish: Some(false),
-                se_linux_mount: Some(false),
-                node_allocatable_update_period_seconds: None,
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn test_csidriver_serialization() {
-        let driver = create_test_driver("test-driver");
-        let json = serde_json::to_string(&driver).unwrap();
-        let deserialized: CSIDriver = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metadata.name, "test-driver");
-    }
-}
-
 pub async fn deletecollection_csidrivers(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -275,4 +239,40 @@ pub async fn deletecollection_csidrivers(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::resources::CSIDriverSpec;
+    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    fn create_test_driver(name: &str) -> CSIDriver {
+        CSIDriver {
+            type_meta: TypeMeta {
+                kind: "CSIDriver".to_string(),
+                api_version: "storage.k8s.io/v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name),
+            spec: CSIDriverSpec {
+                attach_required: Some(true),
+                pod_info_on_mount: Some(false),
+                fs_group_policy: None,
+                storage_capacity: Some(true),
+                volume_lifecycle_modes: None,
+                token_requests: None,
+                requires_republish: Some(false),
+                se_linux_mount: Some(false),
+                node_allocatable_update_period_seconds: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_csidriver_serialization() {
+        let driver = create_test_driver("test-driver");
+        let json = serde_json::to_string(&driver).unwrap();
+        let deserialized: CSIDriver = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.metadata.name, "test-driver");
+    }
 }

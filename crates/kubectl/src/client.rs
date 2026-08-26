@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubernetesList<T> {
+    #[allow(dead_code)]
     pub api_version: String,
+    #[allow(dead_code)]
     pub kind: String,
     pub items: Vec<T>,
 }

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chuck-norris-svc
+  namespace: chuck-norris
+spec:
+  selector:
+    app: chuck-norris
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+  type: ClusterIP

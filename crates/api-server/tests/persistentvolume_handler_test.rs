@@ -3,9 +3,8 @@
 //! Tests all CRUD operations, edge cases, and error handling for persistent volumes
 
 use rusternetes_common::resources::volume::{
-    HostPathType, HostPathVolumeSource, NFSVolumeSource, NodeSelector, NodeSelectorRequirement,
-    NodeSelectorTerm, PersistentVolumeMode, PersistentVolumePhase, PersistentVolumeReclaimPolicy,
-    VolumeNodeAffinity,
+    HostPathType, HostPathVolumeSource, NFSVolumeSource, PersistentVolumeMode,
+    PersistentVolumePhase, PersistentVolumeReclaimPolicy,
 };
 use rusternetes_common::resources::{
     PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeSpec, PersistentVolumeStatus,

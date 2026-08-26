@@ -10,7 +10,7 @@ pub async fn execute(
     name: &str,
     namespace: &str,
     labels: &[String],
-    overwrite: bool,
+    _overwrite: bool,
 ) -> Result<()> {
     // Parse labels from key=value or key- (removal) format
     let mut label_map = HashMap::new();

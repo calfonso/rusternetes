@@ -92,7 +92,7 @@ fn create_running_pod(name: &str) -> Pod {
             container_statuses: Some(vec![ContainerStatus {
                 name: "main".to_string(),
                 state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
                 }),
                 ready: true,
                 restart_count: 0,
@@ -295,7 +295,7 @@ fn test_ephemeral_container_status() {
         status.ephemeral_container_statuses = Some(vec![ContainerStatus {
             name: "debugger".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:05:00Z".to_string()),
+                started_at: Some("2024-01-01T00:05:00Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,
@@ -473,7 +473,7 @@ fn test_ephemeral_container_lifecycle() {
         status.ephemeral_container_statuses = Some(vec![ContainerStatus {
             name: "debugger".to_string(),
             state: Some(ContainerState::Running {
-                started_at: Some("2024-01-01T00:10:00Z".to_string()),
+                started_at: Some("2024-01-01T00:10:00Z".parse().unwrap()),
             }),
             ready: true,
             restart_count: 0,

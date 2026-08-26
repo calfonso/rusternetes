@@ -86,11 +86,11 @@ async fn test_volumeattachment_update() {
     });
 
     let updated: VolumeAttachment = storage.update(&key, &va).await.unwrap();
-    assert_eq!(updated.status.as_ref().unwrap().attached, true);
+    assert!(updated.status.as_ref().unwrap().attached);
 
     // Verify update
     let retrieved: VolumeAttachment = storage.get(&key).await.unwrap();
-    assert_eq!(retrieved.status.as_ref().unwrap().attached, true);
+    assert!(retrieved.status.as_ref().unwrap().attached);
 
     // Clean up
     storage.delete(&key).await.unwrap();
@@ -166,7 +166,7 @@ async fn test_volumeattachment_with_status() {
 
     // Create with status
     let created: VolumeAttachment = storage.create(&key, &va).await.unwrap();
-    assert_eq!(created.status.as_ref().unwrap().attached, true);
+    assert!(created.status.as_ref().unwrap().attached);
     let metadata = created
         .status
         .as_ref()
@@ -199,7 +199,7 @@ async fn test_volumeattachment_with_attach_error() {
 
     // Create with attach error
     let created: VolumeAttachment = storage.create(&key, &va).await.unwrap();
-    assert_eq!(created.status.as_ref().unwrap().attached, false);
+    assert!(!created.status.as_ref().unwrap().attached);
     let error = created
         .status
         .as_ref()
@@ -353,7 +353,7 @@ async fn test_volumeattachment_metadata_immutability() {
 
     let updated: VolumeAttachment = storage.update(&key, &updated_va).await.unwrap();
     assert_eq!(updated.metadata.uid, original_uid);
-    assert_eq!(updated.status.as_ref().unwrap().attached, true);
+    assert!(updated.status.as_ref().unwrap().attached);
 
     // Clean up
     storage.delete(&key).await.unwrap();
@@ -490,7 +490,7 @@ async fn test_volumeattachment_attachment_lifecycle() {
     storage.update(&key, &va).await.unwrap();
 
     let retrieved2: VolumeAttachment = storage.get(&key).await.unwrap();
-    assert_eq!(retrieved2.status.as_ref().unwrap().attached, true);
+    assert!(retrieved2.status.as_ref().unwrap().attached);
 
     // Transition 3: Detached
     va.status = Some(VolumeAttachmentStatus {
@@ -502,7 +502,7 @@ async fn test_volumeattachment_attachment_lifecycle() {
     storage.update(&key, &va).await.unwrap();
 
     let retrieved3: VolumeAttachment = storage.get(&key).await.unwrap();
-    assert_eq!(retrieved3.status.as_ref().unwrap().attached, false);
+    assert!(!retrieved3.status.as_ref().unwrap().attached);
 
     // Clean up
     storage.delete(&key).await.unwrap();
@@ -521,7 +521,7 @@ async fn test_volumeattachment_all_fields() {
     let mut volume_attrs = HashMap::new();
     volume_attrs.insert("provisioner".to_string(), "test".to_string());
 
-    let mut va = VolumeAttachment {
+    let va = VolumeAttachment {
         type_meta: TypeMeta {
             api_version: "storage.k8s.io/v1".to_string(),
             kind: "VolumeAttachment".to_string(),
@@ -573,7 +573,7 @@ async fn test_volumeattachment_node_affinity() {
     let storage = Arc::new(MemoryStorage::new());
 
     // Test multiple VolumeAttachments to different nodes
-    let nodes = vec!["node1", "node2", "node3"];
+    let nodes = ["node1", "node2", "node3"];
 
     for (i, node) in nodes.iter().enumerate() {
         let name = format!("va-node-{}", i);

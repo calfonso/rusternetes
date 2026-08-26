@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 /// or replication controller.
 ///
 /// Equivalent to `kubectl autoscale deployment foo --min=2 --max=10 --cpu-percent=80`
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     client: &ApiClient,
     resource_type: &str,
@@ -164,6 +165,7 @@ pub async fn execute(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_hpa_v1(
     hpa_name: &str,
     namespace: &str,

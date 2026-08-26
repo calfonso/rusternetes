@@ -3,7 +3,6 @@
 //! Tests all CRUD operations for Roles, RoleBindings, ClusterRoles, and ClusterRoleBindings
 //! This is security-critical functionality requiring comprehensive test coverage
 
-use axum::http::StatusCode;
 use rusternetes_common::resources::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
 };

@@ -31,8 +31,8 @@ generate_token() {
 create_sa_resources() {
     local namespace=$1
     local token=$(generate_token "$namespace")
-    local token_b64=$(echo -n "$token" | base64)
-    local namespace_b64=$(echo -n "$namespace" | base64)
+    local token_b64=$(echo -n "$token" | base64 | tr -d '\n')
+    local namespace_b64=$(echo -n "$namespace" | base64 | tr -d '\n')
 
     cat << EOF
 ---

@@ -29,6 +29,18 @@ pub async fn execute(
     websocket::port_forward_stream(ws_url, local_port, remote_port, address).await
 }
 
+fn parse_port_mapping(port_spec: &str) -> Result<(u16, u16)> {
+    if let Some((local, remote)) = port_spec.split_once(':') {
+        let local_port = local.parse::<u16>()?;
+        let remote_port = remote.parse::<u16>()?;
+        Ok((local_port, remote_port))
+    } else {
+        // If only one port specified, use same for both local and remote
+        let port = port_spec.parse::<u16>()?;
+        Ok((port, port))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,17 +89,5 @@ mod tests {
         // Port number exceeding u16 max should fail
         let result = parse_port_mapping("70000");
         assert!(result.is_err());
-    }
-}
-
-fn parse_port_mapping(port_spec: &str) -> Result<(u16, u16)> {
-    if let Some((local, remote)) = port_spec.split_once(':') {
-        let local_port = local.parse::<u16>()?;
-        let remote_port = remote.parse::<u16>()?;
-        Ok((local_port, remote_port))
-    } else {
-        // If only one port specified, use same for both local and remote
-        let port = port_spec.parse::<u16>()?;
-        Ok((port, port))
     }
 }

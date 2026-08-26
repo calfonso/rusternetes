@@ -144,6 +144,7 @@ impl KubeConfig {
     }
 
     /// Get a specific context by name
+    #[allow(dead_code)]
     pub fn get_context(&self, name: &str) -> Result<&Context> {
         self.contexts
             .iter()
@@ -198,6 +199,7 @@ impl KubeConfig {
     }
 
     /// Get client certificate data if available (base64 encoded)
+    #[allow(dead_code)]
     pub fn get_client_cert_data(&self) -> Result<Option<String>> {
         let context = self.get_current_context()?;
         let user = self.get_user(context)?;
@@ -205,6 +207,7 @@ impl KubeConfig {
     }
 
     /// Get client key data if available (base64 encoded)
+    #[allow(dead_code)]
     pub fn get_client_key_data(&self) -> Result<Option<String>> {
         let context = self.get_current_context()?;
         let user = self.get_user(context)?;

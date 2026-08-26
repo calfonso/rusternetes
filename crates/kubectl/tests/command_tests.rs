@@ -1,9 +1,9 @@
-/// Comprehensive tests for kubectl commands without requiring a cluster
-///
-/// These tests demonstrate how to test kubectl command logic using:
-/// - Unit tests for parsing and formatting
-/// - Mock responses for API interactions
-/// - Integration tests with in-memory data
+//! Comprehensive tests for kubectl commands without requiring a cluster
+//!
+//! These tests demonstrate how to test kubectl command logic using:
+//! - Unit tests for parsing and formatting
+//! - Mock responses for API interactions
+//! - Integration tests with in-memory data
 
 #[cfg(test)]
 mod rollout_tests {
@@ -27,7 +27,7 @@ mod rollout_tests {
         let supported_types = vec!["deployment", "statefulset", "daemonset"];
 
         for rt in supported_types {
-            assert!(rt.len() > 0, "Resource type should not be empty");
+            assert!(!rt.is_empty(), "Resource type should not be empty");
         }
     }
 }
@@ -37,8 +37,8 @@ mod diff_tests {
     #[test]
     fn test_diff_line_comparison() {
         // Test basic line-by-line diff logic
-        let current = vec!["line1", "line2", "line3"];
-        let new = vec!["line1", "line2-modified", "line3", "line4"];
+        let current = ["line1", "line2", "line3"];
+        let new = ["line1", "line2-modified", "line3", "line4"];
 
         let max_len = current.len().max(new.len());
         let mut differences = Vec::new();
@@ -123,7 +123,7 @@ mod cp_tests {
         // Upload: local to pod
         let (is_upload, pod, pod_path, local_path) =
             parse_copy_spec("/local/file.txt", "my-pod:/remote/file.txt").unwrap();
-        assert_eq!(is_upload, true);
+        assert!(is_upload);
         assert_eq!(pod, "my-pod");
         assert_eq!(pod_path, "/remote/file.txt");
         assert_eq!(local_path, "/local/file.txt");
@@ -131,7 +131,7 @@ mod cp_tests {
         // Download: pod to local
         let (is_upload, pod, pod_path, local_path) =
             parse_copy_spec("nginx-pod:/var/log/nginx.log", "/tmp/nginx.log").unwrap();
-        assert_eq!(is_upload, false);
+        assert!(!is_upload);
         assert_eq!(pod, "nginx-pod");
         assert_eq!(pod_path, "/var/log/nginx.log");
         assert_eq!(local_path, "/tmp/nginx.log");
@@ -224,7 +224,7 @@ mod config_tests {
     #[test]
     fn test_context_switching_validation() {
         // Test that context switching validates context exists
-        let contexts = vec!["dev", "staging", "production"];
+        let contexts = ["dev", "staging", "production"];
 
         // Valid context
         assert!(contexts.contains(&"production"));
@@ -256,8 +256,8 @@ mod logs_tests {
     #[test]
     fn test_duration_parsing() {
         fn parse_duration(s: &str) -> Result<i64, String> {
-            let (num_str, unit) = if s.ends_with("ms") {
-                (&s[..s.len() - 2], "ms")
+            let (num_str, unit) = if let Some(stripped) = s.strip_suffix("ms") {
+                (stripped, "ms")
             } else {
                 let last = s.chars().last().ok_or("Empty duration")?;
                 if last.is_alphabetic() {

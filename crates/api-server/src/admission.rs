@@ -1,8 +1,6 @@
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use rusternetes_common::{
-    resources::{
-        LimitRange, Pod, ResourceQuota, SecretVolumeSource, ServiceAccount, Volume, VolumeMount,
-    },
+    resources::{LimitRange, Pod, ResourceQuota, ServiceAccount, Volume, VolumeMount},
     types::ResourceRequirements,
 };
 use rusternetes_storage::Storage;
@@ -144,11 +142,11 @@ fn pod_matches_quota_scopes(pod: &Pod, quota: &ResourceQuota) -> bool {
                         "In" => req
                             .values
                             .as_ref()
-                            .map_or(false, |v| v.iter().any(|val| val == pod_priority_class)),
+                            .is_some_and(|v| v.iter().any(|val| val == pod_priority_class)),
                         "NotIn" => req
                             .values
                             .as_ref()
-                            .map_or(true, |v| !v.iter().any(|val| val == pod_priority_class)),
+                            .is_none_or(|v| !v.iter().any(|val| val == pod_priority_class)),
                         "Exists" => !pod_priority_class.is_empty(),
                         "DoesNotExist" => pod_priority_class.is_empty(),
                         _ => true,
@@ -333,9 +331,12 @@ pub async fn check_resource_quota<S: Storage>(
         // K8s treats any quota key starting with "requests." that isn't
         // cpu/memory/ephemeral-storage as an extended resource.
         for (key, limit_str) in &hard {
-            if key.starts_with("requests.") && !matches!(key.as_str(),
-                "requests.cpu" | "requests.memory" | "requests.ephemeral-storage"
-            ) {
+            if key.starts_with("requests.")
+                && !matches!(
+                    key.as_str(),
+                    "requests.cpu" | "requests.memory" | "requests.ephemeral-storage"
+                )
+            {
                 // Extended resource name is the part after "requests."
                 let ext_name = &key["requests.".len()..];
                 let limit: i64 = limit_str.parse().unwrap_or(i64::MAX);
@@ -346,13 +347,20 @@ pub async fn check_resource_quota<S: Storage>(
                     .unwrap_or(0);
                 // Get this pod's request for the resource
                 let pod_request: i64 = pod
-                    .spec.as_ref()
-                    .map(|s| s.containers.iter()
-                        .filter_map(|c| c.resources.as_ref()
-                            .and_then(|r| r.requests.as_ref())
-                            .and_then(|reqs| reqs.get(ext_name))
-                            .and_then(|v| v.parse::<i64>().ok()))
-                        .sum::<i64>())
+                    .spec
+                    .as_ref()
+                    .map(|s| {
+                        s.containers
+                            .iter()
+                            .filter_map(|c| {
+                                c.resources
+                                    .as_ref()
+                                    .and_then(|r| r.requests.as_ref())
+                                    .and_then(|reqs| reqs.get(ext_name))
+                                    .and_then(|v| v.parse::<i64>().ok())
+                            })
+                            .sum::<i64>()
+                    })
                     .unwrap_or(0);
                 if pod_request > 0 && current + pod_request > limit {
                     exceeded.push(format!(
@@ -431,6 +439,7 @@ pub async fn check_resource_quota<S: Storage>(
 }
 
 /// Apply LimitRange defaults and validate constraints
+#[allow(dead_code)]
 pub async fn apply_limit_range<S: Storage>(
     storage: &Arc<S>,
     namespace: &str,
@@ -472,14 +481,13 @@ pub fn apply_limit_range_with(
 
                         // Apply default limits
                         if let Some(default_limits) = &limit_item.default {
-                            if resources.limits.is_none() {
-                                resources.limits = Some(default_limits.clone());
-                            } else {
+                            if let Some(limits) = resources.limits.as_mut() {
                                 // Merge with existing limits
-                                let limits = resources.limits.as_mut().unwrap();
                                 for (key, value) in default_limits {
                                     limits.entry(key.clone()).or_insert_with(|| value.clone());
                                 }
+                            } else {
+                                resources.limits = Some(default_limits.clone());
                             }
                         }
 
@@ -995,7 +1003,7 @@ pub async fn inject_service_account_token<S: Storage>(
     }
 
     // The service account token secret name follows the pattern: {sa-name}-token
-    let token_secret_name = format!("{}-token", sa_name);
+    let _token_secret_name = format!("{}-token", sa_name);
 
     // Define the service account token volume as a Projected volume
     // with three sources, matching K8s TokenVolumeSource() exactly:
@@ -1149,7 +1157,13 @@ pub async fn check_count_quota<S: Storage>(
     resource_type: &str,
 ) -> Result<(), rusternetes_common::Error> {
     let quota_prefix = format!("/registry/resourcequotas/{}/", namespace);
-    let quotas: Vec<ResourceQuota> = storage.list(&quota_prefix).await.unwrap_or_default();
+    let quotas: Vec<ResourceQuota> = match storage.list(&quota_prefix).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, namespace, "failed to list resource quotas; skipping count quota check");
+            return Ok(());
+        }
+    };
 
     for quota in &quotas {
         if let Some(hard) = &quota.spec.hard {
@@ -1160,8 +1174,16 @@ pub async fn check_count_quota<S: Storage>(
                     let limit: i64 = limit_str.parse().unwrap_or(i64::MAX);
                     // Count current resources
                     let prefix = format!("/registry/{}/{}/", resource_type, namespace);
-                    let current: Vec<serde_json::Value> =
-                        storage.list(&prefix).await.unwrap_or_default();
+                    let current: Vec<serde_json::Value> = match storage.list(&prefix).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(error = %e, namespace, resource_type, "failed to list resources for quota check; treating as over-quota");
+                            return Err(rusternetes_common::Error::Forbidden(format!(
+                                "could not verify quota for {}: {}",
+                                limit_key, e
+                            )));
+                        }
+                    };
                     if current.len() as i64 >= limit {
                         return Err(rusternetes_common::Error::Forbidden(format!(
                             "exceeded quota: {}, requested: 1, used: {}, limited: {}",

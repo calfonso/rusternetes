@@ -7,7 +7,7 @@
 use crate::spdy::{SpdyChannel, SpdyConnection};
 use rusternetes_common::resources::Pod;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Get the kubelet address for a pod's node.
 /// In our Docker Compose setup, kubelets are reachable by container name.
@@ -29,6 +29,7 @@ fn get_kubelet_url(pod: &Pod) -> String {
 }
 
 /// Handle SPDY exec connection by proxying to the kubelet
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_spdy_exec(
     spdy: SpdyConnection,
     pod: Pod,
@@ -251,11 +252,16 @@ async fn setup_port_forward(
         loop {
             match spdy_to_tcp.read_frame().await {
                 Ok(Some(frame)) if frame.channel == SpdyChannel::Stdin => {
-                    if tcp_write.write_all(&frame.data).await.is_err() {
+                    if let Err(e) = tcp_write.write_all(&frame.data).await {
+                        tracing::error!(task = "spdy_to_tcp", error = %e, "TCP write failed");
                         break;
                     }
                 }
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!(task = "spdy_to_tcp", error = %e, "SPDY read_frame failed");
+                    break;
+                }
                 _ => {}
             }
         }

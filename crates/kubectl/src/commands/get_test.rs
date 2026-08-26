@@ -83,15 +83,15 @@ mod tests {
     #[test]
     fn test_resource_type_aliases() {
         // These are common aliases that should be supported
-        let pod_aliases = vec!["pod", "pods"];
-        let service_aliases = vec!["service", "services", "svc"];
-        let deployment_aliases = vec!["deployment", "deployments", "deploy"];
-        let namespace_aliases = vec!["namespace", "namespaces", "ns"];
-        let pvc_aliases = vec!["persistentvolumeclaim", "persistentvolumeclaims", "pvc"];
-        let pv_aliases = vec!["persistentvolume", "persistentvolumes", "pv"];
-        let sc_aliases = vec!["storageclass", "storageclasses", "sc"];
-        let cm_aliases = vec!["configmap", "configmaps", "cm"];
-        let sa_aliases = vec!["serviceaccount", "serviceaccounts", "sa"];
+        let pod_aliases = ["pod", "pods"];
+        let service_aliases = ["service", "services", "svc"];
+        let _deployment_aliases = ["deployment", "deployments", "deploy"];
+        let _namespace_aliases = ["namespace", "namespaces", "ns"];
+        let _pvc_aliases = ["persistentvolumeclaim", "persistentvolumeclaims", "pvc"];
+        let _pv_aliases = ["persistentvolume", "persistentvolumes", "pv"];
+        let _sc_aliases = ["storageclass", "storageclasses", "sc"];
+        let _cm_aliases = ["configmap", "configmaps", "cm"];
+        let _sa_aliases = ["serviceaccount", "serviceaccounts", "sa"];
 
         // Just verify the patterns exist (actual matching happens in the execute function)
         for alias in pod_aliases {
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn test_new_resource_types_supported() {
         // Verify new resource types are in our type list
-        let new_types = vec![
+        let new_types = [
             "storageclass",
             "volumesnapshot",
             "volumesnapshotclass",
@@ -235,7 +235,7 @@ mod tests {
 
         // These should all be valid resource type strings
         for resource_type in new_types {
-            assert!(resource_type.len() > 0);
+            assert!(!resource_type.is_empty());
             assert!(resource_type
                 .chars()
                 .all(|c| c.is_lowercase() || c.is_ascii_alphanumeric()));

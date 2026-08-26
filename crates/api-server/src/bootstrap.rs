@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use rusternetes_common::resources::{Endpoints, EndpointSlice};
-use rusternetes_storage::StorageBackend;
+use rusternetes_common::resources::{EndpointSlice, Endpoints};
 use rusternetes_storage::Storage;
+use rusternetes_storage::StorageBackend;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -129,17 +129,21 @@ pub async fn bootstrap_kubernetes_service(
     match storage.get::<EndpointSlice>(es_key).await {
         Ok(mut es) => {
             // Update existing EndpointSlice
-            let needs_update = es.endpoints.first()
+            let needs_update = es
+                .endpoints
+                .first()
                 .map(|ep| ep.addresses.first().map(|a| a.as_str()) != Some(api_server_ip.as_str()))
                 .unwrap_or(true);
             if needs_update {
                 es.endpoints = vec![rusternetes_common::resources::endpointslice::Endpoint {
                     addresses: vec![api_server_ip.clone()],
-                    conditions: Some(rusternetes_common::resources::endpointslice::EndpointConditions {
-                        ready: Some(true),
-                        serving: Some(true),
-                        terminating: Some(false),
-                    }),
+                    conditions: Some(
+                        rusternetes_common::resources::endpointslice::EndpointConditions {
+                            ready: Some(true),
+                            serving: Some(true),
+                            terminating: Some(false),
+                        },
+                    ),
                     hostname: None,
                     target_ref: None,
                     node_name: None,
@@ -147,21 +151,33 @@ pub async fn bootstrap_kubernetes_service(
                     hints: None,
                     deprecated_topology: None,
                 }];
-                storage.update(es_key, &es).await
+                storage
+                    .update(es_key, &es)
+                    .await
                     .context("Failed to update kubernetes EndpointSlice")?;
-                info!("Updated kubernetes EndpointSlice with IP: {}", api_server_ip);
+                info!(
+                    "Updated kubernetes EndpointSlice with IP: {}",
+                    api_server_ip
+                );
             }
         }
         Err(_) => {
-            use rusternetes_common::resources::endpointslice::{Endpoint, EndpointConditions, EndpointPort};
+            use rusternetes_common::resources::endpointslice::{
+                Endpoint, EndpointConditions, EndpointPort,
+            };
             use rusternetes_common::types::ObjectMeta;
 
             let mut metadata = ObjectMeta::new("kubernetes");
             metadata.namespace = Some("default".to_string());
             let mut labels = std::collections::HashMap::new();
-            labels.insert("kubernetes.io/service-name".to_string(), "kubernetes".to_string());
-            labels.insert("endpointslice.kubernetes.io/managed-by".to_string(),
-                "endpointslice-mirroring-controller.k8s.io".to_string());
+            labels.insert(
+                "kubernetes.io/service-name".to_string(),
+                "kubernetes".to_string(),
+            );
+            labels.insert(
+                "endpointslice.kubernetes.io/managed-by".to_string(),
+                "endpointslice-mirroring-controller.k8s.io".to_string(),
+            );
             metadata.labels = Some(labels);
             metadata.ensure_uid();
             metadata.ensure_creation_timestamp();
@@ -195,9 +211,14 @@ pub async fn bootstrap_kubernetes_service(
                 }],
             };
 
-            storage.create(es_key, &es).await
+            storage
+                .create(es_key, &es)
+                .await
                 .context("Failed to create kubernetes EndpointSlice")?;
-            info!("Created kubernetes EndpointSlice with IP: {}", api_server_ip);
+            info!(
+                "Created kubernetes EndpointSlice with IP: {}",
+                api_server_ip
+            );
         }
     }
 

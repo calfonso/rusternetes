@@ -8,13 +8,13 @@ use axum::{
     body::Body,
     extract::State,
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
-use rusternetes_common::resources::crd::{CustomResourceDefinition, ResourceScope};
 use rusternetes_storage::Storage;
 use std::sync::Arc;
 
 /// Encode a u64 as a protobuf varint
+#[allow(dead_code)]
 fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -33,9 +33,7 @@ fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// Dynamically includes CRD group/version paths so kubectl can discover
 /// CRD schemas via the OpenAPI v3 discovery mechanism.
-pub async fn get_openapi_spec(
-    State(state): State<Arc<ApiServerState>>,
-) -> Response {
+pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Response {
     // Return the root document that lists all available OpenAPI paths
     // In real K8s, this returns {"paths": {"/apis/apps/v1": {...}, ...}}
     let mut paths = serde_json::Map::new();
@@ -184,65 +182,17 @@ pub async fn get_openapi_spec_path(
                 // Build definition key matching K8s ToRESTFriendlyName format:
                 // group/version/kind -> reverse group domain parts, join with dots
                 let group_parts: Vec<&str> = group.rsplitn(10, '.').collect();
-                let def_key = format!(
-                    "{}.{}.{}",
-                    group_parts.iter().copied().collect::<Vec<_>>().join("."),
-                    ver,
-                    kind
-                );
+                let def_key = format!("{}.{}.{}", group_parts.join("."), ver, kind);
 
-                // Build the schema from CRD validation
+                // Build the schema from CRD validation. Same publishing
+                // semantics as the v2 endpoint — see
+                // build_crd_schema_definition for the case analysis.
                 let crd_preserves = crd
                     .pointer("/spec/preserveUnknownFields")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-
-                let schema_value = if let Some(schema_val) = version.pointer("/schema/openAPIV3Schema") {
-                    let schema_preserves = schema_val
-                        .get("x-kubernetes-preserve-unknown-fields")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    if crd_preserves || schema_preserves {
-                        let mut def = serde_json::json!({
-                            "type": "object",
-                            "x-kubernetes-group-version-kind": [{
-                                "group": group,
-                                "kind": kind,
-                                "version": ver,
-                            }],
-                        });
-                        add_standard_crd_properties(&mut def);
-                        def
-                    } else {
-                        let mut cleaned = schema_val.clone();
-                        strip_false_extensions(&mut cleaned);
-                        if let Some(obj) = cleaned.as_object_mut() {
-                            obj.insert(
-                                "x-kubernetes-group-version-kind".to_string(),
-                                serde_json::json!([{
-                                    "group": group,
-                                    "kind": kind,
-                                    "version": ver,
-                                }]),
-                            );
-                        }
-                        add_standard_crd_properties(&mut cleaned);
-                        cleaned
-                    }
-                } else {
-                    // No schema — CRD without validation, treat as preserveUnknownFields
-                    let mut def = serde_json::json!({
-                        "type": "object",
-                        "x-kubernetes-group-version-kind": [{
-                            "group": group,
-                            "kind": kind,
-                            "version": ver,
-                        }],
-                    });
-                    add_standard_crd_properties(&mut def);
-                    def
-                };
+                let schema_value =
+                    build_crd_schema_definition(crd_preserves, version, group, kind, ver);
 
                 // Insert into components/schemas
                 if let Some(schemas) = spec_json
@@ -295,23 +245,21 @@ pub async fn get_openapi_spec_path(
                                 "/apis/{}/{}/namespaces/{{namespace}}/{}/{{name}}",
                                 group, ver, plural
                             );
-                            paths.entry(list_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
-                            paths.entry(item_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
+                            paths
+                                .entry(list_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
+                            paths
+                                .entry(item_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
                         } else {
-                            let list_path =
-                                format!("/apis/{}/{}/{}", group, ver, plural);
-                            let item_path =
-                                format!("/apis/{}/{}/{}/{{name}}", group, ver, plural);
-                            paths.entry(list_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
-                            paths.entry(item_path).or_insert_with(|| {
-                                serde_json::json!({"get": get_op})
-                            });
+                            let list_path = format!("/apis/{}/{}/{}", group, ver, plural);
+                            let item_path = format!("/apis/{}/{}/{}/{{name}}", group, ver, plural);
+                            paths
+                                .entry(list_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
+                            paths
+                                .entry(item_path)
+                                .or_insert_with(|| serde_json::json!({"get": get_op}));
                         }
                     }
                 }
@@ -350,6 +298,7 @@ fn parse_gv_path(path: &str) -> (String, String) {
 ///   - field 2 (raw, bytes): the raw data (JSON spec) -- tag 0x12
 ///   - field 3 (contentEncoding, string): empty, omitted
 ///   - field 4 (contentType, string): "application/json" -- tag 0x22
+#[allow(dead_code)]
 fn wrap_in_k8s_protobuf(_content_type: &str, data: &[u8]) -> Vec<u8> {
     let content_type_bytes = b"application/json";
     let mut msg = Vec::with_capacity(data.len() + 30);
@@ -382,174 +331,36 @@ pub async fn get_swagger_spec(
     State(state): State<Arc<ApiServerState>>,
     headers: HeaderMap,
 ) -> Response {
-    let mut paths = serde_json::Map::new();
-    let mut definitions = serde_json::Map::new();
-
     // Read CRDs from storage as raw JSON to preserve nested schemas.
-    // Using typed deserialization (CustomResourceDefinition) loses nested schemas
-    // in JSONSchemaPropsOrArray untagged enums. Raw JSON preserves everything.
+    // Using typed deserialization (CustomResourceDefinition) loses nested
+    // schemas in JSONSchemaPropsOrArray untagged enums. Raw JSON preserves
+    // everything.
+    //
+    // We rebuild the spec on every request from a fresh storage list so that
+    // CRD create/update/delete events are reflected immediately. This matches
+    // upstream kube-apiserver's openapi controller behaviour where the
+    // published spec is regenerated whenever a CRD is added, removed, or has
+    // its served versions / schema changed.
+    //
     // K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_handler.go
-    if let Ok(crds) = state
+    let crds = state
         .storage
         .list::<serde_json::Value>("/registry/customresourcedefinitions")
         .await
-    {
-        for crd in &crds {
-            let group = crd
-                .pointer("/spec/group")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let plural = crd
-                .pointer("/spec/names/plural")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let kind = crd
-                .pointer("/spec/names/kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let scope = crd
-                .pointer("/spec/scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Namespaced");
+        .unwrap_or_default();
 
-            let versions = crd.pointer("/spec/versions").and_then(|v| v.as_array());
-            for version in versions.into_iter().flatten() {
-                let served = version
-                    .get("served")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !served {
-                    continue;
-                }
-                let ver = version.get("name").and_then(|v| v.as_str()).unwrap_or("");
-
-                // Build definition key like "io.example.stable.v1.CronTab"
-                let group_parts: Vec<&str> = group.rsplitn(10, '.').collect();
-                let def_key = format!(
-                    "{}.{}.{}",
-                    group_parts.iter().copied().collect::<Vec<_>>().join("."),
-                    ver,
-                    kind
-                );
-
-                // Add schema from CRD validation.
-                // K8s ref: controller/openapi/builder/builder.go:392-407
-                //
-                // When XPreserveUnknownFields is true at the schema root OR
-                // CRD-level preserveUnknownFields is true, K8s replaces the
-                // ENTIRE schema with just {"type": "object"}. This prevents
-                // kubectl from rejecting unknown fields during client-side
-                // validation.
-                let crd_preserves = crd
-                    .pointer("/spec/preserveUnknownFields")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                if let Some(schema_val) = version.pointer("/schema/openAPIV3Schema") {
-                    let schema_preserves = schema_val
-                        .get("x-kubernetes-preserve-unknown-fields")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    if crd_preserves || schema_preserves {
-                        // Replace entire schema with just {type: object}
-                        // K8s ref: builder.go:393-395
-                        let mut def = serde_json::json!({
-                            "type": "object",
-                            "x-kubernetes-group-version-kind": [{
-                                "group": group,
-                                "kind": kind,
-                                "version": ver,
-                            }],
-                        });
-                        // Add metadata/apiVersion/kind properties (K8s always adds these)
-                        add_standard_crd_properties(&mut def);
-                        definitions.insert(def_key.clone(), def);
-                    } else {
-                        // Apply v2 conversion: strip extensions, omitempty defaults
-                        let mut cleaned = schema_val.clone();
-                        strip_false_extensions(&mut cleaned);
-                        // Add x-kubernetes-group-version-kind extension.
-                        // kubectl explain uses this to map GVR → OpenAPI definition.
-                        // K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
-                        if let Some(obj) = cleaned.as_object_mut() {
-                            obj.insert(
-                                "x-kubernetes-group-version-kind".to_string(),
-                                serde_json::json!([{
-                                    "group": group,
-                                    "kind": kind,
-                                    "version": ver,
-                                }]),
-                            );
-                        }
-                        // Add metadata/apiVersion/kind properties (K8s always adds these)
-                        add_standard_crd_properties(&mut cleaned);
-                        info!(
-                            "OpenAPI: adding CRD definition {} (group={}, kind={}, version={})",
-                            def_key, group, kind, ver
-                        );
-                        definitions.insert(def_key.clone(), cleaned);
-                    }
-                }
-
-                // Add path entries for the CRD's API endpoints
-                let base_path = format!("/apis/{}/{}", group, ver);
-
-                if scope == "Namespaced" {
-                    let ns_path = format!("{}/namespaces/{{namespace}}/{}", base_path, plural);
-                    let ns_item_path = format!("{}/{{name}}", ns_path);
-                    paths.insert(
-                        ns_path,
-                        serde_json::json!({
-                            "get": {"description": format!("list {}", kind)},
-                            "post": {"description": format!("create {}", kind)}
-                        }),
-                    );
-                    paths.insert(
-                        ns_item_path,
-                        serde_json::json!({
-                            "get": {"description": format!("get {}", kind)},
-                            "put": {"description": format!("update {}", kind)},
-                            "delete": {"description": format!("delete {}", kind)}
-                        }),
-                    );
-                } else {
-                    let cluster_path = format!("{}/{}", base_path, plural);
-                    let cluster_item_path = format!("{}/{{name}}", cluster_path);
-                    paths.insert(
-                        cluster_path,
-                        serde_json::json!({
-                            "get": {"description": format!("list {}", kind)},
-                            "post": {"description": format!("create {}", kind)}
-                        }),
-                    );
-                    paths.insert(
-                        cluster_item_path,
-                        serde_json::json!({
-                            "get": {"description": format!("get {}", kind)},
-                            "put": {"description": format!("update {}", kind)},
-                            "delete": {"description": format!("delete {}", kind)}
-                        }),
-                    );
-                }
-            }
-        }
-    }
-
-    let spec = serde_json::json!({
-        "swagger": "2.0",
-        "info": {
-            "title": "Rusternetes Kubernetes API",
-            "version": "v1.35.0"
-        },
-        "paths": paths,
-        "definitions": definitions
-    });
-    let crd_count = definitions.len();
-    if crd_count > 0 {
+    let spec = build_swagger_spec_for_crds(&crds);
+    let total_definitions = spec
+        .get("definitions")
+        .and_then(|d| d.as_object())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    // Subtract the two baseline definitions (ObjectMeta + OwnerReference)
+    // that are always present to surface the CRD-derived count.
+    if total_definitions > 2 {
         info!(
             "OpenAPI /v2: serving swagger spec with {} CRD definitions",
-            crd_count
+            total_definitions - 2
         );
     }
 
@@ -563,8 +374,8 @@ pub async fn get_swagger_spec(
     // Cache the protobuf conversion to avoid regenerating on every request.
     // The swagger spec changes when CRDs are created/deleted. We use a simple
     // hash of the JSON bytes to detect changes.
-    use std::sync::OnceLock;
     use std::sync::Mutex;
+    use std::sync::OnceLock;
     static PROTO_CACHE: OnceLock<Mutex<(u64, Vec<u8>)>> = OnceLock::new();
     let cache = PROTO_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
 
@@ -608,7 +419,10 @@ pub async fn get_swagger_spec(
                     .unwrap();
             }
             Err(e) => {
-                info!("Failed to convert swagger to protobuf: {}, falling back to JSON", e);
+                info!(
+                    "Failed to convert swagger to protobuf: {}, falling back to JSON",
+                    e
+                );
                 // Fall through to JSON response
             }
         }
@@ -621,6 +435,235 @@ pub async fn get_swagger_spec(
         .unwrap()
 }
 
+/// Build a complete swagger v2 spec given a list of CRDs (as raw JSON).
+///
+/// Centralising this in a pure function means the openapi/v2 endpoint always
+/// reflects the current storage state and the behaviour is independently
+/// testable. Matches upstream kube-apiserver's openapi controller: rebuild
+/// the spec from the latest set of registered CRDs on every refresh, dropping
+/// schemas for versions that are no longer served or no longer present.
+///
+/// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
+pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Value {
+    let mut paths = serde_json::Map::new();
+    let mut definitions = serde_json::Map::new();
+
+    for crd in crds {
+        let group = crd
+            .pointer("/spec/group")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let plural = crd
+            .pointer("/spec/names/plural")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let kind = crd
+            .pointer("/spec/names/kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let scope = crd
+            .pointer("/spec/scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Namespaced");
+
+        // CRD-level preserveUnknownFields applies to all versions unless
+        // overridden at the schema level. K8s ref: builder.go:392-407
+        let crd_preserves = crd
+            .pointer("/spec/preserveUnknownFields")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let versions = crd.pointer("/spec/versions").and_then(|v| v.as_array());
+        for version in versions.into_iter().flatten() {
+            // Skip versions that are not served — they must NOT appear in the
+            // published OpenAPI spec. Conformance test
+            // "removes definition from spec when one version gets changed to
+            // not be served" depends on this filter being applied at
+            // publish-time so toggling served=false is reflected.
+            let served = version
+                .get("served")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !served {
+                continue;
+            }
+            let ver = version.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if ver.is_empty() || group.is_empty() || kind.is_empty() {
+                continue;
+            }
+
+            // Build definition key like "io.example.stable.v1.CronTab"
+            // (reverse-domain group + version + kind), matching K8s
+            // ToRESTFriendlyName format.
+            let group_parts: Vec<&str> = group.rsplitn(10, '.').collect();
+            let def_key = format!("{}.{}.{}", group_parts.join("."), ver, kind);
+
+            let schema_value =
+                build_crd_schema_definition(crd_preserves, version, group, kind, ver);
+            info!(
+                "OpenAPI: publishing CRD definition {} (group={}, kind={}, version={})",
+                def_key, group, kind, ver
+            );
+            definitions.insert(def_key.clone(), schema_value);
+
+            // Add path entries for the CRD's API endpoints.
+            let base_path = format!("/apis/{}/{}", group, ver);
+            if scope == "Namespaced" {
+                let ns_path = format!("{}/namespaces/{{namespace}}/{}", base_path, plural);
+                let ns_item_path = format!("{}/{{name}}", ns_path);
+                paths.insert(
+                    ns_path,
+                    serde_json::json!({
+                        "get": {"description": format!("list {}", kind)},
+                        "post": {"description": format!("create {}", kind)}
+                    }),
+                );
+                paths.insert(
+                    ns_item_path,
+                    serde_json::json!({
+                        "get": {"description": format!("get {}", kind)},
+                        "put": {"description": format!("update {}", kind)},
+                        "delete": {"description": format!("delete {}", kind)}
+                    }),
+                );
+            } else {
+                let cluster_path = format!("{}/{}", base_path, plural);
+                let cluster_item_path = format!("{}/{{name}}", cluster_path);
+                paths.insert(
+                    cluster_path,
+                    serde_json::json!({
+                        "get": {"description": format!("list {}", kind)},
+                        "post": {"description": format!("create {}", kind)}
+                    }),
+                );
+                paths.insert(
+                    cluster_item_path,
+                    serde_json::json!({
+                        "get": {"description": format!("get {}", kind)},
+                        "put": {"description": format!("update {}", kind)},
+                        "delete": {"description": format!("delete {}", kind)}
+                    }),
+                );
+            }
+        }
+    }
+
+    // Add standard K8s definitions referenced by CRD schemas.
+    // CRD schemas use $ref to io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+    // so it must exist in the definitions section.
+    // K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
+    definitions.insert(
+        "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta".to_string(),
+        serde_json::json!({
+            "description": "ObjectMeta is metadata that all persisted resources must have, which includes all objects users must create.",
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Name must be unique within a namespace." },
+                "namespace": { "type": "string", "description": "Namespace defines the space within which each name must be unique." },
+                "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Map of string keys and values that can be used to organize and categorize objects." },
+                "annotations": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Annotations is an unstructured key value map stored with a resource." },
+                "uid": { "type": "string", "description": "UID is the unique in time and space value for this object." },
+                "resourceVersion": { "type": "string", "description": "An opaque value that represents the internal version of this object." },
+                "generation": { "type": "integer", "format": "int64", "description": "A sequence number representing a specific generation of the desired state." },
+                "creationTimestamp": { "type": "string", "format": "date-time", "description": "CreationTimestamp is a timestamp representing the server time when this object was created." },
+                "deletionTimestamp": { "type": "string", "format": "date-time", "description": "DeletionTimestamp is RFC 3339 date and time at which this resource will be deleted." },
+                "deletionGracePeriodSeconds": { "type": "integer", "format": "int64", "description": "Number of seconds allowed for this object to gracefully terminate." },
+                "ownerReferences": { "type": "array", "items": { "$ref": "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference" } },
+                "finalizers": { "type": "array", "items": { "type": "string" } },
+                "managedFields": { "type": "array", "items": { "type": "object" } }
+            }
+        }),
+    );
+    definitions.insert(
+        "io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference".to_string(),
+        serde_json::json!({
+            "description": "OwnerReference contains enough information to let you identify an owning object.",
+            "type": "object",
+            "required": ["apiVersion", "kind", "name", "uid"],
+            "properties": {
+                "apiVersion": { "type": "string" },
+                "kind": { "type": "string" },
+                "name": { "type": "string" },
+                "uid": { "type": "string" },
+                "controller": { "type": "boolean" },
+                "blockOwnerDeletion": { "type": "boolean" }
+            }
+        }),
+    );
+
+    serde_json::json!({
+        "swagger": "2.0",
+        "info": {
+            "title": "Rusternetes Kubernetes API",
+            "version": "v1.35.0"
+        },
+        "paths": paths,
+        "definitions": definitions
+    })
+}
+
+/// Build the per-version CRD schema definition that's inserted into the spec's
+/// definitions map. Handles the three cases that upstream kube-apiserver
+/// distinguishes:
+///   * preserveUnknownFields (CRD- or schema-level) — replace with a bare object
+///   * has openAPIV3Schema — strip Go-omitempty defaults, inject the GVK extension
+///   * no schema — emit a minimal object skeleton with the GVK extension
+///
+/// In all cases the standard metadata/apiVersion/kind properties are added,
+/// matching upstream conformance expectations:
+/// "works for CRD with validation schema" and
+/// "works for CRD without validation schema".
+fn build_crd_schema_definition(
+    crd_preserves: bool,
+    version: &serde_json::Value,
+    group: &str,
+    kind: &str,
+    ver: &str,
+) -> serde_json::Value {
+    let gvk = serde_json::json!([{
+        "group": group,
+        "kind": kind,
+        "version": ver,
+    }]);
+
+    if let Some(schema_val) = version.pointer("/schema/openAPIV3Schema") {
+        let schema_preserves = schema_val
+            .get("x-kubernetes-preserve-unknown-fields")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if crd_preserves || schema_preserves {
+            // Replace entire schema with just {type: object}.
+            // K8s ref: builder.go:393-395
+            let mut def = serde_json::json!({
+                "type": "object",
+                "x-kubernetes-group-version-kind": gvk,
+            });
+            add_standard_crd_properties(&mut def);
+            return def;
+        }
+
+        let mut cleaned = schema_val.clone();
+        strip_false_extensions(&mut cleaned);
+        if let Some(obj) = cleaned.as_object_mut() {
+            obj.insert("x-kubernetes-group-version-kind".to_string(), gvk);
+        }
+        add_standard_crd_properties(&mut cleaned);
+        return cleaned;
+    }
+
+    // No openAPIV3Schema declared. K8s still publishes a definition stub so
+    // kubectl explain / discovery sees the GVK. Conformance test
+    // "works for CRD without validation schema" depends on the definition
+    // being present.
+    let mut def = serde_json::json!({
+        "type": "object",
+        "x-kubernetes-group-version-kind": gvk,
+    });
+    add_standard_crd_properties(&mut def);
+    def
+}
+
 /// Add standard K8s properties (metadata, apiVersion, kind) to a CRD schema definition.
 /// K8s always adds these to CRD OpenAPI definitions.
 /// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
@@ -630,21 +673,24 @@ fn add_standard_crd_properties(schema: &mut serde_json::Value) {
             .entry("properties")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(props) = properties.as_object_mut() {
+            // K8s CRD definitions reference the standard ObjectMeta definition
+            // instead of inlining "type: object". This matches
+            // staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
             props.entry("metadata".to_string()).or_insert_with(|| {
                 serde_json::json!({
-                    "description": "Standard object's metadata.",
-                    "type": "object"
+                    "$ref": "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+                    "description": "Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
                 })
             });
             props.entry("apiVersion".to_string()).or_insert_with(|| {
                 serde_json::json!({
-                    "description": "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/dede/sig-architecture/api-conventions.md#resources",
+                    "description": "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
                     "type": "string"
                 })
             });
             props.entry("kind".to_string()).or_insert_with(|| {
                 serde_json::json!({
-                    "description": "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/dede/sig-architecture/api-conventions.md#types-kinds",
+                    "description": "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
                     "type": "string"
                 })
             });
@@ -726,19 +772,21 @@ fn strip_false_extensions(value: &mut serde_json::Value) {
         // IMPORTANT: For min* fields, 0 has semantic meaning (explicitly allow 0),
         // so only strip max* and multipleOf when zero.
         let zero_int_fields = [
-            "maximum", "multipleOf",
+            "maximum",
+            "minimum",
+            "multipleOf",
             "maxLength",
+            "minLength",
             "maxItems",
+            "minItems",
             "maxProperties",
+            "minProperties",
         ];
         for key in &zero_int_fields {
-            match obj.get(*key) {
-                Some(serde_json::Value::Number(n)) => {
-                    if n.as_f64() == Some(0.0) || n.as_i64() == Some(0) {
-                        obj.remove(*key);
-                    }
+            if let Some(serde_json::Value::Number(n)) = obj.get(*key) {
+                if n.as_f64() == Some(0.0) || n.as_i64() == Some(0) {
+                    obj.remove(*key);
                 }
-                _ => {}
             }
         }
 
@@ -769,10 +817,58 @@ fn strip_false_extensions(value: &mut serde_json::Value) {
             }
         }
 
-        // Empty "properties" object should be omitted
-        if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
-            if props.is_empty() {
-                obj.remove("properties");
+        // Empty objects should be omitted (Go omitempty on maps/structs)
+        let empty_obj_fields = [
+            "properties",
+            "additionalProperties",
+            "definitions",
+            "patternProperties",
+            "dependencies",
+            "externalDocs",
+        ];
+        for key in &empty_obj_fields {
+            if let Some(serde_json::Value::Object(m)) = obj.get(*key) {
+                if m.is_empty() {
+                    obj.remove(*key);
+                }
+            }
+        }
+
+        // Remove "additionalProperties": false — Go omitempty treats
+        // the zero-value JSONSchemaPropsOrBool as omitted.
+        // K8s only includes additionalProperties when it's explicitly
+        // set to a non-default value.
+        if obj.get("additionalProperties") == Some(&serde_json::Value::Bool(false)) {
+            obj.remove("additionalProperties");
+        }
+
+        // Remove "default" when it's null — Go omits nil *JSON fields
+        if obj.get("default") == Some(&serde_json::Value::Null) {
+            obj.remove("default");
+        }
+
+        // Remove "example" when it's null
+        if obj.get("example") == Some(&serde_json::Value::Null) {
+            obj.remove("example");
+        }
+
+        // Remove "x-kubernetes-list-type" and "x-kubernetes-map-type" when empty
+        for key in [
+            "x-kubernetes-list-type",
+            "x-kubernetes-map-type",
+            "x-kubernetes-list-map-keys",
+        ] {
+            match obj.get(key) {
+                Some(serde_json::Value::String(s)) if s.is_empty() => {
+                    obj.remove(key);
+                }
+                Some(serde_json::Value::Array(a)) if a.is_empty() => {
+                    obj.remove(key);
+                }
+                Some(serde_json::Value::Null) => {
+                    obj.remove(key);
+                }
+                _ => {}
             }
         }
 
@@ -1091,10 +1187,464 @@ mod tests {
             obj.remove("x-kubernetes-group-version-kind");
         }
 
-        assert_eq!(cleaned, original_schema,
+        assert_eq!(
+            cleaned,
+            original_schema,
             "Schema should match after roundtrip.\nExpected:\n{}\n\nActual:\n{}",
             serde_json::to_string_pretty(&original_schema).unwrap(),
             serde_json::to_string_pretty(&cleaned).unwrap()
+        );
+    }
+
+    /// K8s CRD schemas reference io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+    /// via $ref. kubectl validates CRs against the OpenAPI spec before sending
+    /// them to the API server. If ObjectMeta is missing from definitions,
+    /// kubectl fails with "unknown model in reference".
+    /// K8s ref: staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder/builder.go
+    #[test]
+    fn test_strip_empty_objects_and_arrays() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+            "default": null,
+            "example": null,
+            "required": [],
+            "enum": [],
+            "x-kubernetes-list-type": "",
+            "x-kubernetes-map-type": "",
+            "x-kubernetes-list-map-keys": [],
+            "definitions": {},
+            "allOf": [],
+        });
+        strip_false_extensions(&mut schema);
+
+        // All empty/null/false values should be stripped (Go omitempty)
+        let obj = schema.as_object().unwrap();
+        assert!(
+            !obj.contains_key("properties"),
+            "empty properties should be stripped"
+        );
+        assert!(
+            !obj.contains_key("additionalProperties"),
+            "false additionalProperties should be stripped"
+        );
+        assert!(
+            !obj.contains_key("default"),
+            "null default should be stripped"
+        );
+        assert!(
+            !obj.contains_key("example"),
+            "null example should be stripped"
+        );
+        assert!(
+            !obj.contains_key("required"),
+            "empty required should be stripped"
+        );
+        assert!(!obj.contains_key("enum"), "empty enum should be stripped");
+        assert!(
+            !obj.contains_key("x-kubernetes-list-type"),
+            "empty x-kubernetes-list-type should be stripped"
+        );
+        assert!(
+            !obj.contains_key("x-kubernetes-map-type"),
+            "empty x-kubernetes-map-type should be stripped"
+        );
+        assert!(
+            !obj.contains_key("x-kubernetes-list-map-keys"),
+            "empty x-kubernetes-list-map-keys should be stripped"
+        );
+        assert!(
+            !obj.contains_key("definitions"),
+            "empty definitions should be stripped"
+        );
+        assert!(!obj.contains_key("allOf"), "empty allOf should be stripped");
+        // type: "object" should be kept (non-empty)
+        assert!(obj.contains_key("type"), "non-empty type should be kept");
+    }
+
+    // -- CRD OpenAPI publish-on-update tests ------------------------------
+    //
+    // These cover upstream Kubernetes v1.35 conformance expectations:
+    //   [Conformance] CustomResourceDefinition resources publish openAPI ...
+    //   - works for CRD with validation schema
+    //   - works for CRD without validation schema
+    //   - removes definition from spec when one version gets changed to not be served
+    //   - updates the published spec when one version gets renamed
+    //   - works for multiple CRDs of same group but different versions
+    //
+    // We exercise `build_swagger_spec_for_crds` directly (the helper that
+    // the live /openapi/v2 handler delegates to). That guarantees the spec
+    // reflects the latest CRD set whenever it's regenerated, which the
+    // production handler does on every request.
+
+    fn crd_with_schema(
+        name: &str,
+        group: &str,
+        plural: &str,
+        kind: &str,
+        versions: Vec<(&str, bool, Option<serde_json::Value>)>,
+    ) -> serde_json::Value {
+        let versions_json: Vec<serde_json::Value> = versions
+            .into_iter()
+            .map(|(ver, served, schema)| {
+                let mut v = serde_json::json!({
+                    "name": ver,
+                    "served": served,
+                    "storage": false,
+                });
+                if let Some(s) = schema {
+                    v["schema"] = serde_json::json!({ "openAPIV3Schema": s });
+                }
+                v
+            })
+            .collect();
+        serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": name },
+            "spec": {
+                "group": group,
+                "names": { "plural": plural, "kind": kind },
+                "scope": "Namespaced",
+                "versions": versions_json,
+            }
+        })
+    }
+
+    fn def_key(group: &str, ver: &str, kind: &str) -> String {
+        let group_parts: Vec<&str> = group.rsplitn(10, '.').collect();
+        format!("{}.{}.{}", group_parts.join("."), ver, kind)
+    }
+
+    #[test]
+    fn test_publish_crd_with_validation_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "bars": {
+                            "type": "array",
+                            "items": { "type": "object" }
+                        }
+                    }
+                }
+            }
+        });
+        let crd = crd_with_schema(
+            "foos.test.example.com",
+            "test.example.com",
+            "foos",
+            "Foo",
+            vec![("v1", true, Some(schema.clone()))],
+        );
+
+        let spec = build_swagger_spec_for_crds(&[crd]);
+        let key = def_key("test.example.com", "v1", "Foo");
+        let def = spec
+            .pointer(&format!("/definitions/{}", key))
+            .expect("CRD definition must be published");
+
+        // GVK extension must be present with the right values.
+        let gvk = def
+            .get("x-kubernetes-group-version-kind")
+            .and_then(|v| v.as_array())
+            .expect("GVK extension must be an array");
+        assert_eq!(gvk.len(), 1);
+        assert_eq!(gvk[0]["group"], "test.example.com");
+        assert_eq!(gvk[0]["kind"], "Foo");
+        assert_eq!(gvk[0]["version"], "v1");
+
+        // Standard K8s metadata/apiVersion/kind properties must be auto-added.
+        let props = def
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties must exist");
+        assert!(props.contains_key("metadata"));
+        assert!(props.contains_key("apiVersion"));
+        assert!(props.contains_key("kind"));
+        // The user-supplied spec property must still be present.
+        assert!(props.contains_key("spec"));
+    }
+
+    #[test]
+    fn test_publish_crd_without_validation_schema() {
+        // Upstream conformance: a CRD with no openAPIV3Schema must still get
+        // a definition stub so kubectl explain & discovery clients see the
+        // GVK. We emit {type: object} + GVK + the standard properties.
+        let crd = crd_with_schema(
+            "bars.test.example.com",
+            "test.example.com",
+            "bars",
+            "Bar",
+            vec![("v1", true, None)],
+        );
+
+        let spec = build_swagger_spec_for_crds(&[crd]);
+        let key = def_key("test.example.com", "v1", "Bar");
+        let def = spec
+            .pointer(&format!("/definitions/{}", key))
+            .expect("a definition must be published even without a schema");
+
+        assert_eq!(def["type"], "object");
+        let gvk = def
+            .get("x-kubernetes-group-version-kind")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(gvk[0]["kind"], "Bar");
+        let props = def["properties"].as_object().unwrap();
+        assert!(props.contains_key("metadata"));
+        assert!(props.contains_key("apiVersion"));
+        assert!(props.contains_key("kind"));
+    }
+
+    #[test]
+    fn test_published_spec_refreshes_on_crd_update() {
+        // First publish with schema A — then with schema B. The spec must
+        // reflect the latest schema. This is the core of the upstream
+        // "[Conformance] updates an existing CustomResourceDefinition's
+        // published OpenAPI schema" check.
+        let schema_a = serde_json::json!({
+            "type": "object",
+            "properties": { "color": { "type": "string" } }
+        });
+        let schema_b = serde_json::json!({
+            "type": "object",
+            "properties": { "size": { "type": "integer" } }
+        });
+
+        let crd_v1 = crd_with_schema(
+            "widgets.test.example.com",
+            "test.example.com",
+            "widgets",
+            "Widget",
+            vec![("v1", true, Some(schema_a))],
+        );
+        let spec1 = build_swagger_spec_for_crds(&[crd_v1]);
+        let key = def_key("test.example.com", "v1", "Widget");
+        let props1 = spec1
+            .pointer(&format!("/definitions/{}/properties", key))
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(props1.contains_key("color"));
+        assert!(!props1.contains_key("size"));
+
+        let crd_v2 = crd_with_schema(
+            "widgets.test.example.com",
+            "test.example.com",
+            "widgets",
+            "Widget",
+            vec![("v1", true, Some(schema_b))],
+        );
+        let spec2 = build_swagger_spec_for_crds(&[crd_v2]);
+        let props2 = spec2
+            .pointer(&format!("/definitions/{}/properties", key))
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(
+            props2.contains_key("size"),
+            "updated schema must publish new property"
+        );
+        assert!(
+            !props2.contains_key("color"),
+            "stale schema property must be dropped after update"
+        );
+    }
+
+    #[test]
+    fn test_removes_definition_when_version_no_longer_served() {
+        // Upstream: "removes definition from spec when one version gets
+        // changed to not be served". Toggling served=false must drop the
+        // corresponding definition from the published spec.
+        let schema = serde_json::json!({"type": "object"});
+        let initial = crd_with_schema(
+            "zwidgets.test.example.com",
+            "test.example.com",
+            "zwidgets",
+            "Zwidget",
+            vec![
+                ("v1beta1", true, Some(schema.clone())),
+                ("v1", true, Some(schema.clone())),
+            ],
+        );
+        let spec_initial = build_swagger_spec_for_crds(&[initial]);
+        let beta_key = def_key("test.example.com", "v1beta1", "Zwidget");
+        let v1_key = def_key("test.example.com", "v1", "Zwidget");
+        assert!(spec_initial
+            .pointer(&format!("/definitions/{}", beta_key))
+            .is_some());
+        assert!(spec_initial
+            .pointer(&format!("/definitions/{}", v1_key))
+            .is_some());
+
+        // Now v1beta1 is no longer served.
+        let updated = crd_with_schema(
+            "zwidgets.test.example.com",
+            "test.example.com",
+            "zwidgets",
+            "Zwidget",
+            vec![
+                ("v1beta1", false, Some(schema.clone())),
+                ("v1", true, Some(schema)),
+            ],
+        );
+        let spec_updated = build_swagger_spec_for_crds(&[updated]);
+        assert!(
+            spec_updated
+                .pointer(&format!("/definitions/{}", beta_key))
+                .is_none(),
+            "unserved version must be removed from the published spec"
+        );
+        assert!(
+            spec_updated
+                .pointer(&format!("/definitions/{}", v1_key))
+                .is_some(),
+            "served version must remain in the published spec"
+        );
+    }
+
+    #[test]
+    fn test_updates_published_spec_when_version_gets_renamed() {
+        // Upstream: "updates the published spec when one version gets
+        // renamed". Replacing v1beta1 with v2 must drop the old definition
+        // key and add the new one.
+        let schema = serde_json::json!({"type": "object"});
+        let before = crd_with_schema(
+            "gadgets.test.example.com",
+            "test.example.com",
+            "gadgets",
+            "Gadget",
+            vec![("v1beta1", true, Some(schema.clone()))],
+        );
+        let key_before = def_key("test.example.com", "v1beta1", "Gadget");
+        let spec_before = build_swagger_spec_for_crds(&[before]);
+        assert!(spec_before
+            .pointer(&format!("/definitions/{}", key_before))
+            .is_some());
+
+        let after = crd_with_schema(
+            "gadgets.test.example.com",
+            "test.example.com",
+            "gadgets",
+            "Gadget",
+            vec![("v2", true, Some(schema))],
+        );
+        let key_after = def_key("test.example.com", "v2", "Gadget");
+        let spec_after = build_swagger_spec_for_crds(&[after]);
+        assert!(
+            spec_after
+                .pointer(&format!("/definitions/{}", key_after))
+                .is_some(),
+            "renamed version must appear in the spec"
+        );
+        assert!(
+            spec_after
+                .pointer(&format!("/definitions/{}", key_before))
+                .is_none(),
+            "stale version key must be removed when CRD is renamed"
+        );
+    }
+
+    #[test]
+    fn test_deletion_removes_published_definition() {
+        // Deleting a CRD must drop its definitions from the spec.
+        let crd = crd_with_schema(
+            "doomeds.test.example.com",
+            "test.example.com",
+            "doomeds",
+            "Doomed",
+            vec![("v1", true, Some(serde_json::json!({"type": "object"})))],
+        );
+        let key = def_key("test.example.com", "v1", "Doomed");
+        let spec_with = build_swagger_spec_for_crds(&[crd]);
+        assert!(spec_with
+            .pointer(&format!("/definitions/{}", key))
+            .is_some());
+
+        // Simulate post-deletion (no CRDs).
+        let spec_without: serde_json::Value = build_swagger_spec_for_crds(&[]);
+        assert!(
+            spec_without
+                .pointer(&format!("/definitions/{}", key))
+                .is_none(),
+            "deleted CRD must not leak into the published spec"
+        );
+        // Baseline definitions are still present.
+        assert!(spec_without
+            .pointer("/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta")
+            .is_some());
+    }
+
+    #[test]
+    fn test_publishes_multiple_crds_same_group_different_versions() {
+        // Upstream: "works for multiple CRDs of same group but different
+        // versions". Each served version yields its own definition keyed by
+        // group/version/kind.
+        let schema = serde_json::json!({"type": "object"});
+        let crd_one = crd_with_schema(
+            "alphas.example.com",
+            "example.com",
+            "alphas",
+            "Alpha",
+            vec![("v1", true, Some(schema.clone()))],
+        );
+        let crd_two = crd_with_schema(
+            "betas.example.com",
+            "example.com",
+            "betas",
+            "Beta",
+            vec![("v2", true, Some(schema))],
+        );
+        let spec = build_swagger_spec_for_crds(&[crd_one, crd_two]);
+        assert!(spec
+            .pointer(&format!(
+                "/definitions/{}",
+                def_key("example.com", "v1", "Alpha")
+            ))
+            .is_some());
+        assert!(spec
+            .pointer(&format!(
+                "/definitions/{}",
+                def_key("example.com", "v2", "Beta")
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn test_preserve_unknown_fields_collapses_definition() {
+        // CRD-level preserveUnknownFields=true must collapse the schema to a
+        // bare {type: object} (with GVK + standard properties), preventing
+        // kubectl from rejecting unknown fields during client-side validation.
+        let mut crd = crd_with_schema(
+            "freeforms.example.com",
+            "example.com",
+            "freeforms",
+            "FreeForm",
+            vec![(
+                "v1",
+                true,
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "anything": { "type": "string" } }
+                })),
+            )],
+        );
+        crd["spec"]["preserveUnknownFields"] = serde_json::Value::Bool(true);
+
+        let spec = build_swagger_spec_for_crds(&[crd]);
+        let key = def_key("example.com", "v1", "FreeForm");
+        let def = spec.pointer(&format!("/definitions/{}", key)).unwrap();
+        // preserveUnknownFields collapses to bare object; the user "anything"
+        // property must NOT appear.
+        let props = def["properties"].as_object().unwrap();
+        assert!(props.contains_key("metadata"));
+        assert!(props.contains_key("apiVersion"));
+        assert!(props.contains_key("kind"));
+        assert!(
+            !props.contains_key("anything"),
+            "preserveUnknownFields must drop user-defined properties to bare object"
         );
     }
 }

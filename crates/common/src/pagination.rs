@@ -101,13 +101,13 @@ pub fn paginate<T>(
             // K8s uses resourceVersion consistency, not item count comparison.
             // Item count can change between pages (controllers creating resources)
             // without invalidating the pagination — items are sorted by key.
-            (cont.created_at > 0 && {
+            cont.created_at > 0 && {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 now.saturating_sub(cont.created_at) > 300
-            });
+            };
 
         if is_stale {
             // Generate a fresh continue token starting from the same offset

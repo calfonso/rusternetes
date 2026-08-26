@@ -26,6 +26,35 @@ fn allocate_node_port() -> u16 {
     30000 + (seed % 2768) as u16
 }
 
+/// Apply K8s session-affinity defaulting to a service spec.
+///
+/// - When sessionAffinity == "ClientIP" and timeoutSeconds is unset, default
+///   it to 10800 (3 hours).
+/// - When sessionAffinity != "ClientIP" (e.g. "None") the affinity config
+///   must be cleared. Callers may opt into this clearing for the update path.
+///
+/// K8s ref: pkg/apis/core/v1/defaults.go SetDefaults_Service
+fn apply_session_affinity_defaults(
+    spec: &mut rusternetes_common::resources::ServiceSpec,
+    clear_when_none: bool,
+) {
+    if spec.session_affinity.as_deref() == Some("ClientIP") {
+        let cfg = spec.session_affinity_config.get_or_insert(
+            rusternetes_common::resources::SessionAffinityConfig { client_ip: None },
+        );
+        let client_ip =
+            cfg.client_ip
+                .get_or_insert(rusternetes_common::resources::ClientIPConfig {
+                    timeout_seconds: None,
+                });
+        if client_ip.timeout_seconds.is_none() {
+            client_ip.timeout_seconds = Some(10800);
+        }
+    } else if clear_when_none {
+        spec.session_affinity_config = None;
+    }
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -68,6 +97,8 @@ pub async fn create(
         service.spec.session_affinity = Some("None".to_string());
     }
 
+    apply_session_affinity_defaults(&mut service.spec, false);
+
     // Default target_port to port value if not set
     for port in &mut service.spec.ports {
         if port.target_port.is_none() {
@@ -83,16 +114,16 @@ pub async fn create(
 
     // Default internalTrafficPolicy to "Cluster" for ClusterIP/NodePort/LoadBalancer
     // K8s ref: pkg/apis/core/v1/defaults.go:141-146
-    if service.spec.internal_traffic_policy.is_none() {
-        if matches!(
+    if service.spec.internal_traffic_policy.is_none()
+        && matches!(
             service.spec.service_type,
             Some(ServiceType::ClusterIP)
                 | Some(ServiceType::NodePort)
                 | Some(ServiceType::LoadBalancer)
-        ) {
-            service.spec.internal_traffic_policy =
-                Some(rusternetes_common::resources::ServiceInternalTrafficPolicy::Cluster);
-        }
+        )
+    {
+        service.spec.internal_traffic_policy =
+            Some(rusternetes_common::resources::ServiceInternalTrafficPolicy::Cluster);
     }
 
     // Default ip_families and ip_family_policy for non-ExternalName services
@@ -380,6 +411,15 @@ pub async fn update(
     service.metadata.name = name.clone();
     service.metadata.namespace = Some(namespace.clone());
 
+    // Default sessionAffinity to "None" if not set (mirrors create handler).
+    if service.spec.session_affinity.is_none() {
+        service.spec.session_affinity = Some("None".to_string());
+    }
+
+    // Clear the affinity config when affinity is set to "None" on update so
+    // the stored object matches the K8s API contract.
+    apply_session_affinity_defaults(&mut service.spec, true);
+
     // When service type changes to ExternalName, clear ClusterIP and NodePorts
     if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
         service.spec.cluster_ip = Some("".to_string());
@@ -395,7 +435,7 @@ pub async fn update(
             .spec
             .cluster_ip
             .as_ref()
-            .map_or(true, |ip| ip.is_empty());
+            .is_none_or(|ip| ip.is_empty());
         if needs_ip {
             if let Some(ip) = state.ip_allocator.allocate() {
                 service.spec.cluster_ip = Some(ip.clone());
@@ -556,7 +596,10 @@ pub async fn list(
     }
     crate::handlers::filtering::apply_selectors(&mut services, &params_map)?;
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -618,7 +661,10 @@ pub async fn list_all_services(
     }
     crate::handlers::filtering::apply_selectors(&mut services, &params_map)?;
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -679,7 +725,7 @@ pub async fn patch(
             .spec
             .cluster_ip
             .as_ref()
-            .map_or(true, |ip| ip.is_empty());
+            .is_none_or(|ip| ip.is_empty());
         if needs_ip {
             if let Some(ip) = state.ip_allocator.allocate() {
                 service.spec.cluster_ip = Some(ip.clone());

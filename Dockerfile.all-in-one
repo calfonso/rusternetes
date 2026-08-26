@@ -1,0 +1,73 @@
+# Dockerfile for the all-in-one rusternetes binary.
+#
+# Cargo fetches the rhino crate from git automatically — no adjacent
+# clone required.
+#
+# Build args:
+#   CARGO_FEATURES — cargo features to enable (default: "sqlite")
+#                    use "redis" for Redis backend, "sqlite,redis" for both
+#
+# Usage (from compose):
+#   build:
+#     context: .
+#     dockerfile: Dockerfile.all-in-one
+#     args:
+#       CARGO_FEATURES: redis
+
+# Stage 1: Build the console SPA
+FROM node:26-slim AS console-builder
+WORKDIR /console
+COPY console/package.json console/package-lock.json* ./
+RUN npm ci --ignore-scripts
+COPY console/ ./
+RUN npm run build
+
+# Stage 2: Build the Rust binary
+FROM rust:latest AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace manifest
+COPY Cargo.toml Cargo.lock* ./
+
+# Copy all crate manifests for layer caching
+COPY crates/rusternetes/Cargo.toml ./crates/rusternetes/
+COPY crates/api-server/Cargo.toml ./crates/api-server/
+COPY crates/common/Cargo.toml ./crates/common/
+COPY crates/storage/Cargo.toml ./crates/storage/
+COPY crates/scheduler/Cargo.toml ./crates/scheduler/
+COPY crates/controller-manager/Cargo.toml ./crates/controller-manager/
+COPY crates/kubelet/Cargo.toml ./crates/kubelet/
+COPY crates/kube-proxy/Cargo.toml ./crates/kube-proxy/
+COPY crates/kubectl/Cargo.toml ./crates/kubectl/
+
+# Copy all source code
+COPY crates ./crates
+
+# Build the all-in-one binary
+ARG CARGO_FEATURES=sqlite
+RUN cargo build --release --features ${CARGO_FEATURES} -p rusternetes
+
+# Stage 3: Runtime image
+FROM debian:sid-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/rusternetes /app/rusternetes
+COPY --from=console-builder /console/dist /app/console
+
+EXPOSE 6443 10250
+
+ENTRYPOINT ["/app/rusternetes"]
+CMD ["--storage-backend", "sqlite", "--tls", "--console-dir", "/app/console"]

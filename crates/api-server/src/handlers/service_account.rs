@@ -281,8 +281,8 @@ pub async fn list(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -345,8 +345,8 @@ pub async fn list_all_serviceaccounts(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -453,9 +453,10 @@ pub async fn deletecollection_serviceaccounts(
 }
 
 /// Create a token for a service account (TokenRequest API)
+#[allow(dead_code)]
 pub async fn create_token(
     State(state): State<Arc<ApiServerState>>,
-    Extension(auth_ctx): Extension<AuthContext>,
+    Extension(_auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
@@ -509,12 +510,12 @@ pub async fn create_token(
         "metadata": {
             "name": name,
             "namespace": namespace,
-            "creationTimestamp": chrono::Utc::now().to_rfc3339(),
+            "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
         },
         "spec": body.get("spec").cloned().unwrap_or(serde_json::json!({})),
         "status": {
             "token": token,
-            "expirationTimestamp": expiration_time.to_rfc3339(),
+            "expirationTimestamp": rusternetes_common::time::k8s_time::format(&expiration_time),
         }
     });
 

@@ -44,6 +44,28 @@ mkdir -p "$CERT_DIR"
 # Generate private key
 openssl ecparam -name prime256v1 -genkey -noout -out "$KEY_FILE"
 
+# Detect container runtime and get network subnet
+# Try podman first, then docker
+CONTAINER_RT=""
+NETWORK_SUBNET=""
+NETWORK_GATEWAY=""
+
+if command -v podman &>/dev/null && podman network inspect rusternetes-network &>/dev/null 2>&1; then
+    CONTAINER_RT="podman"
+    NETWORK_SUBNET=$(podman network inspect rusternetes-network 2>/dev/null | jq -r '.[0].subnets[0].subnet // empty')
+    NETWORK_GATEWAY=$(podman network inspect rusternetes-network 2>/dev/null | jq -r '.[0].subnets[0].gateway // empty')
+elif command -v docker &>/dev/null && docker network inspect rusternetes-network &>/dev/null 2>&1; then
+    CONTAINER_RT="docker"
+    NETWORK_SUBNET=$(docker network inspect rusternetes-network 2>/dev/null | jq -r '.[0].IPAM.Config[0].Subnet // empty')
+    NETWORK_GATEWAY=$(docker network inspect rusternetes-network 2>/dev/null | jq -r '.[0].IPAM.Config[0].Gateway // empty')
+fi
+
+# Extract base IP from gateway (e.g., 10.89.0.1 -> 10.89.0)
+BASE_IP=""
+if [ -n "$NETWORK_GATEWAY" ]; then
+    BASE_IP=$(echo "$NETWORK_GATEWAY" | sed 's/\.[0-9]*$//')
+fi
+
 # Create certificate configuration
 cat > "${CERT_DIR}/cert.conf" <<EOF
 [req]
@@ -73,6 +95,17 @@ DNS.7 = kubernetes.default.svc.cluster.local
 IP.1 = 127.0.0.1
 IP.2 = 10.96.0.1
 EOF
+
+# Add container network IPs to certificate SANs
+# Include gateway + first 10 IPs to cover typical pod IP assignments
+if [ -n "$BASE_IP" ]; then
+    echo "# Container network: $CONTAINER_RT ($NETWORK_SUBNET)" >> "${CERT_DIR}/cert.conf"
+    IP_INDEX=3
+    for i in {1..10}; do
+        echo "IP.$IP_INDEX = ${BASE_IP}.${i}" >> "${CERT_DIR}/cert.conf"
+        IP_INDEX=$((IP_INDEX + 1))
+    done
+fi
 
 # Generate self-signed certificate (valid for 10 years, matching the Rust implementation)
 openssl req -new -x509 \

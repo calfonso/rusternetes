@@ -2,7 +2,6 @@
 //!
 //! Tests watch streams, bookmarks, timeouts, and resource version handling
 
-use axum::http::StatusCode;
 use futures::StreamExt;
 use rusternetes_common::resources::namespace::{Namespace, NamespaceSpec, NamespaceStatus};
 use rusternetes_common::resources::{
@@ -18,6 +17,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 // Helper to parse watch stream response
+#[allow(dead_code)]
 async fn parse_watch_events<T: DeserializeOwned>(body: &str) -> Vec<(String, T)> {
     let mut events = Vec::new();
     for line in body.lines() {
@@ -387,13 +387,8 @@ async fn test_watch_multiple_resources() {
     // Verify we get 5 ADDED events
     let mut count = 0;
     for _ in 0..5 {
-        if let Some(Ok(event)) = watch_stream.next().await {
-            match event {
-                rusternetes_storage::WatchEvent::Added(_, _) => {
-                    count += 1;
-                }
-                _ => {}
-            }
+        if let Some(Ok(rusternetes_storage::WatchEvent::Added(_, _))) = watch_stream.next().await {
+            count += 1;
         }
     }
     assert_eq!(count, 5);
@@ -696,7 +691,7 @@ async fn test_watch_stream_disconnection() {
     storage.create(&key2, &pod2).await.unwrap();
 
     // Start new watch - should get current state
-    let new_watch_stream = storage.watch(&prefix).await.unwrap();
+    let _new_watch_stream = storage.watch(&prefix).await.unwrap();
     // In a real implementation, we'd verify we get initial state
 
     // Cleanup
@@ -787,7 +782,7 @@ async fn test_watch_event_ordering() {
     storage.delete(&key).await.unwrap();
 
     // Verify event order: Added -> Modified -> Deleted
-    let events = vec![
+    let events = [
         watch_stream.next().await,
         watch_stream.next().await,
         watch_stream.next().await,

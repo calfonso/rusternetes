@@ -406,7 +406,7 @@ fn check_pod_security(pod: &Pod, level: &PodSecurityLevel) -> Result<(), Vec<Str
                             if caps
                                 .drop
                                 .as_ref()
-                                .map_or(true, |d| !d.contains(&"ALL".to_string()))
+                                .is_none_or(|d| !d.contains(&"ALL".to_string()))
                             {
                                 violations.push(format!(
                                     "Container '{}' must drop ALL capabilities",

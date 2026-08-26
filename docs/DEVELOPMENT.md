@@ -5,6 +5,10 @@ How to build, test, and run Rusternetes locally.
 ## Prerequisites
 
 - **Rust** (latest stable, via [rustup](https://rustup.rs))
+- **Protocol Buffers compiler** — required for building the API server
+  - Fedora/RHEL: `sudo dnf install -y protobuf-compiler protobuf-devel`
+  - Debian/Ubuntu: `sudo apt install -y protobuf-compiler`
+  - macOS: `brew install protobuf`
 - **Container runtime** — Docker or Podman (see [Container Runtime Setup](#container-runtime-setup) below)
 - **Compose tool** — `docker-compose` and/or `podman-compose` for orchestrating the cluster
 
@@ -24,7 +28,7 @@ Rusternetes is a Cargo workspace with 10 crates (216,000+ lines of Rust, 3,100+ 
 |-------|---------|
 | `crates/common` | Shared resource types (Pod, Service, Deployment, etc.), errors, utilities |
 | `crates/api-server` | Axum-based REST API with 75+ handler files and router.rs |
-| `crates/storage` | Pluggable storage: etcd, SQLite (rhino), and in-memory backends |
+| `crates/storage` | Pluggable storage: etcd, SQLite/Redis (rhino), and in-memory backends |
 | `crates/controller-manager` | 31 reconciliation controllers |
 | `crates/kubelet` | Node agent, Docker container runtime via bollard |
 | `crates/kube-proxy` | iptables-based service routing (host network mode) |

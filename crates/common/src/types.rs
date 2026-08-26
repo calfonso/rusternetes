@@ -14,6 +14,7 @@ where
 /// ObjectMeta is metadata that all persisted resources must have
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct ObjectMeta {
     /// Name must be unique within a namespace
     #[serde(default, deserialize_with = "deserialize_null_string")]
@@ -45,11 +46,21 @@ pub struct ObjectMeta {
     pub managed_fields: Option<Vec<ManagedFieldsEntry>>,
 
     /// CreationTimestamp is the creation time
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub creation_timestamp: Option<DateTime<Utc>>,
 
     /// DeletionTimestamp is the time when the resource will be deleted
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub deletion_timestamp: Option<DateTime<Utc>>,
 
     /// DeletionGracePeriodSeconds is the number of seconds before the object should be deleted
@@ -75,27 +86,6 @@ pub struct ObjectMeta {
 
 fn generate_uid() -> String {
     String::new()
-}
-
-impl Default for ObjectMeta {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            generate_name: None,
-            namespace: None,
-            uid: String::new(),
-            generation: None,
-            resource_version: None,
-            managed_fields: None,
-            creation_timestamp: None,
-            deletion_timestamp: None,
-            deletion_grace_period_seconds: None,
-            labels: None,
-            annotations: None,
-            finalizers: None,
-            owner_references: None,
-        }
-    }
 }
 
 impl ObjectMeta {
@@ -197,7 +187,7 @@ impl ObjectMeta {
 
     /// Check if the object has any finalizers
     pub fn has_finalizers(&self) -> bool {
-        self.finalizers.as_ref().map_or(false, |f| !f.is_empty())
+        self.finalizers.as_ref().is_some_and(|f| !f.is_empty())
     }
 }
 
@@ -215,12 +205,21 @@ pub struct TypeMeta {
 }
 
 /// Resource status phase
+///
+/// `Unknown` carries `#[serde(alias = "")]` because kubectl / client-go send
+/// `status: { phase: "" }` on CREATE for resources where the server assigns
+/// the phase (namespace, pod, etc.). Upstream Kubernetes accepts the empty
+/// string and overwrites it; without this alias `Option<Phase>` rejects the
+/// empty inner string and the api-server returns 422 before any handler
+/// runs, breaking every kubectl-driven CREATE including the one hydrophone
+/// + sonobuoy issue to bootstrap their test namespace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Phase {
     Pending,
     Running,
     Succeeded,
     Failed,
+    #[serde(alias = "")]
     Unknown,
     Active,
     Terminating,
@@ -246,14 +245,107 @@ pub struct LabelSelectorRequirement {
     pub values: Option<Vec<String>>,
 }
 
+/// Tolerant deserializer for `HashMap<String, String>` maps whose
+/// values represent Kubernetes `resource.Quantity` wire-form values.
+///
+/// Upstream `Quantity` round-trips as a JSON string (`"100m"`, `"1Gi"`),
+/// but the Go marshaller routes values through `inf.Dec` and several
+/// code paths emit a bare JSON number rather than a quoted string —
+/// notably zero-valued quantities defaulted from `int64` fields, and
+/// some legacy clients. K8s' Go deserialiser tolerates all three forms
+/// (`UnmarshalJSON` in `pkg/api/resource/quantity.go`).
+///
+/// Our previous plain `HashMap<String, String>` deserialiser rejected
+/// every pod-update body that carried a numeric `0` in
+/// `containers[*].resources.{requests,limits}` (column 942 of the
+/// canonical service-account-injected pod body). This function accepts
+/// `String`, integer, and float JSON values and renders each into the
+/// canonical string form so existing string-typed maps round-trip
+/// without forcing every caller to switch to a newtype.
+pub fn deserialize_quantity_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct OuterVisitor;
+    impl<'de> Visitor<'de> for OuterVisitor {
+        type Value = Option<HashMap<String, String>>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("null or a map<string, Quantity>")
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2>(self, d: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            d.deserialize_map(InnerVisitor).map(Some)
+        }
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            InnerVisitor.visit_map(map).map(Some)
+        }
+    }
+
+    struct InnerVisitor;
+    impl<'de> Visitor<'de> for InnerVisitor {
+        type Value = HashMap<String, String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map<string, Quantity>")
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = HashMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let v: serde_json::Value = map.next_value()?;
+                let s = match v {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Null => continue,
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "Quantity value must be a string or number, got {}",
+                            other
+                        )));
+                    }
+                };
+                out.insert(key, s);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_option(OuterVisitor)
+}
+
 /// Resource requirements for compute resources
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRequirements {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_quantity_map"
+    )]
     pub limits: Option<HashMap<String, String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_quantity_map"
+    )]
     pub requests: Option<HashMap<String, String>>,
 
     /// Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container
@@ -461,7 +553,12 @@ pub struct Condition {
     pub observed_generation: Option<i64>,
 
     /// LastTransitionTime is the last time the condition transitioned from one status to another
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<DateTime<Utc>>,
 
     /// Reason contains a programmatic identifier indicating the reason for the condition's last transition
@@ -635,7 +732,12 @@ pub struct ManagedFieldsEntry {
     pub api_version: Option<String>,
 
     /// Time is the timestamp of when the ManagedFields entry was added
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub time: Option<DateTime<Utc>>,
 
     /// FieldsType is the discriminator for the different fields format
@@ -778,28 +880,76 @@ mod tests {
     }
 
     #[test]
-    fn test_creation_timestamp_nanosecond_preservation() {
+    fn test_creation_timestamp_round_trip_is_stable() {
         use chrono::{DateTime, Utc};
-        // K8s client sends nanosecond-precision timestamps
-        let ts_str = "2026-03-29T21:05:27.270173921Z";
-        let ts: DateTime<Utc> = ts_str.parse().unwrap();
+        // A client may send a sub-second timestamp; it must be accepted.
+        let ts: DateTime<Utc> = "2026-03-29T21:05:27.270173921Z".parse().unwrap();
         let meta = ObjectMeta {
             name: "test".to_string(),
             creation_timestamp: Some(ts),
             ..Default::default()
         };
-        // Serialize (as our API server does when writing to etcd)
+
+        // Serialize (as our API server does when writing to etcd). `metav1.Time`
+        // is whole seconds, which is the precision client-go keeps: emitting more
+        // makes a client's round-trip differ from what the server holds.
         let json = serde_json::to_string(&meta).unwrap();
-        // The timestamp should contain fractional seconds
         assert!(
-            json.contains(".270173921") || json.contains(".27017392"),
-            "Timestamp should preserve sub-second precision: {}",
+            json.contains("\"creationTimestamp\":\"2026-03-29T21:05:27Z\""),
+            "Timestamp should serialize at second precision: {}",
             json
         );
-        // Deserialize (as our API server does when reading from etcd)
+
+        // Deserialize (as our API server does when reading from etcd), then
+        // re-serialize (as it does when responding to a client).
         let meta2: ObjectMeta = serde_json::from_str(&json).unwrap();
-        // Re-serialize (as our API server does when responding to client)
         let json2 = serde_json::to_string(&meta2).unwrap();
         assert_eq!(json, json2, "Timestamp should survive round-trip");
+    }
+
+    /// Regression: kubectl / client-go send `status: { phase: "" }` on CREATE
+    /// for namespace/pod/etc. — server is meant to assign the phase. Without
+    /// `#[serde(alias = "")]` on `Phase::Unknown` the api-server returned 422
+    /// before any handler ran and `kubectl create ns <X>` was uniformly broken,
+    /// taking hydrophone + sonobuoy down with it.
+    #[test]
+    fn phase_accepts_empty_string_on_input() {
+        let p: Phase = serde_json::from_str(r#""""#).unwrap();
+        assert_eq!(p, Phase::Unknown);
+    }
+
+    #[test]
+    fn phase_named_variants_still_deserialize() {
+        for (input, expected) in [
+            (r#""Pending""#, Phase::Pending),
+            (r#""Running""#, Phase::Running),
+            (r#""Active""#, Phase::Active),
+            (r#""Terminating""#, Phase::Terminating),
+            (r#""Unknown""#, Phase::Unknown),
+        ] {
+            let parsed: Phase = serde_json::from_str(input).unwrap();
+            assert_eq!(
+                parsed, expected,
+                "input {} should yield {:?}",
+                input, expected
+            );
+        }
+    }
+
+    /// Output wire format must NOT change: `Phase::Unknown` still serializes as
+    /// `"Unknown"`, not the empty string. The alias is an input-only synonym so
+    /// upstream-shape persistence is preserved.
+    #[test]
+    fn phase_unknown_serializes_as_unknown_not_empty() {
+        let json = serde_json::to_string(&Phase::Unknown).unwrap();
+        assert_eq!(json, r#""Unknown""#);
+    }
+
+    /// Genuinely invalid variants must still fail loudly — the alias is only
+    /// for the empty string, not a catch-all.
+    #[test]
+    fn phase_rejects_unknown_non_empty_variants() {
+        let r: Result<Phase, _> = serde_json::from_str(r#""NotAPhase""#);
+        assert!(r.is_err(), "unknown non-empty variant must error");
     }
 }

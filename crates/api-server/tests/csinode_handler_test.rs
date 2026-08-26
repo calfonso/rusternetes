@@ -390,7 +390,7 @@ async fn test_csinode_common_drivers() {
     let storage = Arc::new(MemoryStorage::new());
 
     // Test common CSI drivers
-    let drivers = vec![
+    let drivers = [
         ("ebs.csi.aws.com", "i-abc123"),
         ("efs.csi.aws.com", "i-abc123"),
         ("pd.csi.storage.gke.io", "gke-node-123"),

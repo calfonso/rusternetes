@@ -1,5 +1,7 @@
 pub mod advanced;
+#[allow(dead_code)]
 pub mod framework;
+#[allow(dead_code)]
 pub mod plugins;
 pub mod scheduler;
 

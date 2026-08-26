@@ -360,50 +360,6 @@ crate::patch_handler_namespaced!(
     "autoscaling"
 );
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::resources::{
-        CrossVersionObjectReference, HorizontalPodAutoscalerSpec, MetricSpec, MetricTarget,
-        ResourceMetricSource,
-    };
-
-    #[test]
-    fn test_hpa_handler_structure() {
-        // Basic test to ensure handler structure is correct
-        let spec = HorizontalPodAutoscalerSpec {
-            scale_target_ref: CrossVersionObjectReference {
-                kind: "Deployment".to_string(),
-                name: "test".to_string(),
-                api_version: Some("apps/v1".to_string()),
-            },
-            min_replicas: Some(1),
-            max_replicas: 10,
-            metrics: Some(vec![MetricSpec {
-                metric_type: "Resource".to_string(),
-                resource: Some(ResourceMetricSource {
-                    name: "cpu".to_string(),
-                    target: MetricTarget {
-                        target_type: "Utilization".to_string(),
-                        value: None,
-                        average_value: None,
-                        average_utilization: Some(80),
-                    },
-                }),
-                pods: None,
-                object: None,
-                external: None,
-                container_resource: None,
-            }]),
-            behavior: None,
-        };
-
-        let hpa = HorizontalPodAutoscaler::new("test-hpa", "default", spec);
-        assert_eq!(hpa.metadata.name, "test-hpa");
-        assert_eq!(hpa.metadata.namespace, Some("default".to_string()));
-    }
-}
-
 pub async fn deletecollection_horizontalpodautoscalers(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -475,4 +431,48 @@ pub async fn deletecollection_horizontalpodautoscalers(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::resources::{
+        CrossVersionObjectReference, HorizontalPodAutoscalerSpec, MetricSpec, MetricTarget,
+        ResourceMetricSource,
+    };
+
+    #[test]
+    fn test_hpa_handler_structure() {
+        // Basic test to ensure handler structure is correct
+        let spec = HorizontalPodAutoscalerSpec {
+            scale_target_ref: CrossVersionObjectReference {
+                kind: "Deployment".to_string(),
+                name: "test".to_string(),
+                api_version: Some("apps/v1".to_string()),
+            },
+            min_replicas: Some(1),
+            max_replicas: 10,
+            metrics: Some(vec![MetricSpec {
+                metric_type: "Resource".to_string(),
+                resource: Some(ResourceMetricSource {
+                    name: "cpu".to_string(),
+                    target: MetricTarget {
+                        target_type: "Utilization".to_string(),
+                        value: None,
+                        average_value: None,
+                        average_utilization: Some(80),
+                    },
+                }),
+                pods: None,
+                object: None,
+                external: None,
+                container_resource: None,
+            }]),
+            behavior: None,
+        };
+
+        let hpa = HorizontalPodAutoscaler::new("test-hpa", "default", spec);
+        assert_eq!(hpa.metadata.name, "test-hpa");
+        assert_eq!(hpa.metadata.namespace, Some("default".to_string()));
+    }
 }

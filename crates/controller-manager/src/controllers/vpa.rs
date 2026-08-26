@@ -3,7 +3,7 @@ use rusternetes_common::resources::{
     Deployment, Pod, RecommendedContainerResources, RecommendedPodResources, ReplicaSet,
     StatefulSet, VerticalPodAutoscaler, VerticalPodAutoscalerStatus,
 };
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 pub struct VerticalPodAutoscalerController<S: Storage> {
     storage: Arc<S>,
     /// Historical resource usage data: pod_key -> container_name -> usage samples
+    #[allow(clippy::type_complexity)]
     usage_history: Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, Vec<ResourceUsage>>>>>,
     /// How many samples to keep for recommendations
     history_size: usize,
@@ -28,6 +29,7 @@ pub struct VerticalPodAutoscalerController<S: Storage> {
 struct ResourceUsage {
     cpu_millicores: i64,
     memory_bytes: i64,
+    #[allow(dead_code)]
     timestamp: chrono::DateTime<chrono::Utc>,
 }
 
@@ -101,19 +103,24 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("verticalpodautoscalers", Some(ns), name);
-            match self.storage.get::<VerticalPodAutoscaler>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_vpa(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<VerticalPodAutoscaler>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_vpa(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -124,13 +131,17 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<VerticalPodAutoscaler>("/registry/verticalpodautoscalers/").await {
+        match self
+            .storage
+            .list::<VerticalPodAutoscaler>("/registry/verticalpodautoscalers/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("verticalpodautoscalers/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("verticalpodautoscalers/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -140,6 +151,7 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Reconciling all VPAs");
 
@@ -338,8 +350,8 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         &self,
         container: &rusternetes_common::resources::Container,
     ) -> (i64, i64) {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
 
         // Get CPU request (default to 100m if not specified)
         let cpu_request = container
@@ -360,8 +372,8 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
             .unwrap_or(128 * 1024 * 1024);
 
         // Simulate usage as 60-90% of request with some variance
-        let cpu_usage = (cpu_request as f64 * (0.6 + rng.gen::<f64>() * 0.3)) as i64;
-        let memory_usage = (memory_request as f64 * (0.6 + rng.gen::<f64>() * 0.3)) as i64;
+        let cpu_usage = (cpu_request as f64 * (0.6 + rng.random::<f64>() * 0.3)) as i64;
+        let memory_usage = (memory_request as f64 * (0.6 + rng.random::<f64>() * 0.3)) as i64;
 
         (cpu_usage, memory_usage)
     }
@@ -580,13 +592,24 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         let namespace = vpa.metadata.namespace.as_deref().unwrap_or("default");
         let name = &vpa.metadata.name;
 
-        let mut updated_vpa = vpa.clone();
-        updated_vpa.status = Some(VerticalPodAutoscalerStatus {
+        let new_status = VerticalPodAutoscalerStatus {
             recommendation: Some(RecommendedPodResources {
                 container_recommendations: Some(recommendations),
             }),
             conditions: None,
-        });
+        };
+
+        // Skip the write when nothing actually changed. Without this guard,
+        // a stable VPA would still emit a MODIFIED watch event every interval
+        // since recommendations get rebuilt unconditionally — controller churn.
+        let old_v = serde_json::to_value(vpa.status.as_ref()).ok();
+        let new_v = serde_json::to_value(Some(&new_status)).ok();
+        if old_v == new_v {
+            return Ok(());
+        }
+
+        let mut updated_vpa = vpa.clone();
+        updated_vpa.status = Some(new_status);
 
         let key = rusternetes_storage::build_key("verticalpodautoscalers", Some(namespace), name);
         self.storage.update(&key, &updated_vpa).await?;

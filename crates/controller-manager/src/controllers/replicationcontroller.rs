@@ -1,10 +1,10 @@
 use chrono::Utc;
+use futures::StreamExt;
 use rusternetes_common::{
     resources::{Pod, PodStatus, ReplicationController, ReplicationControllerCondition},
     types::{ObjectMeta, OwnerReference, Phase},
 };
-use futures::StreamExt;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -25,7 +25,6 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         info!("ReplicationController controller started (watch-based)");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -38,20 +37,41 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             // Initial full reconciliation
             self.enqueue_all(&queue).await;
 
-            // Watch for changes
+            // Watch for changes to ReplicationControllers AND Pods.
+            // Pod watch is required for low-latency status updates: when a pod
+            // transitions Pending -> Running or its Ready condition flips, the
+            // RC must reconcile immediately so status.readyReplicas reflects
+            // reality. Otherwise conformance tests (e.g. "should serve a basic
+            // image") time out waiting on the periodic resync.
             let prefix = build_prefix("replicationcontrollers", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to establish watch: {}, retrying in {:?}", e, self.interval);
+                    error!(
+                        "Failed to establish watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
                     tokio::time::sleep(self.interval).await;
                     continue;
                 }
             };
 
-            // Periodic full resync as safety net (every 30s)
-            let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
+            let pod_prefix = build_prefix("pods", None);
+            let mut pod_watch = match self.storage.watch(&pod_prefix).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(
+                        "Failed to establish pod watch: {}, retrying in {:?}",
+                        e, self.interval
+                    );
+                    tokio::time::sleep(self.interval).await;
+                    continue;
+                }
+            };
+
+            // Periodic full resync as safety net
+            let mut resync = tokio::time::interval(std::time::Duration::from_secs(5));
             resync.tick().await; // consume first immediate tick
 
             let mut watch_broken = false;
@@ -73,6 +93,21 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                             }
                         }
                     }
+                    event = pod_watch.next() => {
+                        match event {
+                            Some(Ok(ev)) => {
+                                self.enqueue_owner_rc(&queue, &ev).await;
+                            }
+                            Some(Err(e)) => {
+                                warn!("Pod watch error: {}, reconnecting", e);
+                                watch_broken = true;
+                            }
+                            None => {
+                                warn!("Pod watch stream ended, reconnecting");
+                                watch_broken = true;
+                            }
+                        }
+                    }
                     _ = resync.tick() => {
                         self.enqueue_all(&queue).await;
                     }
@@ -81,24 +116,76 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             // Watch broke — loop back to re-establish
         }
     }
+
+    /// When a pod changes, check its ownerReferences for a ReplicationController
+    /// owner and enqueue that RC for reconciliation.
+    async fn enqueue_owner_rc(&self, queue: &WorkQueue, event: &rusternetes_storage::WatchEvent) {
+        let pod_key = extract_key(event);
+        let parts: Vec<&str> = pod_key.splitn(3, '/').collect();
+        let ns = match parts.get(1) {
+            Some(ns) => *ns,
+            None => return,
+        };
+
+        let storage_key = format!("/registry/{}", pod_key);
+        match self.storage.get::<Pod>(&storage_key).await {
+            Ok(pod) => {
+                if let Some(refs) = &pod.metadata.owner_references {
+                    for owner_ref in refs {
+                        if owner_ref.kind == "ReplicationController" {
+                            queue
+                                .add(format!("replicationcontrollers/{}/{}", ns, owner_ref.name))
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Pod deleted — enqueue all RCs in this namespace so they
+                // notice the missing replica and create a replacement.
+                if let Ok(items) = self
+                    .storage
+                    .list::<ReplicationController>(&build_prefix(
+                        "replicationcontrollers",
+                        Some(ns),
+                    ))
+                    .await
+                {
+                    for rc in &items {
+                        queue
+                            .add(format!(
+                                "replicationcontrollers/{}/{}",
+                                ns, rc.metadata.name
+                            ))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
     async fn worker(&self, queue: WorkQueue) {
         while let Some(key) = queue.get().await {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("replicationcontrollers", Some(ns), name);
-            match self.storage.get::<ReplicationController>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_rc(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<ReplicationController>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_rc(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -109,13 +196,17 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<ReplicationController>("/registry/replicationcontrollers/").await {
+        match self
+            .storage
+            .list::<ReplicationController>("/registry/replicationcontrollers/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = {
-                    let ns = item.metadata.namespace.as_deref().unwrap_or("");
-                    format!("replicationcontrollers/{}/{}", ns, item.metadata.name)
-                };
+                        let ns = item.metadata.namespace.as_deref().unwrap_or("");
+                        format!("replicationcontrollers/{}/{}", ns, item.metadata.name)
+                    };
                     queue.add(key).await;
                 }
             }
@@ -125,6 +216,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
         debug!("Reconciling all replicationcontrollers");
 
@@ -154,7 +246,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 .metadata
                 .finalizers
                 .as_ref()
-                .map_or(false, |f| f.contains(&"orphan".to_string()));
+                .is_some_and(|f| f.contains(&"orphan".to_string()));
             if has_orphan_finalizer {
                 info!(
                     "RC {}/{} being deleted with orphan policy, removing ownerRefs from pods",
@@ -172,7 +264,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                         .metadata
                         .owner_references
                         .as_ref()
-                        .map_or(false, |refs| refs.iter().any(|r| r.uid == rc.metadata.uid));
+                        .is_some_and(|refs| refs.iter().any(|r| r.uid == rc.metadata.uid));
                     if owned {
                         let mut updated_pod = pod.clone();
                         updated_pod.metadata.owner_references =
@@ -183,7 +275,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                             });
                         let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
                         if let Err(e) = self.storage.update(&pod_key, &updated_pod).await {
-                            debug!("Failed to orphan pod {}: {} — will retry", pod.metadata.name, e);
+                            debug!(
+                                "Failed to orphan pod {}: {} — will retry",
+                                pod.metadata.name, e
+                            );
                             all_orphaned = false;
                         }
                     }
@@ -208,7 +303,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                     .metadata
                     .finalizers
                     .as_ref()
-                    .map_or(true, |f| f.is_empty())
+                    .is_none_or(|f| f.is_empty())
                 {
                     let _ = self.storage.delete(&rc_key).await;
                 } else {
@@ -327,7 +422,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             .count() as i32;
 
         // Check for failed pods as a failure signal
-        let failed_pods = rc_pods_after
+        let _failed_pods = rc_pods_after
             .iter()
             .filter(|pod| {
                 matches!(
@@ -405,6 +500,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         mut all_pods: Vec<Pod>,
         namespace: &str,
     ) -> rusternetes_common::Result<Vec<Pod>> {
+        #[allow(clippy::needless_range_loop)]
         for i in 0..all_pods.len() {
             let pod = &all_pods[i];
 

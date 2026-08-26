@@ -7,9 +7,8 @@ use rusternetes_common::{
     auth::UserInfo,
     authz::{Decision, RequestAttributes},
     resources::{
-        LocalSubjectAccessReview, NonResourceRule, ResourceRule, SelfSubjectAccessReview,
-        SelfSubjectRulesReview, SubjectAccessReview, SubjectAccessReviewStatus,
-        SubjectRulesReviewStatus,
+        LocalSubjectAccessReview, SelfSubjectAccessReview, SelfSubjectRulesReview,
+        SubjectAccessReview, SubjectAccessReviewStatus, SubjectRulesReviewStatus,
     },
     Result,
 };
@@ -278,8 +277,6 @@ pub async fn create_self_subject_rules_review(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_subject_access_review_allowed() {
         // This test would verify that a user with permissions gets allowed=true

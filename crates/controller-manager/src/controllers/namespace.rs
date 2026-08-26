@@ -84,7 +84,11 @@ impl<S: Storage + 'static> NamespaceController<S> {
 
     /// Enqueue all existing namespace keys for reconciliation.
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<Namespace>("/registry/namespaces/").await {
+        match self
+            .storage
+            .list::<Namespace>("/registry/namespaces/")
+            .await
+        {
             Ok(namespaces) => {
                 for ns in &namespaces {
                     let key = format!("namespaces/{}", ns.metadata.name);
@@ -105,17 +109,15 @@ impl<S: Storage + 'static> NamespaceController<S> {
             let storage_key = build_key("namespaces", None, name);
 
             match self.storage.get::<Namespace>(&storage_key).await {
-                Ok(ns) => {
-                    match self.reconcile_namespace(&ns).await {
-                        Ok(()) => {
-                            queue.forget(&key).await;
-                        }
-                        Err(e) => {
-                            error!("Failed to reconcile namespace {}: {}", name, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(ns) => match self.reconcile_namespace(&ns).await {
+                    Ok(()) => {
+                        queue.forget(&key).await;
                     }
-                }
+                    Err(e) => {
+                        error!("Failed to reconcile namespace {}: {}", name, e);
+                        queue.requeue_rate_limited(key.clone()).await;
+                    }
+                },
                 Err(_) => {
                     // Namespace was deleted or not found — nothing to reconcile
                     queue.forget(&key).await;
@@ -126,6 +128,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
     }
 
     /// Main reconciliation loop - processes all namespaces
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting namespace reconciliation");
 
@@ -533,11 +536,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 }
 
                 // If no finalizers remain, the namespace can be fully deleted
-                let no_finalizers = ns
-                    .metadata
-                    .finalizers
-                    .as_ref()
-                    .map_or(true, |f| f.is_empty());
+                let no_finalizers = ns.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty());
 
                 if no_finalizers {
                     // Delete the namespace from storage
@@ -663,9 +662,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
                     // executing and will never process their finalizers. Leaving them
                     // in storage blocks namespace deletion indefinitely.
                     if resource_type == "pods" {
-                        let phase = resource
-                            .pointer("/status/phase")
-                            .and_then(|p| p.as_str());
+                        let phase = resource.pointer("/status/phase").and_then(|p| p.as_str());
                         if matches!(phase, Some("Succeeded") | Some("Failed")) {
                             match self.storage.delete(&key).await {
                                 Ok(_) => {
@@ -788,6 +785,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
     }
 
     /// Remove finalizers from a namespace
+    #[allow(dead_code)]
     async fn remove_namespace_finalizers(&self, name: &str) -> Result<()> {
         let key = build_key("namespaces", None, name);
 
@@ -807,13 +805,12 @@ impl<S: Storage + 'static> NamespaceController<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
 
     #[test]
     fn test_namespace_resource_types() {
         // Ensure we have the major resource types covered
-        let resource_types = vec!["pods", "services", "configmaps", "secrets", "deployments"];
+        let resource_types = ["pods", "services", "configmaps", "secrets", "deployments"];
         assert!(resource_types.contains(&"pods"));
         assert!(resource_types.contains(&"services"));
     }

@@ -1,11 +1,10 @@
-/// Tests for kubectl apply command
-/// Tests resource application logic without requiring a cluster
+//! Tests for kubectl apply command
+//! Tests resource application logic without requiring a cluster
 
 #[cfg(test)]
 mod tests {
     use rusternetes_common::resources::*;
     use serde::Deserialize;
-    use serde_yaml;
 
     #[test]
     fn test_apply_pod_yaml_parsing() {
@@ -237,10 +236,10 @@ spec:
             matches!(flag, Some("client") | Some("server"))
         }
 
-        assert_eq!(is_dry_run(Some("client")), true);
-        assert_eq!(is_dry_run(Some("server")), true);
-        assert_eq!(is_dry_run(None), false);
-        assert_eq!(is_dry_run(Some("invalid")), false);
+        assert!(is_dry_run(Some("client")));
+        assert!(is_dry_run(Some("server")));
+        assert!(!is_dry_run(None));
+        assert!(!is_dry_run(Some("invalid")));
     }
 
     #[test]

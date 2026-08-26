@@ -22,26 +22,25 @@ pub async fn create(
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Result<(StatusCode, Json<Deployment>)> {
-    // Parse the body manually so we can do strict field validation against the raw bytes.
-    // For strict mode, if serde_json errors on duplicate fields, parse via serde_json::Value
-    // first (which is lenient) and then re-parse as Deployment, so validate_strict_fields
-    // can report all issues (unknown + duplicate) in the correct K8s format.
-    let is_strict = params.get("fieldValidation").map(|v| v.as_str()) == Some("Strict");
+) -> Result<(StatusCode, HeaderMap, Json<Deployment>)> {
+    // Parse the body manually so we can do strict field validation against the
+    // raw bytes. In any mode that may need to report duplicate keys (Strict —
+    // now the K8s 1.25+ default — or Warn) we re-parse via serde_json::Value
+    // so validate_strict_fields can report unknown + duplicate issues in the
+    // canonical `strict decoding error: ...` format.
     let mut deployment: Deployment = match serde_json::from_slice(&body) {
         Ok(d) => d,
         Err(e) => {
             let msg = e.to_string();
-            if is_strict && msg.contains("duplicate field") {
-                // Parse via Value (lenient — takes last duplicate) so validate_strict_fields runs
+            if msg.contains("duplicate field") {
                 let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e2| {
-                    rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e2))
+                    rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
                 })?;
                 serde_json::from_value(value).map_err(|e2| {
-                    rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e2))
+                    rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
                 })?
             } else {
-                return Err(rusternetes_common::Error::InvalidResource(format!(
+                return Err(rusternetes_common::Error::BadRequest(format!(
                     "failed to decode: {}",
                     msg
                 )));
@@ -54,8 +53,12 @@ pub async fn create(
         namespace, deployment.metadata.name
     );
 
-    // Strict field validation: reject unknown fields when requested
-    crate::handlers::validation::validate_strict_fields(&params, &body, &deployment)?;
+    // Strict field validation: reject unknown fields when requested. Warn
+    // mode surfaces warnings as `Warning: 299` response headers (per RFC
+    // 7234), matching upstream apimachinery util/warning behaviour.
+    let warnings =
+        crate::handlers::validation::validate_strict_fields(&params, &body, &deployment)?;
+    let response_headers = build_warning_headers(&warnings);
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
@@ -81,7 +84,7 @@ pub async fn create(
         version: "v1".to_string(),
         kind: "Deployment".to_string(),
     };
-    if let Err(e) = state
+    state
         .webhook_manager
         .run_validating_admission_policies_ext(
             &rusternetes_common::admission::Operation::Create,
@@ -91,10 +94,7 @@ pub async fn create(
             Some("deployments"),
             Some(&namespace),
         )
-        .await
-    {
-        return Err(e);
-    }
+        .await?;
 
     deployment.metadata.ensure_uid();
     deployment.metadata.ensure_creation_timestamp();
@@ -120,12 +120,26 @@ pub async fn create(
             "Dry-run: Deployment {}/{} validated successfully (not created)",
             namespace, deployment.metadata.name
         );
-        return Ok((StatusCode::CREATED, Json(deployment)));
+        return Ok((StatusCode::CREATED, response_headers, Json(deployment)));
     }
 
     let created = state.storage.create(&key, &deployment).await?;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    Ok((StatusCode::CREATED, response_headers, Json(created)))
+}
+
+/// Convert the `validate_strict_fields` warning strings into a `HeaderMap`
+/// holding RFC 7234 `Warning: 299 - "..."` entries. Empty input → empty map,
+/// which keeps response shape identical for non-Warn callers.
+fn build_warning_headers(warnings: &[String]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for warning in warnings {
+        let value = crate::handlers::validation::format_warning_header(warning);
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&value) {
+            headers.append(axum::http::header::WARNING, hv);
+        }
+    }
+    headers
 }
 
 pub async fn get(
@@ -334,8 +348,8 @@ pub async fn list(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -375,7 +389,10 @@ pub async fn list(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut deployments, &params)?;
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
@@ -412,8 +429,8 @@ pub async fn list_all_deployments(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -450,7 +467,10 @@ pub async fn list_all_deployments(
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut deployments, &params)?;
 
-    let resource_version = match state.storage.current_revision().await { Ok(rev) => rev.to_string(), Err(_) => "1".to_string() };
+    let resource_version = match state.storage.current_revision().await {
+        Ok(rev) => rev.to_string(),
+        Err(_) => "1".to_string(),
+    };
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());

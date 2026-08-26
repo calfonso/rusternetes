@@ -149,11 +149,11 @@ fn create_test_cronjob(name: &str, namespace: &str, schedule: &str) -> CronJob {
 
 #[tokio::test]
 async fn test_cronjob_job_template() {
-    let storage = setup_test().await;
+    let _storage = setup_test().await;
 
     // Test that CronJob creates jobs from its job template
     let cronjob = create_test_cronjob("template-test", "default", "* * * * *");
-    let key = build_key("cronjobs", Some("default"), "template-test");
+    let _key = build_key("cronjobs", Some("default"), "template-test");
 
     // Verify job template structure is correct
     assert_eq!(cronjob.spec.job_template.spec.completions, Some(1));
@@ -206,7 +206,7 @@ async fn test_cronjob_suspend() {
 
 #[tokio::test]
 async fn test_cronjob_concurrency_policy_forbid() {
-    let storage = setup_test().await;
+    let _storage = setup_test().await;
 
     // Create CronJob with Forbid policy
     let mut cronjob = create_test_cronjob("forbid-test", "default", "* * * * *");
@@ -218,7 +218,7 @@ async fn test_cronjob_concurrency_policy_forbid() {
 
 #[tokio::test]
 async fn test_cronjob_concurrency_policy_replace() {
-    let storage = setup_test().await;
+    let _storage = setup_test().await;
 
     // Create CronJob with Replace policy
     let mut cronjob = create_test_cronjob("replace-test", "default", "* * * * *");
@@ -230,7 +230,7 @@ async fn test_cronjob_concurrency_policy_replace() {
 
 #[tokio::test]
 async fn test_cronjob_concurrency_policy_allow() {
-    let storage = setup_test().await;
+    let _storage = setup_test().await;
 
     // Create CronJob with Allow policy (default)
     let cronjob = create_test_cronjob("allow-test", "default", "* * * * *");
@@ -241,7 +241,7 @@ async fn test_cronjob_concurrency_policy_allow() {
 
 #[tokio::test]
 async fn test_cronjob_history_limits() {
-    let storage = setup_test().await;
+    let _storage = setup_test().await;
 
     // Create CronJob with custom history limits
     let mut cronjob = create_test_cronjob("cleanup-job", "default", "* * * * *");
@@ -258,7 +258,7 @@ async fn test_cronjob_schedule_parsing() {
     let storage = setup_test().await;
 
     // Test various schedule formats
-    let schedules = vec!["@hourly", "@daily", "@weekly", "@monthly", "*/5 * * * *"];
+    let schedules = ["@hourly", "@daily", "@weekly", "@monthly", "*/5 * * * *"];
 
     for (i, schedule) in schedules.iter().enumerate() {
         let cronjob = create_test_cronjob(&format!("test-{}", i), "default", schedule);

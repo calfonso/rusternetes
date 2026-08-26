@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     client: &ApiClient,
     name: &str,

@@ -9,34 +9,33 @@ use axum::{
     routing::get,
     Router,
 };
-use futures::{SinkExt, StreamExt};
-use std::net::SocketAddr;
+use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
 
 /// Simulate the exec close sequence from streaming.rs
 async fn handle_test_ws(mut socket: WebSocket) {
     // Send initial stdout frame (channel 1)
-    let _ = socket.send(Message::Binary(vec![1u8].into())).await;
+    let _ = socket.send(Message::Binary(vec![1u8])).await;
 
     // Send stdout data
     let mut stdout = vec![1u8];
     stdout.extend_from_slice(b"hello\n");
-    let _ = socket.send(Message::Binary(stdout.into())).await;
+    let _ = socket.send(Message::Binary(stdout)).await;
 
     // Send empty stdout/stderr frames
-    let _ = socket.send(Message::Binary(vec![1u8].into())).await;
-    let _ = socket.send(Message::Binary(vec![2u8].into())).await;
+    let _ = socket.send(Message::Binary(vec![1u8])).await;
+    let _ = socket.send(Message::Binary(vec![2u8])).await;
 
     // Flush with ping
-    let _ = socket.send(Message::Ping(vec![].into())).await;
+    let _ = socket.send(Message::Ping(vec![])).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Send status on channel 3
     let status_json = r#"{"status":"Success"}"#;
     let mut status_data = vec![3u8];
     status_data.extend_from_slice(status_json.as_bytes());
-    let _ = socket.send(Message::Binary(status_data.into())).await;
+    let _ = socket.send(Message::Binary(status_data)).await;
 
     // THE FIX: delay before close to let client read channel 3
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -115,13 +114,13 @@ async fn test_exec_websocket_client_receives_status_before_close() {
 #[tokio::test]
 async fn test_exec_websocket_nonzero_exit_status() {
     async fn handle_fail_ws(mut socket: WebSocket) {
-        let _ = socket.send(Message::Binary(vec![1u8].into())).await;
+        let _ = socket.send(Message::Binary(vec![1u8])).await;
 
         // Send failure status on channel 3
         let status_json = r#"{"status":"Failure","message":"command terminated with exit code 1"}"#;
         let mut status_data = vec![3u8];
         status_data.extend_from_slice(status_json.as_bytes());
-        let _ = socket.send(Message::Binary(status_data.into())).await;
+        let _ = socket.send(Message::Binary(status_data)).await;
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

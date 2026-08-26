@@ -37,7 +37,7 @@ impl EtcdStorage {
 
     /// Helper to serialize a value to JSON
     fn serialize<T: Serialize>(value: &T) -> Result<String> {
-        serde_json::to_string(value).map_err(|e| Error::Serialization(e))
+        serde_json::to_string(value).map_err(Error::Serialization)
     }
 
     /// Inject resourceVersion into a JSON string by parsing, modifying, and re-serializing.
@@ -72,11 +72,11 @@ impl Storage for EtcdStorage {
             let mut raw = Self::serialize(value)?;
             if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 // Ensure metadata object exists
-                if v.get("metadata").is_none() || v.get("metadata").map_or(false, |m| m.is_null()) {
+                if v.get("metadata").is_none() || v.get("metadata").is_some_and(|m| m.is_null()) {
                     v["metadata"] = serde_json::json!({});
                 }
                 if let Some(metadata) = v.get_mut("metadata") {
-                    if metadata.get("generation").map_or(true, |g| g.is_null()) {
+                    if metadata.get("generation").is_none_or(|g| g.is_null()) {
                         metadata["generation"] = serde_json::json!(1);
                     }
                 }
@@ -121,7 +121,7 @@ impl Storage for EtcdStorage {
 
         // Inject resourceVersion and deserialize
         let json_with_rv = Self::inject_resource_version(&json, mod_revision);
-        serde_json::from_str(&json_with_rv).map_err(|e| Error::Serialization(e))
+        serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
     }
 
     async fn get<T>(&self, key: &str) -> Result<T>
@@ -142,7 +142,7 @@ impl Storage for EtcdStorage {
 
             let mod_revision = kv.mod_revision();
             let json_with_rv = Self::inject_resource_version(json, mod_revision);
-            serde_json::from_str(&json_with_rv).map_err(|e| Error::Serialization(e))
+            serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         } else {
             Err(Error::NotFound(key.to_string()))
         }
@@ -157,7 +157,7 @@ impl Storage for EtcdStorage {
 
         // Extract resourceVersion from the incoming resource
         let incoming_resource: serde_json::Value =
-            serde_json::from_str(&json).map_err(|e| Error::Serialization(e))?;
+            serde_json::from_str(&json).map_err(Error::Serialization)?;
         let incoming_rv = crate::concurrency::extract_resource_version(
             incoming_resource
                 .get("metadata")
@@ -227,7 +227,7 @@ impl Storage for EtcdStorage {
                 .unwrap_or_else(|| txn_resp.header().map(|h| h.revision()).unwrap_or(0));
 
             let json_with_rv = Self::inject_resource_version(&json, mod_revision);
-            serde_json::from_str(&json_with_rv).map_err(|e| Error::Serialization(e))
+            serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         } else {
             // No resourceVersion provided — check key exists, then put
             let get_resp = client
@@ -255,17 +255,17 @@ impl Storage for EtcdStorage {
             if let Some(kv) = get_resp.kvs().first() {
                 let mod_revision = kv.mod_revision();
                 let json_with_rv = Self::inject_resource_version(&json, mod_revision);
-                serde_json::from_str(&json_with_rv).map_err(|e| Error::Serialization(e))
+                serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
             } else {
                 // Key was deleted between put and get — shouldn't happen
-                serde_json::from_str(&json).map_err(|e| Error::Serialization(e))
+                serde_json::from_str(&json).map_err(Error::Serialization)
             }
         }
     }
 
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let mut client = self.client.clone();
-        let json = serde_json::to_string(value).map_err(|e| Error::Serialization(e))?;
+        let json = serde_json::to_string(value).map_err(Error::Serialization)?;
 
         // Check if the key exists first (keys_only to save bandwidth)
         let get_resp = client

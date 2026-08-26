@@ -138,6 +138,7 @@ pub fn build_service(
 }
 
 /// Execute the `kubectl expose` command.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     client: &ApiClient,
     resource_type: &str,

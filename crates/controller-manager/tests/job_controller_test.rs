@@ -37,7 +37,7 @@ fn create_test_job(name: &str, namespace: &str, completions: i32, parallelism: i
             active_deadline_seconds: None,
             template: PodTemplateSpec {
                 metadata: Some({
-                    let mut meta = ObjectMeta::new(&format!("{}-pod", name));
+                    let mut meta = ObjectMeta::new(format!("{}-pod", name));
                     meta.labels = Some(labels);
                     meta
                 }),
@@ -309,8 +309,8 @@ async fn test_job_backoff_limit() {
 
     // Mark 3 pods as failed (exceeds backoff limit of 2)
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
-    for i in 0..2 {
-        let mut failed_pod = pods[i].clone();
+    for pod in pods.iter().take(2) {
+        let mut failed_pod = pod.clone();
         failed_pod.status = Some(PodStatus {
             phase: Some(Phase::Failed),
             message: None,
@@ -330,12 +330,12 @@ async fn test_job_backoff_limit() {
             resource_claim_statuses: None,
             observed_generation: None,
         });
-        let pod_key = build_key("pods", Some("default"), &pods[i].metadata.name);
+        let pod_key = build_key("pods", Some("default"), &pod.metadata.name);
         storage.update(&pod_key, &failed_pod).await.unwrap();
     }
 
     // Create one more failed pod manually to exceed limit
-    let extra_pod_name = format!("failing-extra");
+    let extra_pod_name = "failing-extra".to_string();
     let mut extra_pod = pods[0].clone();
     extra_pod.metadata.name = extra_pod_name.clone();
     extra_pod.metadata.uid = uuid::Uuid::new_v4().to_string();
@@ -447,7 +447,7 @@ async fn test_job_suspend_deletes_active_pods() {
     let storage = setup_test().await;
 
     // Create a job with 3 completions, parallelism 3
-    let mut job = create_test_job("suspend-test", "default", 3, 3);
+    let job = create_test_job("suspend-test", "default", 3, 3);
     let key = build_key("jobs", Some("default"), "suspend-test");
     storage.create(&key, &job).await.unwrap();
 

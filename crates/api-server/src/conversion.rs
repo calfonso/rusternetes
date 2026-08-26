@@ -200,7 +200,7 @@ impl ConversionWebhookClient {
         let converted_objects: Vec<CustomResource> = conv_response
             .converted_objects
             .into_iter()
-            .map(|obj| serde_json::from_value(obj))
+            .map(serde_json::from_value)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
                 rusternetes_common::Error::Network(format!(
@@ -291,7 +291,7 @@ pub async fn convert_custom_resource(
 
 /// Extract version from API version string (e.g., "stable.example.com/v1" -> "v1")
 fn extract_version(api_version: &str) -> &str {
-    api_version.split('/').last().unwrap_or(api_version)
+    api_version.split('/').next_back().unwrap_or(api_version)
 }
 
 #[cfg(test)]

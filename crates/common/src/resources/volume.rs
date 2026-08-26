@@ -1,3 +1,4 @@
+use crate::resources::serde_helpers::empty_string_as_none;
 use crate::resources::service_account::ObjectReference;
 use crate::types::{ObjectMeta, TypeMeta};
 use chrono::{DateTime, Utc};
@@ -26,7 +27,11 @@ pub struct PersistentVolumeSpec {
     pub access_modes: Vec<PersistentVolumeAccessMode>,
 
     /// Reclaim policy
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub persistent_volume_reclaim_policy: Option<PersistentVolumeReclaimPolicy>,
 
     /// Storage class name
@@ -38,7 +43,11 @@ pub struct PersistentVolumeSpec {
     pub mount_options: Option<Vec<String>>,
 
     /// Volume mode
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub volume_mode: Option<PersistentVolumeMode>,
 
     /// Node affinity
@@ -74,7 +83,11 @@ pub struct PersistentVolumeSpec {
 #[serde(rename_all = "camelCase")]
 pub struct HostPathVolumeSource {
     pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub r#type: Option<HostPathType>,
 }
 
@@ -194,7 +207,12 @@ pub struct PersistentVolumeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// lastPhaseTransitionTime is the time the phase transitioned from one to another
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_phase_transition_time: Option<DateTime<Utc>>,
 }
 
@@ -240,7 +258,11 @@ pub struct PersistentVolumeClaimSpec {
     pub storage_class_name: Option<String>,
 
     /// Volume mode
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub volume_mode: Option<PersistentVolumeMode>,
 
     /// Selector for PV
@@ -263,9 +285,17 @@ pub struct PersistentVolumeClaimSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRequirements {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub limits: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub requests: Option<HashMap<String, String>>,
 }
 
@@ -314,13 +344,21 @@ pub struct PersistentVolumeClaimStatus {
     pub phase: PersistentVolumeClaimPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_modes: Option<Vec<PersistentVolumeAccessMode>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub capacity: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<PersistentVolumeClaimCondition>>,
     /// Allocated resources represents the resources allocated to the PVC
     /// Used during volume expansion to track the new size
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::types::deserialize_quantity_map"
+    )]
     pub allocated_resources: Option<HashMap<String, String>>,
     /// AllocatedResourceStatuses stores status of resource being resized for the given PVC
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -408,11 +446,19 @@ pub struct StorageClass {
     pub parameters: Option<HashMap<String, String>>,
 
     /// Reclaim policy
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub reclaim_policy: Option<PersistentVolumeReclaimPolicy>,
 
     /// Volume binding mode
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "empty_string_as_none"
+    )]
     pub volume_binding_mode: Option<VolumeBindingMode>,
 
     /// Allowed topologies

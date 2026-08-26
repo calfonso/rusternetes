@@ -22,6 +22,7 @@ pub mod pv_binder;
 pub mod replicaset;
 pub mod replicationcontroller;
 pub mod resource_quota;
+#[allow(dead_code)]
 pub mod resourceclaim;
 pub mod service;
 pub mod serviceaccount;

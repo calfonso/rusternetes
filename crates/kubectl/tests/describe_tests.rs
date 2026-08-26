@@ -1,5 +1,5 @@
-/// Tests for kubectl describe command
-/// Tests resource description formatting without requiring a cluster
+//! Tests for kubectl describe command
+//! Tests resource description formatting without requiring a cluster
 
 #[cfg(test)]
 mod tests {
@@ -307,13 +307,12 @@ mod tests {
                 && !key.starts_with("kubernetes.io/created-by")
         }
 
-        assert_eq!(should_show_annotation("description"), true);
-        assert_eq!(should_show_annotation("owner"), true);
-        assert_eq!(
-            should_show_annotation("kubectl.kubernetes.io/last-applied-configuration"),
-            false
-        );
-        assert_eq!(should_show_annotation("kubernetes.io/created-by"), false);
+        assert!(should_show_annotation("description"));
+        assert!(should_show_annotation("owner"));
+        assert!(!should_show_annotation(
+            "kubectl.kubernetes.io/last-applied-configuration"
+        ));
+        assert!(!should_show_annotation("kubernetes.io/created-by"));
     }
 
     #[test]

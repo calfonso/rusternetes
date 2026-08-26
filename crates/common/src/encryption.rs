@@ -4,8 +4,8 @@
 // It follows the Kubernetes encryption provider model.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
-    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Nonce},
+    Aes256Gcm, Key,
 };
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -114,7 +114,8 @@ impl AesGcmProvider {
             return Err(anyhow!("AES-GCM key must be 32 bytes (256 bits)"));
         }
 
-        let cipher = Aes256Gcm::new(key.into());
+        let key_array: [u8; 32] = key.try_into().map_err(|_| anyhow!("Invalid key length"))?;
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(key_array));
         info!(
             "AES-GCM encryption provider initialized with key '{}'",
             key_name
@@ -132,10 +133,9 @@ impl AesGcmProvider {
     }
 
     pub fn generate_key() -> [u8; 32] {
-        use aes_gcm::aead::rand_core::RngCore;
-        let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
-        key
+        use aes_gcm::aead::Generate;
+        let key = Key::<Aes256Gcm>::generate();
+        key.into()
     }
 }
 
@@ -143,7 +143,7 @@ impl EncryptionProvider for AesGcmProvider {
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         // Generate random nonce
         let nonce_bytes = Self::generate_nonce();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = &nonce_bytes.into();
 
         // Encrypt
         let ciphertext = self
@@ -169,12 +169,14 @@ impl EncryptionProvider for AesGcmProvider {
         }
 
         // Extract nonce (first 12 bytes)
-        let nonce = Nonce::from_slice(&ciphertext[..12]);
+        let nonce_bytes: [u8; 12] = ciphertext[..12]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid nonce length"))?;
 
         // Decrypt
         let plaintext = self
             .cipher
-            .decrypt(nonce, &ciphertext[12..])
+            .decrypt(&nonce_bytes.into(), &ciphertext[12..])
             .map_err(|e| anyhow!("Decryption failed: {}", e))?;
 
         debug!(
@@ -192,10 +194,8 @@ impl EncryptionProvider for AesGcmProvider {
 
 impl AesGcmProvider {
     fn generate_nonce() -> [u8; 12] {
-        use aes_gcm::aead::rand_core::RngCore;
-        let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
-        nonce
+        use aes_gcm::aead::Generate;
+        Nonce::<Aes256Gcm>::generate().into()
     }
 }
 

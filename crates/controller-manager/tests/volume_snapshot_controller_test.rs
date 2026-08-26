@@ -10,11 +10,7 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 async fn setup_test() -> Arc<MemoryStorage> {
-    let storage = Arc::new(MemoryStorage::new());
-
-    // Clean up test data
-
-    storage
+    Arc::new(MemoryStorage::new())
 }
 
 async fn create_test_pvc(
@@ -137,8 +133,8 @@ async fn test_snapshot_content_auto_creation() {
     storage.create(&vsc_key, &vsc).await.unwrap();
 
     // Create PV and bound PVC
-    let pv = create_test_pv(&storage, "test-pv").await;
-    let pvc = create_test_pvc(&storage, "test-pvc", "default", "test-pv").await;
+    let _pv = create_test_pv(&storage, "test-pv").await;
+    let _pvc = create_test_pvc(&storage, "test-pvc", "default", "test-pv").await;
 
     // Create VolumeSnapshot
     let vs = VolumeSnapshot {

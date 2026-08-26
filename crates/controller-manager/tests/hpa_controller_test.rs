@@ -34,7 +34,7 @@ fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Deploym
             revision_history_limit: None,
             template: PodTemplateSpec {
                 metadata: Some({
-                    let mut meta = ObjectMeta::new(&format!("{}-pod", name));
+                    let mut meta = ObjectMeta::new(format!("{}-pod", name));
                     meta.labels = Some(labels);
                     meta
                 }),

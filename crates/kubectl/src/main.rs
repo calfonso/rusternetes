@@ -5,7 +5,7 @@ mod types;
 mod websocket;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use client::ApiClient;
 use kubeconfig::KubeConfig;
 use types::{
@@ -1035,7 +1035,7 @@ async fn main() -> Result<()> {
             KubeConfig::load_default().unwrap_or_else(|_| {
                 eprintln!("Warning: Could not load kubeconfig, using defaults");
                 // Return a minimal default config
-                return KubeConfig {
+                KubeConfig {
                     api_version: Some("v1".to_string()),
                     kind: Some("Config".to_string()),
                     current_context: "default".to_string(),
@@ -1043,7 +1043,7 @@ async fn main() -> Result<()> {
                     clusters: vec![],
                     users: vec![],
                     preferences: std::collections::HashMap::new(),
-                };
+                }
             })
         };
 

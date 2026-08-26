@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use chrono::{Datelike, Utc};
+use chrono::Utc;
 use rusternetes_common::resources::{
     CertificateSigningRequest, CertificateSigningRequestCondition, CertificateSigningRequestStatus,
     KeyUsage,
 };
-use rusternetes_storage::{Storage, WorkQueue, extract_key, build_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -90,18 +90,22 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
     }
     async fn worker(&self, queue: WorkQueue) {
         while let Some(key) = queue.get().await {
-            let name = key.strip_prefix("certificatesigningrequests/").unwrap_or(&key);
+            let name = key
+                .strip_prefix("certificatesigningrequests/")
+                .unwrap_or(&key);
             let storage_key = build_key("certificatesigningrequests", None, name);
-            match self.storage.get::<CertificateSigningRequest>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_csr(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+            match self
+                .storage
+                .get::<CertificateSigningRequest>(&storage_key)
+                .await
+            {
+                Ok(resource) => match self.reconcile_csr(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     // Resource was deleted — nothing to reconcile
                     queue.forget(&key).await;
@@ -112,7 +116,11 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<CertificateSigningRequest>("/registry/certificatesigningrequests/").await {
+        match self
+            .storage
+            .list::<CertificateSigningRequest>("/registry/certificatesigningrequests/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let key = format!("certificatesigningrequests/{}", item.metadata.name);
@@ -120,12 +128,16 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
                 }
             }
             Err(e) => {
-                error!("Failed to list certificatesigningrequests for enqueue: {}", e);
+                error!(
+                    "Failed to list certificatesigningrequests for enqueue: {}",
+                    e
+                );
             }
         }
     }
 
     /// Main reconciliation loop - processes all CSR resources
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting CertificateSigningRequest reconciliation");
 
@@ -217,13 +229,12 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
         }
 
         // Auto-approve kubelet serving certificates
-        if csr.spec.signer_name == "kubernetes.io/kubelet-serving" {
-            if csr.spec.usages.contains(&KeyUsage::ServerAuth)
-                && csr.spec.usages.contains(&KeyUsage::DigitalSignature)
-                && csr.spec.usages.contains(&KeyUsage::KeyEncipherment)
-            {
-                return Ok(true);
-            }
+        if csr.spec.signer_name == "kubernetes.io/kubelet-serving"
+            && csr.spec.usages.contains(&KeyUsage::ServerAuth)
+            && csr.spec.usages.contains(&KeyUsage::DigitalSignature)
+            && csr.spec.usages.contains(&KeyUsage::KeyEncipherment)
+        {
+            return Ok(true);
         }
 
         Ok(false)
@@ -412,8 +423,7 @@ mod tests {
         let controller = CertificateSigningRequestController::new(storage);
 
         // Create a CSR for testing (using rcgen for test data generation)
-        let mut params =
-            rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         // Generate CSR, not a certificate
         let csr_der = params.serialize_request(&key_pair).unwrap();
@@ -463,8 +473,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = CertificateSigningRequestController::new(storage);
 
-        let mut params =
-            rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let csr_der = params.serialize_request(&key_pair).unwrap();
         let csr_pem = pem::encode(&pem::Pem::new(
@@ -494,8 +503,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = CertificateSigningRequestController::new(storage);
 
-        let mut params =
-            rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let csr_der = params.serialize_request(&key_pair).unwrap();
         let csr_pem = pem::encode(&pem::Pem::new(
@@ -541,8 +549,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = CertificateSigningRequestController::new(storage);
 
-        let mut params =
-            rcgen::CertificateParams::new(vec!["system:node:test".to_string()]).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["system:node:test".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let csr_der = params.serialize_request(&key_pair).unwrap();
         let csr_pem = pem::encode(&pem::Pem::new(
@@ -578,8 +585,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = CertificateSigningRequestController::new(storage);
 
-        let mut params =
-            rcgen::CertificateParams::new(vec!["node1.example.com".to_string()]).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["node1.example.com".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let csr_der = params.serialize_request(&key_pair).unwrap();
         let csr_pem = pem::encode(&pem::Pem::new(

@@ -93,6 +93,12 @@ struct WorkQueueInner {
 /// to coalesce self-triggered events (status write -> watch -> re-enqueue).
 const MIN_REPROCESS_INTERVAL: Duration = Duration::from_millis(200);
 
+impl Default for WorkQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkQueue {
     /// Create a new work queue with default rate limiting.
     pub fn new() -> Self {
@@ -292,13 +298,20 @@ impl WorkQueue {
         let inner = self.inner.lock().await;
         inner.queue.len()
     }
+
+    /// Returns true if the queue is empty.
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
 }
 
 fn backoff_duration(failures: u32, base: Duration, max: Duration) -> Duration {
     if failures == 0 {
         return Duration::ZERO;
     }
-    let multiplier = 1u64.checked_shl(failures.saturating_sub(1)).unwrap_or(u64::MAX);
+    let multiplier = 1u64
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u64::MAX);
     let delay_ms = (base.as_millis() as u64).saturating_mul(multiplier);
     let delay = Duration::from_millis(delay_ms.min(max.as_millis() as u64));
     delay.min(max)
@@ -443,19 +456,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_key_cluster_scoped() {
-        let event = WatchEvent::Added(
-            "/registry/namespaces/kube-system".into(),
-            "{}".into(),
-        );
+        let event = WatchEvent::Added("/registry/namespaces/kube-system".into(), "{}".into());
         assert_eq!(extract_key(&event), "namespaces/kube-system");
     }
 
     #[tokio::test]
     async fn test_extract_key_deleted() {
-        let event = WatchEvent::Deleted(
-            "/registry/pods/test-ns/test-pod".into(),
-            "{}".into(),
-        );
+        let event = WatchEvent::Deleted("/registry/pods/test-ns/test-pod".into(), "{}".into());
         assert_eq!(extract_key(&event), "pods/test-ns/test-pod");
     }
 
@@ -465,9 +472,7 @@ mod tests {
         let q2 = q.clone();
 
         // Spawn a task that waits for an item
-        let handle = tokio::spawn(async move {
-            q2.get().await
-        });
+        let handle = tokio::spawn(async move { q2.get().await });
 
         // Give the task time to block
         tokio::time::sleep(Duration::from_millis(50)).await;

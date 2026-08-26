@@ -3,8 +3,8 @@
 //! Tests all CRUD operations, edge cases, and error handling for cronjobs
 
 use rusternetes_common::resources::{
-    Container, CronJob, CronJobSpec, CronJobStatus, JobSpec, JobTemplateSpec, LabelSelector,
-    PodSpec, PodTemplateSpec,
+    Container, CronJob, CronJobSpec, CronJobStatus, JobSpec, JobTemplateSpec, PodSpec,
+    PodTemplateSpec,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
@@ -37,7 +37,7 @@ fn create_test_cronjob(name: &str, namespace: &str, schedule: &str) -> CronJob {
                     active_deadline_seconds: None,
                     template: PodTemplateSpec {
                         metadata: Some(
-                            ObjectMeta::new(&format!("{}-pod", name))
+                            ObjectMeta::new(format!("{}-pod", name))
                                 .with_namespace(namespace)
                                 .with_labels(labels),
                         ),

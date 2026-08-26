@@ -32,7 +32,7 @@ fn create_test_replicaset(name: &str, namespace: &str, replicas: i32) -> Replica
             min_ready_seconds: None,
             template: PodTemplateSpec {
                 metadata: Some({
-                    let mut meta = ObjectMeta::new(&format!("{}-pod", name));
+                    let mut meta = ObjectMeta::new(format!("{}-pod", name));
                     meta.labels = Some(labels);
                     meta
                 }),

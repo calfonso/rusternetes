@@ -7,7 +7,8 @@ This guide shows how to run each rusternetes component as a separate process on 
 ## Prerequisites
 
 - **Rust toolchain** — install via [rustup.rs](https://rustup.rs/)
-- **etcd** — for cluster state storage (or use SQLite with the all-in-one binary)
+- **Protocol Buffers compiler** — `protobuf-compiler` + `protobuf-devel` (Fedora), `protobuf-compiler` (Debian/Ubuntu), `brew install protobuf` (macOS)
+- **etcd** — for cluster state storage (or use SQLite/Redis with the all-in-one binary)
 - **Docker** — for the kubelet to create containers
 
 ### Start etcd
@@ -104,6 +105,13 @@ Instead of running 5 separate processes, run everything in one:
 ```
 
 This starts the API server, scheduler, controller manager, kubelet, and kube-proxy as concurrent tokio tasks with embedded SQLite. No etcd needed.
+
+For Redis instead of SQLite:
+
+```bash
+cargo build -p rusternetes --features redis --release
+./target/release/rusternetes --storage-backend redis --redis-url redis://localhost:6379
+```
 
 ## Next Steps
 

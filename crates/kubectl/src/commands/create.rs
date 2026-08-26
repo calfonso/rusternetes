@@ -537,8 +537,8 @@ pub fn build_ingress(
         let raw_path = eq_parts[0];
         let svc_port = eq_parts[1];
 
-        let (path, path_type) = if raw_path.ends_with('*') {
-            (format!("/{}", &raw_path[..raw_path.len() - 1]), "Prefix")
+        let (path, path_type) = if let Some(stripped) = raw_path.strip_suffix('*') {
+            (format!("/{}", stripped), "Prefix")
         } else {
             (format!("/{}", raw_path), "Exact")
         };
@@ -595,7 +595,7 @@ pub fn build_ingress(
             if !secret_name.is_empty() {
                 tls["secretName"] = json!(secret_name);
             }
-            if tls.as_object().map_or(false, |o| !o.is_empty()) {
+            if tls.as_object().is_some_and(|o| !o.is_empty()) {
                 tls_entries.push(tls);
             }
         }
@@ -1353,12 +1353,12 @@ fn parse_int_or_string(s: &str) -> Value {
 
 fn parse_duration_to_seconds(s: &str) -> Result<i64> {
     let s = s.trim();
-    if s.ends_with('s') {
-        Ok(s[..s.len() - 1].parse::<i64>()?)
-    } else if s.ends_with('m') {
-        Ok(s[..s.len() - 1].parse::<i64>()? * 60)
-    } else if s.ends_with('h') {
-        Ok(s[..s.len() - 1].parse::<i64>()? * 3600)
+    if let Some(stripped) = s.strip_suffix('s') {
+        Ok(stripped.parse::<i64>()?)
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        Ok(stripped.parse::<i64>()? * 60)
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        Ok(stripped.parse::<i64>()? * 3600)
     } else {
         // Assume seconds
         Ok(s.parse::<i64>()?)
@@ -1383,7 +1383,7 @@ fn build_ingress_backend(svc_name: &str, svc_port: &str) -> Value {
 // ── Legacy inline creation ──────────────────────────────────────────────────
 
 /// Execute inline resource creation (e.g., kubectl create namespace foo)
-pub async fn execute_inline(client: &ApiClient, args: &[String], namespace: &str) -> Result<()> {
+pub async fn execute_inline(_client: &ApiClient, args: &[String], namespace: &str) -> Result<()> {
     if args.is_empty() {
         anyhow::bail!("Resource type required");
     }

@@ -1,5 +1,7 @@
 mod advanced;
+#[allow(dead_code)]
 mod framework;
+#[allow(dead_code)]
 mod plugins;
 mod scheduler;
 
@@ -80,10 +82,16 @@ async fn main() -> Result<()> {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
-            StorageConfig::Sqlite { path: args.data_dir }
+            StorageConfig::Sqlite {
+                path: args.data_dir,
+            }
         }
         _ => {
-            let endpoints: Vec<String> = args.etcd_servers.split(',').map(|s| s.trim().to_string()).collect();
+            let endpoints: Vec<String> = args
+                .etcd_servers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
             info!("Connecting to etcd: {:?}", endpoints);
             StorageConfig::Etcd { endpoints }
         }
@@ -105,9 +113,14 @@ async fn main() -> Result<()> {
 
     // Leader election
     if args.enable_leader_election {
-        let etcd_endpoints: Vec<String> = args.etcd_servers.split(',').map(|s| s.trim().to_string()).collect();
+        let etcd_endpoints: Vec<String> = args
+            .etcd_servers
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
 
-        let identity = args.leader_election_identity
+        let identity = args
+            .leader_election_identity
             .unwrap_or_else(|| format!("scheduler-{}", Uuid::new_v4()));
 
         let config = LeaderElectionConfig {

@@ -1,4 +1,4 @@
-/// Tests for kubectl scale, patch, label, and annotate commands
+//! Tests for kubectl scale, patch, label, and annotate commands
 
 #[cfg(test)]
 mod scale_tests {

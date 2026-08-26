@@ -188,41 +188,6 @@ pub async fn delete_csinode(
 // Use the macro to create a PATCH handler
 crate::patch_handler_cluster!(patch_csinode, CSINode, "csinodes", "storage.k8s.io");
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::{
-        resources::{CSINodeDriver, CSINodeSpec},
-        types::{ObjectMeta, TypeMeta},
-    };
-
-    fn create_test_node(name: &str) -> CSINode {
-        CSINode {
-            type_meta: TypeMeta {
-                kind: "CSINode".to_string(),
-                api_version: "storage.k8s.io/v1".to_string(),
-            },
-            metadata: ObjectMeta::new(name),
-            spec: CSINodeSpec {
-                drivers: vec![CSINodeDriver {
-                    name: "test-driver".to_string(),
-                    node_id: "node1-id".to_string(),
-                    topology_keys: None,
-                    allocatable: None,
-                }],
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn test_csinode_serialization() {
-        let node = create_test_node("node1");
-        let json = serde_json::to_string(&node).unwrap();
-        let deserialized: CSINode = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metadata.name, "node1");
-    }
-}
-
 pub async fn deletecollection_csinodes(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -278,4 +243,39 @@ pub async fn deletecollection_csinodes(
         deleted_count
     );
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::{
+        resources::{CSINodeDriver, CSINodeSpec},
+        types::{ObjectMeta, TypeMeta},
+    };
+
+    fn create_test_node(name: &str) -> CSINode {
+        CSINode {
+            type_meta: TypeMeta {
+                kind: "CSINode".to_string(),
+                api_version: "storage.k8s.io/v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name),
+            spec: CSINodeSpec {
+                drivers: vec![CSINodeDriver {
+                    name: "test-driver".to_string(),
+                    node_id: "node1-id".to_string(),
+                    topology_keys: None,
+                    allocatable: None,
+                }],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_csinode_serialization() {
+        let node = create_test_node("node1");
+        let json = serde_json::to_string(&node).unwrap();
+        let deserialized: CSINode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.metadata.name, "node1");
+    }
 }

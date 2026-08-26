@@ -42,6 +42,7 @@
           <li><a href="all-in-one.html">All-in-One Binary</a></li>
           <li><a href="docker-cluster.html">Compose + etcd</a></li>
           <li><a href="sqlite-cluster.html" class="active">Compose + SQLite</a></li>
+          <li><a href="redis-cluster.html">Compose + Redis</a></li>
           <li><a href="high-availability.html">High Availability</a></li>
         </ul>
       </div>
@@ -117,6 +118,7 @@
 
       <ul>
         <li><strong>SQLite</strong> &mdash; single-file embedded database, no external dependencies</li>
+        <li><strong>Redis</strong> &mdash; in-memory data store with optional persistence (see <a href="redis-cluster.html">Compose + Redis</a>)</li>
         <li><strong>PostgreSQL</strong> &mdash; for environments with existing PostgreSQL infrastructure</li>
         <li><strong>MySQL</strong> &mdash; for environments with existing MySQL infrastructure</li>
       </ul>
@@ -161,7 +163,7 @@
           <tr>
             <td>Compose file</td>
             <td><code>compose.yml</code> / <code>docker-compose.yml</code></td>
-            <td><code>compose.sqlite.yml</code> / <code>docker-compose.sqlite.yml</code></td>
+            <td><code>compose.sqlite.yml</code> / <code>docker-compose.sqlite.yml</code> (or <code>compose.redis.yml</code> for Redis)</td>
           </tr>
           <tr>
             <td>State storage</td>
@@ -397,7 +399,7 @@ FROM pragma_page_count(), pragma_page_size();
 </code>
       </pre>
 
-      <h2>Switching Between etcd and SQLite</h2>
+      <h2>Switching Between etcd, SQLite, and Redis</h2>
       <p>
         You can switch between deployment modes without changing any workload YAML. The API
         is identical &mdash; only the storage backend changes.
@@ -406,8 +408,8 @@ FROM pragma_page_count(), pragma_page_size();
       <div class="admonition warning">
         <div class="admonition-title">WARNING</div>
         <p>
-          State is not automatically migrated between etcd and SQLite. If you switch modes,
-          you start with a fresh cluster. To migrate state, you would need to export all
+          State is not automatically migrated between etcd, SQLite, and Redis. If you switch
+          modes, you start with a fresh cluster. To migrate state, you would need to export all
           resources from one backend and re-apply them to the other using <code>kubectl</code>.
         </p>
       </div>
@@ -425,6 +427,9 @@ podman compose -f compose.yml down
 
 <span class="comment"># Start with SQLite instead</span>
 podman compose -f compose.sqlite.yml up -d
+
+<span class="comment"># Or start with Redis instead</span>
+podman compose -f compose.redis.yml up -d
 
 <span class="comment"># Or switch back to etcd</span>
 podman compose -f compose.sqlite.yml down

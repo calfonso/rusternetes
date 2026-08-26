@@ -7,7 +7,7 @@ use rusternetes_common::resources::{
     VolumeSnapshotContent,
 };
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +28,6 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
 
         info!("Starting Dynamic Provisioner Controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -36,7 +35,6 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -86,10 +84,17 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("persistentvolumeclaims", Some(ns), name);
-            match self.storage.get::<PersistentVolumeClaim>(&storage_key).await {
+            match self
+                .storage
+                .get::<PersistentVolumeClaim>(&storage_key)
+                .await
+            {
                 Ok(pvc) => {
                     // Only process unbound PVCs with a storage class
                     if pvc.spec.volume_name.is_none() && pvc.spec.storage_class_name.is_some() {
@@ -113,7 +118,11 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<PersistentVolumeClaim>("/registry/persistentvolumeclaims/").await {
+        match self
+            .storage
+            .list::<PersistentVolumeClaim>("/registry/persistentvolumeclaims/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let ns = item.metadata.namespace.as_deref().unwrap_or("");
@@ -127,6 +136,7 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         // Get all PVCs
         let pvcs: Vec<PersistentVolumeClaim> = self
@@ -265,7 +275,7 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         };
 
         let message = if snapshot_source_path.is_some() {
-            Some(format!("Dynamically provisioned from snapshot"))
+            Some("Dynamically provisioned from snapshot".to_string())
         } else {
             Some("Dynamically provisioned".to_string())
         };

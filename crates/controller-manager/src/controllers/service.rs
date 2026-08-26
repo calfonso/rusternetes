@@ -12,10 +12,9 @@
 /// - EndpointSliceController: Maintains endpoint slices for scalability
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_common::resources::IntOrString;
 use rusternetes_common::resources::Service;
 use rusternetes_common::resources::ServiceType;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -55,7 +54,6 @@ impl<S: Storage + 'static> ServiceController<S> {
     /// Falls back to periodic resync every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         self.initialize().await?;
-
 
         let queue = WorkQueue::new();
 
@@ -159,19 +157,20 @@ impl<S: Storage + 'static> ServiceController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("services", Some(ns), name);
             match self.storage.get::<Service>(&storage_key).await {
-                Ok(resource) => {
-                    match self.reconcile_service(&resource).await {
-                        Ok(()) => queue.forget(&key).await,
-                        Err(e) => {
-                            error!("Failed to reconcile {}: {}", key, e);
-                            queue.requeue_rate_limited(key.clone()).await;
-                        }
+                Ok(resource) => match self.reconcile_service(&resource).await {
+                    Ok(()) => queue.forget(&key).await,
+                    Err(e) => {
+                        error!("Failed to reconcile {}: {}", key, e);
+                        queue.requeue_rate_limited(key.clone()).await;
                     }
-                }
+                },
                 Err(_) => {
                     queue.forget(&key).await;
                 }
@@ -195,6 +194,7 @@ impl<S: Storage + 'static> ServiceController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting service reconciliation");
 
@@ -381,6 +381,7 @@ impl<S: Storage + 'static> ServiceController<S> {
     }
 
     /// Handle service deletion - release allocated resources
+    #[allow(dead_code)]
     pub async fn handle_service_deletion(&self, namespace: &str, service_name: &str) -> Result<()> {
         info!(
             "Handling deletion of service {}/{}",
@@ -442,7 +443,7 @@ impl<S: Storage + 'static> ServiceController<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::{ServicePort, ServiceSpec};
+    use rusternetes_common::resources::{IntOrString, ServicePort, ServiceSpec};
     use rusternetes_common::types::ObjectMeta;
 
     #[tokio::test]
@@ -471,11 +472,11 @@ mod tests {
 
         // Allocate first NodePort
         let port1 = controller.allocate_node_port().await.unwrap();
-        assert!(port1 >= NODE_PORT_MIN && port1 <= NODE_PORT_MAX);
+        assert!((NODE_PORT_MIN..=NODE_PORT_MAX).contains(&port1));
 
         // Allocate second NodePort
         let port2 = controller.allocate_node_port().await.unwrap();
-        assert!(port2 >= NODE_PORT_MIN && port2 <= NODE_PORT_MAX);
+        assert!((NODE_PORT_MIN..=NODE_PORT_MAX).contains(&port2));
 
         // Ports should be different
         assert_ne!(port1, port2);

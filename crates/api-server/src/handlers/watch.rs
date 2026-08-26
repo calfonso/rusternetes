@@ -159,12 +159,13 @@ where
     // Extract parameters
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
     let send_initial_events = params.send_initial_events.unwrap_or(false);
-    // Watch timeout: use client-requested timeout, capped at 5 minutes.
-    // K8s default is ~30 minutes but lingering watches from completed tests
-    // consume HTTP/2 streams. 5 minutes balances test needs (some watches
-    // need 300s) with stream recycling. client-go RetryWatcher auto-reconnects.
+    // Watch timeout: honor client-requested timeout, capped at 10 minutes.
+    // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
+    // request 350-572s timeouts. Capping below the client's request causes
+    // "context canceled" errors when the server closes the watch early.
+    // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go
     let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(300).min(300),
+        params.timeout_seconds.unwrap_or(600).min(600),
     ));
     let label_selector = params.label_selector.clone();
     let field_selector = params.field_selector.clone();
@@ -451,7 +452,11 @@ where
                             }
                             Some(Ok(WatchEvent::Deleted(key, prev_value))) => {
                                 debug!("Watch event - Deleted: {}", key);
-                                // For DELETE events, Kubernetes requires the full object with metadata
+                                // For DELETE events, Kubernetes requires the full object with metadata.
+                                // Try typed deserialization first; fall back to raw JSON if it fails.
+                                // prev_kv can be empty after etcd compaction or when the storage
+                                // backend doesn't capture the previous value. Silently dropping
+                                // the DELETE event causes watchers to hang (conformance #4).
                                 if let Ok(object) = serde_json::from_str::<T>(&prev_value) {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
@@ -478,6 +483,18 @@ where
                                         object,
                                     };
                                     if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
+                                            debug!("Watch: tx.send failed, client disconnected");
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    // Typed deserialization failed — use raw JSON fallback.
+                                    debug!("Watch: typed deser failed for DELETE key={}, using raw fallback", key);
+                                    if let Some(rv) = extract_rv_from_json(&prev_value) {
+                                        latest_resource_version = Some(rv);
+                                    }
+                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -630,12 +647,13 @@ where
     // Extract parameters
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
     let send_initial_events = params.send_initial_events.unwrap_or(false);
-    // Watch timeout: use client-requested timeout, capped at 5 minutes.
-    // K8s default is ~30 minutes but lingering watches from completed tests
-    // consume HTTP/2 streams. 5 minutes balances test needs (some watches
-    // need 300s) with stream recycling. client-go RetryWatcher auto-reconnects.
+    // Watch timeout: honor client-requested timeout, capped at 10 minutes.
+    // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
+    // request 350-572s timeouts. Capping below the client's request causes
+    // "context canceled" errors when the server closes the watch early.
+    // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go
     let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(300).min(300),
+        params.timeout_seconds.unwrap_or(600).min(600),
     ));
     let label_selector = params.label_selector.clone();
     let field_selector = params.field_selector.clone();
@@ -906,7 +924,11 @@ where
                             }
                             Some(Ok(WatchEvent::Deleted(key, prev_value))) => {
                                 debug!("Watch event - Deleted: {}", key);
-                                // For DELETE events, Kubernetes requires the full object with metadata
+                                // For DELETE events, Kubernetes requires the full object with metadata.
+                                // Try typed deserialization first; fall back to raw JSON if it fails.
+                                // prev_kv can be empty after etcd compaction or when the storage
+                                // backend doesn't capture the previous value. Silently dropping
+                                // the DELETE event causes watchers to hang (conformance #4).
                                 if let Ok(object) = serde_json::from_str::<T>(&prev_value) {
                                     // Update latest resourceVersion
                                     if let Some(rv) = object.metadata().resource_version.as_ref() {
@@ -933,6 +955,18 @@ where
                                         object,
                                     };
                                     if let Ok(json) = serde_json::to_string(&k8s_event) {
+                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
+                                            debug!("Watch: tx.send failed, client disconnected");
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    // Typed deserialization failed — use raw JSON fallback.
+                                    debug!("Watch: typed deser failed for DELETE key={}, using raw fallback", key);
+                                    if let Some(rv) = extract_rv_from_json(&prev_value) {
+                                        latest_resource_version = Some(rv);
+                                    }
+                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value) {
                                         if tx.send(Ok(format!("{}\n", json))).await.is_err() {
                                             debug!("Watch: tx.send failed, client disconnected");
                                             break;
@@ -1070,13 +1104,13 @@ fn matches_label_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
             match captures {
                 SetRequirement::In(key, values) => {
                     let label_val = labels.get(key);
-                    if !values.iter().any(|v| label_val.map_or(false, |lv| lv == v)) {
+                    if !values.iter().any(|v| label_val.is_some_and(|lv| lv == v)) {
                         return false;
                     }
                 }
                 SetRequirement::NotIn(key, values) => {
                     let label_val = labels.get(key);
-                    if values.iter().any(|v| label_val.map_or(false, |lv| lv == v)) {
+                    if values.iter().any(|v| label_val.is_some_and(|lv| lv == v)) {
                         return false;
                     }
                 }
@@ -1098,19 +1132,18 @@ fn matches_label_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
             // Handle != (key!=value)
             if key.ends_with('!') {
                 let key = key.trim_end_matches('!');
-                if labels.get(key).map_or(false, |v| v == value) {
+                if labels.get(key).is_some_and(|v| v == value) {
                     return false; // Must NOT equal
                 }
             } else {
                 // key=value or key==value: must match
                 let value = value.trim_start_matches('='); // handle ==
-                if labels.get(key).map_or(true, |v| v != value) {
+                if labels.get(key).is_none_or(|v| v != value) {
                     return false;
                 }
             }
-        } else if requirement.starts_with('!') {
+        } else if let Some(key) = requirement.strip_prefix('!') {
             // !key — key must not exist
-            let key = &requirement[1..];
             if labels.contains_key(key) {
                 return false;
             }
@@ -1181,23 +1214,80 @@ fn matches_field_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
 
     for requirement in selector.split(',') {
         let requirement = requirement.trim();
-        if let Some((field, value)) = requirement.split_once('=') {
-            match field {
-                "metadata.name" => {
-                    if metadata.name != value {
-                        return false;
-                    }
-                }
-                "metadata.namespace" => {
-                    if metadata.namespace.as_deref() != Some(value) {
-                        return false;
-                    }
-                }
-                _ => {} // Unknown fields pass through
-            }
+
+        // `!=` has to be probed before `=`. `split_once('=')` splits inside the
+        // `!=`, which leaves the field name with a trailing `!` ("metadata.name!"),
+        // and an unrecognised field is passed through — so a negated requirement
+        // would be dropped instead of applied.
+        let (field, value, negated) = match requirement.split_once("!=") {
+            Some((field, value)) => (field.trim(), value.trim(), true),
+            None => match requirement.split_once('=') {
+                Some((field, value)) => (field.trim(), value.trim(), false),
+                None => continue,
+            },
+        };
+
+        let equal = match field {
+            "metadata.name" => metadata.name == value,
+            "metadata.namespace" => metadata.namespace.as_deref() == Some(value),
+            _ => continue, // Unknown fields pass through
+        };
+
+        // `=` keeps only equal objects, `!=` keeps only unequal ones.
+        if equal == negated {
+            return false;
         }
     }
     true
+}
+
+/// Construct a fallback DELETE event JSON when typed deserialization fails.
+///
+/// When etcd's prev_kv is absent (compaction) or the stored JSON doesn't match
+/// the typed struct, the DELETE event must still be delivered. K8s always
+/// delivers DELETE events; the object payload is best-effort.
+///
+/// Returns `Some(json_string)` if a valid event was constructed, `None` otherwise.
+pub fn build_delete_fallback_json(key: &str, prev_value: &str) -> Option<String> {
+    // Try to parse prev_value as raw JSON
+    if let Ok(raw_obj) = serde_json::from_str::<serde_json::Value>(prev_value) {
+        let k8s_event = serde_json::json!({
+            "type": "DELETED",
+            "object": raw_obj
+        });
+        return serde_json::to_string(&k8s_event).ok();
+    }
+
+    // prev_value is not valid JSON — construct minimal DELETE event from the key path.
+    // Key format: /registry/{type}/{ns}/{name} or /registry/{type}/{name}
+    let parts: Vec<&str> = key.split('/').collect();
+    let name = parts.last().unwrap_or(&"");
+    let ns = if parts.len() >= 5 {
+        parts[parts.len() - 2]
+    } else {
+        ""
+    };
+    let k8s_event = serde_json::json!({
+        "type": "DELETED",
+        "object": {
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+            }
+        }
+    });
+    serde_json::to_string(&k8s_event).ok()
+}
+
+/// Extract resourceVersion from a raw JSON string.
+pub fn extract_rv_from_json(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/metadata/resourceVersion")
+                .and_then(|rv| rv.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 /// Derive the Kind and apiVersion from resource_type and api_group
@@ -2202,7 +2292,9 @@ pub async fn watch_cluster_scoped_json(
 
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
     let send_initial_events = params.send_initial_events.unwrap_or(false);
-    let timeout_duration = Some(Duration::from_secs(params.timeout_seconds.unwrap_or(300)));
+    let timeout_duration = Some(Duration::from_secs(
+        params.timeout_seconds.unwrap_or(300).min(300),
+    ));
     let (bookmark_kind, bookmark_api_version) =
         resource_type_to_kind_and_version(resource_type, api_group);
 
@@ -2383,8 +2475,10 @@ pub async fn watch_namespaced_json(
 
     let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
     let send_initial_events = params.send_initial_events.unwrap_or(false);
-    let timeout_duration = Some(Duration::from_secs(params.timeout_seconds.unwrap_or(300)));
-    let requested_rv = params.resource_version.clone();
+    let timeout_duration = Some(Duration::from_secs(
+        params.timeout_seconds.unwrap_or(300).min(300),
+    ));
+    let _requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
         resource_type_to_kind_and_version(resource_type, api_group);
 
@@ -2531,4 +2625,116 @@ pub async fn watch_namespaced_json(
         .header(header::TRANSFER_ENCODING, "chunked")
         .body(body)
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(name: &str, namespace: Option<&str>) -> ObjectMeta {
+        let meta = ObjectMeta::new(name);
+        match namespace {
+            Some(ns) => meta.with_namespace(ns),
+            None => meta,
+        }
+    }
+
+    #[test]
+    fn field_selector_absent_or_empty_matches_everything() {
+        let m = meta("pod-a", Some("default"));
+        assert!(matches_field_selector(&m, &None));
+        assert!(matches_field_selector(&m, &Some(String::new())));
+    }
+
+    #[test]
+    fn field_selector_equality_filters_name_and_namespace() {
+        let m = meta("pod-a", Some("default"));
+
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.name=pod-a".to_string())
+        ));
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.name=pod-b".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default".to_string())
+        ));
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace=kube-system".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_honours_negated_requirements() {
+        let m = meta("pod-a", Some("default"));
+
+        // `split_once('=')` used to split inside the `!=`, leaving the field name
+        // as "metadata.name!" -- an unrecognised field, so the requirement was
+        // dropped and the object matched regardless of the value.
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.name!=pod-a".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.name!=pod-b".to_string())
+        ));
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace!=default".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace!=kube-system".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_combines_requirements_with_and() {
+        let m = meta("pod-a", Some("default"));
+
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default,metadata.name!=pod-b".to_string())
+        ));
+        // The second requirement excludes it even though the first matches.
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default,metadata.name!=pod-a".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_passes_through_unsupported_fields() {
+        // Only metadata.name / metadata.namespace are evaluated here; anything
+        // else is deliberately not filtered, in either polarity.
+        let m = meta("pod-a", Some("default"));
+        assert!(matches_field_selector(
+            &m,
+            &Some("spec.nodeName=node-1".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("spec.nodeName!=node-1".to_string())
+        ));
+    }
+
+    #[test]
+    fn field_selector_namespace_requirement_excludes_cluster_scoped_objects() {
+        // Unchanged from before: an object with no namespace never satisfies a
+        // metadata.namespace equality requirement.
+        let m = meta("node-1", None);
+        assert!(!matches_field_selector(
+            &m,
+            &Some("metadata.namespace=default".to_string())
+        ));
+        assert!(matches_field_selector(
+            &m,
+            &Some("metadata.namespace!=default".to_string())
+        ));
+    }
 }

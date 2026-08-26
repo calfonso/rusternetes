@@ -134,7 +134,7 @@ fn test_content_negotiation() {
     use axum::http::{header, HeaderMap};
     use rusternetes_api_server::response::{negotiate_content_type, ContentType};
 
-    let pod = Pod {
+    let _pod = Pod {
         api_version: "v1".to_string(),
         kind: "Pod".to_string(),
         metadata: Metadata {

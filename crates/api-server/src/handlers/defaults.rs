@@ -66,6 +66,16 @@ fn apply_container_defaults(container: &mut rusternetes_common::resources::Conta
         }
     }
 
+    // K8s: SetDefaults_Container — default port protocol to TCP
+    // K8s ref: pkg/apis/core/v1/defaults.go — SetDefaults_Container
+    if let Some(ref mut ports) = container.ports {
+        for port in ports.iter_mut() {
+            if port.protocol.is_none() {
+                port.protocol = Some("TCP".to_string());
+            }
+        }
+    }
+
     // K8s: SetDefaults_Probe (runs on all probes)
     if let Some(ref mut probe) = container.liveness_probe {
         apply_probe_defaults(probe);
@@ -405,7 +415,7 @@ mod tests {
                 liveness_probe: Some(Probe {
                     http_get: Some(HTTPGetAction {
                         path: Some("/health".to_string()),
-                        port: 8080,
+                        port: rusternetes_common::resources::IntOrString::Int(8080),
                         host: None,
                         scheme: None,
                         http_headers: None,

@@ -61,7 +61,7 @@ pub async fn create(
         kind: "ConfigMap".to_string(),
     };
     let cm_value = serde_json::to_value(&configmap).ok();
-    if let Err(e) = state
+    state
         .webhook_manager
         .run_validating_admission_policies_ext(
             &Operation::Create,
@@ -71,14 +71,10 @@ pub async fn create(
             Some("configmaps"),
             Some(&namespace),
         )
-        .await
-    {
-        return Err(e);
-    }
+        .await?;
 
     // Run admission webhooks (mutating + validating)
     {
-        use crate::admission_webhook::AdmissionWebhookClient;
         let gvr = rusternetes_common::admission::GroupVersionResource {
             group: "".to_string(),
             version: "v1".to_string(),
@@ -94,7 +90,7 @@ pub async fn create(
         // Run mutating webhooks
         let (_response, mutated_obj) = state
             .webhook_manager
-            .run_mutating_webhooks(
+            .run_mutating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Create,
                 &gvk,
                 &gvr,
@@ -103,6 +99,7 @@ pub async fn create(
                 cm_val.clone(),
                 None,
                 &user_info,
+                is_dry_run,
             )
             .await?;
         // Check if the mutating webhook DENIED the request.
@@ -119,9 +116,9 @@ pub async fn create(
             }
         }
         // Run validating webhooks
-        match state
+        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
             .webhook_manager
-            .run_validating_webhooks(
+            .run_validating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Create,
                 &gvk,
                 &gvr,
@@ -130,16 +127,14 @@ pub async fn create(
                 serde_json::to_value(&configmap).ok(),
                 None,
                 &user_info,
+                is_dry_run,
             )
             .await?
         {
-            rusternetes_common::admission::AdmissionResponse::Deny(reason) => {
-                return Err(rusternetes_common::Error::Forbidden(format!(
-                    "admission webhook denied the request: {}",
-                    reason
-                )));
-            }
-            _ => {}
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "admission webhook denied the request: {}",
+                reason
+            )));
         }
     }
 
@@ -221,7 +216,7 @@ pub async fn update(
         kind: "ConfigMap".to_string(),
     };
     let cm_value = serde_json::to_value(&configmap).ok();
-    if let Err(e) = state
+    state
         .webhook_manager
         .run_validating_admission_policies_ext(
             &Operation::Update,
@@ -231,14 +226,10 @@ pub async fn update(
             Some("configmaps"),
             Some(&namespace),
         )
-        .await
-    {
-        return Err(e);
-    }
+        .await?;
 
     // Run admission webhooks (mutating + validating) for UPDATE
     {
-        use crate::admission_webhook::AdmissionWebhookClient;
         let gvr = rusternetes_common::admission::GroupVersionResource {
             group: "".to_string(),
             version: "v1".to_string(),
@@ -254,7 +245,7 @@ pub async fn update(
         // Run mutating webhooks
         let (_response, mutated_obj) = state
             .webhook_manager
-            .run_mutating_webhooks(
+            .run_mutating_webhooks_with_dryrun(
                 &rusternetes_common::admission::Operation::Update,
                 &gvk,
                 &gvr,
@@ -263,6 +254,7 @@ pub async fn update(
                 cm_val.clone(),
                 None,
                 &user_info,
+                is_dry_run,
             )
             .await?;
         // Check if the mutating webhook DENIED the request.
@@ -278,7 +270,7 @@ pub async fn update(
             }
         }
         // Run validating webhooks
-        match state
+        if let rusternetes_common::admission::AdmissionResponse::Deny(reason) = state
             .webhook_manager
             .run_validating_webhooks(
                 &rusternetes_common::admission::Operation::Update,
@@ -292,13 +284,10 @@ pub async fn update(
             )
             .await?
         {
-            rusternetes_common::admission::AdmissionResponse::Deny(reason) => {
-                return Err(rusternetes_common::Error::Forbidden(format!(
-                    "admission webhook denied the request: {}",
-                    reason
-                )));
-            }
-            _ => {}
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "admission webhook denied the request: {}",
+                reason
+            )));
         }
     }
 
@@ -423,8 +412,8 @@ pub async fn list(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
@@ -487,8 +476,8 @@ pub async fn list_all_configmaps(
             timeout_seconds: params
                 .get("timeoutSeconds")
                 .and_then(|v| v.parse::<u64>().ok()),
-            label_selector: params.get("labelSelector").map(|s| s.clone()),
-            field_selector: params.get("fieldSelector").map(|s| s.clone()),
+            label_selector: params.get("labelSelector").cloned(),
+            field_selector: params.get("fieldSelector").cloned(),
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")

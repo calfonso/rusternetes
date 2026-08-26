@@ -28,7 +28,7 @@ pub async fn create_resourceclaim(
         claim
             .metadata
             .as_ref()
-            .map(|m| m.name.as_ref().map(|n| n.as_str()).unwrap_or(""))
+            .map(|m| m.name.as_deref().unwrap_or(""))
             .unwrap_or("")
     );
 

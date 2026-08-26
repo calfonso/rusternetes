@@ -17,6 +17,7 @@ pub struct PrometheusClient {
     /// Cache of query results with TTL
     cache: Arc<RwLock<MetricsCache>>,
     /// Prometheus server URL
+    #[allow(dead_code)]
     prometheus_url: String,
 }
 
@@ -346,6 +347,7 @@ impl PrometheusClient {
     }
 
     /// Get the Prometheus server URL
+    #[allow(dead_code)]
     pub fn url(&self) -> &str {
         &self.prometheus_url
     }

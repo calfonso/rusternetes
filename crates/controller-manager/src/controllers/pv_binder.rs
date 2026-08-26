@@ -5,7 +5,7 @@ use rusternetes_common::resources::volume::{
 use rusternetes_common::resources::{
     PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus,
 };
-use rusternetes_storage::{build_key, Storage, WorkQueue, extract_key};
+use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -25,7 +25,6 @@ impl<S: Storage + 'static> PVBinderController<S> {
 
         info!("Starting PV/PVC Binder Controller");
 
-
         let queue = WorkQueue::new();
 
         let worker_queue = queue.clone();
@@ -33,7 +32,6 @@ impl<S: Storage + 'static> PVBinderController<S> {
         tokio::spawn(async move {
             worker_self.worker(worker_queue).await;
         });
-
 
         loop {
             self.enqueue_all(&queue).await;
@@ -83,10 +81,17 @@ impl<S: Storage + 'static> PVBinderController<S> {
             let parts: Vec<&str> = key.splitn(3, '/').collect();
             let (ns, name) = match parts.len() {
                 3 => (parts[1], parts[2]),
-                _ => { queue.done(&key).await; continue; }
+                _ => {
+                    queue.done(&key).await;
+                    continue;
+                }
             };
             let storage_key = build_key("persistentvolumeclaims", Some(ns), name);
-            match self.storage.get::<PersistentVolumeClaim>(&storage_key).await {
+            match self
+                .storage
+                .get::<PersistentVolumeClaim>(&storage_key)
+                .await
+            {
                 Ok(resource) => {
                     let mut resource = resource;
                     match self.bind_pvc(&mut resource).await {
@@ -106,7 +111,11 @@ impl<S: Storage + 'static> PVBinderController<S> {
     }
 
     async fn enqueue_all(&self, queue: &WorkQueue) {
-        match self.storage.list::<PersistentVolumeClaim>("/registry/persistentvolumeclaims/").await {
+        match self
+            .storage
+            .list::<PersistentVolumeClaim>("/registry/persistentvolumeclaims/")
+            .await
+        {
             Ok(items) => {
                 for item in &items {
                     let ns = item.metadata.namespace.as_deref().unwrap_or("");
@@ -120,6 +129,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         // Get all PVCs
         let pvcs: Vec<PersistentVolumeClaim> = self
