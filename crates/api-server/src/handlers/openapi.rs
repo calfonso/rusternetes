@@ -769,6 +769,8 @@ fn strip_false_extensions(value: &mut serde_json::Value) {
         // Zero-value integers should be omitted (Go omitempty on int64/float64).
         // JSONSchemaProps fields like maxLength, minLength, maxItems, etc. use
         // pointer types (*int64) in Go with omitempty — zero means "not set".
+        // IMPORTANT: For min* fields, 0 has semantic meaning (explicitly allow 0),
+        // so only strip max* and multipleOf when zero.
         let zero_int_fields = [
             "maximum",
             "minimum",
@@ -785,6 +787,23 @@ fn strip_false_extensions(value: &mut serde_json::Value) {
                 if n.as_f64() == Some(0.0) || n.as_i64() == Some(0) {
                     obj.remove(*key);
                 }
+            }
+        }
+
+        // For minimum constraints, only strip if explicitly negative or very large
+        // (likely default values), preserve 0 as it has semantic meaning
+        let min_fields = ["minimum", "minLength", "minItems", "minProperties"];
+        for key in &min_fields {
+            match obj.get(*key) {
+                Some(serde_json::Value::Number(n)) => {
+                    // Only strip if it looks like an unset sentinel value
+                    if let Some(i) = n.as_i64() {
+                        if i < 0 || i > 1000000 {
+                            obj.remove(*key);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
