@@ -59,7 +59,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 cel = "0.14" # Common Expression Language (CEL) interpreter
 x509-parser = "0.16" # X.509 certificate parsing
 pem = "4.0" # PEM format encoding/decoding
-base64 = "0.22" # Base64 encoding/decoding
+base64 = "0.23" # Base64 encoding/decoding
 serial_test = "4.0" # Serialize tests that modify global state
 warp = "0.3" # HTTP server framework for testing
 
