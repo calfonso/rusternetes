@@ -51,7 +51,7 @@ rcgen = "0.13" # Certificate generation
 prometheus = "0.14" # Prometheus metrics
 opentelemetry = "0.32" # Distributed tracing
 opentelemetry-prometheus = "0.15" # Prometheus exporter for OpenTelemetry
-opentelemetry-jaeger = "0.21" # Jaeger exporter for OpenTelemetry
+opentelemetry-jaeger = "0.22" # Jaeger exporter for OpenTelemetry
 opentelemetry-otlp = "0.32" # OTLP exporter for OpenTelemetry
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] } # OpenTelemetry SDK
 tracing-opentelemetry = "0.23" # OpenTelemetry integration with tracing
