@@ -1094,27 +1094,10 @@ pub async fn create_eviction(
     let pdbs: Vec<rusternetes_common::resources::PodDisruptionBudget> =
         state.storage.list(&pdb_prefix).await.unwrap_or_default();
 
-    // Get pod labels for matching
-    let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
-
     // Check if any PDB applies to this pod
     for pdb in &pdbs {
-        // Check if PDB selector matches the pod
-        let selector = &pdb.spec.selector;
-
-        // Check if all match_labels are present in pod labels
-        let matches = if let Some(ref match_labels) = selector.match_labels {
-            match_labels
-                .iter()
-                .all(|(k, v)| pod_labels.get(k).map(|pv| pv == v).unwrap_or(false))
-        } else if selector.match_expressions.is_some() {
-            // TODO: Implement match_expressions support for more complex selectors
-            // For now, treat match_expressions as non-matching
-            false
-        } else {
-            // Empty selector (no match_labels or match_expressions) matches nothing
-            false
-        };
+        // Check if PDB selector matches the pod (matchLabels AND matchExpressions)
+        let matches = pod_matches_pdb_selector(&pod, &pdb.spec.selector);
 
         if matches {
             // This PDB applies to our pod - compute disruptions_allowed inline
@@ -1246,7 +1229,41 @@ fn pod_matches_pdb_selector(
         }
     }
 
+    if let Some(match_expressions) = &selector.match_expressions {
+        for expr in match_expressions {
+            if !pod_matches_pdb_expression(pod_labels, expr) {
+                return false;
+            }
+        }
+    }
+
     true
+}
+
+/// Check if pod labels satisfy a single label selector expression
+fn pod_matches_pdb_expression(
+    pod_labels: &std::collections::HashMap<String, String>,
+    expr: &rusternetes_common::types::LabelSelectorRequirement,
+) -> bool {
+    let label_value = pod_labels.get(&expr.key);
+    let empty_values = vec![];
+
+    match expr.operator.as_str() {
+        "In" => {
+            let values = expr.values.as_ref().unwrap_or(&empty_values);
+            label_value.map(|v| values.contains(v)).unwrap_or(false)
+        }
+        "NotIn" => {
+            let values = expr.values.as_ref().unwrap_or(&empty_values);
+            label_value.map(|v| !values.contains(v)).unwrap_or(true)
+        }
+        "Exists" => label_value.is_some(),
+        "DoesNotExist" => label_value.is_none(),
+        _ => {
+            tracing::warn!("Unknown label selector operator: {}", expr.operator);
+            false
+        }
+    }
 }
 
 /// Check if a pod is healthy (Running phase)
@@ -1528,6 +1545,80 @@ mod tests {
             match_expressions: None,
         };
         assert!(!pod_matches_pdb_selector(&pod, &wrong_selector));
+    }
+
+    #[test]
+    fn test_pod_matches_pdb_selector_match_expressions_only() {
+        // A selector with only matchExpressions (no matchLabels) must actually
+        // evaluate the expression, not match every pod unconditionally.
+        let non_matching_labels = HashMap::from([("tier".to_string(), "backend".to_string())]);
+        let non_matching_pod = make_pod("p1", "default", non_matching_labels, true);
+
+        let matching_labels = HashMap::from([("tier".to_string(), "frontend".to_string())]);
+        let matching_pod = make_pod("p2", "default", matching_labels, true);
+
+        let selector = LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "tier".to_string(),
+                operator: "In".to_string(),
+                values: Some(vec!["frontend".to_string()]),
+            }]),
+        };
+
+        assert!(
+            !pod_matches_pdb_selector(&non_matching_pod, &selector),
+            "pod with tier=backend must not match a matchExpressions selector requiring tier in [frontend]"
+        );
+        assert!(
+            pod_matches_pdb_selector(&matching_pod, &selector),
+            "pod with tier=frontend must match a matchExpressions selector requiring tier in [frontend]"
+        );
+    }
+
+    #[test]
+    fn test_pod_matches_pdb_selector_combined_labels_and_expressions() {
+        let labels = HashMap::from([
+            ("app".to_string(), "web".to_string()),
+            ("env".to_string(), "prod".to_string()),
+        ]);
+        let pod = make_pod("p1", "default", labels, true);
+
+        // Both matchLabels and matchExpressions satisfied.
+        let selector = LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "In".to_string(),
+                values: Some(vec!["prod".to_string()]),
+            }]),
+        };
+        assert!(pod_matches_pdb_selector(&pod, &selector));
+
+        // matchLabels satisfied but matchExpressions is not - must not match.
+        let selector_expr_fails = LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "NotIn".to_string(),
+                values: Some(vec!["prod".to_string()]),
+            }]),
+        };
+        assert!(!pod_matches_pdb_selector(&pod, &selector_expr_fails));
+    }
+
+    #[test]
+    fn test_pod_matches_pdb_selector_empty_selector_matches_all() {
+        // A completely empty selector (no matchLabels, no matchExpressions)
+        // matches every pod, per Kubernetes label selector semantics.
+        let labels = HashMap::from([("app".to_string(), "web".to_string())]);
+        let pod = make_pod("p1", "default", labels, true);
+
+        let selector = LabelSelector {
+            match_labels: None,
+            match_expressions: None,
+        };
+        assert!(pod_matches_pdb_selector(&pod, &selector));
     }
 
     #[test]
