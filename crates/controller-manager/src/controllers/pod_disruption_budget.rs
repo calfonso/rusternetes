@@ -325,13 +325,43 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
             }
         }
 
-        // TODO: Implement match_expressions support
-        // For now, if there are match_expressions, we skip them
-        if selector.match_expressions.is_some() {
-            debug!("match_expressions not yet implemented for PDB selector matching");
+        // Check match_expressions
+        if let Some(match_expressions) = &selector.match_expressions {
+            for expr in match_expressions {
+                if !self.pod_matches_expression(pod_labels, expr) {
+                    return false;
+                }
+            }
         }
 
         true
+    }
+
+    /// Check if pod labels satisfy a single label selector expression
+    fn pod_matches_expression(
+        &self,
+        pod_labels: &std::collections::HashMap<String, String>,
+        expr: &rusternetes_common::types::LabelSelectorRequirement,
+    ) -> bool {
+        let label_value = pod_labels.get(&expr.key);
+        let empty_vec = vec![];
+
+        match expr.operator.as_str() {
+            "In" => {
+                let values = expr.values.as_ref().unwrap_or(&empty_vec);
+                label_value.map(|v| values.contains(v)).unwrap_or(false)
+            }
+            "NotIn" => {
+                let values = expr.values.as_ref().unwrap_or(&empty_vec);
+                label_value.map(|v| !values.contains(v)).unwrap_or(true)
+            }
+            "Exists" => label_value.is_some(),
+            "DoesNotExist" => label_value.is_none(),
+            _ => {
+                warn!("Unknown label selector operator: {}", expr.operator);
+                false
+            }
+        }
     }
 }
 
@@ -532,6 +562,177 @@ mod tests {
         };
 
         assert!(!controller.pod_matches_selector(&pod, &selector_no_match));
+    }
+
+    #[tokio::test]
+    async fn test_pod_matches_expression_in() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PodDisruptionBudgetController::new(storage);
+
+        let labels = HashMap::from([("env".to_string(), "prod".to_string())]);
+
+        let matching = rusternetes_common::types::LabelSelectorRequirement {
+            key: "env".to_string(),
+            operator: "In".to_string(),
+            values: Some(vec!["prod".to_string(), "staging".to_string()]),
+        };
+        assert!(controller.pod_matches_expression(&labels, &matching));
+
+        let non_matching = rusternetes_common::types::LabelSelectorRequirement {
+            key: "env".to_string(),
+            operator: "In".to_string(),
+            values: Some(vec!["dev".to_string()]),
+        };
+        assert!(!controller.pod_matches_expression(&labels, &non_matching));
+
+        let missing_key = rusternetes_common::types::LabelSelectorRequirement {
+            key: "missing".to_string(),
+            operator: "In".to_string(),
+            values: Some(vec!["prod".to_string()]),
+        };
+        assert!(!controller.pod_matches_expression(&labels, &missing_key));
+    }
+
+    #[tokio::test]
+    async fn test_pod_matches_expression_not_in() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PodDisruptionBudgetController::new(storage);
+
+        let labels = HashMap::from([("env".to_string(), "prod".to_string())]);
+
+        let matching = rusternetes_common::types::LabelSelectorRequirement {
+            key: "env".to_string(),
+            operator: "NotIn".to_string(),
+            values: Some(vec!["dev".to_string()]),
+        };
+        assert!(controller.pod_matches_expression(&labels, &matching));
+
+        let non_matching = rusternetes_common::types::LabelSelectorRequirement {
+            key: "env".to_string(),
+            operator: "NotIn".to_string(),
+            values: Some(vec!["prod".to_string()]),
+        };
+        assert!(!controller.pod_matches_expression(&labels, &non_matching));
+
+        // A missing key trivially satisfies NotIn.
+        let missing_key = rusternetes_common::types::LabelSelectorRequirement {
+            key: "missing".to_string(),
+            operator: "NotIn".to_string(),
+            values: Some(vec!["prod".to_string()]),
+        };
+        assert!(controller.pod_matches_expression(&labels, &missing_key));
+    }
+
+    #[tokio::test]
+    async fn test_pod_matches_expression_exists() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PodDisruptionBudgetController::new(storage);
+
+        let labels = HashMap::from([("env".to_string(), "prod".to_string())]);
+
+        let present = rusternetes_common::types::LabelSelectorRequirement {
+            key: "env".to_string(),
+            operator: "Exists".to_string(),
+            values: None,
+        };
+        assert!(controller.pod_matches_expression(&labels, &present));
+
+        let absent = rusternetes_common::types::LabelSelectorRequirement {
+            key: "missing".to_string(),
+            operator: "Exists".to_string(),
+            values: None,
+        };
+        assert!(!controller.pod_matches_expression(&labels, &absent));
+    }
+
+    #[tokio::test]
+    async fn test_pod_matches_expression_does_not_exist() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PodDisruptionBudgetController::new(storage);
+
+        let labels = HashMap::from([("env".to_string(), "prod".to_string())]);
+
+        let absent = rusternetes_common::types::LabelSelectorRequirement {
+            key: "missing".to_string(),
+            operator: "DoesNotExist".to_string(),
+            values: None,
+        };
+        assert!(controller.pod_matches_expression(&labels, &absent));
+
+        let present = rusternetes_common::types::LabelSelectorRequirement {
+            key: "env".to_string(),
+            operator: "DoesNotExist".to_string(),
+            values: None,
+        };
+        assert!(!controller.pod_matches_expression(&labels, &present));
+    }
+
+    #[tokio::test]
+    async fn test_pod_matches_selector_combined_labels_and_expressions() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PodDisruptionBudgetController::new(storage);
+
+        let pod = Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta {
+                labels: Some(HashMap::from([
+                    ("app".to_string(), "web".to_string()),
+                    ("env".to_string(), "prod".to_string()),
+                ])),
+                ..ObjectMeta::new("test-pod")
+            },
+            spec: None,
+            status: None,
+        };
+
+        // matchLabels and matchExpressions both satisfied.
+        let selector = LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "In".to_string(),
+                values: Some(vec!["prod".to_string(), "staging".to_string()]),
+            }]),
+        };
+        assert!(controller.pod_matches_selector(&pod, &selector));
+
+        // matchLabels satisfied but matchExpressions is not.
+        let selector_expr_fails = LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "NotIn".to_string(),
+                values: Some(vec!["prod".to_string()]),
+            }]),
+        };
+        assert!(!controller.pod_matches_selector(&pod, &selector_expr_fails));
+
+        // matchExpressions satisfied but matchLabels is not.
+        let selector_labels_fail = LabelSelector {
+            match_labels: Some(HashMap::from([("app".to_string(), "api".to_string())])),
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "In".to_string(),
+                values: Some(vec!["prod".to_string()]),
+            }]),
+        };
+        assert!(!controller.pod_matches_selector(&pod, &selector_labels_fail));
+
+        // A PDB with only matchExpressions (no matchLabels) must not match
+        // every pod in the namespace — this is the bug this test guards
+        // against.
+        let selector_expr_only = LabelSelector {
+            match_labels: None,
+            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+                key: "env".to_string(),
+                operator: "In".to_string(),
+                values: Some(vec!["staging".to_string()]),
+            }]),
+        };
+        assert!(!controller.pod_matches_selector(&pod, &selector_expr_only));
     }
 
     #[tokio::test]
