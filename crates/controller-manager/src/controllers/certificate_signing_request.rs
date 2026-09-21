@@ -167,14 +167,6 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
 
         debug!("Reconciling CSR {}", csr_name);
 
-        // Validate the CSR spec
-        if let Err(e) = self.validate_csr_spec(&csr.spec) {
-            warn!("CSR {} validation failed: {}", csr_name, e);
-            return self
-                .deny_csr(csr, &format!("Validation failed: {}", e))
-                .await;
-        }
-
         // Check if CSR is already approved/denied
         if let Some(status) = &csr.status {
             if let Some(conditions) = &status.conditions {
@@ -196,6 +188,14 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
                     }
                 }
             }
+        }
+
+        // Validate the CSR spec
+        if let Err(e) = self.validate_csr_spec(&csr.spec) {
+            warn!("CSR {} validation failed: {}", csr_name, e);
+            return self
+                .deny_csr(csr, &format!("Validation failed: {}", e))
+                .await;
         }
 
         // Auto-approve if policy allows
