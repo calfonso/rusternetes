@@ -597,6 +597,7 @@ impl AuthzStorage for EtcdStorage {
             Some(ns) => {
                 if std::any::type_name::<T>().contains("Role")
                     && !std::any::type_name::<T>().contains("Cluster")
+                    && !std::any::type_name::<T>().contains("Binding")
                 {
                     format!("/registry/roles/{}/{}", ns, key)
                 } else if std::any::type_name::<T>().contains("RoleBinding")
@@ -631,6 +632,7 @@ impl AuthzStorage for EtcdStorage {
             Some(ns) => {
                 if std::any::type_name::<T>().contains("Role")
                     && !std::any::type_name::<T>().contains("Cluster")
+                    && !std::any::type_name::<T>().contains("Binding")
                 {
                     format!("/registry/roles/{}/", ns)
                 } else if std::any::type_name::<T>().contains("RoleBinding")

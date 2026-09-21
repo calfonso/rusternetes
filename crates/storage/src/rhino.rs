@@ -413,6 +413,7 @@ impl<B: Backend + Send + Sync + 'static> AuthzStorage for RhinoStorage<B> {
             Some(ns) => {
                 if std::any::type_name::<T>().contains("Role")
                     && !std::any::type_name::<T>().contains("Cluster")
+                    && !std::any::type_name::<T>().contains("Binding")
                 {
                     format!("/registry/roles/{}/{}", ns, key)
                 } else if std::any::type_name::<T>().contains("RoleBinding")
@@ -447,6 +448,7 @@ impl<B: Backend + Send + Sync + 'static> AuthzStorage for RhinoStorage<B> {
             Some(ns) => {
                 if std::any::type_name::<T>().contains("Role")
                     && !std::any::type_name::<T>().contains("Cluster")
+                    && !std::any::type_name::<T>().contains("Binding")
                 {
                     format!("/registry/roles/{}/", ns)
                 } else if std::any::type_name::<T>().contains("RoleBinding")
