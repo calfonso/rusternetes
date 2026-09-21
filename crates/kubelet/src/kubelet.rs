@@ -89,6 +89,7 @@ impl Kubelet {
         cluster_domain: String,
         network: String,
         kubernetes_service_host: String,
+        pod_prefer_cluster_dns: bool,
     ) -> Result<Self> {
         let runtime = ContainerRuntime::new(
             volume_dir,
@@ -96,6 +97,7 @@ impl Kubelet {
             cluster_domain,
             network,
             kubernetes_service_host,
+            pod_prefer_cluster_dns,
         )
         .await?
         .with_storage(storage.clone());

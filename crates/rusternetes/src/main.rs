@@ -111,6 +111,12 @@ struct Args {
     /// Client CA certificate file for mTLS client certificate authentication
     #[arg(long)]
     client_ca_file: Option<String>,
+
+    /// By default, a pod's resolv.conf lists the node's own DNS server first
+    /// so pods can resolve sibling container names under Docker Compose.
+    /// Set this flag outside Compose so pods resolve cluster Service names.
+    #[arg(long, default_value = "false")]
+    pod_prefer_cluster_dns: bool,
 }
 
 fn main() -> Result<()> {
@@ -236,6 +242,7 @@ async fn run() -> Result<()> {
             .clone()
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
             .unwrap_or_else(|| "127.0.0.1".to_string()),
+        pod_prefer_cluster_dns: args.pod_prefer_cluster_dns,
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {

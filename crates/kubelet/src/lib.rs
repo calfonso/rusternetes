@@ -23,6 +23,7 @@ pub struct KubeletConfig {
     pub sync_interval: u64,
     pub metrics_port: u16,
     pub kubernetes_service_host: String,
+    pub pod_prefer_cluster_dns: bool,
 }
 
 impl Default for KubeletConfig {
@@ -36,6 +37,7 @@ impl Default for KubeletConfig {
             sync_interval: 3,
             metrics_port: 10250,
             kubernetes_service_host: "127.0.0.1".to_string(),
+            pod_prefer_cluster_dns: false,
         }
     }
 }
@@ -116,6 +118,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             config.cluster_domain,
             config.network,
             config.kubernetes_service_host,
+            config.pod_prefer_cluster_dns,
         )
         .await?,
     );

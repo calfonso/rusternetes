@@ -96,6 +96,7 @@ pub struct ContainerRuntime {
     /// Docker rejects it outright. See [`Self::detect_uts_container_mode`].
     supports_uts_container_mode: bool,
     kubernetes_service_host: String,
+    pod_prefer_cluster_dns: bool,
     /// Token manager for generating projected service account tokens
     token_manager: rusternetes_common::auth::TokenManager,
     /// Probe state tracker: key is "{pod_name}/{container_name}/{probe_type}"
@@ -188,6 +189,7 @@ impl ContainerRuntime {
         cluster_domain: String,
         network: String,
         kubernetes_service_host: String,
+        pod_prefer_cluster_dns: bool,
     ) -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()?;
 
@@ -231,6 +233,7 @@ impl ContainerRuntime {
             use_cni,
             supports_uts_container_mode,
             kubernetes_service_host,
+            pod_prefer_cluster_dns,
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(std::collections::HashSet::new()),
@@ -4108,6 +4111,9 @@ impl ContainerRuntime {
                                     })
                                 });
                         let nameservers = match host_dns {
+                            Some(dns) if self.pod_prefer_cluster_dns => {
+                                format!("nameserver {}\nnameserver {}", self.cluster_dns, dns)
+                            }
                             Some(dns) => {
                                 format!("nameserver {}\nnameserver {}", dns, self.cluster_dns)
                             }

@@ -86,6 +86,12 @@ struct Args {
     /// SQLite database path (only used when --storage-backend=sqlite)
     #[arg(long, default_value = "./data/rusternetes.db")]
     data_dir: String,
+
+    /// By default, a pod's resolv.conf lists this node's own DNS server first
+    /// so pods can resolve sibling container names under Docker Compose.
+    /// Set this flag outside Compose so pods resolve cluster Service names.
+    #[arg(long, default_value = "false")]
+    pod_prefer_cluster_dns: bool,
 }
 
 fn main() -> Result<()> {
@@ -253,6 +259,7 @@ async fn run() -> Result<()> {
             args.cluster_domain,
             args.network,
             runtime_config.kubernetes_service_host.clone(),
+            args.pod_prefer_cluster_dns,
         )
         .await?,
     );
