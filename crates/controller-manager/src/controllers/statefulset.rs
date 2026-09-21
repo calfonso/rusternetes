@@ -1,7 +1,8 @@
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::{
-    PersistentVolumeClaim, Pod, PodStatus, StatefulSet, StatefulSetStatus,
+    PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PodStatus, StatefulSet,
+    StatefulSetStatus, StorageClass, Volume,
 };
 use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
@@ -12,6 +13,44 @@ use tracing::{debug, error, info, warn};
 
 pub struct StatefulSetController<S: Storage> {
     storage: Arc<S>,
+}
+
+fn claim_name(template_name: &str, statefulset_name: &str, ordinal: i32) -> String {
+    format!("{}-{}-{}", template_name, statefulset_name, ordinal)
+}
+
+fn with_claim_volumes(statefulset: &StatefulSet, ordinal: i32, mut spec: PodSpec) -> PodSpec {
+    let Some(templates) = statefulset.spec.volume_claim_templates.as_ref() else {
+        return spec;
+    };
+    let mut volumes = spec.volumes.take().unwrap_or_default();
+    volumes.retain(|v| !templates.iter().any(|t| t.metadata.name == v.name));
+    for template in templates {
+        volumes.push(Volume {
+            name: template.metadata.name.clone(),
+            empty_dir: None,
+            host_path: None,
+            config_map: None,
+            secret: None,
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: claim_name(
+                    &template.metadata.name,
+                    &statefulset.metadata.name,
+                    ordinal,
+                ),
+                read_only: None,
+            }),
+            downward_api: None,
+            csi: None,
+            ephemeral: None,
+            nfs: None,
+            iscsi: None,
+            projected: None,
+            image: None,
+        });
+    }
+    spec.volumes = Some(volumes);
+    spec
 }
 
 impl<S: Storage + 'static> StatefulSetController<S> {
@@ -955,6 +994,21 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         Ok(())
     }
 
+    async fn default_storage_class_name(&self) -> Option<String> {
+        let classes: Vec<StorageClass> =
+            self.storage.list("/registry/storageclasses/").await.ok()?;
+        classes
+            .into_iter()
+            .find(|sc| {
+                sc.metadata.annotations.as_ref().is_some_and(|a| {
+                    a.get("storageclass.kubernetes.io/is-default-class")
+                        .or_else(|| a.get("storageclass.beta.kubernetes.io/is-default-class"))
+                        .is_some_and(|v| v == "true")
+                })
+            })
+            .map(|sc| sc.metadata.name)
+    }
+
     async fn ensure_pvcs_for_ordinal(
         &self,
         statefulset: &StatefulSet,
@@ -963,10 +1017,8 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     ) -> Result<()> {
         if let Some(ref templates) = statefulset.spec.volume_claim_templates {
             for template in templates {
-                let pvc_name = format!(
-                    "{}-{}-{}",
-                    template.metadata.name, statefulset.metadata.name, ordinal
-                );
+                let pvc_name =
+                    claim_name(&template.metadata.name, &statefulset.metadata.name, ordinal);
                 let key = build_key("persistentvolumeclaims", Some(namespace), &pvc_name);
 
                 // Check if PVC already exists
@@ -1001,13 +1053,18 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     block_owner_deletion: Some(true),
                 }]);
 
+                let mut pvc_spec = template.spec.clone();
+                if pvc_spec.storage_class_name.is_none() {
+                    pvc_spec.storage_class_name = self.default_storage_class_name().await;
+                }
+
                 let pvc = PersistentVolumeClaim {
                     type_meta: TypeMeta {
                         kind: "PersistentVolumeClaim".to_string(),
                         api_version: "v1".to_string(),
                     },
                     metadata: pvc_metadata,
-                    spec: template.spec.clone(),
+                    spec: pvc_spec,
                     status: None,
                 };
 
@@ -1102,7 +1159,11 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 api_version: "v1".to_string(),
             },
             metadata,
-            spec: Some(template.spec.clone()),
+            spec: Some(with_claim_volumes(
+                statefulset,
+                ordinal,
+                template.spec.clone(),
+            )),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
                 message: None,
@@ -1187,7 +1248,11 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 api_version: "v1".to_string(),
             },
             metadata,
-            spec: Some(template.spec.clone()),
+            spec: Some(with_claim_volumes(
+                statefulset,
+                ordinal,
+                template.spec.clone(),
+            )),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
                 message: None,
@@ -1925,5 +1990,102 @@ mod tests {
                 i
             );
         }
+    }
+    fn claim_template(name: &str) -> PersistentVolumeClaim {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": name },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        }))
+        .unwrap()
+    }
+
+    fn empty_dir_volume(name: &str) -> Volume {
+        serde_json::from_value(serde_json::json!({ "name": name, "emptyDir": {} })).unwrap()
+    }
+
+    #[test]
+    fn test_with_claim_volumes_adds_claim_volume() {
+        let mut ss = make_statefulset("web", "default", 1, "nginx");
+        ss.spec.volume_claim_templates = Some(vec![claim_template("data")]);
+
+        let spec = with_claim_volumes(&ss, 2, ss.spec.template.spec.clone());
+
+        let volumes = spec.volumes.unwrap();
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].name, "data");
+        assert_eq!(
+            volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
+            "data-web-2"
+        );
+    }
+
+    #[test]
+    fn test_with_claim_volumes_replaces_same_named_volume() {
+        let mut ss = make_statefulset("web", "default", 1, "nginx");
+        ss.spec.volume_claim_templates = Some(vec![claim_template("data")]);
+        let mut spec = ss.spec.template.spec.clone();
+        spec.volumes = Some(vec![empty_dir_volume("data"), empty_dir_volume("scratch")]);
+
+        let volumes = with_claim_volumes(&ss, 0, spec).volumes.unwrap();
+
+        assert_eq!(volumes.len(), 2);
+        assert!(volumes
+            .iter()
+            .any(|v| v.name == "scratch" && v.empty_dir.is_some()));
+        let data = volumes.iter().find(|v| v.name == "data").unwrap();
+        assert!(data.empty_dir.is_none());
+        assert_eq!(
+            data.persistent_volume_claim.as_ref().unwrap().claim_name,
+            "data-web-0"
+        );
+    }
+
+    #[test]
+    fn test_with_claim_volumes_without_templates_leaves_spec_alone() {
+        let ss = make_statefulset("web", "default", 1, "nginx");
+        let spec = with_claim_volumes(&ss, 0, ss.spec.template.spec.clone());
+        assert!(spec.volumes.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_claim_gets_default_storage_class() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+        let class: StorageClass = serde_json::from_value(serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": {
+                "name": "standard",
+                "annotations": { "storageclass.kubernetes.io/is-default-class": "true" }
+            },
+            "provisioner": "rusternetes.io/hostpath"
+        }))
+        .unwrap();
+        storage
+            .create("/registry/storageclasses/standard", &class)
+            .await
+            .unwrap();
+
+        let mut ss = make_statefulset("web", "default", 1, "nginx");
+        ss.spec.volume_claim_templates = Some(vec![claim_template("data")]);
+        controller
+            .ensure_pvcs_for_ordinal(&ss, 0, "default")
+            .await
+            .unwrap();
+
+        let pvc: PersistentVolumeClaim = storage
+            .get("/registry/persistentvolumeclaims/default/data-web-0")
+            .await
+            .unwrap();
+        assert_eq!(pvc.spec.storage_class_name.as_deref(), Some("standard"));
     }
 }
