@@ -92,7 +92,7 @@ struct Args {
     proxy_sync_interval: u64,
 
     /// Skip authentication (insecure, for development)
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value = "true", num_args = 0..=1, default_missing_value = "true")]
     skip_auth: bool,
 
     /// Disable kube-proxy (useful when iptables is not available)
