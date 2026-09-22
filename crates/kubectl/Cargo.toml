@@ -18,7 +18,7 @@ serde_yaml.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 chrono.workspace = true
-tabled = "0.15"
+tabled = "0.22"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio-tungstenite = "0.21"
 futures = "0.3"
