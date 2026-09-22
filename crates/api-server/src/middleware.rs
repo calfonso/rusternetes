@@ -510,8 +510,10 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
                     if !raw.is_empty() && (raw[0] == b'{' || raw[0] == b'[') {
                         return Some(raw.to_vec());
                     }
-                    // Log what field 2 contains if it's not JSON
-                    if field_number == 2 && !raw.is_empty() {
+                    // Field 2 holds native protobuf, not JSON. Return None so the
+                    // caller uses the schema decoder; scanning the body would match
+                    // JSON inside string values (e.g. a Secret's .dockerconfigjson).
+                    if !raw.is_empty() {
                         let preview: String = raw
                             .iter()
                             .take(40)
@@ -523,6 +525,7 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
                             len,
                             preview
                         );
+                        return None;
                     }
                 }
                 if pos + len > data.len() {
@@ -1292,6 +1295,24 @@ mod tests {
         let result = extract_json_from_k8s_protobuf(&data);
         // Should return None because field 2 doesn't start with { or [
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_json_from_k8s_protobuf_native_raw_with_embedded_json() {
+        // Native protobuf in field 2 whose string value is a JSON object, as in a
+        // Secret carrying .dockerconfigjson. The embedded JSON must not be extracted.
+        let embedded = br#"{"auths":{"ghcr.io":{"auth":"eDp5"}}}"#;
+        let mut native_pb = vec![0x0a, embedded.len() as u8];
+        native_pb.extend_from_slice(embedded);
+        let mut data = Vec::new();
+        data.extend_from_slice(b"k8s\0");
+        data.push(0x0a); // field 1 (TypeMeta) — empty
+        data.push(0x00);
+        data.push(0x12); // field 2 (raw)
+        data.push(native_pb.len() as u8);
+        data.extend_from_slice(&native_pb);
+
+        assert!(extract_json_from_k8s_protobuf(&data).is_none());
     }
 
     #[test]
