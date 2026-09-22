@@ -91,6 +91,8 @@ spec:
       items:
       - key: Corefile
         path: Corefile
+      - key: kubeconfig
+        path: kubeconfig
   dnsPolicy: Default
   restartPolicy: Always
 ---
@@ -139,8 +141,7 @@ data:
           pods insecure
           fallthrough in-addr.arpa ip6.arpa
           ttl 30
-          endpoint https://api-server:6443
-          tls "" "" /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          kubeconfig /etc/coredns/kubeconfig
         }
         prometheus :9153
         forward . 8.8.8.8 {
@@ -151,3 +152,22 @@ data:
         reload
         loadbalance
     }
+  # kubeconfig for the CoreDNS kubernetes plugin, using the pod's service account token
+  kubeconfig: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - name: default
+      cluster:
+        server: https://api-server:6443
+        certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+    - name: default
+      user:
+        tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+    - name: default
+      context:
+        cluster: default
+        user: default
+    current-context: default
