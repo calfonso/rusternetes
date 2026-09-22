@@ -46,6 +46,17 @@ pub async fn skip_auth_middleware(mut request: Request, next: Next) -> Result<Re
     Ok(next.run(request).await)
 }
 
+/// Returns the token of an `Authorization: Bearer <token>` header. The scheme name is
+/// case-insensitive; the Python Kubernetes client sends it in lowercase.
+fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("Bearer") {
+        Some(token.trim())
+    } else {
+        None
+    }
+}
+
 /// Authentication middleware that extracts and validates JWT tokens
 pub async fn auth_middleware(
     Extension(token_manager): Extension<Arc<TokenManager>>,
@@ -60,9 +71,7 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    let user = if let Some(token) = auth_header.strip_prefix("Bearer ") {
-        // Skip "Bearer "
-
+    let user = if let Some(token) = bearer_token(auth_header) {
         // Try to validate as a service account token first
         if let Ok(claims) = token_manager.validate_token(token) {
             let user_info = UserInfo::from_service_account_claims(&claims);
@@ -1233,6 +1242,20 @@ fn try_brace_scan_or_type_meta(body_bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_token_accepts_any_scheme_case() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+    }
+
+    #[test]
+    fn bearer_token_rejects_other_schemes_and_empty() {
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token(""), None);
+    }
 
     #[test]
     fn test_scan_balanced_braces_valid_json() {
