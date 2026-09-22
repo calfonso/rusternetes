@@ -2713,6 +2713,10 @@ impl ContainerRuntime {
                     "PersistentVolume does not have a hostPath volume source"
                 ));
             };
+            // Create the directory now so fsGroup ownership is applied to it before
+            // the container runtime would create it as root.
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("Failed to create PersistentVolume path {}", path))?;
             info!(
                 "Using PersistentVolumeClaim volume {} backed by PV {} at {}",
                 volume.name, pv_name, path
