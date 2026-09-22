@@ -3196,6 +3196,27 @@ impl ContainerRuntime {
                 }
             }
 
+            // Pods created without API server admission get a token-only
+            // kube-api-access volume; in-cluster clients also need namespace and ca.crt.
+            let has_token_source = projected
+                .sources
+                .as_ref()
+                .is_some_and(|s| s.iter().any(|p| p.service_account_token.is_some()));
+            if volume.name.contains("kube-api-access") && has_token_source {
+                let ca_source = std::env::var("CA_CERT_PATH").unwrap_or_else(|_| {
+                    format!(
+                        "{}/.rusternetes/certs/ca.crt",
+                        std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+                    )
+                });
+                ensure_sa_volume_files(
+                    &volume_dir,
+                    namespace,
+                    &ca_source,
+                    proj_default_mode as u32,
+                );
+            }
+
             // Set directory permissions after files are written so that restrictive
             // defaultMode values don't prevent file creation.
             #[cfg(unix)]
@@ -8220,11 +8241,93 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
     }
 }
 
+/// Write `namespace` and `ca.crt` into a service account volume directory when the
+/// projection sources did not provide them. Existing files are left untouched.
+fn ensure_sa_volume_files(volume_dir: &str, namespace: &str, ca_source: &str, mode: u32) {
+    let write_missing = |name: &str, content: &[u8]| {
+        let path = format!("{}/{}", volume_dir, name);
+        if std::path::Path::new(&path).exists() {
+            return;
+        }
+        if let Err(e) = std::fs::write(&path, content) {
+            warn!("Failed to write {}: {}", path, e);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        }
+    };
+
+    write_missing("namespace", namespace.as_bytes());
+    match std::fs::read(ca_source) {
+        Ok(ca) => write_missing("ca.crt", &ca),
+        Err(_) => warn!(
+            "CA certificate not found at {}, pods may not be able to verify API server",
+            ca_source
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ContainerRuntime;
+    use super::{ensure_sa_volume_files, ContainerRuntime};
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+
+    #[test]
+    fn sa_volume_gets_namespace_and_ca_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("cluster-ca.crt");
+        std::fs::write(&ca, b"CA-PEM").unwrap();
+        let vol = dir.path().join("vol");
+        std::fs::create_dir(&vol).unwrap();
+
+        ensure_sa_volume_files(
+            vol.to_str().unwrap(),
+            "redwall-system",
+            ca.to_str().unwrap(),
+            0o644,
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(vol.join("namespace")).unwrap(),
+            "redwall-system"
+        );
+        assert_eq!(std::fs::read(vol.join("ca.crt")).unwrap(), b"CA-PEM");
+    }
+
+    #[test]
+    fn sa_volume_keeps_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("cluster-ca.crt");
+        std::fs::write(&ca, b"CA-PEM").unwrap();
+        let vol = dir.path().join("vol");
+        std::fs::create_dir(&vol).unwrap();
+        std::fs::write(vol.join("ca.crt"), b"FROM-CONFIGMAP").unwrap();
+        std::fs::write(vol.join("namespace"), b"other").unwrap();
+
+        ensure_sa_volume_files(vol.to_str().unwrap(), "ns", ca.to_str().unwrap(), 0o644);
+
+        assert_eq!(
+            std::fs::read(vol.join("ca.crt")).unwrap(),
+            b"FROM-CONFIGMAP"
+        );
+        assert_eq!(std::fs::read(vol.join("namespace")).unwrap(), b"other");
+    }
+
+    #[test]
+    fn sa_volume_without_ca_source_still_gets_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = dir.path().join("vol");
+        std::fs::create_dir(&vol).unwrap();
+
+        ensure_sa_volume_files(vol.to_str().unwrap(), "ns", "/nonexistent/ca.crt", 0o644);
+
+        assert!(vol.join("namespace").exists());
+        assert!(!vol.join("ca.crt").exists());
+    }
 
     /// Docker rejects `UtsMode: "container:<id>"` with `400 invalid UTS mode`,
     /// so it must be classified as unsupported; Podman accepts it.
