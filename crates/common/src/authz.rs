@@ -1,6 +1,8 @@
 use crate::auth::UserInfo;
 use crate::error::Result;
-use crate::resources::rbac::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding};
+use crate::resources::rbac::{
+    ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject,
+};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -125,6 +127,22 @@ pub trait Authorizer: Send + Sync {
     )>;
 }
 
+/// Returns true if a binding subject refers to the requesting user.
+///
+/// ServiceAccount subjects match the `system:serviceaccount:<namespace>:<name>`
+/// username; User subjects match the username; Group subjects match a group.
+/// Subjects with any other kind match by name against both.
+fn subject_matches(subject: &Subject, user: &UserInfo) -> bool {
+    match subject.kind.as_str() {
+        "ServiceAccount" => subject.namespace.as_deref().is_some_and(|namespace| {
+            user.username == format!("system:serviceaccount:{}:{}", namespace, subject.name)
+        }),
+        "User" => subject.name == user.username,
+        "Group" => user.groups.contains(&subject.name),
+        _ => subject.name == user.username || user.groups.contains(&subject.name),
+    }
+}
+
 /// RBAC Authorizer that uses Role and RoleBinding resources
 pub struct RBACAuthorizer<S: AuthzStorage> {
     storage: Arc<S>,
@@ -204,9 +222,10 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         Ok(all_bindings
             .into_iter()
             .filter(|binding| {
-                binding.subjects.iter().any(|subject| {
-                    subject.name == attrs.user.username || attrs.user.groups.contains(&subject.name)
-                })
+                binding
+                    .subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, &attrs.user))
             })
             .collect())
     }
@@ -221,9 +240,10 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         Ok(all_bindings
             .into_iter()
             .filter(|binding| {
-                binding.subjects.iter().any(|subject| {
-                    subject.name == attrs.user.username || attrs.user.groups.contains(&subject.name)
-                })
+                binding
+                    .subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, &attrs.user))
             })
             .collect())
     }
@@ -821,5 +841,72 @@ mod tests {
         // This would need a mock storage implementation to fully test
         // Just testing the rule matching logic
         assert!(rule.verbs.contains(&attrs.verb));
+    }
+
+    fn subject(kind: &str, name: &str, namespace: Option<&str>) -> Subject {
+        Subject {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            namespace: namespace.map(str::to_string),
+            api_group: None,
+        }
+    }
+
+    fn user(username: &str, groups: &[&str]) -> UserInfo {
+        UserInfo {
+            username: username.to_string(),
+            uid: "uid".to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn service_account_subject_matches_service_account_username() {
+        let sa = user("system:serviceaccount:kube-system:admin", &[]);
+        assert!(subject_matches(
+            &subject("ServiceAccount", "admin", Some("kube-system")),
+            &sa
+        ));
+    }
+
+    #[test]
+    fn service_account_subject_requires_matching_namespace() {
+        let sa = user("system:serviceaccount:kube-system:admin", &[]);
+        assert!(!subject_matches(
+            &subject("ServiceAccount", "admin", Some("default")),
+            &sa
+        ));
+        assert!(!subject_matches(
+            &subject("ServiceAccount", "admin", None),
+            &sa
+        ));
+    }
+
+    #[test]
+    fn service_account_subject_does_not_match_plain_user_with_same_name() {
+        let plain = user("admin", &[]);
+        assert!(!subject_matches(
+            &subject("ServiceAccount", "admin", Some("kube-system")),
+            &plain
+        ));
+    }
+
+    #[test]
+    fn user_subject_matches_username_only() {
+        let u = user("alice", &["alice"]);
+        assert!(subject_matches(&subject("User", "alice", None), &u));
+        let g = user("bob", &["alice"]);
+        assert!(!subject_matches(&subject("User", "alice", None), &g));
+    }
+
+    #[test]
+    fn group_subject_matches_group_only() {
+        let u = user("bob", &["system:serviceaccounts"]);
+        assert!(subject_matches(
+            &subject("Group", "system:serviceaccounts", None),
+            &u
+        ));
+        assert!(!subject_matches(&subject("Group", "bob", None), &u));
     }
 }
