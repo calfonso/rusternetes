@@ -35,6 +35,8 @@ pub enum FieldType {
     Message(String),
     /// map<string, string> — encoded as repeated MapEntry messages
     StringMap,
+    /// map<string, bytes> — encoded as repeated MapEntry messages, values base64 encoded
+    BytesMap,
     /// Repeated field — value is the element type
     Repeated(Box<FieldType>),
     /// Bytes field — base64 encode
@@ -1130,7 +1132,7 @@ impl ProtoRegistry {
                         ("metadata".into(), FieldType::Message("ObjectMeta".into())),
                     ),
                     (2, ("data".into(), FieldType::StringMap)),
-                    (3, ("binaryData".into(), FieldType::StringMap)),
+                    (3, ("binaryData".into(), FieldType::BytesMap)),
                     (4, ("immutable".into(), FieldType::Bool)),
                 ]),
             },
@@ -1143,7 +1145,7 @@ impl ProtoRegistry {
                         1,
                         ("metadata".into(), FieldType::Message("ObjectMeta".into())),
                     ),
-                    (2, ("data".into(), FieldType::StringMap)),
+                    (2, ("data".into(), FieldType::BytesMap)),
                     (3, ("type".into(), FieldType::String)),
                     (4, ("stringData".into(), FieldType::StringMap)),
                     (5, ("immutable".into(), FieldType::Bool)),
@@ -2727,6 +2729,21 @@ impl ProtoRegistry {
                                     m.insert(key, Value::String(val));
                                 }
                             }
+                            FieldType::BytesMap => {
+                                use base64::Engine;
+                                let (key, val) = decode_map_entry_bytes(field_data);
+                                let map = obj
+                                    .entry(name.clone())
+                                    .or_insert_with(|| Value::Object(Map::new()));
+                                if let Value::Object(ref mut m) = map {
+                                    m.insert(
+                                        key,
+                                        Value::String(
+                                            base64::engine::general_purpose::STANDARD.encode(val),
+                                        ),
+                                    );
+                                }
+                            }
                             FieldType::MessageMap(ref msg_type) => {
                                 // map<string, Message> — decode MapEntry with message value
                                 let (key, val) =
@@ -2807,7 +2824,7 @@ impl ProtoRegistry {
                 // Single element of a repeated field (not packed)
                 self.decode_field_value(inner, data)
             }
-            FieldType::StringMap => {
+            FieldType::StringMap | FieldType::BytesMap => {
                 // Should be handled at the caller level as MapEntry
                 Value::Object(Map::new())
             }
@@ -3070,8 +3087,14 @@ fn read_varint(data: &[u8], mut pos: usize) -> Option<(u64, usize)> {
 
 /// Decode a protobuf map entry (field 1 = key, field 2 = value, both strings)
 fn decode_map_entry(data: &[u8]) -> (String, String) {
+    let (key, val) = decode_map_entry_bytes(data);
+    (key, String::from_utf8(val).unwrap_or_default())
+}
+
+/// Decode a protobuf map entry (field 1 = key string, field 2 = value bytes)
+fn decode_map_entry_bytes(data: &[u8]) -> (String, Vec<u8>) {
     let mut key = String::new();
-    let mut val = String::new();
+    let mut val = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
         let (tag, new_pos) = match read_varint(data, pos) {
@@ -3091,12 +3114,14 @@ fn decode_map_entry(data: &[u8]) -> (String, String) {
             if pos + len > data.len() {
                 break;
             }
-            if let Ok(s) = std::str::from_utf8(&data[pos..pos + len]) {
-                match field_num {
-                    1 => key = s.to_string(),
-                    2 => val = s.to_string(),
-                    _ => {}
+            match field_num {
+                1 => {
+                    if let Ok(s) = std::str::from_utf8(&data[pos..pos + len]) {
+                        key = s.to_string();
+                    }
                 }
+                2 => val = data[pos..pos + len].to_vec(),
+                _ => {}
             }
             pos += len;
         } else if wire_type == WIRE_VARINT {
@@ -3249,6 +3274,69 @@ mod tests {
         assert_eq!(
             val.pointer("/matchLabels/app"),
             Some(&Value::String("nginx".into()))
+        );
+    }
+
+    /// Encode a map<string, bytes> field holding one entry.
+    fn map_field(field_tag: u8, key: &str, value: &[u8]) -> Vec<u8> {
+        let mut entry = vec![0x0a, key.len() as u8];
+        entry.extend_from_slice(key.as_bytes());
+        entry.push(0x12);
+        entry.push(value.len() as u8);
+        entry.extend_from_slice(value);
+        let mut field = vec![field_tag, entry.len() as u8];
+        field.extend_from_slice(&entry);
+        field
+    }
+
+    #[test]
+    fn test_decode_secret_data_is_base64() {
+        let registry = ProtoRegistry::new();
+        // Secret.data (field 2): ASCII value, as Helm stores its release payload.
+        let secret = map_field(0x12, "release", b"H4sIAAAAAAAC");
+
+        let val = registry.decode_message("Secret", &secret).unwrap();
+        assert_eq!(
+            val.pointer("/data/release"),
+            Some(&Value::String("SDRzSUFBQUFBQUFD".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_secret_data_keeps_non_utf8_bytes() {
+        let registry = ProtoRegistry::new();
+        let secret = map_field(0x12, "key", &[0xff, 0x00, 0x8b, 0x1f]);
+
+        let val = registry.decode_message("Secret", &secret).unwrap();
+        assert_eq!(
+            val.pointer("/data/key"),
+            Some(&Value::String("/wCLHw==".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_configmap_binary_data_is_base64() {
+        let registry = ProtoRegistry::new();
+        // ConfigMap.binaryData (field 3)
+        let configmap = map_field(0x1a, "blob", &[0x00, 0x01, 0xfe]);
+
+        let val = registry.decode_message("ConfigMap", &configmap).unwrap();
+        assert_eq!(
+            val.pointer("/binaryData/blob"),
+            Some(&Value::String("AAH+".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_configmap_data_stays_plain_string() {
+        let registry = ProtoRegistry::new();
+        // ConfigMap.data (field 2) holds strings, not bytes.
+        let configmap = map_field(0x12, "Corefile", b"hello");
+
+        let val = registry.decode_message("ConfigMap", &configmap).unwrap();
+        assert_eq!(
+            val.pointer("/data/Corefile"),
+            Some(&Value::String("hello".into()))
         );
     }
 
