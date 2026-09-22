@@ -1,11 +1,13 @@
 /// Concurrency control module for optimistic locking with resourceVersion
 use rusternetes_common::Error;
 
-/// Extract resourceVersion from metadata
+/// Extract resourceVersion from metadata. An empty resourceVersion means the client
+/// sent no precondition, so it is treated as absent.
 pub fn extract_resource_version(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("resourceVersion")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -63,6 +65,12 @@ mod tests {
 
         let no_rv = json!({"name": "test"});
         assert_eq!(extract_resource_version(&no_rv), None);
+    }
+
+    #[test]
+    fn test_extract_resource_version_ignores_empty() {
+        let empty_rv = json!({"name": "test", "resourceVersion": ""});
+        assert_eq!(extract_resource_version(&empty_rv), None);
     }
 
     #[test]
