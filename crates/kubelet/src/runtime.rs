@@ -105,6 +105,8 @@ pub struct ContainerRuntime {
     image_cache: Mutex<std::collections::HashSet<String>>,
     /// Cache of shell availability per image (true = has /bin/sh)
     shell_cache: Mutex<HashMap<String, bool>>,
+    /// Names of containers this process is currently creating and starting
+    starting_containers: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Join a list of strings into a shell-safe command string.
@@ -238,6 +240,7 @@ impl ContainerRuntime {
             probe_states: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
+            starting_containers: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -3424,6 +3427,16 @@ impl ContainerRuntime {
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let container_name = format!("{}_{}", pod_name, container.name);
 
+        let Some(_start_in_flight) =
+            StartInFlight::acquire(&self.starting_containers, &container_name)
+        else {
+            debug!(
+                "Container {} is already being started, skipping",
+                container_name
+            );
+            return Ok(());
+        };
+
         info!(
             "Starting container: {} (netns: {:?})",
             container_name, netns_path
@@ -3439,28 +3452,22 @@ impl ContainerRuntime {
             let is_running = state.and_then(|s| s.running).unwrap_or(false);
             let status = state.and_then(|s| s.status.as_ref());
 
-            // Skip if container is running or just created (about to start)
             if is_running {
                 return Ok(());
             }
+
+            // Remove a container that exited, or that was created but never started
+            // (no start is in flight for it, so an earlier process stopped mid-start).
             if matches!(
                 status,
                 Some(bollard::secret::ContainerStateStatusEnum::CREATED)
-            ) {
-                debug!(
-                    "Container {} is in created state, waiting for it to start",
-                    container_name
-                );
-                return Ok(());
-            }
-
-            // Only remove if container has actually exited
-            if matches!(
-                status,
-                Some(bollard::secret::ContainerStateStatusEnum::EXITED)
+                    | Some(bollard::secret::ContainerStateStatusEnum::EXITED)
                     | Some(bollard::secret::ContainerStateStatusEnum::DEAD)
             ) {
-                debug!("Removing exited container: {}", container_name);
+                debug!(
+                    "Removing exited or never-started container: {}",
+                    container_name
+                );
                 let remove_options = RemoveContainerOptions {
                     force: true,
                     ..Default::default()
@@ -8220,11 +8227,65 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
     }
 }
 
+/// Marks a container name as being started until dropped.
+struct StartInFlight {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    name: String,
+}
+
+impl StartInFlight {
+    /// Returns `None` when a start for `name` is already in flight.
+    fn acquire(set: &Arc<Mutex<std::collections::HashSet<String>>>, name: &str) -> Option<Self> {
+        let inserted = set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+        inserted.then(|| Self {
+            set: Arc::clone(set),
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for StartInFlight {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ContainerRuntime;
+    use super::{ContainerRuntime, StartInFlight};
     use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn start_in_flight_rejects_second_start_of_same_container() {
+        let set = Arc::new(Mutex::new(HashSet::new()));
+        let first = StartInFlight::acquire(&set, "coredns_coredns");
+        assert!(first.is_some());
+        assert!(StartInFlight::acquire(&set, "coredns_coredns").is_none());
+    }
+
+    #[test]
+    fn start_in_flight_is_released_on_drop() {
+        let set = Arc::new(Mutex::new(HashSet::new()));
+        drop(StartInFlight::acquire(&set, "coredns_coredns"));
+        assert!(set.lock().unwrap().is_empty());
+        assert!(StartInFlight::acquire(&set, "coredns_coredns").is_some());
+    }
+
+    #[test]
+    fn start_in_flight_tracks_containers_independently() {
+        let set = Arc::new(Mutex::new(HashSet::new()));
+        let _a = StartInFlight::acquire(&set, "pod-a_main");
+        assert!(StartInFlight::acquire(&set, "pod-b_main").is_some());
+    }
 
     /// Docker rejects `UtsMode: "container:<id>"` with `400 invalid UTS mode`,
     /// so it must be classified as unsupported; Podman accepts it.
