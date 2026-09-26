@@ -973,6 +973,7 @@ pub async fn portforward(
             namespace, name, ports
         );
         Ok(ws
+            .protocols(["v4.channel.k8s.io"])
             .on_upgrade(move |socket| streaming::handle_portforward_websocket(socket, pod, ports))
             .into_response())
     } else {

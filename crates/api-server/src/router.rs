@@ -799,6 +799,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::generic::get_apiservice).put(handlers::generic::update_apiservice_status),
         )
         .route("/version", get(handlers::discovery::get_version))
+        .route("/version/", get(handlers::discovery::get_version))
         // OpenAPI spec endpoints
         .route("/openapi/v2", get(handlers::openapi::get_swagger_spec))
         .route("/openapi/v3", get(handlers::openapi::get_openapi_spec))
