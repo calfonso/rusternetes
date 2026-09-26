@@ -98,6 +98,57 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Query parameters that hold a boolean.
+const BOOLEAN_QUERY_PARAMS: &[&str] = &[
+    "watch",
+    "allowWatchBookmarks",
+    "sendInitialEvents",
+    "follow",
+    "previous",
+    "timestamps",
+    "stdin",
+    "stdout",
+    "stderr",
+    "tty",
+    "orphanDependents",
+];
+
+/// Rewrite boolean query parameters to `true` or `false`.
+///
+/// Kubernetes parses booleans with Go's `strconv.ParseBool`, so clients send
+/// values such as `True` (the Python client sends `watch=True`). The handlers
+/// parse with Rust's `bool::parse`, which only accepts `true` and `false`.
+/// Returns the rewritten URI, or `None` if nothing changed.
+pub fn normalize_boolean_query(uri: &axum::http::Uri) -> Option<axum::http::Uri> {
+    let query = uri.query()?;
+    let mut changed = false;
+    let rewritten: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            let Some((key, value)) = pair.split_once('=') else {
+                return pair.to_string();
+            };
+            if !BOOLEAN_QUERY_PARAMS.contains(&key) {
+                return pair.to_string();
+            }
+            let normalized = match value {
+                "1" | "t" | "T" | "TRUE" | "True" => "true",
+                "0" | "f" | "F" | "FALSE" | "False" => "false",
+                _ => return pair.to_string(),
+            };
+            changed = true;
+            format!("{}={}", key, normalized)
+        })
+        .collect();
+    if !changed {
+        return None;
+    }
+    axum::http::Uri::builder()
+        .path_and_query(format!("{}?{}", uri.path(), rewritten.join("&")))
+        .build()
+        .ok()
+}
+
 /// Middleware that normalizes Content-Type to application/json for write requests.
 /// The Kubernetes client defaults to application/vnd.kubernetes.protobuf, but we only
 /// support JSON. Axum's Json extractor rejects non-application/json content types with
@@ -1667,5 +1718,48 @@ mod tests {
             !uri.path().contains("/watch/"),
             "regular path should not contain /watch/"
         );
+    }
+}
+
+#[cfg(test)]
+mod boolean_query_tests {
+    use super::normalize_boolean_query;
+
+    fn normalized(uri: &str) -> Option<String> {
+        normalize_boolean_query(&uri.parse().unwrap()).map(|u| u.to_string())
+    }
+
+    #[test]
+    fn rewrites_capitalized_watch() {
+        assert_eq!(
+            normalized("/api/v1/pods?watch=True&labelSelector=a%3Db").as_deref(),
+            Some("/api/v1/pods?watch=true&labelSelector=a%3Db")
+        );
+    }
+
+    #[test]
+    fn rewrites_numeric_and_short_forms() {
+        assert_eq!(
+            normalized("/x?follow=1&previous=F&timestamps=T").as_deref(),
+            Some("/x?follow=true&previous=false&timestamps=true")
+        );
+    }
+
+    #[test]
+    fn leaves_canonical_values_alone() {
+        assert_eq!(normalized("/x?watch=true&follow=false"), None);
+    }
+
+    #[test]
+    fn leaves_other_parameters_alone() {
+        assert_eq!(
+            normalized("/x?labelSelector=watch%3DTrue&pretty=True"),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_uri_without_query() {
+        assert_eq!(normalized("/x"), None);
     }
 }

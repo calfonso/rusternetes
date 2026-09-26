@@ -2400,6 +2400,14 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
 
     app.layer(axum_middleware::map_request(
         |mut req: axum::extract::Request| async move {
+            if let Some(uri) = middleware::normalize_boolean_query(req.uri()) {
+                *req.uri_mut() = uri;
+            }
+            req
+        },
+    ))
+    .layer(axum_middleware::map_request(
+        |mut req: axum::extract::Request| async move {
             let path = req.uri().path();
             // Strip trailing slash for non-root paths (but not /console/ paths,
             // which are handled by ServeDir and need trailing slashes intact)
