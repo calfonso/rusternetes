@@ -790,6 +790,15 @@ impl Kubelet {
 
         debug!("Found {} pods assigned to this node", node_pods.len());
 
+        {
+            let node_pod_uids: HashSet<&str> =
+                node_pods.iter().map(|p| p.metadata.uid.as_str()).collect();
+            self.pod_states
+                .lock()
+                .unwrap()
+                .retain(|uid, _| node_pod_uids.contains(uid.as_str()));
+        }
+
         // Ensure per-pod workers exist for all assigned pods and signal them.
         // K8s ref: pkg/kubelet/pod_workers.go — podWorkerLoop (long-lived)
         for pod in &node_pods {
@@ -1440,6 +1449,7 @@ impl Kubelet {
                 // re-entering TerminatingPod indefinitely.
                 if pod.metadata.deletion_timestamp.is_some() {
                     let _ = self.storage.delete(&key).await;
+                    self.pod_states.lock().unwrap().remove(pod_uid);
                     debug!(
                         "Pod {}/{} removed from storage (deletionTimestamp set, no finalizers)",
                         namespace, pod_name
@@ -1463,9 +1473,8 @@ impl Kubelet {
                     }
                 }
             }
-            // Volumes are cleaned by stop_pod_for during TerminatingPod.
-            // Remove pod worker state — K8s HandlePodCleanups removes finished workers
-            self.pod_states.lock().unwrap().remove(pod_uid);
+            // Keep TerminatedPod until the pod leaves storage; dropping it here
+            // makes the next sync re-enter TerminatingPod for a finished pod.
             return Ok(());
         }
 
