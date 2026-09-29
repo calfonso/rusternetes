@@ -947,32 +947,40 @@ pub async fn patch_custom_resource_status(
         rusternetes_common::Error::InvalidResource(format!("Invalid patch JSON: {}", e))
     })?;
 
-    // Apply the patch to the status field only
-    let current_status = current
-        .status
-        .as_ref()
-        .unwrap_or(&serde_json::Value::Null)
-        .clone();
-
     let patch_type = crate::patch::PatchType::from_content_type(content_type).map_err(|e| {
         rusternetes_common::Error::InvalidResource(format!("Unsupported patch content type: {}", e))
     })?;
 
-    let patched_status = crate::patch::apply_patch(&current_status, &patch_value, patch_type)
-        .map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!(
-                "Failed to apply status patch: {}",
-                e
-            ))
-        })?;
+    let patched_status = status_after_patch(&current, &patch_value, patch_type)?;
 
     // Update only the status field
-    current.status = Some(patched_status);
+    current.status = patched_status;
 
     // Save the updated resource
     let updated = state.storage.update(&key, &current).await?;
 
     Ok(Json(updated))
+}
+
+/// Apply a patch addressed to the whole resource and return the resulting
+/// status. Changes to any other field are discarded.
+fn status_after_patch(
+    current: &CustomResource,
+    patch: &serde_json::Value,
+    patch_type: crate::patch::PatchType,
+) -> Result<Option<serde_json::Value>> {
+    let document = serde_json::to_value(current).map_err(|e| {
+        rusternetes_common::Error::Internal(format!("Failed to serialize resource: {}", e))
+    })?;
+    let patched = crate::patch::apply_patch(&document, patch, patch_type).map_err(|e| {
+        rusternetes_common::Error::InvalidResource(format!("Failed to apply status patch: {}", e))
+    })?;
+    Ok(patched.get("status").cloned())
+}
+
+/// The status carried by a whole resource sent to the status subresource.
+fn status_from_object(object: &serde_json::Value) -> Option<serde_json::Value> {
+    object.get("status").cloned()
 }
 
 /// Delete a custom resource instance
@@ -1415,7 +1423,7 @@ pub async fn update_custom_resource_status(
         Option<String>,
         String,
     )>,
-    Json(status): Json<serde_json::Value>,
+    Json(object): Json<serde_json::Value>,
 ) -> Result<Json<CustomResource>> {
     info!(
         "Updating custom resource status {}/{}/{}: {}",
@@ -1479,7 +1487,7 @@ pub async fn update_custom_resource_status(
     let mut cr: CustomResource = state.storage.get(&key).await?;
 
     // Update only the status field (optimistic concurrency control)
-    cr.status = Some(status);
+    cr.status = status_from_object(&object);
 
     // Save the updated resource
     let updated = state.storage.update(&key, &cr).await?;
@@ -2064,5 +2072,64 @@ mod tests {
             "Strict validation should pass for valid CR: {:?}",
             result
         );
+    }
+}
+
+#[cfg(test)]
+mod status_subresource_tests {
+    use super::*;
+    use crate::patch::PatchType;
+    use rusternetes_common::types::ObjectMeta;
+    use serde_json::json;
+
+    fn resource(status: Option<serde_json::Value>) -> CustomResource {
+        CustomResource {
+            api_version: "k8s.redwall.dev/v1alpha1".to_string(),
+            kind: "SandboxDaemon".to_string(),
+            metadata: ObjectMeta::new("daemon"),
+            spec: Some(json!({"arch": "amd64"})),
+            status,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn merge_patch_sets_status_fields() {
+        let patch = json!({"status": {"phase": "Ready", "activeSessions": 0}});
+        let status =
+            status_after_patch(&resource(None), &patch, PatchType::JsonMergePatch).unwrap();
+        assert_eq!(status, Some(json!({"phase": "Ready", "activeSessions": 0})));
+    }
+
+    #[test]
+    fn merge_patch_keeps_existing_status_fields() {
+        let current = resource(Some(json!({"phase": "Ready", "activeSessions": 2})));
+        let patch = json!({"status": {"activeSessions": 3}});
+        let status = status_after_patch(&current, &patch, PatchType::JsonMergePatch).unwrap();
+        assert_eq!(status, Some(json!({"phase": "Ready", "activeSessions": 3})));
+    }
+
+    #[test]
+    fn json_patch_paths_are_relative_to_the_resource() {
+        let current = resource(Some(json!({"phase": "Pending"})));
+        let patch = json!([{"op": "replace", "path": "/status/phase", "value": "Ready"}]);
+        let status = status_after_patch(&current, &patch, PatchType::JsonPatch).unwrap();
+        assert_eq!(status, Some(json!({"phase": "Ready"})));
+    }
+
+    #[test]
+    fn patch_does_not_change_spec() {
+        let patch = json!({"spec": {"arch": "arm64"}, "status": {"phase": "Ready"}});
+        let current = resource(None);
+        let status = status_after_patch(&current, &patch, PatchType::JsonMergePatch).unwrap();
+        assert_eq!(status, Some(json!({"phase": "Ready"})));
+        assert_eq!(current.spec, Some(json!({"arch": "amd64"})));
+    }
+
+    #[test]
+    fn put_takes_status_from_the_resource_body() {
+        let object = json!({"metadata": {"name": "daemon"}, "status": {"phase": "Ready"}});
+        assert_eq!(status_from_object(&object), Some(json!({"phase": "Ready"})));
+        assert_eq!(status_from_object(&json!({"metadata": {}})), None);
     }
 }
