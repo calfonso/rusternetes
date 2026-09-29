@@ -94,6 +94,19 @@ pub fn normalize_resource_version(rv: Option<String>) -> Option<String> {
     rv.filter(|s| !s.is_empty())
 }
 
+/// Resource name to authorize for a watch. Custom resources use the storage type
+/// `<group with '_'>_<plural>`; RBAC rules name the plural only.
+fn authz_resource_name<'a>(resource_type: &'a str, api_group: &str) -> &'a str {
+    if api_group.is_empty() {
+        return resource_type;
+    }
+    let group_prefix = format!("{}_", api_group.replace('.', "_"));
+    resource_type
+        .strip_prefix(&group_prefix)
+        .filter(|plural| !plural.is_empty())
+        .unwrap_or(resource_type)
+}
+
 /// Check if a query param map indicates a watch request
 pub fn is_watch_request(params: &std::collections::HashMap<String, String>) -> bool {
     params
@@ -142,9 +155,13 @@ where
     );
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_namespace(&namespace)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        authz_resource_name(resource_type, api_group),
+    )
+    .with_namespace(&namespace)
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -631,8 +648,12 @@ where
     );
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        authz_resource_name(resource_type, api_group),
+    )
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -2637,6 +2658,36 @@ mod tests {
             Some(ns) => meta.with_namespace(ns),
             None => meta,
         }
+    }
+
+    #[test]
+    fn authz_resource_name_strips_custom_resource_group_prefix() {
+        assert_eq!(
+            authz_resource_name("stable_example_com_crontabs", "stable.example.com"),
+            "crontabs"
+        );
+        assert_eq!(
+            authz_resource_name("example_com_widgets", "example.com"),
+            "widgets"
+        );
+    }
+
+    #[test]
+    fn authz_resource_name_keeps_built_in_resource_types() {
+        assert_eq!(authz_resource_name("pods", ""), "pods");
+        assert_eq!(authz_resource_name("deployments", "apps"), "deployments");
+        assert_eq!(
+            authz_resource_name("customresourcedefinitions", "apiextensions.k8s.io"),
+            "customresourcedefinitions"
+        );
+    }
+
+    #[test]
+    fn authz_resource_name_keeps_bare_group_prefix() {
+        assert_eq!(
+            authz_resource_name("stable_example_com_", "stable.example.com"),
+            "stable_example_com_"
+        );
     }
 
     #[test]
