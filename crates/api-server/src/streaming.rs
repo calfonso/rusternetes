@@ -371,52 +371,294 @@ pub async fn handle_attach_websocket(
 }
 
 /// Handle WebSocket port-forward
-pub async fn handle_portforward_websocket(mut socket: WebSocket, pod: Pod, ports: Vec<u16>) {
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpStream;
-
+///
+/// Implements the Kubernetes `v4.channel.k8s.io` port-forward protocol. Each
+/// requested port `i` gets two channels: `2*i` carries data in both
+/// directions and `2*i+1` carries errors from the server. Every binary frame
+/// starts with its channel byte. Before any data, the server sends one frame
+/// per channel holding the channel byte and the port as a little-endian u16.
+pub async fn handle_portforward_websocket(socket: WebSocket, pod: Pod, ports: Vec<u16>) {
     let pod_ip = match pod.status.as_ref().and_then(|s| s.pod_ip.as_ref()) {
         Some(ip) => ip.clone(),
         None => {
+            let mut socket = socket;
             let _ = socket.send(Message::Text("Pod has no IP".into())).await;
             let _ = socket.close().await;
             return;
         }
     };
 
-    for port in &ports {
-        let target = format!("{}:{}", pod_ip, port);
+    run_portforward(socket, &pod_ip, &ports).await;
+}
+
+/// Frame announcing `port` on `channel`.
+fn portforward_header_frame(channel: u8, port: u16) -> Vec<u8> {
+    let port = port.to_le_bytes();
+    vec![channel, port[0], port[1]]
+}
+
+/// Frame carrying `data` on `channel`.
+fn portforward_data_frame(channel: u8, data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(data.len() + 1);
+    frame.push(channel);
+    frame.extend_from_slice(data);
+    frame
+}
+
+/// Forward every port in `ports` to `host` over `socket` until the client
+/// closes it or every target connection has ended.
+async fn run_portforward(socket: WebSocket, host: &str, ports: &[u16]) {
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinSet;
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+
+    let writer = tokio::spawn(async move {
+        while let Some(message) = out_rx.recv().await {
+            if ws_tx.send(message).await.is_err() {
+                return;
+            }
+        }
+        let _ = ws_tx.close().await;
+    });
+
+    let mut readers = JoinSet::new();
+    let mut tcp_writers = HashMap::new();
+
+    for (index, port) in ports.iter().enumerate() {
+        let data_channel = (index * 2) as u8;
+        let error_channel = data_channel + 1;
+        for channel in [data_channel, error_channel] {
+            let frame = portforward_header_frame(channel, *port);
+            if out_tx.send(Message::Binary(frame)).await.is_err() {
+                return;
+            }
+        }
+
+        let target = format!("{}:{}", host, port);
         match TcpStream::connect(&target).await {
             Ok(tcp) => {
-                let (mut tcp_read, _tcp_write) = tcp.into_split();
-                // Simple forward: read from TCP, send to WebSocket
-                let mut buf = vec![0u8; 8192];
-                loop {
-                    match tcp_read.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if socket
-                                .send(Message::Binary(buf[..n].to_vec()))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                let (mut tcp_read, tcp_write) = tcp.into_split();
+                tcp_writers.insert(data_channel, tcp_write);
+                let out_tx = out_tx.clone();
+                readers.spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        match tcp_read.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let frame = portforward_data_frame(data_channel, &buf[..n]);
+                                if out_tx.send(Message::Binary(frame)).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                        Err(_) => break,
                     }
-                }
+                });
             }
             Err(e) => {
-                let _ = socket
-                    .send(Message::Text(format!(
-                        "Failed to connect to {}: {}",
-                        target, e
-                    )))
-                    .await;
+                error!("Port-forward failed to connect to {}: {}", target, e);
+                let message = format!("Failed to connect to {}: {}", target, e);
+                let frame = portforward_data_frame(error_channel, message.as_bytes());
+                let _ = out_tx.send(Message::Binary(frame)).await;
             }
         }
     }
 
-    let _ = socket.close().await;
+    loop {
+        tokio::select! {
+            message = ws_rx.next() => match message {
+                Some(Ok(Message::Binary(data))) => {
+                    let Some((channel, payload)) = data.split_first() else {
+                        continue;
+                    };
+                    if let Some(tcp_write) = tcp_writers.get_mut(channel) {
+                        if !payload.is_empty() && tcp_write.write_all(payload).await.is_err() {
+                            tcp_writers.remove(channel);
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            finished = readers.join_next(), if !readers.is_empty() => {
+                if finished.is_some() && readers.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
+    readers.abort_all();
+    drop(out_tx);
+    let _ = writer.await;
+}
+
+#[cfg(test)]
+mod portforward_tests {
+    use super::*;
+    use axum::extract::ws::WebSocketUpgrade;
+    use axum::routing::get;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    async fn serve_portforward(ports: Vec<u16>) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/pf",
+            get(move |ws: WebSocketUpgrade| {
+                let ports = ports.clone();
+                async move {
+                    ws.protocols(["v4.channel.k8s.io"])
+                        .on_upgrade(move |socket| async move {
+                            run_portforward(socket, "127.0.0.1", &ports).await
+                        })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    async fn next_binary<S>(ws: &mut S) -> Vec<u8>
+    where
+        S: futures::Stream<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                ClientMessage::Binary(data) => return data,
+                ClientMessage::Close(_) => panic!("closed"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn header_frame_encodes_port_little_endian() {
+        assert_eq!(portforward_header_frame(2, 0x1234), vec![2, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn data_frame_prefixes_channel() {
+        assert_eq!(portforward_data_frame(4, b"ab"), vec![4, b'a', b'b']);
+    }
+
+    #[tokio::test]
+    async fn forwards_data_both_ways_on_channel_pairs() {
+        let echo_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ports = vec![
+            echo_a.local_addr().unwrap().port(),
+            echo_b.local_addr().unwrap().port(),
+        ];
+        for listener in [echo_a, echo_b] {
+            tokio::spawn(async move {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 64];
+                loop {
+                    let n = conn.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 || conn.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let addr = serve_portforward(ports.clone()).await;
+        let (mut ws, response) = connect_async(format!("ws://{}/pf", addr)).await.unwrap();
+        drop(response);
+
+        let mut headers = Vec::new();
+        for _ in 0..4 {
+            headers.push(next_binary(&mut ws).await);
+        }
+        headers.sort();
+        let mut expected = Vec::new();
+        for (i, port) in ports.iter().enumerate() {
+            expected.push(portforward_header_frame((i * 2) as u8, *port));
+            expected.push(portforward_header_frame((i * 2 + 1) as u8, *port));
+        }
+        expected.sort();
+        assert_eq!(headers, expected);
+
+        ws.send(ClientMessage::Binary(portforward_data_frame(0, b"one")))
+            .await
+            .unwrap();
+        ws.send(ClientMessage::Binary(portforward_data_frame(2, b"two")))
+            .await
+            .unwrap();
+        let mut replies = vec![next_binary(&mut ws).await, next_binary(&mut ws).await];
+        replies.sort();
+        assert_eq!(
+            replies,
+            vec![
+                portforward_data_frame(0, b"one"),
+                portforward_data_frame(2, b"two")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_connect_failure_on_error_channel() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+
+        let addr = serve_portforward(vec![port]).await;
+        let (mut ws, _) = connect_async(format!("ws://{}/pf", addr)).await.unwrap();
+
+        assert_eq!(
+            next_binary(&mut ws).await,
+            portforward_header_frame(0, port)
+        );
+        assert_eq!(
+            next_binary(&mut ws).await,
+            portforward_header_frame(1, port)
+        );
+        let error = next_binary(&mut ws).await;
+        assert_eq!(error[0], 1);
+        assert!(String::from_utf8_lossy(&error[1..]).contains("Failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn closes_when_target_closes() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut conn, _) = target.accept().await.unwrap();
+            conn.write_all(b"hi").await.unwrap();
+        });
+
+        let addr = serve_portforward(vec![port]).await;
+        let (mut ws, _) = connect_async(format!("ws://{}/pf", addr)).await.unwrap();
+
+        assert_eq!(
+            next_binary(&mut ws).await,
+            portforward_header_frame(0, port)
+        );
+        assert_eq!(
+            next_binary(&mut ws).await,
+            portforward_header_frame(1, port)
+        );
+
+        let mut data = Vec::new();
+        loop {
+            match ws.next().await {
+                Some(Ok(ClientMessage::Binary(frame))) if frame[0] == 0 => {
+                    data.extend_from_slice(&frame[1..]);
+                }
+                Some(Ok(ClientMessage::Close(_))) | Some(Err(_)) | None => break,
+                _ => {}
+            }
+        }
+        assert_eq!(data, b"hi");
+    }
 }
