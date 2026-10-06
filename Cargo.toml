@@ -61,7 +61,7 @@ x509-parser = "0.16" # X.509 certificate parsing
 pem = "4.0" # PEM format encoding/decoding
 base64 = "0.23" # Base64 encoding/decoding
 serial_test = "4.0" # Serialize tests that modify global state
-warp = "0.3" # HTTP server framework for testing
+warp = "0.4" # HTTP server framework for testing
 
 # Cloud provider SDKs
 aws-config = "1.1"
