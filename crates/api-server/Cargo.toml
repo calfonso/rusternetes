@@ -60,7 +60,7 @@ prost.workspace = true
 prost-types = "0.13"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
 
 [dev-dependencies]
 tokio-test = "0.4"
