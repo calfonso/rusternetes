@@ -79,6 +79,11 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
 }
 
 impl Kubelet {
+    /// The container backend this kubelet's runtime drives.
+    pub fn backend(&self) -> Arc<dyn crate::backend::ContainerBackend> {
+        self.runtime.backend().clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         node_name: String,
@@ -4010,7 +4015,7 @@ impl Kubelet {
             .collect();
 
         // Get pod resource usage statistics
-        let pod_stats = get_pod_stats(&node_pods).await;
+        let pod_stats = get_pod_stats(self.runtime.backend().as_ref(), &node_pods).await;
 
         // For each active signal, select pods for eviction
         for signal in signals {
