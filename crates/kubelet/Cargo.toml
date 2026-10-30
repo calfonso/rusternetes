@@ -30,6 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 bollard.workspace = true
 chrono.workspace = true
 axum.workspace = true
@@ -37,9 +38,17 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tonic.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 http = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { workspace = true, features = ["util"] }
+sha2 = "0.11"
 tar = "0.4"
 sysinfo = "0.32"
 
 [dev-dependencies]
 tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.12"

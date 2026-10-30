@@ -1,6 +1,8 @@
 #[allow(dead_code)]
+pub mod backend;
 pub mod cni;
 pub mod config;
+pub mod csi;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;

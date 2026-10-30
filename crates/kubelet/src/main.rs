@@ -1,6 +1,10 @@
 #[allow(dead_code)]
+mod backend;
+#[allow(dead_code)]
 mod cni;
 mod config;
+#[allow(dead_code, unused_imports)]
+mod csi;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;
@@ -13,9 +17,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bollard::container::LogOutput;
-use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::Docker;
+use backend::{ContainerBackend, CreateExecOptions, DockerBackend, LogOutput, StartExecResults};
 use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
 use futures::StreamExt;
@@ -270,8 +272,8 @@ async fn run() -> Result<()> {
 
 /// Handle exec requests from the API server.
 ///
-/// The API server proxies exec requests to the kubelet, which uses bollard
-/// to create and start a Docker exec on the target container.
+/// The API server proxies exec requests to the kubelet, which creates and
+/// starts an exec on the target container through the container backend.
 async fn handle_exec(
     Path(container_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
@@ -284,38 +286,31 @@ async fn handle_exec(
     let stdin_data = if body.is_empty() { None } else { Some(body) };
     let tty = params.get("tty").map(|v| v == "true").unwrap_or(false);
 
-    let docker = Docker::connect_with_local_defaults()
+    let docker = DockerBackend::connect_with_local_defaults()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let exec_config = CreateExecOptions {
-        cmd: Some(command.iter().map(|s| s.as_str()).collect()),
+        cmd: Some(command.clone()),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
         attach_stdin: Some(stdin_data.is_some()),
         tty: Some(tty),
-        ..Default::default()
     };
 
-    let exec = docker
+    let exec_id = docker
         .create_exec(&container_id, exec_config)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Always use attached mode to collect output
-    let start_config = Some(bollard::exec::StartExecOptions {
-        detach: false,
-        ..Default::default()
-    });
-
     let output = docker
-        .start_exec(&exec.id, start_config)
+        .start_exec(&exec_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Collect output with short timeout per read to prevent hanging
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exec_id = exec.id.clone();
     if let StartExecResults::Attached {
         output: mut stream, ..
     } = output

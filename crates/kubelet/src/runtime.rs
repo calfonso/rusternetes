@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
-use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+use crate::backend::{
+    ContainerBackend, ContainerConfig, ContainerStateStatus, CreateExecOptions, DockerBackend,
+    HostConfig, ListContainersOptions, LogsOptions, Mount, NetworkSettings, PortBinding,
+    RemoveContainerOptions, StartExecResults, StatsOptions, StopContainerOptions,
+    UpdateContainerOptions,
 };
-use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::image::CreateImageOptions;
-use bollard::Docker;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::StreamExt;
 use rusternetes_common::resources::{
@@ -84,7 +83,7 @@ struct ProbeState {
 
 /// ContainerRuntime manages containers using Docker/Podman with CNI networking
 pub struct ContainerRuntime {
-    docker: Docker,
+    backend: Arc<dyn ContainerBackend>,
     storage: Option<Arc<rusternetes_storage::StorageBackend>>,
     volumes_base_path: String,
     cluster_dns: String,
@@ -107,6 +106,8 @@ pub struct ContainerRuntime {
     shell_cache: Mutex<HashMap<String, bool>>,
     /// Names of containers this process is currently creating and starting
     starting_containers: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// CSI drivers registered on this node and the node-side volume calls.
+    csi: Arc<crate::csi::CsiManager>,
 }
 
 /// Join a list of strings into a shell-safe command string.
@@ -193,8 +194,30 @@ impl ContainerRuntime {
         kubernetes_service_host: String,
         pod_prefer_cluster_dns: bool,
     ) -> Result<Self> {
-        let docker = Docker::connect_with_local_defaults()?;
+        let backend: Arc<dyn ContainerBackend> =
+            Arc::new(DockerBackend::connect_with_local_defaults()?);
+        Self::with_backend(
+            backend,
+            volumes_base_path,
+            cluster_dns,
+            cluster_domain,
+            network,
+            kubernetes_service_host,
+            pod_prefer_cluster_dns,
+        )
+        .await
+    }
 
+    /// Like [`Self::new`], with an explicit container backend.
+    pub async fn with_backend(
+        backend: Arc<dyn ContainerBackend>,
+        volumes_base_path: String,
+        cluster_dns: String,
+        cluster_domain: String,
+        network: String,
+        kubernetes_service_host: String,
+        pod_prefer_cluster_dns: bool,
+    ) -> Result<Self> {
         info!("Using volumes base path: {}", volumes_base_path);
         info!(
             "Cluster DNS: {}, domain: {}, network: {}",
@@ -222,10 +245,10 @@ impl ContainerRuntime {
             .unwrap_or_else(|_| "rusternetes-secret-change-in-production".to_string());
         let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
 
-        let supports_uts_container_mode = Self::detect_uts_container_mode(&docker).await;
+        let supports_uts_container_mode = Self::detect_uts_container_mode(backend.as_ref()).await;
 
         Ok(Self {
-            docker,
+            backend,
             storage: None,
             volumes_base_path,
             cluster_dns,
@@ -241,7 +264,19 @@ impl ContainerRuntime {
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
             starting_containers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            csi: Arc::new(crate::csi::CsiManager::from_env()),
         })
+    }
+
+    /// Use this CSI manager instead of the default one.
+    #[allow(dead_code)] // used by the library and tests, not by the binary
+    pub fn with_csi(mut self, csi: Arc<crate::csi::CsiManager>) -> Self {
+        self.csi = csi;
+        self
+    }
+
+    pub fn csi(&self) -> &Arc<crate::csi::CsiManager> {
+        &self.csi
     }
 
     /// Classify a daemon identity string as Podman, Docker, or unknown.
@@ -271,9 +306,9 @@ impl ContainerRuntime {
     /// "Podman Engine" in `Components[].Name`; Docker reports "Engine" plus a
     /// `Platform.Name` of "Docker Engine - <edition>". Anything we cannot
     /// positively identify as Docker keeps the previous behaviour.
-    async fn detect_uts_container_mode(docker: &Docker) -> bool {
-        let version = match docker.version().await {
-            Ok(version) => version,
+    async fn detect_uts_container_mode(backend: &dyn ContainerBackend) -> bool {
+        let identity = match backend.version_identity().await {
+            Ok(identity) => identity,
             Err(e) => {
                 // The daemon is unreachable; nothing else will work either.
                 // Don't change pod-creation behaviour off a failed probe.
@@ -281,15 +316,6 @@ impl ContainerRuntime {
                 return true;
             }
         };
-
-        let identity = version
-            .platform
-            .as_ref()
-            .map(|p| p.name.as_str())
-            .into_iter()
-            .chain(version.components.iter().flatten().map(|c| c.name.as_str()))
-            .collect::<Vec<_>>()
-            .join(" ");
 
         let supported = Self::uts_container_mode_from_identity(&identity);
         if supported {
@@ -345,6 +371,11 @@ impl ContainerRuntime {
             .with_default_network("rusternetes".to_string());
 
         Ok(cni)
+    }
+
+    /// The container backend this runtime drives.
+    pub fn backend(&self) -> &Arc<dyn ContainerBackend> {
+        &self.backend
     }
 
     pub fn volumes_base_path(&self) -> &str {
@@ -522,7 +553,7 @@ impl ContainerRuntime {
 
     /// Check if an image exists locally
     async fn check_image_exists(&self, image: &str) -> bool {
-        match self.docker.inspect_image(image).await {
+        match self.backend.inspect_image(image).await {
             Ok(_) => {
                 debug!("Image {} exists locally", image);
                 true
@@ -556,12 +587,7 @@ impl ContainerRuntime {
 
     /// Pull image with retry logic
     async fn pull_image_with_retry(&self, image: &str) -> Result<()> {
-        let options = CreateImageOptions {
-            from_image: image,
-            ..Default::default()
-        };
-
-        let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut stream = self.backend.pull_image(image);
         let mut last_error = None;
 
         while let Some(result) = stream.next().await {
@@ -616,8 +642,8 @@ impl ContainerRuntime {
         // Without this, Docker returns 409 Conflict for container name reuse.
         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — SyncPod
         if let Ok(containers) = self
-            .docker
-            .list_containers(Some(ListContainersOptions::<String> {
+            .backend
+            .list_containers(ListContainersOptions {
                 all: true,
                 filters: {
                     let mut f = std::collections::HashMap::new();
@@ -632,8 +658,7 @@ impl ContainerRuntime {
                     );
                     f
                 },
-                ..Default::default()
-            }))
+            })
             .await
         {
             // Remove old containers in parallel for faster cleanup
@@ -642,13 +667,8 @@ impl ContainerRuntime {
                 .filter_map(|c| c.id.as_ref())
                 .map(|id| {
                     debug!("Removing old container {} for pod {}", id, pod_name);
-                    self.docker.remove_container(
-                        id,
-                        Some(bollard::container::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
+                    self.backend
+                        .remove_container(id, RemoveContainerOptions { force: true })
                 })
                 .collect();
             let _ = futures_util::future::join_all(remove_futures).await;
@@ -962,13 +982,10 @@ impl ContainerRuntime {
                                     // Remove the failed container before retrying
                                     let full_name = format!("{}_{}", pod_name, container.name);
                                     let _ = self
-                                        .docker
+                                        .backend
                                         .remove_container(
                                             &full_name,
-                                            Some(RemoveContainerOptions {
-                                                force: true,
-                                                ..Default::default()
-                                            }),
+                                            RemoveContainerOptions { force: true },
                                         )
                                         .await;
 
@@ -1270,11 +1287,7 @@ impl ContainerRuntime {
 
         // Check if pause container already exists and is running — if so, just return its IP.
         // Recreating the pause container would destroy all containers sharing its network namespace.
-        if let Ok(inspect) = self
-            .docker
-            .inspect_container(&pause_name, None::<InspectContainerOptions>)
-            .await
-        {
+        if let Ok(inspect) = self.backend.inspect_container(&pause_name).await {
             let state = inspect.state.as_ref();
             let is_running = state.and_then(|s| s.running).unwrap_or(false);
 
@@ -1300,11 +1313,11 @@ impl ContainerRuntime {
             // Remove dependent containers first (required for Podman which
             // refuses to remove a container that has dependents).
             if let Ok(containers) = self
-                .docker
-                .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+                .backend
+                .list_containers(ListContainersOptions {
                     all: true,
                     ..Default::default()
-                }))
+                })
                 .await
             {
                 let network_mode_key = format!("container:{}", pause_name);
@@ -1318,34 +1331,22 @@ impl ContainerRuntime {
                     if is_dependent {
                         if let Some(id) = &c.id {
                             let _ = self
-                                .docker
-                                .stop_container(
-                                    id,
-                                    Some(bollard::container::StopContainerOptions { t: 0 }),
-                                )
+                                .backend
+                                .stop_container(id, StopContainerOptions { t: 0 })
                                 .await;
                             let _ = self
-                                .docker
-                                .remove_container(
-                                    id,
-                                    Some(bollard::container::RemoveContainerOptions {
-                                        force: true,
-                                        ..Default::default()
-                                    }),
-                                )
+                                .backend
+                                .remove_container(id, RemoveContainerOptions { force: true })
                                 .await;
                         }
                     }
                 }
             }
             // Pause container exists but is not running — remove it
-            let remove_options = RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            };
+            let remove_options = RemoveContainerOptions { force: true };
             let _ = self
-                .docker
-                .remove_container(&pause_name, Some(remove_options))
+                .backend
+                .remove_container(&pause_name, remove_options)
                 .await;
         }
 
@@ -1353,8 +1354,7 @@ impl ContainerRuntime {
         // The pause container owns the network namespace and must declare all ports;
         // child containers that join via --network container:<pause> cannot re-declare them.
         let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
-        let mut port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
-            HashMap::new();
+        let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         if let Some(spec) = &pod.spec {
             for c in &spec.containers {
                 if let Some(ports) = &c.ports {
@@ -1381,7 +1381,7 @@ impl ContainerRuntime {
                             };
                             port_bindings.insert(
                                 port_key,
-                                Some(vec![bollard::models::PortBinding {
+                                Some(vec![PortBinding {
                                     host_ip: Some(bind_ip.to_string()),
                                     host_port: Some(host_port.to_string()),
                                 }]),
@@ -1431,7 +1431,7 @@ impl ContainerRuntime {
             .await
             .context("Failed to ensure busybox image for pause container")?;
 
-        let config = Config {
+        let config = ContainerConfig {
             image: Some("busybox:latest".to_string()),
             cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
             hostname: Some(pause_hostname),
@@ -1440,7 +1440,7 @@ impl ContainerRuntime {
             } else {
                 Some(exposed_ports)
             },
-            host_config: Some(bollard::models::HostConfig {
+            host_config: Some(HostConfig {
                 network_mode: Some(self.network.clone()),
                 // Shareable IPC so app containers can join via ipc_mode=container:pause
                 ipc_mode: Some("shareable".to_string()),
@@ -1465,15 +1465,10 @@ impl ContainerRuntime {
             ..Default::default()
         };
 
-        let options = CreateContainerOptions {
-            name: pause_name.clone(),
-            ..Default::default()
-        };
-
         // Create pause container, handling 409 Conflict by removing and retrying
         match self
-            .docker
-            .create_container(Some(options.clone()), config.clone())
+            .backend
+            .create_container(&pause_name, config.clone())
             .await
         {
             Ok(_) => {}
@@ -1490,13 +1485,11 @@ impl ContainerRuntime {
                     // Remove dependent containers first (required for Podman which
                     // refuses to remove a container that has dependents).
                     if let Ok(containers) = self
-                        .docker
-                        .list_containers(Some(
-                            bollard::container::ListContainersOptions::<String> {
-                                all: true,
-                                ..Default::default()
-                            },
-                        ))
+                        .backend
+                        .list_containers(ListContainersOptions {
+                            all: true,
+                            ..Default::default()
+                        })
                         .await
                     {
                         let network_mode_key = format!("container:{}", pause_name);
@@ -1510,20 +1503,14 @@ impl ContainerRuntime {
                             if is_dependent {
                                 if let Some(id) = &c.id {
                                     let _ = self
-                                        .docker
-                                        .stop_container(
-                                            id,
-                                            Some(bollard::container::StopContainerOptions { t: 0 }),
-                                        )
+                                        .backend
+                                        .stop_container(id, StopContainerOptions { t: 0 })
                                         .await;
                                     let _ = self
-                                        .docker
+                                        .backend
                                         .remove_container(
                                             id,
-                                            Some(bollard::container::RemoveContainerOptions {
-                                                force: true,
-                                                ..Default::default()
-                                            }),
+                                            RemoveContainerOptions { force: true },
                                         )
                                         .await;
                                 }
@@ -1532,21 +1519,12 @@ impl ContainerRuntime {
                     }
                     // Force stop the pause container, then remove.
                     let _ = self
-                        .docker
-                        .stop_container(
-                            &pause_name,
-                            Some(bollard::container::StopContainerOptions { t: 0 }),
-                        )
+                        .backend
+                        .stop_container(&pause_name, StopContainerOptions { t: 0 })
                         .await;
                     match self
-                        .docker
-                        .remove_container(
-                            &pause_name,
-                            Some(bollard::container::RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
+                        .backend
+                        .remove_container(&pause_name, RemoveContainerOptions { force: true })
                         .await
                     {
                         Ok(_) => {
@@ -1562,8 +1540,8 @@ impl ContainerRuntime {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                     }
-                    self.docker
-                        .create_container(Some(options), config.clone())
+                    self.backend
+                        .create_container(&pause_name, config.clone())
                         .await
                         .context("Failed to create pause container after cleanup")?;
                 } else {
@@ -1572,8 +1550,8 @@ impl ContainerRuntime {
             }
         }
 
-        self.docker
-            .start_container(&pause_name, None::<StartContainerOptions<String>>)
+        self.backend
+            .start_container(&pause_name)
             .await
             .context("Failed to start pause container")?;
 
@@ -1585,11 +1563,7 @@ impl ContainerRuntime {
         {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                match self
-                    .docker
-                    .inspect_container(&pause_name, None::<InspectContainerOptions>)
-                    .await
-                {
+                match self.backend.inspect_container(&pause_name).await {
                     Ok(info) if info.state.as_ref().and_then(|s| s.running).unwrap_or(false) => {
                         break
                     }
@@ -1615,8 +1589,8 @@ impl ContainerRuntime {
 
         // Inspect to get the assigned IP
         let inspect = self
-            .docker
-            .inspect_container(&pause_name, None::<InspectContainerOptions>)
+            .backend
+            .inspect_container(&pause_name)
             .await
             .context("Failed to inspect pause container")?;
 
@@ -1692,11 +1666,7 @@ impl ContainerRuntime {
                 ));
             }
 
-            match self
-                .docker
-                .inspect_container(&full_container_name, None::<InspectContainerOptions>)
-                .await
-            {
+            match self.backend.inspect_container(&full_container_name).await {
                 Ok(inspect) => {
                     if let Some(state) = inspect.state {
                         let running = state.running.unwrap_or(false);
@@ -2708,6 +2678,11 @@ impl ContainerRuntime {
                 .await
                 .with_context(|| format!("PersistentVolume {} not found", pv_name))?;
 
+            if pv.spec.csi.is_some() && pv.spec.host_path.is_none() {
+                let read_only = pvc_source.read_only.unwrap_or(false);
+                return self.mount_pv_csi(pod, &volume.name, &pv, read_only).await;
+            }
+
             // Get the host path from the PV
             let path = if let Some(hp) = &pv.spec.host_path {
                 hp.path.clone()
@@ -2800,19 +2775,9 @@ impl ContainerRuntime {
             return Ok(volume_dir);
         }
 
-        // CSI: ephemeral inline volume (handled by external CSI driver)
-        if let Some(_csi) = &volume.csi {
-            // CSI ephemeral inline volumes are managed by the CSI driver via the kubelet CSI plugin
-            // For conformance, we create a placeholder directory and rely on the CSI driver to populate it
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create CSI volume directory")?;
-
-            info!(
-                "Created CSI ephemeral volume {} at {} (managed by CSI driver)",
-                volume.name, volume_dir
-            );
-            return Ok(volume_dir);
+        // CSI: ephemeral inline volume, published by the node's CSI driver
+        if let Some(csi) = &volume.csi {
+            return self.mount_inline_csi(pod, &volume.name, csi).await;
         }
 
         // Ephemeral: generic ephemeral volume with PVC template
@@ -2882,6 +2847,10 @@ impl ContainerRuntime {
                             pv_name
                         )
                     })?;
+
+                    if pv.spec.csi.is_some() && pv.spec.host_path.is_none() {
+                        return self.mount_pv_csi(pod, &volume.name, &pv, false).await;
+                    }
 
                     let path = if let Some(hp) = &pv.spec.host_path {
                         hp.path.clone()
@@ -3240,6 +3209,236 @@ impl ContainerRuntime {
         Ok(volume_dir)
     }
 
+    /// Publish an inline (ephemeral) CSI volume into the pod volume directory.
+    async fn mount_inline_csi(
+        &self,
+        pod: &Pod,
+        volume_name: &str,
+        csi: &rusternetes_common::resources::csi::CSIVolumeSource,
+    ) -> Result<String> {
+        use crate::csi::proto::csi::v1::volume_capability::access_mode::Mode;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let mut volume_context = csi.volume_attributes.clone().unwrap_or_default();
+        if self.csi_pod_info_on_mount(&csi.driver).await {
+            volume_context.extend(Self::csi_pod_info(pod));
+            volume_context.insert(crate::csi::CTX_EPHEMERAL.to_string(), "true".to_string());
+        }
+        let publish_secrets = match csi
+            .node_publish_secret_ref
+            .as_ref()
+            .and_then(|r| r.name.as_deref())
+        {
+            Some(name) => self.csi_secret(namespace, name).await?,
+            None => HashMap::new(),
+        };
+        let req = crate::csi::MountRequest {
+            driver: csi.driver.clone(),
+            volume_handle: crate::csi::ephemeral_volume_handle(&pod.metadata.uid, volume_name),
+            volume_dir: PathBuf::from(format!(
+                "{}/{}/{}",
+                self.volumes_base_path, pod.metadata.name, volume_name
+            )),
+            read_only: csi.read_only.unwrap_or(false),
+            access_type: crate::csi::AccessType::Mount {
+                fs_type: csi.fs_type.clone().unwrap_or_default(),
+                mount_flags: Vec::new(),
+            },
+            access_mode: Mode::SingleNodeWriter,
+            volume_context,
+            publish_context: HashMap::new(),
+            stage_secrets: HashMap::new(),
+            publish_secrets,
+            ephemeral: true,
+        };
+        let path = self.csi.mount_volume(&req).await?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Stage and publish a CSI-backed PersistentVolume for a pod.
+    async fn mount_pv_csi(
+        &self,
+        pod: &Pod,
+        volume_name: &str,
+        pv: &PersistentVolume,
+        claim_read_only: bool,
+    ) -> Result<String> {
+        use crate::csi::proto::csi::v1::volume_capability::access_mode::Mode;
+        use rusternetes_common::resources::volume::{
+            PersistentVolumeAccessMode, PersistentVolumeMode,
+        };
+        let csi = pv
+            .spec
+            .csi
+            .as_ref()
+            .context("PersistentVolume has no CSI source")?;
+        let pv_name = &pv.metadata.name;
+        let volume_handle = csi
+            .volume_handle
+            .clone()
+            .filter(|h| !h.is_empty())
+            .with_context(|| format!("CSI PersistentVolume {} has no volumeHandle", pv_name))?;
+
+        let mut volume_context = csi.volume_attributes.clone().unwrap_or_default();
+        if self.csi_pod_info_on_mount(&csi.driver).await {
+            volume_context.extend(Self::csi_pod_info(pod));
+            volume_context.insert(crate::csi::CTX_EPHEMERAL.to_string(), "false".to_string());
+        }
+        let secret_ref = |r: &Option<rusternetes_common::resources::volume::SecretReference>| {
+            r.as_ref().and_then(|r| {
+                Some((
+                    r.namespace.clone().unwrap_or_else(|| "default".to_string()),
+                    r.name.clone()?,
+                ))
+            })
+        };
+        let stage_ref = secret_ref(&csi.node_stage_secret_ref);
+        let publish_ref = secret_ref(&csi.node_publish_secret_ref);
+        let stage_secrets = match stage_ref {
+            Some((ns, name)) => self.csi_secret(&ns, &name).await?,
+            None => HashMap::new(),
+        };
+        let publish_secrets = match publish_ref {
+            Some((ns, name)) => self.csi_secret(&ns, &name).await?,
+            None => HashMap::new(),
+        };
+
+        // Same as upstream: the first access mode decides.
+        let access_mode = match pv.spec.access_modes.first() {
+            Some(PersistentVolumeAccessMode::ReadOnlyMany) => Mode::MultiNodeReaderOnly,
+            Some(PersistentVolumeAccessMode::ReadWriteMany) => Mode::MultiNodeMultiWriter,
+            _ => Mode::SingleNodeWriter,
+        };
+        let access_type = if pv.spec.volume_mode == Some(PersistentVolumeMode::Block) {
+            crate::csi::AccessType::Block
+        } else {
+            crate::csi::AccessType::Mount {
+                fs_type: csi.fs_type.clone().unwrap_or_default(),
+                mount_flags: pv.spec.mount_options.clone().unwrap_or_default(),
+            }
+        };
+        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
+        let req = crate::csi::MountRequest {
+            driver: csi.driver.clone(),
+            volume_handle,
+            volume_dir: PathBuf::from(format!(
+                "{}/{}/{}",
+                self.volumes_base_path, pod.metadata.name, volume_name
+            )),
+            read_only: claim_read_only || csi.read_only.unwrap_or(false),
+            access_type,
+            access_mode,
+            volume_context,
+            publish_context: self
+                .csi_publish_context(pv_name, node_name.as_deref())
+                .await,
+            stage_secrets,
+            publish_secrets,
+            ephemeral: false,
+        };
+        let path = self.csi.mount_volume(&req).await?;
+        info!(
+            "Using CSI PersistentVolume {} for volume {} at {}",
+            pv_name,
+            volume_name,
+            path.display()
+        );
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// `podInfoOnMount` from the driver's CSIDriver object (false if absent).
+    async fn csi_pod_info_on_mount(&self, driver: &str) -> bool {
+        let Some(storage) = self.storage.as_ref() else {
+            return false;
+        };
+        storage
+            .get::<rusternetes_common::resources::csi::CSIDriver>(&build_key(
+                "csidrivers",
+                None,
+                driver,
+            ))
+            .await
+            .ok()
+            .and_then(|d| d.spec.pod_info_on_mount)
+            .unwrap_or(false)
+    }
+
+    /// Pod info keys the upstream kubelet adds for `podInfoOnMount` drivers.
+    fn csi_pod_info(pod: &Pod) -> HashMap<String, String> {
+        let mut info = HashMap::new();
+        info.insert(
+            "csi.storage.k8s.io/pod.name".to_string(),
+            pod.metadata.name.clone(),
+        );
+        info.insert(
+            "csi.storage.k8s.io/pod.namespace".to_string(),
+            pod.metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        );
+        info.insert(
+            "csi.storage.k8s.io/pod.uid".to_string(),
+            pod.metadata.uid.clone(),
+        );
+        info.insert(
+            "csi.storage.k8s.io/serviceAccount.name".to_string(),
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.service_account_name.clone())
+                .unwrap_or_else(|| "default".to_string()),
+        );
+        info
+    }
+
+    /// A Secret's data as CSI secrets.
+    async fn csi_secret(&self, namespace: &str, name: &str) -> Result<HashMap<String, String>> {
+        let storage = self
+            .storage
+            .as_ref()
+            .context("Storage not available for CSI secrets")?;
+        let secret: Secret = storage
+            .get(&build_key("secrets", Some(namespace), name))
+            .await
+            .with_context(|| format!("CSI secret {}/{} not found", namespace, name))?;
+        let mut out: HashMap<String, String> = secret
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+            .collect();
+        out.extend(secret.string_data.unwrap_or_default());
+        Ok(out)
+    }
+
+    /// Attachment metadata of an attached VolumeAttachment for this PV and
+    /// node, passed to the driver as the publish context. Rusternetes has no
+    /// attach/detach controller yet, so this is usually empty.
+    async fn csi_publish_context(
+        &self,
+        pv_name: &str,
+        node_name: Option<&str>,
+    ) -> HashMap<String, String> {
+        let (Some(storage), Some(node_name)) = (self.storage.as_ref(), node_name) else {
+            return HashMap::new();
+        };
+        let attachments: Vec<rusternetes_common::resources::csi::VolumeAttachment> = storage
+            .list(&rusternetes_storage::build_prefix(
+                "volumeattachments",
+                None,
+            ))
+            .await
+            .unwrap_or_default();
+        attachments
+            .into_iter()
+            .find(|va| {
+                va.spec.node_name == node_name
+                    && va.spec.source.persistent_volume_name.as_deref() == Some(pv_name)
+                    && va.status.as_ref().map(|s| s.attached).unwrap_or(false)
+            })
+            .and_then(|va| va.status.and_then(|s| s.attachment_metadata))
+            .unwrap_or_default()
+    }
+
     /// Create ServiceAccount token volume for in-cluster authentication
     #[allow(dead_code)]
     async fn create_serviceaccount_token_volume(&self, pod: &Pod) -> Result<String> {
@@ -3447,11 +3646,7 @@ impl ContainerRuntime {
         );
 
         // Check if container already exists
-        if let Ok(inspect) = self
-            .docker
-            .inspect_container(&container_name, None::<InspectContainerOptions>)
-            .await
-        {
+        if let Ok(inspect) = self.backend.inspect_container(&container_name).await {
             let state = inspect.state.as_ref();
             let is_running = state.and_then(|s| s.running).unwrap_or(false);
             let status = state.and_then(|s| s.status.as_ref());
@@ -3464,20 +3659,17 @@ impl ContainerRuntime {
             // (no start is in flight for it, so an earlier process stopped mid-start).
             if matches!(
                 status,
-                Some(bollard::secret::ContainerStateStatusEnum::CREATED)
-                    | Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                    | Some(bollard::secret::ContainerStateStatusEnum::DEAD)
+                Some(ContainerStateStatus::Created)
+                    | Some(ContainerStateStatus::Exited)
+                    | Some(ContainerStateStatus::Dead)
             ) {
                 debug!(
                     "Removing exited or never-started container: {}",
                     container_name
                 );
-                let remove_options = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                self.docker
-                    .remove_container(&container_name, Some(remove_options))
+                let remove_options = RemoveContainerOptions { force: true };
+                self.backend
+                    .remove_container(&container_name, remove_options)
                     .await?;
                 // Brief wait for Docker to release the container name.
                 // Docker typically releases names within 50ms after force removal.
@@ -3886,7 +4078,7 @@ impl ContainerRuntime {
                         let bind_ip = port.host_ip.as_deref().unwrap_or("0.0.0.0").to_string();
                         port_bindings.insert(
                             port_key,
-                            Some(vec![bollard::models::PortBinding {
+                            Some(vec![PortBinding {
                                 host_ip: Some(bind_ip),
                                 host_port: Some(host_port.to_string()),
                             }]),
@@ -3899,7 +4091,7 @@ impl ContainerRuntime {
         // Build volume bindings
         let mut binds = Vec::new();
         let mut tmpfs_mounts: HashMap<String, String> = HashMap::new();
-        let docker_vol_mounts: Vec<bollard::models::Mount> = Vec::new();
+        let docker_vol_mounts: Vec<Mount> = Vec::new();
 
         // Identify which volumes are emptyDir (should use tmpfs)
         let empty_dir_volumes: std::collections::HashSet<String> = pod
@@ -4417,7 +4609,7 @@ impl ContainerRuntime {
             None // Hostname is set on the pause container instead
         };
 
-        let mut config = Config {
+        let mut config = ContainerConfig {
             image: Some(container.image.clone()),
             env,
             working_dir: container.working_dir.clone(),
@@ -4428,7 +4620,7 @@ impl ContainerRuntime {
             } else {
                 Some(exposed_ports)
             },
-            host_config: Some(bollard::models::HostConfig {
+            host_config: Some(HostConfig {
                 port_bindings: if port_bindings.is_empty() {
                     None
                 } else {
@@ -4642,7 +4834,7 @@ impl ContainerRuntime {
                 // Most standard images (alpine, debian, ubuntu, busybox, etc.) have /bin/sh.
                 // This avoids creating+starting+removing a probe container per image.
                 let shell_ok =
-                    if let Ok(inspect) = self.docker.inspect_image(&container.image).await {
+                    if let Ok(inspect) = self.backend.inspect_image(&container.image).await {
                         // Check image labels/config for distroless/scratch indicators
                         let image_name_lower = container.image.to_lowercase();
                         let is_known_no_shell = image_name_lower.contains("distroless")
@@ -4799,7 +4991,7 @@ impl ContainerRuntime {
             if needs_umask_fix {
                 // args-only: discover image entrypoint and wrap with umask
                 let image_entrypoint = self
-                    .docker
+                    .backend
                     .inspect_image(&container.image)
                     .await
                     .ok()
@@ -4832,7 +5024,7 @@ impl ContainerRuntime {
         } else if needs_umask_fix {
             // No command, no args — use image defaults with umask wrapper.
             // Discover image entrypoint+cmd and wrap with umask.
-            let inspect = self.docker.inspect_image(&container.image).await.ok();
+            let inspect = self.backend.inspect_image(&container.image).await.ok();
             let image_config = inspect.and_then(|i| i.config);
             let image_ep = image_config
                 .as_ref()
@@ -4860,18 +5052,13 @@ impl ContainerRuntime {
             }
         }
 
-        let options = CreateContainerOptions {
-            name: container_name.clone(),
-            ..Default::default()
-        };
-
         // Create the container. If a container with this name already exists
         // (Docker 409 Conflict), remove it and retry. K8s kills and removes
         // old containers before creating new ones during SyncPod.
         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go:1433-1447
         if let Err(e) = self
-            .docker
-            .create_container(Some(options.clone()), config.clone())
+            .backend
+            .create_container(&container_name, config.clone())
             .await
         {
             let err_str = format!("{}", e);
@@ -4895,33 +5082,21 @@ impl ContainerRuntime {
                 // Remove by ID if available, otherwise by name
                 let remove_target = conflicting_id.as_deref().unwrap_or(&container_name);
                 let _ = self
-                    .docker
-                    .remove_container(
-                        remove_target,
-                        Some(bollard::container::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
+                    .backend
+                    .remove_container(remove_target, RemoveContainerOptions { force: true })
                     .await;
                 // Also remove by name in case there are multiple conflicts
                 if conflicting_id.is_some() {
                     let _ = self
-                        .docker
-                        .remove_container(
-                            &container_name,
-                            Some(bollard::container::RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
+                        .backend
+                        .remove_container(&container_name, RemoveContainerOptions { force: true })
                         .await;
                 }
                 // Wait for Docker to finalize removal and release the container name.
                 // Force-remove is synchronous in Docker daemon; 200ms is sufficient.
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 // Retry creation after removal
-                if let Err(e2) = self.docker.create_container(Some(options), config).await {
+                if let Err(e2) = self.backend.create_container(&container_name, config).await {
                     error!(
                         "Docker API error creating container {} after cleanup: {}",
                         container_name, e2
@@ -4938,11 +5113,7 @@ impl ContainerRuntime {
         }
 
         // Start the container
-        if let Err(e) = self
-            .docker
-            .start_container(&container_name, None::<StartContainerOptions<String>>)
-            .await
-        {
+        if let Err(e) = self.backend.start_container(&container_name).await {
             error!("Failed to start container {}: {}", container_name, e);
             return Err(anyhow::anyhow!(
                 "Failed to start container {}: {}",
@@ -4969,9 +5140,9 @@ impl ContainerRuntime {
                     attach_stderr: Some(true),
                     ..Default::default()
                 };
-                match self.docker.create_exec(&container_name, exec_config).await {
-                    Ok(exec) => {
-                        if let Err(e) = self.docker.start_exec(&exec.id, None).await {
+                match self.backend.create_exec(&container_name, exec_config).await {
+                    Ok(exec_id) => {
+                        if let Err(e) = self.backend.start_exec(&exec_id).await {
                             debug!(
                                 "Failed to write /etc/hosts via exec for {}: {}",
                                 container_name, e
@@ -5005,8 +5176,8 @@ impl ContainerRuntime {
                     // K8s kills the container if postStart fails
                     // See: pkg/kubelet/kuberuntime/kuberuntime_container.go — killContainer on FailedPostStartHook
                     let _ = self
-                        .docker
-                        .stop_container(&container_name, Some(StopContainerOptions { t: 0 }))
+                        .backend
+                        .stop_container(&container_name, StopContainerOptions { t: 0 })
                         .await;
                     return Err(anyhow::anyhow!(
                         "PostStartHook failed for container {}: {}",
@@ -5034,27 +5205,17 @@ impl ContainerRuntime {
 
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let options = ListContainersOptions { all: true, filters };
+        let containers = self.backend.list_containers(options).await?;
 
         for container in containers {
             if let Some(id) = container.id {
                 let _ = self
-                    .docker
-                    .stop_container(&id, Some(StopContainerOptions { t: 0 }))
+                    .backend
+                    .stop_container(&id, StopContainerOptions { t: 0 })
                     .await;
-                let remove_options = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                let _ = self
-                    .docker
-                    .remove_container(&id, Some(remove_options))
-                    .await;
+                let remove_options = RemoveContainerOptions { force: true };
+                let _ = self.backend.remove_container(&id, remove_options).await;
             }
         }
 
@@ -5081,13 +5242,9 @@ impl ContainerRuntime {
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
 
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
+        let options = ListContainersOptions { all: true, filters };
 
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.backend.list_containers(options).await?;
 
         // Stop app containers first, then the pause container last.
         // The pause container owns the network namespace — stopping it first
@@ -5113,7 +5270,7 @@ impl ContainerRuntime {
                 let stop_options = StopContainerOptions {
                     t: grace_period_seconds,
                 };
-                if let Err(e) = self.docker.stop_container(id, Some(stop_options)).await {
+                if let Err(e) = self.backend.stop_container(id, stop_options).await {
                     warn!("Failed to stop container {}: {}", id, e);
                 }
 
@@ -5131,11 +5288,7 @@ impl ContainerRuntime {
             let stop_options = StopContainerOptions {
                 t: grace_period_seconds,
             };
-            if let Err(e) = self
-                .docker
-                .stop_container(pause_id, Some(stop_options))
-                .await
-            {
+            if let Err(e) = self.backend.stop_container(pause_id, stop_options).await {
                 warn!("Failed to stop pause container {}: {}", pause_id, e);
             }
         }
@@ -5161,7 +5314,17 @@ impl ContainerRuntime {
     pub async fn cleanup_pod_volumes(&self, pod_name: &str) -> Result<()> {
         let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
 
-        if std::path::Path::new(&volume_dir).exists() {
+        // CSI volumes first. If one cannot be unpublished, its mount may
+        // still be live, so keep the directory and retry on the next cleanup.
+        let csi_teardown = self
+            .csi
+            .unmount_pod_volumes(std::path::Path::new(&volume_dir))
+            .await;
+        if let Err(e) = &csi_teardown {
+            warn!("Keeping {} for now: {:#}", volume_dir, e);
+        }
+
+        if csi_teardown.is_ok() && std::path::Path::new(&volume_dir).exists() {
             if let Err(e) = std::fs::remove_dir_all(&volume_dir) {
                 warn!("Failed to remove volume directory {}: {}", volume_dir, e);
             } else {
@@ -5172,15 +5335,13 @@ impl ContainerRuntime {
         // Clean up Docker named volumes created for emptyDir volumes.
         // These are named rusternetes-emptydir-{pod_name}-{volume_name}.
         let prefix = format!("rusternetes-emptydir-{}-", pod_name);
-        if let Ok(volumes) = self.docker.list_volumes::<String>(None).await {
-            if let Some(volume_list) = volumes.volumes {
-                for vol in volume_list {
-                    if vol.name.starts_with(&prefix) {
-                        if let Err(e) = self.docker.remove_volume(&vol.name, None).await {
-                            warn!("Failed to remove Docker volume {}: {}", vol.name, e);
-                        } else {
-                            info!("Removed Docker volume {}", vol.name);
-                        }
+        if let Ok(volume_names) = self.backend.list_volumes().await {
+            for vol_name in volume_names {
+                if vol_name.starts_with(&prefix) {
+                    if let Err(e) = self.backend.remove_volume(&vol_name).await {
+                        warn!("Failed to remove Docker volume {}: {}", vol_name, e);
+                    } else {
+                        info!("Removed Docker volume {}", vol_name);
                     }
                 }
             }
@@ -5191,11 +5352,7 @@ impl ContainerRuntime {
 
     /// Check if a specific container is running
     pub async fn is_container_running(&self, container_name: &str) -> Result<bool> {
-        match self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-        {
+        match self.backend.inspect_container(container_name).await {
             Ok(inspect) => Ok(inspect
                 .state
                 .as_ref()
@@ -5208,10 +5365,7 @@ impl ContainerRuntime {
     /// Check if a container exists in Docker (in any state: running, exited, created, etc.).
     /// Returns true if the container can be inspected, false if it doesn't exist.
     pub async fn container_exists(&self, container_name: &str) -> bool {
-        self.docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-            .is_ok()
+        self.backend.inspect_container(container_name).await.is_ok()
     }
 
     /// Check if any spec container in a pod has terminated (exited).
@@ -5222,11 +5376,7 @@ impl ContainerRuntime {
         if let Some(spec) = &pod.spec {
             for container in &spec.containers {
                 let container_name = format!("{}_{}", pod_name, container.name);
-                match self
-                    .docker
-                    .inspect_container(&container_name, None::<InspectContainerOptions>)
-                    .await
-                {
+                match self.backend.inspect_container(&container_name).await {
                     Ok(inspect) => {
                         let state = inspect.state.unwrap_or_default();
                         let running = state.running.unwrap_or(false);
@@ -5235,10 +5385,7 @@ impl ContainerRuntime {
                             if state.exit_code.is_some()
                                 || matches!(
                                     state.status,
-                                    Some(
-                                        bollard::secret::ContainerStateStatusEnum::EXITED
-                                            | bollard::secret::ContainerStateStatusEnum::DEAD
-                                    )
+                                    Some(ContainerStateStatus::Exited | ContainerStateStatus::Dead)
                                 )
                             {
                                 return true;
@@ -5262,10 +5409,9 @@ impl ContainerRuntime {
         let options = ListContainersOptions {
             all: false, // Only running containers
             filters,
-            ..Default::default()
         };
 
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.backend.list_containers(options).await?;
         // Check that at least one non-pause container is running.
         // Just the pause container running doesn't count — the app containers may have
         // failed to start (e.g., CreateContainerConfigError from subpath validation).
@@ -5290,10 +5436,9 @@ impl ContainerRuntime {
         let options = ListContainersOptions {
             all: true, // Include exited/created containers
             filters,
-            ..Default::default()
         };
 
-        let containers = match self.docker.list_containers(Some(options)).await {
+        let containers = match self.backend.list_containers(options).await {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -5336,10 +5481,7 @@ impl ContainerRuntime {
         for ic in init_containers {
             let container_name = format!("{}_{}", pod_name, ic.name);
 
-            let container_state_info = self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await;
+            let container_state_info = self.backend.inspect_container(&container_name).await;
 
             let (state, container_id, image_id): (ContainerState, Option<String>, Option<String>) =
                 match container_state_info {
@@ -5367,10 +5509,7 @@ impl ContainerRuntime {
                                 iid,
                             )
                         } else if ds.finished_at.is_some()
-                            || matches!(
-                                ds.status,
-                                Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                            )
+                            || matches!(ds.status, Some(ContainerStateStatus::Exited))
                         {
                             let code = ds.exit_code.unwrap_or(0) as i32;
                             let term_msg = self
@@ -5685,10 +5824,7 @@ impl ContainerRuntime {
             }
 
             let container_name = format!("{}_{}", pod_name, ic.name);
-            let inspect = self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await;
+            let inspect = self.backend.inspect_container(&container_name).await;
 
             match inspect {
                 Ok(info) => {
@@ -5702,10 +5838,7 @@ impl ContainerRuntime {
                         return (false, None, false);
                     }
 
-                    if matches!(
-                        status,
-                        Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                    ) {
+                    if matches!(status, Some(ContainerStateStatus::Exited)) {
                         if exit_code == 0 {
                             // This init container completed successfully — check next
                             continue;
@@ -5751,11 +5884,7 @@ impl ContainerRuntime {
 
         for ec in ecs {
             let container_name = format!("{}_{}", pod_name, ec.name);
-            let status = match self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await
-            {
+            let status = match self.backend.inspect_container(&container_name).await {
                 Ok(inspect) => {
                     let state = inspect.state.unwrap_or_default();
                     let running = state.running.unwrap_or(false);
@@ -5853,11 +5982,7 @@ impl ContainerRuntime {
         for container in &pod.spec.as_ref().unwrap().containers {
             let container_name = format!("{}_{}", pod_name, container.name);
 
-            let status = match self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await
-            {
+            let status = match self.backend.inspect_container(&container_name).await {
                 Ok(inspect) => {
                     let state = inspect.state.unwrap_or_default();
                     let running = state.running.unwrap_or(false);
@@ -5901,10 +6026,8 @@ impl ContainerRuntime {
                                 .as_deref()
                                 .and_then(rusternetes_common::time::parse_external),
                         })
-                    } else if matches!(
-                        state.status,
-                        Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                    ) || state.finished_at.is_some()
+                    } else if matches!(state.status, Some(ContainerStateStatus::Exited))
+                        || state.finished_at.is_some()
                     {
                         // Read termination message based on terminationMessagePolicy:
                         // - "File" (default): always read from file
@@ -6201,11 +6324,7 @@ impl ContainerRuntime {
                 let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
                 if initial_delay > 0 {
                     // Check container start time
-                    if let Ok(inspect) = self
-                        .docker
-                        .inspect_container(&container_name, None::<InspectContainerOptions>)
-                        .await
-                    {
+                    if let Ok(inspect) = self.backend.inspect_container(&container_name).await {
                         if let Some(state) = inspect.state {
                             if let Some(started_at) = state.started_at {
                                 if let Ok(started) =
@@ -6374,12 +6493,9 @@ impl ContainerRuntime {
         }
 
         // Fall back to docker cp for containers created before the bind-mount fix
-        let mut stream = self.docker.download_from_container(
-            container_name,
-            Some(bollard::container::DownloadFromContainerOptions {
-                path: msg_path.to_string(),
-            }),
-        );
+        let mut stream = self
+            .backend
+            .download_from_container(container_name, msg_path);
         let mut all_bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -6448,14 +6564,12 @@ impl ContainerRuntime {
 
     /// Read the last N lines of container logs (for FallbackToLogsOnError)
     async fn read_container_logs_tail(&self, container_name: &str, lines: usize) -> Option<String> {
-        use bollard::container::LogsOptions;
-        let options = LogsOptions::<String> {
+        let options = LogsOptions {
             stdout: true,
             stderr: true,
             tail: lines.to_string(),
-            ..Default::default()
         };
-        let mut stream = self.docker.logs(container_name, Some(options));
+        let mut stream = self.backend.logs(container_name, options);
         let mut output = String::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -6476,10 +6590,7 @@ impl ContainerRuntime {
 
     /// Extract the best available IP from container network settings.
     /// Tries the specific network first, then default ip_address, then 127.0.0.1.
-    fn extract_container_ip(
-        &self,
-        network_settings: Option<bollard::secret::NetworkSettings>,
-    ) -> String {
+    fn extract_container_ip(&self, network_settings: Option<NetworkSettings>) -> String {
         if let Some(ns) = network_settings {
             // First try the specific network we're using
             if let Some(networks) = &ns.networks {
@@ -6512,11 +6623,7 @@ impl ContainerRuntime {
     /// Get the effective IP for a container, resolving through pause containers
     /// when the app container uses NetworkMode=container:pause.
     async fn get_effective_container_ip(&self, container_name: &str) -> String {
-        let inspect = match self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-        {
+        let inspect = match self.backend.inspect_container(container_name).await {
             Ok(i) => i,
             Err(_) => return "127.0.0.1".to_string(),
         };
@@ -6527,11 +6634,7 @@ impl ContainerRuntime {
                 if net_mode.starts_with("container:") {
                     // Get the pause container's IP instead
                     let pause_id = net_mode.trim_start_matches("container:");
-                    if let Ok(pause_inspect) = self
-                        .docker
-                        .inspect_container(pause_id, None::<InspectContainerOptions>)
-                        .await
-                    {
+                    if let Ok(pause_inspect) = self.backend.inspect_container(pause_id).await {
                         let ip = self.extract_container_ip(pause_inspect.network_settings);
                         if ip != "127.0.0.1" {
                             return ip;
@@ -6658,12 +6761,11 @@ impl ContainerRuntime {
         };
 
         let exec_id = self
-            .docker
+            .backend
             .create_exec(container_name, exec_config)
-            .await?
-            .id;
+            .await?;
 
-        let start_result = self.docker.start_exec(&exec_id, None).await?;
+        let start_result = self.backend.start_exec(&exec_id).await?;
 
         match start_result {
             StartExecResults::Attached { mut output, .. } => while output.next().await.is_some() {},
@@ -6671,7 +6773,7 @@ impl ContainerRuntime {
         }
 
         // Get exec inspect to check exit code
-        let inspect = self.docker.inspect_exec(&exec_id).await?;
+        let inspect = self.backend.inspect_exec(&exec_id).await?;
         let exit_code = inspect.exit_code.unwrap_or(1);
 
         Ok(exit_code == 0)
@@ -6790,15 +6892,14 @@ impl ContainerRuntime {
             };
 
             let exec_id = self
-                .docker
+                .backend
                 .create_exec(container_name, exec_config)
                 .await
-                .context("Failed to create exec for lifecycle handler")?
-                .id;
+                .context("Failed to create exec for lifecycle handler")?;
 
             let start_result = self
-                .docker
-                .start_exec(&exec_id, None)
+                .backend
+                .start_exec(&exec_id)
                 .await
                 .context("Failed to start exec for lifecycle handler")?;
 
@@ -6812,7 +6913,7 @@ impl ContainerRuntime {
             }
 
             // Check exit code
-            let inspect = self.docker.inspect_exec(&exec_id).await?;
+            let inspect = self.backend.inspect_exec(&exec_id).await?;
             let exit_code = inspect.exit_code.unwrap_or(1);
             if exit_code != 0 {
                 return Err(anyhow::anyhow!(
@@ -6921,10 +7022,7 @@ impl ContainerRuntime {
                     resolved.unwrap_or_else(|| host.clone())
                 }
             } else {
-                let inspect = self
-                    .docker
-                    .inspect_container(container_name, None::<InspectContainerOptions>)
-                    .await?;
+                let inspect = self.backend.inspect_container(container_name).await?;
                 let container_ip = inspect
                     .network_settings
                     .as_ref()
@@ -6947,11 +7045,7 @@ impl ContainerRuntime {
                         "Lifecycle HTTP handler: resolving IP from pause container {} (container: {})",
                         pause_name, container_name
                     );
-                    let pause_inspect = self
-                        .docker
-                        .inspect_container(&pause_name, None::<InspectContainerOptions>)
-                        .await
-                        .ok();
+                    let pause_inspect = self.backend.inspect_container(&pause_name).await.ok();
                     pause_inspect
                         .and_then(|pi| pi.network_settings)
                         .and_then(|ns| {
@@ -7014,10 +7108,7 @@ impl ContainerRuntime {
             }
         } else if let Some(ref tcp_socket) = handler.tcp_socket {
             // Open TCP connection to the container
-            let inspect = self
-                .docker
-                .inspect_container(container_name, None::<InspectContainerOptions>)
-                .await?;
+            let inspect = self.backend.inspect_container(container_name).await?;
 
             let ip = inspect
                 .network_settings
@@ -7106,13 +7197,9 @@ impl ContainerRuntime {
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
 
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
+        let options = ListContainersOptions { all: true, filters };
 
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.backend.list_containers(options).await?;
 
         // First pass: execute preStop hooks on all running containers.
         // We must run ALL preStop hooks before stopping ANY containers, because
@@ -7275,7 +7362,7 @@ impl ContainerRuntime {
 
                 // Stop the container with remaining grace period (after preStop).
                 let stop_options = StopContainerOptions { t: remaining_grace };
-                if let Err(e) = self.docker.stop_container(id, Some(stop_options)).await {
+                if let Err(e) = self.backend.stop_container(id, stop_options).await {
                     warn!("Failed to stop container {}: {}", id, e);
                 }
 
@@ -7287,11 +7374,7 @@ impl ContainerRuntime {
         if let Some(ref pause_id) = pause_container_id {
             info!("Stopping pause container: {} (last)", pause_id);
             let stop_options = StopContainerOptions { t: remaining_grace };
-            if let Err(e) = self
-                .docker
-                .stop_container(pause_id, Some(stop_options))
-                .await
-            {
+            if let Err(e) = self.backend.stop_container(pause_id, stop_options).await {
                 warn!("Failed to stop pause container {}: {}", pause_id, e);
             }
         }
@@ -7316,29 +7399,17 @@ impl ContainerRuntime {
     /// Get the exit code of a terminated container.
     /// Returns the exit code or an error if the container doesn't exist.
     pub async fn get_container_exit_code(&self, container_name: &str) -> Result<i64> {
-        let inspect = self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await?;
+        let inspect = self.backend.inspect_container(container_name).await?;
         Ok(inspect.state.and_then(|s| s.exit_code).unwrap_or(1))
     }
 
     /// Remove a terminated container so it can be recreated for restart.
     pub async fn remove_terminated_container(&self, container_name: &str) -> Result<()> {
-        if let Ok(info) = self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-        {
+        if let Ok(info) = self.backend.inspect_container(container_name).await {
             let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
             if !running {
-                let opts = bollard::container::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                self.docker
-                    .remove_container(container_name, Some(opts))
-                    .await?;
+                let opts = RemoveContainerOptions { force: true };
+                self.backend.remove_container(container_name, opts).await?;
                 debug!(
                     "Removed terminated container {} for restart",
                     container_name
@@ -7507,10 +7578,9 @@ impl ContainerRuntime {
         let options = ListContainersOptions {
             all: false, // Only running containers
             filters,
-            ..Default::default()
         };
 
-        let mut containers = self.docker.list_containers(Some(options)).await?;
+        let mut containers = self.backend.list_containers(options).await?;
 
         // If no pause container, try any container matching the pod name
         if containers.is_empty() {
@@ -7519,18 +7589,14 @@ impl ContainerRuntime {
             let options2 = ListContainersOptions {
                 all: false,
                 filters: filters2,
-                ..Default::default()
             };
-            containers = self.docker.list_containers(Some(options2)).await?;
+            containers = self.backend.list_containers(options2).await?;
         }
 
         // Get the IP from the pause container (or first matching)
         if let Some(container) = containers.first() {
             if let Some(id) = &container.id {
-                let inspect = self
-                    .docker
-                    .inspect_container(id, None::<InspectContainerOptions>)
-                    .await?;
+                let inspect = self.backend.inspect_container(id).await?;
 
                 if let Some(network_settings) = inspect.network_settings {
                     // First try to get IP from the specific network we're using
@@ -7824,15 +7890,14 @@ impl ContainerRuntime {
         // memory_swap, Docker rejects: "Memory limit should be smaller than
         // already set memoryswap limit". Set memory_swap = memory (no swap).
         let memory_swap = memory;
-        let update = bollard::container::UpdateContainerOptions::<String> {
+        let update = UpdateContainerOptions {
             cpu_period,
             cpu_quota,
-            cpu_shares: cpu_shares.map(|s| s as isize),
+            cpu_shares,
             memory,
             memory_swap,
-            ..Default::default()
         };
-        self.docker
+        self.backend
             .update_container(container_name, update)
             .await
             .context("Failed to update container resources")?;
@@ -7842,12 +7907,12 @@ impl ContainerRuntime {
     /// List all running pod names from the container runtime
     #[allow(dead_code)]
     pub async fn list_running_pods(&self) -> Result<Vec<String>> {
-        let options = ListContainersOptions::<String> {
+        let options = ListContainersOptions {
             all: false, // Only running containers
             ..Default::default()
         };
 
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.backend.list_containers(options).await?;
 
         let mut pod_names = std::collections::HashSet::new();
         for container in containers {
@@ -7881,12 +7946,12 @@ impl ContainerRuntime {
         &self,
         existing_pods: &std::collections::HashSet<String>,
     ) -> Result<usize> {
-        let options = ListContainersOptions::<String> {
+        let options = ListContainersOptions {
             all: true,
             ..Default::default()
         };
 
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.backend.list_containers(options).await?;
 
         // Group exited containers by pod name, track which pods have running containers
         let mut exited_by_pod: HashMap<String, Vec<(String, i64)>> = HashMap::new();
@@ -7959,13 +8024,10 @@ impl ContainerRuntime {
                 0
             };
             for (container_id, _) in exited.iter().skip(keep_count) {
-                let opts = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
+                let opts = RemoveContainerOptions { force: true };
                 if self
-                    .docker
-                    .remove_container(container_id, Some(opts))
+                    .backend
+                    .remove_container(container_id, opts)
                     .await
                     .is_ok()
                 {
@@ -7977,13 +8039,10 @@ impl ContainerRuntime {
             // and clean up the pause container (orphaned sandbox)
             if !pods_with_running.contains(&pod_name) {
                 for (container_id, _) in exited.iter().take(1) {
-                    let opts = RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    };
+                    let opts = RemoveContainerOptions { force: true };
                     if self
-                        .docker
-                        .remove_container(container_id, Some(opts))
+                        .backend
+                        .remove_container(container_id, opts)
                         .await
                         .is_ok()
                     {
@@ -7993,16 +8052,13 @@ impl ContainerRuntime {
                 // Remove orphaned pause container
                 let pause_name = format!("{}_pause", pod_name);
                 let _ = self
-                    .docker
-                    .stop_container(&pause_name, Some(StopContainerOptions { t: 0 }))
+                    .backend
+                    .stop_container(&pause_name, StopContainerOptions { t: 0 })
                     .await;
-                let opts = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
+                let opts = RemoveContainerOptions { force: true };
                 if self
-                    .docker
-                    .remove_container(&pause_name, Some(opts))
+                    .backend
+                    .remove_container(&pause_name, opts)
                     .await
                     .is_ok()
                 {
@@ -8015,13 +8071,10 @@ impl ContainerRuntime {
 
         // 2. Remove stale "created" containers
         for container_id in &stale_created {
-            let opts = RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            };
+            let opts = RemoveContainerOptions { force: true };
             if self
-                .docker
-                .remove_container(container_id, Some(opts))
+                .backend
+                .remove_container(container_id, opts)
                 .await
                 .is_ok()
             {
@@ -8036,12 +8089,12 @@ impl ContainerRuntime {
     /// Used by orphan cleanup to find and remove stopped containers from
     /// pods that have been deleted from storage.
     pub async fn list_all_pods(&self) -> Result<Vec<String>> {
-        let options = ListContainersOptions::<String> {
+        let options = ListContainersOptions {
             all: true,
             ..Default::default()
         };
 
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.backend.list_containers(options).await?;
 
         let mut pod_names = std::collections::HashSet::new();
         for container in containers {
@@ -8064,7 +8117,7 @@ impl ContainerRuntime {
     /// Returns Duration::ZERO if the container can't be found.
     pub async fn get_container_age(&self, pod_name: &str) -> Result<std::time::Duration> {
         let pause_name = format!("{}_pause", pod_name);
-        match self.docker.inspect_container(&pause_name, None).await {
+        match self.backend.inspect_container(&pause_name).await {
             Ok(info) => {
                 if let Some(state) = info.state {
                     if let Some(started_at) = state.started_at {
@@ -8091,12 +8144,12 @@ impl ContainerRuntime {
             return (0, 0);
         }
 
-        let opts = ListContainersOptions::<String> {
+        let opts = ListContainersOptions {
             all: false,
             ..Default::default()
         };
 
-        let containers = match self.docker.list_containers(Some(opts)).await {
+        let containers = match self.backend.list_containers(opts).await {
             Ok(c) => c,
             Err(e) => {
                 warn!("Failed to list containers for metrics: {}", e);
@@ -8135,13 +8188,13 @@ impl ContainerRuntime {
         for container in &node_containers {
             if let Some(id) = &container.id {
                 let id_clone = id.clone();
-                let docker_ref = &self.docker;
+                let backend_ref = &self.backend;
                 stat_futures.push(async move {
-                    let stats_opts = bollard::container::StatsOptions {
+                    let stats_opts = StatsOptions {
                         stream: true,
                         one_shot: false,
                     };
-                    let mut stream = docker_ref.stats(&id_clone, Some(stats_opts));
+                    let mut stream = backend_ref.stats(&id_clone, stats_opts);
                     // Skip first sample (precpu_stats may be zeros), use second
                     let _ = stream.next().await;
                     let second = stream.next().await;
@@ -8159,28 +8212,20 @@ impl ContainerRuntime {
         for result in results {
             if let Some(Ok(stats)) = result {
                 // Memory: usage minus cache
-                if let Some(usage) = stats.memory_stats.usage {
-                    let cache = stats
-                        .memory_stats
-                        .stats
-                        .as_ref()
-                        .map(|s| match s {
-                            bollard::container::MemoryStatsStats::V1(v1) => v1.cache,
-                            bollard::container::MemoryStatsStats::V2(v2) => v2.inactive_file,
-                        })
-                        .unwrap_or(0);
+                if let Some(usage) = stats.memory_usage {
+                    let cache = stats.memory_cache.unwrap_or(0);
                     total_memory_bytes += usage.saturating_sub(cache);
                 }
 
                 // CPU: delta between current and previous sample
-                let total_usage = stats.cpu_stats.cpu_usage.total_usage;
-                if let Some(system_cpu) = stats.cpu_stats.system_cpu_usage {
-                    let prev_total = stats.precpu_stats.cpu_usage.total_usage;
-                    let prev_system = stats.precpu_stats.system_cpu_usage.unwrap_or(0);
+                let total_usage = stats.cpu_total_usage;
+                if let Some(system_cpu) = stats.system_cpu_usage {
+                    let prev_total = stats.precpu_total_usage;
+                    let prev_system = stats.precpu_system_cpu_usage.unwrap_or(0);
                     let cpu_delta = total_usage.saturating_sub(prev_total);
                     let system_delta = system_cpu.saturating_sub(prev_system);
                     if system_delta > 0 {
-                        let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1);
+                        let num_cpus = stats.online_cpus.unwrap_or(1);
                         total_cpu_pct +=
                             (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
                     }
@@ -11806,5 +11851,313 @@ mod tests {
             grace, 45,
             "spec.terminationGracePeriodSeconds must propagate"
         );
+    }
+}
+
+/// `ContainerRuntime` logic against an in-memory backend: no daemon needed.
+#[cfg(test)]
+mod backend_tests {
+    use super::ContainerRuntime;
+    use crate::backend::fake::FakeBackend;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    async fn runtime_with(backend: Arc<FakeBackend>) -> (ContainerRuntime, tempfile::TempDir) {
+        let volumes = tempfile::tempdir().unwrap();
+        let runtime = ContainerRuntime::with_backend(
+            backend,
+            volumes.path().to_string_lossy().into_owned(),
+            "10.96.0.10".to_string(),
+            "cluster.local".to_string(),
+            "rusternetes".to_string(),
+            "10.96.0.1".to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        (runtime, volumes)
+    }
+
+    #[tokio::test]
+    async fn uts_container_mode_comes_from_backend_identity() {
+        let docker = Arc::new(FakeBackend::new("Docker Engine - Community Engine"));
+        let (runtime, _v) = runtime_with(docker).await;
+        assert!(!runtime.supports_uts_container_mode);
+
+        let podman = Arc::new(FakeBackend::new("Podman Engine"));
+        let (runtime, _v) = runtime_with(podman).await;
+        assert!(runtime.supports_uts_container_mode);
+    }
+
+    #[tokio::test]
+    async fn pod_with_only_pause_running_is_not_running() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        backend.add("web_pause", "running", 1);
+        backend.add("web_app", "exited", 1);
+        let (runtime, _v) = runtime_with(backend.clone()).await;
+        assert!(!runtime.is_pod_running("web").await.unwrap());
+
+        backend.add("web_app", "running", 2);
+        assert!(runtime.is_pod_running("web").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stop_pod_stops_app_containers_before_pause() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        backend.add("web_pause", "running", 1);
+        backend.add("web_app", "running", 1);
+        backend.add("web_sidecar", "running", 1);
+        backend.add("other_app", "running", 1);
+        let (runtime, _v) = runtime_with(backend.clone()).await;
+
+        runtime.stop_pod_with_grace_period("web", 5).await.unwrap();
+
+        let stops: Vec<String> = backend
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("stop "))
+            .collect();
+        assert_eq!(stops.len(), 3, "{stops:?}");
+        assert_eq!(stops.last().unwrap(), "stop web_pause");
+        // Stopped containers are kept for log access.
+        assert_eq!(backend.names().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn gc_removes_dead_containers_of_deleted_pods_and_keeps_newest_for_live_pods() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        backend.add("gone_pause", "exited", 1);
+        backend.add("gone_app", "exited", 1);
+        backend.add("kept_app", "running", 1);
+        backend.add("kept_old", "exited", 1);
+        backend.add("kept_newer", "exited", 2);
+        let (runtime, _v) = runtime_with(backend.clone()).await;
+
+        let existing: HashSet<String> = ["kept".to_string()].into_iter().collect();
+        let removed = runtime.garbage_collect_containers(&existing).await.unwrap();
+
+        assert_eq!(removed, 3);
+        assert_eq!(backend.names(), vec!["kept_app", "kept_newer"]);
+    }
+}
+
+#[cfg(test)]
+mod csi_volume_tests {
+    use super::ContainerRuntime;
+    use crate::backend::fake::FakeBackend;
+    use crate::csi::fake::{FakeOptions, FakePlugin};
+    use crate::csi::CsiManager;
+    use rusternetes_common::resources::Pod;
+    use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct Env {
+        _root: tempfile::TempDir,
+        volumes: tempfile::TempDir,
+        runtime: ContainerRuntime,
+        storage: Arc<StorageBackend>,
+        plugin: FakePlugin,
+    }
+
+    async fn env() -> Env {
+        let root = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+        let csi = Arc::new(CsiManager::new(root.path()));
+        let plugin = FakePlugin::start(
+            &csi.plugins_registry_dir(),
+            &root.path().join("plugins/fake"),
+            FakeOptions::default(),
+        )
+        .await;
+        csi.plugin_watcher().scan().await;
+        plugin.clear();
+        let runtime = ContainerRuntime::with_backend(
+            Arc::new(FakeBackend::new("fake")),
+            volumes.path().to_string_lossy().into_owned(),
+            "10.96.0.10".to_string(),
+            "cluster.local".to_string(),
+            "rusternetes".to_string(),
+            "10.96.0.1".to_string(),
+            false,
+        )
+        .await
+        .unwrap()
+        .with_storage(storage.clone())
+        .with_csi(csi);
+        Env {
+            _root: root,
+            volumes,
+            runtime,
+            storage,
+            plugin,
+        }
+    }
+
+    async fn put(storage: &StorageBackend, key: &str, value: serde_json::Value) {
+        storage.create(key, &value).await.unwrap();
+    }
+
+    fn pod(volume: serde_json::Value) -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "ns", "uid": "uid-1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "busybox"}],
+                "volumes": [volume]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn ops(plugin: &FakePlugin) -> Vec<String> {
+        plugin
+            .calls()
+            .iter()
+            .map(|c| c.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn csi_pv_is_staged_and_published_and_torn_down() {
+        let e = env().await;
+        put(
+            &e.storage,
+            &build_key("secrets", Some("ns"), "stage-secret"),
+            json!({"apiVersion": "v1", "kind": "Secret",
+                   "metadata": {"name": "stage-secret", "namespace": "ns"},
+                   "stringData": {"password": "hunter2"}}),
+        )
+        .await;
+        put(
+            &e.storage,
+            &build_key("persistentvolumes", None, "pv-1"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "pv-1"},
+                   "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                            "mountOptions": ["noatime"],
+                            "csi": {"driver": "fake.csi.rusternetes.io", "volumeHandle": "h-1",
+                                    "fsType": "xfs", "volumeAttributes": {"a": "b"},
+                                    "nodeStageSecretRef": {"name": "stage-secret", "namespace": "ns"}}}}),
+        )
+        .await;
+        put(
+            &e.storage,
+            &build_key("persistentvolumeclaims", Some("ns"), "claim"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": "claim", "namespace": "ns"},
+                   "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": "pv-1",
+                            "resources": {"requests": {"storage": "1Gi"}}}}),
+        )
+        .await;
+        let pod = pod(json!({"name": "data", "persistentVolumeClaim": {"claimName": "claim"}}));
+
+        let paths = e.runtime.create_pod_volumes(&pod).await.unwrap();
+        let target = e.volumes.path().join("web/data/mount");
+        assert_eq!(paths["data"], target.to_string_lossy());
+        assert_eq!(ops(&e.plugin), vec!["NodeStageVolume", "NodePublishVolume"]);
+        e.plugin.recorded(|r| {
+            assert_eq!(r.stage[0].volume_id, "h-1");
+            assert_eq!(r.stage[0].secrets["password"], "hunter2");
+            assert_eq!(r.publish[0].volume_context["a"], "b");
+            assert!(!r.publish[0].readonly);
+        });
+
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert_eq!(
+            ops(&e.plugin),
+            vec![
+                "NodeStageVolume",
+                "NodePublishVolume",
+                "NodeUnpublishVolume",
+                "NodeUnstageVolume"
+            ]
+        );
+        assert!(!e.volumes.path().join("web").exists());
+    }
+
+    #[tokio::test]
+    async fn inline_csi_volume_is_published_with_pod_info() {
+        let e = env().await;
+        put(
+            &e.storage,
+            &build_key("csidrivers", None, "fake.csi.rusternetes.io"),
+            json!({"apiVersion": "storage.k8s.io/v1", "kind": "CSIDriver",
+                   "metadata": {"name": "fake.csi.rusternetes.io"},
+                   "spec": {"podInfoOnMount": true}}),
+        )
+        .await;
+        let pod = pod(json!({"name": "eph", "csi": {
+            "driver": "fake.csi.rusternetes.io", "readOnly": true,
+            "volumeAttributes": {"size": "1Mi"}}}));
+
+        let paths = e.runtime.create_pod_volumes(&pod).await.unwrap();
+        assert!(paths["eph"].ends_with("/web/eph/mount"));
+        assert_eq!(ops(&e.plugin), vec!["NodePublishVolume"]);
+        e.plugin.recorded(|r| {
+            let p = &r.publish[0];
+            assert_eq!(
+                p.volume_id,
+                crate::csi::ephemeral_volume_handle("uid-1", "eph")
+            );
+            assert!(p.readonly);
+            assert_eq!(p.volume_context["size"], "1Mi");
+            assert_eq!(p.volume_context["csi.storage.k8s.io/ephemeral"], "true");
+            assert_eq!(p.volume_context["csi.storage.k8s.io/pod.name"], "web");
+            assert_eq!(p.volume_context["csi.storage.k8s.io/pod.uid"], "uid-1");
+        });
+
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert_eq!(
+            ops(&e.plugin),
+            vec!["NodePublishVolume", "NodeUnpublishVolume"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_unpublish_keeps_the_pod_volume_dir() {
+        let e = env().await;
+        let pod = pod(json!({"name": "eph", "csi": {"driver": "fake.csi.rusternetes.io"}}));
+        e.runtime.create_pod_volumes(&pod).await.unwrap();
+        e.plugin
+            .set_fail("NodeUnpublishVolume", Some(tonic::Code::Unavailable));
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert!(e.volumes.path().join("web/eph/vol_data.json").exists());
+
+        e.plugin.set_fail("NodeUnpublishVolume", None);
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert!(!e.volumes.path().join("web").exists());
+    }
+
+    #[tokio::test]
+    async fn hostpath_pv_is_unchanged() {
+        let e = env().await;
+        let host = e.volumes.path().join("host-data");
+        put(
+            &e.storage,
+            &build_key("persistentvolumes", None, "pv-h"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "pv-h"},
+                   "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                            "hostPath": {"path": host.to_string_lossy()}}}),
+        )
+        .await;
+        put(
+            &e.storage,
+            &build_key("persistentvolumeclaims", Some("ns"), "claim"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": "claim", "namespace": "ns"},
+                   "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": "pv-h",
+                            "resources": {"requests": {"storage": "1Gi"}}}}),
+        )
+        .await;
+        let pod = pod(json!({"name": "data", "persistentVolumeClaim": {"claimName": "claim"}}));
+        let paths = e.runtime.create_pod_volumes(&pod).await.unwrap();
+        assert_eq!(paths["data"], host.to_string_lossy());
+        assert!(host.is_dir());
+        assert!(e.plugin.calls().is_empty());
     }
 }

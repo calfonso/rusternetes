@@ -143,6 +143,22 @@ pub struct CSIVolumeSource {
     pub fs_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_attributes: Option<HashMap<String, String>>,
+    /// Secret passed to NodeStageVolume
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_stage_secret_ref: Option<SecretReference>,
+    /// Secret passed to NodePublishVolume
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_publish_secret_ref: Option<SecretReference>,
+}
+
+/// SecretReference names a Secret in any namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretReference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
