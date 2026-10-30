@@ -39,6 +39,7 @@ tonic.workspace = true
 prost.workspace = true
 http = "1"
 tar = "0.4"
+sha2 = "0.11"
 sysinfo = "0.32"
 
 [dev-dependencies]

@@ -42,6 +42,20 @@ pub struct CniRuntime {
     default_network: Option<String>,
 }
 
+/// The `CNI_CONTAINERID` for a pod sandbox the kubelet names by `id` (the
+/// pod name): 64 hex digits, the shape CRI runtimes pass. Plugins derive
+/// interface names from it — Cilium's temporary peer is `tmp` + its first
+/// five characters, so a pod name with a `:` or `.` there (`web` → `web:e`
+/// of `web:eth0`) became an invalid interface name ("unable to create veth
+/// pair: invalid argument"). Deterministic, so ADD, CHECK and DEL agree.
+pub fn cni_container_id(id: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(id.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 impl CniRuntime {
     /// Create a new CNI runtime
     pub fn new(plugin_paths: Vec<PathBuf>, config_dir: PathBuf) -> Result<Self, CniError> {
@@ -71,6 +85,19 @@ impl CniRuntime {
         netns: &str,
         ifname: &str,
         network_name: Option<&str>,
+    ) -> Result<CniResult, CniError> {
+        self.setup_network_with_args(container_id, netns, ifname, network_name, None)
+    }
+
+    /// Setup network for a container (ADD operation) with `CNI_ARGS`
+    /// (`K8S_POD_NAMESPACE=…;K8S_POD_NAME=…`, as the CRI runtimes pass them).
+    pub fn setup_network_with_args(
+        &self,
+        container_id: &str,
+        netns: &str,
+        ifname: &str,
+        network_name: Option<&str>,
+        args: Option<&str>,
     ) -> Result<CniResult, CniError> {
         info!(
             "Setting up network for container {} in netns {}",
@@ -103,15 +130,24 @@ impl CniRuntime {
         // Get network configuration
         let network = self.get_network_config(network_name)?;
 
-        // Execute ADD command
-        let plugin_manager = self.plugin_manager.lock().unwrap();
+        // Execute ADD command. A plugin the network names but the last scan
+        // did not see (installed after start, e.g. by a CNI agent's pod) is
+        // looked for again before giving up.
+        let mut plugin_manager = self.plugin_manager.lock().unwrap();
+        if network
+            .plugins
+            .iter()
+            .any(|p| !plugin_manager.has_plugin(&p.plugin_type))
+        {
+            plugin_manager.discover_plugins()?;
+        }
         let result = plugin_manager.execute_network(
             CniCommand::Add,
             &network,
-            container_id,
+            &cni_container_id(container_id),
             netns,
             ifname,
-            None,
+            args,
         )?;
 
         // Store attachment
@@ -159,7 +195,7 @@ impl CniRuntime {
         plugin_manager.execute_network(
             CniCommand::Del,
             &network,
-            container_id,
+            &cni_container_id(container_id),
             netns,
             ifname,
             None,
@@ -206,7 +242,7 @@ impl CniRuntime {
         plugin_manager.execute_network(
             CniCommand::Check,
             &network,
-            container_id,
+            &cni_container_id(container_id),
             netns,
             ifname,
             None,
@@ -310,6 +346,65 @@ pub struct NetworkStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cni_container_ids_are_64_hex_and_stable() {
+        let a = cni_container_id("web");
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, cni_container_id("web"));
+        assert_ne!(a, cni_container_id("web2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_finds_a_plugin_installed_after_start_and_passes_a_hex_id_and_cni_args() {
+        use std::os::unix::fs::PermissionsExt;
+        let plugins = TempDir::new().unwrap();
+        let configs = TempDir::new().unwrap();
+        let netns = TempDir::new().unwrap();
+        std::fs::write(
+            configs.path().join("10-late.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"late-net","plugins":[{"type":"late"}]}"#,
+        )
+        .unwrap();
+        let runtime = CniRuntime::new(
+            vec![plugins.path().to_path_buf()],
+            configs.path().to_path_buf(),
+        )
+        .unwrap();
+
+        // The plugin is installed after the runtime scanned its directory
+        // (a CNI agent's pod copies it in after the kubelet started).
+        let seen = netns.path().join("seen");
+        let plugin = plugins.path().join("late");
+        std::fs::write(
+            &plugin,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho \"$CNI_CONTAINERID $CNI_ARGS\" > {}\necho '{{\"cniVersion\":\"1.0.0\",\"ips\":[]}}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        runtime
+            .setup_network_with_args(
+                "web",
+                netns.path().to_str().unwrap(),
+                "eth0",
+                None,
+                Some("K8S_POD_NAMESPACE=shop;K8S_POD_NAME=web"),
+            )
+            .expect("ADD finds the late plugin");
+        assert_eq!(
+            std::fs::read_to_string(seen).unwrap().trim(),
+            format!(
+                "{} K8S_POD_NAMESPACE=shop;K8S_POD_NAME=web",
+                cni_container_id("web")
+            )
+        );
+    }
 
     #[test]
     fn test_cni_runtime_creation() {

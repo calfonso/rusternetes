@@ -107,6 +107,10 @@ pub struct ContainerRuntime {
     shell_cache: Mutex<HashMap<String, bool>>,
     /// Names of containers this process is currently creating and starting
     starting_containers: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Pods with `spec.hostNetwork: true` this process started: they share
+    /// the node's network namespace, get no CNI attachment, and their pod IP
+    /// is the node's address.
+    host_network_pods: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Join a list of strings into a shell-safe command string.
@@ -241,6 +245,7 @@ impl ContainerRuntime {
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
             starting_containers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            host_network_pods: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -359,7 +364,8 @@ impl ContainerRuntime {
     /// Setup CNI networking for a pod
     /// Creates a network namespace and configures CNI networking
     /// Returns None if CNI setup fails (will fall back to Podman networking)
-    async fn setup_pod_network(&self, pod_name: &str) -> Option<String> {
+    async fn setup_pod_network(&self, pod: &Pod) -> Option<String> {
+        let pod_name = pod.metadata.name.as_str();
         info!("Setting up CNI network for pod: {}", pod_name);
 
         // Create network namespace
@@ -395,7 +401,8 @@ impl ContainerRuntime {
 
         // Setup CNI networking in the namespace
         if let Some(cni) = &self.cni {
-            match cni.setup_network(pod_name, &netns_path, "eth0", None) {
+            let args = cni_args(pod, pod_name);
+            match cni.setup_network_with_args(pod_name, &netns_path, "eth0", None, Some(&args)) {
                 Ok(result) => {
                     info!(
                         "CNI network setup successful for pod {}: IP={:?}",
@@ -419,6 +426,10 @@ impl ContainerRuntime {
     /// Teardown CNI networking for a pod
     /// Removes CNI configuration and deletes the network namespace
     async fn teardown_pod_network(&self, pod_name: &str) -> Result<()> {
+        // A host-network pod has no CNI attachment and no netns of its own.
+        if self.host_network_pods.lock().unwrap().contains(pod_name) {
+            return Ok(());
+        }
         info!("Tearing down CNI network for pod: {}", pod_name);
 
         let netns_name = format!("cni-{}", pod_name);
@@ -654,10 +665,21 @@ impl ContainerRuntime {
             let _ = futures_util::future::join_all(remove_futures).await;
         }
 
-        // Create network namespace and setup CNI networking if enabled
-        // If CNI setup fails, netns_path will be None and we fall back to Podman networking
-        let netns_path = if self.use_cni {
-            self.setup_pod_network(pod_name).await
+        // Create network namespace and setup CNI networking if enabled.
+        // A host-network pod uses the node's network and gets no CNI attachment.
+        let host_network = is_host_network(pod);
+        if host_network {
+            self.host_network_pods
+                .lock()
+                .unwrap()
+                .insert(pod_name.to_string());
+        }
+        let netns_path = if self.use_cni && !host_network {
+            Some(pod_network_ready(
+                self.setup_pod_network(pod).await,
+                namespace,
+                pod_name,
+            )?)
         } else {
             None
         };
@@ -741,7 +763,9 @@ impl ContainerRuntime {
         // For non-CNI (Docker bridge) mode, we start a pause container first so we
         // can learn the pod's IP before creating real containers (which need the IP
         // in their environment for Downward API env vars like SONOBUOY_ADVERTISE_IP).
-        let mut pod_ip: Option<String> = if self.use_cni {
+        let mut pod_ip: Option<String> = if host_network {
+            Some(node_internal_ip())
+        } else if self.use_cni {
             if let Some(cni) = &self.cni {
                 cni.get_container_ip(pod_name)
             } else {
@@ -4399,8 +4423,11 @@ impl ContainerRuntime {
 
         // Set container hostname to pod hostname — but only when NOT using container:
         // network mode (Docker rejects hostname on containers sharing another's network NS)
-        let using_container_network = !self.use_cni && netns_path.is_none();
-        let pod_hostname = if !using_container_network {
+        let host_network = is_host_network(pod);
+        let using_container_network = !self.use_cni && netns_path.is_none() && !host_network;
+        let pod_hostname = if host_network {
+            None // the node's UTS namespace: the node's host name
+        } else if !using_container_network {
             let raw = pod
                 .spec
                 .as_ref()
@@ -4461,7 +4488,9 @@ impl ContainerRuntime {
                 // we fell back to the Docker bridge which gave each container its
                 // OWN IP — breaking pod proxy, service routing, and inter-container
                 // communication. K8s ref: all containers share the pod sandbox network.
-                network_mode: if let Some(netns) = netns_path {
+                network_mode: if host_network {
+                    Some("host".to_string())
+                } else if let Some(netns) = netns_path {
                     Some(format!("ns:{}", netns))
                 } else {
                     // Always use pause container's network namespace
@@ -4497,7 +4526,9 @@ impl ContainerRuntime {
                 // Neither is needed there — Docker already propagates the
                 // target container's hostname when joining its network
                 // namespace, so the pod hostname is inherited regardless.
-                uts_mode: if using_container_network && self.supports_uts_container_mode {
+                uts_mode: if host_network {
+                    Some("host".to_string())
+                } else if using_container_network && self.supports_uts_container_mode {
                     Some(format!("container:{}_pause", pod_name))
                 } else {
                     None
@@ -7488,6 +7519,9 @@ impl ContainerRuntime {
 
     /// Get the pod IP address from the first running container
     pub async fn get_pod_ip(&self, pod_name: &str) -> Result<Option<String>> {
+        if self.host_network_pods.lock().unwrap().contains(pod_name) {
+            return Ok(Some(node_internal_ip()));
+        }
         // If using CNI, get IP from CNI runtime
         if self.use_cni {
             if let Some(cni) = &self.cni {
@@ -8258,6 +8292,54 @@ impl Drop for StartInFlight {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.name);
     }
+}
+
+/// `spec.hostNetwork: true`.
+fn is_host_network(pod: &Pod) -> bool {
+    pod.spec.as_ref().and_then(|s| s.host_network) == Some(true)
+}
+
+/// The node's own IPv4 address, the pod IP of a host-network pod: the
+/// address `$HOSTNAME` resolves to (the kubelet's InternalIP), else loopback.
+fn node_internal_ip() -> String {
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 0u16)) {
+            for addr in addrs {
+                if let std::net::IpAddr::V4(ip) = addr.ip() {
+                    if !ip.is_loopback() {
+                        return ip.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+/// The pod's network namespace once CNI ADD succeeded. No network yet (the
+/// CNI plugin or its config is not there, e.g. a CNI agent still starting):
+/// a `CreateContainerError`, so the pod stays Pending and is tried again, as
+/// the upstream kubelet's NetworkNotReady does, instead of starting its
+/// containers without a network.
+fn pod_network_ready(netns: Option<String>, namespace: &str, pod_name: &str) -> Result<String> {
+    netns.with_context(|| {
+        format!(
+            "CreateContainerError: the pod network is not ready (CNI ADD failed for {}/{})",
+            namespace, pod_name
+        )
+    })
+}
+
+/// `CNI_ARGS` for a pod, as the CRI runtimes pass them: plugins such as
+/// Cilium's look the pod up by namespace and name.
+fn cni_args(pod: &Pod, container_id: &str) -> String {
+    format!(
+        "IgnoreUnknown=1;K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={};K8S_POD_UID={}",
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name,
+        crate::cni::runtime::cni_container_id(container_id),
+        pod.metadata.uid,
+    )
 }
 
 #[cfg(test)]
@@ -11805,6 +11887,48 @@ mod tests {
         assert_eq!(
             grace, 45,
             "spec.terminationGracePeriodSeconds must propagate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_network_and_cni_args_tests {
+    use super::*;
+
+    fn pod(json: serde_json::Value) -> Pod {
+        serde_json::from_value(json).expect("pod")
+    }
+
+    #[test]
+    fn host_network_is_read_from_the_spec() {
+        let on = pod(
+            serde_json::json!({"metadata": {"name": "a"}, "spec": {"hostNetwork": true, "containers": []}}),
+        );
+        let off = pod(serde_json::json!({"metadata": {"name": "b"}, "spec": {"containers": []}}));
+        assert!(is_host_network(&on));
+        assert!(!is_host_network(&off));
+    }
+
+    #[test]
+    fn cni_args_name_the_pod_as_cri_runtimes_do() {
+        let p = pod(serde_json::json!({
+            "metadata": {"name": "web", "namespace": "shop", "uid": "u-1"},
+            "spec": {"containers": []}
+        }));
+        assert_eq!(
+            cni_args(&p, "web"),
+            format!("IgnoreUnknown=1;K8S_POD_NAMESPACE=shop;K8S_POD_NAME=web;K8S_POD_INFRA_CONTAINER_ID={};K8S_POD_UID=u-1", crate::cni::runtime::cni_container_id("web"))
+        );
+    }
+
+    #[test]
+    fn a_pod_without_its_network_waits_as_create_container_error() {
+        let err = pod_network_ready(None, "shop", "web").unwrap_err();
+        // The kubelet keeps a pod with this reason Pending and retries it.
+        assert!(format!("{err:#}").starts_with("CreateContainerError:"));
+        assert_eq!(
+            pod_network_ready(Some("/run/netns/cni-web".into()), "shop", "web").unwrap(),
+            "/run/netns/cni-web"
         );
     }
 }
