@@ -28,6 +28,9 @@ redis = [
     "rusternetes-kubelet/redis",
     "rusternetes-kube-proxy/redis",
 ]
+# Daemonless youki container backend for the embedded kubelet (Linux, root,
+# cgroup v2).
+youki = ["rusternetes-kubelet/youki"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }

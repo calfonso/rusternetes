@@ -9,6 +9,11 @@ license.workspace = true
 name = "kubelet"
 path = "src/main.rs"
 
+[[bin]]
+name = "rusternetes-youki-shim"
+path = "src/bin/youki_shim.rs"
+required-features = ["youki"]
+
 [lib]
 name = "rusternetes_kubelet"
 path = "src/lib.rs"
@@ -17,6 +22,8 @@ path = "src/lib.rs"
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
+# Daemonless container backend on youki's libcontainer (Linux, root, cgroup v2).
+youki = ["dep:libcontainer", "dep:oci-spec", "dep:nix", "dep:flate2", "dep:sha2", "dep:uuid"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
@@ -30,6 +37,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 bollard.workspace = true
 chrono.workspace = true
 axum.workspace = true
@@ -40,6 +48,12 @@ prost.workspace = true
 http = "1"
 tar = "0.4"
 sysinfo = "0.32"
+libcontainer = { version = "0.7", default-features = false, features = ["v2"], optional = true }
+oci-spec = { version = "0.10", default-features = false, features = ["runtime"], optional = true }
+nix = { version = "0.29", features = ["mount", "sched", "signal", "process", "net", "fs"], optional = true }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+sha2 = { version = "0.10", optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
