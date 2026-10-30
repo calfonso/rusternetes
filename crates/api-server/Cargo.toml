@@ -52,7 +52,7 @@ tokio-tungstenite = "0.21"
 bollard.workspace = true
 bytes = "1.5"
 get_if_addrs = "0.5"
-prometheus-http-query = "0.8"
+prometheus-http-query = { version = "0.8", default-features = false, features = ["rustls-tls"] }
 url = "2.5.8"
 cel.workspace = true
 sha2 = "0.11"
