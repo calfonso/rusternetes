@@ -1,4 +1,5 @@
 #[allow(dead_code)]
+pub mod backend;
 pub mod cni;
 pub mod config;
 #[allow(dead_code)]
