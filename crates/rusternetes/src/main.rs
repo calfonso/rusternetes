@@ -19,7 +19,7 @@ use tracing::{error, info, Level};
 #[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]
 #[command(version)]
 struct Args {
-    /// Storage backend: "sqlite", "etcd", or "redis"
+    /// Storage backend: "sqlite", "etcd", "redis", or "redb"
     #[arg(long, default_value = "sqlite")]
     storage_backend: String,
 
@@ -117,6 +117,12 @@ struct Args {
     /// Set this flag outside Compose so pods resolve cluster Service names.
     #[arg(long, default_value = "false")]
     pod_prefer_cluster_dns: bool,
+
+    /// With `--storage-backend redb`: also serve the embedded store as etcd v3
+    /// on this address, so kubelets on other nodes can use it
+    /// (`--storage-backend etcd --etcd-servers http://<this>`). Plaintext.
+    #[arg(long)]
+    serve_etcd: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -148,6 +154,13 @@ async fn run() -> Result<()> {
 
     // Initialize storage — all components share one instance
     let storage_config = match args.storage_backend.as_str() {
+        #[cfg(feature = "redb")]
+        "redb" => {
+            info!("Using embedded redb storage at: {}", args.data_dir);
+            StorageConfig::Redb {
+                path: args.data_dir,
+            }
+        }
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Storage: SQLite at {}", args.data_dir);
@@ -173,7 +186,7 @@ async fn run() -> Result<()> {
         }
         other => {
             anyhow::bail!(
-                "Unknown storage backend: {}. Use 'sqlite', 'etcd', or 'redis'.",
+                "Unknown storage backend: {}. Use 'sqlite', 'etcd', 'redis', or 'redb'.",
                 other
             );
         }
@@ -181,6 +194,32 @@ async fn run() -> Result<()> {
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
 
     info!("Storage initialized, starting components...");
+
+    // --- The embedded store, served to other nodes as etcd v3 ---
+    if let Some(addr) = args.serve_etcd.clone() {
+        #[cfg(feature = "redb")]
+        {
+            let StorageBackend::Redb(redb) = storage.as_ref() else {
+                anyhow::bail!("--serve-etcd needs --storage-backend redb");
+            };
+            let store = redb.store().clone();
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            info!("Serving the embedded store as etcd v3 on {}", addr);
+            let opts = tunnr_etcd::server::ServeOptions {
+                client_url: format!("http://{}", addr),
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                if let Err(e) =
+                    tunnr_etcd::server::serve(store, listener, opts, std::future::pending()).await
+                {
+                    error!("etcd server error: {}", e);
+                }
+            });
+        }
+        #[cfg(not(feature = "redb"))]
+        anyhow::bail!("--serve-etcd {} needs the redb feature", addr);
+    }
 
     // --- API Server ---
     let api_storage = storage.clone();

@@ -43,6 +43,7 @@ async-trait = { workspace = true }
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
+redb = ["rusternetes-storage/redb"]
 cloud-providers = ["rusternetes-cloud-providers"]
 aws = ["cloud-providers", "rusternetes-cloud-providers/aws"]
 gcp = ["cloud-providers", "rusternetes-cloud-providers/gcp"]

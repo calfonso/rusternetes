@@ -7,6 +7,8 @@ use std::sync::Arc;
 pub mod concurrency;
 pub mod etcd;
 pub mod memory;
+#[cfg(feature = "redb")]
+pub mod redb;
 #[cfg(any(feature = "sqlite", feature = "redis"))]
 pub mod rhino;
 pub mod workqueue;
@@ -22,6 +24,8 @@ pub use workqueue::{extract_key, WorkQueue, WorkQueueConfig, RECONCILE_ALL_SENTI
 pub type RhinoStorage = rhino::RhinoStorage<::rhino::SqliteBackend>;
 #[cfg(feature = "redis")]
 pub type RhinoRedisStorage = rhino::RhinoStorage<::rhino::RedisBackend>;
+#[cfg(feature = "redb")]
+pub use redb::RedbStorage;
 
 /// Storage trait for persisting Kubernetes resources
 #[async_trait]
@@ -151,6 +155,13 @@ pub enum StorageConfig {
         /// Redis connection URL (e.g. `"redis://localhost:6379"`).
         url: String,
     },
+    /// Use the embedded redb store (requires `redb` feature): one file, no
+    /// external process, no rhino.
+    #[cfg(feature = "redb")]
+    Redb {
+        /// Path to the redb database file.
+        path: String,
+    },
 }
 
 /// Unified storage backend that dispatches to etcd, SQLite, Redis, or in-memory at runtime.
@@ -164,6 +175,8 @@ pub enum StorageBackend {
     Sqlite(RhinoStorage),
     #[cfg(feature = "redis")]
     Redis(RhinoRedisStorage),
+    #[cfg(feature = "redb")]
+    Redb(RedbStorage),
     /// In-memory backend backed by `MemoryStorage`. Intended for unit/integration
     /// tests that need a full `ApiServerState` without an external store.
     Memory(Arc<MemoryStorage>),
@@ -186,6 +199,11 @@ impl StorageBackend {
             StorageConfig::Redis { url } => {
                 let storage = RhinoRedisStorage::new_redis(&url).await?;
                 Ok(StorageBackend::Redis(storage))
+            }
+            #[cfg(feature = "redb")]
+            StorageConfig::Redb { path } => {
+                let storage = RedbStorage::new(&path).await?;
+                Ok(StorageBackend::Redb(storage))
             }
         }
     }
@@ -211,6 +229,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::create(s, key, value).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::create(s, key, value).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::create(s, key, value).await,
             StorageBackend::Memory(s) => Storage::create(s.as_ref(), key, value).await,
         }
     }
@@ -225,6 +245,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::get(s, key).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::get(s, key).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::get(s, key).await,
             StorageBackend::Memory(s) => Storage::get(s.as_ref(), key).await,
         }
     }
@@ -239,6 +261,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::update(s, key, value).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::update(s, key, value).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::update(s, key, value).await,
             StorageBackend::Memory(s) => Storage::update(s.as_ref(), key, value).await,
         }
     }
@@ -250,6 +274,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::update_raw(s, key, value).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::update_raw(s, key, value).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::update_raw(s, key, value).await,
             StorageBackend::Memory(s) => Storage::update_raw(s.as_ref(), key, value).await,
         }
     }
@@ -261,6 +287,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::delete(s, key).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::delete(s, key).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::delete(s, key).await,
             StorageBackend::Memory(s) => Storage::delete(s.as_ref(), key).await,
         }
     }
@@ -275,6 +303,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::list(s, prefix).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::list(s, prefix).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::list(s, prefix).await,
             StorageBackend::Memory(s) => Storage::list(s.as_ref(), prefix).await,
         }
     }
@@ -286,6 +316,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::watch(s, prefix).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::watch(s, prefix).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::watch(s, prefix).await,
             StorageBackend::Memory(s) => Storage::watch(s.as_ref(), prefix).await,
         }
     }
@@ -297,6 +329,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::watch_from_revision(s, prefix, revision).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::watch_from_revision(s, prefix, revision).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::watch_from_revision(s, prefix, revision).await,
             StorageBackend::Memory(s) => {
                 Storage::watch_from_revision(s.as_ref(), prefix, revision).await
             }
@@ -310,6 +344,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::current_revision(s).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::current_revision(s).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::current_revision(s).await,
             StorageBackend::Memory(s) => Storage::current_revision(s.as_ref()).await,
         }
     }
@@ -321,6 +357,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::is_revision_compacted(s, revision).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::is_revision_compacted(s, revision).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::is_revision_compacted(s, revision).await,
             StorageBackend::Memory(s) => Storage::is_revision_compacted(s.as_ref(), revision).await,
         }
     }
@@ -339,6 +377,8 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Sqlite(s) => AuthzStorage::get(s, key, namespace).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => AuthzStorage::get(s, key, namespace).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => AuthzStorage::get(s, key, namespace).await,
             StorageBackend::Memory(s) => AuthzStorage::get(s.as_ref(), key, namespace).await,
         }
     }
@@ -353,6 +393,8 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Sqlite(s) => AuthzStorage::list(s, namespace).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => AuthzStorage::list(s, namespace).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => AuthzStorage::list(s, namespace).await,
             StorageBackend::Memory(s) => AuthzStorage::list(s.as_ref(), namespace).await,
         }
     }
