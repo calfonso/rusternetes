@@ -117,6 +117,15 @@ struct Args {
     /// Set this flag outside Compose so pods resolve cluster Service names.
     #[arg(long, default_value = "false")]
     pod_prefer_cluster_dns: bool,
+
+    /// Components to run, comma-separated. A worker node runs only
+    /// `kubelet` against a remote store (`--storage-backend etcd`).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "api-server,scheduler,controller-manager,kubelet,kube-proxy"
+    )]
+    components: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -181,6 +190,14 @@ async fn run() -> Result<()> {
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
 
     info!("Storage initialized, starting components...");
+    let on = |c: &str| args.components.iter().any(|x| x == c);
+    for c in &args.components {
+        if !["api-server", "scheduler", "controller-manager", "kubelet", "kube-proxy"]
+            .contains(&c.as_str())
+        {
+            anyhow::bail!("Unknown component: {}", c);
+        }
+    }
 
     // --- API Server ---
     let api_storage = storage.clone();
@@ -196,11 +213,15 @@ async fn run() -> Result<()> {
         client_ca_file: args.client_ca_file,
         ..Default::default()
     };
-    let api_handle = tokio::spawn(async move {
-        if let Err(e) = rusternetes_api_server::run(api_storage, api_config).await {
-            error!("API server error: {}", e);
-        }
-    });
+    let api_handle = if on("api-server") {
+        Some(tokio::spawn(async move {
+            if let Err(e) = rusternetes_api_server::run(api_storage, api_config).await {
+                error!("API server error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
 
     // Give API server a moment to bind before starting clients
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -210,22 +231,26 @@ async fn run() -> Result<()> {
     let sched_config = rusternetes_scheduler::SchedulerConfig {
         interval: args.scheduler_interval,
     };
-    tokio::spawn(async move {
-        if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
-            error!("Scheduler error: {}", e);
-        }
-    });
+    if on("scheduler") {
+        tokio::spawn(async move {
+            if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
+                error!("Scheduler error: {}", e);
+            }
+        });
+    }
 
     // --- Controller Manager ---
     let cm_storage = storage.clone();
     let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
     };
-    tokio::spawn(async move {
-        if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {
-            error!("Controller manager error: {}", e);
-        }
-    });
+    if on("controller-manager") {
+        tokio::spawn(async move {
+            if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {
+                error!("Controller manager error: {}", e);
+            }
+        });
+    }
 
     // --- Kubelet ---
     let kubelet_storage = storage.clone();
@@ -244,14 +269,18 @@ async fn run() -> Result<()> {
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         pod_prefer_cluster_dns: args.pod_prefer_cluster_dns,
     };
-    tokio::spawn(async move {
-        if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {
-            error!("Kubelet error: {}", e);
-        }
-    });
+    let kubelet_handle = if on("kubelet") {
+        Some(tokio::spawn(async move {
+            if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {
+                error!("Kubelet error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
 
     // --- Kube-proxy ---
-    if !args.disable_proxy {
+    if on("kube-proxy") && !args.disable_proxy {
         let proxy_storage = storage.clone();
         let proxy_config = rusternetes_kube_proxy::KubeProxyConfig {
             node_name: args.node_name,
@@ -269,10 +298,18 @@ async fn run() -> Result<()> {
     info!("All components started");
 
     // The API server task blocks on its listener — wait for it or ctrl-c
+    // Without an API server (a worker node), the kubelet is the task to wait for.
+    let main_task = api_handle.or(kubelet_handle);
+    let main_task = async move {
+        match main_task {
+            Some(h) => h.await,
+            None => Ok(std::future::pending::<()>().await),
+        }
+    };
     tokio::select! {
-        result = api_handle => {
+        result = main_task => {
             if let Err(e) = result {
-                error!("API server task panicked: {}", e);
+                error!("Main component task panicked: {}", e);
             }
         }
         _ = tokio::signal::ctrl_c() => {
