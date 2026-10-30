@@ -1108,10 +1108,10 @@ fn matches_label_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
         _ => return true, // No selector = match all
     };
 
-    let labels = match &metadata.labels {
-        Some(l) => l,
-        None => return false, // No labels but selector exists = no match
-    };
+    // No labels is the empty set: `!key`, `key!=v` and `notin` still match it
+    // (Cilium watches Services with `!service.kubernetes.io/headless,…`).
+    let empty = std::collections::HashMap::new();
+    let labels = metadata.labels.as_ref().unwrap_or(&empty);
 
     // Parse selector: supports key=value, key!=value, key in (v1,v2), key notin (v1,v2), key, !key
     for requirement in split_label_requirements(selector) {
@@ -2646,6 +2646,24 @@ pub async fn watch_namespaced_json(
         .header(header::TRANSFER_ENCODING, "chunked")
         .body(body)
         .unwrap())
+}
+
+#[cfg(test)]
+mod label_selector_without_labels_tests {
+    use super::*;
+
+    #[test]
+    fn an_object_without_labels_matches_negative_requirements_only() {
+        let meta = ObjectMeta::new("web");
+        let sel = |s: &str| Some(s.to_string());
+        assert!(matches_label_selector(
+            &meta,
+            &sel("!service.kubernetes.io/headless,!service.kubernetes.io/service-proxy-name")
+        ));
+        assert!(matches_label_selector(&meta, &sel("app!=x")));
+        assert!(!matches_label_selector(&meta, &sel("app=x")));
+        assert!(!matches_label_selector(&meta, &sel("app")));
+    }
 }
 
 #[cfg(test)]

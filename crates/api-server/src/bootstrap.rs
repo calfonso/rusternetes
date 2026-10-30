@@ -35,6 +35,40 @@ fn get_api_server_ip() -> Result<String> {
     Err(anyhow::anyhow!("No non-loopback IPv4 address found"))
 }
 
+/// The namespaces every Kubernetes API server keeps in existence: `default`,
+/// `kube-system`, `kube-public` and `kube-node-lease` (upstream: the
+/// `system-namespaces` controller, `pkg/controlplane/controller/systemnamespaces`).
+/// Components such as CNI agents and operators look their namespace up at
+/// start and refuse to run when it is missing.
+pub const SYSTEM_NAMESPACES: [&str; 4] =
+    ["default", "kube-system", "kube-public", "kube-node-lease"];
+
+/// Create each of [`SYSTEM_NAMESPACES`] that the store does not hold yet.
+pub async fn bootstrap_system_namespaces(storage: Arc<StorageBackend>) -> Result<()> {
+    use rusternetes_common::resources::{Namespace, NamespaceStatus};
+    for name in SYSTEM_NAMESPACES {
+        let key = rusternetes_storage::build_key("namespaces", None, name);
+        if storage.get::<Namespace>(&key).await.is_ok() {
+            continue;
+        }
+        let mut ns = Namespace::new(name);
+        ns.metadata.ensure_uid();
+        ns.metadata.ensure_creation_timestamp();
+        ns.metadata.finalizers = Some(vec!["kubernetes".to_string()]);
+        ns.status = Some(NamespaceStatus {
+            phase: Some(rusternetes_common::types::Phase::Active),
+            conditions: None,
+        });
+        match storage.create(&key, &ns).await {
+            Ok(_) => info!("Created system namespace {}", name),
+            // Another API server instance may have won the race.
+            Err(rusternetes_common::Error::AlreadyExists(_)) => {}
+            Err(e) => return Err(e).with_context(|| format!("create namespace {name}")),
+        }
+    }
+    Ok(())
+}
+
 /// Bootstrap the kubernetes Service and Endpoints in the default namespace
 /// This ensures the "kubernetes" service always points to this API server
 pub async fn bootstrap_kubernetes_service(
@@ -223,4 +257,26 @@ pub async fn bootstrap_kubernetes_service(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusternetes_common::resources::Namespace;
+
+    #[tokio::test]
+    async fn the_system_namespaces_exist_after_start_and_a_second_run_keeps_them() {
+        let storage = Arc::new(StorageBackend::new_memory());
+        bootstrap_system_namespaces(storage.clone()).await.unwrap();
+        bootstrap_system_namespaces(storage.clone()).await.unwrap();
+        for name in SYSTEM_NAMESPACES {
+            let ns: Namespace = storage
+                .get(&rusternetes_storage::build_key("namespaces", None, name))
+                .await
+                .unwrap_or_else(|_| panic!("namespace {name}"));
+            assert_eq!(ns.metadata.name, name);
+            let phase = ns.status.and_then(|s| s.phase);
+            assert_eq!(phase, Some(rusternetes_common::types::Phase::Active));
+        }
+    }
 }

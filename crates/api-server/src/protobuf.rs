@@ -1137,6 +1137,40 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // coordination.k8s.io/v1 Lease (leader election: client-go's
+        // resourcelock writes it as protobuf).
+        schemas.insert(
+            "Lease".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("LeaseSpec".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LeaseSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("holderIdentity".into(), FieldType::String)),
+                    (2, ("leaseDurationSeconds".into(), FieldType::Int)),
+                    (
+                        3,
+                        ("acquireTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (
+                        4,
+                        ("renewTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (5, ("leaseTransitions".into(), FieldType::Int)),
+                    (6, ("strategy".into(), FieldType::String)),
+                    (7, ("preferredHolder".into(), FieldType::String)),
+                ]),
+            },
+        );
         schemas.insert(
             "Secret".into(),
             MessageSchema {
@@ -2796,6 +2830,10 @@ impl ProtoRegistry {
                     // K8s Time is a Timestamp proto — decode to RFC3339 string
                     return decode_timestamp(data);
                 }
+                if msg_type == "MicroTime" {
+                    // MicroTime is the same Timestamp proto, RFC3339 with microseconds
+                    return decode_micro_timestamp(data);
+                }
                 match self.decode_message(msg_type, data) {
                     Some(v) => v,
                     None => {
@@ -3176,6 +3214,37 @@ fn decode_timestamp(data: &[u8]) -> Value {
     }
 }
 
+/// Decode a K8s MicroTime (a Timestamp proto) to RFC3339 with microseconds.
+fn decode_micro_timestamp(data: &[u8]) -> Value {
+    let mut seconds: i64 = 0;
+    let mut nanos: i64 = 0;
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some((tag, p)) = read_varint(data, pos) else {
+            break;
+        };
+        if (tag & 0x07) as u8 != WIRE_VARINT {
+            break;
+        }
+        let Some((val, p)) = read_varint(data, p) else {
+            break;
+        };
+        pos = p;
+        match tag >> 3 {
+            1 => seconds = val as i64,
+            2 => nanos = val as i64,
+            _ => {}
+        }
+    }
+    if seconds == 0 && nanos == 0 {
+        return Value::Null;
+    }
+    match chrono::DateTime::from_timestamp(seconds, nanos as u32) {
+        Some(dt) => Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()),
+        None => Value::String(format!("{}s", seconds)),
+    }
+}
+
 /// Decode K8s IntOrString protobuf message
 /// Proto: message IntOrString { int64 type = 1; int32 intVal = 2; string strVal = 3; }
 fn decode_int_or_string(data: &[u8]) -> Value {
@@ -3242,6 +3311,21 @@ mod tests {
         assert_eq!(read_varint(&[0x08], 0), Some((8, 1)));
         assert_eq!(read_varint(&[0x96, 0x01], 0), Some((150, 2)));
         assert_eq!(read_varint(&[0xac, 0x02], 0), Some((300, 2)));
+    }
+
+    #[test]
+    fn decodes_a_lease_spec_with_micro_time() {
+        let registry = ProtoRegistry::new();
+        // holderIdentity "a", leaseDurationSeconds 15, renewTime {seconds: 1, nanos: 5000}
+        let data = [
+            0x0a, 0x01, b'a', 0x10, 0x0f, 0x22, 0x05, 0x08, 0x01, 0x10, 0x88, 0x27,
+        ];
+        let v = registry
+            .decode_message("LeaseSpec", &data)
+            .expect("LeaseSpec schema");
+        assert_eq!(v["holderIdentity"], "a");
+        assert_eq!(v["leaseDurationSeconds"], 15);
+        assert_eq!(v["renewTime"], "1970-01-01T00:00:01.000005Z");
     }
 
     #[test]

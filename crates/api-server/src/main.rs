@@ -203,6 +203,12 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
+    if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
+        warn!(
+            "Failed to bootstrap the system namespaces: {}. Continuing anyway.",
+            e
+        );
+    }
     if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
         warn!(
             "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",
