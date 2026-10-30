@@ -153,6 +153,13 @@ async fn run() -> Result<()> {
 
     // Initialize storage
     let storage_config = match args.storage_backend.as_str() {
+        #[cfg(feature = "redb")]
+        "redb" => {
+            info!("Using embedded redb storage at: {}", args.data_dir);
+            StorageConfig::Redb {
+                path: args.data_dir.clone(),
+            }
+        }
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);

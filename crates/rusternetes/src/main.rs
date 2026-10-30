@@ -19,7 +19,7 @@ use tracing::{error, info, Level};
 #[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]
 #[command(version)]
 struct Args {
-    /// Storage backend: "sqlite", "etcd", or "redis"
+    /// Storage backend: "sqlite", "etcd", "redis", or "redb"
     #[arg(long, default_value = "sqlite")]
     storage_backend: String,
 
@@ -148,6 +148,13 @@ async fn run() -> Result<()> {
 
     // Initialize storage — all components share one instance
     let storage_config = match args.storage_backend.as_str() {
+        #[cfg(feature = "redb")]
+        "redb" => {
+            info!("Using embedded redb storage at: {}", args.data_dir);
+            StorageConfig::Redb {
+                path: args.data_dir,
+            }
+        }
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Storage: SQLite at {}", args.data_dir);
@@ -173,7 +180,7 @@ async fn run() -> Result<()> {
         }
         other => {
             anyhow::bail!(
-                "Unknown storage backend: {}. Use 'sqlite', 'etcd', or 'redis'.",
+                "Unknown storage backend: {}. Use 'sqlite', 'etcd', 'redis', or 'redb'.",
                 other
             );
         }
