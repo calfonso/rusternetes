@@ -213,7 +213,7 @@ async fn custom_resource_fallback(
     let (group, version, plural, namespace, name, subresource) = match parts.as_slice() {
         // Namespaced: /apis/{group}/{version}/namespaces/{namespace}/{plural}
         [group, version, "namespaces", namespace, plural]
-            if method == Method::GET || method == Method::POST =>
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
         {
             (*group, *version, *plural, Some(*namespace), None, None)
         }
@@ -236,7 +236,9 @@ async fn custom_resource_fallback(
             Some(*subresource),
         ),
         // Cluster-scoped: /apis/{group}/{version}/{plural}
-        [group, version, plural] if method == Method::GET || method == Method::POST => {
+        [group, version, plural]
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
+        {
             (*group, *version, *plural, None, None, None)
         }
         // Cluster-scoped resource: /apis/{group}/{version}/{plural}/{name}
@@ -393,6 +395,7 @@ async fn custom_resource_fallback(
                         plural.to_string(),
                         namespace.map(|s| s.to_string()),
                     )),
+                    axum::extract::Query(query_params.clone()),
                 )
                 .await
                 {
@@ -460,6 +463,76 @@ async fn custom_resource_fallback(
                 Ok(json) => json.into_response(),
                 Err(e) => {
                     warn!("Error updating custom resource: {}", e);
+                    e.into_response()
+                }
+            }
+        }
+        // DELETE on the collection = deletecollection: every object the
+        // list (with its labelSelector / fieldSelector) returns, deleted one
+        // by one through the single-object path (finalizers, admission).
+        (Method::DELETE, None, None) => {
+            let query_params: std::collections::HashMap<String, String> = uri
+                .query()
+                .map(|q| {
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let listed = handlers::custom_resource::list_custom_resources(
+                State(state.clone()),
+                Extension(auth_ctx.clone()),
+                axum::extract::Path((
+                    group.to_string(),
+                    version.to_string(),
+                    plural.to_string(),
+                    namespace.map(|s| s.to_string()),
+                )),
+                axum::extract::Query(query_params.clone()),
+            )
+            .await;
+            match listed {
+                Ok(Json(mut list)) => {
+                    let mut failed = None;
+                    for cr in &list.items {
+                        let item_ns = cr
+                            .metadata
+                            .namespace
+                            .clone()
+                            .or(namespace.map(|s| s.to_string()));
+                        if let Err(e) = handlers::custom_resource::delete_custom_resource(
+                            State(state.clone()),
+                            Extension(auth_ctx.clone()),
+                            axum::extract::Path((
+                                group.to_string(),
+                                version.to_string(),
+                                plural.to_string(),
+                                item_ns,
+                                cr.metadata.name.clone(),
+                            )),
+                            axum::extract::Query(query_params.clone()),
+                        )
+                        .await
+                        {
+                            if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        Some(e) => {
+                            warn!("Error deleting custom resources: {}", e);
+                            e.into_response()
+                        }
+                        None => {
+                            list.items.clear();
+                            Json(list).into_response()
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Error listing custom resources for deletecollection: {}", e);
                     e.into_response()
                 }
             }
@@ -2430,4 +2503,191 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     ))
     .layer(TraceLayer::new_for_http())
     .with_state(state)
+}
+
+#[cfg(test)]
+mod custom_resource_tests {
+    use super::*;
+    use axum::body::Body;
+    use rusternetes_common::resources::CustomResource;
+    use rusternetes_storage::StorageBackend;
+    use serde_json::json;
+
+    const CRD: &str = "crontabs.stable.example.com";
+
+    fn admin() -> middleware::AuthContext {
+        middleware::AuthContext {
+            user: rusternetes_common::auth::UserInfo {
+                username: "admin".to_string(),
+                uid: "admin".to_string(),
+                groups: vec!["system:masters".to_string()],
+                extra: Default::default(),
+            },
+        }
+    }
+
+    fn crd_json() -> serde_json::Value {
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": CRD},
+            "spec": {
+                "group": "stable.example.com",
+                "names": {"plural": "crontabs", "singular": "crontab", "kind": "CronTab", "listKind": "CronTabList"},
+                "scope": "Namespaced",
+                "versions": [{"name": "v1", "served": true, "storage": true}]
+            },
+            // What a typed (protobuf) client sends on create.
+            "status": {"acceptedNames": {"plural": "", "kind": ""}}
+        })
+    }
+
+    /// A state holding the CRD and two CronTabs, `a` (app=a) and `b` (app=b).
+    async fn state() -> Arc<ApiServerState> {
+        let state = Arc::new(ApiServerState::new(
+            Arc::new(StorageBackend::new_memory()),
+            Arc::new(rusternetes_common::auth::TokenManager::new(b"test")),
+            Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
+            Arc::new(rusternetes_common::observability::MetricsRegistry::new()),
+            true,
+        ));
+        let crd: CustomResourceDefinition = serde_json::from_value(crd_json()).unwrap();
+        state
+            .storage
+            .create(&build_key("customresourcedefinitions", None, CRD), &crd)
+            .await
+            .unwrap();
+        for name in ["a", "b"] {
+            let cr: CustomResource = serde_json::from_value(json!({
+                "apiVersion": "stable.example.com/v1",
+                "kind": "CronTab",
+                "metadata": {"name": name, "namespace": "default", "labels": {"app": name}},
+                "spec": {"cronSpec": "* * * * *"}
+            }))
+            .unwrap();
+            state
+                .storage
+                .create(
+                    &build_key("stable_example_com_crontabs", Some("default"), name),
+                    &cr,
+                )
+                .await
+                .unwrap();
+        }
+        state
+    }
+
+    async fn call(state: &Arc<ApiServerState>, method: Method, uri: &str) -> serde_json::Value {
+        let uri: Uri = uri.parse().unwrap();
+        let resp = custom_resource_fallback(
+            State(state.clone()),
+            Extension(admin()),
+            uri,
+            method,
+            Request::new(Body::empty()),
+        )
+        .await
+        .expect("handled");
+        assert!(resp.status().is_success(), "status {}", resp.status());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_list_is_kind_list_in_its_group_version_and_honours_selectors() {
+        let state = state().await;
+        let list = call(
+            &state,
+            Method::GET,
+            "/apis/stable.example.com/v1/namespaces/default/crontabs?labelSelector=app%3Da",
+        )
+        .await;
+        assert_eq!(list["kind"], "CronTabList");
+        assert_eq!(list["apiVersion"], "stable.example.com/v1");
+        let names: Vec<_> = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["metadata"]["name"].clone())
+            .collect();
+        assert_eq!(names, vec![json!("a")]);
+
+        let list = call(
+            &state,
+            Method::GET,
+            "/apis/stable.example.com/v1/namespaces/default/crontabs?fieldSelector=metadata.name%3Db",
+        )
+        .await;
+        let names: Vec<_> = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["metadata"]["name"].clone())
+            .collect();
+        assert_eq!(names, vec![json!("b")]);
+    }
+
+    #[tokio::test]
+    async fn delete_on_the_collection_deletes_what_the_selector_matches() {
+        let state = state().await;
+        call(
+            &state,
+            Method::DELETE,
+            "/apis/stable.example.com/v1/namespaces/default/crontabs?labelSelector=app%3Da",
+        )
+        .await;
+        let left: Vec<CustomResource> = state
+            .storage
+            .list(&rusternetes_storage::build_prefix(
+                "stable_example_com_crontabs",
+                Some("default"),
+            ))
+            .await
+            .unwrap();
+        let left: Vec<_> = left.iter().map(|c| c.metadata.name.as_str()).collect();
+        assert_eq!(left, vec!["b"]);
+    }
+
+    #[tokio::test]
+    async fn a_bookmark_carries_the_crd_kind_and_storage_version() {
+        let state = state().await;
+        assert_eq!(
+            handlers::watch::bookmark_kind_and_version(
+                &state,
+                "stable_example_com_crontabs",
+                "stable.example.com"
+            )
+            .await,
+            ("CronTab".to_string(), "stable.example.com/v1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_a_crd_drops_the_sent_status_and_sets_established() {
+        let state = Arc::new(ApiServerState::new(
+            Arc::new(StorageBackend::new_memory()),
+            Arc::new(rusternetes_common::auth::TokenManager::new(b"test")),
+            Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
+            Arc::new(rusternetes_common::observability::MetricsRegistry::new()),
+            true,
+        ));
+        let (_, Json(created)) = handlers::crd::create_crd(
+            State(state),
+            Extension(admin()),
+            axum::extract::Query(Default::default()),
+            Default::default(),
+            serde_json::to_vec(&crd_json()).unwrap().into(),
+        )
+        .await
+        .expect("created");
+        let conditions = created["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        assert!(conditions
+            .iter()
+            .any(|c| c["type"] == "Established" && c["status"] == "True"));
+        assert_eq!(created["status"]["acceptedNames"]["kind"], "CronTab");
+    }
 }

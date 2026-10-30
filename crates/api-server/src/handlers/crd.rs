@@ -127,8 +127,12 @@ pub async fn create_crd(
     crd.metadata.ensure_uid();
     crd.metadata.ensure_creation_timestamp();
 
-    // Initialize status with Established and NamesAccepted conditions
-    if crd.status.is_none() {
+    // Initialize status with Established and NamesAccepted conditions. A
+    // status in the create request is dropped, as upstream's
+    // PrepareForCreate does: a typed client (protobuf) always sends an empty
+    // `status: {acceptedNames: {}}`, which must not stand in for the
+    // conditions clients wait on.
+    {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         crd.status = Some(
             rusternetes_common::resources::CustomResourceDefinitionStatus {
