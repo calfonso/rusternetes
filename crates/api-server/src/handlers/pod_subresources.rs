@@ -193,11 +193,17 @@ pub async fn get_logs(
     // Get logs from the container runtime
     let logs = match get_container_logs(&pod, &container_name, &query).await {
         Ok(logs) => logs,
-        Err(e) => {
-            info!("Failed to get real container logs, using fallback: {}", e);
-            // Fallback to synthetic logs if container runtime is not available
-            generate_pod_logs(&pod, &container_name, &query)
-        }
+        Err(e) => match get_node_container_logs(&state, &pod, &container_name, &query).await {
+            Ok(logs) => logs,
+            Err(e2) => {
+                info!(
+                    "Failed to get real container logs ({}; from the node: {}), using fallback",
+                    e, e2
+                );
+                // Fallback to synthetic logs if container runtime is not available
+                generate_pod_logs(&pod, &container_name, &query)
+            }
+        },
     };
 
     // If WebSocket upgrade requested, send logs over WebSocket
@@ -219,6 +225,52 @@ pub async fn get_logs(
             .body(Body::from(logs))
             .unwrap())
     }
+}
+
+/// Logs from the kubelet of the pod's node (`GET http://<InternalIP>:10250/
+/// containerLogs/...`), for a pod whose runtime this API server cannot reach.
+async fn get_node_container_logs(
+    state: &ApiServerState,
+    pod: &rusternetes_common::resources::Pod,
+    container_name: &str,
+    query: &LogsQuery,
+) -> anyhow::Result<String> {
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("pod is not on a node"))?;
+    let node: rusternetes_common::resources::Node = state
+        .storage
+        .get(&rusternetes_storage::build_key("nodes", None, &node_name))
+        .await?;
+    let ip = node
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .and_then(|a| a.iter().find(|a| a.address_type == "InternalIP"))
+        .map(|a| a.address.clone())
+        .ok_or_else(|| anyhow::anyhow!("node {} has no InternalIP", node_name))?;
+    let mut url = format!(
+        "http://{}:10250/containerLogs/{}/{}/{}",
+        ip,
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name,
+        container_name
+    );
+    if let Some(t) = query.tail_lines {
+        url.push_str(&format!("?tailLines={}", t));
+    }
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(&url)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("{} answered {}", url, resp.status());
+    }
+    Ok(resp.text().await?)
 }
 
 /// Get real logs from the container runtime

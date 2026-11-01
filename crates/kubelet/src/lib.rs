@@ -1,4 +1,5 @@
 #[allow(dead_code)]
+pub mod backend;
 pub mod cni;
 pub mod config;
 #[allow(dead_code)]
@@ -96,18 +97,6 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_addr
     );
 
-    tokio::spawn(async move {
-        use axum::{routing::get, Json, Router};
-        let app = Router::new()
-            .route("/metrics", get(|| async move { metrics_clone.gather() }))
-            .route(
-                "/configz",
-                get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
-            );
-        let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
-    });
-
     let k = Arc::new(
         kubelet::Kubelet::new(
             config.node_name,
@@ -122,7 +111,57 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         )
         .await?,
     );
+    let logs_backend = k.backend();
+    tokio::spawn(async move {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new()
+            .route(
+                "/containerLogs/:namespace/:pod/:container",
+                get(move |path, query| container_logs(logs_backend.clone(), path, query)),
+            )
+            .route("/metrics", get(|| async move { metrics_clone.gather() }))
+            .route(
+                "/configz",
+                get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
+            );
+        let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+
     k.run().await?;
 
     Ok(())
+}
+
+/// `GET /containerLogs/{namespace}/{pod}/{container}[?tailLines=N]` — a
+/// container's output from this node's backend, so the API server can serve
+/// `pods/log` for pods on any node.
+async fn container_logs(
+    backend: Arc<dyn backend::ContainerBackend>,
+    axum::extract::Path((_namespace, pod, container)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<String, (axum::http::StatusCode, String)> {
+    use futures::StreamExt;
+    let name = format!("{}_{}", pod, container);
+    let opts = backend::LogsOptions {
+        stdout: true,
+        stderr: true,
+        tail: q
+            .get("tailLines")
+            .cloned()
+            .unwrap_or_else(|| "all".to_string()),
+    };
+    let mut out = String::new();
+    let mut stream = backend.logs(&name, opts);
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(c) => out.push_str(&c.to_string()),
+            Err(e) => return Err((axum::http::StatusCode::NOT_FOUND, e.to_string())),
+        }
+    }
+    Ok(out)
 }
