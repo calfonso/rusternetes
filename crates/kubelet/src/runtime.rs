@@ -15,7 +15,6 @@ use rusternetes_common::resources::{
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -318,27 +317,22 @@ impl ContainerRuntime {
         // This will fail in Podman Machine where netns created in container aren't
         // accessible to other containers
         let test_netns = "rusternetes-cni-test";
-        let create_result = Command::new("ip")
-            .args(["netns", "add", test_netns])
-            .output();
+        let created = match crate::netns::add(test_netns) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
+        };
 
-        if let Ok(output) = create_result {
-            if output.status.success()
-                || String::from_utf8_lossy(&output.stderr).contains("File exists")
-            {
-                // Clean up test namespace
-                let _ = Command::new("ip")
-                    .args(["netns", "del", test_netns])
-                    .output();
+        if created {
+            // Clean up test namespace
+            let _ = crate::netns::del(test_netns);
 
-                // Network namespaces work, but we're likely in a container where
-                // they won't be accessible to sibling containers (Podman Machine case)
-                warn!("CNI plugins found but network namespaces may not work across containers.");
-                warn!("This is normal in Podman Machine - will fall back to Podman networking.");
-                return Err(anyhow::anyhow!(
-                    "Network namespace isolation prevents CNI usage"
-                ));
-            }
+            // Network namespaces work, but we're likely in a container where
+            // they won't be accessible to sibling containers (Podman Machine case)
+            warn!("CNI plugins found but network namespaces may not work across containers.");
+            warn!("This is normal in Podman Machine - will fall back to Podman networking.");
+            return Err(anyhow::anyhow!(
+                "Network namespace isolation prevents CNI usage"
+            ));
         }
 
         let cni = CniRuntime::new(cni_plugin_paths, cni_config_dir)?
@@ -364,30 +358,18 @@ impl ContainerRuntime {
 
         // Create network namespace
         let netns_name = format!("cni-{}", pod_name);
-        let output = match Command::new("ip")
-            .args(["netns", "add", &netns_name])
-            .output()
-        {
-            Ok(out) => out,
+        match crate::netns::add(&netns_name) {
+            Ok(()) => info!("Created network namespace: {}", netns_name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                info!(
+                    "Network namespace {} already exists, reusing it",
+                    netns_name
+                );
+            }
             Err(e) => {
                 warn!("Failed to create network namespace for pod {}: {}. Falling back to Podman networking.", pod_name, e);
                 return None;
             }
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore error if namespace already exists
-            if !stderr.contains("File exists") {
-                warn!("Failed to create network namespace for pod {}: {}. Falling back to Podman networking.", pod_name, stderr);
-                return None;
-            }
-            info!(
-                "Network namespace {} already exists, reusing it",
-                netns_name
-            );
-        } else {
-            info!("Created network namespace: {}", netns_name);
         }
 
         // Get the network namespace path
@@ -405,9 +387,7 @@ impl ContainerRuntime {
                 Err(e) => {
                     warn!("Failed to setup CNI network for pod {}: {}. Falling back to Podman networking.", pod_name, e);
                     // Clean up the network namespace on failure
-                    let _ = Command::new("ip")
-                        .args(["netns", "del", &netns_name])
-                        .output();
+                    let _ = crate::netns::del(&netns_name);
                     return None;
                 }
             }
@@ -435,19 +415,9 @@ impl ContainerRuntime {
         }
 
         // Delete network namespace
-        let output = Command::new("ip")
-            .args(["netns", "del", &netns_name])
-            .output()
-            .context("Failed to execute ip netns del command")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(
-                "Failed to delete network namespace {}: {}",
-                netns_name, stderr
-            );
-        } else {
-            info!("Deleted network namespace: {}", netns_name);
+        match crate::netns::del(&netns_name) {
+            Err(e) => warn!("Failed to delete network namespace {}: {}", netns_name, e),
+            Ok(()) => info!("Deleted network namespace: {}", netns_name),
         }
 
         Ok(())
