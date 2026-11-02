@@ -10,6 +10,7 @@
 //! - **QoS-based Eviction**: Pods are evicted in priority order (BestEffort → Burstable → Guaranteed)
 //! - **Resource Usage Ordering**: Within a QoS class, evict based on resource consumption
 
+use crate::backend::{ContainerBackend, ListContainersOptions, StatsOptions};
 use anyhow::Result;
 use rusternetes_common::resources::{Node, NodeCondition, Pod};
 use std::collections::HashMap;
@@ -585,24 +586,19 @@ fn get_pid_stats() -> (u64, u64) {
 
 /// Get pod resource usage statistics
 /// Queries the container runtime for actual resource usage
-pub async fn get_pod_stats(pods: &[Pod]) -> HashMap<String, PodStats> {
-    get_pod_stats_async(pods).await
+pub async fn get_pod_stats(
+    backend: &dyn ContainerBackend,
+    pods: &[Pod],
+) -> HashMap<String, PodStats> {
+    get_pod_stats_async(backend, pods).await
 }
 
 /// Async implementation of pod stats gathering
-async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
-    use bollard::Docker;
-
+async fn get_pod_stats_async(
+    backend: &dyn ContainerBackend,
+    pods: &[Pod],
+) -> HashMap<String, PodStats> {
     let mut stats_map = HashMap::new();
-
-    // Connect to Docker/Podman
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("Failed to connect to container runtime: {}", e);
-            return stats_map;
-        }
-    };
 
     for pod in pods {
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
@@ -623,7 +619,7 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
                 let container_name = format!("k8s_{}_{}_", container.name, pod_name);
 
                 // Try to get container stats
-                match get_container_stats(&docker, &container_name).await {
+                match get_container_stats(backend, &container_name).await {
                     Ok((memory, disk)) => {
                         total_memory_bytes += memory;
                         total_disk_bytes += disk;
@@ -658,22 +654,19 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
 
 /// Get resource stats for a single container
 async fn get_container_stats(
-    docker: &bollard::Docker,
+    backend: &dyn ContainerBackend,
     container_name_prefix: &str,
 ) -> Result<(u64, u64)> {
-    use bollard::container::ListContainersOptions;
-    use std::collections::HashMap as BollardHashMap;
-
     // List all containers and find one matching our prefix
-    let mut filters = BollardHashMap::new();
+    let mut filters = HashMap::new();
     filters.insert("name".to_string(), vec![container_name_prefix.to_string()]);
 
-    let options = Some(ListContainersOptions {
+    let options = ListContainersOptions {
         filters,
         ..Default::default()
-    });
+    };
 
-    let containers = docker.list_containers(options).await?;
+    let containers = backend.list_containers(options).await?;
 
     if containers.is_empty() {
         return Ok((0, 0));
@@ -686,25 +679,25 @@ async fn get_container_stats(
         .ok_or_else(|| anyhow::anyhow!("Container has no ID"))?;
 
     // Get container stats (one-shot, not streaming)
-    let stats_options = bollard::container::StatsOptions {
+    let stats_options = StatsOptions {
         stream: false,
         one_shot: true,
     };
 
     use futures::stream::StreamExt;
-    let mut stats_stream = docker.stats(container_id, Some(stats_options));
+    let mut stats_stream = backend.stats(container_id, stats_options);
 
     if let Some(stats_result) = stats_stream.next().await {
         let stats = stats_result?;
 
         // Extract memory usage
-        let memory_bytes = stats.memory_stats.usage.unwrap_or(0);
+        let memory_bytes = stats.memory_usage.unwrap_or(0);
 
         // Extract disk usage (from blkio stats)
         let mut disk_bytes = 0u64;
-        if let Some(io_service_bytes_recursive) = &stats.blkio_stats.io_service_bytes_recursive {
-            for entry in io_service_bytes_recursive {
-                disk_bytes += entry.value;
+        if let Some(io_service_bytes_recursive) = &stats.blkio_service_bytes {
+            for value in io_service_bytes_recursive {
+                disk_bytes += value;
             }
         }
 
