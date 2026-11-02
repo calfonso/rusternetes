@@ -3,11 +3,13 @@
 //! Layout under the backend root (default `/var/lib/rusternetes/youki`):
 //!
 //! ```text
-//! images/<config digest>/{rootfs, image.json}   flattened image layers
+//! images/<config digest>/image.json             image config and reference
+//! layers/{blobs,layers/<diff_id>,images}       oci-image layer store: each
+//!                                               layer unpacked once, shared
 //! refs/<reference>.json                         reference -> image
 //! containers/<name>/meta.json                   what Docker would remember
 //! containers/<name>/{config.json, rootfs}       the OCI bundle; rootfs is an
-//!                                               overlay on the image rootfs
+//!                                               overlay of the image's layers
 //! containers/<name>/{upper, work}               overlay upper and work dirs
 //! containers/<name>/{output.log, exit.json}     stdout+stderr, exit status
 //! containers/<name>/exec/<id>.*                 exec args, output, exit
@@ -353,15 +355,16 @@ impl Inner {
         fs::create_dir_all(&dir)?;
         let result = (|| -> Result<Meta> {
             let rootfs = dir.join("rootfs");
-            for d in ["rootfs", "upper", "work", "exec"] {
-                fs::create_dir_all(dir.join(d))?;
-            }
-            let opts = format!(
-                "lowerdir={},upperdir={},workdir={}",
-                self.images.rootfs(&image_id).display(),
-                dir.join("upper").display(),
-                dir.join("work").display()
-            );
+            let overlay = oci_image::Overlay {
+                lower: oci_image::Overlay::stack(&self.images.layers(&image_id)?),
+                upper: dir.join("upper"),
+                work: dir.join("work"),
+                merged: rootfs.clone(),
+                userxattr: false,
+            };
+            overlay.create()?;
+            fs::create_dir_all(dir.join("exec"))?;
+            let opts = overlay.mount_data();
             nix::mount::mount(
                 Some("overlay"),
                 &rootfs,
