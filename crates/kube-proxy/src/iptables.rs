@@ -24,6 +24,48 @@ fn detect_iptables_cmd() -> &'static str {
     "/usr/sbin/iptables-legacy"
 }
 
+/// Migrate the overly broad host-source NAT rule without touching other rules.
+fn remove_legacy_nodeport_masquerade(iptables_cmd: &str) -> Result<()> {
+    loop {
+        let output = Command::new(iptables_cmd)
+            .env("LC_ALL", "C")
+            .args([
+                "-w",
+                "10",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-m",
+                "comment",
+                "--comment",
+                "rusternetes nodeport masquerade",
+                "-m",
+                "addrtype",
+                "--src-type",
+                "LOCAL",
+                "-j",
+                "MASQUERADE",
+            ])
+            .output()
+            .context("Failed to remove legacy NodePort MASQUERADE rule")?;
+        if output.status.success() {
+            info!("Removed legacy MASQUERADE rule matching all local sources");
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Both nft and legacy backends report an absent exact rule this way.
+        // Permission errors, lock timeouts and other failures must abort startup.
+        if output.status.code() == Some(1) && stderr.contains("Bad rule") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Failed to remove legacy NodePort MASQUERADE rule: {}",
+            stderr
+        );
+    }
+}
+
 /// Detect the container bridge interface and its CIDR.
 /// Works with both Docker (172.18.0.0/16 on br-xxx) and Podman (10.89.0.0/24 on podman1).
 /// Returns (interface_name, cidr) if found.
@@ -174,6 +216,12 @@ impl IptablesManager {
     pub fn initialize(&self) -> Result<()> {
         info!("Initializing iptables chains for kube-proxy");
 
+        // The old LOCAL-source rule also matched unrelated host traffic, including
+        // loopback DNS queries to systemd-resolved. Remove any copies left by an
+        // older proxy. NodePort traffic is DNATed and is already covered by the
+        // conntrack DNAT masquerade rule installed below, as is ClusterIP traffic.
+        remove_legacy_nodeport_masquerade(&self.iptables_cmd)?;
+
         // Enable bridge-nf-call-iptables so that iptables rules apply to
         // bridge-forwarded traffic. Without this, pod-to-NodePort traffic
         // within the container bridge bypasses PREROUTING/OUTPUT DNAT rules.
@@ -294,58 +342,6 @@ impl IptablesManager {
             }
         } else {
             warn!("No bridge CIDR detected, skipping hairpin MASQUERADE rule");
-        }
-
-        // Add MASQUERADE for NodePort traffic from local sources.
-        // When a process on the node itself connects to a NodePort, the source IP
-        // is local. Without MASQUERADE the backend pod replies directly, bypassing
-        // conntrack, and the connection breaks (asymmetric routing).
-        let nodeport_masq_check = Command::new(&self.iptables_cmd)
-            .args([
-                "-t",
-                "nat",
-                "-C",
-                "POSTROUTING",
-                "-m",
-                "comment",
-                "--comment",
-                "rusternetes nodeport masquerade",
-                "-m",
-                "addrtype",
-                "--src-type",
-                "LOCAL",
-                "-j",
-                "MASQUERADE",
-            ])
-            .output();
-        if nodeport_masq_check.map_or(true, |o| !o.status.success()) {
-            let output = Command::new(&self.iptables_cmd)
-                .args([
-                    "-t",
-                    "nat",
-                    "-A",
-                    "POSTROUTING",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "rusternetes nodeport masquerade",
-                    "-m",
-                    "addrtype",
-                    "--src-type",
-                    "LOCAL",
-                    "-j",
-                    "MASQUERADE",
-                ])
-                .output()
-                .context("Failed to add NodePort MASQUERADE rule")?;
-            if output.status.success() {
-                info!("Added MASQUERADE rule for NodePort traffic (local source)");
-            } else {
-                warn!(
-                    "Failed to add NodePort MASQUERADE: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
         }
 
         // Add general MASQUERADE for all DNAT'd traffic.
@@ -1741,6 +1737,57 @@ impl Drop for IptablesManager {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn test_legacy_masquerade_migration() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("rusternetes-nat-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let fake_iptables = directory.join("iptables");
+        let count = directory.join("count");
+        let script = r#"#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+[ "$#" = 16 ]
+[ "$1 $2 $3 $4 $5 $6" = '-w 10 -t nat -D POSTROUTING' ]
+shift 6
+[ "$1 $2 $3 $4" = '-m comment --comment rusternetes nodeport masquerade' ]
+shift 4
+[ "$*" = '-m addrtype --src-type LOCAL -j MASQUERADE' ]
+value=$(cat count)
+if [ "$value" = denied ]; then
+  echo 'Permission denied' >&2
+  exit 1
+fi
+if [ "$value" = locked ]; then
+  echo 'Another app is currently holding the xtables lock' >&2
+  exit 4
+fi
+if [ "$value" -gt 0 ]; then
+  echo "$((value - 1))" > count
+  exit 0
+fi
+echo 'iptables: Bad rule (does a matching rule exist in that chain?).' >&2
+exit 1
+"#;
+        std::fs::write(&fake_iptables, script).unwrap();
+        std::fs::set_permissions(&fake_iptables, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Existing duplicate rules are all removed; a clean restart is idempotent.
+        std::fs::write(&count, "2").unwrap();
+        super::remove_legacy_nodeport_masquerade(fake_iptables.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "0");
+        super::remove_legacy_nodeport_masquerade(fake_iptables.to_str().unwrap()).unwrap();
+        // An operational error must not be treated as an absent rule.
+        for failure in ["denied", "locked"] {
+            std::fs::write(&count, failure).unwrap();
+            assert!(
+                super::remove_legacy_nodeport_masquerade(fake_iptables.to_str().unwrap()).is_err()
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn test_probability_calculation_uniform() {
