@@ -79,6 +79,11 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
 }
 
 impl Kubelet {
+    /// The container backend this kubelet's runtime drives.
+    pub fn backend(&self) -> Arc<dyn crate::backend::ContainerBackend> {
+        self.runtime.backend().clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         node_name: String,
