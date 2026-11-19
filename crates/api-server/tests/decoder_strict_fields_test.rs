@@ -10,10 +10,8 @@
 //!   read-back, and emit one `Warning:` header per unknown field.
 //! - `fieldValidation=Ignore`  → accept silently; unknown fields are dropped
 //!   on read-back with no header.
-//! - No param                  → in Kubernetes >= 1.25 the server-side
-//!   default is `Strict`. Rusternetes currently defaults to `Ignore`
-//!   (handler short-circuits when the query param is absent), so the
-//!   strict-default test is `#[ignore]` pending parity work.
+//! - No param                  → `Warn`, the API server's default since 1.23
+//!   (kubectl asks for `Strict` explicitly; client-go asks nothing).
 //!
 //! Pattern follows `tests/integration_dryrun_all_resources.rs` — spawn an
 //! in-process Axum router backed by `MemoryStorage`, drive it with
@@ -538,26 +536,33 @@ async fn test_field_validation_default_pod_clean_body_accepted() {
 }
 
 #[tokio::test]
-async fn test_field_validation_default_pod_unknown_field_rejected_k8s_1_35() {
+async fn test_field_validation_default_pod_unknown_field_warns() {
+    // The API server's default since 1.23 (KEP-2885) is Warn: a request
+    // without ?fieldValidation= accepts the object, drops the unknown field
+    // and names it in a Warning header. kubectl asks for Strict explicitly.
     let (_mem, router) = spawn_router();
-    let mut stub = pod_stub("pod-default-strict");
+    let mut stub = pod_stub("pod-default-warn");
     stub["spec"]["bogusField"] = json!("nope");
     let uri = pod_uri();
 
-    let (status, _hdrs, body) = send_json(router, Method::POST, &uri, &stub).await;
+    let (status, headers, body) = send_json(router, Method::POST, &uri, &stub).await;
 
     assert!(
-        status.is_client_error(),
-        "K8s 1.35 default must reject unknown fields without explicit param; \
-         got {}: body={}",
+        status.is_success(),
+        "default (Warn) must accept unknown fields; got {}: body={}",
         status,
         body
     );
-    let message = body["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("strict decoding error"),
-        "default rejection should match strict decoder format: {}",
-        message
+        body["spec"].get("bogusField").is_none(),
+        "unknown field must be dropped from the response body: {}",
+        body["spec"]
+    );
+    let warnings = warning_headers(&headers);
+    assert!(
+        warnings.iter().any(|w| w.contains("bogusField")),
+        "default (Warn) must name the unknown field in a Warning header: {:?}",
+        warnings
     );
 }
 

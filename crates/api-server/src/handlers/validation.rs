@@ -391,15 +391,17 @@ pub enum FieldValidationMode {
 }
 
 impl FieldValidationMode {
-    /// Resolve the mode from the query param map, defaulting to `Strict` when
-    /// the param is absent. Unknown values fall back to `Strict` to match
-    /// upstream's conservative behaviour.
+    /// Resolve the mode from the query param map, defaulting to `Warn` when
+    /// the param is absent (the upstream default since 1.23). Unknown values
+    /// fall back to `Strict`.
     pub fn from_query(params: &HashMap<String, String>) -> Self {
         match params.get("fieldValidation").map(|v| v.as_str()) {
-            Some("Warn") => Self::Warn,
+            Some("Strict") => Self::Strict,
             Some("Ignore") => Self::Ignore,
-            // Strict, missing, or unknown values: default to Strict per
-            // K8s 1.25+ server-side default.
+            // Missing: Warn, the API server's default since 1.23
+            // (KEP-2885; kubectl asks Strict explicitly, client-go asks
+            // nothing). Unknown values: Strict, the conservative reading.
+            None | Some("Warn") => Self::Warn,
             _ => Self::Strict,
         }
     }
@@ -741,9 +743,9 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_validation_default_is_strict() {
-        // K8s 1.25+ default: missing ?fieldValidation= behaves like
-        // ?fieldValidation=Strict, so unknown fields must be rejected.
+    fn test_strict_validation_default_is_warn() {
+        // The API server's default since 1.23 (KEP-2885): a missing
+        // ?fieldValidation= warns about unknown fields and accepts the object.
         #[derive(serde::Serialize, serde::Deserialize)]
         struct Simple {
             name: String,
@@ -755,17 +757,9 @@ mod tests {
         };
         let params = HashMap::new(); // no fieldValidation param
 
-        let result = validate_strict_fields(&params, body, &parsed);
-        assert!(
-            result.is_err(),
-            "default mode must reject unknown fields (K8s 1.25+ default is Strict)"
-        );
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("strict decoding error") && err_msg.contains("unknown field"),
-            "default rejection should match strict decoder format: {}",
-            err_msg
-        );
+        let warnings = validate_strict_fields(&params, body, &parsed)
+            .expect("default mode accepts unknown fields");
+        assert_eq!(warnings, vec!["unknown field \"extra\"".to_string()]);
     }
 
     #[test]
@@ -950,11 +944,11 @@ mod tests {
     }
 
     #[test]
-    fn test_field_validation_mode_from_query_defaults_to_strict() {
+    fn test_field_validation_mode_from_query_defaults_to_warn() {
         let empty = HashMap::new();
         assert_eq!(
             FieldValidationMode::from_query(&empty),
-            FieldValidationMode::Strict
+            FieldValidationMode::Warn
         );
 
         let mut warn = HashMap::new();
