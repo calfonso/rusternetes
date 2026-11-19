@@ -9,10 +9,13 @@ license.workspace = true
 default = []
 sqlite = ["dep:rhino"]
 redis = ["dep:rhino"]
+# Embedded redb store: no rhino, no external process.
+redb = ["dep:tunnr-etcd"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
 rhino = { git = "https://github.com/calfonso/rhino", branch = "main", optional = true }
+tunnr-etcd = { version = "0.2", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

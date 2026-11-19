@@ -28,6 +28,14 @@ redis = [
     "rusternetes-kubelet/redis",
     "rusternetes-kube-proxy/redis",
 ]
+redb = [
+    "rusternetes-storage/redb",
+    "rusternetes-api-server/redb",
+    "rusternetes-scheduler/redb",
+    "rusternetes-controller-manager/redb",
+    "rusternetes-kubelet/redb",
+    "rusternetes-kube-proxy/redb",
+]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }
