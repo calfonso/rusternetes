@@ -121,6 +121,14 @@ impl Kubelet {
         // Register the node
         self.register_node().await?;
 
+        // CSI plugin registration (node-driver-registrar sockets).
+        let csi_watcher = self
+            .runtime
+            .csi()
+            .plugin_watcher()
+            .with_csinode(self.storage.clone(), self.node_name.clone());
+        tokio::spawn(csi_watcher.run(Duration::from_secs(2)));
+
         // Startup cleanup: immediately remove any containers from previous runs
         // that don't correspond to pods in etcd. K8s kubelet does a full
         // reconciliation at startup to ensure no stale containers remain.

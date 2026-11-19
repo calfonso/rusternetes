@@ -3,6 +3,8 @@ mod backend;
 #[allow(dead_code)]
 mod cni;
 mod config;
+#[allow(dead_code, unused_imports)]
+mod csi;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;

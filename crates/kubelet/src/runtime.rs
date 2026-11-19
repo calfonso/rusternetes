@@ -106,6 +106,8 @@ pub struct ContainerRuntime {
     shell_cache: Mutex<HashMap<String, bool>>,
     /// Names of containers this process is currently creating and starting
     starting_containers: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// CSI drivers registered on this node and the node-side volume calls.
+    csi: Arc<crate::csi::CsiManager>,
 }
 
 /// Join a list of strings into a shell-safe command string.
@@ -262,7 +264,19 @@ impl ContainerRuntime {
             image_cache: Mutex::new(std::collections::HashSet::new()),
             shell_cache: Mutex::new(HashMap::new()),
             starting_containers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            csi: Arc::new(crate::csi::CsiManager::from_env()),
         })
+    }
+
+    /// Use this CSI manager instead of the default one.
+    #[allow(dead_code)] // used by the library and tests, not by the binary
+    pub fn with_csi(mut self, csi: Arc<crate::csi::CsiManager>) -> Self {
+        self.csi = csi;
+        self
+    }
+
+    pub fn csi(&self) -> &Arc<crate::csi::CsiManager> {
+        &self.csi
     }
 
     /// Classify a daemon identity string as Podman, Docker, or unknown.
@@ -2664,6 +2678,11 @@ impl ContainerRuntime {
                 .await
                 .with_context(|| format!("PersistentVolume {} not found", pv_name))?;
 
+            if pv.spec.csi.is_some() && pv.spec.host_path.is_none() {
+                let read_only = pvc_source.read_only.unwrap_or(false);
+                return self.mount_pv_csi(pod, &volume.name, &pv, read_only).await;
+            }
+
             // Get the host path from the PV
             let path = if let Some(hp) = &pv.spec.host_path {
                 hp.path.clone()
@@ -2756,19 +2775,9 @@ impl ContainerRuntime {
             return Ok(volume_dir);
         }
 
-        // CSI: ephemeral inline volume (handled by external CSI driver)
-        if let Some(_csi) = &volume.csi {
-            // CSI ephemeral inline volumes are managed by the CSI driver via the kubelet CSI plugin
-            // For conformance, we create a placeholder directory and rely on the CSI driver to populate it
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
-            std::fs::create_dir_all(&volume_dir)
-                .context("Failed to create CSI volume directory")?;
-
-            info!(
-                "Created CSI ephemeral volume {} at {} (managed by CSI driver)",
-                volume.name, volume_dir
-            );
-            return Ok(volume_dir);
+        // CSI: ephemeral inline volume, published by the node's CSI driver
+        if let Some(csi) = &volume.csi {
+            return self.mount_inline_csi(pod, &volume.name, csi).await;
         }
 
         // Ephemeral: generic ephemeral volume with PVC template
@@ -2838,6 +2847,10 @@ impl ContainerRuntime {
                             pv_name
                         )
                     })?;
+
+                    if pv.spec.csi.is_some() && pv.spec.host_path.is_none() {
+                        return self.mount_pv_csi(pod, &volume.name, &pv, false).await;
+                    }
 
                     let path = if let Some(hp) = &pv.spec.host_path {
                         hp.path.clone()
@@ -3194,6 +3207,236 @@ impl ContainerRuntime {
         std::fs::create_dir_all(&volume_dir)
             .context("Failed to create fallback volume directory")?;
         Ok(volume_dir)
+    }
+
+    /// Publish an inline (ephemeral) CSI volume into the pod volume directory.
+    async fn mount_inline_csi(
+        &self,
+        pod: &Pod,
+        volume_name: &str,
+        csi: &rusternetes_common::resources::csi::CSIVolumeSource,
+    ) -> Result<String> {
+        use crate::csi::proto::csi::v1::volume_capability::access_mode::Mode;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let mut volume_context = csi.volume_attributes.clone().unwrap_or_default();
+        if self.csi_pod_info_on_mount(&csi.driver).await {
+            volume_context.extend(Self::csi_pod_info(pod));
+            volume_context.insert(crate::csi::CTX_EPHEMERAL.to_string(), "true".to_string());
+        }
+        let publish_secrets = match csi
+            .node_publish_secret_ref
+            .as_ref()
+            .and_then(|r| r.name.as_deref())
+        {
+            Some(name) => self.csi_secret(namespace, name).await?,
+            None => HashMap::new(),
+        };
+        let req = crate::csi::MountRequest {
+            driver: csi.driver.clone(),
+            volume_handle: crate::csi::ephemeral_volume_handle(&pod.metadata.uid, volume_name),
+            volume_dir: PathBuf::from(format!(
+                "{}/{}/{}",
+                self.volumes_base_path, pod.metadata.name, volume_name
+            )),
+            read_only: csi.read_only.unwrap_or(false),
+            access_type: crate::csi::AccessType::Mount {
+                fs_type: csi.fs_type.clone().unwrap_or_default(),
+                mount_flags: Vec::new(),
+            },
+            access_mode: Mode::SingleNodeWriter,
+            volume_context,
+            publish_context: HashMap::new(),
+            stage_secrets: HashMap::new(),
+            publish_secrets,
+            ephemeral: true,
+        };
+        let path = self.csi.mount_volume(&req).await?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Stage and publish a CSI-backed PersistentVolume for a pod.
+    async fn mount_pv_csi(
+        &self,
+        pod: &Pod,
+        volume_name: &str,
+        pv: &PersistentVolume,
+        claim_read_only: bool,
+    ) -> Result<String> {
+        use crate::csi::proto::csi::v1::volume_capability::access_mode::Mode;
+        use rusternetes_common::resources::volume::{
+            PersistentVolumeAccessMode, PersistentVolumeMode,
+        };
+        let csi = pv
+            .spec
+            .csi
+            .as_ref()
+            .context("PersistentVolume has no CSI source")?;
+        let pv_name = &pv.metadata.name;
+        let volume_handle = csi
+            .volume_handle
+            .clone()
+            .filter(|h| !h.is_empty())
+            .with_context(|| format!("CSI PersistentVolume {} has no volumeHandle", pv_name))?;
+
+        let mut volume_context = csi.volume_attributes.clone().unwrap_or_default();
+        if self.csi_pod_info_on_mount(&csi.driver).await {
+            volume_context.extend(Self::csi_pod_info(pod));
+            volume_context.insert(crate::csi::CTX_EPHEMERAL.to_string(), "false".to_string());
+        }
+        let secret_ref = |r: &Option<rusternetes_common::resources::volume::SecretReference>| {
+            r.as_ref().and_then(|r| {
+                Some((
+                    r.namespace.clone().unwrap_or_else(|| "default".to_string()),
+                    r.name.clone()?,
+                ))
+            })
+        };
+        let stage_ref = secret_ref(&csi.node_stage_secret_ref);
+        let publish_ref = secret_ref(&csi.node_publish_secret_ref);
+        let stage_secrets = match stage_ref {
+            Some((ns, name)) => self.csi_secret(&ns, &name).await?,
+            None => HashMap::new(),
+        };
+        let publish_secrets = match publish_ref {
+            Some((ns, name)) => self.csi_secret(&ns, &name).await?,
+            None => HashMap::new(),
+        };
+
+        // Same as upstream: the first access mode decides.
+        let access_mode = match pv.spec.access_modes.first() {
+            Some(PersistentVolumeAccessMode::ReadOnlyMany) => Mode::MultiNodeReaderOnly,
+            Some(PersistentVolumeAccessMode::ReadWriteMany) => Mode::MultiNodeMultiWriter,
+            _ => Mode::SingleNodeWriter,
+        };
+        let access_type = if pv.spec.volume_mode == Some(PersistentVolumeMode::Block) {
+            crate::csi::AccessType::Block
+        } else {
+            crate::csi::AccessType::Mount {
+                fs_type: csi.fs_type.clone().unwrap_or_default(),
+                mount_flags: pv.spec.mount_options.clone().unwrap_or_default(),
+            }
+        };
+        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
+        let req = crate::csi::MountRequest {
+            driver: csi.driver.clone(),
+            volume_handle,
+            volume_dir: PathBuf::from(format!(
+                "{}/{}/{}",
+                self.volumes_base_path, pod.metadata.name, volume_name
+            )),
+            read_only: claim_read_only || csi.read_only.unwrap_or(false),
+            access_type,
+            access_mode,
+            volume_context,
+            publish_context: self
+                .csi_publish_context(pv_name, node_name.as_deref())
+                .await,
+            stage_secrets,
+            publish_secrets,
+            ephemeral: false,
+        };
+        let path = self.csi.mount_volume(&req).await?;
+        info!(
+            "Using CSI PersistentVolume {} for volume {} at {}",
+            pv_name,
+            volume_name,
+            path.display()
+        );
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// `podInfoOnMount` from the driver's CSIDriver object (false if absent).
+    async fn csi_pod_info_on_mount(&self, driver: &str) -> bool {
+        let Some(storage) = self.storage.as_ref() else {
+            return false;
+        };
+        storage
+            .get::<rusternetes_common::resources::csi::CSIDriver>(&build_key(
+                "csidrivers",
+                None,
+                driver,
+            ))
+            .await
+            .ok()
+            .and_then(|d| d.spec.pod_info_on_mount)
+            .unwrap_or(false)
+    }
+
+    /// Pod info keys the upstream kubelet adds for `podInfoOnMount` drivers.
+    fn csi_pod_info(pod: &Pod) -> HashMap<String, String> {
+        let mut info = HashMap::new();
+        info.insert(
+            "csi.storage.k8s.io/pod.name".to_string(),
+            pod.metadata.name.clone(),
+        );
+        info.insert(
+            "csi.storage.k8s.io/pod.namespace".to_string(),
+            pod.metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        );
+        info.insert(
+            "csi.storage.k8s.io/pod.uid".to_string(),
+            pod.metadata.uid.clone(),
+        );
+        info.insert(
+            "csi.storage.k8s.io/serviceAccount.name".to_string(),
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.service_account_name.clone())
+                .unwrap_or_else(|| "default".to_string()),
+        );
+        info
+    }
+
+    /// A Secret's data as CSI secrets.
+    async fn csi_secret(&self, namespace: &str, name: &str) -> Result<HashMap<String, String>> {
+        let storage = self
+            .storage
+            .as_ref()
+            .context("Storage not available for CSI secrets")?;
+        let secret: Secret = storage
+            .get(&build_key("secrets", Some(namespace), name))
+            .await
+            .with_context(|| format!("CSI secret {}/{} not found", namespace, name))?;
+        let mut out: HashMap<String, String> = secret
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+            .collect();
+        out.extend(secret.string_data.unwrap_or_default());
+        Ok(out)
+    }
+
+    /// Attachment metadata of an attached VolumeAttachment for this PV and
+    /// node, passed to the driver as the publish context. Rusternetes has no
+    /// attach/detach controller yet, so this is usually empty.
+    async fn csi_publish_context(
+        &self,
+        pv_name: &str,
+        node_name: Option<&str>,
+    ) -> HashMap<String, String> {
+        let (Some(storage), Some(node_name)) = (self.storage.as_ref(), node_name) else {
+            return HashMap::new();
+        };
+        let attachments: Vec<rusternetes_common::resources::csi::VolumeAttachment> = storage
+            .list(&rusternetes_storage::build_prefix(
+                "volumeattachments",
+                None,
+            ))
+            .await
+            .unwrap_or_default();
+        attachments
+            .into_iter()
+            .find(|va| {
+                va.spec.node_name == node_name
+                    && va.spec.source.persistent_volume_name.as_deref() == Some(pv_name)
+                    && va.status.as_ref().map(|s| s.attached).unwrap_or(false)
+            })
+            .and_then(|va| va.status.and_then(|s| s.attachment_metadata))
+            .unwrap_or_default()
     }
 
     /// Create ServiceAccount token volume for in-cluster authentication
@@ -5071,7 +5314,17 @@ impl ContainerRuntime {
     pub async fn cleanup_pod_volumes(&self, pod_name: &str) -> Result<()> {
         let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
 
-        if std::path::Path::new(&volume_dir).exists() {
+        // CSI volumes first. If one cannot be unpublished, its mount may
+        // still be live, so keep the directory and retry on the next cleanup.
+        let csi_teardown = self
+            .csi
+            .unmount_pod_volumes(std::path::Path::new(&volume_dir))
+            .await;
+        if let Err(e) = &csi_teardown {
+            warn!("Keeping {} for now: {:#}", volume_dir, e);
+        }
+
+        if csi_teardown.is_ok() && std::path::Path::new(&volume_dir).exists() {
             if let Err(e) = std::fs::remove_dir_all(&volume_dir) {
                 warn!("Failed to remove volume directory {}: {}", volume_dir, e);
             } else {
@@ -11685,5 +11938,226 @@ mod backend_tests {
 
         assert_eq!(removed, 3);
         assert_eq!(backend.names(), vec!["kept_app", "kept_newer"]);
+    }
+}
+
+#[cfg(test)]
+mod csi_volume_tests {
+    use super::ContainerRuntime;
+    use crate::backend::fake::FakeBackend;
+    use crate::csi::fake::{FakeOptions, FakePlugin};
+    use crate::csi::CsiManager;
+    use rusternetes_common::resources::Pod;
+    use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct Env {
+        _root: tempfile::TempDir,
+        volumes: tempfile::TempDir,
+        runtime: ContainerRuntime,
+        storage: Arc<StorageBackend>,
+        plugin: FakePlugin,
+    }
+
+    async fn env() -> Env {
+        let root = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let storage = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+        let csi = Arc::new(CsiManager::new(root.path()));
+        let plugin = FakePlugin::start(
+            &csi.plugins_registry_dir(),
+            &root.path().join("plugins/fake"),
+            FakeOptions::default(),
+        )
+        .await;
+        csi.plugin_watcher().scan().await;
+        plugin.clear();
+        let runtime = ContainerRuntime::with_backend(
+            Arc::new(FakeBackend::new("fake")),
+            volumes.path().to_string_lossy().into_owned(),
+            "10.96.0.10".to_string(),
+            "cluster.local".to_string(),
+            "rusternetes".to_string(),
+            "10.96.0.1".to_string(),
+            false,
+        )
+        .await
+        .unwrap()
+        .with_storage(storage.clone())
+        .with_csi(csi);
+        Env {
+            _root: root,
+            volumes,
+            runtime,
+            storage,
+            plugin,
+        }
+    }
+
+    async fn put(storage: &StorageBackend, key: &str, value: serde_json::Value) {
+        storage.create(key, &value).await.unwrap();
+    }
+
+    fn pod(volume: serde_json::Value) -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "ns", "uid": "uid-1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "busybox"}],
+                "volumes": [volume]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn ops(plugin: &FakePlugin) -> Vec<String> {
+        plugin
+            .calls()
+            .iter()
+            .map(|c| c.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn csi_pv_is_staged_and_published_and_torn_down() {
+        let e = env().await;
+        put(
+            &e.storage,
+            &build_key("secrets", Some("ns"), "stage-secret"),
+            json!({"apiVersion": "v1", "kind": "Secret",
+                   "metadata": {"name": "stage-secret", "namespace": "ns"},
+                   "stringData": {"password": "hunter2"}}),
+        )
+        .await;
+        put(
+            &e.storage,
+            &build_key("persistentvolumes", None, "pv-1"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "pv-1"},
+                   "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                            "mountOptions": ["noatime"],
+                            "csi": {"driver": "fake.csi.rusternetes.io", "volumeHandle": "h-1",
+                                    "fsType": "xfs", "volumeAttributes": {"a": "b"},
+                                    "nodeStageSecretRef": {"name": "stage-secret", "namespace": "ns"}}}}),
+        )
+        .await;
+        put(
+            &e.storage,
+            &build_key("persistentvolumeclaims", Some("ns"), "claim"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": "claim", "namespace": "ns"},
+                   "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": "pv-1",
+                            "resources": {"requests": {"storage": "1Gi"}}}}),
+        )
+        .await;
+        let pod = pod(json!({"name": "data", "persistentVolumeClaim": {"claimName": "claim"}}));
+
+        let paths = e.runtime.create_pod_volumes(&pod).await.unwrap();
+        let target = e.volumes.path().join("web/data/mount");
+        assert_eq!(paths["data"], target.to_string_lossy());
+        assert_eq!(ops(&e.plugin), vec!["NodeStageVolume", "NodePublishVolume"]);
+        e.plugin.recorded(|r| {
+            assert_eq!(r.stage[0].volume_id, "h-1");
+            assert_eq!(r.stage[0].secrets["password"], "hunter2");
+            assert_eq!(r.publish[0].volume_context["a"], "b");
+            assert!(!r.publish[0].readonly);
+        });
+
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert_eq!(
+            ops(&e.plugin),
+            vec![
+                "NodeStageVolume",
+                "NodePublishVolume",
+                "NodeUnpublishVolume",
+                "NodeUnstageVolume"
+            ]
+        );
+        assert!(!e.volumes.path().join("web").exists());
+    }
+
+    #[tokio::test]
+    async fn inline_csi_volume_is_published_with_pod_info() {
+        let e = env().await;
+        put(
+            &e.storage,
+            &build_key("csidrivers", None, "fake.csi.rusternetes.io"),
+            json!({"apiVersion": "storage.k8s.io/v1", "kind": "CSIDriver",
+                   "metadata": {"name": "fake.csi.rusternetes.io"},
+                   "spec": {"podInfoOnMount": true}}),
+        )
+        .await;
+        let pod = pod(json!({"name": "eph", "csi": {
+            "driver": "fake.csi.rusternetes.io", "readOnly": true,
+            "volumeAttributes": {"size": "1Mi"}}}));
+
+        let paths = e.runtime.create_pod_volumes(&pod).await.unwrap();
+        assert!(paths["eph"].ends_with("/web/eph/mount"));
+        assert_eq!(ops(&e.plugin), vec!["NodePublishVolume"]);
+        e.plugin.recorded(|r| {
+            let p = &r.publish[0];
+            assert_eq!(
+                p.volume_id,
+                crate::csi::ephemeral_volume_handle("uid-1", "eph")
+            );
+            assert!(p.readonly);
+            assert_eq!(p.volume_context["size"], "1Mi");
+            assert_eq!(p.volume_context["csi.storage.k8s.io/ephemeral"], "true");
+            assert_eq!(p.volume_context["csi.storage.k8s.io/pod.name"], "web");
+            assert_eq!(p.volume_context["csi.storage.k8s.io/pod.uid"], "uid-1");
+        });
+
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert_eq!(
+            ops(&e.plugin),
+            vec!["NodePublishVolume", "NodeUnpublishVolume"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_unpublish_keeps_the_pod_volume_dir() {
+        let e = env().await;
+        let pod = pod(json!({"name": "eph", "csi": {"driver": "fake.csi.rusternetes.io"}}));
+        e.runtime.create_pod_volumes(&pod).await.unwrap();
+        e.plugin
+            .set_fail("NodeUnpublishVolume", Some(tonic::Code::Unavailable));
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert!(e.volumes.path().join("web/eph/vol_data.json").exists());
+
+        e.plugin.set_fail("NodeUnpublishVolume", None);
+        e.runtime.cleanup_pod_volumes("web").await.unwrap();
+        assert!(!e.volumes.path().join("web").exists());
+    }
+
+    #[tokio::test]
+    async fn hostpath_pv_is_unchanged() {
+        let e = env().await;
+        let host = e.volumes.path().join("host-data");
+        put(
+            &e.storage,
+            &build_key("persistentvolumes", None, "pv-h"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "pv-h"},
+                   "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                            "hostPath": {"path": host.to_string_lossy()}}}),
+        )
+        .await;
+        put(
+            &e.storage,
+            &build_key("persistentvolumeclaims", Some("ns"), "claim"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": "claim", "namespace": "ns"},
+                   "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": "pv-h",
+                            "resources": {"requests": {"storage": "1Gi"}}}}),
+        )
+        .await;
+        let pod = pod(json!({"name": "data", "persistentVolumeClaim": {"claimName": "claim"}}));
+        let paths = e.runtime.create_pod_volumes(&pod).await.unwrap();
+        assert_eq!(paths["data"], host.to_string_lossy());
+        assert!(host.is_dir());
+        assert!(e.plugin.calls().is_empty());
     }
 }
