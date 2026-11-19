@@ -6,6 +6,8 @@ mod config;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;
+#[allow(dead_code)]
+mod netns;
 mod runtime;
 
 use anyhow::Result;

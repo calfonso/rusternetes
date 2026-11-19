@@ -5,6 +5,7 @@ pub mod config;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
+pub mod netns;
 pub mod runtime;
 
 pub use kubelet::PodWorkerState;
