@@ -117,6 +117,12 @@ struct Args {
     /// Set this flag outside Compose so pods resolve cluster Service names.
     #[arg(long, default_value = "false")]
     pod_prefer_cluster_dns: bool,
+
+    /// With `--storage-backend redb`: also serve the embedded store as etcd v3
+    /// on this address, so kubelets on other nodes can use it
+    /// (`--storage-backend etcd --etcd-servers http://<this>`). Plaintext.
+    #[arg(long)]
+    serve_etcd: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -188,6 +194,32 @@ async fn run() -> Result<()> {
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
 
     info!("Storage initialized, starting components...");
+
+    // --- The embedded store, served to other nodes as etcd v3 ---
+    if let Some(addr) = args.serve_etcd.clone() {
+        #[cfg(feature = "redb")]
+        {
+            let StorageBackend::Redb(redb) = storage.as_ref() else {
+                anyhow::bail!("--serve-etcd needs --storage-backend redb");
+            };
+            let store = redb.store().clone();
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            info!("Serving the embedded store as etcd v3 on {}", addr);
+            let opts = tunnr_etcd::server::ServeOptions {
+                client_url: format!("http://{}", addr),
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                if let Err(e) =
+                    tunnr_etcd::server::serve(store, listener, opts, std::future::pending()).await
+                {
+                    error!("etcd server error: {}", e);
+                }
+            });
+        }
+        #[cfg(not(feature = "redb"))]
+        anyhow::bail!("--serve-etcd {} needs the redb feature", addr);
+    }
 
     // --- API Server ---
     let api_storage = storage.clone();
