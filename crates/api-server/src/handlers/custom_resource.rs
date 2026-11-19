@@ -354,6 +354,7 @@ pub async fn list_custom_resources(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((group, version, plural, namespace)): Path<(String, String, String, Option<String>)>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<List<CustomResource>>> {
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
 
@@ -391,8 +392,19 @@ pub async fn list_custom_resources(
     for cr in &mut crs {
         apply_schema_defaults(&crd, &version, cr);
     }
+    // labelSelector / fieldSelector (metadata.name, metadata.namespace, …),
+    // as for the built-in kinds: an informer on one object (e.g. a node's own
+    // CiliumNode, `fieldSelector=metadata.name=<node>`) must see only it.
+    crate::handlers::filtering::apply_selectors(&mut crs, &params)?;
 
-    let list = List::new("List", "v1", crs);
+    // A custom resource list is `<Kind>List` in the CRD's group/version, as the
+    // upstream apiextensions-apiserver serves it; typed clients (client-go
+    // generated clientsets) refuse a bare `v1 List`.
+    let list = List::new(
+        format!("{}List", crd.spec.names.kind),
+        format!("{}/{}", group, version),
+        crs,
+    );
     Ok(Json(list))
 }
 

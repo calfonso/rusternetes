@@ -358,8 +358,15 @@ pub async fn normalize_content_type_middleware(
     // sends "Accept: application/vnd.kubernetes.protobuf, application/json"
     // and falls back to JSON when protobuf is unavailable.
     let wants_protobuf = false;
+    // `Accept: application/json;as=PartialObjectMetadata[List];g=meta.k8s.io;v=v1`
+    // — the metadata-only view client-go's metadata informers ask for.
+    let wants_partial = accept_header.contains("as=PartialObjectMetadata");
 
     let response = next.run(request).await;
+
+    if wants_partial {
+        return Ok(partial_object_metadata_response(response, _is_watch_request).await);
+    }
 
     // Wrap response in protobuf if:
     // 1. The Accept header requests protobuf
@@ -397,6 +404,89 @@ pub async fn normalize_content_type_middleware(
     }
 
     Ok(response)
+}
+
+/// One object as `meta.k8s.io/v1` `PartialObjectMetadata` (its metadata only),
+/// a list as `PartialObjectMetadataList`. A `Status` (an error) is left as it is.
+fn to_partial_object_metadata(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::{json, Value};
+    if v.get("kind").and_then(Value::as_str) == Some("Status") {
+        return v;
+    }
+    if let Some(items) = v.get("items").and_then(Value::as_array) {
+        let items: Vec<Value> = items
+            .iter()
+            .map(|i| json!({"kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1", "metadata": i.get("metadata").cloned().unwrap_or(json!({}))}))
+            .collect();
+        return json!({
+            "kind": "PartialObjectMetadataList",
+            "apiVersion": "meta.k8s.io/v1",
+            "metadata": v.get("metadata").cloned().unwrap_or(json!({})),
+            "items": items,
+        });
+    }
+    json!({"kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1", "metadata": v.get("metadata").cloned().unwrap_or(json!({}))})
+}
+
+/// A watch event line `{"type":…,"object":{…}}` with its object as
+/// `PartialObjectMetadata`; a line that is not an event passes unchanged.
+fn partial_watch_line(line: &[u8]) -> Vec<u8> {
+    let Ok(mut ev) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return line.to_vec();
+    };
+    if let Some(obj) = ev.get_mut("object") {
+        let o = std::mem::take(obj);
+        *obj = to_partial_object_metadata(o);
+    }
+    let mut out = serde_json::to_vec(&ev).unwrap_or_else(|_| line.to_vec());
+    out.push(b'\n');
+    out
+}
+
+/// The handler's JSON response re-shaped for a client that asked for
+/// `as=PartialObjectMetadata` (a list, an object, or a watch stream, event by
+/// event). Non-JSON and error responses pass unchanged.
+async fn partial_object_metadata_response(response: Response, is_watch: bool) -> Response {
+    use futures::StreamExt;
+    let ct = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !response.status().is_success() || !(ct.starts_with("application/json") || is_watch) {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    if is_watch {
+        let mut buf: Vec<u8> = Vec::new();
+        let stream = body.into_data_stream().map(move |chunk| {
+            let chunk = chunk?;
+            buf.extend_from_slice(&chunk);
+            let mut out = Vec::new();
+            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                out.extend_from_slice(&partial_watch_line(&line[..line.len() - 1]));
+            }
+            Ok::<_, axum::Error>(bytes::Bytes::from(out))
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+    match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
+            Ok(v) => {
+                let out = serde_json::to_vec(&to_partial_object_metadata(v))
+                    .unwrap_or_else(|_| b.to_vec());
+                Response::from_parts(parts, Body::from(out))
+            }
+            Err(_) => Response::from_parts(parts, Body::from(b)),
+        },
+        Err(_) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .unwrap(),
+    }
 }
 
 /// Extract apiVersion and kind from JSON bytes without full parsing.
@@ -1711,6 +1801,29 @@ mod tests {
             json,
             "extracted JSON must match original"
         );
+    }
+
+    #[test]
+    fn partial_object_metadata_shapes_objects_lists_and_watch_events() {
+        let obj = serde_json::json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": {"name": "a.b", "resourceVersion": "7"}, "spec": {"group": "b"}});
+        let p = to_partial_object_metadata(obj.clone());
+        assert_eq!(p["kind"], "PartialObjectMetadata");
+        assert_eq!(p["apiVersion"], "meta.k8s.io/v1");
+        assert_eq!(p["metadata"]["name"], "a.b");
+        assert!(p.get("spec").is_none());
+        let list = serde_json::json!({"kind": "CustomResourceDefinitionList", "apiVersion": "apiextensions.k8s.io/v1",
+            "metadata": {"resourceVersion": "9"}, "items": [obj]});
+        let pl = to_partial_object_metadata(list);
+        assert_eq!(pl["kind"], "PartialObjectMetadataList");
+        assert_eq!(pl["metadata"]["resourceVersion"], "9");
+        assert_eq!(pl["items"][0]["kind"], "PartialObjectMetadata");
+        let status = serde_json::json!({"kind": "Status", "status": "Failure"});
+        assert_eq!(to_partial_object_metadata(status.clone()), status);
+        let line = br#"{"type":"ADDED","object":{"kind":"CustomResourceDefinition","metadata":{"name":"a.b"},"spec":{}}}"#;
+        let ev: serde_json::Value = serde_json::from_slice(&partial_watch_line(line)).unwrap();
+        assert_eq!(ev["type"], "ADDED");
+        assert_eq!(ev["object"]["kind"], "PartialObjectMetadata");
     }
 
     #[test]

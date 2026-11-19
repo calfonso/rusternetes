@@ -188,7 +188,7 @@ where
     let field_selector = params.field_selector.clone();
     let requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        bookmark_kind_and_version(&state, resource_type, api_group).await;
 
     // Determine if we have a specific non-zero resourceVersion to replay from.
     // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
@@ -680,7 +680,7 @@ where
     let field_selector = params.field_selector.clone();
     let requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        bookmark_kind_and_version(&state, resource_type, api_group).await;
 
     // Determine if we have a specific non-zero resourceVersion to replay from.
     // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
@@ -1309,6 +1309,48 @@ pub fn extract_rv_from_json(json: &str) -> Option<String> {
                 .and_then(|rv| rv.as_str())
                 .map(|s| s.to_string())
         })
+}
+
+/// The kind and apiVersion a watch's BOOKMARK objects carry. A custom
+/// resource (storage type `<group with _>_<plural>`) takes them from its CRD
+/// (`names.kind`, the storage version): typed clients decode the bookmark
+/// by kind, and the heuristic below spells `cilium_io_ciliumnodes` as
+/// `Cilium_io_ciliumnode` in `cilium.io/v1`, which no scheme knows.
+pub(crate) async fn bookmark_kind_and_version(
+    state: &Arc<ApiServerState>,
+    resource_type: &str,
+    api_group: &str,
+) -> (String, String) {
+    if !api_group.is_empty() {
+        if let Some(plural) =
+            resource_type.strip_prefix(&format!("{}_", api_group.replace('.', "_")))
+        {
+            let key = rusternetes_storage::build_key(
+                "customresourcedefinitions",
+                None,
+                &format!("{plural}.{api_group}"),
+            );
+            if let Ok(crd) = state
+                .storage
+                .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
+                .await
+            {
+                let version = crd
+                    .spec
+                    .versions
+                    .iter()
+                    .find(|v| v.storage)
+                    .or(crd.spec.versions.first())
+                    .map(|v| v.name.clone())
+                    .unwrap_or_else(|| "v1".to_string());
+                return (
+                    crd.spec.names.kind.clone(),
+                    format!("{api_group}/{version}"),
+                );
+            }
+        }
+    }
+    resource_type_to_kind_and_version(resource_type, api_group)
 }
 
 /// Derive the Kind and apiVersion from resource_type and api_group
@@ -2317,7 +2359,7 @@ pub async fn watch_cluster_scoped_json(
         params.timeout_seconds.unwrap_or(300).min(300),
     ));
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        bookmark_kind_and_version(&state, resource_type, api_group).await;
 
     let should_send_initial =
         send_initial_events || requested_rv.as_deref() == Some("0") || requested_rv.is_none();
@@ -2501,7 +2543,7 @@ pub async fn watch_namespaced_json(
     ));
     let _requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        bookmark_kind_and_version(&state, resource_type, api_group).await;
 
     // Always send initial events for namespaced JSON watches.
     // When the client watches with a specific resourceVersion (from a CREATE),
