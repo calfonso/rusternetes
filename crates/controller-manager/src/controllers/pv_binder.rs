@@ -190,6 +190,15 @@ impl<S: Storage + 'static> PVBinderController<S> {
 
         debug!("Found {} PVs to check for binding", pvs.len());
 
+        // A dynamically provisioned PV encodes its claim in the name
+        // (`pvc-<namespace>-<claim>`); such a volume may only ever be bound to
+        // that claim. Sorting alone was not enough: when a claim's own PV is
+        // missing, it happily took a freshly provisioned volume of another
+        // workload - mounting someone else's data.
+        pvs.retain(|pv| {
+            !pv.metadata.name.starts_with("pvc-") || pv.metadata.name == expected
+        });
+
         // Find a matching available PV
         for mut pv in pvs {
             debug!("Checking PV {} (storage_class={:?}, capacity={:?}, access_modes={:?}, claim_ref={:?})",
