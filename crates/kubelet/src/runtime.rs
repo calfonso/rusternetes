@@ -1053,7 +1053,7 @@ impl ContainerRuntime {
         // concurrent stop/restart can leave the sandbox in `created`, and Docker
         // then rejects every app container with
         //   "cannot join network namespace of a non running container".
-        if !self.use_cni && pod_ip.is_some() {
+        if !self.use_cni {
             self.ensure_pause_running(pod_name, pod).await?;
         }
 
@@ -1479,22 +1479,26 @@ impl ContainerRuntime {
             ..Default::default()
         };
 
-        // Create pause container, handling 409 Conflict by removing and retrying
-        match self
-            .backend
-            .create_container(&pause_name, config.clone())
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                let err_str = format!("{}", e);
-                if err_str.contains("409")
-                    || err_str.contains("Conflict")
-                    || err_str.contains("already in use")
-                {
+        // Create the pause container. The name can still be taken by a sandbox
+        // from a previous attempt (and another cleanup path may remove it while
+        // we are cleaning up, hence the 404 on removal). Retry a few times
+        // instead of failing the whole pod on the first conflict.
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match self
+                .backend
+                .create_container(&pause_name, config.clone())
+                .await
+            {
+                Ok(_) => break,
+                Err(e) => {
+                    if attempt >= 5 {
+                        return Err(e).context("Failed to create pause container");
+                    }
                     warn!(
-                        "Pause container {} already exists, removing and retrying",
-                        pause_name
+                        "Pause container {} could not be created (attempt {}): {}",
+                        pause_name, attempt, e
                     );
                     // Remove dependent containers first (required for Podman which
                     // refuses to remove a container that has dependents).
@@ -1531,35 +1535,29 @@ impl ContainerRuntime {
                             }
                         }
                     }
-                    // Force stop the pause container, then remove.
                     let _ = self
                         .backend
                         .stop_container(&pause_name, StopContainerOptions { t: 0 })
                         .await;
-                    match self
+                    // A container that is already gone (404) is the desired
+                    // state, so removal errors are not fatal here.
+                    if let Err(rm_err) = self
                         .backend
                         .remove_container(&pause_name, RemoveContainerOptions { force: true })
                         .await
                     {
-                        Ok(_) => {
-                            // Wait briefly for the runtime to release the container name
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(rm_err) => {
+                        let text = format!("{}", rm_err);
+                        if !text.contains("404") && !text.contains("No such container") {
                             warn!(
                                 "Failed to remove pause container {}: {}",
                                 pause_name, rm_err
                             );
-                            // Try waiting longer — runtime may still be processing
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                     }
-                    self.backend
-                        .create_container(&pause_name, config.clone())
-                        .await
-                        .context("Failed to create pause container after cleanup")?;
-                } else {
-                    return Err(e).context("Failed to create pause container");
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * u64::from(attempt),
+                    ))
+                    .await;
                 }
             }
         }

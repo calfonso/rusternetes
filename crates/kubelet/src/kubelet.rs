@@ -603,23 +603,22 @@ impl Kubelet {
 
         // Ensure capacity, allocatable, and nodeInfo are always set
         if let Some(ref mut status) = node.status {
+            // Always reflect the current host: a node object registered by an
+            // older kubelet kept its 4 CPU / 8Gi forever, and the scheduler then
+            // refused every pod beyond that budget on an idle machine.
             let (capacity_cpu, capacity_memory) = detect_node_capacity();
-            if status.capacity.as_ref().is_none_or(|c| c.is_empty()) {
-                status.capacity = Some(HashMap::from([
-                    ("cpu".to_string(), capacity_cpu.clone()),
-                    ("memory".to_string(), capacity_memory.clone()),
-                    ("pods".to_string(), "110".to_string()),
-                    ("ephemeral-storage".to_string(), "100Gi".to_string()),
-                ]));
-            }
-            if status.allocatable.as_ref().is_none_or(|a| a.is_empty()) {
-                status.allocatable = Some(HashMap::from([
-                    ("cpu".to_string(), capacity_cpu),
-                    ("memory".to_string(), capacity_memory),
-                    ("pods".to_string(), "110".to_string()),
-                    ("ephemeral-storage".to_string(), "100Gi".to_string()),
-                ]));
-            }
+            status.capacity = Some(HashMap::from([
+                ("cpu".to_string(), capacity_cpu.clone()),
+                ("memory".to_string(), capacity_memory.clone()),
+                ("pods".to_string(), "110".to_string()),
+                ("ephemeral-storage".to_string(), "100Gi".to_string()),
+            ]));
+            status.allocatable = Some(HashMap::from([
+                ("cpu".to_string(), capacity_cpu),
+                ("memory".to_string(), capacity_memory),
+                ("pods".to_string(), "110".to_string()),
+                ("ephemeral-storage".to_string(), "100Gi".to_string()),
+            ]));
             // Ensure nodeInfo is populated (may have been lost during updates)
             if status
                 .node_info
