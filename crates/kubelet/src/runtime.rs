@@ -1493,7 +1493,7 @@ impl ContainerRuntime {
             {
                 Ok(_) => break,
                 Err(e) => {
-                    if attempt >= 5 {
+                    if attempt >= 10 {
                         return Err(e).context("Failed to create pause container");
                     }
                     warn!(
@@ -1553,6 +1553,17 @@ impl ContainerRuntime {
                                 pause_name, rm_err
                             );
                         }
+                    }
+                    // The container garbage collector removes sandboxes that
+                    // have no app containers yet, so the removal above can race
+                    // it ("removal of container ... is already in progress") and
+                    // the name stays taken for a moment. Wait until the name is
+                    // really free before creating it again.
+                    for _ in 0..20 {
+                        if self.backend.inspect_container(&pause_name).await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(
                         200 * u64::from(attempt),
