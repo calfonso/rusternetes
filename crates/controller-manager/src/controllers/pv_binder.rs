@@ -169,8 +169,24 @@ impl<S: Storage + 'static> PVBinderController<S> {
             pvc_spec.access_modes
         );
 
-        // Get all available PVs
-        let pvs: Vec<PersistentVolume> = self.storage.list("/registry/persistentvolumes/").await?;
+        // Get all available PVs.
+        //
+        // The dynamic provisioner names a PV after its claim
+        // (`pvc-<namespace>-<claim>`). Binding simply picked the *first* PV whose
+        // class/capacity/access modes matched, so with several identical volumes
+        // a claim could be attached to another workload's volume — silently
+        // mounting the wrong data directory. Prefer the PV that belongs to this
+        // claim and only fall back to any matching volume when none exists.
+        let mut pvs: Vec<PersistentVolume> =
+            self.storage.list("/registry/persistentvolumes/").await?;
+        let expected = format!("pvc-{}-{}", namespace, pvc_name);
+        pvs.sort_by_key(|pv| {
+            if pv.metadata.name == expected || pv.metadata.name.ends_with(pvc_name) {
+                0
+            } else {
+                1
+            }
+        });
 
         debug!("Found {} PVs to check for binding", pvs.len());
 
