@@ -1,0 +1,61 @@
+name: Binary
+
+# Builds the all-in-one `rusternetes` binary and publishes it as a GitHub
+# release asset, so a node installs a versioned download instead of compiling
+# (or receiving a hand-built file) on the host.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (for example v0.1.0-elizon.1)"
+        required: true
+        default: "v0.1.0-elizon.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p rusternetes
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/rusternetes dist/rusternetes-x86_64-linux
+          strip dist/rusternetes-x86_64-linux || true
+          (cd dist && sha256sum rusternetes-x86_64-linux > rusternetes-x86_64-linux.sha256)
+          ./dist/rusternetes-x86_64-linux --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rusternetes-x86_64-linux
+          path: dist/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --notes "rusternetes binary $TAG"
+          gh release upload "$TAG" dist/* --clobber
