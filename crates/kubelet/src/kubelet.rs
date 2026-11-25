@@ -78,6 +78,56 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
     serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
 }
 
+/// Node capacity as reported by this host.
+///
+/// The kubelet used to advertise a hardcoded `4` CPU / `8Gi`, so on a larger
+/// machine every pod beyond that budget stayed `Pending` while the host was
+/// mostly idle (and it silently reverted a manually corrected node status on the
+/// next restart). Read the real values, allow an explicit override for hosts
+/// whose cgroup view is narrower than the machine, and only fall back to the old
+/// defaults when nothing can be detected.
+fn detect_node_capacity() -> (String, String) {
+    fn env_or(name: &str, fallback: impl FnOnce() -> String) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(fallback)
+    }
+
+    let cpu = env_or("RUSTERNETES_NODE_CPU", || {
+        std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4)
+            .to_string()
+    });
+
+    let memory = env_or("RUSTERNETES_NODE_MEMORY", || {
+        let total_kib = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|content| {
+                content.lines().find_map(|line| {
+                    let rest = line.strip_prefix("MemTotal:")?;
+                    let kib = rest
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()?;
+                    Some(kib)
+                })
+            })
+            .unwrap_or(0);
+        if total_kib == 0 {
+            "8Gi".to_string()
+        } else {
+            // /proc/meminfo is in KiB; report whole GiB as Kubernetes does.
+            let gib = total_kib / (1024 * 1024);
+            format!("{}Gi", gib.max(1))
+        }
+    });
+
+    (cpu, memory)
+}
+
 impl Kubelet {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -402,16 +452,17 @@ impl Kubelet {
         });
 
         // Set node status
+        let (capacity_cpu, capacity_memory) = detect_node_capacity();
         node.status = Some(NodeStatus {
             capacity: Some(HashMap::from([
-                ("cpu".to_string(), "4".to_string()),
-                ("memory".to_string(), "8Gi".to_string()),
+                ("cpu".to_string(), capacity_cpu.clone()),
+                ("memory".to_string(), capacity_memory.clone()),
                 ("pods".to_string(), "110".to_string()),
                 ("ephemeral-storage".to_string(), "100Gi".to_string()),
             ])),
             allocatable: Some(HashMap::from([
-                ("cpu".to_string(), "4".to_string()),
-                ("memory".to_string(), "8Gi".to_string()),
+                ("cpu".to_string(), capacity_cpu.clone()),
+                ("memory".to_string(), capacity_memory.clone()),
                 ("pods".to_string(), "110".to_string()),
                 ("ephemeral-storage".to_string(), "100Gi".to_string()),
             ])),
@@ -552,18 +603,19 @@ impl Kubelet {
 
         // Ensure capacity, allocatable, and nodeInfo are always set
         if let Some(ref mut status) = node.status {
+            let (capacity_cpu, capacity_memory) = detect_node_capacity();
             if status.capacity.as_ref().is_none_or(|c| c.is_empty()) {
                 status.capacity = Some(HashMap::from([
-                    ("cpu".to_string(), "4".to_string()),
-                    ("memory".to_string(), "8Gi".to_string()),
+                    ("cpu".to_string(), capacity_cpu.clone()),
+                    ("memory".to_string(), capacity_memory.clone()),
                     ("pods".to_string(), "110".to_string()),
                     ("ephemeral-storage".to_string(), "100Gi".to_string()),
                 ]));
             }
             if status.allocatable.as_ref().is_none_or(|a| a.is_empty()) {
                 status.allocatable = Some(HashMap::from([
-                    ("cpu".to_string(), "4".to_string()),
-                    ("memory".to_string(), "8Gi".to_string()),
+                    ("cpu".to_string(), capacity_cpu),
+                    ("memory".to_string(), capacity_memory),
                     ("pods".to_string(), "110".to_string()),
                     ("ephemeral-storage".to_string(), "100Gi".to_string()),
                 ]));
