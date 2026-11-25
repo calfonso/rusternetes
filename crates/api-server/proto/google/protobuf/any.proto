@@ -1,0 +1,19 @@
+// Vendored copy of protobuf's well-known type so `protoc` resolves
+// `import "google/protobuf/any.proto"` without relying on the system include
+// path (which differs between distributions and CI images).
+syntax = "proto3";
+
+package google.protobuf;
+
+option csharp_namespace = "Google.Protobuf.WellKnownTypes";
+option go_package = "google.golang.org/protobuf/types/known/anypb";
+option java_package = "com.google.protobuf";
+option java_outer_classname = "AnyProto";
+option java_multiple_files = true;
+option objc_class_prefix = "GPB";
+option cc_enable_arenas = true;
+
+message Any {
+  string type_url = 1;
+  bytes value = 2;
+}
