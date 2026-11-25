@@ -812,9 +812,28 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             node_name
         );
 
-        // Update pod spec with node name
-        if let Some(ref mut spec) = pod.spec {
-            spec.node_name = Some(node_name.to_string());
+        // Update pod spec with node name.
+        //
+        // A Pod object handed to the scheduler without its `spec` silently
+        // skipped this assignment, and `storage.update` still succeeded — the
+        // scheduler logged "Successfully bound pod", yet the stored Pod kept
+        // `spec.nodeName = null` and the kubelet (correctly) ignored it.
+        let pod_key = rusternetes_storage::build_key(
+            "pods",
+            pod.metadata.namespace.as_deref(),
+            &pod.metadata.name,
+        );
+        if pod.spec.is_none() {
+            let stored: Pod = self.storage.get(&pod_key).await?;
+            pod.spec = stored.spec;
+        }
+        match pod.spec.as_mut() {
+            Some(spec) => spec.node_name = Some(node_name.to_string()),
+            None => {
+                return Err(rusternetes_common::Error::Internal(
+                    "pod has no spec; cannot bind it to a node".to_string(),
+                ))
+            }
         }
 
         // Update pod status with PodScheduled condition
@@ -863,11 +882,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Update pod in storage with retry on conflict
-        let key = rusternetes_storage::build_key(
-            "pods",
-            pod.metadata.namespace.as_deref(),
-            &pod.metadata.name,
-        );
+        let key = pod_key;
 
         match self.storage.update(&key, &pod).await {
             Ok(_) => {
