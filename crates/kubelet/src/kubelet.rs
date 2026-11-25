@@ -803,15 +803,34 @@ impl Kubelet {
         // K8s ref: pkg/kubelet/pod_workers.go — podWorkerLoop (long-lived)
         for pod in &node_pods {
             let pod_name = &pod.metadata.name;
+            let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
             // Signal existing worker or create a new one
             let has_worker = {
-                let workers = self.pod_workers.lock().unwrap();
-                if let Some(tx) = workers.get(pod_name.as_str()) {
-                    let _ = tx.try_send(());
-                    true
-                } else {
-                    false
+                let mut workers = self.pod_workers.lock().unwrap();
+                match workers.get(pod_name.as_str()) {
+                    // A closed channel means the worker task is gone (panic or
+                    // shutdown). Keeping the dead sender made `has_worker` true
+                    // forever, so the pod was never signalled again and stayed
+                    // Pending without a single log line.
+                    Some(tx) if tx.is_closed() => {
+                        warn!(
+                            "Pod worker for {}/{} is gone, starting a new one",
+                            namespace, pod_name
+                        );
+                        workers.remove(pod_name.as_str());
+                        false
+                    }
+                    Some(tx) => {
+                        if tx.try_send(()).is_err() {
+                            debug!(
+                                "Pod worker for {}/{} is busy, coalescing signal",
+                                namespace, pod_name
+                            );
+                        }
+                        true
+                    }
+                    None => false,
                 }
             };
 
@@ -1294,8 +1313,10 @@ impl Kubelet {
         {
             let mut locks = self.pod_sync_locks.lock().unwrap();
             if locks.contains(pod_uid) {
-                debug!(
-                    "Skipping sync for pod {}/{} — already syncing",
+                // Visible at info level: a stuck sync is exactly the state where
+                // a pod looks Pending forever and nothing is logged.
+                info!(
+                    "Skipping sync for pod {}/{} — a previous sync is still running",
                     namespace, pod_name
                 );
                 return Ok(());
@@ -1360,6 +1381,35 @@ impl Kubelet {
             .and_then(|s| s.restart_policy.as_deref())
             .unwrap_or("Always");
         let terminal_and_done = is_terminal_phase && restart_policy != "Always";
+        // A pod that is still present, not being deleted and not terminal must
+        // be running. If a previous incarnation left the worker state at
+        // Terminating/Terminated (e.g. after a failed stop), the pod would never
+        // be started again.
+        let stale_terminal_state = matches!(
+            current_state,
+            PodWorkerState::TerminatingPod | PodWorkerState::TerminatedPod
+        ) && pod.metadata.deletion_timestamp.is_none()
+            && !terminal_and_done;
+        if stale_terminal_state {
+            warn!(
+                "Pod {}/{} has stale worker state, resetting to SyncPod",
+                namespace, pod_name
+            );
+            self.pod_states
+                .lock()
+                .unwrap()
+                .insert(pod_uid.clone(), PodWorkerState::SyncPod);
+        }
+
+        let current_state = {
+            self.pod_states
+                .lock()
+                .unwrap()
+                .get(pod_uid)
+                .cloned()
+                .unwrap_or(PodWorkerState::SyncPod)
+        };
+
         let needs_terminating = (pod.metadata.deletion_timestamp.is_some() || terminal_and_done)
             && matches!(current_state, PodWorkerState::SyncPod);
 
