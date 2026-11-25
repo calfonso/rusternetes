@@ -7833,23 +7833,31 @@ impl ContainerRuntime {
                         removed += 1;
                     }
                 }
-                // Remove orphaned pause container
-                let pause_name = format!("{}_pause", pod_name);
-                let _ = self
-                    .backend
-                    .stop_container(&pause_name, StopContainerOptions { t: 0 })
-                    .await;
-                let opts = RemoveContainerOptions { force: true };
-                if self
-                    .backend
-                    .remove_container(&pause_name, opts)
-                    .await
-                    .is_ok()
-                {
-                    removed += 1;
+                // Remove the orphaned pause container - but only when the Pod
+                // is gone. A Pod that still exists may simply be starting: its
+                // sandbox is created first and the app containers are only
+                // running after their images are pulled. Deleting the sandbox in
+                // that window aborts the start ("No such container:
+                // <pod>_pause", "removal of container ... is already in
+                // progress") and its volumes would be wiped as well.
+                if !existing_pods.contains(&pod_name) {
+                    let pause_name = format!("{}_pause", pod_name);
+                    let _ = self
+                        .backend
+                        .stop_container(&pause_name, StopContainerOptions { t: 0 })
+                        .await;
+                    let opts = RemoveContainerOptions { force: true };
+                    if self
+                        .backend
+                        .remove_container(&pause_name, opts)
+                        .await
+                        .is_ok()
+                    {
+                        removed += 1;
+                    }
+                    // Clean up volumes
+                    let _ = self.cleanup_pod_volumes(&pod_name).await;
                 }
-                // Clean up volumes
-                let _ = self.cleanup_pod_volumes(&pod_name).await;
             }
         }
 
