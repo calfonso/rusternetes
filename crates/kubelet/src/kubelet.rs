@@ -349,8 +349,13 @@ impl Kubelet {
                     // Timeout sync_loop to prevent blocking heartbeat.
                     // sync_loop is fire-and-forget so it should return in
                     // <100ms, but storage.list can be slow under load.
+                    // The heartbeat runs in its own task, so a slow full sync is
+                    // not a reason to cancel it. A 5 s cap aborted the loop
+                    // mid-way on a node with a handful of pods: pods later in
+                    // the list were never synced and stayed Pending with no log
+                    // line, while the loop "timed out" on every tick.
                     match tokio::time::timeout(
-                        Duration::from_secs(5),
+                        Duration::from_secs(120),
                         self.sync_loop(),
                     ).await {
                         Ok(Ok(())) => {},
