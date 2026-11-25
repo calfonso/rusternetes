@@ -1047,6 +1047,16 @@ impl ContainerRuntime {
             }
         }
 
+        // Step 3 guard: app containers join the sandbox's network namespace, so
+        // the pause container must be *running* right now. Image pulls happen
+        // between sandbox creation and this point (minutes for big images); a
+        // concurrent stop/restart can leave the sandbox in `created`, and Docker
+        // then rejects every app container with
+        //   "cannot join network namespace of a non running container".
+        if !self.use_cni && pod_ip.is_some() {
+            self.ensure_pause_running(pod_name, pod).await?;
+        }
+
         // Step 3: Start main containers (images already pre-pulled above)
         let spec_containers = pod.spec.as_ref().unwrap().containers.clone();
         for container in &spec_containers {
@@ -1268,6 +1278,24 @@ impl ContainerRuntime {
     /// correctly populate Downward API env vars like `status.podIP`.
     ///
     /// Returns the IP address assigned to the pause container.
+    /// Ensures the pod sandbox is running. Called right before app containers are
+    /// created: a sandbox that exists but is not running (state `created`) cannot
+    /// be joined, and recreating it after an image pull is cheap compared to a
+    /// pod that never starts.
+    async fn ensure_pause_running(&self, pod_name: &str, pod: &Pod) -> Result<()> {
+        let pause_name = format!("{}_pause", pod_name);
+        match self.backend.inspect_container(&pause_name).await {
+            Ok(info) if info.state.as_ref().and_then(|s| s.running).unwrap_or(false) => Ok(()),
+            _ => {
+                warn!(
+                    "Pod sandbox {} is not running before container start, re-creating it",
+                    pause_name
+                );
+                self.start_pause_container(pod_name, pod).await.map(|_| ())
+            }
+        }
+    }
+
     async fn start_pause_container(&self, pod_name: &str, pod: &Pod) -> Result<String> {
         let pause_name = format!("{}_pause", pod_name);
 
