@@ -1,5 +1,11 @@
 use crate::eviction::{get_node_stats, get_pod_stats, EvictionManager, EvictionSignal};
 use crate::runtime::ContainerRuntime;
+
+fn is_retryable_volume_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::runtime::UnboundPersistentVolumeClaim>()
+        .is_some()
+}
 use anyhow::Result;
 use rusternetes_common::{
     resources::{
@@ -76,6 +82,52 @@ pub struct Kubelet {
 /// write it back blindly, and emit a MODIFIED watch event — every cycle.
 pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
     serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
+}
+
+/// Node capacity as reported by this host.
+///
+/// The kubelet used to advertise a hardcoded `4` CPU / `8Gi`, so on a larger
+/// machine every pod beyond that budget stayed `Pending` while the host was
+/// mostly idle (and it silently reverted a manually corrected node status on the
+/// next restart). Read the real values, allow an explicit override for hosts
+/// whose cgroup view is narrower than the machine, and only fall back to the old
+/// defaults when nothing can be detected.
+fn detect_node_capacity() -> (String, String) {
+    fn env_or(name: &str, fallback: impl FnOnce() -> String) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(fallback)
+    }
+
+    let cpu = env_or("RUSTERNETES_NODE_CPU", || {
+        std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4)
+            .to_string()
+    });
+
+    let memory = env_or("RUSTERNETES_NODE_MEMORY", || {
+        let total_kib = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|content| {
+                content.lines().find_map(|line| {
+                    let rest = line.strip_prefix("MemTotal:")?;
+                    let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+                    Some(kib)
+                })
+            })
+            .unwrap_or(0);
+        if total_kib == 0 {
+            "8Gi".to_string()
+        } else {
+            // /proc/meminfo is in KiB; report whole GiB as Kubernetes does.
+            let gib = total_kib / (1024 * 1024);
+            format!("{}Gi", gib.max(1))
+        }
+    });
+
+    (cpu, memory)
 }
 
 impl Kubelet {
@@ -349,8 +401,13 @@ impl Kubelet {
                     // Timeout sync_loop to prevent blocking heartbeat.
                     // sync_loop is fire-and-forget so it should return in
                     // <100ms, but storage.list can be slow under load.
+                    // The heartbeat runs in its own task, so a slow full sync is
+                    // not a reason to cancel it. A 5 s cap aborted the loop
+                    // mid-way on a node with a handful of pods: pods later in
+                    // the list were never synced and stayed Pending with no log
+                    // line, while the loop "timed out" on every tick.
                     match tokio::time::timeout(
-                        Duration::from_secs(5),
+                        Duration::from_secs(120),
                         self.sync_loop(),
                     ).await {
                         Ok(Ok(())) => {},
@@ -397,16 +454,17 @@ impl Kubelet {
         });
 
         // Set node status
+        let (capacity_cpu, capacity_memory) = detect_node_capacity();
         node.status = Some(NodeStatus {
             capacity: Some(HashMap::from([
-                ("cpu".to_string(), "4".to_string()),
-                ("memory".to_string(), "8Gi".to_string()),
+                ("cpu".to_string(), capacity_cpu.clone()),
+                ("memory".to_string(), capacity_memory.clone()),
                 ("pods".to_string(), "110".to_string()),
                 ("ephemeral-storage".to_string(), "100Gi".to_string()),
             ])),
             allocatable: Some(HashMap::from([
-                ("cpu".to_string(), "4".to_string()),
-                ("memory".to_string(), "8Gi".to_string()),
+                ("cpu".to_string(), capacity_cpu.clone()),
+                ("memory".to_string(), capacity_memory.clone()),
                 ("pods".to_string(), "110".to_string()),
                 ("ephemeral-storage".to_string(), "100Gi".to_string()),
             ])),
@@ -547,22 +605,22 @@ impl Kubelet {
 
         // Ensure capacity, allocatable, and nodeInfo are always set
         if let Some(ref mut status) = node.status {
-            if status.capacity.as_ref().is_none_or(|c| c.is_empty()) {
-                status.capacity = Some(HashMap::from([
-                    ("cpu".to_string(), "4".to_string()),
-                    ("memory".to_string(), "8Gi".to_string()),
-                    ("pods".to_string(), "110".to_string()),
-                    ("ephemeral-storage".to_string(), "100Gi".to_string()),
-                ]));
-            }
-            if status.allocatable.as_ref().is_none_or(|a| a.is_empty()) {
-                status.allocatable = Some(HashMap::from([
-                    ("cpu".to_string(), "4".to_string()),
-                    ("memory".to_string(), "8Gi".to_string()),
-                    ("pods".to_string(), "110".to_string()),
-                    ("ephemeral-storage".to_string(), "100Gi".to_string()),
-                ]));
-            }
+            // Always reflect the current host: a node object registered by an
+            // older kubelet kept its 4 CPU / 8Gi forever, and the scheduler then
+            // refused every pod beyond that budget on an idle machine.
+            let (capacity_cpu, capacity_memory) = detect_node_capacity();
+            status.capacity = Some(HashMap::from([
+                ("cpu".to_string(), capacity_cpu.clone()),
+                ("memory".to_string(), capacity_memory.clone()),
+                ("pods".to_string(), "110".to_string()),
+                ("ephemeral-storage".to_string(), "100Gi".to_string()),
+            ]));
+            status.allocatable = Some(HashMap::from([
+                ("cpu".to_string(), capacity_cpu),
+                ("memory".to_string(), capacity_memory),
+                ("pods".to_string(), "110".to_string()),
+                ("ephemeral-storage".to_string(), "100Gi".to_string()),
+            ]));
             // Ensure nodeInfo is populated (may have been lost during updates)
             if status
                 .node_info
@@ -803,15 +861,34 @@ impl Kubelet {
         // K8s ref: pkg/kubelet/pod_workers.go — podWorkerLoop (long-lived)
         for pod in &node_pods {
             let pod_name = &pod.metadata.name;
+            let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
             // Signal existing worker or create a new one
             let has_worker = {
-                let workers = self.pod_workers.lock().unwrap();
-                if let Some(tx) = workers.get(pod_name.as_str()) {
-                    let _ = tx.try_send(());
-                    true
-                } else {
-                    false
+                let mut workers = self.pod_workers.lock().unwrap();
+                match workers.get(pod_name.as_str()) {
+                    // A closed channel means the worker task is gone (panic or
+                    // shutdown). Keeping the dead sender made `has_worker` true
+                    // forever, so the pod was never signalled again and stayed
+                    // Pending without a single log line.
+                    Some(tx) if tx.is_closed() => {
+                        warn!(
+                            "Pod worker for {}/{} is gone, starting a new one",
+                            namespace, pod_name
+                        );
+                        workers.remove(pod_name.as_str());
+                        false
+                    }
+                    Some(tx) => {
+                        if tx.try_send(()).is_err() {
+                            debug!(
+                                "Pod worker for {}/{} is busy, coalescing signal",
+                                namespace, pod_name
+                            );
+                        }
+                        true
+                    }
+                    None => false,
                 }
             };
 
@@ -1294,8 +1371,10 @@ impl Kubelet {
         {
             let mut locks = self.pod_sync_locks.lock().unwrap();
             if locks.contains(pod_uid) {
-                debug!(
-                    "Skipping sync for pod {}/{} — already syncing",
+                // Visible at info level: a stuck sync is exactly the state where
+                // a pod looks Pending forever and nothing is logged.
+                info!(
+                    "Skipping sync for pod {}/{} — a previous sync is still running",
                     namespace, pod_name
                 );
                 return Ok(());
@@ -1360,6 +1439,35 @@ impl Kubelet {
             .and_then(|s| s.restart_policy.as_deref())
             .unwrap_or("Always");
         let terminal_and_done = is_terminal_phase && restart_policy != "Always";
+        // A pod that is still present, not being deleted and not terminal must
+        // be running. If a previous incarnation left the worker state at
+        // Terminating/Terminated (e.g. after a failed stop), the pod would never
+        // be started again.
+        let stale_terminal_state = matches!(
+            current_state,
+            PodWorkerState::TerminatingPod | PodWorkerState::TerminatedPod
+        ) && pod.metadata.deletion_timestamp.is_none()
+            && !terminal_and_done;
+        if stale_terminal_state {
+            warn!(
+                "Pod {}/{} has stale worker state, resetting to SyncPod",
+                namespace, pod_name
+            );
+            self.pod_states
+                .lock()
+                .unwrap()
+                .insert(pod_uid.clone(), PodWorkerState::SyncPod);
+        }
+
+        let current_state = {
+            self.pod_states
+                .lock()
+                .unwrap()
+                .get(pod_uid)
+                .cloned()
+                .unwrap_or(PodWorkerState::SyncPod)
+        };
+
         let needs_terminating = (pod.metadata.deletion_timestamp.is_some() || terminal_and_done)
             && matches!(current_state, PodWorkerState::SyncPod);
 
@@ -2000,8 +2108,10 @@ impl Kubelet {
                             // The pod worker retries on the next sync cycle.
                             // K8s ref: pkg/kubelet/kubelet.go:2204 — WaitForAttachAndMount
                             //          pkg/kubelet/kubelet_pods.go:2496 — defaultWaitingState
-                            if err_msg.contains("not found in namespace")
-                                && (err_msg.contains("Secret") || err_msg.contains("ConfigMap"))
+                            if is_retryable_volume_error(&e)
+                                || (err_msg.contains("not found in namespace")
+                                    && (err_msg.contains("Secret")
+                                        || err_msg.contains("ConfigMap")))
                             {
                                 warn!(
                                     "Pod {}/{} waiting for volume (will retry): {}",
@@ -2009,6 +2119,7 @@ impl Kubelet {
                                 );
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                                    let original = p.clone();
                                     // Set container statuses to Waiting{ContainerCreating}
                                     let container_statuses: Vec<ContainerStatus> = p
                                         .spec
@@ -2046,7 +2157,9 @@ impl Kubelet {
                                         status.container_statuses = Some(container_statuses);
                                         status.conditions = Some(Self::not_ready_pod_conditions());
                                     }
-                                    let _ = self.storage.update(&key, &p).await;
+                                    if !pod_status_equal(&original, &p) {
+                                        let _ = self.storage.update(&key, &p).await;
+                                    }
                                 }
                                 return Ok(());
                             }
@@ -4081,6 +4194,22 @@ mod tests {
         Container, ContainerState, ContainerStatus, Pod, PodStatus,
     };
     use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+
+    #[test]
+    fn unbound_pvc_is_retryable_even_when_wrapped() {
+        let error = anyhow::Error::new(crate::runtime::UnboundPersistentVolumeClaim {
+            namespace: "test".to_string(),
+            name: "data".to_string(),
+        })
+        .context("failed to prepare volumes");
+        assert!(super::is_retryable_volume_error(&error));
+        assert!(!super::is_retryable_volume_error(&anyhow::anyhow!(
+            "PersistentVolumeClaim is not bound to a volume"
+        )));
+        assert!(!super::is_retryable_volume_error(&anyhow::anyhow!(
+            "permission denied"
+        )));
+    }
 
     fn make_container(name: &str) -> Container {
         Container {

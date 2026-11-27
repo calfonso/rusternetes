@@ -16,10 +16,14 @@ env:
 jobs:
   build-and-test:
     name: cargo nextest + clippy
-    runs-on: ubuntu-latest
+    # Leaseweb runners have no passwordless sudo. Tools install into the job home.
+    runs-on: leaseweb
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Private CARGO_HOME
+        run: bash .github/scripts/private-cargo-home.sh
 
       - name: Clone rhino adjacent to repo
         # crates/storage/Cargo.toml resolves the optional `rhino` dep via
@@ -27,25 +31,25 @@ jobs:
         # The default `sqlite` feature on the rusternetes binary activates
         # this dep, so `cargo metadata` (and therefore every cargo step
         # below) fails unless rhino is present on disk.
-        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+        run: |
+          set -euo pipefail
+          if [ ! -d ../rhino/.git ]; then
+            rm -rf ../rhino
+            git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+          fi
 
       - name: Install Rust toolchain
-        run: |
-          rustup update --no-self-update stable
-          rustup component add --toolchain stable clippy
-          rustup default stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        run: bash .github/scripts/install-protoc.sh
 
       - name: Install cargo-nextest
-        # Prebuilt binary install — much faster and more parallel than
-        # `cargo test`. The action caches the binary across runs.
-        uses: taiki-e/install-action@v2.90.3
-        with:
-          tool: nextest
+        # Prebuilt binary install. The upstream action uses sudo, which the
+        # Leaseweb runners do not allow.
+        run: bash .github/scripts/install-nextest.sh
 
       - name: Cache cargo registry + target
         # Rust-aware cache: prunes stale artifacts, hashes Cargo.lock plus
