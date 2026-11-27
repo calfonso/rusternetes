@@ -42,11 +42,9 @@ jobs:
         run: bash .github/scripts/install-protoc.sh
 
       - name: Install cargo-nextest
-        # Prebuilt binary install — much faster and more parallel than
-        # `cargo test`. The action caches the binary across runs.
-        uses: taiki-e/install-action@v2.90.3
-        with:
-          tool: nextest
+        # Prebuilt binary install. The upstream action uses sudo, which the
+        # Leaseweb runners do not allow.
+        run: bash .github/scripts/install-nextest.sh
 
       - name: Cache cargo registry + target
         # Rust-aware cache: prunes stale artifacts, hashes Cargo.lock plus
