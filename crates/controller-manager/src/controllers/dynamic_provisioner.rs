@@ -109,7 +109,13 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                         queue.forget(&key).await;
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    // A PVC that cannot be read must not disappear silently: that
+                    // is exactly how a claim stays unbound forever with no trace.
+                    warn!(
+                        "Cannot read PVC {} for dynamic provisioning: {error}",
+                        key
+                    );
                     queue.forget(&key).await;
                 }
             }
