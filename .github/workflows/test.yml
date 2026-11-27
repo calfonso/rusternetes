@@ -16,10 +16,14 @@ env:
 jobs:
   build-and-test:
     name: cargo nextest + clippy
-    runs-on: ubuntu-latest
+    # Leaseweb runners have no passwordless sudo. Tools install into the job home.
+    runs-on: leaseweb
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Private CARGO_HOME
+        run: bash .github/scripts/private-cargo-home.sh
 
       - name: Clone rhino adjacent to repo
         # crates/storage/Cargo.toml resolves the optional `rhino` dep via
@@ -30,15 +34,12 @@ jobs:
         run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
 
       - name: Install Rust toolchain
-        run: |
-          rustup update --no-self-update stable
-          rustup component add --toolchain stable clippy
-          rustup default stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        run: bash .github/scripts/install-protoc.sh
 
       - name: Install cargo-nextest
         # Prebuilt binary install — much faster and more parallel than

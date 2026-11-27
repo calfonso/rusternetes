@@ -16,18 +16,20 @@ on:
 permissions:
   contents: write
 
+# Leaseweb runners are self-hosted and have no passwordless sudo. Do not use
+# a GitHub-hosted runner or apt here.
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: leaseweb
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
+      - name: Private CARGO_HOME
+        run: bash .github/scripts/private-cargo-home.sh
+
       - name: Install protoc
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
-          protoc --version
+        run: bash .github/scripts/install-protoc.sh
 
       - uses: dtolnay/rust-toolchain@stable
 

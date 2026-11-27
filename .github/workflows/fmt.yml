@@ -8,10 +8,14 @@ on:
 jobs:
   fmt:
     name: Verify formatting with cargo fmt
-    runs-on: ubuntu-latest
+    # Leaseweb runners have no passwordless sudo.
+    runs-on: leaseweb
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Private CARGO_HOME
+        run: bash .github/scripts/private-cargo-home.sh
 
       - name: Clone rhino adjacent to repo
         # `cargo fmt --all` loads workspace metadata, which fails if the
@@ -21,10 +25,9 @@ jobs:
         run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
 
       - name: Install Rust toolchain
-        run: |
-          rustup update --no-self-update stable
-          rustup component add --toolchain stable rustfmt
-          rustup default stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Validate formatting
         # `cargo fmt --all` recurses into path-deps (rhino) too, but the
@@ -33,7 +36,5 @@ jobs:
         # `cargo metadata --no-deps`.
         run: |
           PKGS=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[].name' \
-            | sed 's/^/-p /' \
-            | tr '\n' ' ')
+            | python3 -c 'import json,sys; print(" ".join("-p "+p["name"] for p in json.load(sys.stdin)["packages"]))')
           cargo fmt $PKGS -- --check
