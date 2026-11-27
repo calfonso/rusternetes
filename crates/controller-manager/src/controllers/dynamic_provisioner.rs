@@ -272,6 +272,23 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
 
         let volume_path = format!("{}/{}", base_path, pv_name);
 
+        // The volume is mounted into the pod as the workload user. Rootless
+        // Docker maps container uid 1000 to a subordinate host uid, so a
+        // root-owned directory appears as `nobody` inside the container and the
+        // workload cannot write to it ("Permission denied" on upload). Make the
+        // directory world-writable; the pod's own user owns its files.
+        if let Err(error) = std::fs::create_dir_all(&volume_path) {
+            warn!("Could not create volume directory {}: {error}", volume_path);
+        } else {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = std::fs::set_permissions(
+                &volume_path,
+                std::fs::Permissions::from_mode(0o777),
+            ) {
+                warn!("Could not chmod volume directory {}: {error}", volume_path);
+            }
+        }
+
         // Check if this PVC is being restored from a snapshot
         let snapshot_source_path = if let Some(data_source) = &pvc.spec.data_source {
             self.handle_snapshot_restore(data_source, namespace, &volume_path)
