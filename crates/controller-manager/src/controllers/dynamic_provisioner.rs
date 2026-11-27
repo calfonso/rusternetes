@@ -14,6 +14,38 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+fn ensure_volume_directory(path: &std::path::Path) -> Result<()> {
+    let parent = path.parent().context("Volume directory has no parent")?;
+    let mut parents = std::fs::DirBuilder::new();
+    parents.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        parents.mode(0o711);
+    }
+    parents.create(parent)?;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Err(error) = builder.create(path) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error)
+                .with_context(|| format!("Failed to create volume directory {}", path.display()));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect volume directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "Volume path is not a real directory: {}",
+        path.display()
+    );
+    Ok(())
+}
+
 pub struct DynamicProvisionerController<S: Storage> {
     storage: Arc<S>,
 }
@@ -112,10 +144,7 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                 Err(error) => {
                     // A PVC that cannot be read must not disappear silently: that
                     // is exactly how a claim stays unbound forever with no trace.
-                    warn!(
-                        "Cannot read PVC {} for dynamic provisioning: {error}",
-                        key
-                    );
+                    warn!("Cannot read PVC {} for dynamic provisioning: {error}", key);
                     queue.forget(&key).await;
                 }
             }
@@ -272,22 +301,10 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
 
         let volume_path = format!("{}/{}", base_path, pv_name);
 
-        // The volume is mounted into the pod as the workload user. Rootless
-        // Docker maps container uid 1000 to a subordinate host uid, so a
-        // root-owned directory appears as `nobody` inside the container and the
-        // workload cannot write to it ("Permission denied" on upload). Make the
-        // directory world-writable; the pod's own user owns its files.
-        if let Err(error) = std::fs::create_dir_all(&volume_path) {
-            warn!("Could not create volume directory {}: {error}", volume_path);
-        } else {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) = std::fs::set_permissions(
-                &volume_path,
-                std::fs::Permissions::from_mode(0o777),
-            ) {
-                warn!("Could not chmod volume directory {}: {error}", volume_path);
-            }
-        }
+        // Only newly created directories receive private permissions. Existing
+        // volume modes and contents must not be silently changed on reconcile.
+        // The kubelet grants the mapped fsGroup access before mounting.
+        ensure_volume_directory(std::path::Path::new(&volume_path))?;
 
         // Check if this PVC is being restored from a snapshot
         let snapshot_source_path = if let Some(data_source) = &pvc.spec.data_source {
@@ -487,6 +504,43 @@ mod tests {
         PersistentVolumeMode, ResourceRequirements,
     };
     use rusternetes_storage::memory::MemoryStorage;
+
+    #[test]
+    #[cfg(unix)]
+    fn provisioned_directory_is_private_and_existing_mode_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("pv-test-{}", uuid::Uuid::new_v4()));
+        let volume = base.join("volume");
+        super::ensure_volume_directory(&volume).unwrap();
+        assert_eq!(
+            std::fs::metadata(&volume).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::set_permissions(&volume, std::fs::Permissions::from_mode(0o750)).unwrap();
+        super::ensure_volume_directory(&volume).unwrap();
+        assert_eq!(
+            std::fs::metadata(&volume).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        std::fs::remove_dir(&volume).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provisioned_directory_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("pv-link-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(super::ensure_volume_directory(&link).is_err());
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir(target).unwrap();
+        std::fs::remove_dir(base).unwrap();
+    }
 
     #[test]
     fn test_is_provisioner_supported() {

@@ -108,6 +108,154 @@ pub struct ContainerRuntime {
     starting_containers: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct UnboundPersistentVolumeClaim {
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+}
+
+impl std::fmt::Display for UnboundPersistentVolumeClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PersistentVolumeClaim {}/{} is not bound to a volume",
+            self.namespace, self.name
+        )
+    }
+}
+
+impl std::error::Error for UnboundPersistentVolumeClaim {}
+
+/// Read the current Docker daemon's map, rather than caching its PID across restarts.
+#[cfg(target_os = "linux")]
+fn gid_map_from_runtime_socket(path: &std::path::Path) -> anyhow::Result<String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let socket = UnixStream::connect(path).context("failed to connect to runtime socket")?;
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: credentials and length point to writable values of the expected size,
+    // and socket is a live Unix-domain stream descriptor.
+    let status = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to identify runtime socket peer");
+    }
+    anyhow::ensure!(
+        credentials.pid > 0 && length as usize == std::mem::size_of::<libc::ucred>(),
+        "invalid runtime socket peer"
+    );
+    std::fs::read_to_string(format!("/proc/{}/gid_map", credentials.pid))
+        .context("failed to read runtime peer GID map")
+}
+
+/// Translate an ID using the kernel's three-column user-namespace map.
+#[cfg(target_os = "linux")]
+fn translate_mapped_gid(map: &str, gid: u32) -> anyhow::Result<u32> {
+    let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
+    for line in map.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        anyhow::ensure!(fields.len() == 3, "invalid gid map entry");
+        let inside: u64 = fields[0].parse()?;
+        let outside: u64 = fields[1].parse()?;
+        let length: u64 = fields[2].parse()?;
+        let inside_end = inside.checked_add(length).context("gid map overflow")?;
+        let outside_end = outside.checked_add(length).context("gid map overflow")?;
+        anyhow::ensure!(
+            length > 0 && inside_end <= u32::MAX as u64 && outside_end <= u32::MAX as u64,
+            "invalid gid map range"
+        );
+        for &(other_inside, other_outside, other_length) in &ranges {
+            anyhow::ensure!(
+                !(inside < other_inside + other_length && other_inside < inside_end)
+                    && !(outside < other_outside + other_length && other_outside < outside_end),
+                "overlapping gid map ranges"
+            );
+        }
+        ranges.push((inside, outside, length));
+    }
+    ranges
+        .into_iter()
+        .find_map(|(inside, outside, length)| {
+            let gid = u64::from(gid);
+            (inside <= gid && gid < inside + length).then(|| (outside + gid - inside) as u32)
+        })
+        .context("fsGroup is not mapped by the container runtime")
+}
+
+/// Apply group permission bits without following links supplied by a workload.
+/// Open each inode relative to an already opened directory and operate on the
+/// descriptor so renaming a directory entry cannot redirect chmod.
+#[cfg(target_os = "linux")]
+fn apply_fsgroup_permissions(root: &std::path::Path, gid: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    fn apply(file: &std::fs::File, gid: u32, is_root: bool) -> std::io::Result<()> {
+        let meta = file.metadata()?;
+        if meta.gid() != gid {
+            // SAFETY: file is an open descriptor and -1 leaves the owner unchanged.
+            if unsafe { libc::fchown(file.as_raw_fd(), !0 as libc::uid_t, gid) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let mode = file.metadata()?.permissions().mode();
+        let mut new_mode = (mode & !0o070) | (((mode >> 6) & 0o7) << 3);
+        if is_root {
+            new_mode |= 0o2000;
+        }
+        if new_mode != mode {
+            file.set_permissions(std::fs::Permissions::from_mode(new_mode))?;
+        }
+        Ok(())
+    }
+
+    fn visit(dir: &std::fs::File, gid: u32) -> std::io::Result<()> {
+        let entries = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+        for entry in entries {
+            let entry = entry?;
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(entry.path())
+            {
+                Ok(file) => file,
+                Err(error) if error.raw_os_error() == Some(libc::ELOOP) => continue,
+                Err(error) => return Err(error),
+            };
+            let meta = file.metadata()?;
+            if !meta.is_file() && !meta.is_dir() {
+                continue;
+            }
+            apply(&file, gid, false)?;
+            if meta.is_dir() {
+                visit(&file, gid)?;
+            }
+        }
+        Ok(())
+    }
+
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    apply(&root, gid, true)?;
+    visit(&root, gid)
+}
+
 /// Join a list of strings into a shell-safe command string.
 /// Wraps arguments containing spaces or special characters in single quotes.
 fn shell_join(args: &[String]) -> String {
@@ -1333,11 +1481,7 @@ impl ContainerRuntime {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while std::time::Instant::now() < deadline {
                     if let Ok(info) = self.backend.inspect_container(&pause_name).await {
-                        let running = info
-                            .state
-                            .as_ref()
-                            .and_then(|s| s.running)
-                            .unwrap_or(false);
+                        let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                         if running {
                             let ip = info
                                 .network_settings
@@ -1602,10 +1746,8 @@ impl ContainerRuntime {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        200 * u64::from(attempt),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
+                        .await;
                 }
             }
         }
@@ -1789,49 +1931,29 @@ impl ContainerRuntime {
             .and_then(|s| s.security_context.as_ref())
             .and_then(|sc| sc.fs_group)
         {
-            use std::os::unix::fs::PermissionsExt;
             for path in volume_paths.values() {
-                // Recursively chown to fsGroup
-                let _ = std::process::Command::new("chown")
-                    .args(["-R", &format!(":{}", fs_group), path])
-                    .output();
-
-                // Set group bits to mirror owner bits on each file/directory.
-                // This matches real K8s behavior: if owner=r--, group becomes r--
-                // (not r+w which chmod g+rwX would do).
-                fn apply_fsgroup_permissions(dir: &std::path::Path) {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let fpath = entry.path();
-                            if let Ok(meta) = std::fs::metadata(&fpath) {
-                                let mode = meta.permissions().mode();
-                                // Copy owner bits (bits 8-6) to group bits (bits 5-3)
-                                let owner_bits = (mode >> 6) & 0o7;
-                                let new_mode = (mode & !0o070) | (owner_bits << 3);
-                                if new_mode != mode {
-                                    let _ = std::fs::set_permissions(
-                                        &fpath,
-                                        std::fs::Permissions::from_mode(new_mode),
-                                    );
-                                }
-                                if meta.is_dir() {
-                                    apply_fsgroup_permissions(&fpath);
-                                }
-                            }
-                        }
+                #[cfg(target_os = "linux")]
+                apply_fsgroup_permissions(std::path::Path::new(path), {
+                    let gid = u32::try_from(fs_group).context("fsGroup must be a valid GID")?;
+                    if let Some(socket_path) =
+                        std::env::var_os("RUSTERNETES_RUNTIME_GID_MAP_SOCKET")
+                    {
+                        let map = gid_map_from_runtime_socket(std::path::Path::new(&socket_path))?;
+                        translate_mapped_gid(&map, gid)?
+                    } else if let Some(map_path) = std::env::var_os("RUSTERNETES_RUNTIME_GID_MAP") {
+                        let map = std::fs::read_to_string(&map_path)
+                            .context("failed to read runtime GID map")?;
+                        translate_mapped_gid(&map, gid)?
+                    } else {
+                        gid
                     }
-                }
-                apply_fsgroup_permissions(std::path::Path::new(path));
-
-                // Set setgid bit on the directory itself so new files inherit group
-                if let Ok(meta) = std::fs::metadata(path) {
-                    let mode = meta.permissions().mode();
-                    let owner_bits = (mode >> 6) & 0o7;
-                    let new_mode = (mode & !0o070) | (owner_bits << 3) | 0o2000;
-                    let _ =
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode));
-                }
+                })
+                .with_context(|| format!("Failed to apply fsGroup permissions to {}", path))?;
+                #[cfg(not(target_os = "linux"))]
+                anyhow::bail!(
+                    "fsGroup volume handling is only supported on Linux: {}",
+                    path
+                );
             }
             info!(
                 "Applied fsGroup {} to {} volumes",
@@ -2725,11 +2847,14 @@ impl ContainerRuntime {
             })?;
 
             // Get the bound PV name
-            let pv_name = pvc
-                .spec
-                .volume_name
-                .as_ref()
-                .context("PersistentVolumeClaim is not bound to a volume")?;
+            let pv_name =
+                pvc.spec
+                    .volume_name
+                    .as_ref()
+                    .ok_or_else(|| UnboundPersistentVolumeClaim {
+                        namespace: namespace.to_string(),
+                        name: pvc_source.claim_name.clone(),
+                    })?;
 
             // Get the PV
             let pv_key = build_key("persistentvolumes", None, pv_name);
@@ -10366,6 +10491,84 @@ mod tests {
     /// fsGroup should copy owner permission bits to group bits, not unconditionally
     /// add g+rwX. A file with mode 0440 (r--r-----) should stay 0440 after fsGroup,
     /// not become 0460 (r--rw----) which would happen with `chmod g+rwX`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn gid_map_is_read_from_current_unix_socket_peer() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("docker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || listener.accept().unwrap());
+        let map = super::gid_map_from_runtime_socket(&path).unwrap();
+        let (_stream, _) = peer.join().unwrap();
+        assert_eq!(map, std::fs::read_to_string("/proc/self/gid_map").unwrap());
+        assert!(super::gid_map_from_runtime_socket(&temp.path().join("missing")).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fsgroup_translates_rootless_gid_map_and_rejects_invalid_maps() {
+        let map = "0 1001 1\n1 165536 65536\n";
+        assert_eq!(super::translate_mapped_gid(map, 0).unwrap(), 1001);
+        assert_eq!(super::translate_mapped_gid(map, 1000).unwrap(), 166535);
+        assert_eq!(super::translate_mapped_gid(map, 65536).unwrap(), 231071);
+        assert!(super::translate_mapped_gid(map, 65537).is_err());
+        assert!(super::translate_mapped_gid("0 1000 0", 0).is_err());
+        assert!(super::translate_mapped_gid("1 4294967295 2", 1).is_err());
+        assert!(super::translate_mapped_gid("0 1000 2\n1 2000 2", 1).is_err());
+        assert!(super::translate_mapped_gid("0 1001 1\ninvalid", 0).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fsgroup_does_not_follow_symlinks_outside_volume() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let volume = temp.path().join("volume");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&volume).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let inside = volume.join("inside");
+        std::fs::write(&inside, b"owned").unwrap();
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let secret = outside.join("secret");
+        std::fs::write(&secret, b"private").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&outside, volume.join("escape")).unwrap();
+
+        let gid = std::fs::metadata(&volume).unwrap().gid();
+        super::apply_fsgroup_permissions(&volume, gid).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(inside).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+        assert_eq!(
+            std::fs::metadata(secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&volume).unwrap().permissions().mode() & 0o2000,
+            0o2000
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fsgroup_rejects_symlink_as_volume_root() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let root = temp.path().join("volume");
+        std::fs::create_dir(&target).unwrap();
+        symlink(target, &root).unwrap();
+        let gid = std::fs::metadata(&root).unwrap().gid();
+        assert!(super::apply_fsgroup_permissions(&root, gid).is_err());
+    }
+
     #[test]
     #[cfg(unix)]
     fn test_fsgroup_preserves_restrictive_permissions() {

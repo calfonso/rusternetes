@@ -1,5 +1,11 @@
 use crate::eviction::{get_node_stats, get_pod_stats, EvictionManager, EvictionSignal};
 use crate::runtime::ContainerRuntime;
+
+fn is_retryable_volume_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::runtime::UnboundPersistentVolumeClaim>()
+        .is_some()
+}
 use anyhow::Result;
 use rusternetes_common::{
     resources::{
@@ -107,11 +113,7 @@ fn detect_node_capacity() -> (String, String) {
             .and_then(|content| {
                 content.lines().find_map(|line| {
                     let rest = line.strip_prefix("MemTotal:")?;
-                    let kib = rest
-                        .split_whitespace()
-                        .next()?
-                        .parse::<u64>()
-                        .ok()?;
+                    let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
                     Some(kib)
                 })
             })
@@ -2106,8 +2108,10 @@ impl Kubelet {
                             // The pod worker retries on the next sync cycle.
                             // K8s ref: pkg/kubelet/kubelet.go:2204 — WaitForAttachAndMount
                             //          pkg/kubelet/kubelet_pods.go:2496 — defaultWaitingState
-                            if err_msg.contains("not found in namespace")
-                                && (err_msg.contains("Secret") || err_msg.contains("ConfigMap"))
+                            if is_retryable_volume_error(&e)
+                                || (err_msg.contains("not found in namespace")
+                                    && (err_msg.contains("Secret")
+                                        || err_msg.contains("ConfigMap")))
                             {
                                 warn!(
                                     "Pod {}/{} waiting for volume (will retry): {}",
@@ -2115,6 +2119,7 @@ impl Kubelet {
                                 );
                                 let key = build_key("pods", Some(namespace), pod_name);
                                 if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                                    let original = p.clone();
                                     // Set container statuses to Waiting{ContainerCreating}
                                     let container_statuses: Vec<ContainerStatus> = p
                                         .spec
@@ -2152,7 +2157,9 @@ impl Kubelet {
                                         status.container_statuses = Some(container_statuses);
                                         status.conditions = Some(Self::not_ready_pod_conditions());
                                     }
-                                    let _ = self.storage.update(&key, &p).await;
+                                    if !pod_status_equal(&original, &p) {
+                                        let _ = self.storage.update(&key, &p).await;
+                                    }
                                 }
                                 return Ok(());
                             }
@@ -4187,6 +4194,22 @@ mod tests {
         Container, ContainerState, ContainerStatus, Pod, PodStatus,
     };
     use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+
+    #[test]
+    fn unbound_pvc_is_retryable_even_when_wrapped() {
+        let error = anyhow::Error::new(crate::runtime::UnboundPersistentVolumeClaim {
+            namespace: "test".to_string(),
+            name: "data".to_string(),
+        })
+        .context("failed to prepare volumes");
+        assert!(super::is_retryable_volume_error(&error));
+        assert!(!super::is_retryable_volume_error(&anyhow::anyhow!(
+            "PersistentVolumeClaim is not bound to a volume"
+        )));
+        assert!(!super::is_retryable_volume_error(&anyhow::anyhow!(
+            "permission denied"
+        )));
+    }
 
     fn make_container(name: &str) -> Container {
         Container {
