@@ -1324,6 +1324,43 @@ impl ContainerRuntime {
                 }
             }
 
+            // The sandbox exists but is not running. It may simply be in the
+            // middle of being created by a concurrent sync: starting the
+            // existing container is idempotent and keeps its network namespace,
+            // while removing it here raced the creator ("409 name already in
+            // use", then "No such container" for every dependent).
+            if self.backend.start_container(&pause_name).await.is_ok() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(info) = self.backend.inspect_container(&pause_name).await {
+                        let running = info
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.running)
+                            .unwrap_or(false);
+                        if running {
+                            let ip = info
+                                .network_settings
+                                .as_ref()
+                                .and_then(|ns| ns.networks.as_ref())
+                                .and_then(|networks| networks.get(&self.network))
+                                .and_then(|info| info.ip_address.clone())
+                                .unwrap_or_default();
+                            info!(
+                                "Pause container {} was already created, started it instead of recreating it",
+                                pause_name
+                            );
+                            return Ok(ip);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                warn!(
+                    "Pause container {} did not start, recreating it",
+                    pause_name
+                );
+            }
+
             // Remove dependent containers first (required for Podman which
             // refuses to remove a container that has dependents).
             if let Ok(containers) = self
